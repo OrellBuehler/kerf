@@ -65,4 +65,15 @@ export interface AssetMetadata {
 	analysis: AssetAnalysis | null;
 }
 
+export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
+
+export interface Task {
+	id: string;
+	prompt: string;
+	status: TaskStatus;
+	result?: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
 export const clipDuration = (clip: Clip): number => Math.max(0, clip.source_out - clip.source_in);

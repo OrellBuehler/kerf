@@ -5,7 +5,7 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline, Track } from './types';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, Task, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
 export function inTauri(): boolean {
@@ -82,6 +82,35 @@ const sampleTimeline: Timeline = {
 		}
 	]
 };
+
+// A representative queue spanning the task lifecycle, mirroring the Rust seed.
+const now = () => new Date().toISOString();
+let devTasks: Task[] = [
+	{
+		id: 't1',
+		prompt: 'Assemble a rough cut from the interview',
+		status: 'done',
+		result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
+		created_at: now(),
+		updated_at: now()
+	},
+	{
+		id: 't2',
+		prompt: 'Tighten the intro and remove filler words',
+		status: 'ready',
+		result: 'Staged 3 cuts; review on the timeline',
+		created_at: now(),
+		updated_at: now()
+	},
+	{
+		id: 't3',
+		prompt: 'Balance the voiceover levels against the music bed',
+		status: 'queued',
+		result: null,
+		created_at: now(),
+		updated_at: now()
+	}
+];
 
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
@@ -291,6 +320,46 @@ export async function concatenate(assetIds: string[]): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('concatenate', { assetIds });
+}
+
+// ---- agent task queue ------------------------------------------------------
+//
+// The desktop app persists tasks in kerf-core; a connected LLM claims and works
+// them over MCP. In the browser there is no agent, so queued tasks simply wait —
+// which is the honest behavior: Kerf never edits on its own.
+
+export async function listTasks(): Promise<Task[]> {
+	if (!inTauri()) return structuredClone(devTasks);
+	return invoke<Task[]>('list_tasks');
+}
+
+/** Enqueue a task; resolves to the newly created (queued) task. */
+export async function addTask(prompt: string): Promise<Task> {
+	if (!inTauri()) {
+		const ts = now();
+		const task: Task = { id: uid(), prompt, status: 'queued', result: null, created_at: ts, updated_at: ts };
+		devTasks = [...devTasks, task];
+		return structuredClone(task);
+	}
+	return invoke<Task>('add_task', { prompt });
+}
+
+/** Accept a staged edit (status → done); resolves to the refreshed queue. */
+export async function resolveTask(taskId: string): Promise<Task[]> {
+	if (!inTauri()) {
+		devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
+		return structuredClone(devTasks);
+	}
+	return invoke<Task[]>('resolve_task', { taskId });
+}
+
+/** Remove a task from the queue; resolves to the refreshed queue. */
+export async function removeTask(taskId: string): Promise<Task[]> {
+	if (!inTauri()) {
+		devTasks = devTasks.filter((t) => t.id !== taskId);
+		return structuredClone(devTasks);
+	}
+	return invoke<Task[]>('remove_task', { taskId });
 }
 
 // ---- media (preview frames, waveforms) -------------------------------------

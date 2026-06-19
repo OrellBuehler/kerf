@@ -180,6 +180,16 @@ non-destructive timeline:
 | `extract_audio`         | Append an asset's audio to the audio track                |
 | `concatenate`           | Stitch several assets end-to-end                          |
 | `export`                | Render the timeline (requires the `ffmpeg` feature)       |
+| `list_tasks`            | List the agent task queue with each task's status         |
+| `add_task`              | Enqueue a task (status: queued)                           |
+| `claim_next_task`       | Claim the oldest queued task (marks it working)           |
+| `complete_task`         | Mark a claimed task ready for review, with a summary      |
+| `fail_task`             | Mark a task failed with an error message                  |
+
+The **task queue** is how the user and a connected LLM hand work back and forth:
+the desktop app enqueues plain-language tasks, the agent calls `claim_next_task`,
+performs edits with the timeline tools above, then `complete_task`s with a summary
+the user reviews and applies. Kerf never edits on its own.
 
 ### Connect it to Claude Code / Claude Desktop
 
@@ -216,6 +226,8 @@ The desktop shell exposes these commands to the frontend (`@tauri-apps/api`):
 - `get_timeline() -> Timeline`
 - `get_asset_metadata(assetId) -> { asset, analysis }`
 - `import_asset(path) -> Asset` _(requires the `ffmpeg` feature)_
+- `list_tasks() -> Task[]`, `add_task(prompt) -> Task`, `resolve_task(taskId) -> Task[]`,
+  `remove_task(taskId) -> Task[]` — the agent task queue
 
 ## Analysis is pluggable
 
@@ -235,19 +247,24 @@ This is a scaffold that boots end-to-end:
   (unit-tested).
 - ✅ FFmpeg engine: CLI-driven probe/analysis/frames/waveforms/export everywhere,
   plus `ffmpeg-next` in-process probing under the `ffmpeg` feature.
-- ✅ Working stdio MCP server (15 tools, incl. `analyze_asset`) verified against a
-  sample project.
+- ✅ Working stdio MCP server (20 tools, incl. `analyze_asset` and the task-queue
+  tools) verified against a sample project.
 - ✅ Tauri commands wiring the frontend to every `kerf-core` operation (editing,
   analysis, preview frames, waveforms, export).
 - ✅ Real local analysis: FFmpeg `silencedetect` + scene detection, decoded preview
   frames, and audio waveforms — all CLI-driven, so no dev libraries required.
 - ✅ Timeline, preview and transcript render real backend state (not mock data).
+- ✅ Agent task queue persisted in `kerf-core` (`tasks` table), exposed over MCP
+  (`list_tasks` / `claim_next_task` / `complete_task` / `fail_task`) and as Tauri
+  commands; the agent panel renders the live queue and an add-task box, so a
+  connected LLM and the user hand work back and forth over MCP.
 
 Behind feature flags (need a fuller toolchain, not exercised in the default CI
 build): `libav-render` — an experimental in-process libav export pipeline; and
 `whisper` — local `whisper-rs` transcription (set `KERF_WHISPER_MODEL`).
 
-Next up: connecting the agent panel's task queue to a live LLM over MCP.
+Next up: a live activity stream pushed from the MCP server (the queue is polled
+on load today), and richer staged-edit diffs in the review step.
 
 ## License
 

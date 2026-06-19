@@ -10,10 +10,12 @@
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { agent } from '$lib/agent.svelte';
 	import { inTauri, pickAndExport } from '$lib/api';
 
 	onMount(() => {
 		void editor.load();
+		void agent.load();
 	});
 
 	async function onExport() {
