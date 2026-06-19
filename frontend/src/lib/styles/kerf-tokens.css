@@ -1,0 +1,250 @@
+/* =============================================================
+   KERF — design tokens (ported from the Kerf design system).
+   Dark-first, editor-grade. Color is rationed: mostly neutral slate,
+   two saturated accents carry meaning — KERF AMBER (you / the cut /
+   primary action) and AGENT CYAN (the AI / proposals / analysis).
+   Source of truth: claude.ai/design "Kerf Design System".
+   ============================================================= */
+
+:root {
+	/* ---------- Neutral slate ramp (dark → light) ---------- */
+	--neutral-950: #0a0c0f;
+	--neutral-925: #0f1318;
+	--neutral-900: #14181e;
+	--neutral-870: #181d24;
+	--neutral-840: #1c222a;
+	--neutral-800: #222932;
+	--neutral-720: #2c3540;
+	--neutral-680: #36404c;
+	--neutral-600: #4a5562;
+	--neutral-500: #5e6b7a;
+	--neutral-400: #7a8696;
+	--neutral-300: #97a3b2;
+	--neutral-200: #c2cad4;
+	--neutral-050: #eef1f5;
+	--white: #ffffff;
+
+	/* ---------- Kerf amber — you / the cut / primary ---------- */
+	--kerf-200: #f6d9a3;
+	--kerf-300: #f0c277;
+	--kerf-400: #eab14e;
+	--kerf-500: #e29d2e;
+	--kerf-600: #c8851c;
+	--kerf-700: #9a6413;
+	--kerf-glow: rgba(226, 157, 46, 0.35);
+
+	/* ---------- Agent cyan — the AI / proposals / analysis ---------- */
+	--agent-200: #aef0ec;
+	--agent-300: #6fe0e0;
+	--agent-400: #3fcdd4;
+	--agent-500: #22b4c4;
+	--agent-600: #1894a6;
+	--agent-700: #126f80;
+	--agent-fg: #04181c;
+	--agent-surface: rgba(34, 180, 196, 0.1);
+	--agent-border: rgba(34, 180, 196, 0.32);
+
+	/* ---------- Semantic hues ---------- */
+	--green-400: #5fe0a8;
+	--green-500: #28c585;
+	--red-400: #ff8a80;
+	--red-500: #f1543f;
+	--red-600: #d63a27;
+	--orange-400: #ffb24a;
+	--orange-500: #f59020;
+
+	/* ---------- Surfaces ---------- */
+	--surface-void: var(--neutral-950);
+	--surface-app: var(--neutral-925);
+	--surface-panel: var(--neutral-900);
+	--surface-raised: var(--neutral-870);
+	--surface-inset: var(--neutral-950);
+	--surface-hover: var(--neutral-800);
+	--surface-active: var(--neutral-720);
+	--surface-overlay: rgba(10, 12, 15, 0.72);
+	--input: #10151b;
+
+	/* ---------- Borders ---------- */
+	--border-subtle: rgba(255, 255, 255, 0.06);
+	--border-default: rgba(255, 255, 255, 0.1);
+	--border-strong: rgba(255, 255, 255, 0.16);
+
+	/* ---------- Text ---------- */
+	--text-primary: var(--neutral-050);
+	--text-secondary: var(--neutral-300);
+	--text-muted: var(--neutral-400);
+	--text-disabled: var(--neutral-500);
+	--text-on-accent: #1a1205;
+	--text-inverted: var(--neutral-950);
+
+	/* ---------- Primary / accent ---------- */
+	--selection: var(--kerf-500);
+	--selection-border: var(--kerf-400);
+	--selection-fill: rgba(226, 157, 46, 0.16);
+
+	/* ---------- Status ---------- */
+	--success: var(--green-500);
+	--success-surface: rgba(40, 197, 133, 0.12);
+	--warning: var(--orange-500);
+	--warning-surface: rgba(245, 144, 32, 0.12);
+	--danger: var(--red-500);
+	--danger-surface: rgba(241, 84, 63, 0.12);
+	--info: var(--agent-500);
+
+	/* ---------- AI proposal DIFF states (timeline preview) ---------- */
+	--diff-add: var(--green-500);
+	--diff-add-surface: rgba(40, 197, 133, 0.14);
+	--diff-remove: var(--red-500);
+	--diff-remove-surface: rgba(241, 84, 63, 0.14);
+	--diff-shift: var(--orange-500);
+
+	/* ---------- The cut line ---------- */
+	--playhead: var(--kerf-500);
+	--playhead-glow: var(--kerf-glow);
+
+	/* ---------- Timeline / track palette ---------- */
+	--track-bg: #11151a;
+	--track-video: #294253;
+	--track-video-edge: #5b93b0;
+	--track-audio: #234438;
+	--track-audio-edge: #4f8f78;
+	--track-text: #3a2c49;
+	--track-text-edge: #8a6aa8;
+	--waveform: #6fcfa8;
+	--scene-marker: var(--kerf-500);
+	--silence-region: rgba(241, 84, 63, 0.12);
+	--timeline-grid: rgba(255, 255, 255, 0.04);
+	--timeline-grid-major: rgba(255, 255, 255, 0.08);
+
+	/* ---------- Typography ---------- */
+	--font-display: 'Space Grotesk', 'Geist', ui-sans-serif, system-ui, sans-serif;
+	--font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: 'Geist Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+
+	--fw-light: 300;
+	--fw-regular: 400;
+	--fw-medium: 500;
+	--fw-semibold: 600;
+	--fw-bold: 700;
+
+	--text-2xs: 10px;
+	--text-xs: 11px;
+	--text-sm: 12px;
+	--text-base: 13px;
+	--text-md: 14px;
+	--text-lg: 16px;
+	--text-xl: 20px;
+	--text-2xl: 26px;
+	--text-3xl: 34px;
+	--text-4xl: 46px;
+
+	--leading-tight: 1.1;
+	--leading-snug: 1.22;
+	--leading-normal: 1.45;
+	--leading-relaxed: 1.6;
+
+	--tracking-tighter: -0.02em;
+	--tracking-tight: -0.01em;
+	--tracking-normal: 0em;
+	--tracking-wide: 0.02em;
+	--tracking-caps: 0.1em;
+
+	--type-display: var(--fw-bold) var(--text-4xl) / 1.05 var(--font-display);
+	--type-title: var(--fw-semibold) var(--text-2xl) / 1.15 var(--font-display);
+	--type-heading: var(--fw-semibold) var(--text-xl) / var(--leading-snug) var(--font-sans);
+	--type-subhead: var(--fw-medium) var(--text-lg) / var(--leading-snug) var(--font-sans);
+	--type-body: var(--fw-regular) var(--text-base) / var(--leading-normal) var(--font-sans);
+	--type-ui: var(--fw-medium) var(--text-sm) / var(--leading-snug) var(--font-sans);
+	--type-label: var(--fw-medium) var(--text-xs) / var(--leading-snug) var(--font-sans);
+	--type-overline: var(--fw-semibold) var(--text-2xs) / 1 var(--font-sans);
+	--type-mono: var(--fw-medium) var(--text-sm) / 1.3 var(--font-mono);
+	--type-timecode: var(--fw-medium) var(--text-base) / var(--leading-tight) var(--font-mono);
+
+	/* ---------- Spacing & sizing (4px base) ---------- */
+	--space-0: 0;
+	--space-px: 1px;
+	--space-0_5: 2px;
+	--space-1: 4px;
+	--space-1_5: 6px;
+	--space-2: 8px;
+	--space-2_5: 10px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 20px;
+	--space-6: 24px;
+	--space-8: 32px;
+	--space-10: 40px;
+	--space-12: 48px;
+	--space-16: 64px;
+	--space-20: 80px;
+
+	--control-xs: 22px;
+	--control-sm: 28px;
+	--control-md: 34px;
+	--control-lg: 40px;
+
+	--icon-xs: 14px;
+	--icon-sm: 16px;
+	--icon-md: 18px;
+	--icon-lg: 20px;
+	--icon-xl: 24px;
+
+	/* ---------- Editor layout rails ---------- */
+	--titlebar-h: 36px;
+	--toolbar-h: 44px;
+	--statusbar-h: 26px;
+	--sidebar-w: 248px;
+	--agent-panel-w: 340px;
+	--track-header-w: 128px;
+	--ruler-h: 26px;
+	--track-h-video: 64px;
+	--track-h-audio: 48px;
+
+	/* ---------- Radii ---------- */
+	--radius-none: 0;
+	--radius-xs: 2px;
+	--radius-sm: 4px;
+	--radius-md: 6px;
+	--radius-lg: 8px;
+	--radius-xl: 12px;
+	--radius-full: 999px;
+	--clip-radius: 2px;
+
+	/* ---------- Shadows ---------- */
+	--shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+	--shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.45);
+	--shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
+	--shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.6);
+	--shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.66);
+	--shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
+
+	--focus-ring: 0 0 0 2px var(--surface-app), 0 0 0 4px rgba(226, 157, 46, 0.45);
+
+	/* ---------- Motion ---------- */
+	--ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+	--ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+	--ease-snap: cubic-bezier(0.2, 0.9, 0.25, 1);
+	--dur-instant: 80ms;
+	--dur-fast: 130ms;
+	--dur-normal: 200ms;
+	--dur-slow: 320ms;
+	--dur-scan: 1.4s;
+}
+
+/* The one signature motion: the agent analysis sweep. */
+@keyframes kerf-sweep-kf {
+	0% {
+		transform: translateX(-100%);
+	}
+	100% {
+		transform: translateX(360%);
+	}
+}
+.kerf-sweep {
+	animation: kerf-sweep-kf var(--dur-scan) var(--ease-in-out) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	.kerf-sweep {
+		animation: none;
+	}
+}

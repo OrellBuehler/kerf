@@ -104,15 +104,31 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `vite.config.ts` via the `sveltekit()` plugin (new-style config). Static SPA via
   `adapter-static` (fallback `index.html`); `+layout.ts` sets `ssr = false` +
   `prerender = true`. Dev port is pinned to **1420** for Tauri.
-- **Tailwind 4 = CSS config**, no `tailwind.config.js`. Theme tokens (shadcn vega
-  preset) live in `src/routes/layout.css`; that's also the `tailwind.css` in
-  `components.json`. Run `bunx shadcn-svelte add <name>` to add primitives.
+- **Tailwind 4 = CSS config**, no `tailwind.config.js`. `src/routes/layout.css` imports
+  the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
+  semantic vars onto them; the app is **dark-only** (`<html class="dark">` in `app.html`).
+  That file is also the `tailwind.css` in `components.json`. Run
+  `bunx shadcn-svelte add <name>` to add primitives.
+
+The editor UI is implemented from the **Kerf design system** (claude.ai/design): a dark,
+editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
+`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
+`Preview`, `Timeline`, `AgentPanel`, `StatusBar`, composed by `routes/+page.svelte`.
+Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
+utilities. The **timeline is a bespoke NLE timeline** (ruler + tracks + absolutely-positioned
+diff clips + playhead) — the old `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was
+removed (the dep is still in `package.json`, now unused). The **agent panel is an MCP task
+queue** (status · queue · activity log · add-task) — Kerf has no in-app chat; a connected
+LLM claims tasks over MCP and proposes edits.
 
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and
 **seeded sample data**, so `bun run dev` is fully explorable in a plain browser.
-State is one runes singleton (`src/lib/state.svelte.ts`, `export const editor`).
-The timeline is `@xyflow/svelte` (Svelte Flow): `TimelineCanvas.svelte` rebuilds clip
-nodes from `editor.timeline` in an `$effect`; `clip-node.svelte` is the custom node.
+State is two runes singletons: `src/lib/state.svelte.ts` (`export const editor` — assets,
+timeline, analysis) and `src/lib/editor-ui.svelte.ts` (`export const ui` — chrome state +
+the `empty → analyzing → review → editing` cut-workflow demo machine driven by the
+status-bar "Demo state" selector). `MediaBin` shows real `editor.assets` when present and
+falls back to the design's mock bin; the timeline diff/queue/log states are mock until the
+agent backend exists (`components/editor/data.ts`).
 
 ## Conventions
 
