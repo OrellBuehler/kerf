@@ -94,7 +94,8 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it manag
 `Mutex<Project>` and registers commands (`list_assets`, `get_timeline`,
 `get_asset_metadata`, `import_asset`). Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
-`frontendDist` at `../../frontend/build` and runs the frontend via `cd ../../frontend && bun run dev`.
+`frontendDist` at `../../frontend/build` and runs the frontend via `cd frontend && bun run dev`
+(the `beforeDevCommand`/`beforeBuildCommand` hooks run from the CLI invocation dir = repo root).
 `capabilities/default.json` grants `core:default` + `dialog:default`.
 
 ### frontend (`frontend/`)
