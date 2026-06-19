@@ -1,11 +1,34 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
+	import { toast } from 'svelte-sonner';
 	import { ui } from '$lib/editor-ui.svelte';
+	import { editor } from '$lib/state.svelte';
 	import { QUEUE_META, STATUS_MAP, LOG, PRESETS, type TaskStatus } from './data';
 
 	const working = $derived(ui.phase === 'analyzing');
-	const disabled = $derived(ui.phase === 'empty');
+	const disabled = $derived(editor.assets.length === 0);
+
+	async function runPreset(p: string) {
+		const assetId = editor.selectedAssetId ?? editor.assets[0]?.id;
+		if (!assetId) {
+			toast.error('Import media first');
+			return;
+		}
+		try {
+			if (p === 'Remove silences' || p === 'Assemble rough cut') {
+				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
+				await editor.removeSilence(assetId);
+				ui.setPhase('editing');
+				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
+			} else {
+				await ui.runAnalysis(assetId);
+				toast.info(`"${p}" is handed to your connected agent over MCP`);
+			}
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
 
 	const tint: Record<string, string> = {
 		agent: 'var(--agent-300)',
@@ -228,7 +251,7 @@
 			{#each PRESETS as p (p)}
 				<button
 					{disabled}
-					onclick={() => ui.startAnalyze()}
+					onclick={() => runPreset(p)}
 					style="display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:{disabled
 						? 'var(--text-disabled)'
 						: 'var(--text-secondary)'};font-size:11px;cursor:{disabled ? 'not-allowed' : 'pointer'}"
@@ -250,7 +273,7 @@
 			/>
 			<button
 				title="Add to queue"
-				onclick={() => !disabled && ui.startAnalyze()}
+				onclick={() => !disabled && toast.info('Queued — your connected agent claims tasks over MCP')}
 				style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-secondary);cursor:pointer"
 			>
 				<Icon n="corner-down-left" s={14} />

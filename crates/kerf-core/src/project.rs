@@ -238,6 +238,62 @@ impl Project {
         }
     }
 
+    /// Run silence + scene detection (and, with the `whisper` feature and a
+    /// `KERF_WHISPER_MODEL` model, transcription) against an asset's media file,
+    /// cache the result, and return it.
+    pub fn analyze_asset(&self, asset_id: Uuid) -> Result<AssetAnalysis> {
+        use crate::analysis::{
+            analyze, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
+            Transcriber,
+        };
+
+        let asset = self.require_asset(asset_id)?;
+        let silence = FfmpegSilenceDetector::default();
+        let scene = FfmpegSceneDetector::default();
+        let null = NullAnalyzer;
+
+        #[cfg(feature = "whisper")]
+        let whisper = std::env::var("KERF_WHISPER_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .map(|m| crate::analysis::WhisperTranscriber {
+                model_path: m.into(),
+                language: None,
+            });
+        #[cfg(feature = "whisper")]
+        let transcriber: &dyn Transcriber = whisper
+            .as_ref()
+            .map(|w| w as &dyn Transcriber)
+            .unwrap_or(&null);
+        #[cfg(not(feature = "whisper"))]
+        let transcriber: &dyn Transcriber = &null;
+
+        let providers = AnalysisProviders {
+            silence: &silence,
+            scene: &scene,
+            transcriber,
+        };
+        let analysis = analyze(&asset, &providers)?;
+        self.set_analysis(&analysis)?;
+        Ok(analysis)
+    }
+
+    // ---- media extraction (preview frames, waveforms) ---------------------
+
+    /// Decode a single frame of an asset at `time_secs` as PNG bytes, scaled to
+    /// at most `max_width` px wide.
+    pub fn frame_at(&self, asset_id: Uuid, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
+        let asset = self.require_asset(asset_id)?;
+        engine::frame_at(Path::new(&asset.path), time_secs, max_width)
+    }
+
+    /// Reduce an asset's first audio stream to `buckets` peak magnitudes in
+    /// `0.0..=1.0` for waveform rendering.
+    pub fn waveform(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
+        let asset = self.require_asset(asset_id)?;
+        engine::waveform(Path::new(&asset.path), buckets, 8_000)
+    }
+
     // ---- timeline ---------------------------------------------------------
 
     pub fn timeline(&self) -> Result<Timeline> {

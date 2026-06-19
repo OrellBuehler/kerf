@@ -1,9 +1,13 @@
-//! Media engine: probing and rendering.
+//! Media engine: probing, analysis, frame/waveform extraction and rendering.
 //!
-//! When the `ffmpeg` feature is enabled these are backed by in-process libav
-//! (via `ffmpeg-next`). Otherwise they return [`Error::FfmpegDisabled`], which
-//! lets the rest of the core (domain model, persistence, MCP read tools) build
-//! and run without the FFmpeg development libraries installed.
+//! Two backends sit behind one API:
+//!
+//! * [`cli`] drives the system `ffmpeg` / `ffprobe` **binaries**. It is always
+//!   compiled, so probing, analysis, frame/waveform extraction and export work
+//!   in the `--no-default-features` build (no FFmpeg *dev* libraries needed).
+//! * [`ffmpeg`] (the `ffmpeg` feature) is in-process **libav** via
+//!   `ffmpeg-next`, used for probing; with the additional `libav-render`
+//!   feature it also drives an experimental in-process export pipeline.
 
 use std::path::Path;
 
@@ -17,23 +21,50 @@ pub struct ProbeResult {
     pub streams: Vec<StreamInfo>,
 }
 
+mod cli;
+
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
-#[cfg(feature = "ffmpeg")]
-pub use ffmpeg::{probe, render};
+// Analysis, frame and waveform extraction always go through the CLI backend —
+// they only need the FFmpeg binaries, never the dev libraries.
+pub use cli::{detect_scenes, detect_silence, frame_at, waveform};
 
-#[cfg(not(feature = "ffmpeg"))]
-pub fn probe(_path: &Path) -> Result<ProbeResult> {
-    Err(crate::error::Error::FfmpegDisabled)
+#[cfg(feature = "whisper")]
+pub use cli::decode_audio_16k_mono;
+
+/// Probe a media file for duration and per-stream metadata.
+#[cfg(feature = "ffmpeg")]
+pub fn probe(path: &Path) -> Result<ProbeResult> {
+    ffmpeg::probe(path)
 }
 
+/// Probe a media file for duration and per-stream metadata.
 #[cfg(not(feature = "ffmpeg"))]
+pub fn probe(path: &Path) -> Result<ProbeResult> {
+    cli::probe(path)
+}
+
+/// Render the timeline to `output` (in-process libav with the `libav-render`
+/// feature, otherwise by driving the `ffmpeg` binary).
+#[cfg(feature = "libav-render")]
 pub fn render(
-    _timeline: &crate::model::Timeline,
-    _assets: &[crate::model::Asset],
-    _output: &Path,
-    _format: &str,
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    output: &Path,
+    format: &str,
 ) -> Result<()> {
-    Err(crate::error::Error::FfmpegDisabled)
+    ffmpeg::render(timeline, assets, output, format)
+}
+
+/// Render the timeline to `output` (in-process libav with the `libav-render`
+/// feature, otherwise by driving the `ffmpeg` binary).
+#[cfg(not(feature = "libav-render"))]
+pub fn render(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    output: &Path,
+    format: &str,
+) -> Result<()> {
+    cli::render(timeline, assets, output, format)
 }

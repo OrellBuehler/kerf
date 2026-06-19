@@ -13,8 +13,11 @@ pub mod project;
 mod engine;
 
 pub use analysis::{
-    analyze, AnalysisProviders, NullAnalyzer, SceneDetector, SilenceDetector, Transcriber,
+    analyze, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
+    SceneDetector, SilenceDetector, Transcriber,
 };
+#[cfg(feature = "whisper")]
+pub use analysis::WhisperTranscriber;
 pub use error::{Error, Result};
 pub use model::{
     Asset, AssetAnalysis, Clip, StreamInfo, StreamKind, TimeRange, Timeline, Track,

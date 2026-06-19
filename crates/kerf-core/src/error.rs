@@ -28,6 +28,9 @@ pub enum Error {
     #[error("FFmpeg support is not enabled in this build (enable the `ffmpeg` feature)")]
     FfmpegDisabled,
 
+    #[error("media engine error: {0}")]
+    Engine(String),
+
     #[cfg(feature = "ffmpeg")]
     #[error("ffmpeg error: {0}")]
     Ffmpeg(#[from] ffmpeg_next::Error),

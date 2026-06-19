@@ -1,6 +1,7 @@
-/* Mock project data ported from the Kerf editor design kit. Used for the
-   timeline diff showcase, the transcript, and the agent queue/activity log —
-   the parts the current backend does not model yet. */
+/* Mock project data ported from the Kerf editor design kit. The timeline,
+   transcript, preview and waveforms now render real backend data; what remains
+   here is the agent queue / activity log narrative (Kerf has no in-app agent —
+   a connected LLM claims tasks over MCP) plus the browser-only fallback bin. */
 
 import type { EditorPhase } from '$lib/editor-ui.svelte';
 
@@ -19,36 +20,6 @@ export const MOCK_ASSETS: MockAsset[] = [
 	{ id: 'a4', name: 'voiceover_2.wav', dur: '03:46', kind: 'audio', tag: 'VO' },
 	{ id: 'a5', name: 'ambient_loop.wav', dur: '06:00', kind: 'audio', tag: 'Music' }
 ];
-
-export type DiffState = 'keep' | 'cut' | 'normal';
-export type ClipBlock = { id: string; label: string; w: number; state: DiffState; kind?: string };
-
-export const V1_REVIEW: ClipBlock[] = [
-	{ id: 'v1', label: 'cold open', w: 92, state: 'keep' },
-	{ id: 'v2', label: 'umm…', w: 40, state: 'cut' },
-	{ id: 'v3', label: 'point 1', w: 150, state: 'keep' },
-	{ id: 'v4', label: 'dead air', w: 34, state: 'cut' },
-	{ id: 'v5', label: 'b-roll city', w: 120, state: 'keep', kind: 'video' },
-	{ id: 'v6', label: 'tangent', w: 70, state: 'cut' },
-	{ id: 'v7', label: 'point 2', w: 138, state: 'keep' },
-	{ id: 'v8', label: 'outro', w: 96, state: 'keep' }
-];
-
-export const V1_EDIT: ClipBlock[] = V1_REVIEW.filter((c) => c.state === 'keep').map((c) => ({
-	...c,
-	state: 'normal'
-}));
-
-export const A1: ClipBlock[] = [
-	{ id: 'au1', label: 'VO 01', w: 92, state: 'normal' },
-	{ id: 'au2', label: 'VO 02', w: 150, state: 'normal' },
-	{ id: 'au3', label: 'VO 03', w: 120, state: 'normal' },
-	{ id: 'au4', label: 'VO 04', w: 138, state: 'normal' },
-	{ id: 'au5', label: 'VO 05', w: 96, state: 'normal' }
-];
-
-export const RULER = ['00:00', '00:05', '00:10', '00:15', '00:20', '00:25', '00:30', '00:35', '00:40'];
-export const SCENE_X = [92, 282, 452, 660]; /* detected scene cuts (px in track area) */
 
 export type TranscriptLine = { t: string; s: string; cut: boolean; sil?: boolean };
 

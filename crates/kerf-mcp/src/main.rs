@@ -142,6 +142,15 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
+    #[tool(
+        description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result"
+    )]
+    fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.lock();
+        json(&project.analyze_asset(id).map_err(core_err)?)
+    }
+
     #[tool(description = "Cut [start, end) of an asset and append it to the matching track")]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -250,7 +259,8 @@ impl ServerHandler for KerfMcp {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "Kerf MCP server. Inspect loaded media with list_assets / \
-             get_asset_metadata / get_timeline_state, then assemble a \
+             get_asset_metadata / get_timeline_state, run analyze_asset to \
+             populate silence / scene / transcript metadata, then assemble a \
              non-destructive edit with the cut/split/trim/add/reorder/remove \
              tools. Call export to render."
                 .to_string(),

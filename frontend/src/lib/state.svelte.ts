@@ -1,22 +1,65 @@
 // Central editor state (Svelte 5 runes).
 
-import { getAssetMetadata, listAssets, getTimeline, pickAndImport } from './api';
-import type { Asset, AssetMetadata, Timeline } from './types';
+import {
+	addClip,
+	analyzeAsset,
+	concatenate,
+	cutClip,
+	exportTimeline,
+	extractAudio,
+	getAssetMetadata,
+	getTimeline,
+	getWaveform,
+	listAssets,
+	pickAndImport,
+	removeClip,
+	removeSilence,
+	reorderClip,
+	setVolume,
+	splitClip,
+	trimClip
+} from './api';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline } from './types';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
 	selectedAssetId = $state<string | null>(null);
+	selectedClipId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
+	analyses = $state<Record<string, AssetAnalysis>>({});
 	loading = $state(false);
+	busy = $state(false);
 	error = $state<string | null>(null);
+
+	#waveforms = new Map<string, number[]>();
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
 	}
 
+	get selectedClip(): Clip | undefined {
+		for (const t of this.timeline.tracks) {
+			const c = t.clips.find((c) => c.id === this.selectedClipId);
+			if (c) return c;
+		}
+		return undefined;
+	}
+
+	get duration(): number {
+		let max = 0;
+		for (const t of this.timeline.tracks) {
+			for (const c of t.clips) max = Math.max(max, c.timeline_start + Math.max(0, c.source_out - c.source_in));
+		}
+		return max;
+	}
+
 	assetName(assetId: string): string {
 		return this.assets.find((a) => a.id === assetId)?.name ?? 'unknown';
+	}
+
+	analysisFor(assetId: string): AssetAnalysis | undefined {
+		return this.analyses[assetId];
 	}
 
 	async load() {
@@ -28,7 +71,7 @@ class EditorState {
 				await this.select(this.assets[0].id);
 			}
 		} catch (e) {
-			this.error = e instanceof Error ? e.message : String(e);
+			this.error = this.#msg(e);
 		} finally {
 			this.loading = false;
 		}
@@ -38,6 +81,7 @@ class EditorState {
 		this.selectedAssetId = assetId;
 		try {
 			this.selectedMetadata = await getAssetMetadata(assetId);
+			if (this.selectedMetadata.analysis) this.analyses[assetId] = this.selectedMetadata.analysis;
 		} catch {
 			this.selectedMetadata = null;
 		}
@@ -54,6 +98,90 @@ class EditorState {
 			await this.select(asset.id);
 		}
 		return asset;
+	}
+
+	/** Run analysis on an asset and merge the result into local caches. */
+	async analyze(assetId: string): Promise<AssetAnalysis> {
+		const analysis = await analyzeAsset(assetId);
+		this.analyses[assetId] = analysis;
+		if (assetId === this.selectedAssetId && this.selectedMetadata) {
+			this.selectedMetadata = { ...this.selectedMetadata, analysis };
+		}
+		return analysis;
+	}
+
+	/** Cached waveform peaks for an asset's audio. */
+	async waveform(assetId: string, buckets: number): Promise<number[]> {
+		const key = `${assetId}:${buckets}`;
+		const cached = this.#waveforms.get(key);
+		if (cached) return cached;
+		try {
+			const peaks = await getWaveform(assetId, buckets);
+			this.#waveforms.set(key, peaks);
+			return peaks;
+		} catch {
+			return [];
+		}
+	}
+
+	// ---- editing actions (apply backend result to local timeline) -----------
+
+	async #apply(op: Promise<Timeline>) {
+		this.busy = true;
+		this.error = null;
+		try {
+			this.timeline = await op;
+		} catch (e) {
+			this.error = this.#msg(e);
+			throw e;
+		} finally {
+			this.busy = false;
+		}
+	}
+
+	cut(assetId: string, start: number, end: number) {
+		return this.#apply(cutClip(assetId, start, end));
+	}
+	add(assetId: string, sourceIn: number, sourceOut: number, trackId?: string, timelineStart?: number) {
+		return this.#apply(addClip(assetId, sourceIn, sourceOut, trackId, timelineStart));
+	}
+	split(clipId: string, at: number) {
+		return this.#apply(splitClip(clipId, at));
+	}
+	trim(clipId: string, sourceIn?: number, sourceOut?: number) {
+		return this.#apply(trimClip(clipId, sourceIn, sourceOut));
+	}
+	reorder(trackId: string, clipId: string, newIndex: number) {
+		return this.#apply(reorderClip(trackId, clipId, newIndex));
+	}
+	remove(clipId: string) {
+		if (this.selectedClipId === clipId) this.selectedClipId = null;
+		return this.#apply(removeClip(clipId));
+	}
+	setVolume(clipId: string, volume: number) {
+		return this.#apply(setVolume(clipId, volume));
+	}
+	removeSilence(assetId: string) {
+		return this.#apply(removeSilence(assetId));
+	}
+	extractAudio(assetId: string) {
+		return this.#apply(extractAudio(assetId));
+	}
+	concatenate(assetIds: string[]) {
+		return this.#apply(concatenate(assetIds));
+	}
+
+	async export(outputPath: string, format: string): Promise<string> {
+		this.busy = true;
+		try {
+			return await exportTimeline(outputPath, format);
+		} finally {
+			this.busy = false;
+		}
+	}
+
+	#msg(e: unknown): string {
+		return e instanceof Error ? e.message : String(e);
 	}
 }
 

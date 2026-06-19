@@ -151,8 +151,11 @@ cargo test   -p kerf-core       --no-default-features
 cargo run    -p kerf-mcp        --no-default-features
 ```
 
-In this mode `import_asset` and `export` return `FfmpegDisabled`; everything else
-(timeline editing, analysis storage, the seeded sample) works.
+In this mode the in-process libav **probe** is unavailable, but import, analysis
+(`silencedetect` / scene detection), preview frames, waveforms and export all
+still work by driving the system `ffmpeg` / `ffprobe` **binaries** — only the
+optional `libav-render` (in-process export) and `whisper` (transcription)
+features need a fuller toolchain.
 
 ---
 
@@ -227,17 +230,24 @@ the core.
 This is a scaffold that boots end-to-end:
 
 - ✅ Cargo workspace + Tauri v2 app with a SvelteKit/Svelte 5 frontend (Tailwind 4,
-  shadcn-svelte, Svelte Flow rendering the timeline).
+  shadcn-svelte, bespoke NLE timeline).
 - ✅ `kerf-core` domain model, SQLite `.kerf` persistence, and timeline operations
   (unit-tested).
-- ✅ `ffmpeg-next` integrated for in-process probing + a filtergraph export path
-  (gated behind the `ffmpeg` feature).
-- ✅ Working stdio MCP server (14 tools) verified against a sample project.
-- ✅ Tauri commands wiring the frontend to `kerf-core`.
+- ✅ FFmpeg engine: CLI-driven probe/analysis/frames/waveforms/export everywhere,
+  plus `ffmpeg-next` in-process probing under the `ffmpeg` feature.
+- ✅ Working stdio MCP server (15 tools, incl. `analyze_asset`) verified against a
+  sample project.
+- ✅ Tauri commands wiring the frontend to every `kerf-core` operation (editing,
+  analysis, preview frames, waveforms, export).
+- ✅ Real local analysis: FFmpeg `silencedetect` + scene detection, decoded preview
+  frames, and audio waveforms — all CLI-driven, so no dev libraries required.
+- ✅ Timeline, preview and transcript render real backend state (not mock data).
 
-Stubbed / next up: real frame decoding into the preview player, waveform rendering,
-an in-process (rather than CLI-driven) export pipeline, and wiring the agent panel
-to an LLM.
+Behind feature flags (need a fuller toolchain, not exercised in the default CI
+build): `libav-render` — an experimental in-process libav export pipeline; and
+`whisper` — local `whisper-rs` transcription (set `KERF_WHISPER_MODEL`).
+
+Next up: connecting the agent panel's task queue to a live LLM over MCP.
 
 ## License
 

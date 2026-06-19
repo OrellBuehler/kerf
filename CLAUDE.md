@@ -17,15 +17,25 @@ In the workspace `Cargo.toml`, `kerf-core` is declared with `default-features = 
 so the feature is **only** activated through these forwards — which is what makes
 `--no-default-features` actually disable it everywhere.
 
-- **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
-- **Without them** (CI, UI work, MCP read tools): always pass `--no-default-features`.
-  In this mode `Project::import_asset` and `Project::export` return `Error::FfmpegDisabled`;
-  everything else (timeline editing, persistence, the seeded sample) works.
+**The engine has two backends** (`crates/kerf-core/src/engine/`):
 
-When disabled, the `ffmpeg` engine module is `#[cfg]`-compiled out and replaced by
-stubs in `crates/kerf-core/src/engine/mod.rs`. The real libav code lives in
-`engine/ffmpeg.rs` (written against the ffmpeg-next 8.1 API); it can only be
-compiled with the dev libraries present.
+- `cli.rs` is **always compiled** and drives the `ffmpeg` / `ffprobe` **binaries**
+  (override with `KERF_FFMPEG` / `KERF_FFPROBE`). Probe, `silencedetect`, scene
+  detection, preview frames (`frame_at`), waveforms, and export all live here, so
+  they work in the `--no-default-features` build — only the binaries are needed,
+  never the dev libraries.
+- `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
+  `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
+  export pipeline. It can only compile with the dev libraries present (written against
+  the ffmpeg-next 8.1 API). The default export path is the CLI one even in full builds.
+
+Two more optional features: `libav-render` (above) and `whisper` (local `whisper-rs`
+transcription; needs a ggml model via `KERF_WHISPER_MODEL` and the whisper.cpp build
+toolchain). Both are off by default and **not** exercised by `--no-default-features` CI.
+
+- **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
+- **Without them** (CI, UI work): pass `--no-default-features`; everything but the
+  in-process libav probe still works via the binaries.
 
 ## Common commands
 
@@ -71,10 +81,13 @@ expose them in each adapter. Keep that boundary: no editing logic in the adapter
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
-  timeline) and is what both adapters launch with by default.
+  timeline) and is what both adapters launch with by default. `analyze_asset`,
+  `frame_at` and `waveform` delegate to the engine; editing ops are unchanged.
 - `analysis.rs` — transcription / scene / silence are **pluggable traits**
-  (`Transcriber`, `SceneDetector`, `SilenceDetector`) with a `NullAnalyzer`. Wire real
-  engines (whisper-rs, FFmpeg `silencedetect`) here without touching core logic.
+  (`Transcriber`, `SceneDetector`, `SilenceDetector`). Real impls now exist:
+  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available) and
+  `WhisperTranscriber` (`whisper` feature); `NullAnalyzer` is still the fallback.
+  `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
 
@@ -91,8 +104,12 @@ it's the transport; use `tracing` (stderr).
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
 Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it manages a
-`Mutex<Project>` and registers commands (`list_assets`, `get_timeline`,
-`get_asset_metadata`, `import_asset`). Tauri auto-converts JS camelCase args to Rust
+`Mutex<Project>` and registers a command per `Project` op — reads (`list_assets`,
+`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
+op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `remove_clip`,
+`set_volume`, `remove_silence`, `extract_audio`, `concatenate` — each returns the
+refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), and
+`export_timeline`. Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
 `beforeDevCommand`/`beforeBuildCommand` hooks, however, run from Tauri's *app dir* —
@@ -119,20 +136,28 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
 `Preview`, `Timeline`, `AgentPanel`, `StatusBar`, composed by `routes/+page.svelte`.
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
-utilities. The **timeline is a bespoke NLE timeline** (ruler + tracks + absolutely-positioned
-diff clips + playhead) — the old `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was
-removed (the dep is still in `package.json`, now unused). The **agent panel is an MCP task
+utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
+state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
+px/sec + playhead), with scene markers / silence regions mapped from `AssetAnalysis` and
+real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, clicks
+select/seek. The old `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
+dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
+(`get_frame`) under the playhead with real playback/scrub. The **agent panel is an MCP task
 queue** (status · queue · activity log · add-task) — Kerf has no in-app chat; a connected
-LLM claims tasks over MCP and proposes edits.
+LLM claims tasks over MCP. Its preset chips now run the matching real op locally; the
+queue/activity log remain a representative mock (there is no in-app agent backend to drive).
 
-`src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and
-**seeded sample data**, so `bun run dev` is fully explorable in a plain browser.
-State is two runes singletons: `src/lib/state.svelte.ts` (`export const editor` — assets,
-timeline, analysis) and `src/lib/editor-ui.svelte.ts` (`export const ui` — chrome state +
-the `empty → analyzing → review → editing` cut-workflow demo machine driven by the
-status-bar "Demo state" selector). `MediaBin` shows real `editor.assets` when present and
-falls back to the design's mock bin; the timeline diff/queue/log states are mock until the
-agent backend exists (`components/editor/data.ts`).
+`src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
+**seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform
+is explorable in a plain browser via `bun run dev` (frames return `null` there → Preview
+keeps its placeholder). State is two runes singletons: `src/lib/state.svelte.ts`
+(`export const editor` — assets, timeline, analyses, selection, and the editing actions that
+call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
+(`export const ui` — chrome state, playhead/zoom/playback, and `runAnalysis` which does real
+analysis in Tauri or the `empty → analyzing → review → editing` demo machine in the browser,
+still driven by the status-bar "Demo state" selector). `MediaBin` shows real `editor.assets`
+when present and falls back to the design's mock bin; the agent queue/log mock lives in
+`components/editor/data.ts`.
 
 ## Conventions
 

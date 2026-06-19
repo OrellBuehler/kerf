@@ -1,8 +1,11 @@
 /* Editor chrome + the agent workflow state machine.
-   The cut workflow (empty → analyzing → review → editing) is driven here as
-   a UI-level affordance: Kerf has no in-app AI, so until a connected agent
-   claims tasks over MCP, the status-bar "Demo state" selector and the import
-   action move through the same states the design showcases. */
+   The cut workflow (empty → analyzing → review → editing) drives the editor
+   chrome. In the desktop app `runAnalysis` performs real local analysis over
+   MCP/kerf-core; in the browser the status-bar "Demo state" selector and the
+   import action animate through the same states the design showcases. */
+
+import { editor } from './state.svelte';
+import { inTauri } from './api';
 
 export type EditorPhase = 'empty' | 'analyzing' | 'review' | 'editing';
 export type Tool = 'pointer' | 'razor' | 'bookmark';
@@ -14,9 +17,14 @@ class EditorUi {
 	agentOpen = $state(true);
 	playing = $state(false);
 	progress = $state(0);
+	/** Playhead position, seconds. */
+	time = $state(0);
+	/** Timeline zoom, pixels per second. */
+	zoom = $state(36);
 
 	#timer: ReturnType<typeof setInterval> | null = null;
 	#advance: ReturnType<typeof setTimeout> | null = null;
+	#raf: number | null = null;
 
 	#clear() {
 		if (this.#timer) clearInterval(this.#timer);
@@ -28,10 +36,10 @@ class EditorUi {
 	setPhase(phase: EditorPhase) {
 		this.#clear();
 		this.phase = phase;
-		if (phase === 'analyzing') this.#runAnalysis();
+		if (phase === 'analyzing') this.#runMockAnalysis();
 	}
 
-	#runAnalysis() {
+	#runMockAnalysis() {
 		this.progress = 8;
 		this.#timer = setInterval(() => {
 			if (this.progress >= 100) {
@@ -43,9 +51,31 @@ class EditorUi {
 		}, 220);
 	}
 
+	/** Browser-only showcase: fake the analyze → review transition. */
 	startAnalyze() {
 		this.progress = 0;
 		this.setPhase('analyzing');
+	}
+
+	/** Real analysis: animate progress while kerf-core works, then land in edit. */
+	async runAnalysis(assetId: string) {
+		if (!inTauri()) {
+			this.startAnalyze();
+			return;
+		}
+		this.#clear();
+		this.phase = 'analyzing';
+		this.progress = 6;
+		this.#timer = setInterval(() => {
+			this.progress = Math.min(94, this.progress + 6);
+		}, 200);
+		try {
+			await editor.analyze(assetId);
+		} finally {
+			this.#clear();
+			this.progress = 100;
+			this.phase = 'editing';
+		}
 	}
 
 	apply() {
@@ -54,6 +84,41 @@ class EditorUi {
 
 	reject() {
 		this.setPhase('editing');
+	}
+
+	// ---- playback ----------------------------------------------------------
+
+	seek(t: number) {
+		this.time = Math.max(0, t);
+	}
+
+	togglePlay() {
+		this.playing ? this.pause() : this.play();
+	}
+
+	play() {
+		if (this.playing) return;
+		if (this.time >= editor.duration) this.time = 0;
+		this.playing = true;
+		let last = performance.now();
+		const step = (now: number) => {
+			if (!this.playing) return;
+			this.time += (now - last) / 1000;
+			last = now;
+			if (this.time >= editor.duration) {
+				this.time = editor.duration;
+				this.playing = false;
+				return;
+			}
+			this.#raf = requestAnimationFrame(step);
+		};
+		this.#raf = requestAnimationFrame(step);
+	}
+
+	pause() {
+		this.playing = false;
+		if (this.#raf) cancelAnimationFrame(this.#raf);
+		this.#raf = null;
 	}
 }
 

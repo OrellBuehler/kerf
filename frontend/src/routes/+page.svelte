@@ -10,20 +10,46 @@
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { inTauri } from '$lib/api';
+	import { inTauri, pickAndExport } from '$lib/api';
 
 	onMount(() => {
 		void editor.load();
 	});
 
-	function onExport() {
+	async function onExport() {
 		if (!inTauri()) {
-			toast.info('Export runs the in-process FFmpeg render in the desktop app.');
+			toast.info('Export renders the timeline with FFmpeg in the desktop app.');
 			return;
 		}
-		toast.info('Export wiring is stubbed — connect it to the export command.');
+		try {
+			const out = await toast.promise(pickAndExport(), {
+				loading: 'Rendering timeline…',
+				success: (p) => (p ? `Exported → ${p}` : 'Export cancelled'),
+				error: (e) => (e instanceof Error ? e.message : String(e))
+			});
+			void out;
+		} catch {
+			/* surfaced via toast */
+		}
+	}
+
+	function onKey(e: KeyboardEvent) {
+		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		const k = e.key.toLowerCase();
+		if (k === 'v') ui.tool = 'pointer';
+		else if (k === 'c') ui.tool = 'razor';
+		else if (k === 'm') ui.tool = 'bookmark';
+		else if (e.key === ' ') {
+			e.preventDefault();
+			ui.togglePlay();
+		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipId) {
+			e.preventDefault();
+			void editor.remove(editor.selectedClipId);
+		}
 	}
 </script>
+
+<svelte:window onkeydown={onKey} />
 
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />

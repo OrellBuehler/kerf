@@ -11,7 +11,7 @@
 
 	let tab = $state<'bin' | 'tx' | 'fx'>('bin');
 
-	const loaded = $derived(ui.phase !== 'empty');
+	const loaded = $derived(editor.assets.length > 0 || ui.phase !== 'empty');
 
 	function fmt(s: number): string {
 		const m = Math.floor(s / 60);
@@ -58,14 +58,22 @@
 		if (inTauri()) {
 			try {
 				const asset = await editor.importMedia();
-				if (asset) toast.success(`Imported ${asset.name}`);
+				if (asset) {
+					toast.success(`Imported ${asset.name}`);
+					await ui.runAnalysis(asset.id);
+					toast.success('Analysis complete');
+				}
 			} catch (e) {
 				toast.error(e instanceof Error ? e.message : String(e));
 			}
 		} else {
 			toast.info('Kerf transcribes & detects locally on import (desktop app).');
+			ui.startAnalyze();
 		}
-		ui.startAnalyze();
+	}
+
+	function onSelect(assetId: string) {
+		void editor.select(assetId);
 	}
 </script>
 
@@ -134,8 +142,13 @@
 						<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
 					</div>
 					{#each assets as a, i (a.id)}
+						{@const sel = a.id === editor.selectedAssetId}
 						<div
-							style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--border-subtle)"
+							role="button"
+							tabindex="0"
+							onclick={() => onSelect(a.id)}
+							onkeydown={(e) => e.key === 'Enter' && onSelect(a.id)}
+							style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:pointer"
 						>
 							<div
 								style="width:46px;height:30px;border-radius:3px;flex:none;background:{a.kind ===

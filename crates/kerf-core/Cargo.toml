@@ -10,10 +10,17 @@ description = "Kerf domain model, .kerf project persistence, and FFmpeg media en
 
 [features]
 default = ["ffmpeg"]
-# In-process libav access (probe / analysis / render) via ffmpeg-next.
-# Requires the system FFmpeg dev libraries (see README). Disable to build the
-# domain model + MCP read tools without FFmpeg installed.
+# In-process libav probing via ffmpeg-next. Requires the system FFmpeg dev
+# libraries (see README). Disable to build the domain model + MCP read tools
+# with only the FFmpeg *binaries* (analysis / frames / waveforms / export all
+# run by driving the `ffmpeg` / `ffprobe` CLI, which needs no dev libraries).
 ffmpeg = ["dep:ffmpeg-next"]
+# Experimental in-process libav export pipeline (otherwise export drives the
+# `ffmpeg` binary). Implies `ffmpeg`; needs the FFmpeg dev libraries.
+libav-render = ["ffmpeg"]
+# Local speech-to-text transcription via whisper-rs. Needs a ggml model file
+# (KERF_WHISPER_MODEL) at runtime and the whisper.cpp build toolchain.
+whisper = ["dep:whisper-rs"]
 
 [dependencies]
 serde.workspace = true
@@ -24,3 +31,4 @@ chrono.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
 ffmpeg-next = { workspace = true, optional = true }
+whisper-rs = { version = "0.16.0", optional = true }

@@ -3,6 +3,7 @@
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
+	import { editor } from '$lib/state.svelte';
 
 	let { onExport }: { onExport: () => void } = $props();
 
@@ -11,6 +12,13 @@
 		['razor', 'Scissors', 'Razor (C)'],
 		['bookmark', 'Bookmark', 'Marker (M)']
 	];
+
+	function tc(s: number): string {
+		const m = Math.floor(s / 60);
+		const sec = Math.floor(s % 60);
+		const frames = Math.floor((s % 1) * 24);
+		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}:${frames.toString().padStart(2, '0')}`;
+	}
 </script>
 
 {#snippet divider()}
@@ -31,17 +39,17 @@
 
 	{@render divider()}
 
-	<IconBtn title="Skip back"><Icon n="skip-back" /></IconBtn>
+	<IconBtn title="Skip to start" onclick={() => ui.seek(0)}><Icon n="skip-back" /></IconBtn>
 	<IconBtn
 		title={ui.playing ? 'Pause' : 'Play'}
-		onclick={() => (ui.playing = !ui.playing)}
+		onclick={() => ui.togglePlay()}
 		style="background:var(--surface-hover);color:var(--text-primary)"
 	>
 		<Icon n={ui.playing ? 'pause' : 'play'} />
 	</IconBtn>
-	<IconBtn title="Skip forward"><Icon n="skip-forward" /></IconBtn>
+	<IconBtn title="Skip to end" onclick={() => ui.seek(editor.duration)}><Icon n="skip-forward" /></IconBtn>
 	<span style="font-family:var(--font-mono);font-size:13px;color:var(--kerf-300);margin-left:6px;font-weight:500">
-		00:00:32:08
+		{tc(ui.time)}
 	</span>
 
 	<div style="flex:1"></div>
