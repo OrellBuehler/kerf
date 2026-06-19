@@ -94,8 +94,11 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it manag
 `Mutex<Project>` and registers commands (`list_assets`, `get_timeline`,
 `get_asset_metadata`, `import_asset`). Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
-`frontendDist` at `../../frontend/build` and runs the frontend via `cd frontend && bun run dev`
-(the `beforeDevCommand`/`beforeBuildCommand` hooks run from the CLI invocation dir = repo root).
+`frontendDist` at `../../frontend/build` (resolved relative to the config file). The
+`beforeDevCommand`/`beforeBuildCommand` hooks, however, run from Tauri's *app dir* —
+which for this `crates/kerf-app` layout resolves to `crates/`, not the config dir or repo
+root — so they anchor to the repo via `cd "$(git rev-parse --show-toplevel)/frontend" && bun run dev`
+instead of a fragile relative path.
 `capabilities/default.json` grants `core:default` + `dialog:default`.
 
 ### frontend (`frontend/`)
