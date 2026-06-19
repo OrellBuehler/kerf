@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kerf",
+  "version": "0.1.0",
+  "identifier": "ch.orellbuehler.kerf",
+  "build": {
+    "frontendDist": "../../frontend/build",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "cd ../../frontend && bun run dev",
+    "beforeBuildCommand": "cd ../../frontend && bun run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Kerf",
+        "label": "main",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Video",
+    "shortDescription": "AI-assisted video/audio editor",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

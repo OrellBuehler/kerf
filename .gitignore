@@ -1,0 +1,32 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+
+# Node / Bun (frontend)
+node_modules
+/frontend/node_modules
+/frontend/.svelte-kit
+/frontend/build
+/frontend/.vite
+bun.lockb.orig
+
+# Tauri build output
+/crates/kerf-app/gen
+/crates/kerf-app/target
+
+# Kerf projects & media scratch
+*.kerf
+*.kerf-wal
+*.kerf-shm
+/samples/*.mp4
+/samples/*.mov
+/samples/*.wav
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.log

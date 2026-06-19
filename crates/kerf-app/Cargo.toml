@@ -1,0 +1,36 @@
+[package]
+name = "kerf-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Kerf — Tauri v2 desktop shell bridging the SvelteKit frontend to kerf-core"
+publish = false
+
+[lib]
+name = "kerf_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kerf-app"
+path = "src/main.rs"
+
+[features]
+default = ["ffmpeg"]
+# Forward in-process FFmpeg support to kerf-core (probe / export).
+ffmpeg = ["kerf-core/ffmpeg"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri = { workspace = true, features = [] }
+tauri-plugin-dialog.workspace = true
+kerf-core = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

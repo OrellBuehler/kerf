@@ -1,0 +1,29 @@
+[package]
+name = "kerf-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Stdio MCP server (rmcp) exposing Kerf's timeline and media tools to an LLM"
+
+[[bin]]
+name = "kerf-mcp"
+path = "src/main.rs"
+
+[features]
+default = ["ffmpeg"]
+# Forward FFmpeg support to kerf-core (needed for import_asset / export).
+ffmpeg = ["kerf-core/ffmpeg"]
+
+[dependencies]
+kerf-core = { workspace = true }
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
