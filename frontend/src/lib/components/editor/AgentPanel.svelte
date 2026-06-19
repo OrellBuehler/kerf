@@ -4,10 +4,30 @@
 	import { toast } from 'svelte-sonner';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { QUEUE_META, STATUS_MAP, LOG, PRESETS, type TaskStatus } from './data';
+	import { QUEUE_META, STATUS_MAP, PRESETS, type TaskStatus } from './data';
+	import type { EditSource } from '$lib/types';
 
 	const working = $derived(ui.phase === 'analyzing');
 	const disabled = $derived(editor.assets.length === 0);
+
+	// History, newest first.
+	const revisions = $derived([...editor.history].reverse());
+
+	const sourceTint: Record<EditSource, string> = {
+		agent: 'var(--agent-300)',
+		user: 'var(--kerf-400)',
+		system: 'var(--text-muted)'
+	};
+	const sourceIcon: Record<EditSource, string> = {
+		agent: 'plug',
+		user: 'hand',
+		system: 'history'
+	};
+	const sourceLabel: Record<EditSource, string> = {
+		agent: 'Agent',
+		user: 'You',
+		system: 'Kerf'
+	};
 
 	async function runPreset(p: string) {
 		const assetId = editor.selectedAssetId ?? editor.assets[0]?.id;
@@ -29,12 +49,6 @@
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
 	}
-
-	const tint: Record<string, string> = {
-		agent: 'var(--agent-300)',
-		local: 'var(--text-muted)',
-		you: 'var(--kerf-400)'
-	};
 
 	function iconColor(status: TaskStatus): string {
 		if (status === 'working') return 'var(--agent-300)';
@@ -225,18 +239,42 @@
 			</div>
 		</div>
 
-		<!-- activity -->
+		<!-- history -->
 		<div>
-			{@render secHead('Agent activity', null)}
+			{@render secHead('History', `${editor.history.length} edit${editor.history.length === 1 ? '' : 's'}`)}
 			<div style="display:flex;flex-direction:column;gap:1px">
-				{#each LOG[ui.phase] as [t, ic, text, who], i (i)}
-					<div style="display:flex;gap:9px;align-items:flex-start;padding:6px 4px">
-						<span
-							style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);width:30px;flex:none;padding-top:2px;text-align:right"
-							>{t}</span
-						>
-						<Icon n={ic} s={13} color={tint[who]} style="margin-top:1px" />
-						<span style="font-size:12px;line-height:1.45;color:var(--text-secondary)">{text}</span>
+				{#each revisions as rev (rev.seq)}
+					<div
+						style="display:flex;gap:9px;align-items:center;padding:6px 4px;border-radius:var(--radius-sm);{rev.current
+							? 'background:var(--surface-raised)'
+							: ''}"
+					>
+						<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
+						<div style="flex:1;min-width:0">
+							<div
+								style="font-size:12px;line-height:1.35;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							>
+								{rev.label}
+							</div>
+							<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
+								{sourceLabel[rev.source]}
+							</div>
+						</div>
+						{#if rev.current}
+							<span
+								style="display:inline-flex;align-items:center;gap:4px;font-family:var(--font-mono);font-size:9px;color:var(--green-400)"
+							>
+								<span style="width:6px;height:6px;border-radius:50%;background:var(--green-500)"></span>now
+							</span>
+						{:else}
+							<button
+								title="Revert the timeline to this point"
+								onclick={() => editor.revertTo(rev.seq)}
+								style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:var(--text-secondary);font-size:10px;cursor:pointer"
+							>
+								<Icon n="rotate-ccw" s={11} />Revert
+							</button>
+						{/if}
 					</div>
 				{/each}
 			</div>

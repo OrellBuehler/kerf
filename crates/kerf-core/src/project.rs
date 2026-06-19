@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 use crate::engine;
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetAnalysis, Clip, StreamInfo, StreamKind, TimeRange, Timeline, Track};
+use crate::model::{
+    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, TimeRange, Timeline,
+    Track,
+};
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -39,10 +42,23 @@ CREATE TABLE IF NOT EXISTS timeline (
     id   INTEGER PRIMARY KEY CHECK (id = 1),
     data TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS history (
+    seq        INTEGER PRIMARY KEY,
+    label      TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    snapshot   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 "#;
+
+/// `meta` key holding the seq of the currently-applied revision.
+const HISTORY_HEAD: &str = "history_head";
 
 pub struct Project {
     conn: Connection,
+    /// Attributed to edits recorded in the history (see [`Project::set_actor`]).
+    actor: EditSource,
 }
 
 impl Project {
@@ -50,6 +66,7 @@ impl Project {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let project = Self {
             conn: Connection::open(path)?,
+            actor: EditSource::User,
         };
         project.init()?;
         Ok(project)
@@ -59,6 +76,7 @@ impl Project {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let project = Self {
             conn: Connection::open(path)?,
+            actor: EditSource::User,
         };
         project.init()?;
         Ok(project)
@@ -68,9 +86,17 @@ impl Project {
     pub fn open_in_memory() -> Result<Self> {
         let project = Self {
             conn: Connection::open_in_memory()?,
+            actor: EditSource::User,
         };
         project.init()?;
         Ok(project)
+    }
+
+    /// Set who subsequent edits are attributed to in the history. The MCP server
+    /// calls this with [`EditSource::Agent`]; the desktop app keeps the default
+    /// [`EditSource::User`].
+    pub fn set_actor(&mut self, actor: EditSource) {
+        self.actor = actor;
     }
 
     /// An in-memory project seeded with demo assets, analysis, and a timeline.
@@ -90,6 +116,19 @@ impl Project {
                 })?;
         if !has_timeline {
             self.save_timeline(&Timeline::new())?;
+        }
+
+        let has_history: bool =
+            self.conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM history)", [], |r| r.get(0))?;
+        if !has_history {
+            let snapshot = serde_json::to_string(&self.timeline()?)?;
+            self.conn.execute(
+                "INSERT INTO history (seq, label, source, snapshot, created_at)
+                 VALUES (0, 'Initial state', ?1, ?2, ?3)",
+                params![EditSource::System.as_str(), snapshot, Utc::now().to_rfc3339()],
+            )?;
+            self.set_meta(HISTORY_HEAD, "0")?;
         }
 
         self.conn.execute(
@@ -311,11 +350,138 @@ impl Project {
         Ok(())
     }
 
-    fn edit_timeline<R>(&self, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+    /// Apply a mutation to the timeline, persist it, and record a new revision
+    /// in the history (attributed to the current [`Project::actor`]).
+    fn edit_timeline<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
         self.save_timeline(&timeline)?;
+        self.record_revision(label, self.actor, &serde_json::to_string(&timeline)?)?;
         Ok(result)
+    }
+
+    // ---- history ----------------------------------------------------------
+
+    fn head(&self) -> Result<i64> {
+        Ok(self.meta(HISTORY_HEAD)?.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    fn set_head(&self, seq: i64) -> Result<()> {
+        self.set_meta(HISTORY_HEAD, &seq.to_string())
+    }
+
+    /// Append a revision after the current head, dropping any redo branch.
+    fn record_revision(&self, label: &str, source: EditSource, snapshot: &str) -> Result<i64> {
+        let head = self.head()?;
+        self.conn
+            .execute("DELETE FROM history WHERE seq > ?1", params![head])?;
+        let seq = head + 1;
+        self.conn.execute(
+            "INSERT INTO history (seq, label, source, snapshot, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![seq, label, source.as_str(), snapshot, Utc::now().to_rfc3339()],
+        )?;
+        self.set_head(seq)?;
+        Ok(seq)
+    }
+
+    /// Restore the stored snapshot at `seq` as the live timeline and move the
+    /// head there. Does not itself record a new revision.
+    fn restore(&self, seq: i64) -> Result<Timeline> {
+        let snapshot: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT snapshot FROM history WHERE seq = ?1",
+                params![seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
+        let timeline: Timeline = serde_json::from_str(&snapshot)?;
+        self.save_timeline(&timeline)?;
+        self.set_head(seq)?;
+        Ok(timeline)
+    }
+
+    /// The full edit history, oldest first; the entry matching the head is `current`.
+    pub fn history(&self) -> Result<Vec<Revision>> {
+        let head = self.head()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, label, source, created_at FROM history ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut revisions = Vec::new();
+        for row in rows {
+            let (seq, label, source, created_at) = row?;
+            revisions.push(Revision {
+                seq,
+                label,
+                source: parse_source(&source),
+                created_at: parse_dt(&created_at)?,
+                current: seq == head,
+            });
+        }
+        Ok(revisions)
+    }
+
+    pub fn can_undo(&self) -> Result<bool> {
+        let head = self.head()?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM history WHERE seq < ?1",
+            params![head],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn can_redo(&self) -> Result<bool> {
+        let head = self.head()?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM history WHERE seq > ?1",
+            params![head],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Step the head back one revision, returning the restored timeline.
+    pub fn undo(&self) -> Result<Timeline> {
+        let head = self.head()?;
+        let prev: Option<i64> = self.conn.query_row(
+            "SELECT MAX(seq) FROM history WHERE seq < ?1",
+            params![head],
+            |r| r.get(0),
+        )?;
+        match prev {
+            Some(seq) => self.restore(seq),
+            None => Err(Error::InvalidArgument("nothing to undo".to_string())),
+        }
+    }
+
+    /// Step the head forward one revision, returning the restored timeline.
+    pub fn redo(&self) -> Result<Timeline> {
+        let head = self.head()?;
+        let next: Option<i64> = self.conn.query_row(
+            "SELECT MIN(seq) FROM history WHERE seq > ?1",
+            params![head],
+            |r| r.get(0),
+        )?;
+        match next {
+            Some(seq) => self.restore(seq),
+            None => Err(Error::InvalidArgument("nothing to redo".to_string())),
+        }
+    }
+
+    /// Jump the head to any revision `seq`, returning the restored timeline.
+    pub fn revert_to(&self, seq: i64) -> Result<Timeline> {
+        self.restore(seq)
     }
 
     // ---- timeline operations ---------------------------------------------
@@ -338,7 +504,7 @@ impl Project {
             ));
         }
         let primary = asset.primary_kind();
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Add clip", |timeline| {
             let tid = match track_id {
                 Some(t) => {
                     if timeline.track(t).is_none() {
@@ -372,7 +538,7 @@ impl Project {
 
     /// Split a timeline clip at timeline time `at` into two adjacent clips.
     pub fn split_at(&self, clip_id: Uuid, at: f64) -> Result<(Clip, Clip)> {
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Split clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = timeline.tracks[ti].clips[ci].clone();
             if at <= clip.timeline_start || at >= clip.timeline_end() {
@@ -398,7 +564,7 @@ impl Project {
 
     /// Adjust a clip's source in/out points (timeline position is preserved).
     pub fn trim(&self, clip_id: Uuid, source_in: Option<f64>, source_out: Option<f64>) -> Result<Clip> {
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Trim clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
             if let Some(value) = source_in {
@@ -418,7 +584,7 @@ impl Project {
 
     /// Move a clip to a new index within its track and re-flow the track gaplessly.
     pub fn reorder(&self, track_id: Uuid, clip_id: Uuid, new_index: usize) -> Result<()> {
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Reorder clip", |timeline| {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
             let current = track
                 .clips
@@ -435,7 +601,7 @@ impl Project {
 
     /// Remove a clip from the timeline.
     pub fn remove(&self, clip_id: Uuid) -> Result<()> {
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Remove clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             timeline.tracks[ti].clips.remove(ci);
             Ok(())
@@ -447,7 +613,7 @@ impl Project {
         if volume < 0.0 {
             return Err(Error::InvalidArgument("volume must be >= 0".to_string()));
         }
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Set volume", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             timeline.tracks[ti].clips[ci].volume = volume;
             Ok(timeline.tracks[ti].clips[ci].clone())
@@ -477,7 +643,7 @@ impl Project {
         }
 
         let primary = asset.primary_kind();
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Remove silence", |timeline| {
             let tid = timeline
                 .first_track_of(primary)
                 .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?;
@@ -508,7 +674,7 @@ impl Project {
                 "asset has no audio stream".to_string(),
             ));
         }
-        self.edit_timeline(|timeline| {
+        self.edit_timeline("Extract audio", |timeline| {
             let tid = timeline
                 .first_track_of(StreamKind::Audio)
                 .ok_or_else(|| Error::Other("no audio track".to_string()))?;
@@ -653,6 +819,14 @@ fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| Error::Other(format!("invalid uuid {s}: {e}")))
 }
 
+fn parse_source(s: &str) -> EditSource {
+    match s {
+        "agent" => EditSource::Agent,
+        "system" => EditSource::System,
+        _ => EditSource::User,
+    }
+}
+
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -703,5 +877,89 @@ mod tests {
 
         project.remove(right.id).unwrap();
         assert!(project.timeline().unwrap().clip(right.id).is_none());
+    }
+
+    #[test]
+    fn history_undo_redo_revert() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 10.0,
+            streams: vec![StreamInfo {
+                index: 0,
+                kind: StreamKind::Video,
+                codec: "h264".into(),
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(25.0),
+                sample_rate: None,
+                channels: None,
+            }],
+            imported_at: Utc::now(),
+        };
+        project.insert_asset(&asset).unwrap();
+
+        let clipped = |p: &Project| -> usize {
+            p.timeline().unwrap().tracks.iter().map(|t| t.clips.len()).sum()
+        };
+
+        // Baseline (seq 0) is the only revision; nothing to undo yet.
+        assert!(!project.can_undo().unwrap());
+        assert_eq!(project.history().unwrap().len(), 1);
+
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        project.split_at(clip.id, 4.0).unwrap();
+        assert_eq!(clipped(&project), 2);
+        assert_eq!(project.history().unwrap().len(), 3); // baseline + add + split
+
+        // Undo the split, then the add.
+        project.undo().unwrap();
+        assert_eq!(clipped(&project), 1);
+        assert!(project.can_redo().unwrap());
+
+        // Redo the split back.
+        project.redo().unwrap();
+        assert_eq!(clipped(&project), 2);
+
+        // Revert all the way to the empty baseline.
+        project.revert_to(0).unwrap();
+        assert_eq!(clipped(&project), 0);
+        assert!(project.history().unwrap().iter().find(|r| r.seq == 0).unwrap().current);
+
+        // A new edit from a non-tip head truncates the redo branch.
+        project.cut_clip(asset.id, 0.0, 5.0).unwrap();
+        assert_eq!(clipped(&project), 1);
+        assert_eq!(project.history().unwrap().len(), 2); // baseline + the new edit
+        assert!(!project.can_redo().unwrap());
+    }
+
+    #[test]
+    fn edits_are_attributed_to_actor() {
+        let mut project = Project::open_in_memory().unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 10.0,
+            streams: vec![StreamInfo {
+                index: 0,
+                kind: StreamKind::Video,
+                codec: "h264".into(),
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(25.0),
+                sample_rate: None,
+                channels: None,
+            }],
+            imported_at: Utc::now(),
+        };
+        project.insert_asset(&asset).unwrap();
+
+        project.set_actor(crate::model::EditSource::Agent);
+        project.cut_clip(asset.id, 0.0, 5.0).unwrap();
+        let latest = project.history().unwrap().pop().unwrap();
+        assert_eq!(latest.source, crate::model::EditSource::Agent);
     }
 }

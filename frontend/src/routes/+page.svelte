@@ -36,6 +36,20 @@
 	function onKey(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 		const k = e.key.toLowerCase();
+		if ((e.metaKey || e.ctrlKey) && k === 'z') {
+			e.preventDefault();
+			if (e.shiftKey) {
+				if (editor.canRedo) void editor.redo();
+			} else if (editor.canUndo) {
+				void editor.undo();
+			}
+			return;
+		}
+		if ((e.metaKey || e.ctrlKey) && k === 'y') {
+			e.preventDefault();
+			if (editor.canRedo) void editor.redo();
+			return;
+		}
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
 		else if (k === 'm') ui.tool = 'bookmark';

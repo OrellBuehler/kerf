@@ -5,7 +5,7 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline, Track } from './types';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, EditSource, Revision, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
 export function inTauri(): boolean {
@@ -89,6 +89,31 @@ let devTimeline: Timeline = structuredClone(sampleTimeline);
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
 
+// ---- local edit history (browser dev fallback) ----------------------------
+// Mirrors kerf-core's snapshot history so undo/redo/revert work without Tauri.
+
+type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline };
+let devHistory: DevRevision[] = [
+	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline) }
+];
+let devHead = 0;
+
+/** Append a snapshot of the current dev timeline, dropping any redo branch. */
+function recordDev(label: string) {
+	devHistory = devHistory.slice(0, devHead + 1);
+	devHead += 1;
+	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot() });
+}
+
+function devRestore(seq: number): Timeline {
+	const rev = devHistory.find((r) => r.seq === seq);
+	if (rev) {
+		devTimeline = structuredClone(rev.snapshot);
+		devHead = seq;
+	}
+	return snapshot();
+}
+
 function trackEnd(t: Track): number {
 	return t.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
 }
@@ -167,6 +192,7 @@ export async function cutClip(assetId: string, start: number, end: number): Prom
 	if (!inTauri()) {
 		const track = trackForAsset(devTimeline, assetId);
 		track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1 });
+		recordDev('Add clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip', { assetId, start, end });
@@ -183,6 +209,7 @@ export async function addClip(
 		const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
 		const start = timelineStart ?? trackEnd(track);
 		track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1 });
+		recordDev('Add clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('add_clip', { assetId, trackId, sourceIn, sourceOut, timelineStart });
@@ -201,6 +228,7 @@ export async function splitClip(clipId: string, at: number): Promise<Timeline> {
 				track.clips.splice(ci + 1, 0, right);
 			}
 		}
+		recordDev('Split clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('split_clip', { clipId, at });
@@ -214,6 +242,7 @@ export async function trimClip(clipId: string, sourceIn?: number, sourceOut?: nu
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
 		}
+		recordDev('Trim clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('trim_clip', { clipId, sourceIn, sourceOut });
@@ -230,6 +259,7 @@ export async function reorderClip(trackId: string, clipId: string, newIndex: num
 				reflow(track);
 			}
 		}
+		recordDev('Reorder clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('reorder_clip', { trackId, clipId, newIndex });
@@ -239,6 +269,7 @@ export async function removeClip(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips.splice(found[1], 1);
+		recordDev('Remove clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clip', { clipId });
@@ -248,6 +279,7 @@ export async function setVolume(clipId: string, volume: number): Promise<Timelin
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips[found[1]].volume = volume;
+		recordDev('Set volume');
 		return snapshot();
 	}
 	return invoke<Timeline>('set_volume', { clipId, volume });
@@ -270,6 +302,7 @@ export async function removeSilence(assetId: string): Promise<Timeline> {
 			track.clips.push({ id: uid(), asset_id: assetId, source_in: si, source_out: so, timeline_start: start, volume: 1 });
 			start += so - si;
 		}
+		recordDev('Remove silence');
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_silence', { assetId });
@@ -280,6 +313,7 @@ export async function extractAudio(assetId: string): Promise<Timeline> {
 		const asset = assetById(assetId);
 		const track = devTimeline.tracks.find((t) => t.kind === 'audio') ?? devTimeline.tracks[0];
 		if (asset) track.clips.push({ id: uid(), asset_id: assetId, source_in: 0, source_out: asset.duration, timeline_start: trackEnd(track), volume: 1 });
+		recordDev('Extract audio');
 		return snapshot();
 	}
 	return invoke<Timeline>('extract_audio', { assetId });
@@ -291,6 +325,42 @@ export async function concatenate(assetIds: string[]): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('concatenate', { assetIds });
+}
+
+// ---- history (undo / redo / revert) ----------------------------------------
+
+export async function getHistory(): Promise<Revision[]> {
+	if (!inTauri()) {
+		return devHistory.map((r) => ({
+			seq: r.seq,
+			label: r.label,
+			source: r.source,
+			created_at: new Date().toISOString(),
+			current: r.seq === devHead
+		}));
+	}
+	return invoke<Revision[]>('get_history');
+}
+
+export async function undo(): Promise<Timeline> {
+	if (!inTauri()) {
+		const prev = [...devHistory].reverse().find((r) => r.seq < devHead);
+		return devRestore(prev ? prev.seq : devHead);
+	}
+	return invoke<Timeline>('undo');
+}
+
+export async function redo(): Promise<Timeline> {
+	if (!inTauri()) {
+		const next = devHistory.find((r) => r.seq > devHead);
+		return devRestore(next ? next.seq : devHead);
+	}
+	return invoke<Timeline>('redo');
+}
+
+export async function revertTo(seq: number): Promise<Timeline> {
+	if (!inTauri()) return devRestore(seq);
+	return invoke<Timeline>('revert_to', { seq });
 }
 
 // ---- media (preview frames, waveforms) -------------------------------------

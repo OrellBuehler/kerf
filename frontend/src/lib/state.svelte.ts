@@ -8,18 +8,22 @@ import {
 	exportTimeline,
 	extractAudio,
 	getAssetMetadata,
+	getHistory,
 	getTimeline,
 	getWaveform,
 	listAssets,
 	pickAndImport,
+	redo as apiRedo,
 	removeClip,
 	removeSilence,
 	reorderClip,
+	revertTo as apiRevertTo,
 	setVolume,
 	splitClip,
-	trimClip
+	trimClip,
+	undo as apiUndo
 } from './api';
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline } from './types';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, Revision, Timeline } from './types';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -28,6 +32,7 @@ class EditorState {
 	selectedClipId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
+	history = $state<Revision[]>([]);
 	loading = $state(false);
 	busy = $state(false);
 	error = $state<string | null>(null);
@@ -54,6 +59,16 @@ class EditorState {
 		return max;
 	}
 
+	get canUndo(): boolean {
+		const i = this.history.findIndex((r) => r.current);
+		return i > 0;
+	}
+
+	get canRedo(): boolean {
+		const i = this.history.findIndex((r) => r.current);
+		return i >= 0 && i < this.history.length - 1;
+	}
+
 	assetName(assetId: string): string {
 		return this.assets.find((a) => a.id === assetId)?.name ?? 'unknown';
 	}
@@ -66,7 +81,11 @@ class EditorState {
 		this.loading = true;
 		this.error = null;
 		try {
-			[this.assets, this.timeline] = await Promise.all([listAssets(), getTimeline()]);
+			[this.assets, this.timeline, this.history] = await Promise.all([
+				listAssets(),
+				getTimeline(),
+				getHistory()
+			]);
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
 			}
@@ -89,6 +108,14 @@ class EditorState {
 
 	async refreshTimeline() {
 		this.timeline = await getTimeline();
+	}
+
+	async refreshHistory() {
+		try {
+			this.history = await getHistory();
+		} catch {
+			/* history is best-effort; ignore */
+		}
 	}
 
 	async importMedia(): Promise<Asset | null> {
@@ -131,6 +158,7 @@ class EditorState {
 		this.error = null;
 		try {
 			this.timeline = await op;
+			await this.refreshHistory();
 		} catch (e) {
 			this.error = this.#msg(e);
 			throw e;
@@ -169,6 +197,21 @@ class EditorState {
 	}
 	concatenate(assetIds: string[]) {
 		return this.#apply(concatenate(assetIds));
+	}
+
+	// ---- history (undo / redo / revert) -------------------------------------
+
+	undo() {
+		this.selectedClipId = null;
+		return this.#apply(apiUndo());
+	}
+	redo() {
+		this.selectedClipId = null;
+		return this.#apply(apiRedo());
+	}
+	revertTo(seq: number) {
+		this.selectedClipId = null;
+		return this.#apply(apiRevertTo(seq));
 	}
 
 	async export(outputPath: string, format: string): Promise<string> {

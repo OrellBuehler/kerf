@@ -39,6 +39,25 @@
 
 	{@render divider()}
 
+	<IconBtn
+		title="Undo (⌘Z)"
+		disabled={!editor.canUndo}
+		onclick={() => editor.undo()}
+		style={editor.canUndo ? '' : 'opacity:.4;cursor:default'}
+	>
+		<Icon n="undo" />
+	</IconBtn>
+	<IconBtn
+		title="Redo (⇧⌘Z)"
+		disabled={!editor.canRedo}
+		onclick={() => editor.redo()}
+		style={editor.canRedo ? '' : 'opacity:.4;cursor:default'}
+	>
+		<Icon n="redo" />
+	</IconBtn>
+
+	{@render divider()}
+
 	<IconBtn title="Skip to start" onclick={() => ui.seek(0)}><Icon n="skip-back" /></IconBtn>
 	<IconBtn
 		title={ui.playing ? 'Pause' : 'Play'}

@@ -65,4 +65,14 @@ export interface AssetMetadata {
 	analysis: AssetAnalysis | null;
 }
 
+export type EditSource = 'user' | 'agent' | 'system';
+
+export interface Revision {
+	seq: number;
+	label: string;
+	source: EditSource;
+	created_at: string;
+	current: boolean;
+}
+
 export const clipDuration = (clip: Clip): number => Math.max(0, clip.source_out - clip.source_in);

@@ -144,6 +144,38 @@ impl Track {
     }
 }
 
+/// Who made an edit. The MCP server sets this to [`EditSource::Agent`]; the
+/// desktop app leaves the default [`EditSource::User`]; the seq-0 baseline is
+/// [`EditSource::System`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditSource {
+    User,
+    Agent,
+    System,
+}
+
+impl EditSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditSource::User => "user",
+            EditSource::Agent => "agent",
+            EditSource::System => "system",
+        }
+    }
+}
+
+/// One entry in the timeline edit history (a stored snapshot of the timeline).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Revision {
+    pub seq: i64,
+    pub label: String,
+    pub source: EditSource,
+    pub created_at: DateTime<Utc>,
+    /// `true` for the revision currently applied to the live timeline.
+    pub current: bool,
+}
+
 /// The non-destructive timeline (EDL): a set of multi-kind tracks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timeline {

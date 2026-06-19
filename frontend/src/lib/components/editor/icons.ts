@@ -31,7 +31,10 @@ import {
 	CornerDownLeft,
 	Hand,
 	FileSearch,
-	History
+	History,
+	Undo2,
+	Redo2,
+	RotateCcw
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -67,7 +70,10 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'corner-down-left': CornerDownLeft,
 	'hand': Hand,
 	'file-search': FileSearch,
-	'history': History
+	'history': History,
+	'undo': Undo2,
+	'redo': Redo2,
+	'rotate-ccw': RotateCcw
 };
 
 export type IconName = keyof typeof icons;

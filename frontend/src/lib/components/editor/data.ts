@@ -49,27 +49,6 @@ export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label:
 	done: { tone: 'neutral', icon: 'check', label: 'Applied' }
 };
 
-export type LogEntry = [time: string, icon: string, text: string, who: string];
-
-export const LOG: Record<EditorPhase, LogEntry[]> = {
-	empty: [['—', 'plug-zap', 'Claude Desktop connected over MCP', 'agent']],
-	analyzing: [
-		['00:03', 'captions', 'Kerf transcribed 04:12 locally', 'local'],
-		['00:04', 'scan-line', 'Detected 4 scenes · 14 silences (local)', 'local'],
-		['00:05', 'hand', 'Claude claimed “Assemble a rough cut”', 'agent']
-	],
-	review: [
-		['00:05', 'hand', 'Claude claimed “Assemble a rough cut”', 'agent'],
-		['00:06', 'file-search', 'Read transcript, silences, scene cuts via MCP', 'agent'],
-		['00:08', 'git-pull-request-arrow', 'Staged proposed cut · −1:48 · 23 cuts', 'agent']
-	],
-	editing: [
-		['00:08', 'git-pull-request-arrow', 'Staged proposed cut · −1:48', 'agent'],
-		['00:31', 'check', 'You applied the cut', 'you'],
-		['00:31', 'history', 'Sources untouched · revert available', 'local']
-	]
-};
-
 export const PRESETS = ['Remove silences', 'Assemble rough cut', 'Find best 60s', 'Color match'];
 
 export const PHASES: [EditorPhase, string][] = [

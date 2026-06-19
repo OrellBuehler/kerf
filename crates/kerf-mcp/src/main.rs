@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kerf_core::Project;
+use kerf_core::{EditSource, Project};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
@@ -101,6 +101,12 @@ struct VolumeParams {
 struct ConcatParams {
     #[schemars(description = "Ordered list of asset UUIDs to stitch together")]
     asset_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RevertParams {
+    #[schemars(description = "Revision seq to jump the timeline back to (see history)")]
+    seq: i64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -232,6 +238,30 @@ impl KerfMcp {
         json(&project.concatenate(&ids).map_err(core_err)?)
     }
 
+    #[tool(description = "List the timeline edit history (revisions, newest changes have higher seq; the current one is marked)")]
+    fn history(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.history().map_err(core_err)?)
+    }
+
+    #[tool(description = "Undo the last timeline edit, returning the restored timeline")]
+    fn undo(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.undo().map_err(core_err)?)
+    }
+
+    #[tool(description = "Redo the next timeline edit, returning the restored timeline")]
+    fn redo(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.redo().map_err(core_err)?)
+    }
+
+    #[tool(description = "Revert the timeline to a specific revision seq (see history), returning the restored timeline")]
+    fn revert_to(&self, Parameters(p): Parameters<RevertParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.revert_to(p.seq).map_err(core_err)?)
+    }
+
     #[tool(description = "Render the timeline to a file (requires the ffmpeg feature)")]
     fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
         let project = self.lock();
@@ -241,7 +271,9 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
-    fn new(project: Project) -> Self {
+    fn new(mut project: Project) -> Self {
+        // The MCP server is the agent: attribute its edits accordingly.
+        project.set_actor(EditSource::Agent);
         Self {
             project: Arc::new(Mutex::new(project)),
         }
@@ -262,7 +294,8 @@ impl ServerHandler for KerfMcp {
              get_asset_metadata / get_timeline_state, run analyze_asset to \
              populate silence / scene / transcript metadata, then assemble a \
              non-destructive edit with the cut/split/trim/add/reorder/remove \
-             tools. Call export to render."
+             tools. Every edit is tracked: use history to list revisions and \
+             undo / redo / revert_to to roll changes back. Call export to render."
                 .to_string(),
         );
         info

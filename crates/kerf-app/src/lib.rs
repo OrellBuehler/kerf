@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, Project, Timeline};
+use kerf_core::{Asset, AssetAnalysis, Project, Revision, Timeline};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
@@ -172,6 +172,28 @@ fn concatenate(state: State<'_, AppState>, asset_ids: Vec<String>) -> CmdResult<
     project.timeline().map_err(|e| e.to_string())
 }
 
+// ---- history (undo / redo / revert) ----------------------------------------
+
+#[tauri::command]
+fn get_history(state: State<'_, AppState>) -> CmdResult<Vec<Revision>> {
+    state.project()?.history().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn undo(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    state.project()?.undo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn redo(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    state.project()?.redo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
+    state.project()?.revert_to(seq).map_err(|e| e.to_string())
+}
+
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
@@ -240,6 +262,10 @@ pub fn run() {
             remove_silence,
             extract_audio,
             concatenate,
+            get_history,
+            undo,
+            redo,
+            revert_to,
             get_frame,
             get_waveform,
             export_timeline
