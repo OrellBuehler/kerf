@@ -35,6 +35,33 @@
 		return () => unlisten?.();
 	});
 
+	async function onOpen() {
+		if (!inTauri()) {
+			toast.info('Opening a project file is available in the desktop app.');
+			return;
+		}
+		try {
+			if (await editor.openProject()) {
+				await agent.load();
+				toast.success(`Opened ${editor.projectName}`);
+			}
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	async function onSave() {
+		if (!inTauri()) {
+			toast.info('Saving a project file is available in the desktop app.');
+			return;
+		}
+		try {
+			if (await editor.saveProjectAs()) toast.success(`Saved → ${editor.currentPath}`);
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
 	async function onExport() {
 		if (!inTauri()) {
 			toast.info('Export renders the timeline with FFmpeg in the desktop app.');
@@ -86,7 +113,7 @@
 
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />
-	<Toolbar {onExport} />
+	<Toolbar {onExport} {onOpen} {onSave} />
 	<div style="flex:1;display:flex;min-height:0">
 		<MediaBin />
 		<div style="flex:1;display:flex;flex-direction:column;min-width:0">

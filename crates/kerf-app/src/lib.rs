@@ -62,6 +62,36 @@ fn get_asset_metadata(state: State<'_, AppState>, asset_id: String) -> CmdResult
     Ok(AssetMetadata { asset, analysis })
 }
 
+// ---- project file (open / save) --------------------------------------------
+
+/// Path of the `.kerf` file backing the open project, or `null` if it lives
+/// only in memory (the seeded sample) and isn't persisted yet.
+#[tauri::command]
+fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    Ok(state.project()?.path().map(|p| p.display().to_string()))
+}
+
+/// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
+/// and the embedded MCP server share this `Project`, so both now operate on —
+/// and persist to — the opened file. Returns its path.
+#[tauri::command]
+fn open_project(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    *project = Project::open(&path).map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
+}
+
+/// Snapshot the current project to a new `.kerf` file and switch to it, so
+/// subsequent edits (from the GUI and the agent alike) write through to disk.
+/// Returns the saved path.
+#[tauri::command]
+fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    project.save_as(&path).map_err(|e| e.to_string())?;
+    *project = Project::open(&path).map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
+}
+
 // ---- import / analysis -----------------------------------------------------
 
 #[tauri::command]
@@ -259,9 +289,7 @@ pub fn run() {
         .init();
 
     // Start on a seeded in-memory sample so the UI has content immediately.
-    let project = Arc::new(Mutex::new(
-        Project::sample().expect("failed to seed sample project"),
-    ));
+    let project = Arc::new(Mutex::new(Project::sample().expect("failed to seed sample project")));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -284,6 +312,9 @@ pub fn run() {
             list_assets,
             get_timeline,
             get_asset_metadata,
+            project_path,
+            open_project,
+            save_project_as,
             import_asset,
             analyze_asset,
             cut_clip,

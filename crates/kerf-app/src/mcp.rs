@@ -178,9 +178,7 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
-    #[tool(
-        description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result"
-    )]
+    #[tool(description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result")]
     fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
@@ -276,11 +274,7 @@ impl KerfMcp {
 
     #[tool(description = "Stitch the full length of several assets together in order")]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
-        let ids = p
-            .asset_ids
-            .iter()
-            .map(|s| parse_id(s))
-            .collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p.asset_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
         let project = self.lock();
         let out = project.concatenate(&ids).map_err(core_err)?;
         self.changed();
@@ -340,9 +334,7 @@ impl KerfMcp {
         json(&task)
     }
 
-    #[tool(
-        description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty"
-    )]
+    #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
     fn claim_next_task(&self) -> Result<String, McpError> {
         let project = self.lock();
         let task = project.claim_next_task().map_err(core_err)?;

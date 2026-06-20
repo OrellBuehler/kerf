@@ -12,12 +12,15 @@ import {
 	getTimeline,
 	getWaveform,
 	listAssets,
+	openProject as apiOpenProject,
 	pickAndImport,
+	projectPath,
 	redo as apiRedo,
 	removeClip,
 	removeSilence,
 	reorderClip,
 	revertTo as apiRevertTo,
+	saveProjectAs as apiSaveProjectAs,
 	setVolume,
 	splitClip,
 	trimClip,
@@ -33,6 +36,7 @@ class EditorState {
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
+	currentPath = $state<string | null>(null);
 	loading = $state(false);
 	busy = $state(false);
 	error = $state<string | null>(null);
@@ -59,6 +63,18 @@ class EditorState {
 		return max;
 	}
 
+	/** Whether the project is backed by a file on disk (vs the in-memory sample). */
+	get saved(): boolean {
+		return this.currentPath !== null;
+	}
+
+	/** File name of the open project, or a placeholder when unsaved. */
+	get projectName(): string {
+		if (!this.currentPath) return 'Untitled project';
+		const parts = this.currentPath.split(/[\\/]/);
+		return parts[parts.length - 1] || this.currentPath;
+	}
+
 	get canUndo(): boolean {
 		const i = this.history.findIndex((r) => r.current);
 		return i > 0;
@@ -81,10 +97,11 @@ class EditorState {
 		this.loading = true;
 		this.error = null;
 		try {
-			[this.assets, this.timeline, this.history] = await Promise.all([
+			[this.assets, this.timeline, this.history, this.currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
-				getHistory()
+				getHistory(),
+				projectPath()
 			]);
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
@@ -94,6 +111,26 @@ class EditorState {
 		} finally {
 			this.loading = false;
 		}
+	}
+
+	// ---- project file (open / save) -----------------------------------------
+
+	/** Open a `.kerf` file (native picker) and reload; resolves true if opened. */
+	async openProject(): Promise<boolean> {
+		const path = await apiOpenProject();
+		if (path === null) return false; // cancelled, or running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Persist the project to a chosen `.kerf` file; resolves true if saved. */
+	async saveProjectAs(): Promise<boolean> {
+		const path = await apiSaveProjectAs(this.currentPath ?? undefined);
+		if (path === null) return false;
+		this.currentPath = path;
+		return true;
 	}
 
 	async select(assetId: string) {

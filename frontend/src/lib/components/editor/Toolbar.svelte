@@ -5,7 +5,11 @@
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 
-	let { onExport }: { onExport: () => void } = $props();
+	let {
+		onExport,
+		onOpen,
+		onSave
+	}: { onExport: () => void; onOpen: () => void; onSave: () => void } = $props();
 
 	const tools: [Tool, string, string][] = [
 		['pointer', 'MousePointer2', 'Select (V)'],
@@ -73,6 +77,15 @@
 
 	<div style="flex:1"></div>
 
+	<Btn variant="ghost" size="sm" icon="folder-open" onclick={onOpen} title="Open project…">Open</Btn>
+	<Btn
+		variant={editor.saved ? 'ghost' : 'secondary'}
+		size="sm"
+		icon="save"
+		onclick={onSave}
+		title="Save project as…">Save</Btn
+	>
+	{@render divider()}
 	<Btn
 		variant={ui.agentOpen ? 'agent' : 'ghost'}
 		size="sm"

@@ -217,6 +217,38 @@ export async function pickAndImport(): Promise<Asset | null> {
 	return importAsset(selected);
 }
 
+// ---- project file (open / save) --------------------------------------------
+
+/** Path of the `.kerf` file backing the open project, or `null` if unsaved. */
+export async function projectPath(): Promise<string | null> {
+	if (!inTauri()) return null;
+	return (await invoke<string | null>('project_path')) ?? null;
+}
+
+/** Pick a `.kerf` file and open it; resolves to its path, or `null` if cancelled. */
+export async function openProject(): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({
+		multiple: false,
+		filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
+	});
+	if (typeof selected !== 'string') return null;
+	return (await invoke<string | null>('open_project', { path: selected })) ?? null;
+}
+
+/** Save the project to a chosen `.kerf` file and switch to it; `null` if cancelled. */
+export async function saveProjectAs(defaultPath?: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({
+		filters: [{ name: 'Kerf project', extensions: ['kerf'] }],
+		defaultPath: defaultPath ?? 'untitled.kerf'
+	});
+	if (typeof path !== 'string') return null;
+	return (await invoke<string | null>('save_project_as', { path })) ?? null;
+}
+
 export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 	if (!inTauri()) {
 		await new Promise((r) => setTimeout(r, 900));

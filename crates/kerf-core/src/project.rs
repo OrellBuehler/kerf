@@ -65,6 +65,10 @@ const HISTORY_HEAD: &str = "history_head";
 
 pub struct Project {
     conn: Connection,
+    /// The `.kerf` file backing this project, or `None` for an in-memory one.
+    /// Edits write through to the connection, so a file-backed project persists
+    /// automatically; an in-memory one must be [`Project::save_as`]'d first.
+    path: Option<PathBuf>,
     /// Attributed to edits recorded in the history (see [`Project::set_actor`]).
     actor: EditSource,
 }
@@ -72,8 +76,10 @@ pub struct Project {
 impl Project {
     /// Create (or overwrite the schema of) a `.kerf` file on disk.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let project = Self {
-            conn: Connection::open(path)?,
+            conn: Connection::open(&path)?,
+            path: Some(path),
             actor: EditSource::User,
         };
         project.init()?;
@@ -82,8 +88,10 @@ impl Project {
 
     /// Open an existing `.kerf` file, ensuring the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let project = Self {
-            conn: Connection::open(path)?,
+            conn: Connection::open(&path)?,
+            path: Some(path),
             actor: EditSource::User,
         };
         project.init()?;
@@ -94,6 +102,7 @@ impl Project {
     pub fn open_in_memory() -> Result<Self> {
         let project = Self {
             conn: Connection::open_in_memory()?,
+            path: None,
             actor: EditSource::User,
         };
         project.init()?;
@@ -105,6 +114,30 @@ impl Project {
     /// [`EditSource::User`].
     pub fn set_actor(&mut self, actor: EditSource) {
         self.actor = actor;
+    }
+
+    /// The `.kerf` file backing this project, if any. `None` means it lives only
+    /// in memory (the seeded sample) and edits are not yet persisted to disk.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Snapshot the entire project database to a new `.kerf` file on disk. The
+    /// in-memory project itself is unchanged; the caller reopens the file (via
+    /// [`Project::open`]) to make subsequent edits write through to it. This is
+    /// how "Save As" turns the throwaway sample into a persistent project.
+    pub fn save_as(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        // `VACUUM INTO` refuses to write to an existing file; the save dialog
+        // has already confirmed any overwrite, so clear it first.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let dst = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 project path: {}", path.display())))?;
+        self.conn.execute("VACUUM INTO ?1", params![dst])?;
+        Ok(())
     }
 
     /// An in-memory project seeded with demo assets, analysis, and a timeline.
@@ -1150,5 +1183,29 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().any(|t| t.status == TaskStatus::Done));
         assert!(tasks.iter().any(|t| t.status == TaskStatus::Queued));
+    }
+
+    #[test]
+    fn save_as_snapshots_and_reopens_with_state() {
+        let project = Project::sample().unwrap();
+        assert!(project.path().is_none(), "in-memory project has no path");
+        let assets = project.list_assets().unwrap().len();
+        let tracks = project.timeline().unwrap().tracks.len();
+        let tasks = project.list_tasks().unwrap().len();
+
+        let path = std::env::temp_dir().join(format!("kerf-save-as-{}.kerf", Uuid::new_v4()));
+        project.save_as(&path).unwrap();
+
+        // Reopening the snapshot is file-backed and preserves the full state.
+        let reopened = Project::open(&path).unwrap();
+        assert_eq!(reopened.path(), Some(path.as_path()));
+        assert_eq!(reopened.list_assets().unwrap().len(), assets);
+        assert_eq!(reopened.timeline().unwrap().tracks.len(), tracks);
+        assert_eq!(reopened.list_tasks().unwrap().len(), tasks);
+
+        // save_as overwrites an existing file (the dialog confirms the overwrite).
+        Project::sample().unwrap().save_as(&path).unwrap();
+
+        std::fs::remove_file(&path).ok();
     }
 }

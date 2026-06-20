@@ -34,7 +34,9 @@ import {
 	History,
 	Undo2,
 	Redo2,
-	RotateCcw
+	RotateCcw,
+	FolderOpen,
+	Save
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -73,7 +75,9 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'history': History,
 	'undo': Undo2,
 	'redo': Redo2,
-	'rotate-ccw': RotateCcw
+	'rotate-ccw': RotateCcw,
+	'folder-open': FolderOpen,
+	'save': Save
 };
 
 export type IconName = keyof typeof icons;
