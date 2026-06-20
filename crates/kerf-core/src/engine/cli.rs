@@ -23,9 +23,7 @@ fn ffprobe_bin() -> String {
 }
 
 fn launch_err(bin: &str, e: std::io::Error) -> Error {
-    Error::Engine(format!(
-        "failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"
-    ))
+    Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
 
 // ---- probe -----------------------------------------------------------------
@@ -72,8 +70,8 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let parsed: ProbeJson = serde_json::from_slice(&output.stdout)
-        .map_err(|e| Error::Engine(format!("could not parse ffprobe output: {e}")))?;
+    let parsed: ProbeJson =
+        serde_json::from_slice(&output.stdout).map_err(|e| Error::Engine(format!("could not parse ffprobe output: {e}")))?;
     Ok(probe_from_json(parsed))
 }
 
@@ -210,7 +208,15 @@ pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> 
         .arg("-i")
         .arg(path)
         .args([
-            "-frames:v", "1", "-vf", &scale, "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+            "-frames:v",
+            "1",
+            "-vf",
+            &scale,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
         ])
         .stderr(Stdio::piped())
         .output()
@@ -239,9 +245,7 @@ fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
     for b in 0..buckets {
         let lo = b * samples.len() / buckets;
         let hi = ((b + 1) * samples.len() / buckets).max(lo + 1).min(samples.len());
-        let peak = samples[lo..hi]
-            .iter()
-            .fold(0.0_f32, |m, s| m.max(s.abs()));
+        let peak = samples[lo..hi].iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         out.push(peak.clamp(0.0, 1.0));
     }
     out
@@ -260,7 +264,15 @@ fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
         .arg("-i")
         .arg(path)
         .args([
-            "-map", "0:a:0", "-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "pipe:1",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            &sample_rate.to_string(),
+            "-f",
+            "f32le",
+            "pipe:1",
         ])
         .stderr(Stdio::piped())
         .output()
@@ -292,12 +304,7 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
         .or_else(|| timeline.tracks.iter().find(|t| !t.clips.is_empty()))
         .ok_or_else(|| Error::InvalidArgument("timeline has no clips to export".to_string()))?;
 
-    let path_of = |id| {
-        assets
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| a.path.clone())
-    };
+    let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.clone());
 
     let bin = ffmpeg_bin();
     let mut cmd = Command::new(&bin);

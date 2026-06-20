@@ -11,8 +11,7 @@ use uuid::Uuid;
 use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus,
-    TimeRange, Timeline, Track,
+    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline, Track,
 };
 
 const SCHEMA: &str = r#"
@@ -118,18 +117,16 @@ impl Project {
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
 
-        let has_timeline: bool =
-            self.conn
-                .query_row("SELECT EXISTS(SELECT 1 FROM timeline WHERE id = 1)", [], |r| {
-                    r.get(0)
-                })?;
+        let has_timeline: bool = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM timeline WHERE id = 1)", [], |r| r.get(0))?;
         if !has_timeline {
             self.save_timeline(&Timeline::new())?;
         }
 
-        let has_history: bool =
-            self.conn
-                .query_row("SELECT EXISTS(SELECT 1 FROM history)", [], |r| r.get(0))?;
+        let has_history: bool = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM history)", [], |r| r.get(0))?;
         if !has_history {
             let snapshot = serde_json::to_string(&self.timeline()?)?;
             self.conn.execute(
@@ -210,9 +207,9 @@ impl Project {
     }
 
     pub fn list_assets(&self) -> Result<Vec<Asset>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, duration, streams, imported_at FROM assets ORDER BY imported_at",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, name, duration, streams, imported_at FROM assets ORDER BY imported_at")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -291,8 +288,7 @@ impl Project {
     /// cache the result, and return it.
     pub fn analyze_asset(&self, asset_id: Uuid) -> Result<AssetAnalysis> {
         use crate::analysis::{
-            analyze, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
-            Transcriber,
+            analyze, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, Transcriber,
         };
 
         let asset = self.require_asset(asset_id)?;
@@ -301,18 +297,16 @@ impl Project {
         let null = NullAnalyzer;
 
         #[cfg(feature = "whisper")]
-        let whisper = std::env::var("KERF_WHISPER_MODEL")
-            .ok()
-            .filter(|m| !m.is_empty())
-            .map(|m| crate::analysis::WhisperTranscriber {
-                model_path: m.into(),
-                language: None,
-            });
+        let whisper =
+            std::env::var("KERF_WHISPER_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .map(|m| crate::analysis::WhisperTranscriber {
+                    model_path: m.into(),
+                    language: None,
+                });
         #[cfg(feature = "whisper")]
-        let transcriber: &dyn Transcriber = whisper
-            .as_ref()
-            .map(|w| w as &dyn Transcriber)
-            .unwrap_or(&null);
+        let transcriber: &dyn Transcriber = whisper.as_ref().map(|w| w as &dyn Transcriber).unwrap_or(&null);
         #[cfg(not(feature = "whisper"))]
         let transcriber: &dyn Transcriber = &null;
 
@@ -345,9 +339,9 @@ impl Project {
     // ---- timeline ---------------------------------------------------------
 
     pub fn timeline(&self) -> Result<Timeline> {
-        let data: String =
-            self.conn
-                .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?;
+        let data: String = self
+            .conn
+            .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?;
         Ok(serde_json::from_str(&data)?)
     }
 
@@ -382,8 +376,7 @@ impl Project {
     /// Append a revision after the current head, dropping any redo branch.
     fn record_revision(&self, label: &str, source: EditSource, snapshot: &str) -> Result<i64> {
         let head = self.head()?;
-        self.conn
-            .execute("DELETE FROM history WHERE seq > ?1", params![head])?;
+        self.conn.execute("DELETE FROM history WHERE seq > ?1", params![head])?;
         let seq = head + 1;
         self.conn.execute(
             "INSERT INTO history (seq, label, source, snapshot, created_at)
@@ -399,11 +392,7 @@ impl Project {
     fn restore(&self, seq: i64) -> Result<Timeline> {
         let snapshot: Option<String> = self
             .conn
-            .query_row(
-                "SELECT snapshot FROM history WHERE seq = ?1",
-                params![seq],
-                |r| r.get(0),
-            )
+            .query_row("SELECT snapshot FROM history WHERE seq = ?1", params![seq], |r| r.get(0))
             .optional()?;
         let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
         let timeline: Timeline = serde_json::from_str(&snapshot)?;
@@ -442,32 +431,26 @@ impl Project {
 
     pub fn can_undo(&self) -> Result<bool> {
         let head = self.head()?;
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM history WHERE seq < ?1",
-            params![head],
-            |r| r.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM history WHERE seq < ?1", params![head], |r| r.get(0))?;
         Ok(count > 0)
     }
 
     pub fn can_redo(&self) -> Result<bool> {
         let head = self.head()?;
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM history WHERE seq > ?1",
-            params![head],
-            |r| r.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM history WHERE seq > ?1", params![head], |r| r.get(0))?;
         Ok(count > 0)
     }
 
     /// Step the head back one revision, returning the restored timeline.
     pub fn undo(&self) -> Result<Timeline> {
         let head = self.head()?;
-        let prev: Option<i64> = self.conn.query_row(
-            "SELECT MAX(seq) FROM history WHERE seq < ?1",
-            params![head],
-            |r| r.get(0),
-        )?;
+        let prev: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(seq) FROM history WHERE seq < ?1", params![head], |r| r.get(0))?;
         match prev {
             Some(seq) => self.restore(seq),
             None => Err(Error::InvalidArgument("nothing to undo".to_string())),
@@ -477,11 +460,9 @@ impl Project {
     /// Step the head forward one revision, returning the restored timeline.
     pub fn redo(&self) -> Result<Timeline> {
         let head = self.head()?;
-        let next: Option<i64> = self.conn.query_row(
-            "SELECT MIN(seq) FROM history WHERE seq > ?1",
-            params![head],
-            |r| r.get(0),
-        )?;
+        let next: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(seq) FROM history WHERE seq > ?1", params![head], |r| r.get(0))?;
         match next {
             Some(seq) => self.restore(seq),
             None => Err(Error::InvalidArgument("nothing to redo".to_string())),
@@ -525,8 +506,7 @@ impl Project {
                     .first_track_of(primary)
                     .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?,
             };
-            let start =
-                timeline_start.unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
+            let start = timeline_start.unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
             let clip = Clip {
                 id: Uuid::new_v4(),
                 asset_id,
@@ -632,9 +612,9 @@ impl Project {
     /// Append the non-silent spans of an asset as clips, using cached analysis.
     pub fn remove_silence(&self, asset_id: Uuid) -> Result<Vec<Clip>> {
         let asset = self.require_asset(asset_id)?;
-        let analysis = self.get_analysis(asset_id)?.ok_or_else(|| {
-            Error::InvalidArgument("no analysis available for asset; run analysis first".to_string())
-        })?;
+        let analysis = self
+            .get_analysis(asset_id)?
+            .ok_or_else(|| Error::InvalidArgument("no analysis available for asset; run analysis first".to_string()))?;
 
         let mut silence: Vec<TimeRange> = analysis.silence_segments.clone();
         silence.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -679,9 +659,7 @@ impl Project {
     pub fn extract_audio(&self, asset_id: Uuid) -> Result<Clip> {
         let asset = self.require_asset(asset_id)?;
         if !asset.has_audio() {
-            return Err(Error::InvalidArgument(
-                "asset has no audio stream".to_string(),
-            ));
+            return Err(Error::InvalidArgument("asset has no audio stream".to_string()));
         }
         self.edit_timeline("Extract audio", |timeline| {
             let tid = timeline
@@ -755,9 +733,9 @@ impl Project {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, prompt, status, result, created_at, updated_at FROM tasks ORDER BY created_at",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, prompt, status, result, created_at, updated_at FROM tasks ORDER BY created_at")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -855,12 +833,7 @@ impl Project {
 
     /// Transition a task. `result == None` leaves the stored result untouched;
     /// `Some(value)` overwrites it (with `value` itself possibly `None`).
-    fn set_task_state(
-        &self,
-        id: Uuid,
-        status: TaskStatus,
-        result: Option<Option<String>>,
-    ) -> Result<Task> {
+    fn set_task_state(&self, id: Uuid, status: TaskStatus, result: Option<Option<String>>) -> Result<Task> {
         let mut task = self.require_task(id)?;
         task.status = status;
         if let Some(value) = result {
@@ -929,10 +902,7 @@ impl Project {
 
         self.set_analysis(&AssetAnalysis {
             asset_id: interview.id,
-            silence_segments: vec![
-                TimeRange { start: 12.5, end: 14.0 },
-                TimeRange { start: 60.0, end: 63.2 },
-            ],
+            silence_segments: vec![TimeRange { start: 12.5, end: 14.0 }, TimeRange { start: 60.0, end: 63.2 }],
             scene_changes: vec![0.0, 30.0, 75.0, 110.0],
             transcript: vec![
                 crate::model::TranscriptSegment {
@@ -981,22 +951,14 @@ fn row_to_task(
     Ok(Task {
         id: parse_uuid(&id)?,
         prompt,
-        status: TaskStatus::parse(&status)
-            .ok_or_else(|| Error::Other(format!("invalid task status {status}")))?,
+        status: TaskStatus::parse(&status).ok_or_else(|| Error::Other(format!("invalid task status {status}")))?,
         result,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
     })
 }
 
-fn row_to_asset(
-    id: String,
-    path: String,
-    name: String,
-    duration: f64,
-    streams: String,
-    imported_at: String,
-) -> Result<Asset> {
+fn row_to_asset(id: String, path: String, name: String, duration: f64, streams: String, imported_at: String) -> Result<Asset> {
     Ok(Asset {
         id: parse_uuid(&id)?,
         path,
@@ -1093,9 +1055,7 @@ mod tests {
         };
         project.insert_asset(&asset).unwrap();
 
-        let clipped = |p: &Project| -> usize {
-            p.timeline().unwrap().tracks.iter().map(|t| t.clips.len()).sum()
-        };
+        let clipped = |p: &Project| -> usize { p.timeline().unwrap().tracks.iter().map(|t| t.clips.len()).sum() };
 
         // Baseline (seq 0) is the only revision; nothing to undo yet.
         assert!(!project.can_undo().unwrap());
@@ -1180,10 +1140,7 @@ mod tests {
 
         project.remove_task(queued.id).unwrap();
         assert!(project.list_tasks().unwrap().is_empty());
-        assert!(matches!(
-            project.require_task(queued.id),
-            Err(Error::TaskNotFound(_))
-        ));
+        assert!(matches!(project.require_task(queued.id), Err(Error::TaskNotFound(_))));
     }
 
     #[test]

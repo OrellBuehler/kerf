@@ -119,12 +119,7 @@ fn trim_clip(
 }
 
 #[tauri::command]
-fn reorder_clip(
-    state: State<'_, AppState>,
-    track_id: String,
-    clip_id: String,
-    new_index: usize,
-) -> CmdResult<Timeline> {
+fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, new_index: usize) -> CmdResult<Timeline> {
     let track = id(&track_id)?;
     let clip = id(&clip_id)?;
     let project = state.project()?;
@@ -197,12 +192,7 @@ fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
-fn get_frame(
-    state: State<'_, AppState>,
-    asset_id: String,
-    time_secs: f64,
-    max_width: Option<u32>,
-) -> CmdResult<String> {
+fn get_frame(state: State<'_, AppState>, asset_id: String, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
     let id = id(&asset_id)?;
     let png = state
         .project()?
@@ -250,10 +240,7 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 
 #[tauri::command]
 fn export_timeline(state: State<'_, AppState>, output_path: String, format: String) -> CmdResult<String> {
-    let out = state
-        .project()?
-        .export(&output_path, &format)
-        .map_err(|e| e.to_string())?;
+    let out = state.project()?.export(&output_path, &format).map_err(|e| e.to_string())?;
     Ok(out.to_string_lossy().into_owned())
 }
 
@@ -261,8 +248,7 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, format: Stri
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 

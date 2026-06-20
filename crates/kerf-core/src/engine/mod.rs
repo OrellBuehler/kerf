@@ -48,23 +48,13 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
 /// Render the timeline to `output` (in-process libav with the `libav-render`
 /// feature, otherwise by driving the `ffmpeg` binary).
 #[cfg(feature = "libav-render")]
-pub fn render(
-    timeline: &crate::model::Timeline,
-    assets: &[crate::model::Asset],
-    output: &Path,
-    format: &str,
-) -> Result<()> {
+pub fn render(timeline: &crate::model::Timeline, assets: &[crate::model::Asset], output: &Path, format: &str) -> Result<()> {
     ffmpeg::render(timeline, assets, output, format)
 }
 
 /// Render the timeline to `output` (in-process libav with the `libav-render`
 /// feature, otherwise by driving the `ffmpeg` binary).
 #[cfg(not(feature = "libav-render"))]
-pub fn render(
-    timeline: &crate::model::Timeline,
-    assets: &[crate::model::Asset],
-    output: &Path,
-    format: &str,
-) -> Result<()> {
+pub fn render(timeline: &crate::model::Timeline, assets: &[crate::model::Asset], output: &Path, format: &str) -> Result<()> {
     cli::render(timeline, assets, output, format)
 }

@@ -89,9 +89,9 @@ pub use render_impl::render;
 mod render_impl {
     use std::path::Path;
 
-    use ffmpeg_next as ff;
     use ff::format::{sample::Sample, Pixel};
     use ff::media::Type;
+    use ffmpeg_next as ff;
 
     use super::ensure_init;
     use crate::error::{Error, Result};
@@ -137,11 +137,9 @@ mod render_impl {
 
         let vcodec = ff::encoder::find(ff::codec::Id::H264);
         let mut vstream = octx.add_stream(vcodec)?;
-        let mut venc = ff::codec::context::Context::new_with_codec(
-            vcodec.ok_or(ff::Error::EncoderNotFound)?,
-        )
-        .encoder()
-        .video()?;
+        let mut venc = ff::codec::context::Context::new_with_codec(vcodec.ok_or(ff::Error::EncoderNotFound)?)
+            .encoder()
+            .video()?;
         venc.set_width(first.width);
         venc.set_height(first.height);
         venc.set_format(OUT_PIX);
@@ -153,11 +151,9 @@ mod render_impl {
 
         let acodec = ff::encoder::find(ff::codec::Id::AAC);
         let mut astream = octx.add_stream(acodec)?;
-        let mut aenc = ff::codec::context::Context::new_with_codec(
-            acodec.ok_or(ff::Error::EncoderNotFound)?,
-        )
-        .encoder()
-        .audio()?;
+        let mut aenc = ff::codec::context::Context::new_with_codec(acodec.ok_or(ff::Error::EncoderNotFound)?)
+            .encoder()
+            .audio()?;
         aenc.set_rate(OUT_RATE);
         aenc.set_channel_layout(ff::channel_layout::ChannelLayout::STEREO);
         aenc.set_format(Sample::F32(ff::format::sample::Type::Planar));
@@ -257,11 +253,7 @@ mod render_impl {
             let mut vframe = ff::frame::Video::empty();
             let mut aframe = ff::frame::Audio::empty();
 
-            let packets: Vec<(usize, ff::Packet)> = self
-                .ictx
-                .packets()
-                .map(|(s, p)| (s.index(), p))
-                .collect();
+            let packets: Vec<(usize, ff::Packet)> = self.ictx.packets().map(|(s, p)| (s.index(), p)).collect();
             for (index, packet) in packets {
                 if index == self.v_stream {
                     self.vdec.send_packet(&packet)?;
@@ -318,10 +310,7 @@ mod render_impl {
             ));
             concat_in.push_str(&format!("[v{i}][a{i}]"));
         }
-        spec.push_str(&format!(
-            "{concat_in}concat=n={n}:v=1:a=1[cv][ca];",
-            n = clips.len()
-        ));
+        spec.push_str(&format!("{concat_in}concat=n={n}:v=1:a=1[cv][ca];", n = clips.len()));
         spec.push_str("[cv]buffersink@outv;");
         spec.push_str(&format!(
             "[ca]aformat=sample_fmts=fltp:sample_rates={r}:channel_layouts=stereo,abuffersink@outa",

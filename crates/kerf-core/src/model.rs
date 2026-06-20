@@ -128,10 +128,7 @@ pub struct Track {
 impl Track {
     /// End time of the last clip on this track (seconds).
     pub fn end(&self) -> f64 {
-        self.clips
-            .iter()
-            .map(Clip::timeline_end)
-            .fold(0.0, f64::max)
+        self.clips.iter().map(Clip::timeline_end).fold(0.0, f64::max)
     }
 
     /// Recompute clip positions so the track is gapless and in clip order.
@@ -233,8 +230,7 @@ impl Timeline {
     }
 
     pub fn clip(&self, clip_id: Uuid) -> Option<&Clip> {
-        self.locate(clip_id)
-            .map(|(ti, ci)| &self.tracks[ti].clips[ci])
+        self.locate(clip_id).map(|(ti, ci)| &self.tracks[ti].clips[ci])
     }
 
     /// Total timeline duration (seconds).

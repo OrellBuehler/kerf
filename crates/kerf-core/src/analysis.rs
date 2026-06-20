@@ -42,11 +42,7 @@ impl Default for FfmpegSilenceDetector {
 
 impl SilenceDetector for FfmpegSilenceDetector {
     fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>> {
-        crate::engine::detect_silence(
-            std::path::Path::new(&asset.path),
-            self.noise_db,
-            self.min_silence,
-        )
+        crate::engine::detect_silence(std::path::Path::new(&asset.path), self.noise_db, self.min_silence)
     }
 }
 
@@ -86,14 +82,9 @@ impl Transcriber for WhisperTranscriber {
 
         let samples = crate::engine::decode_audio_16k_mono(std::path::Path::new(&asset.path))?;
 
-        let ctx = WhisperContext::new_with_params(
-            &self.model_path.to_string_lossy(),
-            WhisperContextParameters::default(),
-        )
-        .map_err(|e| Error::Engine(format!("whisper: failed to load model: {e}")))?;
-        let mut state = ctx
-            .create_state()
-            .map_err(|e| Error::Engine(format!("whisper: {e}")))?;
+        let ctx = WhisperContext::new_with_params(&self.model_path.to_string_lossy(), WhisperContextParameters::default())
+            .map_err(|e| Error::Engine(format!("whisper: failed to load model: {e}")))?;
+        let mut state = ctx.create_state().map_err(|e| Error::Engine(format!("whisper: {e}")))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         if let Some(lang) = &self.language {
@@ -108,9 +99,7 @@ impl Transcriber for WhisperTranscriber {
             .full(params, &samples)
             .map_err(|e| Error::Engine(format!("whisper: inference failed: {e}")))?;
 
-        let n = state
-            .full_n_segments()
-            .map_err(|e| Error::Engine(format!("whisper: {e}")))?;
+        let n = state.full_n_segments().map_err(|e| Error::Engine(format!("whisper: {e}")))?;
         let mut segments = Vec::new();
         for i in 0..n {
             let text = state

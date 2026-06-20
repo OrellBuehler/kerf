@@ -170,9 +170,7 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
-    #[tool(
-        description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result"
-    )]
+    #[tool(description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result")]
     fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
@@ -191,9 +189,11 @@ impl KerfMcp {
         let asset_id = parse_id(&p.asset_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
         let project = self.lock();
-        json(&project
-            .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
-            .map_err(core_err)?)
+        json(
+            &project
+                .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+                .map_err(core_err)?,
+        )
     }
 
     #[tool(description = "Split a timeline clip at a timeline time into two adjacent clips")]
@@ -251,11 +251,7 @@ impl KerfMcp {
 
     #[tool(description = "Stitch the full length of several assets together in order")]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
-        let ids = p
-            .asset_ids
-            .iter()
-            .map(|s| parse_id(s))
-            .collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p.asset_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
         let project = self.lock();
         json(&project.concatenate(&ids).map_err(core_err)?)
     }
@@ -305,9 +301,7 @@ impl KerfMcp {
         json(&project.add_task(&p.prompt).map_err(core_err)?)
     }
 
-    #[tool(
-        description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty"
-    )]
+    #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
     fn claim_next_task(&self) -> Result<String, McpError> {
         let project = self.lock();
         json(&project.claim_next_task().map_err(core_err)?)
@@ -385,8 +379,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
