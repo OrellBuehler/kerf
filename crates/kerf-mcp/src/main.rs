@@ -117,6 +117,28 @@ struct ExportParams {
     format: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddTaskParams {
+    #[schemars(description = "What the task should accomplish, in plain language")]
+    prompt: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CompleteTaskParams {
+    #[schemars(description = "UUID of the task to complete")]
+    task_id: String,
+    #[schemars(description = "Short summary of the edits made, shown to the user")]
+    result: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FailTaskParams {
+    #[schemars(description = "UUID of the task that could not be completed")]
+    task_id: String,
+    #[schemars(description = "Why the task failed")]
+    error: String,
+}
+
 #[derive(Serialize)]
 struct AssetMetadata {
     asset: kerf_core::Asset,
@@ -268,6 +290,42 @@ impl KerfMcp {
         let output = project.export(&p.output_path, &p.format).map_err(core_err)?;
         json(&serde_json::json!({ "output": output.to_string_lossy() }))
     }
+
+    // ---- agent task queue --------------------------------------------------
+
+    #[tool(description = "List the agent task queue with each task's status (queued/working/ready/done/failed)")]
+    fn list_tasks(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.list_tasks().map_err(core_err)?)
+    }
+
+    #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
+    fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.add_task(&p.prompt).map_err(core_err)?)
+    }
+
+    #[tool(
+        description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty"
+    )]
+    fn claim_next_task(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        json(&project.claim_next_task().map_err(core_err)?)
+    }
+
+    #[tool(description = "Mark a claimed task ready for the user to review, with a summary of the edits made")]
+    fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.task_id)?;
+        let project = self.lock();
+        json(&project.complete_task(id, p.result).map_err(core_err)?)
+    }
+
+    #[tool(description = "Mark a task failed with an error message")]
+    fn fail_task(&self, Parameters(p): Parameters<FailTaskParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.task_id)?;
+        let project = self.lock();
+        json(&project.fail_task(id, &p.error).map_err(core_err)?)
+    }
 }
 
 impl KerfMcp {
@@ -290,12 +348,17 @@ impl ServerHandler for KerfMcp {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Kerf MCP server. Inspect loaded media with list_assets / \
-             get_asset_metadata / get_timeline_state, run analyze_asset to \
-             populate silence / scene / transcript metadata, then assemble a \
-             non-destructive edit with the cut/split/trim/add/reorder/remove \
-             tools. Every edit is tracked: use history to list revisions and \
-             undo / redo / revert_to to roll changes back. Call export to render."
+            "Kerf MCP server. The user queues editing tasks in the desktop app; \
+             call claim_next_task to take the oldest one (or list_tasks to see \
+             the whole queue). To work a task, inspect loaded media with \
+             list_assets / get_asset_metadata / get_timeline_state, run \
+             analyze_asset to populate silence / scene / transcript metadata, \
+             then assemble a non-destructive edit with the \
+             cut/split/trim/add/reorder/remove tools. Every edit is tracked: use \
+             history to list revisions and undo / redo / revert_to to roll \
+             changes back. When finished call complete_task with a short summary \
+             (or fail_task on error); the user reviews and applies the staged \
+             edit. Call export to render."
                 .to_string(),
         );
         info

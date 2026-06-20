@@ -20,7 +20,7 @@ pub use analysis::{
 pub use analysis::WhisperTranscriber;
 pub use error::{Error, Result};
 pub use model::{
-    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, TimeRange, Timeline,
-    Track, TranscriptSegment,
+    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus,
+    TimeRange, Timeline, Track, TranscriptSegment,
 };
 pub use project::Project;

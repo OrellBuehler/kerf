@@ -81,8 +81,12 @@ expose them in each adapter. Keep that boundary: no editing logic in the adapter
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
-  timeline) and is what both adapters launch with by default. `analyze_asset`,
-  `frame_at` and `waveform` delegate to the engine; editing ops are unchanged.
+  timeline + a sample task queue) and is what both adapters launch with by default.
+  `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
+  unchanged. The **agent task queue** is a real `tasks` table (one row per `Task`,
+  columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
+  / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
+  ready → done` (or `failed`) lifecycle in `model.rs`.
 - `analysis.rs` — transcription / scene / silence are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`). Real impls now exist:
   `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available) and
@@ -108,8 +112,9 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it manag
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `remove_clip`,
 `set_volume`, `remove_silence`, `extract_audio`, `concatenate` — each returns the
-refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), and
-`export_timeline`. Tauri auto-converts JS camelCase args to Rust
+refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
+agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
+`remove_task` → the refreshed `Task[]`), and `export_timeline`. Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
 `beforeDevCommand`/`beforeBuildCommand` hooks, however, run from Tauri's *app dir* —
@@ -142,10 +147,17 @@ px/sec + playhead), with scene markers / silence regions mapped from `AssetAnaly
 real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, clicks
 select/seek. The old `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
-(`get_frame`) under the playhead with real playback/scrub. The **agent panel is an MCP task
-queue** (status · queue · activity log · add-task) — Kerf has no in-app chat; a connected
-LLM claims tasks over MCP. Its preset chips now run the matching real op locally; the
-queue/activity log remain a representative mock (there is no in-app agent backend to drive).
+(`get_frame`) under the playhead with real playback/scrub. The **agent panel is a real MCP task
+queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
+LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
+runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
+`agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
+Two preset chips (`Remove silences` / `Assemble rough cut`) also run the matching local op and
+resolve their task; the rest just enqueue for the agent. In the browser there is no agent, so
+queued tasks correctly just wait. Below the queue, the **History** section renders
+`editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
+`editor.revertTo(seq)`. `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits and the
+fallback bin.
 
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
 **seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform

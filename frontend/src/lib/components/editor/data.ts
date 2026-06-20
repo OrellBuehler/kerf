@@ -1,9 +1,11 @@
 /* Mock project data ported from the Kerf editor design kit. The timeline,
-   transcript, preview and waveforms now render real backend data; what remains
-   here is the agent queue / activity log narrative (Kerf has no in-app agent —
-   a connected LLM claims tasks over MCP) plus the browser-only fallback bin. */
+   transcript, preview, waveforms and the agent task queue now render real
+   backend data; what remains here is the browser-only fallback media bin, the
+   transcript/FX showcase, the demo-phase labels, and the shared task-status
+   presentation map. */
 
 import type { EditorPhase } from '$lib/editor-ui.svelte';
+import type { TaskStatus } from '$lib/types';
 
 export type MockAsset = {
 	id: string;
@@ -33,20 +35,12 @@ export const TRANSCRIPT: TranscriptLine[] = [
 
 export const FX = ['Color · Neutral LUT', 'Stabilize', 'Auto-ducking', 'Denoise (voice)', 'Crossfade 12f'];
 
-export const QUEUE_META: Record<EditorPhase, string> = {
-	empty: '0 tasks',
-	analyzing: '1 running',
-	review: '1 ready',
-	editing: '1 done · 1 queued'
-};
-
-export type TaskStatus = 'queued' | 'working' | 'ready' | 'done';
-
 export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label: string }> = {
 	queued: { tone: 'neutral', icon: 'clock', label: 'Queued' },
 	working: { tone: 'agent', icon: 'loader', label: 'Working' },
 	ready: { tone: 'success', icon: 'git-pull-request-arrow', label: 'Ready to review' },
-	done: { tone: 'neutral', icon: 'check', label: 'Applied' }
+	done: { tone: 'neutral', icon: 'check', label: 'Applied' },
+	failed: { tone: 'neutral', icon: 'history', label: 'Failed' }
 };
 
 export const PRESETS = ['Remove silences', 'Assemble rough cut', 'Find best 60s', 'Color match'];

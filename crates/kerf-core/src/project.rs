@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, TimeRange, Timeline,
-    Track,
+    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus,
+    TimeRange, Timeline, Track,
 };
 
 const SCHEMA: &str = r#"
@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS history (
     source     TEXT NOT NULL,
     snapshot   TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id         TEXT PRIMARY KEY,
+    prompt     TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    result     TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 "#;
 
@@ -711,6 +720,157 @@ impl Project {
         Ok(output.to_path_buf())
     }
 
+    // ---- agent task queue -------------------------------------------------
+
+    /// Enqueue a task for a connected agent to claim. Returns the new `queued`
+    /// task.
+    pub fn add_task(&self, prompt: &str) -> Result<Task> {
+        let now = Utc::now();
+        let task = Task {
+            id: Uuid::new_v4(),
+            prompt: prompt.to_string(),
+            status: TaskStatus::Queued,
+            result: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.upsert_task(&task)?;
+        Ok(task)
+    }
+
+    fn upsert_task(&self, task: &Task) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks (id, prompt, status, result, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                task.id.to_string(),
+                task.prompt,
+                task.status.as_str(),
+                task.result,
+                task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tasks(&self) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prompt, status, result, created_at, updated_at FROM tasks ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let (id, prompt, status, result, created_at, updated_at) = row?;
+            tasks.push(row_to_task(id, prompt, status, result, created_at, updated_at)?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn get_task(&self, id: Uuid) -> Result<Option<Task>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, prompt, status, result, created_at, updated_at FROM tasks WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some((id, prompt, status, result, created_at, updated_at)) => {
+                Ok(Some(row_to_task(id, prompt, status, result, created_at, updated_at)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn require_task(&self, id: Uuid) -> Result<Task> {
+        self.get_task(id)?.ok_or(Error::TaskNotFound(id))
+    }
+
+    /// Mark a specific task `working` (an agent has claimed it).
+    pub fn claim_task(&self, id: Uuid) -> Result<Task> {
+        self.set_task_state(id, TaskStatus::Working, None)
+    }
+
+    /// Claim the oldest `queued` task, marking it `working`. Returns `None` when
+    /// nothing is waiting — the agent's "give me work" primitive.
+    pub fn claim_next_task(&self) -> Result<Option<Task>> {
+        let next: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tasks WHERE status = 'queued' ORDER BY created_at LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match next {
+            Some(id) => Ok(Some(self.set_task_state(parse_uuid(&id)?, TaskStatus::Working, None)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a task `ready` for review, recording the agent's summary.
+    pub fn complete_task(&self, id: Uuid, result: Option<String>) -> Result<Task> {
+        self.set_task_state(id, TaskStatus::Ready, Some(result))
+    }
+
+    /// Mark a task `failed`, recording the error.
+    pub fn fail_task(&self, id: Uuid, error: &str) -> Result<Task> {
+        self.set_task_state(id, TaskStatus::Failed, Some(Some(error.to_string())))
+    }
+
+    /// Mark a task `done` (the user accepted the staged edit).
+    pub fn resolve_task(&self, id: Uuid) -> Result<Task> {
+        self.set_task_state(id, TaskStatus::Done, None)
+    }
+
+    pub fn remove_task(&self, id: Uuid) -> Result<()> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
+        if affected == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Transition a task. `result == None` leaves the stored result untouched;
+    /// `Some(value)` overwrites it (with `value` itself possibly `None`).
+    fn set_task_state(
+        &self,
+        id: Uuid,
+        status: TaskStatus,
+        result: Option<Option<String>>,
+    ) -> Result<Task> {
+        let mut task = self.require_task(id)?;
+        task.status = status;
+        if let Some(value) = result {
+            task.result = value;
+        }
+        task.updated_at = Utc::now();
+        self.upsert_task(&task)?;
+        Ok(task)
+    }
+
     // ---- sample seed ------------------------------------------------------
 
     fn seed_sample(&self) -> Result<()> {
@@ -793,8 +953,40 @@ impl Project {
         self.cut_clip(broll.id, 0.0, 8.0)?;
         self.extract_audio(interview.id)?;
 
+        // A representative agent queue spanning the task lifecycle.
+        let applied = self.add_task("Assemble a rough cut from the interview")?;
+        self.complete_task(
+            applied.id,
+            Some("Kept 6 segments; cut 2 fillers and 14 silences (−1:48)".to_string()),
+        )?;
+        self.resolve_task(applied.id)?;
+
+        let staged = self.add_task("Tighten the intro and remove filler words")?;
+        self.complete_task(staged.id, Some("Staged 3 cuts; review on the timeline".to_string()))?;
+
+        self.add_task("Balance the voiceover levels against the music bed")?;
+
         Ok(())
     }
+}
+
+fn row_to_task(
+    id: String,
+    prompt: String,
+    status: String,
+    result: Option<String>,
+    created_at: String,
+    updated_at: String,
+) -> Result<Task> {
+    Ok(Task {
+        id: parse_uuid(&id)?,
+        prompt,
+        status: TaskStatus::parse(&status)
+            .ok_or_else(|| Error::Other(format!("invalid task status {status}")))?,
+        result,
+        created_at: parse_dt(&created_at)?,
+        updated_at: parse_dt(&updated_at)?,
+    })
 }
 
 fn row_to_asset(
@@ -961,5 +1153,45 @@ mod tests {
         project.cut_clip(asset.id, 0.0, 5.0).unwrap();
         let latest = project.history().unwrap().pop().unwrap();
         assert_eq!(latest.source, crate::model::EditSource::Agent);
+    }
+
+    #[test]
+    fn task_queue_lifecycle() {
+        let project = Project::open_in_memory().unwrap();
+        assert!(project.list_tasks().unwrap().is_empty());
+
+        let queued = project.add_task("trim the intro").unwrap();
+        assert_eq!(queued.status, TaskStatus::Queued);
+
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        assert_eq!(claimed.id, queued.id);
+        assert_eq!(claimed.status, TaskStatus::Working);
+        // The queue is now empty, so there is nothing left to claim.
+        assert!(project.claim_next_task().unwrap().is_none());
+
+        let ready = project.complete_task(queued.id, Some("done".to_string())).unwrap();
+        assert_eq!(ready.status, TaskStatus::Ready);
+        assert_eq!(ready.result.as_deref(), Some("done"));
+
+        let resolved = project.resolve_task(queued.id).unwrap();
+        assert_eq!(resolved.status, TaskStatus::Done);
+        // resolve leaves the agent's summary intact.
+        assert_eq!(resolved.result.as_deref(), Some("done"));
+
+        project.remove_task(queued.id).unwrap();
+        assert!(project.list_tasks().unwrap().is_empty());
+        assert!(matches!(
+            project.require_task(queued.id),
+            Err(Error::TaskNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn sample_project_seeds_tasks() {
+        let project = Project::sample().unwrap();
+        let tasks = project.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().any(|t| t.status == TaskStatus::Done));
+        assert!(tasks.iter().any(|t| t.status == TaskStatus::Queued));
     }
 }

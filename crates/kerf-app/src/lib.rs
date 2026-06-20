@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, Project, Revision, Timeline};
+use kerf_core::{Asset, AssetAnalysis, Project, Revision, Task, Timeline};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
@@ -218,6 +218,34 @@ fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) ->
     state.project()?.waveform(id, buckets).map_err(|e| e.to_string())
 }
 
+// ---- agent task queue (mutations return the refreshed queue) ---------------
+
+#[tauri::command]
+fn list_tasks(state: State<'_, AppState>) -> CmdResult<Vec<Task>> {
+    state.project()?.list_tasks().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_task(state: State<'_, AppState>, prompt: String) -> CmdResult<Task> {
+    state.project()?.add_task(&prompt).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn resolve_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
+    let id = id(&task_id)?;
+    let project = state.project()?;
+    project.resolve_task(id).map_err(|e| e.to_string())?;
+    project.list_tasks().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
+    let id = id(&task_id)?;
+    let project = state.project()?;
+    project.remove_task(id).map_err(|e| e.to_string())?;
+    project.list_tasks().map_err(|e| e.to_string())
+}
+
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
@@ -268,6 +296,10 @@ pub fn run() {
             revert_to,
             get_frame,
             get_waveform,
+            list_tasks,
+            add_task,
+            resolve_task,
+            remove_task,
             export_timeline
         ])
         .run(tauri::generate_context!())

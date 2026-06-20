@@ -4,11 +4,20 @@
 	import { toast } from 'svelte-sonner';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { QUEUE_META, STATUS_MAP, PRESETS, type TaskStatus } from './data';
-	import type { EditSource } from '$lib/types';
+	import { agent } from '$lib/agent.svelte';
+	import { STATUS_MAP, PRESETS } from './data';
+	import type { EditSource, Task, TaskStatus } from '$lib/types';
 
-	const working = $derived(ui.phase === 'analyzing');
+	const working = $derived(agent.working);
 	const disabled = $derived(editor.assets.length === 0);
+
+	let draft = $state('');
+
+	// Most actionable first: the agent's current work and anything awaiting review.
+	const RANK: Record<TaskStatus, number> = { working: 0, ready: 1, queued: 2, failed: 3, done: 4 };
+	const queue = $derived(
+		[...agent.tasks].sort((a, b) => RANK[a.status] - RANK[b.status] || a.created_at.localeCompare(b.created_at))
+	);
 
 	// History, newest first.
 	const revisions = $derived([...editor.history].reverse());
@@ -29,6 +38,32 @@
 		system: 'Kerf'
 	};
 
+	function metaFor(t: Task): string | null {
+		if (t.result) return t.result;
+		if (t.status === 'queued') return 'waiting · an agent claims it over MCP';
+		if (t.status === 'working') return 'agent working over MCP';
+		return null;
+	}
+
+	async function submit() {
+		const v = draft.trim();
+		if (disabled || !v) return;
+		draft = '';
+		try {
+			await agent.add(v);
+			toast.success('Queued — your connected agent claims tasks over MCP');
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	function onInputKey(e: KeyboardEvent) {
+		if (e.key === 'Enter' && !e.shiftKey) {
+			e.preventDefault();
+			void submit();
+		}
+	}
+
 	async function runPreset(p: string) {
 		const assetId = editor.selectedAssetId ?? editor.assets[0]?.id;
 		if (!assetId) {
@@ -36,14 +71,16 @@
 			return;
 		}
 		try {
-			if (p === 'Remove silences' || p === 'Assemble rough cut') {
+			const task = await agent.add(p);
+			// Two presets map to a local op we can run now; the rest wait for the agent.
+			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
 				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
 				await editor.removeSilence(assetId);
 				ui.setPhase('editing');
+				await agent.resolve(task.id);
 				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
 			} else {
-				await ui.runAnalysis(assetId);
-				toast.info(`"${p}" is handed to your connected agent over MCP`);
+				toast.info(`Queued “${p}” — your connected agent claims tasks over MCP`);
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
@@ -68,53 +105,61 @@
 	</div>
 {/snippet}
 
-{#snippet diffLine(color: string, label: string, value: string)}
-	<div style="display:flex;align-items:center;gap:8px;font-size:12px">
-		<span style="width:8px;height:8px;border-radius:2px;background:{color};flex:none"></span>
-		<span style="color:var(--text-secondary);width:56px">{label}</span>
-		<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{value}</span>
-	</div>
-{/snippet}
-
-{#snippet taskCard(title: string, status: TaskStatus, meta: string | null, withProgress: boolean)}
-	{@const s = STATUS_MAP[status]}
+{#snippet taskCard(t: Task)}
+	{@const s = STATUS_MAP[t.status]}
+	{@const meta = metaFor(t)}
 	<div
-		style="border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);border-left:{status ===
+		style="border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);border-left:{t.status ===
 		'ready'
 			? '2px solid var(--agent-500)'
 			: '1px solid var(--border-default)'};padding:10px 11px"
 	>
 		<div style="display:flex;align-items:center;gap:8px">
-			<Icon n={s.icon} s={13} color={iconColor(status)} />
+			<Icon n={s.icon} s={13} color={iconColor(t.status)} />
 			<span
 				style="flex:1;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				>{title}</span
+				title={t.prompt}>{t.prompt}</span
 			>
-			<Badge tone={s.tone as 'neutral' | 'agent' | 'success'} dot={status === 'working'}>{s.label}</Badge>
+			<Badge tone={s.tone as 'neutral' | 'agent' | 'success'} dot={t.status === 'working'}>{s.label}</Badge>
+			{#if t.status !== 'ready'}
+				<button
+					title="Remove from queue"
+					onclick={() => agent.remove(t.id)}
+					style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex:none;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
+				>
+					<Icon n="plus" s={13} style="transform:rotate(45deg)" />
+				</button>
+			{/if}
 		</div>
 		{#if meta}
-			<div
-				style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px"
-			>
+			<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px">
 				{meta}
 			</div>
 		{/if}
-		{#if withProgress}
+		{#if t.status === 'working'}
 			<div style="margin-top:9px;padding-left:21px">
 				<div
 					style="position:relative;height:5px;border-radius:999px;background:var(--surface-inset);overflow:hidden;border:1px solid var(--border-subtle)"
 				>
 					<div
-						style="position:absolute;inset:0 auto 0 0;width:{Math.min(
-							100,
-							ui.progress
-						)}%;background:var(--agent-500);border-radius:999px;transition:width var(--dur-normal) var(--ease-out)"
-					></div>
-					<div
 						class="kerf-sweep"
-						style="position:absolute;top:0;bottom:0;width:30%;background:linear-gradient(90deg, transparent, var(--agent-200), transparent);opacity:.5"
+						style="position:absolute;top:0;bottom:0;width:30%;background:linear-gradient(90deg, transparent, var(--agent-400), transparent)"
 					></div>
 				</div>
+			</div>
+		{/if}
+		{#if t.status === 'ready'}
+			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
+				<button
+					onclick={() => agent.resolve(t.id)}
+					style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+					>Apply</button
+				>
+				<button
+					onclick={() => agent.remove(t.id)}
+					style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+					>Dismiss</button
+				>
 			</div>
 		{/if}
 	</div>
@@ -146,14 +191,14 @@
 			>
 			<div style="flex:1;min-width:0">
 				<div style="display:flex;align-items:center;gap:6px">
-					<span style="font-size:13px;font-weight:600;color:var(--text-primary)">Claude Desktop</span>
+					<span style="font-size:13px;font-weight:600;color:var(--text-primary)">Connected agent</span>
 					<span
 						style="font-family:var(--font-mono);font-size:9px;color:var(--agent-300);letter-spacing:.08em;border:1px solid var(--agent-border);border-radius:3px;padding:0 4px"
 						>MCP</span
 					>
 				</div>
 				<div style="font-size:11px;color:var(--text-muted);margin-top:2px">
-					Connected · {working ? 'working a task' : 'idle'}
+					Claims tasks over MCP · {working ? 'working a task' : 'idle'}
 				</div>
 			</div>
 			<span
@@ -172,69 +217,22 @@
 
 		<!-- queue -->
 		<div>
-			{@render secHead('Queue', QUEUE_META[ui.phase])}
+			{@render secHead('Queue', agent.summary)}
 			<div style="display:flex;flex-direction:column;gap:8px">
-				{#if ui.phase === 'empty'}
+				{#if queue.length === 0}
 					<div
 						style="display:flex;flex-direction:column;align-items:center;gap:7px;padding:22px 16px;border-radius:var(--radius-md);border:1px dashed var(--border-strong);background:var(--surface-inset);text-align:center"
 					>
 						<Icon n="list-plus" s={20} color="var(--text-disabled)" />
 						<div style="font-size:12px;color:var(--text-secondary)">No tasks queued</div>
 						<div style="font-size:11px;color:var(--text-muted);line-height:1.5">
-							Import media, then queue a task below. Your connected agent claims it and proposes edits.
-						</div>
-					</div>
-				{:else if ui.phase === 'analyzing'}
-					{@render taskCard(
-						'Assemble a rough cut',
-						'working',
-						'claude · reading transcript + 14 silences',
-						true
-					)}
-					{@render taskCard('Balance VO levels', 'queued', 'waiting · runs after current task', false)}
-				{:else if ui.phase === 'review'}
-					{@const s = STATUS_MAP['ready']}
-					<div
-						style="border-radius:var(--radius-md);background:var(--surface-raised);border-left:2px solid var(--agent-500);padding:10px 11px"
-					>
-						<div style="display:flex;align-items:center;gap:8px">
-							<Icon n={s.icon} s={13} color="var(--green-400)" />
-							<span
-								style="flex:1;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-								>Assemble a rough cut</span
-							>
-							<Badge tone="success">{s.label}</Badge>
-						</div>
-						<div
-							style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px"
-						>
-							staged on timeline · not applied
-						</div>
-						<div style="margin-top:11px;padding-left:21px">
-							<div
-								style="display:flex;flex-direction:column;gap:5px;margin-bottom:11px;padding:9px 10px;background:var(--surface-inset);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)"
-							>
-								{@render diffLine('var(--diff-add)', 'Keep', '6 segments')}
-								{@render diffLine('var(--diff-remove)', 'Cut', '2 fillers · 14 silences')}
-								{@render diffLine('var(--diff-shift)', 'Tighten', 'ripple −1:48')}
-							</div>
-							<div style="display:flex;gap:7px">
-								<button
-									onclick={() => ui.apply()}
-									style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
-									>Apply cut</button
-								>
-								<button
-									onclick={() => ui.reject()}
-									style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
-									>Reject</button
-								>
-							</div>
+							Queue a task below. Your connected agent claims it and proposes edits.
 						</div>
 					</div>
 				{:else}
-					{@render taskCard('Assemble a rough cut', 'done', 'applied · 02:24 · non-destructive', false)}
-					{@render taskCard('Balance VO levels', 'queued', 'ready to run · agent idle', false)}
+					{#each queue as t (t.id)}
+						{@render taskCard(t)}
+					{/each}
 				{/if}
 			</div>
 		</div>
@@ -306,13 +304,18 @@
 			<Icon n="list-plus" s={14} color="var(--text-muted)" />
 			<input
 				{disabled}
+				bind:value={draft}
+				onkeydown={onInputKey}
 				placeholder="Describe a task to queue…"
 				style="flex:1;background:none;border:none;outline:none;color:var(--text-primary);font-family:var(--font-sans);font-size:13px"
 			/>
 			<button
 				title="Add to queue"
-				onclick={() => !disabled && toast.info('Queued — your connected agent claims tasks over MCP')}
-				style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-secondary);cursor:pointer"
+				disabled={disabled || !draft.trim()}
+				onclick={submit}
+				style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:{draft.trim()
+					? 'var(--kerf-300)'
+					: 'var(--text-secondary)'};cursor:{disabled || !draft.trim() ? 'not-allowed' : 'pointer'}"
 			>
 				<Icon n="corner-down-left" s={14} />
 			</button>
