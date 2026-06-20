@@ -101,7 +101,8 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
-      # Compile the desktop shell + MCP server on every OS without the FFmpeg
-      # dev libraries (the CLI engine still drives the ffmpeg/ffprobe binaries).
-      - name: Build app + MCP server
-        run: cargo build --no-default-features -p kerf-app -p kerf-mcp
+      # Compile the whole workspace on every OS without the FFmpeg dev libraries
+      # (the CLI engine still drives the ffmpeg/ffprobe binaries). The desktop
+      # app embeds the MCP server, so there is no separate binary to build.
+      - name: Build workspace
+        run: cargo build --workspace --no-default-features
