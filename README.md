@@ -22,8 +22,8 @@ kerf/
 │   │   ├── project.rs         #   .kerf project (SQLite) + timeline operations
 │   │   ├── analysis.rs        #   pluggable transcription / scene / silence traits
 │   │   └── engine/ffmpeg.rs   #   in-process libav probe + filtergraph render
-│   ├── kerf-mcp/              # stdio MCP server (rmcp) operating on kerf-core
-│   └── kerf-app/              # Tauri v2 shell + commands bridging the frontend
+│   └── kerf-app/              # Tauri v2 shell: webview commands + embedded MCP server
+│       └── src/mcp.rs         #   rmcp HTTP MCP server, shares the app's Project
 └── frontend/                  # SvelteKit 2 / Svelte 5 / Tailwind 4 / shadcn-svelte
     └── src/lib/components/     #   MediaBin, PreviewPlayer, TimelineCanvas, AgentPanel
 ```
@@ -33,10 +33,11 @@ kerf/
   (silence, scene changes, transcript), and a non-destructive **timeline / EDL**
   (tracks of clips referencing source ranges). FFmpeg access is in-process via
   `ffmpeg-next`, gated behind a default-on `ffmpeg` cargo feature.
-- **`kerf-mcp`** — an stdio [Model Context Protocol](https://modelcontextprotocol.io)
-  server (official Rust SDK, `rmcp`) exposing the timeline + media engine as tools.
 - **`kerf-app`** — the Tauri v2 desktop shell. Tauri commands bridge the SvelteKit
-  frontend to `kerf-core`.
+  frontend to `kerf-core`, and the app **also hosts an embedded
+  [Model Context Protocol](https://modelcontextprotocol.io) server** (official Rust
+  SDK, `rmcp`, streamable HTTP) that exposes the timeline + media engine as tools over
+  the *same* live project — so a connected LLM edits what the user has open.
 - **`frontend/`** — media bin, a Svelte Flow (`@xyflow/svelte`) timeline canvas,
   preview player, and an AI agent panel, built with shadcn-svelte primitives.
 
@@ -51,7 +52,7 @@ kerf/
 | Timeline UI  | `@xyflow/svelte` **1.6** (Svelte Flow)            |
 | Media        | `ffmpeg-next` **8.1** (libav, FFmpeg ≥ 4.4)       |
 | Persistence  | `rusqlite` **0.40** (bundled SQLite)              |
-| MCP          | `rmcp` **1.7** (stdio transport)                  |
+| MCP          | `rmcp` **1.7** (streamable-HTTP transport)        |
 
 ---
 
@@ -132,12 +133,10 @@ bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 
 ### MCP server
 
-```bash
-cargo run -p kerf-mcp                 # serves a seeded sample project on stdio
-cargo run -p kerf-mcp -- path/to.kerf # serve an existing project
-```
-
-Logs go to **stderr**; **stdout** is reserved for the MCP JSON-RPC transport.
+The MCP server is **embedded in the desktop app** — running `kerf-app` (above) starts
+it on `127.0.0.1:7777/mcp` (override with `KERF_MCP_ADDR`). There is no separate
+binary; the agent edits the same project the GUI has open. See
+[MCP server](#mcp-server-1) below to connect a client.
 
 ### Building without FFmpeg
 
@@ -148,7 +147,7 @@ tools **without the FFmpeg dev libraries installed**:
 ```bash
 cargo check  --workspace        --no-default-features
 cargo test   -p kerf-core       --no-default-features
-cargo run    -p kerf-mcp        --no-default-features
+cargo run    -p kerf-app        --no-default-features
 ```
 
 In this mode the in-process libav **probe** is unavailable, but import, analysis
@@ -161,8 +160,8 @@ features need a fuller toolchain.
 
 ## MCP server
 
-`kerf-mcp` speaks MCP over stdio and exposes these tools, all operating on the
-non-destructive timeline:
+The desktop app hosts the MCP server over streamable HTTP and exposes these tools, all
+operating on the same live, non-destructive timeline the GUI shows:
 
 | Tool                    | Purpose                                                    |
 | ----------------------- | --------------------------------------------------------- |
@@ -196,12 +195,21 @@ the user reviews and applies. Kerf never edits on its own.
 
 ### Connect it to Claude Code / Claude Desktop
 
+Start the desktop app first (it hosts the server), then register the HTTP endpoint.
+With Claude Code:
+
+```bash
+claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
+```
+
+Or directly in an MCP client config that supports HTTP servers:
+
 ```json
 {
   "mcpServers": {
     "kerf": {
-      "command": "/absolute/path/to/target/debug/kerf-mcp",
-      "args": []
+      "type": "http",
+      "url": "http://127.0.0.1:7777/mcp"
     }
   }
 }
@@ -209,14 +217,14 @@ the user reviews and applies. Kerf never edits on its own.
 
 ### Smoke test (no MCP client needed)
 
+With the app running, hit the endpoint over HTTP (the streamable-HTTP transport
+replies via SSE, so ask for an event stream):
+
 ```bash
-cargo build -p kerf-mcp --no-default-features
-printf '%s\n' \
- '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' \
- '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
- '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
- '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_assets","arguments":{}}}' \
- | ./target/debug/kerf-mcp
+curl -sN http://127.0.0.1:7777/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}'
 ```
 
 ---

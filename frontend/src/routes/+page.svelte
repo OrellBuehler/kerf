@@ -16,6 +16,23 @@
 	onMount(() => {
 		void editor.load();
 		void agent.load();
+
+		// The desktop app hosts the MCP server, so an agent can edit the same
+		// project live. It emits `project-changed` after each mutation; re-fetch
+		// the timeline, history, and task queue so the GUI reflects agent edits.
+		let unlisten: (() => void) | undefined;
+		if (inTauri()) {
+			void import('@tauri-apps/api/event').then(({ listen }) =>
+				listen('project-changed', () => {
+					void editor.refreshTimeline();
+					void editor.refreshHistory();
+					void agent.load();
+				}).then((un) => {
+					unlisten = un;
+				})
+			);
+		}
+		return () => unlisten?.();
 	});
 
 	async function onExport() {

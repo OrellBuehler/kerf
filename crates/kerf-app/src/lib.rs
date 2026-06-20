@@ -5,16 +5,18 @@
 //! types; editing commands perform the mutation and return the refreshed
 //! [`Timeline`] so the frontend can re-render in a single round-trip.
 
-use std::sync::Mutex;
+mod mcp;
+
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, Project, Revision, Task, Timeline};
+use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, Task, Timeline};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 
 struct AppState {
-    project: Mutex<Project>,
+    project: Arc<Mutex<Project>>,
 }
 
 #[derive(Serialize)]
@@ -27,7 +29,11 @@ type CmdResult<T> = Result<T, String>;
 
 impl AppState {
     fn project(&self) -> CmdResult<std::sync::MutexGuard<'_, Project>> {
-        self.project.lock().map_err(|_| "project mutex poisoned".to_string())
+        let mut guard = self.project.lock().map_err(|_| "project mutex poisoned".to_string())?;
+        // The GUI is the user; the MCP server attributes its own edits to the
+        // agent under the same shared lock (see `mcp::KerfMcp::lock`).
+        guard.set_actor(EditSource::User);
+        Ok(guard)
     }
 }
 
@@ -253,12 +259,26 @@ pub fn run() {
         .init();
 
     // Start on a seeded in-memory sample so the UI has content immediately.
-    let project = Project::sample().expect("failed to seed sample project");
+    let project = Arc::new(Mutex::new(
+        Project::sample().expect("failed to seed sample project"),
+    ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            project: Mutex::new(project),
+            project: project.clone(),
+        })
+        .setup(move |app| {
+            // The app *is* the MCP server: host the tools over HTTP, sharing the
+            // same Project the GUI edits, so a connected LLM works on the open
+            // project and its edits show up live.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = mcp::serve(project, handle).await {
+                    tracing::error!(error = %e, "MCP server stopped");
+                }
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_assets,

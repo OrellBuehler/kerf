@@ -45,9 +45,10 @@ cargo check --workspace --no-default-features
 cargo test  -p kerf-core --no-default-features
 cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # single test
 
-# MCP server (logs -> stderr, JSON-RPC -> stdout)
-cargo run -p kerf-mcp --no-default-features            # seeded in-memory sample
-cargo run -p kerf-mcp -- path/to.kerf                  # full build, open a project
+# MCP server — the desktop app hosts it (streamable HTTP on 127.0.0.1:7777/mcp).
+# Run the app (below), then point an MCP client at the URL, e.g.:
+#   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
+# Override the bind address with KERF_MCP_ADDR. There is no standalone MCP binary.
 
 # Frontend (Bun) — from frontend/
 bun install
@@ -65,9 +66,11 @@ There is no Rust lint config beyond defaults; `cargo clippy --workspace --no-def
 
 ## Architecture
 
-`kerf-core` is the UI-agnostic engine. **Both `kerf-mcp` and `kerf-app` are thin
-adapters over the same `Project` API** — add capabilities to `kerf-core` first, then
-expose them in each adapter. Keep that boundary: no editing logic in the adapters.
+`kerf-core` is the UI-agnostic engine. **`kerf-app` is the only binary; it is a thin
+adapter over the `Project` API and exposes that same API twice — as Tauri commands to
+the webview and as MCP tools to a connected LLM, both over one shared `Project`.** Add
+capabilities to `kerf-core` first, then expose them in each surface. Keep that boundary:
+no editing logic in the adapter.
 
 ### kerf-core (`crates/kerf-core/src/`)
 
@@ -81,7 +84,7 @@ expose them in each adapter. Keep that boundary: no editing logic in the adapter
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
-  timeline + a sample task queue) and is what both adapters launch with by default.
+  timeline + a sample task queue) and is what the app launches with by default.
   `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
   unchanged. The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
@@ -95,20 +98,28 @@ expose them in each adapter. Keep that boundary: no editing logic in the adapter
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
 
-### kerf-mcp (`crates/kerf-mcp/src/main.rs`)
+### embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
-stdio MCP server using `rmcp` 1.7. Pattern that matters if you edit it:
-`#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
+The app **is** the MCP server — there is no separate binary. `mcp::serve` hosts the
+tools over `rmcp` 1.7's **streamable-HTTP** transport (`StreamableHttpService` +
+`LocalSessionManager`, nested into an `axum` router) on `127.0.0.1:7777/mcp`
+(`KERF_MCP_ADDR` overrides). It is spawned from `lib.rs`'s Tauri `.setup` hook on
+`tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
+hold, so the agent edits the project the user has open. Patterns that matter if you edit
+it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro calls `Self::tool_router()`).
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
-then mutates fields. Tools return `Result<String, McpError>` (pretty JSON). Each tool
-locks `Arc<Mutex<Project>>` and calls a `kerf-core` method. **Never print to stdout** —
-it's the transport; use `tracing` (stderr).
+then mutates fields. Tools return `Result<String, McpError>` (pretty JSON). The `lock()`
+helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
+helper sets `User` the same way); every **mutating** tool calls `self.changed()`, which
+emits a `project-changed` Tauri event so the webview re-fetches and the edit shows up
+live in the GUI.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it manages a
-`Mutex<Project>` and registers a command per `Project` op — reads (`list_assets`,
+Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+`Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
+registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `remove_clip`,
 `set_volume`, `remove_silence`, `extract_audio`, `concatenate` — each returns the

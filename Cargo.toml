@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kerf-core", "crates/kerf-mcp", "crates/kerf-app"]
+members = ["crates/kerf-core", "crates/kerf-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,9 +40,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Media — system FFmpeg (libav*) via pkg-config; compatible with FFmpeg >= 3.4
 ffmpeg-next = "8.1"
 
-# MCP — official Rust SDK (stdio transport)
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+# MCP — official Rust SDK (streamable-HTTP server transport, hosted by kerf-app)
+rmcp = { version = "1.7", features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = "1.2"
+
+# HTTP server for the embedded MCP endpoint (matches rmcp's tower/axum 0.8)
+axum = "0.8"
 
 # Desktop shell — Tauri v2
 tauri = { version = "2", features = [] }

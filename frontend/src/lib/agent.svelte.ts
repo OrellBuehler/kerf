@@ -1,7 +1,8 @@
 // Agent task queue state (Svelte 5 runes).
 //
 // The agent panel is an MCP task queue: the user enqueues tasks here, and a
-// connected LLM claims and works them over MCP (see kerf-mcp). This singleton
+// connected LLM claims and works them over MCP (the desktop app hosts the MCP
+// server itself; see crates/kerf-app/src/mcp.rs). This singleton
 // holds the queue the backend owns and the actions that mutate it; the panel
 // renders `agent.tasks` directly.
 

@@ -1,26 +1,34 @@
-//! Kerf stdio MCP server.
+//! Embedded MCP server — the app *is* the MCP server.
 //!
-//! Exposes the Kerf timeline / media engine as MCP tools over stdio so an LLM
-//! can inspect loaded media and assemble a non-destructive edit. All editing
-//! tools mutate the in-memory `.kerf` timeline; `export` triggers the render.
+//! Hosts the Kerf timeline / media engine as MCP tools over a streamable-HTTP
+//! endpoint (`/mcp`) on localhost, sharing the **same** `Project` the Tauri
+//! commands edit. A connected LLM thus operates on the project the user has
+//! open; after every mutation we emit a `project-changed` Tauri event so the
+//! webview re-fetches and the edit shows up live in the GUI.
 //!
-//! Usage:
-//!   kerf-mcp [PATH_TO.kerf]
-//! With no argument it serves a seeded in-memory sample project.
+//! Edits made through these tools are attributed to [`EditSource::Agent`]; the
+//! actor is set per-operation under the shared lock (the GUI sets
+//! [`EditSource::User`] the same way), so attribution stays correct even though
+//! both front doors share one `Project`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use kerf_core::{EditSource, Project};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::transport::stdio;
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
+/// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
+const DEFAULT_ADDR: &str = "127.0.0.1:7777";
+
 #[derive(Clone)]
-struct KerfMcp {
+pub struct KerfMcp {
     project: Arc<Mutex<Project>>,
+    app: AppHandle,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -170,18 +178,24 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
-    #[tool(description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result")]
+    #[tool(
+        description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result"
+    )]
     fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
-        json(&project.analyze_asset(id).map_err(core_err)?)
+        let analysis = project.analyze_asset(id).map_err(core_err)?;
+        self.changed();
+        json(&analysis)
     }
 
     #[tool(description = "Cut [start, end) of an asset and append it to the matching track")]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
-        json(&project.cut_clip(id, p.start, p.end).map_err(core_err)?)
+        let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Add a clip referencing a source range of an asset to the timeline")]
@@ -189,11 +203,11 @@ impl KerfMcp {
         let asset_id = parse_id(&p.asset_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
         let project = self.lock();
-        json(
-            &project
-                .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
-                .map_err(core_err)?,
-        )
+        let out = project
+            .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Split a timeline clip at a timeline time into two adjacent clips")]
@@ -201,6 +215,7 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         let (left, right) = project.split_at(clip_id, p.at).map_err(core_err)?;
+        self.changed();
         json(&serde_json::json!({ "left": left, "right": right }))
     }
 
@@ -208,7 +223,9 @@ impl KerfMcp {
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
-        json(&project.trim(clip_id, p.source_in, p.source_out).map_err(core_err)?)
+        let out = project.trim(clip_id, p.source_in, p.source_out).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Move a clip to a new index within its track (re-flows the track gaplessly)")]
@@ -217,6 +234,7 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
+        self.changed();
         Ok("ok".to_string())
     }
 
@@ -225,6 +243,7 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         project.remove(clip_id).map_err(core_err)?;
+        self.changed();
         Ok("ok".to_string())
     }
 
@@ -232,28 +251,40 @@ impl KerfMcp {
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
-        json(&project.set_volume(clip_id, p.volume).map_err(core_err)?)
+        let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
-        json(&project.remove_silence(id).map_err(core_err)?)
+        let out = project.remove_silence(id).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Append the full audio of an asset to the first audio track")]
     fn extract_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
-        json(&project.extract_audio(id).map_err(core_err)?)
+        let out = project.extract_audio(id).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Stitch the full length of several assets together in order")]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
-        let ids = p.asset_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .asset_ids
+            .iter()
+            .map(|s| parse_id(s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         let project = self.lock();
-        json(&project.concatenate(&ids).map_err(core_err)?)
+        let out = project.concatenate(&ids).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "List the timeline edit history (revisions, newest changes have higher seq; the current one is marked)")]
@@ -265,19 +296,25 @@ impl KerfMcp {
     #[tool(description = "Undo the last timeline edit, returning the restored timeline")]
     fn undo(&self) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.undo().map_err(core_err)?)
+        let out = project.undo().map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Redo the next timeline edit, returning the restored timeline")]
     fn redo(&self) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.redo().map_err(core_err)?)
+        let out = project.redo().map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Revert the timeline to a specific revision seq (see history), returning the restored timeline")]
     fn revert_to(&self, Parameters(p): Parameters<RevertParams>) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.revert_to(p.seq).map_err(core_err)?)
+        let out = project.revert_to(p.seq).map_err(core_err)?;
+        self.changed();
+        json(&out)
     }
 
     #[tool(description = "Render the timeline to a file (requires the ffmpeg feature)")]
@@ -298,41 +335,59 @@ impl KerfMcp {
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
     fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.add_task(&p.prompt).map_err(core_err)?)
+        let task = project.add_task(&p.prompt).map_err(core_err)?;
+        self.changed();
+        json(&task)
     }
 
-    #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
+    #[tool(
+        description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty"
+    )]
     fn claim_next_task(&self) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.claim_next_task().map_err(core_err)?)
+        let task = project.claim_next_task().map_err(core_err)?;
+        self.changed();
+        json(&task)
     }
 
     #[tool(description = "Mark a claimed task ready for the user to review, with a summary of the edits made")]
     fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
         let project = self.lock();
-        json(&project.complete_task(id, p.result).map_err(core_err)?)
+        let task = project.complete_task(id, p.result).map_err(core_err)?;
+        self.changed();
+        json(&task)
     }
 
     #[tool(description = "Mark a task failed with an error message")]
     fn fail_task(&self, Parameters(p): Parameters<FailTaskParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
         let project = self.lock();
-        json(&project.fail_task(id, &p.error).map_err(core_err)?)
+        let task = project.fail_task(id, &p.error).map_err(core_err)?;
+        self.changed();
+        json(&task)
     }
 }
 
 impl KerfMcp {
-    fn new(mut project: Project) -> Self {
-        // The MCP server is the agent: attribute its edits accordingly.
-        project.set_actor(EditSource::Agent);
-        Self {
-            project: Arc::new(Mutex::new(project)),
-        }
+    fn new(project: Arc<Mutex<Project>>, app: AppHandle) -> Self {
+        Self { project, app }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Project> {
-        self.project.lock().expect("project mutex poisoned")
+    /// Lock the shared project, attributing any edits made under this guard to
+    /// the agent. The GUI sets `User` the same way, and the mutex keeps the two
+    /// from interleaving within a single operation.
+    fn lock(&self) -> MutexGuard<'_, Project> {
+        let mut guard = self.project.lock().expect("project mutex poisoned");
+        guard.set_actor(EditSource::Agent);
+        guard
+    }
+
+    /// Tell the webview the project changed so it re-fetches and renders live.
+    fn changed(&self) {
+        if let Err(e) = self.app.emit("project-changed", ()) {
+            tracing::warn!(error = %e, "failed to emit project-changed");
+        }
     }
 }
 
@@ -359,6 +414,26 @@ impl ServerHandler for KerfMcp {
     }
 }
 
+// ---- server ----------------------------------------------------------------
+
+/// Serve the MCP tools over streamable HTTP at `/mcp`, sharing `project` with
+/// the Tauri commands. Runs until the process exits.
+pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
+    let addr = std::env::var("KERF_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+
+    let service = StreamableHttpService::new(
+        move || Ok(KerfMcp::new(project.clone(), app.clone())),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!(%addr, "kerf MCP server listening on http://{addr}/mcp");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 fn parse_id(s: &str) -> Result<Uuid, McpError> {
@@ -371,32 +446,4 @@ fn core_err(e: kerf_core::Error) -> McpError {
 
 fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string_pretty(value).map_err(|e| McpError::internal_error(e.to_string(), None))
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Logs go to stderr; stdout is reserved for the MCP transport.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let project = match std::env::args().nth(1) {
-        Some(path) => {
-            tracing::info!(%path, "opening project");
-            Project::open(path)?
-        }
-        None => {
-            tracing::info!("no project path given; serving seeded sample project");
-            Project::sample()?
-        }
-    };
-
-    let server = KerfMcp::new(project);
-    tracing::info!("kerf-mcp serving on stdio");
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
 }
