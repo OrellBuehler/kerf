@@ -16,5 +16,9 @@
 			<Badge tone="warning" dot>Unsaved</Badge>
 		{/if}
 	</div>
-	<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled)">v0.4 · local</span>
+	<span
+		title={editor.currentPath ?? 'In-memory project — not yet saved'}
+		style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled);max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+		>{editor.currentPath ?? 'local · in-memory'}</span
+	>
 </div>
