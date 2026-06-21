@@ -5,7 +5,11 @@
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 
-	let { onExport }: { onExport: () => void } = $props();
+	let {
+		onExport,
+		onOpen,
+		onSave
+	}: { onExport: () => void; onOpen: () => void; onSave: () => void } = $props();
 
 	const tools: [Tool, string, string][] = [
 		['pointer', 'MousePointer2', 'Select (V)'],
@@ -39,6 +43,25 @@
 
 	{@render divider()}
 
+	<IconBtn
+		title="Undo (⌘Z)"
+		disabled={!editor.canUndo}
+		onclick={() => editor.undo()}
+		style={editor.canUndo ? '' : 'opacity:.4;cursor:default'}
+	>
+		<Icon n="undo" />
+	</IconBtn>
+	<IconBtn
+		title="Redo (⇧⌘Z)"
+		disabled={!editor.canRedo}
+		onclick={() => editor.redo()}
+		style={editor.canRedo ? '' : 'opacity:.4;cursor:default'}
+	>
+		<Icon n="redo" />
+	</IconBtn>
+
+	{@render divider()}
+
 	<IconBtn title="Skip to start" onclick={() => ui.seek(0)}><Icon n="skip-back" /></IconBtn>
 	<IconBtn
 		title={ui.playing ? 'Pause' : 'Play'}
@@ -54,6 +77,15 @@
 
 	<div style="flex:1"></div>
 
+	<Btn variant="ghost" size="sm" icon="folder-open" onclick={onOpen} title="Open project…">Open</Btn>
+	<Btn
+		variant={editor.saved ? 'ghost' : 'secondary'}
+		size="sm"
+		icon="save"
+		onclick={onSave}
+		title="Save project as…">Save</Btn
+	>
+	{@render divider()}
 	<Btn
 		variant={ui.agentOpen ? 'agent' : 'ghost'}
 		size="sm"

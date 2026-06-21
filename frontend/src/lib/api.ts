@@ -5,7 +5,17 @@
 // the whole editor — including edits, analysis, and waveforms — stays
 // explorable without the desktop shell.
 
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline, Track } from './types';
+import type {
+	Asset,
+	AssetAnalysis,
+	AssetMetadata,
+	Clip,
+	EditSource,
+	Revision,
+	Task,
+	Timeline,
+	Track
+} from './types';
 import { clipDuration } from './types';
 
 export function inTauri(): boolean {
@@ -83,11 +93,65 @@ const sampleTimeline: Timeline = {
 	]
 };
 
+// A representative queue spanning the task lifecycle, mirroring the Rust seed.
+const now = () => new Date().toISOString();
+let devTasks: Task[] = [
+	{
+		id: 't1',
+		prompt: 'Assemble a rough cut from the interview',
+		status: 'done',
+		result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
+		created_at: now(),
+		updated_at: now()
+	},
+	{
+		id: 't2',
+		prompt: 'Tighten the intro and remove filler words',
+		status: 'ready',
+		result: 'Staged 3 cuts; review on the timeline',
+		created_at: now(),
+		updated_at: now()
+	},
+	{
+		id: 't3',
+		prompt: 'Balance the voiceover levels against the music bed',
+		status: 'queued',
+		result: null,
+		created_at: now(),
+		updated_at: now()
+	}
+];
+
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
 let devTimeline: Timeline = structuredClone(sampleTimeline);
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}`);
 const snapshot = () => structuredClone(devTimeline);
+
+// ---- local edit history (browser dev fallback) ----------------------------
+// Mirrors kerf-core's snapshot history so undo/redo/revert work without Tauri.
+
+type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline };
+let devHistory: DevRevision[] = [
+	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline) }
+];
+let devHead = 0;
+
+/** Append a snapshot of the current dev timeline, dropping any redo branch. */
+function recordDev(label: string) {
+	devHistory = devHistory.slice(0, devHead + 1);
+	devHead += 1;
+	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot() });
+}
+
+function devRestore(seq: number): Timeline {
+	const rev = devHistory.find((r) => r.seq === seq);
+	if (rev) {
+		devTimeline = structuredClone(rev.snapshot);
+		devHead = seq;
+	}
+	return snapshot();
+}
 
 function trackEnd(t: Track): number {
 	return t.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
@@ -153,6 +217,38 @@ export async function pickAndImport(): Promise<Asset | null> {
 	return importAsset(selected);
 }
 
+// ---- project file (open / save) --------------------------------------------
+
+/** Path of the `.kerf` file backing the open project, or `null` if unsaved. */
+export async function projectPath(): Promise<string | null> {
+	if (!inTauri()) return null;
+	return (await invoke<string | null>('project_path')) ?? null;
+}
+
+/** Pick a `.kerf` file and open it; resolves to its path, or `null` if cancelled. */
+export async function openProject(): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({
+		multiple: false,
+		filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
+	});
+	if (typeof selected !== 'string') return null;
+	return (await invoke<string | null>('open_project', { path: selected })) ?? null;
+}
+
+/** Save the project to a chosen `.kerf` file and switch to it; `null` if cancelled. */
+export async function saveProjectAs(defaultPath?: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({
+		filters: [{ name: 'Kerf project', extensions: ['kerf'] }],
+		defaultPath: defaultPath ?? 'untitled.kerf'
+	});
+	if (typeof path !== 'string') return null;
+	return (await invoke<string | null>('save_project_as', { path })) ?? null;
+}
+
 export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 	if (!inTauri()) {
 		await new Promise((r) => setTimeout(r, 900));
@@ -167,6 +263,7 @@ export async function cutClip(assetId: string, start: number, end: number): Prom
 	if (!inTauri()) {
 		const track = trackForAsset(devTimeline, assetId);
 		track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1 });
+		recordDev('Add clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip', { assetId, start, end });
@@ -183,6 +280,7 @@ export async function addClip(
 		const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
 		const start = timelineStart ?? trackEnd(track);
 		track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1 });
+		recordDev('Add clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('add_clip', { assetId, trackId, sourceIn, sourceOut, timelineStart });
@@ -201,6 +299,7 @@ export async function splitClip(clipId: string, at: number): Promise<Timeline> {
 				track.clips.splice(ci + 1, 0, right);
 			}
 		}
+		recordDev('Split clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('split_clip', { clipId, at });
@@ -214,6 +313,7 @@ export async function trimClip(clipId: string, sourceIn?: number, sourceOut?: nu
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
 		}
+		recordDev('Trim clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('trim_clip', { clipId, sourceIn, sourceOut });
@@ -230,6 +330,7 @@ export async function reorderClip(trackId: string, clipId: string, newIndex: num
 				reflow(track);
 			}
 		}
+		recordDev('Reorder clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('reorder_clip', { trackId, clipId, newIndex });
@@ -239,6 +340,7 @@ export async function removeClip(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips.splice(found[1], 1);
+		recordDev('Remove clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clip', { clipId });
@@ -248,6 +350,7 @@ export async function setVolume(clipId: string, volume: number): Promise<Timelin
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips[found[1]].volume = volume;
+		recordDev('Set volume');
 		return snapshot();
 	}
 	return invoke<Timeline>('set_volume', { clipId, volume });
@@ -270,6 +373,7 @@ export async function removeSilence(assetId: string): Promise<Timeline> {
 			track.clips.push({ id: uid(), asset_id: assetId, source_in: si, source_out: so, timeline_start: start, volume: 1 });
 			start += so - si;
 		}
+		recordDev('Remove silence');
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_silence', { assetId });
@@ -280,6 +384,7 @@ export async function extractAudio(assetId: string): Promise<Timeline> {
 		const asset = assetById(assetId);
 		const track = devTimeline.tracks.find((t) => t.kind === 'audio') ?? devTimeline.tracks[0];
 		if (asset) track.clips.push({ id: uid(), asset_id: assetId, source_in: 0, source_out: asset.duration, timeline_start: trackEnd(track), volume: 1 });
+		recordDev('Extract audio');
 		return snapshot();
 	}
 	return invoke<Timeline>('extract_audio', { assetId });
@@ -291,6 +396,82 @@ export async function concatenate(assetIds: string[]): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('concatenate', { assetIds });
+}
+
+// ---- history (undo / redo / revert) ----------------------------------------
+
+export async function getHistory(): Promise<Revision[]> {
+	if (!inTauri()) {
+		return devHistory.map((r) => ({
+			seq: r.seq,
+			label: r.label,
+			source: r.source,
+			created_at: new Date().toISOString(),
+			current: r.seq === devHead
+		}));
+	}
+	return invoke<Revision[]>('get_history');
+}
+
+export async function undo(): Promise<Timeline> {
+	if (!inTauri()) {
+		const prev = [...devHistory].reverse().find((r) => r.seq < devHead);
+		return devRestore(prev ? prev.seq : devHead);
+	}
+	return invoke<Timeline>('undo');
+}
+
+export async function redo(): Promise<Timeline> {
+	if (!inTauri()) {
+		const next = devHistory.find((r) => r.seq > devHead);
+		return devRestore(next ? next.seq : devHead);
+	}
+	return invoke<Timeline>('redo');
+}
+
+export async function revertTo(seq: number): Promise<Timeline> {
+	if (!inTauri()) return devRestore(seq);
+	return invoke<Timeline>('revert_to', { seq });
+}
+
+// ---- agent task queue ------------------------------------------------------
+//
+// The desktop app persists tasks in kerf-core; a connected LLM claims and works
+// them over MCP. In the browser there is no agent, so queued tasks simply wait —
+// which is the honest behavior: Kerf never edits on its own.
+
+export async function listTasks(): Promise<Task[]> {
+	if (!inTauri()) return structuredClone(devTasks);
+	return invoke<Task[]>('list_tasks');
+}
+
+/** Enqueue a task; resolves to the newly created (queued) task. */
+export async function addTask(prompt: string): Promise<Task> {
+	if (!inTauri()) {
+		const ts = now();
+		const task: Task = { id: uid(), prompt, status: 'queued', result: null, created_at: ts, updated_at: ts };
+		devTasks = [...devTasks, task];
+		return structuredClone(task);
+	}
+	return invoke<Task>('add_task', { prompt });
+}
+
+/** Accept a staged edit (status → done); resolves to the refreshed queue. */
+export async function resolveTask(taskId: string): Promise<Task[]> {
+	if (!inTauri()) {
+		devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
+		return structuredClone(devTasks);
+	}
+	return invoke<Task[]>('resolve_task', { taskId });
+}
+
+/** Remove a task from the queue; resolves to the refreshed queue. */
+export async function removeTask(taskId: string): Promise<Task[]> {
+	if (!inTauri()) {
+		devTasks = devTasks.filter((t) => t.id !== taskId);
+		return structuredClone(devTasks);
+	}
+	return invoke<Task[]>('remove_task', { taskId });
 }
 
 // ---- media (preview frames, waveforms) -------------------------------------

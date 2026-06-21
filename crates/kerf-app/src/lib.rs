@@ -5,16 +5,18 @@
 //! types; editing commands perform the mutation and return the refreshed
 //! [`Timeline`] so the frontend can re-render in a single round-trip.
 
-use std::sync::Mutex;
+mod mcp;
+
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, Project, Timeline};
+use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, Task, Timeline};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 
 struct AppState {
-    project: Mutex<Project>,
+    project: Arc<Mutex<Project>>,
 }
 
 #[derive(Serialize)]
@@ -27,7 +29,11 @@ type CmdResult<T> = Result<T, String>;
 
 impl AppState {
     fn project(&self) -> CmdResult<std::sync::MutexGuard<'_, Project>> {
-        self.project.lock().map_err(|_| "project mutex poisoned".to_string())
+        let mut guard = self.project.lock().map_err(|_| "project mutex poisoned".to_string())?;
+        // The GUI is the user; the MCP server attributes its own edits to the
+        // agent under the same shared lock (see `mcp::KerfMcp::lock`).
+        guard.set_actor(EditSource::User);
+        Ok(guard)
     }
 }
 
@@ -54,6 +60,36 @@ fn get_asset_metadata(state: State<'_, AppState>, asset_id: String) -> CmdResult
     let asset = project.require_asset(id).map_err(|e| e.to_string())?;
     let analysis = project.get_analysis(id).map_err(|e| e.to_string())?;
     Ok(AssetMetadata { asset, analysis })
+}
+
+// ---- project file (open / save) --------------------------------------------
+
+/// Path of the `.kerf` file backing the open project, or `null` if it lives
+/// only in memory (the seeded sample) and isn't persisted yet.
+#[tauri::command]
+fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    Ok(state.project()?.path().map(|p| p.display().to_string()))
+}
+
+/// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
+/// and the embedded MCP server share this `Project`, so both now operate on —
+/// and persist to — the opened file. Returns its path.
+#[tauri::command]
+fn open_project(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    *project = Project::open(&path).map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
+}
+
+/// Snapshot the current project to a new `.kerf` file and switch to it, so
+/// subsequent edits (from the GUI and the agent alike) write through to disk.
+/// Returns the saved path.
+#[tauri::command]
+fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    project.save_as(&path).map_err(|e| e.to_string())?;
+    *project = Project::open(&path).map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
 }
 
 // ---- import / analysis -----------------------------------------------------
@@ -119,12 +155,7 @@ fn trim_clip(
 }
 
 #[tauri::command]
-fn reorder_clip(
-    state: State<'_, AppState>,
-    track_id: String,
-    clip_id: String,
-    new_index: usize,
-) -> CmdResult<Timeline> {
+fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, new_index: usize) -> CmdResult<Timeline> {
     let track = id(&track_id)?;
     let clip = id(&clip_id)?;
     let project = state.project()?;
@@ -172,15 +203,32 @@ fn concatenate(state: State<'_, AppState>, asset_ids: Vec<String>) -> CmdResult<
     project.timeline().map_err(|e| e.to_string())
 }
 
+// ---- history (undo / redo / revert) ----------------------------------------
+
+#[tauri::command]
+fn get_history(state: State<'_, AppState>) -> CmdResult<Vec<Revision>> {
+    state.project()?.history().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn undo(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    state.project()?.undo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn redo(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    state.project()?.redo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
+    state.project()?.revert_to(seq).map_err(|e| e.to_string())
+}
+
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
-fn get_frame(
-    state: State<'_, AppState>,
-    asset_id: String,
-    time_secs: f64,
-    max_width: Option<u32>,
-) -> CmdResult<String> {
+fn get_frame(state: State<'_, AppState>, asset_id: String, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
     let id = id(&asset_id)?;
     let png = state
         .project()?
@@ -196,14 +244,39 @@ fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) ->
     state.project()?.waveform(id, buckets).map_err(|e| e.to_string())
 }
 
+// ---- agent task queue (mutations return the refreshed queue) ---------------
+
+#[tauri::command]
+fn list_tasks(state: State<'_, AppState>) -> CmdResult<Vec<Task>> {
+    state.project()?.list_tasks().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_task(state: State<'_, AppState>, prompt: String) -> CmdResult<Task> {
+    state.project()?.add_task(&prompt).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn resolve_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
+    let id = id(&task_id)?;
+    let project = state.project()?;
+    project.resolve_task(id).map_err(|e| e.to_string())?;
+    project.list_tasks().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
+    let id = id(&task_id)?;
+    let project = state.project()?;
+    project.remove_task(id).map_err(|e| e.to_string())?;
+    project.list_tasks().map_err(|e| e.to_string())
+}
+
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
 fn export_timeline(state: State<'_, AppState>, output_path: String, format: String) -> CmdResult<String> {
-    let out = state
-        .project()?
-        .export(&output_path, &format)
-        .map_err(|e| e.to_string())?;
+    let out = state.project()?.export(&output_path, &format).map_err(|e| e.to_string())?;
     Ok(out.to_string_lossy().into_owned())
 }
 
@@ -211,23 +284,37 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, format: Stri
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     // Start on a seeded in-memory sample so the UI has content immediately.
-    let project = Project::sample().expect("failed to seed sample project");
+    let project = Arc::new(Mutex::new(Project::sample().expect("failed to seed sample project")));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            project: Mutex::new(project),
+            project: project.clone(),
+        })
+        .setup(move |app| {
+            // The app *is* the MCP server: host the tools over HTTP, sharing the
+            // same Project the GUI edits, so a connected LLM works on the open
+            // project and its edits show up live.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = mcp::serve(project, handle).await {
+                    tracing::error!(error = %e, "MCP server stopped");
+                }
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_assets,
             get_timeline,
             get_asset_metadata,
+            project_path,
+            open_project,
+            save_project_as,
             import_asset,
             analyze_asset,
             cut_clip,
@@ -240,8 +327,16 @@ pub fn run() {
             remove_silence,
             extract_audio,
             concatenate,
+            get_history,
+            undo,
+            redo,
+            revert_to,
             get_frame,
             get_waveform,
+            list_tasks,
+            add_task,
+            resolve_task,
+            remove_task,
             export_timeline
         ])
         .run(tauri::generate_context!())

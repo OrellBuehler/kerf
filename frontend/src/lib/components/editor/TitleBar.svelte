@@ -1,6 +1,7 @@
 <script lang="ts">
 	import KerfMark from './KerfMark.svelte';
 	import Badge from './Badge.svelte';
+	import { editor } from '$lib/state.svelte';
 
 	const lights = ['#ff5f57', '#febc2e', '#28c840'];
 </script>
@@ -15,8 +16,12 @@
 	</div>
 	<div style="flex:1;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px">
 		<KerfMark size={15} />
-		<span style="font:var(--type-label);color:var(--text-secondary)">Launch film — rough cut</span>
-		<Badge tone="warning" dot>Unsaved</Badge>
+		<span style="font:var(--type-label);color:var(--text-secondary)">{editor.projectName}</span>
+		{#if editor.saved}
+			<Badge tone="success" dot>Saved</Badge>
+		{:else}
+			<Badge tone="warning" dot>Unsaved</Badge>
+		{/if}
 	</div>
 	<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled)">v0.4 · local</span>
 </div>

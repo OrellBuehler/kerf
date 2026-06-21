@@ -128,10 +128,7 @@ pub struct Track {
 impl Track {
     /// End time of the last clip on this track (seconds).
     pub fn end(&self) -> f64 {
-        self.clips
-            .iter()
-            .map(Clip::timeline_end)
-            .fold(0.0, f64::max)
+        self.clips.iter().map(Clip::timeline_end).fold(0.0, f64::max)
     }
 
     /// Recompute clip positions so the track is gapless and in clip order.
@@ -142,6 +139,38 @@ impl Track {
             cursor += clip.duration();
         }
     }
+}
+
+/// Who made an edit. The MCP server sets this to [`EditSource::Agent`]; the
+/// desktop app leaves the default [`EditSource::User`]; the seq-0 baseline is
+/// [`EditSource::System`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditSource {
+    User,
+    Agent,
+    System,
+}
+
+impl EditSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditSource::User => "user",
+            EditSource::Agent => "agent",
+            EditSource::System => "system",
+        }
+    }
+}
+
+/// One entry in the timeline edit history (a stored snapshot of the timeline).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Revision {
+    pub seq: i64,
+    pub label: String,
+    pub source: EditSource,
+    pub created_at: DateTime<Utc>,
+    /// `true` for the revision currently applied to the live timeline.
+    pub current: bool,
 }
 
 /// The non-destructive timeline (EDL): a set of multi-kind tracks.
@@ -201,12 +230,66 @@ impl Timeline {
     }
 
     pub fn clip(&self, clip_id: Uuid) -> Option<&Clip> {
-        self.locate(clip_id)
-            .map(|(ti, ci)| &self.tracks[ti].clips[ci])
+        self.locate(clip_id).map(|(ti, ci)| &self.tracks[ti].clips[ci])
     }
 
     /// Total timeline duration (seconds).
     pub fn duration(&self) -> f64 {
         self.tracks.iter().map(Track::end).fold(0.0, f64::max)
     }
+}
+
+/// Lifecycle of a task in the agent queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// Waiting for an agent to claim it.
+    Queued,
+    /// Claimed by an agent and in progress.
+    Working,
+    /// The agent finished; the resulting edit is staged for the user to review.
+    Ready,
+    /// Reviewed and accepted by the user.
+    Done,
+    /// The agent could not complete it.
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskStatus::Queued => "queued",
+            TaskStatus::Working => "working",
+            TaskStatus::Ready => "ready",
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => TaskStatus::Queued,
+            "working" => TaskStatus::Working,
+            "ready" => TaskStatus::Ready,
+            "done" => TaskStatus::Done,
+            "failed" => TaskStatus::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// A unit of work in the agent queue. A human (or a planning agent) enqueues a
+/// `prompt`; a connected LLM claims it over MCP, performs timeline edits through
+/// the same engine the GUI uses, then marks it `ready` (or `failed`). Kerf never
+/// edits on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: Uuid,
+    pub prompt: String,
+    pub status: TaskStatus,
+    /// The agent's summary on completion, or the error message on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }

@@ -1,0 +1,68 @@
+name: Release
+
+# Builds and uploads binaries when a GitHub Release is published.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Desktop app installers (.deb/.AppImage/.rpm, .dmg/.app, .msi/.exe) per OS.
+  app-bundles:
+    name: app (${{ matrix.platform }} / ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            arch: aarch64
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            arch: x86_64
+            args: --target x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            arch: x86_64
+            args: ''
+          - platform: windows-latest
+            arch: x86_64
+            args: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies (Tauri)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-app-${{ matrix.platform }}-${{ matrix.arch }}
+      # Build the frontend ourselves so the build is deterministic and so we can
+      # disable the committed `beforeBuildCommand` (it uses `$(git rev-parse ...)`,
+      # which is not valid on the Windows `cmd` runner) via the --config override.
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - name: Build and upload bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/kerf-app
+          tauriScript: bunx @tauri-apps/cli@2
+          releaseId: ${{ github.event.release.id }}
+          # `--config` zeroes out beforeBuildCommand (frontend is already built);
+          # everything after `--` is forwarded to cargo, where --no-default-features
+          # disables the FFmpeg dev-library dependency.
+          args: "${{ matrix.args }} --config '{\"build\":{\"beforeBuildCommand\":\"\"}}' -- --no-default-features"

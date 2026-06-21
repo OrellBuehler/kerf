@@ -10,11 +10,57 @@
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { agent } from '$lib/agent.svelte';
 	import { inTauri, pickAndExport } from '$lib/api';
 
 	onMount(() => {
 		void editor.load();
+		void agent.load();
+
+		// The desktop app hosts the MCP server, so an agent can edit the same
+		// project live. It emits `project-changed` after each mutation; re-fetch
+		// the timeline, history, and task queue so the GUI reflects agent edits.
+		let unlisten: (() => void) | undefined;
+		if (inTauri()) {
+			void import('@tauri-apps/api/event').then(({ listen }) =>
+				listen('project-changed', () => {
+					void editor.refreshTimeline();
+					void editor.refreshHistory();
+					void agent.load();
+				}).then((un) => {
+					unlisten = un;
+				})
+			);
+		}
+		return () => unlisten?.();
 	});
+
+	async function onOpen() {
+		if (!inTauri()) {
+			toast.info('Opening a project file is available in the desktop app.');
+			return;
+		}
+		try {
+			if (await editor.openProject()) {
+				await agent.load();
+				toast.success(`Opened ${editor.projectName}`);
+			}
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	async function onSave() {
+		if (!inTauri()) {
+			toast.info('Saving a project file is available in the desktop app.');
+			return;
+		}
+		try {
+			if (await editor.saveProjectAs()) toast.success(`Saved → ${editor.currentPath}`);
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
 
 	async function onExport() {
 		if (!inTauri()) {
@@ -36,6 +82,20 @@
 	function onKey(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 		const k = e.key.toLowerCase();
+		if ((e.metaKey || e.ctrlKey) && k === 'z') {
+			e.preventDefault();
+			if (e.shiftKey) {
+				if (editor.canRedo) void editor.redo();
+			} else if (editor.canUndo) {
+				void editor.undo();
+			}
+			return;
+		}
+		if ((e.metaKey || e.ctrlKey) && k === 'y') {
+			e.preventDefault();
+			if (editor.canRedo) void editor.redo();
+			return;
+		}
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
 		else if (k === 'm') ui.tool = 'bookmark';
@@ -53,7 +113,7 @@
 
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />
-	<Toolbar {onExport} />
+	<Toolbar {onExport} {onOpen} {onSave} />
 	<div style="flex:1;display:flex;min-height:0">
 		<MediaBin />
 		<div style="flex:1;display:flex;flex-direction:column;min-width:0">

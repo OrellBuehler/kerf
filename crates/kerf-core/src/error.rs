@@ -22,6 +22,12 @@ pub enum Error {
     #[error("track not found: {0}")]
     TrackNotFound(uuid::Uuid),
 
+    #[error("revision not found: {0}")]
+    RevisionNotFound(i64),
+
+    #[error("task not found: {0}")]
+    TaskNotFound(uuid::Uuid),
+
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 

@@ -8,18 +8,25 @@ import {
 	exportTimeline,
 	extractAudio,
 	getAssetMetadata,
+	getHistory,
 	getTimeline,
 	getWaveform,
 	listAssets,
+	openProject as apiOpenProject,
 	pickAndImport,
+	projectPath,
+	redo as apiRedo,
 	removeClip,
 	removeSilence,
 	reorderClip,
+	revertTo as apiRevertTo,
+	saveProjectAs as apiSaveProjectAs,
 	setVolume,
 	splitClip,
-	trimClip
+	trimClip,
+	undo as apiUndo
 } from './api';
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Timeline } from './types';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, Revision, Timeline } from './types';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -28,6 +35,8 @@ class EditorState {
 	selectedClipId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
+	history = $state<Revision[]>([]);
+	currentPath = $state<string | null>(null);
 	loading = $state(false);
 	busy = $state(false);
 	error = $state<string | null>(null);
@@ -54,6 +63,28 @@ class EditorState {
 		return max;
 	}
 
+	/** Whether the project is backed by a file on disk (vs the in-memory sample). */
+	get saved(): boolean {
+		return this.currentPath !== null;
+	}
+
+	/** File name of the open project, or a placeholder when unsaved. */
+	get projectName(): string {
+		if (!this.currentPath) return 'Untitled project';
+		const parts = this.currentPath.split(/[\\/]/);
+		return parts[parts.length - 1] || this.currentPath;
+	}
+
+	get canUndo(): boolean {
+		const i = this.history.findIndex((r) => r.current);
+		return i > 0;
+	}
+
+	get canRedo(): boolean {
+		const i = this.history.findIndex((r) => r.current);
+		return i >= 0 && i < this.history.length - 1;
+	}
+
 	assetName(assetId: string): string {
 		return this.assets.find((a) => a.id === assetId)?.name ?? 'unknown';
 	}
@@ -66,7 +97,12 @@ class EditorState {
 		this.loading = true;
 		this.error = null;
 		try {
-			[this.assets, this.timeline] = await Promise.all([listAssets(), getTimeline()]);
+			[this.assets, this.timeline, this.history, this.currentPath] = await Promise.all([
+				listAssets(),
+				getTimeline(),
+				getHistory(),
+				projectPath()
+			]);
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
 			}
@@ -75,6 +111,26 @@ class EditorState {
 		} finally {
 			this.loading = false;
 		}
+	}
+
+	// ---- project file (open / save) -----------------------------------------
+
+	/** Open a `.kerf` file (native picker) and reload; resolves true if opened. */
+	async openProject(): Promise<boolean> {
+		const path = await apiOpenProject();
+		if (path === null) return false; // cancelled, or running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Persist the project to a chosen `.kerf` file; resolves true if saved. */
+	async saveProjectAs(): Promise<boolean> {
+		const path = await apiSaveProjectAs(this.currentPath ?? undefined);
+		if (path === null) return false;
+		this.currentPath = path;
+		return true;
 	}
 
 	async select(assetId: string) {
@@ -89,6 +145,14 @@ class EditorState {
 
 	async refreshTimeline() {
 		this.timeline = await getTimeline();
+	}
+
+	async refreshHistory() {
+		try {
+			this.history = await getHistory();
+		} catch {
+			/* history is best-effort; ignore */
+		}
 	}
 
 	async importMedia(): Promise<Asset | null> {
@@ -131,6 +195,7 @@ class EditorState {
 		this.error = null;
 		try {
 			this.timeline = await op;
+			await this.refreshHistory();
 		} catch (e) {
 			this.error = this.#msg(e);
 			throw e;
@@ -169,6 +234,21 @@ class EditorState {
 	}
 	concatenate(assetIds: string[]) {
 		return this.#apply(concatenate(assetIds));
+	}
+
+	// ---- history (undo / redo / revert) -------------------------------------
+
+	undo() {
+		this.selectedClipId = null;
+		return this.#apply(apiUndo());
+	}
+	redo() {
+		this.selectedClipId = null;
+		return this.#apply(apiRedo());
+	}
+	revertTo(seq: number) {
+		this.selectedClipId = null;
+		return this.#apply(apiRevertTo(seq));
 	}
 
 	async export(outputPath: string, format: string): Promise<string> {

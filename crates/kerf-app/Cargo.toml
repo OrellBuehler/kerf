@@ -35,3 +35,10 @@ uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 base64 = "0.22.1"
+
+# Embedded MCP server (streamable HTTP) — the app *is* the MCP server.
+rmcp.workspace = true
+schemars.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["net"] }

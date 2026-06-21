@@ -22,8 +22,8 @@ kerf/
 │   │   ├── project.rs         #   .kerf project (SQLite) + timeline operations
 │   │   ├── analysis.rs        #   pluggable transcription / scene / silence traits
 │   │   └── engine/ffmpeg.rs   #   in-process libav probe + filtergraph render
-│   ├── kerf-mcp/              # stdio MCP server (rmcp) operating on kerf-core
-│   └── kerf-app/              # Tauri v2 shell + commands bridging the frontend
+│   └── kerf-app/              # Tauri v2 shell: webview commands + embedded MCP server
+│       └── src/mcp.rs         #   rmcp HTTP MCP server, shares the app's Project
 └── frontend/                  # SvelteKit 2 / Svelte 5 / Tailwind 4 / shadcn-svelte
     └── src/lib/components/     #   MediaBin, PreviewPlayer, TimelineCanvas, AgentPanel
 ```
@@ -33,10 +33,11 @@ kerf/
   (silence, scene changes, transcript), and a non-destructive **timeline / EDL**
   (tracks of clips referencing source ranges). FFmpeg access is in-process via
   `ffmpeg-next`, gated behind a default-on `ffmpeg` cargo feature.
-- **`kerf-mcp`** — an stdio [Model Context Protocol](https://modelcontextprotocol.io)
-  server (official Rust SDK, `rmcp`) exposing the timeline + media engine as tools.
 - **`kerf-app`** — the Tauri v2 desktop shell. Tauri commands bridge the SvelteKit
-  frontend to `kerf-core`.
+  frontend to `kerf-core`, and the app **also hosts an embedded
+  [Model Context Protocol](https://modelcontextprotocol.io) server** (official Rust
+  SDK, `rmcp`, streamable HTTP) that exposes the timeline + media engine as tools over
+  the *same* live project — so a connected LLM edits what the user has open.
 - **`frontend/`** — media bin, a Svelte Flow (`@xyflow/svelte`) timeline canvas,
   preview player, and an AI agent panel, built with shadcn-svelte primitives.
 
@@ -51,7 +52,7 @@ kerf/
 | Timeline UI  | `@xyflow/svelte` **1.6** (Svelte Flow)            |
 | Media        | `ffmpeg-next` **8.1** (libav, FFmpeg ≥ 4.4)       |
 | Persistence  | `rusqlite` **0.40** (bundled SQLite)              |
-| MCP          | `rmcp` **1.7** (stdio transport)                  |
+| MCP          | `rmcp` **1.7** (streamable-HTTP transport)        |
 
 ---
 
@@ -132,12 +133,10 @@ bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 
 ### MCP server
 
-```bash
-cargo run -p kerf-mcp                 # serves a seeded sample project on stdio
-cargo run -p kerf-mcp -- path/to.kerf # serve an existing project
-```
-
-Logs go to **stderr**; **stdout** is reserved for the MCP JSON-RPC transport.
+The MCP server is **embedded in the desktop app** — running `kerf-app` (above) starts
+it on `127.0.0.1:7777/mcp` (override with `KERF_MCP_ADDR`). There is no separate
+binary; the agent edits the same project the GUI has open. See
+[MCP server](#mcp-server-1) below to connect a client.
 
 ### Building without FFmpeg
 
@@ -148,7 +147,7 @@ tools **without the FFmpeg dev libraries installed**:
 ```bash
 cargo check  --workspace        --no-default-features
 cargo test   -p kerf-core       --no-default-features
-cargo run    -p kerf-mcp        --no-default-features
+cargo run    -p kerf-app        --no-default-features
 ```
 
 In this mode the in-process libav **probe** is unavailable, but import, analysis
@@ -161,8 +160,8 @@ features need a fuller toolchain.
 
 ## MCP server
 
-`kerf-mcp` speaks MCP over stdio and exposes these tools, all operating on the
-non-destructive timeline:
+The desktop app hosts the MCP server over streamable HTTP and exposes these tools, all
+operating on the same live, non-destructive timeline the GUI shows:
 
 | Tool                    | Purpose                                                    |
 | ----------------------- | --------------------------------------------------------- |
@@ -180,15 +179,37 @@ non-destructive timeline:
 | `extract_audio`         | Append an asset's audio to the audio track                |
 | `concatenate`           | Stitch several assets end-to-end                          |
 | `export`                | Render the timeline (requires the `ffmpeg` feature)       |
+| `history`               | List timeline revisions (the edit history)                |
+| `undo` / `redo`         | Step back / forward through the edit history              |
+| `revert_to`             | Restore the timeline to a specific revision               |
+| `list_tasks`            | List the agent task queue with each task's status         |
+| `add_task`              | Enqueue a task (status: queued)                           |
+| `claim_next_task`       | Claim the oldest queued task (marks it working)           |
+| `complete_task`         | Mark a claimed task ready for review, with a summary      |
+| `fail_task`             | Mark a task failed with an error message                  |
+
+The **task queue** is how the user and a connected LLM hand work back and forth:
+the desktop app enqueues plain-language tasks, the agent calls `claim_next_task`,
+performs edits with the timeline tools above, then `complete_task`s with a summary
+the user reviews and applies. Kerf never edits on its own.
 
 ### Connect it to Claude Code / Claude Desktop
+
+Start the desktop app first (it hosts the server), then register the HTTP endpoint.
+With Claude Code:
+
+```bash
+claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
+```
+
+Or directly in an MCP client config that supports HTTP servers:
 
 ```json
 {
   "mcpServers": {
     "kerf": {
-      "command": "/absolute/path/to/target/debug/kerf-mcp",
-      "args": []
+      "type": "http",
+      "url": "http://127.0.0.1:7777/mcp"
     }
   }
 }
@@ -196,14 +217,14 @@ non-destructive timeline:
 
 ### Smoke test (no MCP client needed)
 
+With the app running, hit the endpoint over HTTP (the streamable-HTTP transport
+replies via SSE, so ask for an event stream):
+
 ```bash
-cargo build -p kerf-mcp --no-default-features
-printf '%s\n' \
- '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' \
- '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
- '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
- '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_assets","arguments":{}}}' \
- | ./target/debug/kerf-mcp
+curl -sN http://127.0.0.1:7777/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}'
 ```
 
 ---
@@ -216,6 +237,10 @@ The desktop shell exposes these commands to the frontend (`@tauri-apps/api`):
 - `get_timeline() -> Timeline`
 - `get_asset_metadata(assetId) -> { asset, analysis }`
 - `import_asset(path) -> Asset` _(requires the `ffmpeg` feature)_
+- `list_tasks() -> Task[]`, `add_task(prompt) -> Task`, `resolve_task(taskId) -> Task[]`,
+  `remove_task(taskId) -> Task[]` — the agent task queue
+- `get_history() -> Revision[]`, `undo() / redo() -> Timeline`, `revert_to(seq) -> Timeline`
+  — the timeline edit history
 
 ## Analysis is pluggable
 
@@ -235,19 +260,27 @@ This is a scaffold that boots end-to-end:
   (unit-tested).
 - ✅ FFmpeg engine: CLI-driven probe/analysis/frames/waveforms/export everywhere,
   plus `ffmpeg-next` in-process probing under the `ffmpeg` feature.
-- ✅ Working stdio MCP server (15 tools, incl. `analyze_asset`) verified against a
-  sample project.
+- ✅ Working stdio MCP server (24 tools, incl. `analyze_asset`, the task-queue
+  tools, and the edit-history tools) verified against a sample project.
 - ✅ Tauri commands wiring the frontend to every `kerf-core` operation (editing,
   analysis, preview frames, waveforms, export).
 - ✅ Real local analysis: FFmpeg `silencedetect` + scene detection, decoded preview
   frames, and audio waveforms — all CLI-driven, so no dev libraries required.
 - ✅ Timeline, preview and transcript render real backend state (not mock data).
+- ✅ Agent task queue persisted in `kerf-core` (`tasks` table), exposed over MCP
+  (`list_tasks` / `claim_next_task` / `complete_task` / `fail_task`) and as Tauri
+  commands; the agent panel renders the live queue and an add-task box, so a
+  connected LLM and the user hand work back and forth over MCP.
+- ✅ Revertible timeline edit history (`history` table, attributed to user/agent/
+  system) with `undo` / `redo` / `revert_to` over MCP and Tauri; the agent panel
+  shows the revision list with one-click revert.
 
 Behind feature flags (need a fuller toolchain, not exercised in the default CI
 build): `libav-render` — an experimental in-process libav export pipeline; and
 `whisper` — local `whisper-rs` transcription (set `KERF_WHISPER_MODEL`).
 
-Next up: connecting the agent panel's task queue to a live LLM over MCP.
+Next up: a live activity stream pushed from the MCP server (the queue is polled
+on load today), and richer staged-edit diffs in the review step.
 
 ## License
 
