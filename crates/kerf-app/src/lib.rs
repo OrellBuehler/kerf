@@ -322,8 +322,11 @@ pub fn run() {
 
     use_bundled_ffmpeg();
 
-    // Start on a seeded in-memory sample so the UI has content immediately.
-    let project = Arc::new(Mutex::new(Project::sample().expect("failed to seed sample project")));
+    // Start on a fresh, empty in-memory project; the user opens an existing
+    // `.kerf` file or imports media to populate it.
+    let project = Arc::new(Mutex::new(
+        Project::open_in_memory().expect("failed to create empty project"),
+    ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
