@@ -292,8 +292,74 @@ fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
 
 // ---- export ----------------------------------------------------------------
 
+/// The single output shape every clip is normalized to before `concat`. The
+/// `concat` filter requires identical resolution / frame rate / sample format
+/// across its inputs, and `concat`'s `a=1` requires every segment to carry
+/// audio — so clips from a video-only asset get synthesized silence.
+#[derive(Debug, Clone, Copy)]
+struct ExportFormat {
+    width: u32,
+    height: u32,
+    fps: f64,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl Default for ExportFormat {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            sample_rate: 48_000,
+            channels: 2,
+        }
+    }
+}
+
+impl ExportFormat {
+    fn channel_layout(self) -> &'static str {
+        if self.channels <= 1 {
+            "mono"
+        } else {
+            "stereo"
+        }
+    }
+}
+
+/// Derive the output shape from the first clip that carries a video stream and
+/// the first that carries audio, falling back to 1080p30 stereo defaults.
+fn export_format(track: &crate::model::Track, assets: &[Asset]) -> ExportFormat {
+    let stream_of = |clip: &crate::model::Clip, kind: StreamKind| {
+        assets
+            .iter()
+            .find(|a| a.id == clip.asset_id)
+            .and_then(|a| a.streams.iter().find(|s| s.kind == kind))
+    };
+
+    let mut fmt = ExportFormat::default();
+    if let Some(v) = track.clips.iter().find_map(|c| stream_of(c, StreamKind::Video)) {
+        if let (Some(w), Some(h)) = (v.width, v.height) {
+            fmt.width = w;
+            fmt.height = h;
+        }
+        if let Some(f) = v.fps.filter(|f| *f > 0.0) {
+            fmt.fps = f;
+        }
+    }
+    if let Some(a) = track.clips.iter().find_map(|c| stream_of(c, StreamKind::Audio)) {
+        if let Some(r) = a.sample_rate.filter(|r| *r > 0) {
+            fmt.sample_rate = r;
+        }
+        if let Some(c) = a.channels.filter(|c| *c > 0) {
+            fmt.channels = c;
+        }
+    }
+    fmt
+}
+
 /// Render the timeline by driving the `ffmpeg` binary with a generated
-/// `filter_complex` (trim + per-clip volume + concat).
+/// `filter_complex` (trim + per-clip volume + normalize + concat).
 // With the `libav-render` feature the in-process libav executor is used instead.
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &str) -> Result<()> {
@@ -313,7 +379,8 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         cmd.arg("-i").arg(path);
     }
-    let filter = build_filter_complex(track);
+    let fmt = export_format(track, assets);
+    let filter = build_filter_complex(track, assets, &fmt);
     cmd.arg("-filter_complex").arg(&filter);
     cmd.arg("-map").arg("[outv]").arg("-map").arg("[outa]");
     cmd.arg(output);
@@ -326,27 +393,58 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
 }
 
 /// Build the `filter_complex` string that trims each clip to its source range,
-/// applies per-clip volume, and concatenates them into `[outv][outa]`.
+/// normalizes it to `fmt`, applies per-clip volume, and concatenates the clips
+/// into `[outv][outa]`.
 ///
-/// Kept pure (no I/O) so it is unit-testable and reusable by the in-process
-/// libav executor.
-pub fn build_filter_complex(track: &crate::model::Track) -> String {
+/// Each video segment is scaled (preserving aspect, padded to fit) to a common
+/// resolution, frame rate and pixel format so `concat` accepts them. Clips
+/// whose asset has no audio stream get synthesized silence (`anullsrc`) of the
+/// clip's duration, so `concat`'s `a=1` always has an audio input to consume.
+///
+/// Kept pure (no I/O) so it is unit-testable.
+fn build_filter_complex(track: &crate::model::Track, assets: &[Asset], fmt: &ExportFormat) -> String {
+    let has_audio = |clip: &crate::model::Clip| {
+        assets
+            .iter()
+            .find(|a| a.id == clip.asset_id)
+            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
+    };
+    let layout = fmt.channel_layout();
+
     let mut filter = String::new();
     let mut concat_inputs = String::new();
     for (i, clip) in track.clips.iter().enumerate() {
         filter.push_str(&format!(
-            "[{i}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];",
-            i = i,
-            start = clip.source_in,
-            end = clip.source_out
-        ));
-        filter.push_str(&format!(
-            "[{i}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,volume={vol}[a{i}];",
+            "[{i}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,\
+             scale={w}:{h}:force_original_aspect_ratio=decrease,\
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}];",
             i = i,
             start = clip.source_in,
             end = clip.source_out,
-            vol = clip.volume
+            w = fmt.width,
+            h = fmt.height,
+            fps = fmt.fps,
         ));
+        if has_audio(clip) {
+            filter.push_str(&format!(
+                "[{i}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,volume={vol},\
+                 aformat=sample_rates={sr}:channel_layouts={layout}[a{i}];",
+                i = i,
+                start = clip.source_in,
+                end = clip.source_out,
+                vol = clip.volume,
+                sr = fmt.sample_rate,
+                layout = layout,
+            ));
+        } else {
+            filter.push_str(&format!(
+                "anullsrc=r={sr}:cl={layout}:d={dur},asetpts=PTS-STARTPTS[a{i}];",
+                sr = fmt.sample_rate,
+                layout = layout,
+                dur = clip.duration(),
+                i = i,
+            ));
+        }
         concat_inputs.push_str(&format!("[v{i}][a{i}]", i = i));
     }
     filter.push_str(&format!(
@@ -360,7 +458,8 @@ pub fn build_filter_complex(track: &crate::model::Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, StreamKind, Track};
+    use crate::model::{Asset, Clip, StreamInfo, StreamKind, Track};
+    use chrono::Utc;
     use uuid::Uuid;
 
     #[test]
@@ -410,8 +509,50 @@ mod tests {
         assert!(p.iter().all(|&v| (0.0..=1.0).contains(&v)));
     }
 
+    fn test_asset(streams: Vec<StreamInfo>) -> Asset {
+        Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 100.0,
+            streams,
+            imported_at: Utc::now(),
+        }
+    }
+
+    fn video_stream(w: u32, h: u32, fps: f64) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: Some(w),
+            height: Some(h),
+            fps: Some(fps),
+            sample_rate: None,
+            channels: None,
+        }
+    }
+
+    fn audio_stream(rate: u32, channels: u16) -> StreamInfo {
+        StreamInfo {
+            index: 1,
+            kind: StreamKind::Audio,
+            codec: "aac".into(),
+            width: None,
+            height: None,
+            fps: None,
+            sample_rate: Some(rate),
+            channels: Some(channels),
+        }
+    }
+
     #[test]
-    fn filter_complex_concats_all_clips() {
+    fn filter_complex_concats_and_normalizes_clips() {
+        // One clip with audio, one from a video-only asset.
+        let with_audio = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let video_only = test_asset(vec![video_stream(3840, 2160, 24.0)]);
+        let assets = vec![with_audio.clone(), video_only.clone()];
+
         let track = Track {
             id: Uuid::new_v4(),
             kind: StreamKind::Video,
@@ -419,25 +560,53 @@ mod tests {
             clips: vec![
                 Clip {
                     id: Uuid::new_v4(),
-                    asset_id: Uuid::new_v4(),
+                    asset_id: with_audio.id,
                     source_in: 0.0,
                     source_out: 5.0,
                     timeline_start: 0.0,
-                    volume: 1.0,
+                    volume: 0.5,
                 },
                 Clip {
                     id: Uuid::new_v4(),
-                    asset_id: Uuid::new_v4(),
+                    asset_id: video_only.id,
                     source_in: 2.0,
                     source_out: 4.0,
                     timeline_start: 5.0,
-                    volume: 0.5,
+                    volume: 1.0,
                 },
             ],
         };
-        let f = build_filter_complex(&track);
+
+        let fmt = export_format(&track, &assets);
+        // Output shape comes from the first video/audio-bearing clips.
+        assert_eq!((fmt.width, fmt.height), (1920, 1080));
+        assert_eq!(fmt.sample_rate, 48_000);
+
+        let f = build_filter_complex(&track, &assets, &fmt);
         assert!(f.contains("concat=n=2:v=1:a=1[outv][outa]"));
         assert!(f.contains("volume=0.5"));
         assert!(f.contains("[0:v]trim=start=0:end=5"));
+        // Every video segment is scaled/padded to the common resolution.
+        assert_eq!(f.matches("scale=1920:1080").count(), 2);
+        assert!(f.contains("format=yuv420p"));
+        // The clip with audio is trimmed + reformatted; the video-only clip
+        // gets synthesized silence so concat's a=1 has an input.
+        assert!(f.contains("[0:a]atrim=start=0:end=5"));
+        assert!(f.contains("aformat=sample_rates=48000:channel_layouts=stereo"));
+        assert!(f.contains("anullsrc=r=48000:cl=stereo:d=2"));
+        assert!(!f.contains("[1:a]"));
+    }
+
+    #[test]
+    fn export_format_falls_back_to_defaults() {
+        let track = Track {
+            id: Uuid::new_v4(),
+            kind: StreamKind::Video,
+            name: "V1".into(),
+            clips: Vec::new(),
+        };
+        let fmt = export_format(&track, &[]);
+        assert_eq!((fmt.width, fmt.height), (1920, 1080));
+        assert_eq!(fmt.channel_layout(), "stereo");
     }
 }
