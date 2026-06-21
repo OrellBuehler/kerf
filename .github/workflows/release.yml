@@ -37,7 +37,7 @@ jobs:
           - platform: windows-latest
             arch: x86_64
             args: ''
-            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"]}}'
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
             bundleFfmpeg: true
     runs-on: ${{ matrix.platform }}
     steps:

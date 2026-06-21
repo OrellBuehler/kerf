@@ -18,6 +18,10 @@ import { tmpdir } from "node:os";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(repoRoot, "crates", "kerf-app", "binaries");
+const licenseDir = join(repoRoot, "crates", "kerf-app", "licenses");
+// Bundled FFmpeg is GPL, so ship its license text next to the app. The upstream
+// archive carries the authoritative copy matching this exact build.
+const LICENSE_NAMES = ["LICENSE.txt", "LICENSE", "COPYING.txt", "COPYING"];
 
 function hostTriple() {
   const { stdout } = Bun.spawnSync(["rustc", "-vV"]);
@@ -68,7 +72,9 @@ if (!source) {
 }
 
 await mkdir(outDir, { recursive: true });
+await mkdir(licenseDir, { recursive: true });
 const work = await mkdtemp(join(tmpdir(), "kerf-ffmpeg-"));
+let licenseWritten = false;
 try {
   for (const { url, wants } of source.archives) {
     console.log(`↓ ${url}`);
@@ -88,6 +94,22 @@ try {
       if (source.ext === "") await chmod(dest, 0o755);
       console.log(`✓ ${dest}`);
     }
+
+    if (!licenseWritten) {
+      for (const lic of LICENSE_NAMES) {
+        const src = await findFile(work, lic);
+        if (src) {
+          const dest = join(licenseDir, "FFmpeg-LICENSE.txt");
+          await Bun.write(dest, Bun.file(src));
+          console.log(`✓ ${dest}`);
+          licenseWritten = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!licenseWritten) {
+    console.warn("⚠ no LICENSE file found in the archive(s); ship FFmpeg's license manually.");
   }
 } finally {
   await rm(work, { recursive: true, force: true });
