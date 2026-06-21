@@ -1,39 +1,9 @@
-/* Mock project data ported from the Kerf editor design kit. The timeline,
-   transcript, preview, waveforms and the agent task queue now render real
-   backend data; what remains here is the browser-only fallback media bin, the
-   transcript/FX showcase, the demo-phase labels, and the shared task-status
-   presentation map. */
+/* Presentation-only constants shared by the editor components: the task-status
+   presentation map and the agent preset prompts. All project data (assets,
+   timeline, transcript, waveforms, tasks, history) renders from the real
+   backend via `editor` / `agent`. */
 
-import type { EditorPhase } from '$lib/editor-ui.svelte';
 import type { TaskStatus } from '$lib/types';
-
-export type MockAsset = {
-	id: string;
-	name: string;
-	dur: string;
-	kind: 'video' | 'audio';
-	tag: string;
-};
-
-export const MOCK_ASSETS: MockAsset[] = [
-	{ id: 'a1', name: 'interview_A.mov', dur: '04:12', kind: 'video', tag: 'A-roll' },
-	{ id: 'a2', name: 'broll_city.mp4', dur: '02:38', kind: 'video', tag: 'B-roll' },
-	{ id: 'a3', name: 'broll_desk.mp4', dur: '01:54', kind: 'video', tag: 'B-roll' },
-	{ id: 'a4', name: 'voiceover_2.wav', dur: '03:46', kind: 'audio', tag: 'VO' },
-	{ id: 'a5', name: 'ambient_loop.wav', dur: '06:00', kind: 'audio', tag: 'Music' }
-];
-
-export type TranscriptLine = { t: string; s: string; cut: boolean; sil?: boolean };
-
-export const TRANSCRIPT: TranscriptLine[] = [
-	{ t: '00:02', s: 'So the whole idea behind Kerf is—', cut: false },
-	{ t: '00:05', s: "um, is that editing shouldn't feel like fighting the tool.", cut: true },
-	{ t: '00:09', s: 'You bring the footage, and the agent watches it with you.', cut: false },
-	{ t: '00:14', s: '[silence 1.8s]', cut: true, sil: true },
-	{ t: '00:16', s: 'It finds the dead air, the filler, the false starts.', cut: false }
-];
-
-export const FX = ['Color · Neutral LUT', 'Stabilize', 'Auto-ducking', 'Denoise (voice)', 'Crossfade 12f'];
 
 export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label: string }> = {
 	queued: { tone: 'neutral', icon: 'clock', label: 'Queued' },
@@ -44,10 +14,3 @@ export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label:
 };
 
 export const PRESETS = ['Remove silences', 'Assemble rough cut', 'Find best 60s', 'Color match'];
-
-export const PHASES: [EditorPhase, string][] = [
-	['empty', 'Empty'],
-	['analyzing', 'Agent working'],
-	['review', 'Review cut'],
-	['editing', 'Applied']
-];

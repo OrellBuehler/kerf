@@ -7,11 +7,12 @@
 	import { editor } from '$lib/state.svelte';
 	import { inTauri } from '$lib/api';
 	import { toast } from 'svelte-sonner';
-	import { MOCK_ASSETS, TRANSCRIPT, FX, type MockAsset } from './data';
 
-	let tab = $state<'bin' | 'tx' | 'fx'>('bin');
+	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; tag: string };
 
-	const loaded = $derived(editor.assets.length > 0 || ui.phase !== 'empty');
+	let tab = $state<'bin' | 'tx'>('bin');
+
+	const loaded = $derived(editor.assets.length > 0);
 
 	function fmt(s: number): string {
 		const m = Math.floor(s / 60);
@@ -19,56 +20,46 @@
 		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 	}
 
-	/* Real assets when present (import works in the desktop app); otherwise the
-	   design's mock bin so the browser preview always has content. */
-	const assets = $derived<MockAsset[]>(
-		editor.assets.length
-			? editor.assets.map((a) => {
-					const hasVideo = a.streams.some((s) => s.kind === 'video');
-					const primary = a.streams[0];
-					return {
-						id: a.id,
-						name: a.name,
-						dur: fmt(a.duration),
-						kind: hasVideo ? 'video' : 'audio',
-						tag: primary?.codec ?? (hasVideo ? 'video' : 'audio')
-					};
-				})
-			: MOCK_ASSETS
+	const assets = $derived<BinAsset[]>(
+		editor.assets.map((a) => {
+			const hasVideo = a.streams.some((s) => s.kind === 'video');
+			const primary = a.streams[0];
+			return {
+				id: a.id,
+				name: a.name,
+				dur: fmt(a.duration),
+				kind: hasVideo ? 'video' : 'audio',
+				tag: primary?.codec ?? (hasVideo ? 'video' : 'audio')
+			};
+		})
 	);
 
 	const txLines = $derived(
-		editor.selectedMetadata?.analysis?.transcript?.length
-			? editor.selectedMetadata.analysis.transcript.map((seg) => ({
-					t: fmt(seg.start),
-					s: seg.text,
-					cut: false,
-					sil: false
-				}))
-			: TRANSCRIPT
+		(editor.selectedMetadata?.analysis?.transcript ?? []).map((seg) => ({
+			t: fmt(seg.start),
+			s: seg.text
+		}))
 	);
 
-	const tabs = [
-		{ id: 'bin' as const, label: 'Media', count: undefined as number | undefined },
-		{ id: 'tx' as const, label: 'Transcript', count: 412 },
-		{ id: 'fx' as const, label: 'Effects', count: undefined }
-	];
+	const tabs = $derived([
+		{ id: 'bin' as const, label: 'Media', count: assets.length || undefined },
+		{ id: 'tx' as const, label: 'Transcript', count: txLines.length || undefined }
+	]);
 
 	async function onImport() {
-		if (inTauri()) {
-			try {
-				const asset = await editor.importMedia();
-				if (asset) {
-					toast.success(`Imported ${asset.name}`);
-					await ui.runAnalysis(asset.id);
-					toast.success('Analysis complete');
-				}
-			} catch (e) {
-				toast.error(e instanceof Error ? e.message : String(e));
+		if (!inTauri()) {
+			toast.info('Importing media is available in the desktop app.');
+			return;
+		}
+		try {
+			const asset = await editor.importMedia();
+			if (asset) {
+				toast.success(`Imported ${asset.name}`);
+				await ui.runAnalysis(asset.id);
+				toast.success('Analysis complete');
 			}
-		} else {
-			toast.info('Kerf transcribes & detects locally on import (desktop app).');
-			ui.startAnalyze();
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
@@ -141,7 +132,7 @@
 						>
 						<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
 					</div>
-					{#each assets as a, i (a.id)}
+					{#each assets as a (a.id)}
 						{@const sel = a.id === editor.selectedAssetId}
 						<div
 							role="button"
@@ -166,7 +157,7 @@
 								</div>
 								<div style="display:flex;gap:6px;align-items:center;margin-top:3px">
 									<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{a.dur}</span>
-									{#if ui.phase === 'analyzing' && i < 3}
+									{#if ui.analyzing && a.id === editor.selectedAssetId}
 										<Badge tone="agent" dot>analyzing</Badge>
 									{:else}
 										<Badge tone="neutral">{a.tag}</Badge>
@@ -178,7 +169,7 @@
 				</div>
 			{/if}
 		{:else if tab === 'tx'}
-			{#if !loaded}
+			{#if txLines.length === 0}
 				<div
 					style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-disabled);text-align:center"
 				>
@@ -187,39 +178,16 @@
 			{:else}
 				<div style="display:flex;flex-direction:column;gap:2px">
 					{#each txLines as l, i (i)}
-						<div
-							style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);background:{l.cut
-								? 'var(--diff-remove-surface)'
-								: 'transparent'};border:1px solid {l.cut ? 'rgba(229,84,75,.25)' : 'transparent'}"
-						>
+						<div style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm)">
 							<span
-								style="font-family:var(--font-mono);font-size:10px;color:{l.cut
-									? 'var(--red-400)'
-									: 'var(--text-disabled)'};flex:none;padding-top:1px">{l.t}</span
+								style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none;padding-top:1px"
+								>{l.t}</span
 							>
-							<span
-								style="font-size:12px;line-height:1.45;color:{l.sil
-									? 'var(--text-disabled)'
-									: l.cut
-										? 'var(--text-muted)'
-										: 'var(--text-secondary)'};text-decoration:{l.cut && !l.sil
-									? 'line-through'
-									: 'none'};font-style:{l.sil ? 'italic' : 'normal'}">{l.s}</span
-							>
+							<span style="font-size:12px;line-height:1.45;color:var(--text-secondary)">{l.s}</span>
 						</div>
 					{/each}
 				</div>
 			{/if}
-		{:else}
-			<div style="display:flex;flex-direction:column;gap:6px">
-				{#each FX as f (f)}
-					<div
-						style="display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--border-subtle);font-size:12px;color:var(--text-secondary)"
-					>
-						<Icon n="sliders-horizontal" s={14} color="var(--text-muted)" />{f}
-					</div>
-				{/each}
-			</div>
 		{/if}
 	</div>
 </div>
