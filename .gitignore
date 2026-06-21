@@ -15,6 +15,9 @@ bun.lockb.orig
 /crates/kerf-app/gen
 /crates/kerf-app/target
 
+# Bundled FFmpeg sidecars (fetched by scripts/fetch-ffmpeg.mjs at release time)
+/crates/kerf-app/binaries
+
 # Kerf projects & media scratch
 *.kerf
 *.kerf-wal

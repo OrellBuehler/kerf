@@ -22,15 +22,23 @@ jobs:
           - platform: macos-latest
             arch: aarch64
             args: --target aarch64-apple-darwin
+            config: '{"build":{"beforeBuildCommand":""}}'
           - platform: macos-latest
             arch: x86_64
             args: --target x86_64-apple-darwin
+            config: '{"build":{"beforeBuildCommand":""}}'
           - platform: ubuntu-22.04
             arch: x86_64
             args: ''
+            config: '{"build":{"beforeBuildCommand":""}}'
+          # Windows has no system FFmpeg, so bundle ffmpeg/ffprobe as externalBin
+          # sidecars (fetched below). Injecting externalBin only here keeps it out
+          # of the plain `cargo build` CI runs, which don't ship the binaries.
           - platform: windows-latest
             arch: x86_64
             args: ''
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"]}}'
+            bundleFfmpeg: true
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +62,11 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
+      # Fetch ffmpeg/ffprobe into crates/kerf-app/binaries/ so Tauri can bundle
+      # them as externalBin sidecars (Windows only — see the matrix config above).
+      - name: Fetch bundled FFmpeg
+        if: matrix.bundleFfmpeg
+        run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.arch }}-pc-windows-msvc
       - name: Build and upload bundles
         uses: tauri-apps/tauri-action@v0
         env:
@@ -62,7 +75,8 @@ jobs:
           projectPath: crates/kerf-app
           tauriScript: bunx @tauri-apps/cli@2
           releaseId: ${{ github.event.release.id }}
-          # `--config` zeroes out beforeBuildCommand (frontend is already built);
-          # everything after `--` is forwarded to cargo, where --no-default-features
+          # `--config` (per matrix row) zeroes out beforeBuildCommand (frontend is
+          # already built) and, on Windows, adds the FFmpeg externalBin sidecars.
+          # Everything after `--` is forwarded to cargo, where --no-default-features
           # disables the FFmpeg dev-library dependency.
-          args: "${{ matrix.args }} --config '{\"build\":{\"beforeBuildCommand\":\"\"}}' -- --no-default-features"
+          args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features"

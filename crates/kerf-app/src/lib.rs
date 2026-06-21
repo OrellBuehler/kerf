@@ -290,6 +290,28 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, format: Stri
     Ok(out.to_string_lossy().into_owned())
 }
 
+/// Packaged builds ship `ffmpeg`/`ffprobe` next to the executable as Tauri
+/// `externalBin` sidecars (see `tauri.conf.json`'s `bundle.externalBin`, injected
+/// for Windows where there is no system FFmpeg). Point the CLI engine at them via
+/// the `KERF_FFMPEG`/`KERF_FFPROBE` overrides it already honors. We only set a var
+/// when the user hasn't (an explicit override wins) and the bundled binary is
+/// actually present, so dev builds — which have no sidecar — transparently fall
+/// back to a bare `ffmpeg`/`ffprobe` PATH lookup.
+fn use_bundled_ffmpeg() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    for (var, name) in [("KERF_FFMPEG", "ffmpeg"), ("KERF_FFPROBE", "ffprobe")] {
+        if std::env::var_os(var).is_some() {
+            continue;
+        }
+        let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if path.is_file() {
+            std::env::set_var(var, &path);
+            tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -297,6 +319,8 @@ pub fn run() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    use_bundled_ffmpeg();
 
     // Start on a seeded in-memory sample so the UI has content immediately.
     let project = Arc::new(Mutex::new(Project::sample().expect("failed to seed sample project")));
