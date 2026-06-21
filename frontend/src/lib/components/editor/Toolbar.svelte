@@ -6,10 +6,12 @@
 	import { editor } from '$lib/state.svelte';
 
 	let {
+		onNew,
 		onExport,
 		onOpen,
 		onSave
-	}: { onExport: () => void; onOpen: () => void; onSave: () => void } = $props();
+	}: { onNew: () => void; onExport: () => void; onOpen: () => void; onSave: () => void } =
+		$props();
 
 	const tools: [Tool, string, string][] = [
 		['pointer', 'MousePointer2', 'Select (V)'],
@@ -77,6 +79,7 @@
 
 	<div style="flex:1"></div>
 
+	<Btn variant="ghost" size="sm" icon="file-plus" onclick={onNew} title="New empty project">New</Btn>
 	<Btn variant="ghost" size="sm" icon="folder-open" onclick={onOpen} title="Open project…">Open</Btn>
 	<Btn
 		variant={editor.saved ? 'ghost' : 'secondary'}

@@ -12,6 +12,7 @@ import {
 	getTimeline,
 	getWaveform,
 	listAssets,
+	newProject as apiNewProject,
 	openProject as apiOpenProject,
 	pickAndImport,
 	projectPath,
@@ -113,7 +114,16 @@ class EditorState {
 		}
 	}
 
-	// ---- project file (open / save) -----------------------------------------
+	// ---- project file (new / open / save) -----------------------------------
+
+	/** Discard the open project for a fresh, empty one; resolves true if Tauri. */
+	async newProject(): Promise<boolean> {
+		if (!(await apiNewProject())) return false; // running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		await this.load();
+		return true;
+	}
 
 	/** Open a `.kerf` file (native picker) and reload; resolves true if opened. */
 	async openProject(): Promise<boolean> {

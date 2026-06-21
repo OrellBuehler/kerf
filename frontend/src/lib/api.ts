@@ -225,6 +225,13 @@ export async function projectPath(): Promise<string | null> {
 	return (await invoke<string | null>('project_path')) ?? null;
 }
 
+/** Discard the open project for a fresh, empty one; `false` outside Tauri. */
+export async function newProject(): Promise<boolean> {
+	if (!inTauri()) return false;
+	await invoke('new_project');
+	return true;
+}
+
 /** Pick a `.kerf` file and open it; resolves to its path, or `null` if cancelled. */
 export async function openProject(): Promise<string | null> {
 	if (!inTauri()) return null;

@@ -71,6 +71,16 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(state.project()?.path().map(|p| p.display().to_string()))
 }
 
+/// Replace the open project with a fresh, empty in-memory one (no sample data).
+/// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
+/// the embedded MCP server share this `Project`, so both switch to it.
+#[tauri::command]
+fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    *project = Project::open_in_memory().map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
+}
+
 /// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
 /// and the embedded MCP server share this `Project`, so both now operate on —
 /// and persist to — the opened file. Returns its path.
@@ -313,6 +323,7 @@ pub fn run() {
             get_timeline,
             get_asset_metadata,
             project_path,
+            new_project,
             open_project,
             save_project_as,
             import_asset,
