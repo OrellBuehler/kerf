@@ -1204,6 +1204,9 @@ mod tests {
         assert_eq!(reopened.list_tasks().unwrap().len(), tasks);
 
         // save_as overwrites an existing file (the dialog confirms the overwrite).
+        // Drop the open connection first: on Windows an open handle locks the file,
+        // so the overwrite's remove_file would fail with "used by another process".
+        drop(reopened);
         Project::sample().unwrap().save_as(&path).unwrap();
 
         std::fs::remove_file(&path).ok();
