@@ -1,32 +1,55 @@
 <script lang="ts">
 	import { ui } from '$lib/editor-ui.svelte';
-	import { PHASES } from './data';
+	import { editor } from '$lib/state.svelte';
+
+	/** Real metadata of the selected asset: fps · resolution · codec. */
+	const meta = $derived.by(() => {
+		const a = editor.selectedAsset;
+		if (!a) return null;
+		const v = a.streams.find((s) => s.kind === 'video');
+		const parts: string[] = [];
+		if (v?.fps) parts.push(`${v.fps.toFixed(3)} fps`);
+		if (v?.width && v?.height) parts.push(`${v.width}×${v.height}`);
+		const codec = (v ?? a.streams[0])?.codec;
+		if (codec) parts.push(codec);
+		return parts.join(' · ') || null;
+	});
+
+	const clipCount = $derived(
+		editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
+	);
+
+	function tc(s: number): string {
+		const total = Math.max(0, s);
+		const h = Math.floor(total / 3600);
+		const m = Math.floor((total % 3600) / 60);
+		const sec = Math.floor(total % 60);
+		const mm = `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+		return h > 0 ? `${h}:${mm}` : mm;
+	}
 </script>
 
 <div
 	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:1px solid var(--border-default)"
 >
+	{#if meta}
+		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{meta}</span>
+	{/if}
 	<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
-		23.976 fps · 3840×2160 · ProRes
-	</span>
-	<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
-		{ui.phase === 'editing' ? '02:24:00' : '04:12:00'}
+		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
-	<span style="font-size:10px;color:var(--text-disabled)">Demo state</span>
-	<div
-		style="display:flex;gap:2px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);padding:2px"
-	>
-		{#each PHASES as [id, label] (id)}
-			<button
-				onclick={() => ui.setPhase(id)}
-				style="padding:3px 9px;border-radius:3px;border:none;cursor:pointer;font-family:var(--font-sans);font-size:11px;font-weight:500;background:{ui.phase ===
-				id
-					? 'var(--kerf-500)'
-					: 'transparent'};color:{ui.phase === id ? 'var(--text-on-accent)' : 'var(--text-muted)'}"
-			>
-				{label}
-			</button>
-		{/each}
-	</div>
+	{#if ui.analyzing}
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--agent-300)">
+			<span style="width:6px;height:6px;border-radius:50%;background:var(--agent-400)"></span>
+			Analyzing… {Math.round(ui.progress)}%
+		</span>
+	{:else}
+		<span style="font-size:10px;color:var(--text-disabled)">
+			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===
+			1
+				? ''
+				: 's'}
+		</span>
+	{/if}
 </div>

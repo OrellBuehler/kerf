@@ -71,6 +71,16 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(state.project()?.path().map(|p| p.display().to_string()))
 }
 
+/// Replace the open project with a fresh, empty in-memory one (no sample data).
+/// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
+/// the embedded MCP server share this `Project`, so both switch to it.
+#[tauri::command]
+fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let mut project = state.project()?;
+    *project = Project::open_in_memory().map_err(|e| e.to_string())?;
+    Ok(project.path().map(|p| p.display().to_string()))
+}
+
 /// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
 /// and the embedded MCP server share this `Project`, so both now operate on —
 /// and persist to — the opened file. Returns its path.
@@ -280,6 +290,28 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, format: Stri
     Ok(out.to_string_lossy().into_owned())
 }
 
+/// Packaged builds ship `ffmpeg`/`ffprobe` next to the executable as Tauri
+/// `externalBin` sidecars (see `tauri.conf.json`'s `bundle.externalBin`, injected
+/// for Windows where there is no system FFmpeg). Point the CLI engine at them via
+/// the `KERF_FFMPEG`/`KERF_FFPROBE` overrides it already honors. We only set a var
+/// when the user hasn't (an explicit override wins) and the bundled binary is
+/// actually present, so dev builds — which have no sidecar — transparently fall
+/// back to a bare `ffmpeg`/`ffprobe` PATH lookup.
+fn use_bundled_ffmpeg() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    for (var, name) in [("KERF_FFMPEG", "ffmpeg"), ("KERF_FFPROBE", "ffprobe")] {
+        if std::env::var_os(var).is_some() {
+            continue;
+        }
+        let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if path.is_file() {
+            std::env::set_var(var, &path);
+            tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -288,8 +320,11 @@ pub fn run() {
         )
         .init();
 
-    // Start on a seeded in-memory sample so the UI has content immediately.
-    let project = Arc::new(Mutex::new(Project::sample().expect("failed to seed sample project")));
+    use_bundled_ffmpeg();
+
+    // Start on a fresh, empty in-memory project; the user opens an existing
+    // `.kerf` file or imports media to populate it.
+    let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -313,6 +348,7 @@ pub fn run() {
             get_timeline,
             get_asset_metadata,
             project_path,
+            new_project,
             open_project,
             save_project_as,
             import_asset,

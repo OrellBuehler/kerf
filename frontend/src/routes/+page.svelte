@@ -35,6 +35,21 @@
 		return () => unlisten?.();
 	});
 
+	async function onNew() {
+		if (!inTauri()) {
+			toast.info('Creating a project is available in the desktop app.');
+			return;
+		}
+		try {
+			if (await editor.newProject()) {
+				await agent.load();
+				toast.success('New project');
+			}
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
 	async function onOpen() {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');
@@ -113,7 +128,7 @@
 
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />
-	<Toolbar {onExport} {onOpen} {onSave} />
+	<Toolbar {onNew} {onExport} {onOpen} {onSave} />
 	<div style="flex:1;display:flex;min-height:0">
 		<MediaBin />
 		<div style="flex:1;display:flex;flex-direction:column;min-width:0">

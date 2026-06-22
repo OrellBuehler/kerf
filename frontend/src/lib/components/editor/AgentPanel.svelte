@@ -76,7 +76,6 @@
 			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
 				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
 				await editor.removeSilence(assetId);
-				ui.setPhase('editing');
 				await agent.resolve(task.id);
 				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
 			} else {

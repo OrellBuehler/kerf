@@ -84,7 +84,9 @@ no editing logic in the adapter.
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
-  timeline + a sample task queue) and is what the app launches with by default.
+  timeline + a sample task queue); it backs the kerf-core tests, but the app now
+  launches with an **empty** `Project::open_in_memory()` — the user imports media or
+  opens a `.kerf` file to populate it.
   `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
   unchanged. The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
@@ -167,20 +169,21 @@ Two preset chips (`Remove silences` / `Assemble rough cut`) also run the matchin
 resolve their task; the rest just enqueue for the agent. In the browser there is no agent, so
 queued tasks correctly just wait. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
-`editor.revertTo(seq)`. `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits and the
-fallback bin.
+`editor.revertTo(seq)`. `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
+all project data renders from the real backend.
 
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
 **seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform
 is explorable in a plain browser via `bun run dev` (frames return `null` there → Preview
-keeps its placeholder). State is two runes singletons: `src/lib/state.svelte.ts`
+keeps its placeholder). This browser sample is a **dev harness only** — the desktop app always
+uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
-(`export const ui` — chrome state, playhead/zoom/playback, and `runAnalysis` which does real
-analysis in Tauri or the `empty → analyzing → review → editing` demo machine in the browser,
-still driven by the status-bar "Demo state" selector). `MediaBin` shows real `editor.assets`
-when present and falls back to the design's mock bin; the agent queue/log mock lives in
-`components/editor/data.ts`.
+(`export const ui` — chrome state, playhead/zoom/playback, and `runAnalysis` which runs real
+analysis and toggles the `analyzing` flag). There is **no scripted demo phase machine**: the
+editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
+non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
+duration, and `Preview` shows the decoded frame or a "No media loaded" placeholder.
 
 ## Conventions
 

@@ -1,21 +1,20 @@
-/* Editor chrome + the agent workflow state machine.
-   The cut workflow (empty → analyzing → review → editing) drives the editor
-   chrome. In the desktop app `runAnalysis` performs real local analysis over
-   MCP/kerf-core; in the browser the status-bar "Demo state" selector and the
-   import action animate through the same states the design showcases. */
+/* Editor chrome + playback/transport state. The chrome reflects the real
+   project: which media is imported, whether analysis is running, the playhead
+   and zoom. `runAnalysis` performs real analysis via kerf-core (desktop) or the
+   in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
-import { inTauri } from './api';
 
-export type EditorPhase = 'empty' | 'analyzing' | 'review' | 'editing';
 export type Tool = 'pointer' | 'razor' | 'bookmark';
 
 class EditorUi {
-	phase = $state<EditorPhase>('empty');
 	tool = $state<Tool>('pointer');
 	snap = $state(true);
 	agentOpen = $state(true);
 	playing = $state(false);
+	/** Whether an analysis pass is currently running. */
+	analyzing = $state(false);
+	/** Analysis progress, 0–100. */
 	progress = $state(0);
 	/** Playhead position, seconds. */
 	time = $state(0);
@@ -23,48 +22,17 @@ class EditorUi {
 	zoom = $state(36);
 
 	#timer: ReturnType<typeof setInterval> | null = null;
-	#advance: ReturnType<typeof setTimeout> | null = null;
 	#raf: number | null = null;
 
 	#clear() {
 		if (this.#timer) clearInterval(this.#timer);
-		if (this.#advance) clearTimeout(this.#advance);
 		this.#timer = null;
-		this.#advance = null;
 	}
 
-	setPhase(phase: EditorPhase) {
-		this.#clear();
-		this.phase = phase;
-		if (phase === 'analyzing') this.#runMockAnalysis();
-	}
-
-	#runMockAnalysis() {
-		this.progress = 8;
-		this.#timer = setInterval(() => {
-			if (this.progress >= 100) {
-				this.#clear();
-				this.#advance = setTimeout(() => this.setPhase('review'), 500);
-				return;
-			}
-			this.progress = Math.min(100, this.progress + 8);
-		}, 220);
-	}
-
-	/** Browser-only showcase: fake the analyze → review transition. */
-	startAnalyze() {
-		this.progress = 0;
-		this.setPhase('analyzing');
-	}
-
-	/** Real analysis: animate progress while kerf-core works, then land in edit. */
+	/** Analyze an asset, animating progress while kerf-core works. */
 	async runAnalysis(assetId: string) {
-		if (!inTauri()) {
-			this.startAnalyze();
-			return;
-		}
 		this.#clear();
-		this.phase = 'analyzing';
+		this.analyzing = true;
 		this.progress = 6;
 		this.#timer = setInterval(() => {
 			this.progress = Math.min(94, this.progress + 6);
@@ -74,16 +42,8 @@ class EditorUi {
 		} finally {
 			this.#clear();
 			this.progress = 100;
-			this.phase = 'editing';
+			this.analyzing = false;
 		}
-	}
-
-	apply() {
-		this.setPhase('editing');
-	}
-
-	reject() {
-		this.setPhase('editing');
 	}
 
 	// ---- playback ----------------------------------------------------------
