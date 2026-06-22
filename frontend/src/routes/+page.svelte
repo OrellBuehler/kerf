@@ -117,6 +117,12 @@
 		else if (e.key === ' ') {
 			e.preventDefault();
 			ui.togglePlay();
+		} else if (e.key === '+' || e.key === '=') {
+			e.preventDefault();
+			ui.zoom = Math.min(96, ui.zoom + 8);
+		} else if (e.key === '-') {
+			e.preventDefault();
+			ui.zoom = Math.max(8, ui.zoom - 8);
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipId) {
 			e.preventDefault();
 			void editor.remove(editor.selectedClipId);

@@ -37,7 +37,9 @@ import {
 	Redo2,
 	RotateCcw,
 	FolderOpen,
-	Save
+	Save,
+	ZoomIn,
+	ZoomOut
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -79,7 +81,9 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'redo': Redo2,
 	'rotate-ccw': RotateCcw,
 	'folder-open': FolderOpen,
-	'save': Save
+	'save': Save,
+	'zoom-in': ZoomIn,
+	'zoom-out': ZoomOut
 };
 
 export type IconName = keyof typeof icons;
