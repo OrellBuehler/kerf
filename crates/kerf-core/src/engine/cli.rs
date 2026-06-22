@@ -292,6 +292,29 @@ fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
 
 // ---- export ----------------------------------------------------------------
 
+/// Configurable options for the CLI export pipeline.
+///
+/// `Default` reproduces the original hard-coded behaviour exactly: no explicit
+/// codec flags (ffmpeg picks libx264 + aac from the container), no CRF
+/// override, and no resolution/fps override (both derived from the source
+/// clips).
+#[derive(Debug, Clone, Default)]
+pub struct ExportOptions {
+    /// Container / muxer hint passed to ffmpeg via the output extension.
+    /// `None` means the extension on the output path determines the format
+    /// (current default behaviour).
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    /// Constant Rate Factor; `None` lets ffmpeg use its encoder default.
+    pub crf: Option<u32>,
+    /// Force a specific output resolution, overriding the value derived from
+    /// the first video clip.
+    pub resolution: Option<(u32, u32)>,
+    /// Force a specific output frame rate, overriding the value derived from
+    /// the first video clip.
+    pub fps: Option<f64>,
+}
+
 /// The single output shape every clip is normalized to before `concat`. The
 /// `concat` filter requires identical resolution / frame rate / sample format
 /// across its inputs, and `concat`'s `a=1` requires every segment to carry
@@ -329,7 +352,8 @@ impl ExportFormat {
 
 /// Derive the output shape from the first clip that carries a video stream and
 /// the first that carries audio, falling back to 1080p30 stereo defaults.
-fn export_format(track: &crate::model::Track, assets: &[Asset]) -> ExportFormat {
+/// When `opts` carries resolution or fps overrides those values win.
+fn export_format(track: &crate::model::Track, assets: &[Asset], opts: &ExportOptions) -> ExportFormat {
     let stream_of = |clip: &crate::model::Clip, kind: StreamKind| {
         assets
             .iter()
@@ -355,7 +379,58 @@ fn export_format(track: &crate::model::Track, assets: &[Asset]) -> ExportFormat 
             fmt.channels = c;
         }
     }
+    if let Some((w, h)) = opts.resolution {
+        fmt.width = w;
+        fmt.height = h;
+    }
+    if let Some(f) = opts.fps.filter(|f| *f > 0.0) {
+        fmt.fps = f;
+    }
     fmt
+}
+
+/// Build the complete argument list for `ffmpeg` (everything after the binary
+/// name) that renders `track` to `output_path`.
+///
+/// The function is pure — it performs no I/O and does not spawn ffmpeg —
+/// which makes it unit-testable without the binary being present. The actual
+/// render call feeds the returned `Vec<String>` straight to `Command::args`.
+pub fn build_export_args(
+    track: &crate::model::Track,
+    assets: &[Asset],
+    output_path: &str,
+    opts: &ExportOptions,
+) -> Result<Vec<String>> {
+    let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
+
+    let mut args: Vec<String> = vec!["-y".to_string()];
+    for clip in &track.clips {
+        let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
+        args.push("-i".to_string());
+        args.push(path.to_string());
+    }
+    let fmt = export_format(track, assets, opts);
+    let filter = build_filter_complex(track, assets, &fmt);
+    args.push("-filter_complex".to_string());
+    args.push(filter);
+    args.push("-map".to_string());
+    args.push("[outv]".to_string());
+    args.push("-map".to_string());
+    args.push("[outa]".to_string());
+    if let Some(ref vc) = opts.video_codec {
+        args.push("-c:v".to_string());
+        args.push(vc.clone());
+    }
+    if let Some(ref ac) = opts.audio_codec {
+        args.push("-c:a".to_string());
+        args.push(ac.clone());
+    }
+    if let Some(crf) = opts.crf {
+        args.push("-crf".to_string());
+        args.push(crf.to_string());
+    }
+    args.push(output_path.to_string());
+    Ok(args)
 }
 
 /// Render the timeline by driving the `ffmpeg` binary with a generated
@@ -363,6 +438,12 @@ fn export_format(track: &crate::model::Track, assets: &[Asset]) -> ExportFormat 
 // With the `libav-render` feature the in-process libav executor is used instead.
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &str) -> Result<()> {
+    render_with(timeline, assets, output, &ExportOptions::default())
+}
+
+/// Like [`render`] but with explicit export options.
+#[cfg_attr(feature = "libav-render", allow(dead_code))]
+pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &ExportOptions) -> Result<()> {
     let track = timeline
         .tracks
         .iter()
@@ -370,22 +451,14 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
         .or_else(|| timeline.tracks.iter().find(|t| !t.clips.is_empty()))
         .ok_or_else(|| Error::InvalidArgument("timeline has no clips to export".to_string()))?;
 
-    let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.clone());
+    let output_str = output
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 output path: {}", output.display())))?;
+
+    let args = build_export_args(track, assets, output_str, opts)?;
 
     let bin = ffmpeg_bin();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("-y");
-    for clip in &track.clips {
-        let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        cmd.arg("-i").arg(path);
-    }
-    let fmt = export_format(track, assets);
-    let filter = build_filter_complex(track, assets, &fmt);
-    cmd.arg("-filter_complex").arg(&filter);
-    cmd.arg("-map").arg("[outv]").arg("-map").arg("[outa]");
-    cmd.arg(output);
-
-    let status = cmd.status().map_err(|e| launch_err(&bin, e))?;
+    let status = Command::new(&bin).args(&args).status().map_err(|e| launch_err(&bin, e))?;
     if !status.success() {
         return Err(Error::Engine(format!("ffmpeg exited with {status}")));
     }
@@ -577,7 +650,8 @@ mod tests {
             ],
         };
 
-        let fmt = export_format(&track, &assets);
+        let opts = ExportOptions::default();
+        let fmt = export_format(&track, &assets, &opts);
         // Output shape comes from the first video/audio-bearing clips.
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.sample_rate, 48_000);
@@ -605,8 +679,184 @@ mod tests {
             name: "V1".into(),
             clips: Vec::new(),
         };
-        let fmt = export_format(&track, &[]);
+        let fmt = export_format(&track, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.channel_layout(), "stereo");
+    }
+
+    fn make_track(clips: Vec<Clip>) -> Track {
+        Track {
+            id: Uuid::new_v4(),
+            kind: StreamKind::Video,
+            name: "V1".into(),
+            clips,
+        }
+    }
+
+    fn make_clip(asset_id: uuid::Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
+        Clip {
+            id: Uuid::new_v4(),
+            asset_id,
+            source_in,
+            source_out,
+            timeline_start,
+            volume: 1.0,
+        }
+    }
+
+    #[test]
+    fn build_export_args_single_video_clip() {
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/clip.mp4".into(),
+            name: "clip.mp4".into(),
+            duration: 10.0,
+            streams: vec![video_stream(1280, 720, 25.0), audio_stream(44_100, 2)],
+            imported_at: Utc::now(),
+        };
+        let track = make_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = vec![asset];
+        let opts = ExportOptions::default();
+
+        let args = build_export_args(&track, &assets, "/out/result.mp4", &opts).unwrap();
+
+        assert_eq!(args[0], "-y");
+        assert_eq!(args[1], "-i");
+        assert_eq!(args[2], "/media/clip.mp4");
+        assert!(args.contains(&"-filter_complex".to_string()));
+        let fc_pos = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let filter = &args[fc_pos + 1];
+        assert!(filter.contains("trim=start=0:end=10"));
+        assert!(filter.contains("concat=n=1:v=1:a=1[outv][outa]"));
+        assert!(args.contains(&"-map".to_string()));
+        assert!(args.contains(&"[outv]".to_string()));
+        assert!(args.contains(&"[outa]".to_string()));
+        assert_eq!(args.last().unwrap(), "/out/result.mp4");
+        // Default opts: no explicit codec or crf flags.
+        assert!(!args.contains(&"-c:v".to_string()));
+        assert!(!args.contains(&"-c:a".to_string()));
+        assert!(!args.contains(&"-crf".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_multi_clip_concat() {
+        let a1 = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/a.mp4".into(),
+            name: "a.mp4".into(),
+            duration: 20.0,
+            streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        };
+        let a2 = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/b.mp4".into(),
+            name: "b.mp4".into(),
+            duration: 10.0,
+            streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        };
+        let track = make_track(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
+        let assets = vec![a1, a2.clone()];
+        let opts = ExportOptions::default();
+
+        let args = build_export_args(&track, &assets, "/out/concat.mp4", &opts).unwrap();
+
+        // Two -i flags for the two clips.
+        let input_count = args.windows(2).filter(|w| w[0] == "-i").count();
+        assert_eq!(input_count, 2);
+        let fc_pos = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let filter = &args[fc_pos + 1];
+        assert!(filter.contains("concat=n=2:v=1:a=1[outv][outa]"));
+        assert_eq!(args.last().unwrap(), "/out/concat.mp4");
+    }
+
+    #[test]
+    fn build_export_args_video_only_asset_gets_silence() {
+        let video_only = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/vo.mp4".into(),
+            name: "vo.mp4".into(),
+            duration: 5.0,
+            streams: vec![video_stream(1920, 1080, 30.0)],
+            imported_at: Utc::now(),
+        };
+        let track = make_track(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
+        let assets = vec![video_only];
+        let opts = ExportOptions::default();
+
+        let args = build_export_args(&track, &assets, "/out/vo.mp4", &opts).unwrap();
+
+        let fc_pos = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let filter = &args[fc_pos + 1];
+        assert!(filter.contains("anullsrc"), "video-only clip must get synthesized silence");
+        assert!(!filter.contains("[0:a]"), "no real audio stream should be trimmed");
+        assert!(filter.contains("concat=n=1:v=1:a=1[outv][outa]"));
+    }
+
+    #[test]
+    fn build_export_args_with_codec_and_crf_options() {
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/clip.mp4".into(),
+            name: "clip.mp4".into(),
+            duration: 10.0,
+            streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        };
+        let track = make_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = vec![asset];
+        let opts = ExportOptions {
+            video_codec: Some("libx264".to_string()),
+            audio_codec: Some("aac".to_string()),
+            crf: Some(23),
+            resolution: None,
+            fps: None,
+        };
+
+        let args = build_export_args(&track, &assets, "/out/result.mp4", &opts).unwrap();
+
+        let cv_pos = args.iter().position(|a| a == "-c:v").expect("-c:v must be present");
+        assert_eq!(args[cv_pos + 1], "libx264");
+        let ca_pos = args.iter().position(|a| a == "-c:a").expect("-c:a must be present");
+        assert_eq!(args[ca_pos + 1], "aac");
+        let crf_pos = args.iter().position(|a| a == "-crf").expect("-crf must be present");
+        assert_eq!(args[crf_pos + 1], "23");
+    }
+
+    #[test]
+    fn build_export_args_resolution_override() {
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/4k.mp4".into(),
+            name: "4k.mp4".into(),
+            duration: 10.0,
+            streams: vec![video_stream(3840, 2160, 60.0), audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        };
+        let track = make_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = vec![asset];
+        let opts = ExportOptions {
+            video_codec: None,
+            audio_codec: None,
+            crf: None,
+            resolution: Some((1920, 1080)),
+            fps: Some(30.0),
+        };
+
+        let args = build_export_args(&track, &assets, "/out/downscaled.mp4", &opts).unwrap();
+
+        let fc_pos = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let filter = &args[fc_pos + 1];
+        // Override forces 1920x1080 even though the source is 4K.
+        assert!(filter.contains("scale=1920:1080"), "resolution override must apply");
+        assert!(filter.contains("fps=30"), "fps override must apply");
+    }
+
+    #[test]
+    fn build_export_args_error_on_missing_asset() {
+        let track = make_track(vec![make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0)]);
+        let result = build_export_args(&track, &[], "/out/result.mp4", &ExportOptions::default());
+        assert!(matches!(result, Err(Error::AssetNotFound(_))));
     }
 }

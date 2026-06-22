@@ -28,7 +28,7 @@ mod ffmpeg;
 
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
-pub use cli::{detect_scenes, detect_silence, frame_at, waveform};
+pub use cli::{detect_scenes, detect_silence, frame_at, waveform, ExportOptions};
 
 #[cfg(feature = "whisper")]
 pub use cli::decode_audio_16k_mono;
@@ -57,4 +57,15 @@ pub fn render(timeline: &crate::model::Timeline, assets: &[crate::model::Asset],
 #[cfg(not(feature = "libav-render"))]
 pub fn render(timeline: &crate::model::Timeline, assets: &[crate::model::Asset], output: &Path, format: &str) -> Result<()> {
     cli::render(timeline, assets, output, format)
+}
+
+/// Like [`render`] but with explicit [`ExportOptions`]. Always uses the CLI
+/// backend (the libav-render feature does not yet support options).
+pub fn render_with(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    output: &Path,
+    opts: &ExportOptions,
+) -> Result<()> {
+    cli::render_with(timeline, assets, output, opts)
 }

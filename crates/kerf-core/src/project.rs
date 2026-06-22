@@ -731,6 +731,15 @@ impl Project {
         Ok(output.to_path_buf())
     }
 
+    /// Like [`export`] but with explicit [`engine::ExportOptions`].
+    pub fn export_with(&self, output_path: impl AsRef<Path>, opts: &engine::ExportOptions) -> Result<PathBuf> {
+        let timeline = self.timeline()?;
+        let assets = self.list_assets()?;
+        let output = output_path.as_ref();
+        engine::render_with(&timeline, &assets, output, opts)?;
+        Ok(output.to_path_buf())
+    }
+
     // ---- agent task queue -------------------------------------------------
 
     /// Enqueue a task for a connected agent to claim. Returns the new `queued`
