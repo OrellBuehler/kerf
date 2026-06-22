@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::Engine as _;
 use kerf_core::{EditSource, Project};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -147,10 +148,51 @@ struct FailTaskParams {
     error: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TaskIdParams {
+    #[schemars(description = "UUID of the task")]
+    task_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WaveformParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(description = "Number of peak-magnitude buckets to return")]
+    buckets: usize,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FrameParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(description = "Time in the source asset to decode (seconds)")]
+    time_secs: f64,
+    #[schemars(description = "Maximum output width in pixels (default 960)")]
+    max_width: Option<u32>,
+}
+
 #[derive(Serialize)]
 struct AssetMetadata {
     asset: kerf_core::Asset,
     analysis: Option<kerf_core::AssetAnalysis>,
+}
+
+#[derive(Serialize)]
+struct TrackSummary {
+    id: String,
+    name: String,
+    kind: String,
+    clip_count: usize,
+    duration_secs: f64,
+}
+
+#[derive(Serialize)]
+struct TimelineSummary {
+    total_duration_secs: f64,
+    track_count: usize,
+    total_clip_count: usize,
+    tracks: Vec<TrackSummary>,
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -358,6 +400,68 @@ impl KerfMcp {
         let task = project.fail_task(id, &p.error).map_err(core_err)?;
         self.changed();
         json(&task)
+    }
+
+    #[tool(description = "Mark a task done (user accepted the staged edit), returning the updated task")]
+    fn resolve_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.task_id)?;
+        let project = self.lock();
+        let task = project.resolve_task(id).map_err(core_err)?;
+        self.changed();
+        json(&task)
+    }
+
+    #[tool(description = "Remove a task from the queue permanently, returning the updated task list")]
+    fn remove_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.task_id)?;
+        let project = self.lock();
+        project.remove_task(id).map_err(core_err)?;
+        self.changed();
+        json(&project.list_tasks().map_err(core_err)?)
+    }
+
+    #[tool(description = "Get peak-magnitude waveform data (0.0–1.0) for an asset's first audio stream")]
+    fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.lock();
+        let buckets = project.waveform(id, p.buckets).map_err(core_err)?;
+        json(&buckets)
+    }
+
+    #[tool(description = "Decode a single frame from an asset and return it as a base64 PNG data URL")]
+    fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.lock();
+        let png = project
+            .frame_at(id, p.time_secs, p.max_width.unwrap_or(960))
+            .map_err(core_err)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        Ok(format!("data:image/png;base64,{b64}"))
+    }
+
+    #[tool(description = "Summarise the timeline: total duration, track count, clips per track, and any per-track gaps")]
+    fn timeline_summary(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        let timeline = project.timeline().map_err(core_err)?;
+        let tracks: Vec<TrackSummary> = timeline
+            .tracks
+            .iter()
+            .map(|t| TrackSummary {
+                id: t.id.to_string(),
+                name: t.name.clone(),
+                kind: format!("{:?}", t.kind).to_lowercase(),
+                clip_count: t.clips.len(),
+                duration_secs: t.end(),
+            })
+            .collect();
+        let total_clip_count = tracks.iter().map(|t| t.clip_count).sum();
+        let summary = TimelineSummary {
+            total_duration_secs: timeline.duration(),
+            track_count: tracks.len(),
+            total_clip_count,
+            tracks,
+        };
+        json(&summary)
     }
 }
 
