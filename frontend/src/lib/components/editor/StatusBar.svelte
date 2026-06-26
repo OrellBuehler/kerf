@@ -1,6 +1,11 @@
 <script lang="ts">
+	import Icon from './Icon.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { inTauri, revealLogs } from '$lib/api';
+	import { toast } from 'svelte-sonner';
+
+	const showLogs = inTauri();
 
 	/** Real metadata of the selected asset: fps · resolution · codec. */
 	const meta = $derived.by(() => {
@@ -51,5 +56,18 @@
 				? ''
 				: 's'}
 		</span>
+	{/if}
+	{#if showLogs}
+		<span style="width:1px;height:12px;background:var(--border-default)"></span>
+		<button
+			type="button"
+			title="Open the log folder — attach kerf.<date>.log when reporting an issue"
+			onclick={() =>
+				revealLogs().catch((e) => toast.error(e instanceof Error ? e.message : String(e)))}
+			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-disabled);font-size:10px;padding:0"
+		>
+			<Icon n="folder-open" s={11} />
+			Logs
+		</button>
 	{/if}
 </div>

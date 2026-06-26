@@ -3,7 +3,8 @@
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { clipDuration } from '$lib/types';
+	import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from '$lib/types';
+	import type { TransitionKind } from '$lib/types';
 	import { toast } from 'svelte-sonner';
 
 	const clip = $derived(editor.selectedClip);
@@ -13,6 +14,10 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	const tf = $derived(clip?.transform ?? DEFAULT_TRANSFORM);
+	const col = $derived(clip?.color ?? DEFAULT_COLOR);
+	const speed = $derived(clip?.speed ?? 1);
+	const transition = $derived(clip?.transition_in ?? null);
 
 	function tc(s: number): string {
 		const t = Math.max(0, s);
@@ -34,6 +39,8 @@
 
 	const inputCss =
 		'width:90px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:5px 7px;text-align:right';
+	const selectCss =
+		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
 </script>
 
 {#snippet secHead(label: string)}
@@ -68,6 +75,37 @@
 			}}
 			style={inputCss}
 		/>
+	</label>
+{/snippet}
+
+{#snippet rangeRow(
+	label: string,
+	value: number,
+	min: number,
+	max: number,
+	step: number,
+	display: string,
+	onCommit: (v: number) => void
+)}
+	<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
+		<span style="font-size:12px;color:var(--text-muted);width:64px;flex:none">{label}</span>
+		<input
+			type="range"
+			{min}
+			{max}
+			{step}
+			{value}
+			disabled={editor.busy}
+			onchange={(e) => {
+				const v = parseFloat(e.currentTarget.value);
+				if (Number.isFinite(v)) onCommit(v);
+			}}
+			style="flex:1;accent-color:var(--kerf-500)"
+		/>
+		<span
+			style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
+			>{display}</span
+		>
 	</label>
 {/snippet}
 
@@ -147,6 +185,90 @@
 			{@render numRow('Fade out', clip.fade_out, 0.1, (v) =>
 				run(() => editor.setFade(clip.id, undefined, Math.max(0, v)))
 			)}
+
+			{@render secHead('Speed')}
+			{@render rangeRow('Rate', Math.abs(speed), 0.25, 4, 0.25, `${Math.abs(speed).toFixed(2)}×`, (v) =>
+				run(() => editor.setSpeed(clip.id, speed < 0 ? -v : v))
+			)}
+			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+				<span style="font-size:12px;color:var(--text-muted)">Reverse</span>
+				<input
+					type="checkbox"
+					checked={speed < 0}
+					disabled={editor.busy}
+					onchange={() => run(() => editor.setSpeed(clip.id, -speed))}
+					style="accent-color:var(--kerf-500);width:15px;height:15px"
+				/>
+			</label>
+
+			{#if kind === 'video'}
+				{@render secHead('Transform')}
+				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, `${Math.round(tf.scale * 100)}%`, (v) =>
+					run(() => editor.setTransform(clip.id, { scale: v }))
+				)}
+				{@render rangeRow('Position X', tf.pos_x, -0.5, 0.5, 0.01, tf.pos_x.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { pos_x: v }))
+				)}
+				{@render rangeRow('Position Y', tf.pos_y, -0.5, 0.5, 0.01, tf.pos_y.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { pos_y: v }))
+				)}
+				{@render rangeRow('Rotation', tf.rotation, -180, 180, 1, `${Math.round(tf.rotation)}°`, (v) =>
+					run(() => editor.setTransform(clip.id, { rotation: v }))
+				)}
+				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, `${Math.round(tf.opacity * 100)}%`, (v) =>
+					run(() => editor.setTransform(clip.id, { opacity: v }))
+				)}
+				{@render rangeRow('Crop L', tf.crop_left, 0, 0.9, 0.01, tf.crop_left.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { crop_left: v }))
+				)}
+				{@render rangeRow('Crop R', tf.crop_right, 0, 0.9, 0.01, tf.crop_right.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { crop_right: v }))
+				)}
+				{@render rangeRow('Crop T', tf.crop_top, 0, 0.9, 0.01, tf.crop_top.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { crop_top: v }))
+				)}
+				{@render rangeRow('Crop B', tf.crop_bottom, 0, 0.9, 0.01, tf.crop_bottom.toFixed(2), (v) =>
+					run(() => editor.setTransform(clip.id, { crop_bottom: v }))
+				)}
+
+				{@render secHead('Color')}
+				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, col.brightness.toFixed(2), (v) =>
+					run(() => editor.setColor(clip.id, { brightness: v }))
+				)}
+				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, col.contrast.toFixed(2), (v) =>
+					run(() => editor.setColor(clip.id, { contrast: v }))
+				)}
+				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, col.saturation.toFixed(2), (v) =>
+					run(() => editor.setColor(clip.id, { saturation: v }))
+				)}
+				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, col.gamma.toFixed(2), (v) =>
+					run(() => editor.setColor(clip.id, { gamma: v }))
+				)}
+			{/if}
+
+			{@render secHead('Transition (in)')}
+			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+				<span style="font-size:12px;color:var(--text-muted)">Type</span>
+				<select
+					value={transition?.kind ?? ''}
+					disabled={editor.busy}
+					onchange={(e) => {
+						const k = e.currentTarget.value as '' | TransitionKind;
+						if (!k) void run(() => editor.setTransition(clip.id, null));
+						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? 0.5 }));
+					}}
+					style={selectCss}
+				>
+					<option value="">None</option>
+					<option value="crossfade">Crossfade</option>
+					<option value="dip_to_black">Dip to black</option>
+				</select>
+			</label>
+			{#if transition}
+				{@render numRow('Duration', transition.duration, 0.1, (v) =>
+					run(() => editor.setTransition(clip.id, { kind: transition.kind, duration: Math.max(0.05, v) }))
+				)}
+			{/if}
 
 			<div style="margin-top:18px;display:flex;flex-direction:column;gap:7px">
 				<Btn

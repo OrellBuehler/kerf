@@ -90,6 +90,147 @@ pub struct AssetAnalysis {
     pub transcript: Vec<TranscriptSegment>,
 }
 
+fn one() -> f64 {
+    1.0
+}
+
+/// Per-clip geometric transform applied when compositing at export. A default
+/// transform is the identity (full-frame, centered, opaque, uncropped).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    /// Uniform scale multiplier applied after the clip is fit to the frame
+    /// (1.0 = fit). Values < 1.0 shrink the picture for picture-in-picture.
+    #[serde(default = "one")]
+    pub scale: f64,
+    /// Horizontal offset as a fraction of the frame width (0.0 = centered).
+    #[serde(default)]
+    pub pos_x: f64,
+    /// Vertical offset as a fraction of the frame height (0.0 = centered).
+    #[serde(default)]
+    pub pos_y: f64,
+    /// Clockwise rotation in degrees.
+    #[serde(default)]
+    pub rotation: f64,
+    /// Opacity in 0.0–1.0 (1.0 = fully opaque).
+    #[serde(default = "one")]
+    pub opacity: f64,
+    /// Fraction of the source cropped from each edge (0.0 = no crop).
+    #[serde(default)]
+    pub crop_left: f64,
+    #[serde(default)]
+    pub crop_right: f64,
+    #[serde(default)]
+    pub crop_top: f64,
+    #[serde(default)]
+    pub crop_bottom: f64,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            crop_left: 0.0,
+            crop_right: 0.0,
+            crop_top: 0.0,
+            crop_bottom: 0.0,
+        }
+    }
+}
+
+impl Transform {
+    /// True when the transform leaves the picture untouched (full-frame fit).
+    pub fn is_identity(&self) -> bool {
+        *self == Transform::default()
+    }
+
+    /// True when compositing this clip needs an alpha channel (rotation leaves
+    /// transparent corners; opacity blends; both require alpha).
+    pub fn needs_alpha(&self) -> bool {
+        self.opacity < 1.0 || self.rotation != 0.0
+    }
+
+    /// True when any edge crop is requested.
+    pub fn has_crop(&self) -> bool {
+        self.crop_left > 0.0 || self.crop_right > 0.0 || self.crop_top > 0.0 || self.crop_bottom > 0.0
+    }
+}
+
+/// Per-clip color correction applied at export via the `eq` filter. A default
+/// is the identity (no change).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Color {
+    /// Additive brightness in -1.0–1.0 (0.0 = unchanged).
+    #[serde(default)]
+    pub brightness: f64,
+    /// Contrast multiplier (1.0 = unchanged).
+    #[serde(default = "one")]
+    pub contrast: f64,
+    /// Saturation multiplier (1.0 = unchanged).
+    #[serde(default = "one")]
+    pub saturation: f64,
+    /// Gamma (1.0 = unchanged).
+    #[serde(default = "one")]
+    pub gamma: f64,
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            gamma: 1.0,
+        }
+    }
+}
+
+impl Color {
+    /// True when the color correction leaves the picture untouched.
+    pub fn is_identity(&self) -> bool {
+        *self == Color::default()
+    }
+}
+
+/// How a clip blends with the preceding clip on its track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKind {
+    /// Dissolve: the incoming clip fades up over the outgoing clip's tail.
+    Crossfade,
+    /// Dip to black: the outgoing clip fades to black, the incoming up from it.
+    DipToBlack,
+}
+
+impl TransitionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransitionKind::Crossfade => "crossfade",
+            TransitionKind::DipToBlack => "dip_to_black",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "crossfade" => Some(TransitionKind::Crossfade),
+            "dip_to_black" | "diptoblack" => Some(TransitionKind::DipToBlack),
+            _ => None,
+        }
+    }
+}
+
+/// A transition blending the **start** of a clip with the clip that precedes it
+/// on the same track. Realized at export.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    /// Duration of the transition in seconds.
+    pub duration: f64,
+}
+
 /// A single non-destructive edit referencing a source range of an asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Clip {
@@ -110,11 +251,63 @@ pub struct Clip {
     /// Fade-out duration at the clip's end (seconds); 0.0 = no fade.
     #[serde(default)]
     pub fade_out: f64,
+    /// Playback rate (1.0 = unchanged). > 1.0 speeds up, < 1.0 slows down, and a
+    /// negative value plays the source in reverse. The clip's timeline duration
+    /// is its source span divided by the magnitude of the speed.
+    #[serde(default = "one")]
+    pub speed: f64,
+    /// Geometric transform (scale / position / crop / rotation / opacity).
+    #[serde(default)]
+    pub transform: Transform,
+    /// Color correction (brightness / contrast / saturation / gamma).
+    #[serde(default)]
+    pub color: Color,
+    /// Transition blending this clip's start with the preceding clip, if any.
+    #[serde(default)]
+    pub transition_in: Option<Transition>,
 }
 
+/// Smallest speed magnitude allowed, to keep clip durations finite.
+pub const MIN_SPEED: f64 = 0.01;
+
 impl Clip {
-    pub fn duration(&self) -> f64 {
+    /// A new clip with default volume, no fades, full speed and identity
+    /// transform / color and no transition.
+    pub fn new(asset_id: Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            asset_id,
+            source_in,
+            source_out,
+            timeline_start,
+            volume: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            speed: 1.0,
+            transform: Transform::default(),
+            color: Color::default(),
+            transition_in: None,
+        }
+    }
+
+    /// Length of the referenced source span (seconds), ignoring speed.
+    pub fn source_duration(&self) -> f64 {
         (self.source_out - self.source_in).max(0.0)
+    }
+
+    /// Speed magnitude, clamped away from zero (direction dropped).
+    pub fn speed_mag(&self) -> f64 {
+        self.speed.abs().max(MIN_SPEED)
+    }
+
+    /// True when the clip plays its source in reverse.
+    pub fn is_reversed(&self) -> bool {
+        self.speed < 0.0
+    }
+
+    /// Duration on the timeline (seconds), i.e. the source span retimed by speed.
+    pub fn duration(&self) -> f64 {
+        self.source_duration() / self.speed_mag()
     }
 
     pub fn timeline_end(&self) -> f64 {

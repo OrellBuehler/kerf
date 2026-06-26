@@ -10,14 +10,17 @@ import type {
 	AssetAnalysis,
 	AssetMetadata,
 	Clip,
+	Color,
 	EditSource,
 	Revision,
 	StreamKind,
 	Task,
 	Timeline,
-	Track
+	Track,
+	Transform,
+	Transition
 } from './types';
-import { clipDuration } from './types';
+import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -301,9 +304,18 @@ export async function splitClip(clipId: string, at: number): Promise<Timeline> {
 			const [track, ci] = found;
 			const clip = track.clips[ci];
 			if (at > clip.timeline_start && at < clip.timeline_start + clipDuration(clip)) {
-				const splitSrc = clip.source_in + (at - clip.timeline_start);
-				const right: Clip = { ...clip, id: uid(), source_in: splitSrc, timeline_start: at };
-				clip.source_out = splitSrc;
+				const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
+				const offset = (at - clip.timeline_start) * mag;
+				const right: Clip = { ...clip, id: uid(), timeline_start: at, transition_in: null };
+				if ((clip.speed ?? 1) < 0) {
+					const splitSrc = clip.source_out - offset;
+					right.source_out = splitSrc;
+					clip.source_in = splitSrc;
+				} else {
+					const splitSrc = clip.source_in + offset;
+					right.source_in = splitSrc;
+					clip.source_out = splitSrc;
+				}
 				track.clips.splice(ci + 1, 0, right);
 			}
 		}
@@ -454,6 +466,87 @@ export async function setFade(clipId: string, fadeIn?: number, fadeOut?: number)
 	return invoke<Timeline>('set_fade', { clipId, fadeIn, fadeOut });
 }
 
+/** Set a clip's playback speed (1.0 = normal, negative = reverse). */
+export async function setSpeed(clipId: string, speed: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].speed = speed;
+		recordDev('Set speed');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_speed', { clipId, speed });
+}
+
+/** Update a clip's geometric transform; only the provided fields change. */
+export async function setTransform(clipId: string, patch: Partial<Transform>): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			const next: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
+			for (const k of Object.keys(patch) as (keyof Transform)[]) {
+				const v = patch[k];
+				if (v !== undefined) next[k] = v;
+			}
+			clip.transform = next;
+		}
+		recordDev('Set transform');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_transform', {
+		clipId,
+		scale: patch.scale,
+		posX: patch.pos_x,
+		posY: patch.pos_y,
+		rotation: patch.rotation,
+		opacity: patch.opacity,
+		cropLeft: patch.crop_left,
+		cropRight: patch.crop_right,
+		cropTop: patch.crop_top,
+		cropBottom: patch.crop_bottom
+	});
+}
+
+/** Update a clip's color correction; only the provided fields change. */
+export async function setColor(clipId: string, patch: Partial<Color>): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			const next: Color = { ...DEFAULT_COLOR, ...(clip.color ?? {}) };
+			for (const k of Object.keys(patch) as (keyof Color)[]) {
+				const v = patch[k];
+				if (v !== undefined) next[k] = v;
+			}
+			clip.color = next;
+		}
+		recordDev('Set color');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_color', {
+		clipId,
+		brightness: patch.brightness,
+		contrast: patch.contrast,
+		saturation: patch.saturation,
+		gamma: patch.gamma
+	});
+}
+
+/** Set or clear (`null`) the transition blending a clip's start with the prior clip. */
+export async function setTransition(clipId: string, transition: Transition | null): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].transition_in = transition;
+		recordDev('Set transition');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_transition', {
+		clipId,
+		kind: transition?.kind,
+		duration: transition?.duration
+	});
+}
+
 export async function removeSilence(assetId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const asset = assetById(assetId);
@@ -596,6 +689,20 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 export async function exportTimeline(outputPath: string, format: string): Promise<string> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
 	return invoke<string>('export_timeline', { outputPath, format });
+}
+
+// ---- diagnostics (logs) ----------------------------------------------------
+
+/** The platform log directory Kerf writes its logfile to, or `null` in the browser. */
+export async function logDir(): Promise<string | null> {
+	if (!inTauri()) return null;
+	return (await invoke<string>('log_dir')) ?? null;
+}
+
+/** Open the log directory in the OS file manager so the user can attach the logfile. */
+export async function revealLogs(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('reveal_logs');
 }
 
 /** Open a save dialog and render the timeline to the chosen path. */

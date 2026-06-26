@@ -26,13 +26,29 @@ import {
 	rippleDelete,
 	revertTo as apiRevertTo,
 	saveProjectAs as apiSaveProjectAs,
+	setColor,
 	setFade,
+	setSpeed,
+	setTransform,
+	setTransition,
 	setVolume,
 	splitClip,
 	trimClip,
 	undo as apiUndo
 } from './api';
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Revision, StreamKind, Timeline } from './types';
+import type {
+	Asset,
+	AssetAnalysis,
+	AssetMetadata,
+	Clip,
+	Color,
+	Revision,
+	StreamKind,
+	Timeline,
+	Transform,
+	Transition
+} from './types';
+import { clipDuration } from './types';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -64,7 +80,7 @@ class EditorState {
 	get duration(): number {
 		let max = 0;
 		for (const t of this.timeline.tracks) {
-			for (const c of t.clips) max = Math.max(max, c.timeline_start + Math.max(0, c.source_out - c.source_in));
+			for (const c of t.clips) max = Math.max(max, c.timeline_start + clipDuration(c));
 		}
 		return max;
 	}
@@ -256,6 +272,18 @@ class EditorState {
 	}
 	setFade(clipId: string, fadeIn?: number, fadeOut?: number) {
 		return this.#apply(setFade(clipId, fadeIn, fadeOut));
+	}
+	setSpeed(clipId: string, speed: number) {
+		return this.#apply(setSpeed(clipId, speed));
+	}
+	setTransform(clipId: string, patch: Partial<Transform>) {
+		return this.#apply(setTransform(clipId, patch));
+	}
+	setColor(clipId: string, patch: Partial<Color>) {
+		return this.#apply(setColor(clipId, patch));
+	}
+	setTransition(clipId: string, transition: Transition | null) {
+		return this.#apply(setTransition(clipId, transition));
 	}
 	removeSilence(assetId: string) {
 		return this.#apply(removeSilence(assetId));

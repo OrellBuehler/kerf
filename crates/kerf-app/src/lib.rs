@@ -10,9 +10,9 @@ mod mcp;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, StreamKind, Task, Timeline};
+use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, StreamKind, Task, Timeline, Transition, TransitionKind};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 struct AppState {
@@ -46,6 +46,19 @@ fn kind(s: &str) -> CmdResult<StreamKind> {
         "video" => Ok(StreamKind::Video),
         "audio" => Ok(StreamKind::Audio),
         other => Err(format!("invalid track kind '{other}'; expected \"video\" or \"audio\"")),
+    }
+}
+
+/// Build a `Transition` from a kind string + duration, or `None` to clear it.
+fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Option<Transition>> {
+    match kind {
+        None => Ok(None),
+        Some(k) => {
+            let kind = TransitionKind::parse(&k)
+                .ok_or_else(|| format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""))?;
+            let duration = duration.ok_or("transition duration is required")?;
+            Ok(Some(Transition { kind, duration }))
+        }
     }
 }
 
@@ -249,6 +262,66 @@ fn set_fade(
 }
 
 #[tauri::command]
+fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_speed(id, speed).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn set_transform(
+    state: State<'_, AppState>,
+    clip_id: String,
+    scale: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    rotation: Option<f64>,
+    opacity: Option<f64>,
+    crop_left: Option<f64>,
+    crop_right: Option<f64>,
+    crop_top: Option<f64>,
+    crop_bottom: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project
+        .set_transform(id, scale, pos_x, pos_y, rotation, opacity, crop_left, crop_right, crop_top, crop_bottom)
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_color(
+    state: State<'_, AppState>,
+    clip_id: String,
+    brightness: Option<f64>,
+    contrast: Option<f64>,
+    saturation: Option<f64>,
+    gamma: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_color(id, brightness, contrast, saturation, gamma).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_transition(
+    state: State<'_, AppState>,
+    clip_id: String,
+    kind: Option<String>,
+    duration: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let transition = parse_transition(kind, duration)?;
+    let project = state.project()?;
+    project.set_transition(id, transition).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
     let project = state.project()?;
@@ -349,6 +422,26 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, format: Stri
     Ok(out.to_string_lossy().into_owned())
 }
 
+// ---- diagnostics (logs) ----------------------------------------------------
+
+#[tauri::command]
+fn log_dir(app: AppHandle) -> CmdResult<String> {
+    app.path()
+        .app_log_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+/// Open the log directory in the OS file manager so users can attach the file.
+#[tauri::command]
+fn reveal_logs(app: AppHandle) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Packaged builds ship `ffmpeg`/`ffprobe` next to the executable as Tauri
 /// `externalBin` sidecars (see `tauri.conf.json`'s `bundle.externalBin`, injected
 /// for Windows where there is no system FFmpeg). Point the CLI engine at them via
@@ -371,26 +464,86 @@ fn use_bundled_ffmpeg() {
     }
 }
 
+/// Install the global tracing subscriber: always to stdout, and — when the
+/// platform log directory is writable — to a daily-rolling `kerf.<date>.log`
+/// there (the last 14 days are kept) so users hitting an issue can attach it.
+/// Level is `info` by default; override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+fn init_logging(app: &AppHandle) {
+    use tracing_subscriber::prelude::*;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+
+    let file = app.path().app_log_dir().ok().and_then(|dir| {
+        std::fs::create_dir_all(&dir).ok()?;
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("kerf")
+            .filename_suffix("log")
+            .max_log_files(14)
+            .build(&dir)
+            .ok()?;
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        // Keep the flush worker alive for the whole process; we never tear it down.
+        Box::leak(Box::new(guard));
+        Some((tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer), dir))
+    });
+
+    match file {
+        Some((layer, dir)) => {
+            tracing_subscriber::registry().with(filter).with(stdout).with(layer).init();
+            tracing::info!(dir = %dir.display(), "logging to file");
+        }
+        None => {
+            tracing_subscriber::registry().with(filter).with(stdout).init();
+            tracing::warn!("file logging unavailable; logging to stdout only");
+        }
+    }
+}
+
+/// Route panics through tracing so they land in the logfile, then run the
+/// default hook (which still prints the backtrace to stderr).
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_string());
+        tracing::error!(location = %location, "panic: {message}");
+        default(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    use_bundled_ffmpeg();
-
     // Start on a fresh, empty in-memory project; the user opens an existing
     // `.kerf` file or imports media to populate it.
     let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             project: project.clone(),
         })
         .setup(move |app| {
+            // Logging needs the resolved platform log directory, so set it up here
+            // (before anything else in setup) rather than at the top of `run`.
+            init_logging(app.handle());
+            install_panic_hook();
+            use_bundled_ffmpeg();
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                arch = std::env::consts::ARCH,
+                "kerf starting"
+            );
+
             // The app *is* the MCP server: host the tools over HTTP, sharing the
             // same Project the GUI edits, so a connected LLM works on the open
             // project and its edits show up live.
@@ -424,6 +577,10 @@ pub fn run() {
             remove_clip,
             set_volume,
             set_fade,
+            set_speed,
+            set_transform,
+            set_color,
+            set_transition,
             remove_silence,
             extract_audio,
             concatenate,
@@ -437,7 +594,9 @@ pub fn run() {
             add_task,
             resolve_task,
             remove_task,
-            export_timeline
+            export_timeline,
+            log_dir,
+            reveal_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerf");

@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use super::ProbeResult;
 use crate::error::{Error, Result};
-use crate::model::{Asset, StreamInfo, StreamKind, TimeRange, Timeline};
+use crate::model::{Asset, Clip, StreamInfo, StreamKind, TimeRange, Timeline, TransitionKind};
 
 fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
@@ -409,7 +409,14 @@ pub fn build_export_args(
 ) -> Result<Vec<String>> {
     let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
 
-    let mut args: Vec<String> = vec!["-y".to_string()];
+    // `-hide_banner -nostats` keep the captured stderr to genuine warnings/errors
+    // (matching the probe/frame calls); without `-nostats` the per-frame progress
+    // lines would accumulate unbounded in memory for a long export.
+    let mut args: Vec<String> = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-nostats".to_string(),
+    ];
     for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         args.push("-i".to_string());
@@ -466,27 +473,23 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
     let args = build_export_args(timeline, assets, output_str, opts)?;
 
     let bin = ffmpeg_bin();
-    let status = Command::new(&bin).args(&args).status().map_err(|e| launch_err(&bin, e))?;
-    if !status.success() {
-        return Err(Error::Engine(format!("ffmpeg exited with {status}")));
-    }
-    Ok(())
-}
+    let clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
+    tracing::info!(output = %output.display(), clips, "exporting timeline");
+    tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
-/// Build a fade-filter prefix (with a trailing comma) for one clip, or `""`
-/// when it has no fades. `name` is `fade` for picture or `afade` for audio.
-/// Each fade is clamped to the clip's `dur` so it can never exceed the segment.
-fn fade_chain(name: &str, fade_in: f64, fade_out: f64, dur: f64) -> String {
-    let fi = fade_in.clamp(0.0, dur);
-    let fo = fade_out.clamp(0.0, dur);
-    let mut chain = String::new();
-    if fi > 0.0 {
-        chain.push_str(&format!("{name}=t=in:st=0:d={fi},"));
+    // Capture output (rather than inheriting) so ffmpeg's stderr — the actual
+    // failure reason — ends up in the error and the log, not just the console.
+    let out = Command::new(&bin).args(&args).output().map_err(|e| launch_err(&bin, e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+        tail.reverse();
+        let tail = tail.join("\n");
+        tracing::error!(status = %out.status, "ffmpeg export failed:\n{tail}");
+        return Err(Error::Engine(format!("ffmpeg exited with {}: {}", out.status, tail.trim())));
     }
-    if fo > 0.0 {
-        chain.push_str(&format!("{name}=t=out:st={st}:d={fo},", st = (dur - fo).max(0.0)));
-    }
-    chain
+    tracing::info!(output = %output.display(), "export complete");
+    Ok(())
 }
 
 /// The result of [`build_filter_complex`]: the `-filter_complex` string plus
@@ -524,22 +527,34 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
     };
     let layout = fmt.channel_layout();
 
-    // Assign each clip its ffmpeg input index (track-then-clip order) and split
-    // into the video clips (composited) and the audio-bearing clips (mixed).
+    // Assign each clip its ffmpeg input index (track-then-storage order, matching
+    // the `-i` order) and split into composited video clips and mixed audio clips.
+    // Within a track the clips are visited in *timeline* order so video overlays
+    // composite in timeline order (a later clip on top of an earlier one's tail,
+    // e.g. during a crossfade); tracks keep their list order so a later track
+    // still composites on top.
     let mut video: Vec<(usize, &crate::model::Clip)> = Vec::new();
     let mut audio: Vec<(usize, &crate::model::Clip)> = Vec::new();
-    let mut idx = 0;
+    let mut base = 0;
     for track in &timeline.tracks {
-        for clip in &track.clips {
+        let mut order: Vec<usize> = (0..track.clips.len()).collect();
+        order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
+        for &cj in &order {
+            let clip = &track.clips[cj];
+            let i = base + cj; // storage-order input index
             if track.kind == StreamKind::Video {
-                video.push((idx, clip));
+                video.push((i, clip));
             }
             if has_audio(clip) {
-                audio.push((idx, clip));
+                audio.push((i, clip));
             }
-            idx += 1;
         }
+        base += track.clips.len();
     }
+
+    // Per-clip transition adjustments (crossfade tail / alpha, dip-to-black
+    // fades), computed per track from each clip's `transition_in`.
+    let fx = transition_fx(timeline, assets);
 
     let mut chains: Vec<String> = Vec::new();
 
@@ -556,31 +571,22 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
         let mut cur = "vbase".to_string();
         let last = video.len() - 1;
         for (n, (i, clip)) in video.iter().enumerate() {
-            let dur = clip.duration();
-            let start = clip.timeline_start;
-            let end = clip.timeline_end();
-            chains.push(format!(
-                "[{i}:v]trim=start={si}:end={so},setpts=PTS-STARTPTS+{start}/TB,\
-                 scale={w}:{h}:force_original_aspect_ratio=decrease,\
-                 pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},{vfade}format=yuv420p[v{i}]",
-                i = i,
-                si = clip.source_in,
-                so = clip.source_out,
-                start = start,
-                w = fmt.width,
-                h = fmt.height,
-                fps = fmt.fps,
-                vfade = fade_chain("fade", clip.fade_in, clip.fade_out, dur),
-            ));
+            chains.push(format!("[{i}:v]{chain}[v{i}]", i = i, chain = video_clip_chain(clip, fmt, &fx[*i])));
             let out = if n == last { "outv".to_string() } else { format!("vov{n}") };
-            chains.push(format!(
-                "[{cur}][v{i}]overlay=eof_action=pass:enable='between(t,{start},{end})'[{out}]",
-                cur = cur,
-                i = i,
-                start = start,
-                end = end,
-                out = out,
-            ));
+            let end = clip.timeline_end() + fx[*i].tail;
+            let overlay = if clip.transform.is_identity() {
+                format!("overlay=eof_action=pass:enable='between(t,{start},{end})'", start = clip.timeline_start)
+            } else {
+                let t = &clip.transform;
+                format!(
+                    "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H:\
+                     eof_action=pass:enable='between(t,{start},{end})'",
+                    px = t.pos_x,
+                    py = t.pos_y,
+                    start = clip.timeline_start,
+                )
+            };
+            chains.push(format!("[{cur}][v{i}]{overlay}[{out}]"));
             cur = out;
         }
     }
@@ -589,20 +595,7 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
     let has_audio_out = !audio.is_empty();
     if has_audio_out {
         for (i, clip) in &audio {
-            let dur = clip.duration();
-            let delay_ms = (clip.timeline_start * 1000.0).round().max(0.0) as i64;
-            chains.push(format!(
-                "[{i}:a]atrim=start={si}:end={so},asetpts=PTS-STARTPTS,volume={vol},\
-                 {afade}aformat=sample_rates={sr}:channel_layouts={layout},adelay={delay}:all=1[a{i}]",
-                i = i,
-                si = clip.source_in,
-                so = clip.source_out,
-                vol = clip.volume,
-                sr = fmt.sample_rate,
-                layout = layout,
-                afade = fade_chain("afade", clip.fade_in, clip.fade_out, dur),
-                delay = delay_ms,
-            ));
+            chains.push(format!("[{i}:a]{chain}[a{i}]", i = i, chain = audio_clip_chain(clip, fmt, &fx[*i], layout)));
         }
         let inputs: String = audio.iter().map(|(i, _)| format!("[a{i}]")).collect();
         chains.push(format!(
@@ -617,6 +610,227 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
         has_video,
         has_audio: has_audio_out,
     }
+}
+
+/// Per-clip render adjustments derived from transitions. `tail` extends an
+/// outgoing clip so it keeps showing under the incoming crossfade; `xfade_in`
+/// is the incoming clip's alpha dissolve; `black_in`/`black_out` are the
+/// dip-to-black fades on either side of a cut.
+#[derive(Clone, Copy, Default)]
+struct ClipFx {
+    tail: f64,
+    xfade_in: f64,
+    black_in: f64,
+    black_out: f64,
+}
+
+/// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
+/// track-then-clip order), resolving each `transition_in` against the clip that
+/// precedes it on the same track in timeline order.
+fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
+    let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
+    let mut fx = vec![ClipFx::default(); total_clips];
+    let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
+
+    let mut base = 0;
+    for track in &timeline.tracks {
+        let n = track.clips.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
+        for w in 0..n {
+            let j = order[w];
+            let clip = &track.clips[j];
+            let Some(tr) = clip.transition_in else { continue };
+            let d = tr.duration.max(0.0);
+            if d <= 0.0 {
+                continue;
+            }
+            // The transition partner is the immediately preceding clip on the
+            // track — but only when it is actually adjacent (no gap before this
+            // clip); otherwise the transition resolves against black.
+            let prev = (w > 0)
+                .then(|| order[w - 1])
+                .filter(|&pj| (track.clips[pj].timeline_end() - clip.timeline_start).abs() < 1e-3);
+            match tr.kind {
+                TransitionKind::Crossfade => match prev {
+                    Some(pj) => {
+                        let p = &track.clips[pj];
+                        // The tail borrows the outgoing clip's unused source: for a
+                        // forward clip that is the handle past source_out, for a
+                        // reversed clip the handle below source_in.
+                        let avail = if p.is_reversed() {
+                            p.source_in / p.speed_mag()
+                        } else {
+                            asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0) / p.speed_mag()
+                        };
+                        // Both sides share the achievable overlap so the dissolve
+                        // length matches the tail (no fade-from-black when there is
+                        // no handle — it just becomes a hard cut).
+                        let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
+                        fx[base + j].xfade_in = overlap;
+                        fx[base + pj].tail = fx[base + pj].tail.max(overlap);
+                    }
+                    // No adjacent predecessor: dissolve up from black.
+                    None => fx[base + j].xfade_in = d.min(clip.duration()),
+                },
+                TransitionKind::DipToBlack => {
+                    fx[base + j].black_in = (d / 2.0).min(clip.duration());
+                    if let Some(pj) = prev {
+                        let p = &track.clips[pj];
+                        let out = (d / 2.0).min(p.duration());
+                        fx[base + pj].black_out = fx[base + pj].black_out.max(out);
+                    }
+                }
+            }
+        }
+        base += n;
+    }
+    fx
+}
+
+/// The video filter chain for one clip (everything between its `[i:v]` input
+/// and its `[v{i}]` output): trim, optional reverse / crop / retime, fit or
+/// transform geometry, color correction, fades and transition alpha. With all
+/// new properties at their defaults this reduces to the original
+/// fit-and-letterbox chain.
+fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
+    let s = clip.speed_mag();
+    let t = &clip.transform;
+    // `transform_alpha` is alpha from opacity/rotation (established in the geometry
+    // step); `needs_alpha` also covers the crossfade alpha dissolve.
+    let transform_alpha = !t.is_identity() && t.needs_alpha();
+    let needs_alpha = transform_alpha || fx.xfade_in > 0.0;
+    let dur = clip.duration() + fx.tail;
+    // A crossfade tail borrows unused source: forward clips extend past source_out,
+    // reversed clips extend below source_in (reverse plays high->low, so the visible
+    // tail is at the low end).
+    let (trim_start, trim_end) = if clip.is_reversed() {
+        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
+    } else {
+        (clip.source_in, clip.source_out + fx.tail * s)
+    };
+
+    let mut p: Vec<String> = Vec::new();
+    p.push(format!("trim=start={trim_start}:end={trim_end}"));
+    if clip.is_reversed() {
+        p.push("reverse".to_string());
+    }
+    if t.has_crop() {
+        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
+        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
+        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = t.crop_left, ct = t.crop_top));
+    }
+    if (s - 1.0).abs() < 1e-9 {
+        p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
+    } else {
+        p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
+    }
+    if t.is_identity() {
+        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease", w = fmt.width, h = fmt.height));
+        p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
+    } else {
+        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease", w = fmt.width, h = fmt.height));
+        if (t.scale - 1.0).abs() > 1e-9 {
+            p.push(format!("scale=iw*{sc}:ih*{sc}", sc = t.scale));
+        }
+    }
+    p.push("setsar=1".to_string());
+    p.push(format!("fps={}", fmt.fps));
+    // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`
+    // has no alpha-capable input format, so the graph would otherwise auto-insert a
+    // conversion that drops the alpha (silently disabling opacity / rotation).
+    if !clip.color.is_identity() {
+        let c = &clip.color;
+        p.push(format!(
+            "eq=brightness={}:contrast={}:saturation={}:gamma={}",
+            c.brightness, c.contrast, c.saturation, c.gamma
+        ));
+    }
+    if !t.is_identity() {
+        if transform_alpha {
+            p.push("format=yuva420p".to_string());
+        }
+        if t.opacity < 1.0 {
+            p.push(format!("colorchannelmixer=aa={}", t.opacity));
+        }
+        if t.rotation != 0.0 {
+            let rad = t.rotation.to_radians();
+            p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
+        }
+    }
+    let fi = clip.fade_in + fx.black_in;
+    let fo = clip.fade_out + fx.black_out;
+    if fi > 0.0 {
+        p.push(format!("fade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+    }
+    if fo > 0.0 {
+        p.push(format!("fade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+    }
+    if fx.xfade_in > 0.0 {
+        if !transform_alpha {
+            p.push("format=yuva420p".to_string());
+        }
+        p.push(format!("fade=t=in:st=0:d={}:alpha=1", fx.xfade_in.clamp(0.0, dur)));
+    }
+    if !needs_alpha {
+        p.push("format=yuv420p".to_string());
+    }
+    p.join(",")
+}
+
+/// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
+/// optional reverse / tempo, gain, fades (including transition cross-fades) and
+/// delay to the clip's timeline position. Defaults reduce to the original chain.
+fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) -> String {
+    let s = clip.speed_mag();
+    let dur = clip.duration() + fx.tail;
+    // Mirror the video crossfade tail: extend below source_in for a reversed clip,
+    // past source_out otherwise.
+    let (trim_start, trim_end) = if clip.is_reversed() {
+        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
+    } else {
+        (clip.source_in, clip.source_out + fx.tail * s)
+    };
+    let delay_ms = (clip.timeline_start * 1000.0).round().max(0.0) as i64;
+    let fi = clip.fade_in + fx.black_in + fx.xfade_in;
+    let fo = clip.fade_out + fx.black_out + fx.tail;
+
+    let mut p: Vec<String> = Vec::new();
+    p.push(format!("atrim=start={trim_start}:end={trim_end}"));
+    p.push("asetpts=PTS-STARTPTS".to_string());
+    if clip.is_reversed() {
+        p.push("areverse".to_string());
+    }
+    if (s - 1.0).abs() > 1e-9 {
+        p.push(atempo_chain(s));
+    }
+    p.push(format!("volume={}", clip.volume));
+    if fi > 0.0 {
+        p.push(format!("afade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+    }
+    if fo > 0.0 {
+        p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+    }
+    p.push(format!("aformat=sample_rates={sr}:channel_layouts={layout}", sr = fmt.sample_rate));
+    p.push(format!("adelay={delay_ms}:all=1"));
+    p.join(",")
+}
+
+/// Decompose a tempo change into `atempo` steps each within ffmpeg's supported
+/// `[0.5, 2.0]` range (e.g. 4× → `atempo=2.0,atempo=2.0`).
+fn atempo_chain(speed: f64) -> String {
+    let mut s = speed;
+    let mut parts: Vec<String> = Vec::new();
+    while s > 2.0 {
+        parts.push("atempo=2.0".to_string());
+        s /= 2.0;
+    }
+    while s < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        s *= 2.0;
+    }
+    parts.push(format!("atempo={s}"));
+    parts.join(",")
 }
 
 #[cfg(test)]
@@ -827,16 +1041,7 @@ mod tests {
     }
 
     fn make_clip(asset_id: uuid::Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
-        Clip {
-            id: Uuid::new_v4(),
-            asset_id,
-            source_in,
-            source_out,
-            timeline_start,
-            volume: 1.0,
-            fade_in: 0.0,
-            fade_out: 0.0,
-        }
+        Clip::new(asset_id, source_in, source_out, timeline_start)
     }
 
     fn video_track(clips: Vec<Clip>) -> Track {
@@ -883,8 +1088,9 @@ mod tests {
         let args = build_export_args(&timeline, &assets, "/out/result.mp4", &opts).unwrap();
 
         assert_eq!(args[0], "-y");
-        assert_eq!(args[1], "-i");
-        assert_eq!(args[2], "/media/clip.mp4");
+        assert!(args.contains(&"-nostats".to_string()), "progress stats suppressed so stderr stays bounded");
+        let i_pos = args.iter().position(|a| a == "-i").expect("an input flag");
+        assert_eq!(args[i_pos + 1], "/media/clip.mp4");
         assert!(args.contains(&"-filter_complex".to_string()));
         let fc_pos = args.iter().position(|a| a == "-filter_complex").unwrap();
         let filter = &args[fc_pos + 1];
@@ -1027,5 +1233,185 @@ mod tests {
         let timeline = single(vec![make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0)]);
         let result = build_export_args(&timeline, &[], "/out/result.mp4", &ExportOptions::default());
         assert!(matches!(result, Err(Error::AssetNotFound(_))));
+    }
+
+    fn av_asset(id: Uuid, duration: f64) -> Asset {
+        Asset {
+            id,
+            path: "/media/clip.mp4".into(),
+            name: "clip.mp4".into(),
+            duration,
+            streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        }
+    }
+
+    fn fmt_1080p() -> ExportFormat {
+        ExportFormat {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            sample_rate: 48_000,
+            channels: 2,
+        }
+    }
+
+    fn graph_of(timeline: &Timeline, assets: &[Asset]) -> String {
+        build_filter_complex(timeline, assets, &fmt_1080p(), timeline.duration()).filter
+    }
+
+    #[test]
+    fn speed_retimes_picture_and_sound() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.speed = 2.0;
+        // Source span 10s at 2x => 5s on the timeline.
+        assert!((clip.duration() - 5.0).abs() < 1e-9);
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains("setpts=(PTS-STARTPTS)/2+0/TB"), "{g}");
+        assert!(g.contains("atempo=2"), "{g}");
+    }
+
+    #[test]
+    fn negative_speed_reverses() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.speed = -1.0;
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains(",reverse,"), "{g}");
+        assert!(g.contains("areverse"), "{g}");
+        // |speed| == 1, so the picture is not retimed.
+        assert!(g.contains("setpts=PTS-STARTPTS+0/TB"), "{g}");
+    }
+
+    #[test]
+    fn transform_pip_positions_a_scaled_overlay() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.transform = crate::model::Transform {
+            scale: 0.5,
+            pos_x: 0.25,
+            ..Default::default()
+        };
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains("scale=iw*0.5:ih*0.5"), "{g}");
+        assert!(g.contains("overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H"), "{g}");
+        // A transformed clip is positioned by overlay, not letterbox-padded.
+        assert!(!g.contains("pad=1920:1080"), "{g}");
+    }
+
+    #[test]
+    fn opacity_uses_an_alpha_channel() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.transform = crate::model::Transform {
+            opacity: 0.5,
+            ..Default::default()
+        };
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains("format=yuva420p"), "{g}");
+        assert!(g.contains("colorchannelmixer=aa=0.5"), "{g}");
+    }
+
+    #[test]
+    fn color_correction_adds_an_eq_filter() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.color = crate::model::Color {
+            brightness: 0.1,
+            contrast: 1.2,
+            ..Default::default()
+        };
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains("eq=brightness=0.1:contrast=1.2:saturation=1:gamma=1"), "{g}");
+    }
+
+    #[test]
+    fn crossfade_extends_the_outgoing_tail_and_dissolves_the_incoming() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        // Outgoing clip A renders one extra second of source under the dissolve.
+        assert!(g.contains("trim=start=0:end=11"), "{g}");
+        // Incoming clip B fades up via alpha.
+        assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "{g}");
+    }
+
+    #[test]
+    fn color_eq_runs_before_alpha_is_established() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.transform = crate::model::Transform { opacity: 0.5, ..Default::default() };
+        clip.color = crate::model::Color { brightness: 0.1, ..Default::default() };
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        let eq = g.find("eq=").expect("eq present");
+        let alpha = g.find("format=yuva420p").expect("alpha present");
+        // eq cannot carry alpha, so it must precede the alpha conversion or the
+        // opacity (colorchannelmixer) would be silently dropped.
+        assert!(eq < alpha, "eq must come before alpha: {g}");
+        assert!(g.contains("colorchannelmixer=aa=0.5"), "{g}");
+    }
+
+    #[test]
+    fn crossfade_without_source_handle_is_a_hard_cut() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 20.0, 0.0); // uses the whole asset — no handle to borrow
+        let mut b = make_clip(asset.id, 0.0, 10.0, 20.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(!g.contains(":alpha=1"), "no fade-from-black when there is no handle: {g}");
+        assert!(g.contains("trim=start=0:end=20"), "outgoing tail must not be extended: {g}");
+    }
+
+    #[test]
+    fn crossfade_across_a_gap_dissolves_from_black_without_bleeding_the_partner() {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 15.0); // 5s gap after a
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(g.contains("trim=start=0:end=10"), "outgoing clip must not bleed across the gap: {g}");
+        assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "incoming dissolves from black: {g}");
+    }
+
+    #[test]
+    fn reversed_crossfade_extends_the_low_source_end() {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let mut a = make_clip(asset.id, 5.0, 15.0, 0.0);
+        a.speed = -1.0; // reversed, with 5s of handle below source_in
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(g.contains("trim=start=4:end=15"), "reversed tail extends below source_in: {g}");
+        assert!(g.contains(",reverse,"), "{g}");
+    }
+
+    #[test]
+    fn dip_to_black_fades_both_sides_of_the_cut() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        // Outgoing A fades out to black at its end, incoming B fades up from black.
+        assert!(g.contains("fade=t=out:st=9.5:d=0.5"), "{g}");
+        assert!(g.contains("fade=t=in:st=0:d=0.5"), "{g}");
     }
 }

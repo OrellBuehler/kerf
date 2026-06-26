@@ -20,7 +20,7 @@ pub use analysis::{
 };
 pub use error::{Error, Result};
 pub use model::{
-    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline, Track,
-    TranscriptSegment,
+    Asset, AssetAnalysis, Clip, Color, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline,
+    Track, TranscriptSegment, Transform, Transition, TransitionKind,
 };
 pub use project::Project;

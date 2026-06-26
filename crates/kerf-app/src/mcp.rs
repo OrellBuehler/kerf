@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
-use kerf_core::{EditSource, Project, StreamKind};
+use kerf_core::{EditSource, Project, StreamKind, Transition, TransitionKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
@@ -138,6 +138,62 @@ struct FadeParams {
     fade_in: Option<f64>,
     #[schemars(description = "Fade-out duration in seconds; omit to leave unchanged, 0 to clear")]
     fade_out: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpeedParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Playback rate: 1.0 = normal, 2.0 = 2x faster, 0.5 = half speed, negative = reverse")]
+    speed: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TransformParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Uniform scale after fitting to the frame (1.0 = fit, < 1.0 = picture-in-picture); omit to leave unchanged")]
+    scale: Option<f64>,
+    #[schemars(description = "Horizontal offset as a fraction of frame width (0.0 = centered); omit to leave unchanged")]
+    pos_x: Option<f64>,
+    #[schemars(description = "Vertical offset as a fraction of frame height (0.0 = centered); omit to leave unchanged")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Clockwise rotation in degrees; omit to leave unchanged")]
+    rotation: Option<f64>,
+    #[schemars(description = "Opacity 0.0–1.0 (1.0 = opaque); omit to leave unchanged")]
+    opacity: Option<f64>,
+    #[schemars(description = "Fraction cropped from the left edge (0.0–1.0); omit to leave unchanged")]
+    crop_left: Option<f64>,
+    #[schemars(description = "Fraction cropped from the right edge (0.0–1.0); omit to leave unchanged")]
+    crop_right: Option<f64>,
+    #[schemars(description = "Fraction cropped from the top edge (0.0–1.0); omit to leave unchanged")]
+    crop_top: Option<f64>,
+    #[schemars(description = "Fraction cropped from the bottom edge (0.0–1.0); omit to leave unchanged")]
+    crop_bottom: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ColorParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Additive brightness -1.0–1.0 (0.0 = unchanged); omit to leave unchanged")]
+    brightness: Option<f64>,
+    #[schemars(description = "Contrast multiplier 0.0–4.0 (1.0 = unchanged); omit to leave unchanged")]
+    contrast: Option<f64>,
+    #[schemars(description = "Saturation multiplier 0.0–3.0 (1.0 = unchanged); omit to leave unchanged")]
+    saturation: Option<f64>,
+    #[schemars(description = "Gamma 0.1–10.0 (1.0 = unchanged); omit to leave unchanged")]
+    gamma: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TransitionParams {
+    #[schemars(description = "UUID of the clip whose start blends with the clip before it on the same track")]
+    clip_id: String,
+    #[schemars(description = "Transition kind: \"crossfade\" or \"dip_to_black\". Omit to clear the transition")]
+    kind: Option<String>,
+    #[schemars(description = "Transition duration in seconds (required when a kind is given)")]
+    duration: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -372,6 +428,66 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Set a clip's playback speed (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half, negative = reverse); this retimes the clip and changes its timeline duration"
+    )]
+    fn set_speed(&self, Parameters(p): Parameters<SpeedParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_speed(clip_id, p.speed).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged."
+    )]
+    fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project
+            .set_transform(
+                clip_id,
+                p.scale,
+                p.pos_x,
+                p.pos_y,
+                p.rotation,
+                p.opacity,
+                p.crop_left,
+                p.crop_right,
+                p.crop_top,
+                p.crop_bottom,
+            )
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Set a clip's color correction — brightness / contrast / saturation / gamma. Omit a field to leave it unchanged."
+    )]
+    fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project
+            .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Set or clear the transition blending a clip's start with the clip before it on the same track. kind is \"crossfade\" or \"dip_to_black\" with a duration in seconds; omit kind to clear."
+    )]
+    fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let transition = parse_transition(p.kind, p.duration)?;
+        let project = self.lock();
+        let out = project.set_transition(clip_id, transition).map_err(core_err)?;
         self.changed();
         json(&out)
     }
@@ -630,6 +746,23 @@ fn parse_kind(s: &str) -> Result<StreamKind, McpError> {
             format!("invalid track kind '{other}'; expected \"video\" or \"audio\""),
             None,
         )),
+    }
+}
+
+fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Option<Transition>, McpError> {
+    match kind {
+        None => Ok(None),
+        Some(k) => {
+            let kind = TransitionKind::parse(&k).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""),
+                    None,
+                )
+            })?;
+            let duration = duration
+                .ok_or_else(|| McpError::invalid_params("transition duration is required".to_string(), None))?;
+            Ok(Some(Transition { kind, duration }))
+        }
     }
 }
 

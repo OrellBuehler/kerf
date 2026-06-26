@@ -26,6 +26,15 @@
 
 	// ---- analysis overlays mapped from source-time to timeline-time ----------
 
+	/** Timeline-seconds position of a source-time point inside a clip, honoring
+	 * the clip's speed (and reverse direction). */
+	function srcToTimeline(c: Clip, src: number): number {
+		const sp = c.speed ?? 1;
+		const mag = Math.max(Math.abs(sp), 0.01);
+		const off = sp < 0 ? c.source_out - src : src - c.source_in;
+		return c.timeline_start + off / mag;
+	}
+
 	const sceneXs = $derived.by(() => {
 		const xs: number[] = [];
 		for (const t of editor.timeline.tracks) {
@@ -35,7 +44,7 @@
 				if (!an) continue;
 				for (const sc of an.scene_changes) {
 					if (sc > c.source_in && sc < c.source_out) {
-						xs.push((c.timeline_start + (sc - c.source_in)) * pxPerSec);
+						xs.push(srcToTimeline(c, sc) * pxPerSec);
 					}
 				}
 			}
@@ -51,7 +60,9 @@
 			.map((s) => {
 				const a = Math.max(s.start, c.source_in);
 				const b = Math.min(s.end, c.source_out);
-				return { left: (c.timeline_start + (a - c.source_in)) * pxPerSec, width: (b - a) * pxPerSec };
+				const x1 = srcToTimeline(c, a) * pxPerSec;
+				const x2 = srcToTimeline(c, b) * pxPerSec;
+				return { left: Math.min(x1, x2), width: Math.abs(x2 - x1) };
 			});
 	}
 
@@ -411,10 +422,27 @@
 										style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, rgba(0,0,0,.7), transparent);pointer-events:none"
 									></span>
 								{/if}
+								{#if c.transition_in}
+									<span
+										title="{c.transition_in.kind === 'crossfade' ? 'Crossfade' : 'Dip to black'} {c.transition_in.duration.toFixed(2)}s"
+										style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
+											c.transition_in.duration * pxPerSec,
+											width
+										)}px;background:linear-gradient(to right, rgba(120,140,255,.55), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
+									></span>
+								{/if}
 								<span
 									style="position:relative;font-size:10px;font-weight:600;color:rgba(255,255,255,.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 									>{editor.assetName(c.asset_id)}</span
 								>
+								{#if (c.speed ?? 1) !== 1}
+									{@const sp = c.speed ?? 1}
+									<span
+										title="Speed {sp}×"
+										style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:1px 4px;pointer-events:none"
+										>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
+									>
+								{/if}
 							</button>
 						{/each}
 						{#if drag?.moved && drag.trackId === t.id}

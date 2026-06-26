@@ -4,6 +4,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { getFrame } from '$lib/api';
+	import { clipDuration } from '$lib/types';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -14,9 +15,15 @@
 		for (const t of editor.timeline.tracks) {
 			if (t.kind !== 'video') continue;
 			for (const c of t.clips) {
-				const end = c.timeline_start + Math.max(0, c.source_out - c.source_in);
+				const end = c.timeline_start + clipDuration(c);
 				if (ui.time >= c.timeline_start && ui.time < end) {
-					return { assetId: c.asset_id, srcTime: c.source_in + (ui.time - c.timeline_start) };
+					// Source advances by the speed magnitude per timeline second (and
+					// backwards for a reversed clip).
+					const sp = c.speed ?? 1;
+					const mag = Math.max(Math.abs(sp), 0.01);
+					const srcOffset = (ui.time - c.timeline_start) * mag;
+					const srcTime = sp < 0 ? c.source_out - srcOffset : c.source_in + srcOffset;
+					return { assetId: c.asset_id, srcTime };
 				}
 			}
 		}

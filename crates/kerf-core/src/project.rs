@@ -12,6 +12,7 @@ use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline, Track,
+    Transition,
 };
 
 const SCHEMA: &str = r#"
@@ -540,16 +541,7 @@ impl Project {
                     .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?,
             };
             let start = timeline_start.unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
-            let clip = Clip {
-                id: Uuid::new_v4(),
-                asset_id,
-                source_in,
-                source_out,
-                timeline_start: start,
-                volume: 1.0,
-                fade_in: 0.0,
-                fade_out: 0.0,
-            };
+            let clip = Clip::new(asset_id, source_in, source_out, start);
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
         })
@@ -570,15 +562,23 @@ impl Project {
                     "split point must lie strictly inside the clip".to_string(),
                 ));
             }
-            let split_src = clip.source_in + (at - clip.timeline_start);
-
-            let mut left = clip.clone();
-            left.source_out = split_src;
-
-            let mut right = clip;
+            // Map the timeline split point to a source point honoring speed (the
+            // source advances by |speed| per timeline second), and backwards for a
+            // reversed clip, so the two halves stay gapless and keep total duration.
+            let offset = (at - clip.timeline_start) * clip.speed_mag();
+            let (mut left, mut right) = (clip.clone(), clip);
             right.id = Uuid::new_v4();
-            right.source_in = split_src;
             right.timeline_start = at;
+            right.transition_in = None; // the transition stays with the left (start) half
+            if left.is_reversed() {
+                let split_src = (left.source_out - offset).clamp(left.source_in, left.source_out);
+                left.source_in = split_src;
+                right.source_out = split_src;
+            } else {
+                let split_src = (left.source_in + offset).clamp(left.source_in, left.source_out);
+                left.source_out = split_src;
+                right.source_in = split_src;
+            }
 
             timeline.tracks[ti].clips[ci] = left.clone();
             timeline.tracks[ti].clips.insert(ci + 1, right.clone());
@@ -776,6 +776,139 @@ impl Project {
         })
     }
 
+    /// Set a clip's playback speed (1.0 = unchanged, negative = reverse). The
+    /// magnitude is clamped away from zero so the duration stays finite. Changing
+    /// speed retimes the clip and so changes its timeline duration (like a trim).
+    pub fn set_speed(&self, clip_id: Uuid, speed: f64) -> Result<Clip> {
+        if !speed.is_finite() || speed == 0.0 {
+            return Err(Error::InvalidArgument("speed must be a non-zero, finite number".to_string()));
+        }
+        self.edit_timeline("Set speed", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].speed = speed;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Update a clip's geometric transform. Each `None` leaves that field
+    /// unchanged. Realized when compositing at export.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_transform(
+        &self,
+        clip_id: Uuid,
+        scale: Option<f64>,
+        pos_x: Option<f64>,
+        pos_y: Option<f64>,
+        rotation: Option<f64>,
+        opacity: Option<f64>,
+        crop_left: Option<f64>,
+        crop_right: Option<f64>,
+        crop_top: Option<f64>,
+        crop_bottom: Option<f64>,
+    ) -> Result<Clip> {
+        if scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(Error::InvalidArgument("scale must be a finite value > 0".to_string()));
+        }
+        if opacity.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+            return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
+        }
+        if [crop_left, crop_right, crop_top, crop_bottom]
+            .into_iter()
+            .flatten()
+            .any(|c| !(0.0..1.0).contains(&c))
+        {
+            return Err(Error::InvalidArgument("crop fractions must be within 0.0..1.0".to_string()));
+        }
+        self.edit_timeline("Set transform", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let t = &mut timeline.tracks[ti].clips[ci].transform;
+            if let Some(v) = scale {
+                t.scale = v;
+            }
+            if let Some(v) = pos_x {
+                t.pos_x = v;
+            }
+            if let Some(v) = pos_y {
+                t.pos_y = v;
+            }
+            if let Some(v) = rotation {
+                t.rotation = v;
+            }
+            if let Some(v) = opacity {
+                t.opacity = v;
+            }
+            if let Some(v) = crop_left {
+                t.crop_left = v;
+            }
+            if let Some(v) = crop_right {
+                t.crop_right = v;
+            }
+            if let Some(v) = crop_top {
+                t.crop_top = v;
+            }
+            if let Some(v) = crop_bottom {
+                t.crop_bottom = v;
+            }
+            if t.crop_left + t.crop_right >= 1.0 || t.crop_top + t.crop_bottom >= 1.0 {
+                return Err(Error::InvalidArgument("crop removes the entire frame".to_string()));
+            }
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Update a clip's color correction. Each `None` leaves that field unchanged.
+    pub fn set_color(
+        &self,
+        clip_id: Uuid,
+        brightness: Option<f64>,
+        contrast: Option<f64>,
+        saturation: Option<f64>,
+        gamma: Option<f64>,
+    ) -> Result<Clip> {
+        if brightness.is_some_and(|v| !(-1.0..=1.0).contains(&v)) {
+            return Err(Error::InvalidArgument("brightness must be within -1.0..=1.0".to_string()));
+        }
+        if contrast.is_some_and(|v| !(0.0..=4.0).contains(&v)) {
+            return Err(Error::InvalidArgument("contrast must be within 0.0..=4.0".to_string()));
+        }
+        if saturation.is_some_and(|v| !(0.0..=3.0).contains(&v)) {
+            return Err(Error::InvalidArgument("saturation must be within 0.0..=3.0".to_string()));
+        }
+        if gamma.is_some_and(|v| !(0.1..=10.0).contains(&v)) {
+            return Err(Error::InvalidArgument("gamma must be within 0.1..=10.0".to_string()));
+        }
+        self.edit_timeline("Set color", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let c = &mut timeline.tracks[ti].clips[ci].color;
+            if let Some(v) = brightness {
+                c.brightness = v;
+            }
+            if let Some(v) = contrast {
+                c.contrast = v;
+            }
+            if let Some(v) = saturation {
+                c.saturation = v;
+            }
+            if let Some(v) = gamma {
+                c.gamma = v;
+            }
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Set or clear (`None`) the transition that blends a clip's start with the
+    /// clip preceding it on the same track. Realized at export.
+    pub fn set_transition(&self, clip_id: Uuid, transition: Option<Transition>) -> Result<Clip> {
+        if transition.is_some_and(|t| !t.duration.is_finite() || t.duration <= 0.0) {
+            return Err(Error::InvalidArgument("transition duration must be > 0".to_string()));
+        }
+        self.edit_timeline("Set transition", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].transition_in = transition;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
     /// Append the non-silent spans of an asset as clips, using cached analysis.
     pub fn remove_silence(&self, asset_id: Uuid) -> Result<Vec<Clip>> {
         let asset = self.require_asset(asset_id)?;
@@ -806,16 +939,7 @@ impl Project {
             let mut start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
             let mut clips = Vec::new();
             for (src_in, src_out) in keep {
-                let clip = Clip {
-                    id: Uuid::new_v4(),
-                    asset_id,
-                    source_in: src_in,
-                    source_out: src_out,
-                    timeline_start: start,
-                    volume: 1.0,
-                    fade_in: 0.0,
-                    fade_out: 0.0,
-                };
+                let clip = Clip::new(asset_id, src_in, src_out, start);
                 start += clip.duration();
                 timeline.track_mut(tid).unwrap().clips.push(clip.clone());
                 clips.push(clip);
@@ -835,16 +959,7 @@ impl Project {
                 .first_track_of(StreamKind::Audio)
                 .ok_or_else(|| Error::Other("no audio track".to_string()))?;
             let start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
-            let clip = Clip {
-                id: Uuid::new_v4(),
-                asset_id,
-                source_in: 0.0,
-                source_out: asset.duration,
-                timeline_start: start,
-                volume: 1.0,
-                fade_in: 0.0,
-                fade_out: 0.0,
-            };
+            let clip = Clip::new(asset_id, 0.0, asset.duration, start);
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
         })
@@ -1211,6 +1326,43 @@ mod tests {
 
         project.remove(right.id).unwrap();
         assert!(project.timeline().unwrap().clip(right.id).is_none());
+    }
+
+    #[test]
+    fn split_maps_the_timeline_point_through_speed() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 10.0,
+            streams: vec![StreamInfo {
+                index: 0,
+                kind: StreamKind::Video,
+                codec: "h264".into(),
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(25.0),
+                sample_rate: None,
+                channels: None,
+            }],
+            imported_at: Utc::now(),
+        };
+        project.insert_asset(&asset).unwrap();
+
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        project.set_speed(clip.id, 2.0).unwrap(); // 10s of source over 5s of timeline
+        // Split at timeline t=2.0 → 4.0s into the source (2.0 * 2x).
+        let (left, right) = project.split_at(clip.id, 2.0).unwrap();
+        assert!((left.source_out - 4.0).abs() < 1e-9, "left out: {}", left.source_out);
+        assert!((right.source_in - 4.0).abs() < 1e-9, "right in: {}", right.source_in);
+        assert!((left.duration() - 2.0).abs() < 1e-9, "left dur: {}", left.duration());
+        assert!((right.duration() - 3.0).abs() < 1e-9, "right dur: {}", right.duration());
+        // Gapless: the two halves still sum to the original timeline duration.
+        assert!((left.duration() + right.duration() - 5.0).abs() < 1e-9);
+        assert!((right.timeline_start - 2.0).abs() < 1e-9);
+        assert_eq!(left.speed, 2.0);
+        assert_eq!(right.speed, 2.0);
     }
 
     #[test]
