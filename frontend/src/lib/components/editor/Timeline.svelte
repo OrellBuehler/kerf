@@ -1,9 +1,10 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
+	import { toast } from 'svelte-sonner';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import type { Clip, Track } from '$lib/types';
+	import type { Clip, StreamKind, Track } from '$lib/types';
 	import { clipDuration } from '$lib/types';
 
 	const pxPerSec = $derived(ui.zoom);
@@ -83,24 +84,125 @@
 		return all.slice(lo, Math.min(hi, all.length));
 	}
 
-	// ---- interaction ---------------------------------------------------------
+	// ---- interaction: select / razor split / drag-to-move --------------------
 
-	function onClipClick(e: MouseEvent, c: Clip, left: number) {
-		e.stopPropagation();
+	type Drag = {
+		clipId: string;
+		kind: StreamKind;
+		origTrackId: string;
+		origStart: number;
+		grabSec: number; // pointer offset within the clip (seconds)
+		dur: number;
+		start: number; // current ghost start (seconds)
+		trackId: string; // current ghost destination track
+		moved: boolean;
+	};
+	let drag = $state<Drag | null>(null);
+
+	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
+
+	function err(e: unknown) {
+		toast.error(e instanceof Error ? e.message : String(e));
+	}
+
+	function onClipPointerDown(e: PointerEvent, c: Clip, t: Track) {
+		if (e.button !== 0) return;
+		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
+		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		if (ui.tool === 'razor') {
-			const x = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
-			const at = c.timeline_start + Math.max(0.05, x / pxPerSec);
-			void editor.split(c.id, at);
+			e.stopPropagation();
+			const at = Math.max(c.timeline_start + 0.05, laneTime(e.clientX, laneLeft));
+			void editor.split(c.id, at).catch(err);
 			return;
 		}
 		editor.selectedClipId = c.id;
 		void editor.select(c.asset_id);
+		drag = {
+			clipId: c.id,
+			kind: t.kind,
+			origTrackId: t.id,
+			origStart: c.timeline_start,
+			grabSec: laneTime(e.clientX, laneLeft) - c.timeline_start,
+			dur: clipDuration(c),
+			start: c.timeline_start,
+			trackId: t.id,
+			moved: false
+		};
+	}
+
+	function laneUnder(clientX: number, clientY: number): HTMLElement | null {
+		for (const el of document.elementsFromPoint(clientX, clientY)) {
+			if (el instanceof HTMLElement && el.dataset.lane !== undefined) return el;
+		}
+		return null;
+	}
+
+	/** Snap a candidate start to 0, the playhead, or another clip's edges. */
+	function snapStart(start: number, trackId: string, clipId: string, dur: number): number {
+		const clamped = Math.max(0, start);
+		if (!ui.snap) return clamped;
+		const threshold = 8 / pxPerSec;
+		const cands: number[] = [0, ui.time];
+		const track = editor.timeline.tracks.find((t) => t.id === trackId);
+		if (track)
+			for (const c of track.clips) {
+				if (c.id === clipId) continue;
+				const cs = c.timeline_start;
+				const ce = c.timeline_start + clipDuration(c);
+				cands.push(cs, ce, cs - dur); // align heads, butt after, butt before
+			}
+		let best = clamped;
+		let bestD = threshold;
+		for (const cand of cands) {
+			const d = Math.abs(cand - start);
+			if (d < bestD) {
+				bestD = d;
+				best = Math.max(0, cand);
+			}
+		}
+		return best;
+	}
+
+	function onPointerMove(e: PointerEvent) {
+		if (!drag) return;
+		const lane = laneUnder(e.clientX, e.clientY);
+		let trackId = drag.trackId;
+		let laneLeft: number;
+		if (lane && lane.dataset.kind === drag.kind) {
+			trackId = lane.dataset.trackId!;
+			laneLeft = lane.getBoundingClientRect().left;
+		} else {
+			const cur = document.querySelector(`[data-lane][data-track-id="${trackId}"]`) as HTMLElement | null;
+			laneLeft = cur?.getBoundingClientRect().left ?? 0;
+		}
+		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.clipId, drag.dur);
+		const movedEnough =
+			drag.moved || trackId !== drag.origTrackId || Math.abs(start - drag.origStart) >= 3 / pxPerSec;
+		drag = { ...drag, start: movedEnough ? start : drag.start, trackId, moved: movedEnough };
+	}
+
+	function onPointerUp() {
+		if (!drag) return;
+		const d = drag;
+		drag = null;
+		if (!d.moved) {
+			ui.seek(d.origStart + d.grabSec); // a plain click on the clip seeks there
+			return;
+		}
+		const trackArg = d.trackId !== d.origTrackId ? d.trackId : undefined;
+		if (trackArg === undefined && Math.abs(d.start - d.origStart) < 1e-6) return; // no-op
+		void editor.move(d.clipId, d.start, trackArg).catch(err);
 	}
 
 	function onLaneSeek(e: MouseEvent) {
 		const x = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
 		ui.seek(x / pxPerSec);
 	}
+
+	// ---- tracks (add / remove) -----------------------------------------------
+
+	const onAddTrack = (kind: StreamKind) => void editor.addTrack(kind).catch(err);
+	const onRemoveTrack = (t: Track) => void editor.removeTrack(t.id).catch(err);
 
 	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
 
@@ -114,6 +216,8 @@
 		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT);
 	}
 </script>
+
+<svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
 
 <div
 	style="height:296px;flex:none;border-top:1px solid var(--border-default);background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
@@ -173,6 +277,19 @@
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
 			>{ui.snap ? 'snap on' : 'snap off'}</span
 		>
+		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+		<button
+			title="Add a video track"
+			onclick={() => onAddTrack('video')}
+			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:transparent;color:var(--text-muted)"
+			>+ V</button
+		>
+		<button
+			title="Add an audio track"
+			onclick={() => onAddTrack('audio')}
+			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:transparent;color:var(--text-muted)"
+			>+ A</button
+		>
 	</div>
 
 	<div style="flex:1;display:flex;min-height:0">
@@ -191,6 +308,13 @@
 					>
 					<span style="font-size:11px;color:var(--text-muted);flex:1">{t.kind === 'video' ? 'Video' : 'Audio'}</span>
 					<Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" />
+					<button
+						title="Remove track"
+						aria-label="Remove track"
+						onclick={() => onRemoveTrack(t)}
+						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0"
+						><Icon n="x" s={12} /></button
+					>
 				</div>
 			{/each}
 		</div>
@@ -237,6 +361,9 @@
 				{#each editor.timeline.tracks as t (t.id)}
 					<div
 						role="presentation"
+						data-lane
+						data-track-id={t.id}
+						data-kind={t.kind}
 						onclick={onLaneSeek}
 						style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);position:relative"
 					>
@@ -244,9 +371,13 @@
 							{@const left = c.timeline_start * pxPerSec}
 							{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 							{@const selected = editor.selectedClipId === c.id}
+							{@const dragging = drag?.moved && drag.clipId === c.id}
 							<button
-								onclick={(e) => onClipClick(e, c, left)}
-								style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;cursor:{ui.tool === 'razor' ? 'crosshair' : 'pointer'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+								onpointerdown={(e) => onClipPointerDown(e, c, t)}
+								onclick={(e) => e.stopPropagation()}
+								style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{dragging
+									? 0.4
+									: 1};cursor:{ui.tool === 'razor' ? 'crosshair' : drag ? 'grabbing' : 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 							>
 								{#if t.kind === 'audio'}
 									{@const peaks = clipPeaks(c)}
@@ -286,6 +417,14 @@
 								>
 							</button>
 						{/each}
+						{#if drag?.moved && drag.trackId === t.id}
+							<div
+								style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									6,
+									drag.dur * pxPerSec
+								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+							></div>
+						{/if}
 					</div>
 				{/each}
 

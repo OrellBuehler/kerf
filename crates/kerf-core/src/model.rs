@@ -146,6 +146,13 @@ impl Track {
             cursor += clip.duration();
         }
     }
+
+    /// Order clips left-to-right by their timeline position. Used after a
+    /// free-positioning move so the track stays a well-ordered, non-overlapping
+    /// lane.
+    pub fn sort_by_start(&mut self) {
+        self.clips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+    }
 }
 
 /// Who made an edit. The MCP server sets this to [`EditSource::Agent`]; the

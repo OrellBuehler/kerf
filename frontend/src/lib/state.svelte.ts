@@ -12,6 +12,8 @@ import {
 	getTimeline,
 	getWaveform,
 	listAssets,
+	addTrack,
+	moveClip,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
 	pickAndImport,
@@ -19,7 +21,9 @@ import {
 	redo as apiRedo,
 	removeClip,
 	removeSilence,
+	removeTrack,
 	reorderClip,
+	rippleDelete,
 	revertTo as apiRevertTo,
 	saveProjectAs as apiSaveProjectAs,
 	setFade,
@@ -28,7 +32,7 @@ import {
 	trimClip,
 	undo as apiUndo
 } from './api';
-import type { Asset, AssetAnalysis, AssetMetadata, Clip, Revision, Timeline } from './types';
+import type { Asset, AssetAnalysis, AssetMetadata, Clip, Revision, StreamKind, Timeline } from './types';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -230,9 +234,22 @@ class EditorState {
 	reorder(trackId: string, clipId: string, newIndex: number) {
 		return this.#apply(reorderClip(trackId, clipId, newIndex));
 	}
+	move(clipId: string, timelineStart: number, trackId?: string) {
+		return this.#apply(moveClip(clipId, timelineStart, trackId));
+	}
 	remove(clipId: string) {
 		if (this.selectedClipId === clipId) this.selectedClipId = null;
 		return this.#apply(removeClip(clipId));
+	}
+	rippleDelete(clipId: string) {
+		if (this.selectedClipId === clipId) this.selectedClipId = null;
+		return this.#apply(rippleDelete(clipId));
+	}
+	addTrack(kind: StreamKind, name?: string) {
+		return this.#apply(addTrack(kind, name));
+	}
+	removeTrack(trackId: string) {
+		return this.#apply(removeTrack(trackId));
 	}
 	setVolume(clipId: string, volume: number) {
 		return this.#apply(setVolume(clipId, volume));

@@ -40,7 +40,8 @@ import {
 	Save,
 	ZoomIn,
 	ZoomOut,
-	Trash2
+	Trash2,
+	X
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -85,7 +86,8 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'save': Save,
 	'zoom-in': ZoomIn,
 	'zoom-out': ZoomOut,
-	'trash': Trash2
+	'trash': Trash2,
+	'x': X
 };
 
 export type IconName = keyof typeof icons;

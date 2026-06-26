@@ -10,7 +10,7 @@ mod mcp;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, Task, Timeline};
+use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, StreamKind, Task, Timeline};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
@@ -39,6 +39,14 @@ impl AppState {
 
 fn id(s: &str) -> CmdResult<Uuid> {
     Uuid::parse_str(s).map_err(|e| e.to_string())
+}
+
+fn kind(s: &str) -> CmdResult<StreamKind> {
+    match s.to_lowercase().as_str() {
+        "video" => Ok(StreamKind::Video),
+        "audio" => Ok(StreamKind::Audio),
+        other => Err(format!("invalid track kind '{other}'; expected \"video\" or \"audio\"")),
+    }
 }
 
 // ---- read ------------------------------------------------------------------
@@ -170,6 +178,44 @@ fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, n
     let clip = id(&clip_id)?;
     let project = state.project()?;
     project.reorder(track, clip, new_index).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn move_clip(
+    state: State<'_, AppState>,
+    clip_id: String,
+    timeline_start: f64,
+    track_id: Option<String>,
+) -> CmdResult<Timeline> {
+    let clip = id(&clip_id)?;
+    let track = track_id.as_deref().map(id).transpose()?;
+    let project = state.project()?;
+    project.move_clip(clip, timeline_start, track).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ripple_delete(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.ripple_delete(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_track(state: State<'_, AppState>, kind: String, name: Option<String>) -> CmdResult<Timeline> {
+    let kind = self::kind(&kind)?;
+    let project = state.project()?;
+    project.add_track(kind, name).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_track(state: State<'_, AppState>, track_id: String) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project()?;
+    project.remove_track(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -371,6 +417,10 @@ pub fn run() {
             split_clip,
             trim_clip,
             reorder_clip,
+            move_clip,
+            ripple_delete,
+            add_track,
+            remove_track,
             remove_clip,
             set_volume,
             set_fade,

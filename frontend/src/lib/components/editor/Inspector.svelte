@@ -148,7 +148,7 @@
 				run(() => editor.setFade(clip.id, undefined, Math.max(0, v)))
 			)}
 
-			<div style="margin-top:18px">
+			<div style="margin-top:18px;display:flex;flex-direction:column;gap:7px">
 				<Btn
 					variant="destructive"
 					size="sm"
@@ -157,6 +157,13 @@
 					style="width:100%"
 					disabled={editor.busy}
 					onclick={() => run(() => editor.remove(clip.id))}>Remove clip</Btn
+				>
+				<Btn
+					variant="ghost"
+					size="sm"
+					style="width:100%"
+					disabled={editor.busy}
+					onclick={() => run(() => editor.rippleDelete(clip.id))}>Ripple delete · close gap</Btn
 				>
 			</div>
 		{:else}

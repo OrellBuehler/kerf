@@ -12,6 +12,7 @@ import type {
 	Clip,
 	EditSource,
 	Revision,
+	StreamKind,
 	Task,
 	Timeline,
 	Track
@@ -351,6 +352,82 @@ export async function removeClip(clipId: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clip', { clipId });
+}
+
+/** Move a clip to a new timeline position, optionally onto another same-kind track. */
+export async function moveClip(clipId: string, timelineStart: number, trackId?: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const start = Math.max(0, timelineStart);
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const [srcTrack, ci] = found;
+			const destTrack = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || srcTrack;
+			if (destTrack.kind !== srcTrack.kind)
+				throw new Error('cannot move a clip to a track of a different kind');
+			const clip = srcTrack.clips[ci];
+			const end = start + clipDuration(clip);
+			const overlaps = destTrack.clips.some(
+				(c) => c.id !== clipId && start < c.timeline_start + clipDuration(c) && c.timeline_start < end
+			);
+			if (overlaps) throw new Error('clip would overlap another clip on the destination track');
+			srcTrack.clips.splice(ci, 1);
+			clip.timeline_start = start;
+			destTrack.clips.push(clip);
+			destTrack.clips.sort((a, b) => a.timeline_start - b.timeline_start);
+			recordDev('Move clip');
+		}
+		return snapshot();
+	}
+	return invoke<Timeline>('move_clip', { clipId, timelineStart, trackId });
+}
+
+/** Remove a clip and close the gap (later clips on its track shift left). */
+export async function rippleDelete(clipId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const [track, ci] = found;
+			const removed = track.clips[ci];
+			const dur = clipDuration(removed);
+			const from = removed.timeline_start;
+			track.clips.splice(ci, 1);
+			for (const c of track.clips) if (c.timeline_start >= from) c.timeline_start = Math.max(0, c.timeline_start - dur);
+			recordDev('Ripple delete');
+		}
+		return snapshot();
+	}
+	return invoke<Timeline>('ripple_delete', { clipId });
+}
+
+/** Append a new empty track (video tracks above audio); auto-named when omitted. */
+export async function addTrack(kind: StreamKind, name?: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const count = devTimeline.tracks.filter((t) => t.kind === kind).length;
+		const trackName = name ?? `${kind === 'audio' ? 'A' : 'V'}${count + 1}`;
+		const track: Track = { id: uid(), kind, name: trackName, clips: [] };
+		let at = devTimeline.tracks.length;
+		if (kind !== 'audio') {
+			let lastV = -1;
+			devTimeline.tracks.forEach((t, i) => {
+				if (t.kind === 'video') lastV = i;
+			});
+			at = lastV + 1;
+		}
+		devTimeline.tracks.splice(at, 0, track);
+		recordDev('Add track');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_track', { kind, name });
+}
+
+/** Remove a track and all its clips; refuses to remove the last track. */
+export async function removeTrack(trackId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		if (devTimeline.tracks.length > 1) devTimeline.tracks = devTimeline.tracks.filter((t) => t.id !== trackId);
+		recordDev('Remove track');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_track', { trackId });
 }
 
 export async function setVolume(clipId: string, volume: number): Promise<Timeline> {

@@ -623,6 +623,118 @@ impl Project {
         })
     }
 
+    /// Move a clip to a new timeline position, optionally onto another track of
+    /// the **same kind**. Free positioning: the clip keeps its duration and
+    /// gaps are allowed. A move that would overlap another clip on the
+    /// destination track is rejected, so each track stays a well-ordered,
+    /// non-overlapping lane (which keeps the positional render well-defined).
+    pub fn move_clip(&self, clip_id: Uuid, timeline_start: f64, track_id: Option<Uuid>) -> Result<Clip> {
+        let start = timeline_start.max(0.0);
+        self.edit_timeline("Move clip", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let src_kind = timeline.tracks[ti].kind;
+            let dest_ti = match track_id {
+                Some(tid) => {
+                    let d = timeline
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == tid)
+                        .ok_or(Error::TrackNotFound(tid))?;
+                    if timeline.tracks[d].kind != src_kind {
+                        return Err(Error::InvalidArgument(
+                            "cannot move a clip to a track of a different kind".to_string(),
+                        ));
+                    }
+                    d
+                }
+                None => ti,
+            };
+            let mut clip = timeline.tracks[ti].clips[ci].clone();
+            let end = start + clip.duration();
+            let overlaps = timeline.tracks[dest_ti]
+                .clips
+                .iter()
+                .any(|c| c.id != clip_id && start < c.timeline_end() && c.timeline_start < end);
+            if overlaps {
+                return Err(Error::InvalidArgument(
+                    "clip would overlap another clip on the destination track".to_string(),
+                ));
+            }
+            clip.timeline_start = start;
+            timeline.tracks[ti].clips.remove(ci);
+            timeline.tracks[dest_ti].clips.push(clip.clone());
+            timeline.tracks[dest_ti].sort_by_start();
+            Ok(clip)
+        })
+    }
+
+    /// Remove a clip and close the gap it leaves: every later clip on the **same
+    /// track** shifts left by the removed clip's duration. (Plain [`remove`]
+    /// leaves a gap.)
+    pub fn ripple_delete(&self, clip_id: Uuid) -> Result<()> {
+        self.edit_timeline("Ripple delete", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let removed = timeline.tracks[ti].clips[ci].clone();
+            let dur = removed.duration();
+            let from = removed.timeline_start;
+            timeline.tracks[ti].clips.remove(ci);
+            for c in &mut timeline.tracks[ti].clips {
+                if c.timeline_start >= from {
+                    c.timeline_start = (c.timeline_start - dur).max(0.0);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Append a new empty track of `kind`, keeping kinds grouped (video tracks
+    /// above audio tracks) and auto-naming it (`V2`, `A2`, …) when `name` is
+    /// omitted. Later video tracks composite **on top** at export.
+    pub fn add_track(&self, kind: StreamKind, name: Option<String>) -> Result<Track> {
+        self.edit_timeline("Add track", |timeline| {
+            let count = timeline.tracks.iter().filter(|t| t.kind == kind).count();
+            let name = name.unwrap_or_else(|| {
+                let prefix = if kind == StreamKind::Audio { "A" } else { "V" };
+                format!("{prefix}{}", count + 1)
+            });
+            let track = Track {
+                id: Uuid::new_v4(),
+                kind,
+                name,
+                clips: Vec::new(),
+            };
+            // Insert video tracks just after the last video track and audio
+            // tracks at the very end, so the lanes stay grouped (V1, V2, …, A1, A2).
+            let at = match kind {
+                StreamKind::Audio => timeline.tracks.len(),
+                _ => timeline
+                    .tracks
+                    .iter()
+                    .rposition(|t| t.kind == StreamKind::Video)
+                    .map(|i| i + 1)
+                    .unwrap_or(0),
+            };
+            timeline.tracks.insert(at, track.clone());
+            Ok(track)
+        })
+    }
+
+    /// Remove a track and all of its clips. Refuses to remove the last track.
+    pub fn remove_track(&self, track_id: Uuid) -> Result<()> {
+        self.edit_timeline("Remove track", |timeline| {
+            let idx = timeline
+                .tracks
+                .iter()
+                .position(|t| t.id == track_id)
+                .ok_or(Error::TrackNotFound(track_id))?;
+            if timeline.tracks.len() <= 1 {
+                return Err(Error::InvalidArgument("cannot remove the last track".to_string()));
+            }
+            timeline.tracks.remove(idx);
+            Ok(())
+        })
+    }
+
     /// Remove a clip from the timeline.
     pub fn remove(&self, clip_id: Uuid) -> Result<()> {
         self.edit_timeline("Remove clip", |timeline| {
@@ -1144,6 +1256,104 @@ mod tests {
             project.set_fade(clip.id, Some(-1.0), None),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    fn project_with_video_asset() -> (Project, Uuid) {
+        let project = Project::open_in_memory().unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 60.0,
+            streams: vec![StreamInfo {
+                index: 0,
+                kind: StreamKind::Video,
+                codec: "h264".into(),
+                width: Some(1920),
+                height: Some(1080),
+                fps: Some(30.0),
+                sample_rate: None,
+                channels: None,
+            }],
+            imported_at: Utc::now(),
+        };
+        let id = asset.id;
+        project.insert_asset(&asset).unwrap();
+        (project, id)
+    }
+
+    #[test]
+    fn move_clip_repositions_and_rejects_overlap() {
+        let (project, asset) = project_with_video_asset();
+        let a = project.cut_clip(asset, 0.0, 5.0).unwrap(); // [0,5)
+        let b = project.cut_clip(asset, 0.0, 5.0).unwrap(); // appended [5,10)
+
+        // Free move into the open space well after b.
+        let moved = project.move_clip(a.id, 20.0, None).unwrap();
+        assert!((moved.timeline_start - 20.0).abs() < 1e-9);
+        // The track is re-sorted by start (b first now).
+        let tl = project.timeline().unwrap();
+        let starts: Vec<f64> = tl.tracks[0].clips.iter().map(|c| c.timeline_start).collect();
+        assert_eq!(starts, vec![5.0, 20.0]);
+
+        // Dropping a back on top of b overlaps -> rejected.
+        assert!(matches!(project.move_clip(a.id, 6.0, None), Err(Error::InvalidArgument(_))));
+        assert_eq!(b.timeline_start, 5.0);
+
+        // A negative start clamps to 0.
+        let moved = project.move_clip(a.id, -3.0, None).unwrap();
+        assert_eq!(moved.timeline_start, 0.0);
+    }
+
+    #[test]
+    fn move_clip_across_tracks_same_kind_only() {
+        let (project, asset) = project_with_video_asset();
+        let clip = project.cut_clip(asset, 0.0, 5.0).unwrap();
+        let v2 = project.add_track(StreamKind::Video, None).unwrap();
+        let a1 = project.timeline().unwrap().first_track_of(StreamKind::Audio).unwrap();
+
+        // Lift the clip onto the second video track (B-roll lane).
+        project.move_clip(clip.id, 0.0, Some(v2.id)).unwrap();
+        let tl = project.timeline().unwrap();
+        assert!(tl.track(v2.id).unwrap().clips.iter().any(|c| c.id == clip.id));
+
+        // Moving a video clip onto an audio track is rejected.
+        assert!(matches!(
+            project.move_clip(clip.id, 0.0, Some(a1)),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn ripple_delete_closes_the_gap() {
+        let (project, asset) = project_with_video_asset();
+        let a = project.cut_clip(asset, 0.0, 5.0).unwrap(); // [0,5)
+        let b = project.cut_clip(asset, 0.0, 5.0).unwrap(); // [5,10)
+        project.cut_clip(asset, 0.0, 5.0).unwrap(); // [10,15)
+
+        project.ripple_delete(a.id).unwrap();
+        let tl = project.timeline().unwrap();
+        let starts: Vec<f64> = tl.tracks[0].clips.iter().map(|c| c.timeline_start).collect();
+        // b and the third clip each shift left by 5s, closing the gap.
+        assert_eq!(starts, vec![0.0, 5.0]);
+        assert!(tl.clip(b.id).is_some());
+    }
+
+    #[test]
+    fn add_and_remove_track() {
+        let (project, _asset) = project_with_video_asset();
+        let before = project.timeline().unwrap().tracks.len(); // V1 + A1
+
+        let v2 = project.add_track(StreamKind::Video, None).unwrap();
+        assert_eq!(v2.name, "V2");
+        let tl = project.timeline().unwrap();
+        assert_eq!(tl.tracks.len(), before + 1);
+        // Video tracks stay grouped above audio tracks.
+        let kinds: Vec<StreamKind> = tl.tracks.iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![StreamKind::Video, StreamKind::Video, StreamKind::Audio]);
+
+        project.remove_track(v2.id).unwrap();
+        assert_eq!(project.timeline().unwrap().tracks.len(), before);
     }
 
     #[test]

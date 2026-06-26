@@ -126,7 +126,9 @@
 			ui.zoom = Math.max(8, ui.zoom - 8);
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipId) {
 			e.preventDefault();
-			void editor.remove(editor.selectedClipId);
+			// Shift+Delete ripples (closes the gap); plain Delete leaves a gap.
+			if (e.shiftKey) void editor.rippleDelete(editor.selectedClipId);
+			else void editor.remove(editor.selectedClipId);
 		}
 	}
 </script>

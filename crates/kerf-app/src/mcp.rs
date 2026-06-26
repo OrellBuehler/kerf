@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
-use kerf_core::{EditSource, Project};
+use kerf_core::{EditSource, Project, StreamKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
@@ -96,6 +96,30 @@ struct ReorderParams {
 struct ClipIdParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct MoveClipParams {
+    #[schemars(description = "UUID of the clip to move")]
+    clip_id: String,
+    #[schemars(description = "New timeline position in seconds (clamped to >= 0)")]
+    timeline_start: f64,
+    #[schemars(description = "Destination track UUID (must be the same kind); omit to keep the clip on its current track")]
+    track_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddTrackParams {
+    #[schemars(description = "Track kind: \"video\" or \"audio\"")]
+    kind: String,
+    #[schemars(description = "Optional track name; auto-named (V2/A2/…) when omitted")]
+    name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TrackIdParams {
+    #[schemars(description = "UUID of the track")]
+    track_id: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -284,6 +308,43 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
+        self.changed();
+        Ok("ok".to_string())
+    }
+
+    #[tool(description = "Move a clip to a new timeline position (free positioning, gaps allowed), optionally onto another same-kind track; rejects overlaps")]
+    fn move_clip(&self, Parameters(p): Parameters<MoveClipParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
+        let project = self.lock();
+        let out = project.move_clip(clip_id, p.timeline_start, track_id).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(description = "Remove a clip and close the gap: later clips on the same track shift left by its duration (ripple delete)")]
+    fn ripple_delete(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        project.ripple_delete(clip_id).map_err(core_err)?;
+        self.changed();
+        Ok("ok".to_string())
+    }
+
+    #[tool(description = "Add a new empty track (\"video\" or \"audio\"), e.g. a B-roll lane above the interview; later video tracks composite on top at export")]
+    fn add_track(&self, Parameters(p): Parameters<AddTrackParams>) -> Result<String, McpError> {
+        let kind = parse_kind(&p.kind)?;
+        let project = self.lock();
+        let track = project.add_track(kind, p.name).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(description = "Remove a track and all of its clips (refuses to remove the last track)")]
+    fn remove_track(&self, Parameters(p): Parameters<TrackIdParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        project.remove_track(track_id).map_err(core_err)?;
         self.changed();
         Ok("ok".to_string())
     }
@@ -518,8 +579,13 @@ impl ServerHandler for KerfMcp {
              list_assets / get_asset_metadata / get_timeline_state, run \
              analyze_asset to populate silence / scene / transcript metadata, \
              then assemble a non-destructive edit with the \
-             cut/split/trim/add/reorder/remove tools, and polish with set_volume \
-             / set_fade (fade-in/out, e.g. to smooth hard cuts). Every edit is tracked: use \
+             cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
+             (move_clip frees a clip to any position or same-kind track; \
+             ripple_delete closes the gap). Layer footage with add_track / \
+             remove_track — e.g. add a video track and move_clip B-roll onto it \
+             over the interview (later video tracks composite on top). Polish \
+             with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts). \
+             Every edit is tracked: use \
              history to list revisions and undo / redo / revert_to to roll \
              changes back. When finished call complete_task with a short summary \
              (or fail_task on error); the user reviews and applies the staged \
@@ -554,6 +620,17 @@ pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Resu
 
 fn parse_id(s: &str) -> Result<Uuid, McpError> {
     Uuid::parse_str(s).map_err(|e| McpError::invalid_params(format!("invalid uuid '{s}': {e}"), None))
+}
+
+fn parse_kind(s: &str) -> Result<StreamKind, McpError> {
+    match s.to_lowercase().as_str() {
+        "video" => Ok(StreamKind::Video),
+        "audio" => Ok(StreamKind::Audio),
+        other => Err(McpError::invalid_params(
+            format!("invalid track kind '{other}'; expected \"video\" or \"audio\""),
+            None,
+        )),
+    }
 }
 
 fn core_err(e: kerf_core::Error) -> McpError {

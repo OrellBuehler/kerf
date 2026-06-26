@@ -23,7 +23,12 @@ so the feature is **only** activated through these forwards — which is what ma
   (override with `KERF_FFMPEG` / `KERF_FFPROBE`). Probe, `silencedetect`, scene
   detection, preview frames (`frame_at`), waveforms, and export all live here, so
   they work in the `--no-default-features` build — only the binaries are needed,
-  never the dev libraries.
+  never the dev libraries. Export is a **positional, multi-track** `filter_complex`
+  (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
+  canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
+  top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
+  position and summed with `amix` — so clip positions, gaps and track layering all
+  render.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -123,8 +128,9 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns 
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
-op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `remove_clip`,
-`set_volume`, `set_fade`, `remove_silence`, `extract_audio`, `concatenate` — each returns the
+op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `move_clip`,
+`ripple_delete`, `add_track`, `remove_track`, `remove_clip`, `set_volume`, `set_fade`,
+`remove_silence`, `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), and `export_timeline`. Tauri auto-converts JS camelCase args to Rust
@@ -157,8 +163,13 @@ Everything is styled with the CSS-variable tokens directly (inline `style`), not
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
 px/sec + playhead), with scene markers / silence regions mapped from `AssetAnalysis` and
-real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, clicks
-select/seek. The old `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
+real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
+ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
+positioning with gaps, snapping to clip edges / playhead / 0, and **dropping onto another
+same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing). The timeline
+toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
+(`add_track` / `remove_track`); the timeline is genuinely **multi-track**. The old
+`@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
 (`get_frame`) under the playhead with real playback/scrub. The **agent panel is a real MCP task
 queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
