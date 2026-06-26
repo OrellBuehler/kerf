@@ -547,6 +547,8 @@ impl Project {
                 source_out,
                 timeline_start: start,
                 volume: 1.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
             };
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
@@ -642,6 +644,26 @@ impl Project {
         })
     }
 
+    /// Set a clip's fade-in and/or fade-out duration (seconds). `None` leaves a
+    /// value unchanged; pass `Some(0.0)` to clear a fade. Negative values are
+    /// rejected. The fade is realized at export (see the engine render path).
+    pub fn set_fade(&self, clip_id: Uuid, fade_in: Option<f64>, fade_out: Option<f64>) -> Result<Clip> {
+        if fade_in.is_some_and(|v| v < 0.0) || fade_out.is_some_and(|v| v < 0.0) {
+            return Err(Error::InvalidArgument("fade duration must be >= 0".to_string()));
+        }
+        self.edit_timeline("Set fade", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            if let Some(value) = fade_in {
+                clip.fade_in = value;
+            }
+            if let Some(value) = fade_out {
+                clip.fade_out = value;
+            }
+            Ok(clip.clone())
+        })
+    }
+
     /// Append the non-silent spans of an asset as clips, using cached analysis.
     pub fn remove_silence(&self, asset_id: Uuid) -> Result<Vec<Clip>> {
         let asset = self.require_asset(asset_id)?;
@@ -679,6 +701,8 @@ impl Project {
                     source_out: src_out,
                     timeline_start: start,
                     volume: 1.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
                 };
                 start += clip.duration();
                 timeline.track_mut(tid).unwrap().clips.push(clip.clone());
@@ -706,6 +730,8 @@ impl Project {
                 source_out: asset.duration,
                 timeline_start: start,
                 volume: 1.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
             };
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
@@ -1073,6 +1099,51 @@ mod tests {
 
         project.remove(right.id).unwrap();
         assert!(project.timeline().unwrap().clip(right.id).is_none());
+    }
+
+    #[test]
+    fn set_fade_persists_and_validates() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/x.mp4".into(),
+            name: "x.mp4".into(),
+            duration: 10.0,
+            streams: vec![StreamInfo {
+                index: 0,
+                kind: StreamKind::Video,
+                codec: "h264".into(),
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(25.0),
+                sample_rate: None,
+                channels: None,
+            }],
+            imported_at: Utc::now(),
+        };
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        assert_eq!(clip.fade_in, 0.0);
+
+        // Setting only fade_in leaves fade_out untouched.
+        let faded = project.set_fade(clip.id, Some(0.5), None).unwrap();
+        assert_eq!(faded.fade_in, 0.5);
+        assert_eq!(faded.fade_out, 0.0);
+
+        let faded = project.set_fade(clip.id, None, Some(1.0)).unwrap();
+        assert_eq!(faded.fade_in, 0.5);
+        assert_eq!(faded.fade_out, 1.0);
+
+        // It persists to the stored timeline.
+        let stored = project.timeline().unwrap().clip(clip.id).unwrap().clone();
+        assert_eq!(stored.fade_in, 0.5);
+        assert_eq!(stored.fade_out, 1.0);
+
+        // Negative fades are rejected.
+        assert!(matches!(
+            project.set_fade(clip.id, Some(-1.0), None),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

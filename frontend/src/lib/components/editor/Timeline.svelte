@@ -101,6 +101,18 @@
 		const x = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
 		ui.seek(x / pxPerSec);
 	}
+
+	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
+
+	const FADE_DEFAULT = 0.5;
+	function toggleFadeIn() {
+		const c = editor.selectedClip;
+		if (c) void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT);
+	}
+	function toggleFadeOut() {
+		const c = editor.selectedClip;
+		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT);
+	}
 </script>
 
 <div
@@ -116,6 +128,30 @@
 		>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
+		{#if editor.selectedClip}
+			{@const sc = editor.selectedClip}
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+			<span
+				style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
+				>Fade</span
+			>
+			<button
+				title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
+				onclick={toggleFadeIn}
+				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{sc.fade_in >
+				0
+					? 'var(--surface-hover)'
+					: 'transparent'};color:{sc.fade_in > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">in</button
+			>
+			<button
+				title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
+				onclick={toggleFadeOut}
+				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{sc.fade_out >
+				0
+					? 'var(--surface-hover)'
+					: 'transparent'};color:{sc.fade_out > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">out</button
+			>
+		{/if}
 		<div style="flex:1"></div>
 		<button
 			title="Zoom out"
@@ -231,6 +267,18 @@
 											style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid rgba(229,84,75,.3);border-radius:2px"
 										></span>
 									{/each}
+								{/if}
+								{#if c.fade_in > 0}
+									<span
+										title="Fade in {c.fade_in.toFixed(2)}s"
+										style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, rgba(0,0,0,.7), transparent);pointer-events:none"
+									></span>
+								{/if}
+								{#if c.fade_out > 0}
+									<span
+										title="Fade out {c.fade_out.toFixed(2)}s"
+										style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, rgba(0,0,0,.7), transparent);pointer-events:none"
+									></span>
 								{/if}
 								<span
 									style="position:relative;font-size:10px;font-weight:600;color:rgba(255,255,255,.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"

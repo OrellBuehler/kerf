@@ -124,7 +124,7 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns 
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `remove_clip`,
-`set_volume`, `remove_silence`, `extract_audio`, `concatenate` — each returns the
+`set_volume`, `set_fade`, `remove_silence`, `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), and `export_timeline`. Tauri auto-converts JS camelCase args to Rust

@@ -107,6 +107,16 @@ struct VolumeParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FadeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Fade-in duration in seconds; omit to leave unchanged, 0 to clear")]
+    fade_in: Option<f64>,
+    #[schemars(description = "Fade-out duration in seconds; omit to leave unchanged, 0 to clear")]
+    fade_out: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ConcatParams {
     #[schemars(description = "Ordered list of asset UUIDs to stitch together")]
     asset_ids: Vec<String>,
@@ -292,6 +302,15 @@ impl KerfMcp {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(description = "Set a clip's fade-in / fade-out duration in seconds (omit a field to leave it unchanged, 0 to clear)")]
+    fn set_fade(&self, Parameters(p): Parameters<FadeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
         self.changed();
         json(&out)
     }
@@ -499,7 +518,8 @@ impl ServerHandler for KerfMcp {
              list_assets / get_asset_metadata / get_timeline_state, run \
              analyze_asset to populate silence / scene / transcript metadata, \
              then assemble a non-destructive edit with the \
-             cut/split/trim/add/reorder/remove tools. Every edit is tracked: use \
+             cut/split/trim/add/reorder/remove tools, and polish with set_volume \
+             / set_fade (fade-in/out, e.g. to smooth hard cuts). Every edit is tracked: use \
              history to list revisions and undo / redo / revert_to to roll \
              changes back. When finished call complete_task with a short summary \
              (or fail_task on error); the user reviews and applies the staged \

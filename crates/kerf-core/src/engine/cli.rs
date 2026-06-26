@@ -474,6 +474,22 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
 /// whose asset has no audio stream get synthesized silence (`anullsrc`) of the
 /// clip's duration, so `concat`'s `a=1` always has an audio input to consume.
 ///
+/// Build a fade-filter prefix (with a trailing comma) for one clip, or `""`
+/// when it has no fades. `name` is `fade` for picture or `afade` for audio.
+/// Each fade is clamped to the clip's `dur` so it can never exceed the segment.
+fn fade_chain(name: &str, fade_in: f64, fade_out: f64, dur: f64) -> String {
+    let fi = fade_in.clamp(0.0, dur);
+    let fo = fade_out.clamp(0.0, dur);
+    let mut chain = String::new();
+    if fi > 0.0 {
+        chain.push_str(&format!("{name}=t=in:st=0:d={fi},"));
+    }
+    if fo > 0.0 {
+        chain.push_str(&format!("{name}=t=out:st={st}:d={fo},", st = (dur - fo).max(0.0)));
+    }
+    chain
+}
+
 /// Kept pure (no I/O) so it is unit-testable.
 fn build_filter_complex(track: &crate::model::Track, assets: &[Asset], fmt: &ExportFormat) -> String {
     let has_audio = |clip: &crate::model::Clip| {
@@ -487,27 +503,30 @@ fn build_filter_complex(track: &crate::model::Track, assets: &[Asset], fmt: &Exp
     let mut filter = String::new();
     let mut concat_inputs = String::new();
     for (i, clip) in track.clips.iter().enumerate() {
+        let dur = clip.duration();
         filter.push_str(&format!(
             "[{i}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,\
              scale={w}:{h}:force_original_aspect_ratio=decrease,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}];",
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},{vfade}format=yuv420p[v{i}];",
             i = i,
             start = clip.source_in,
             end = clip.source_out,
             w = fmt.width,
             h = fmt.height,
             fps = fmt.fps,
+            vfade = fade_chain("fade", clip.fade_in, clip.fade_out, dur),
         ));
         if has_audio(clip) {
             filter.push_str(&format!(
                 "[{i}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,volume={vol},\
-                 aformat=sample_rates={sr}:channel_layouts={layout}[a{i}];",
+                 {afade}aformat=sample_rates={sr}:channel_layouts={layout}[a{i}];",
                 i = i,
                 start = clip.source_in,
                 end = clip.source_out,
                 vol = clip.volume,
                 sr = fmt.sample_rate,
                 layout = layout,
+                afade = fade_chain("afade", clip.fade_in, clip.fade_out, dur),
             ));
         } else {
             filter.push_str(&format!(
@@ -638,6 +657,8 @@ mod tests {
                     source_out: 5.0,
                     timeline_start: 0.0,
                     volume: 0.5,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
                 },
                 Clip {
                     id: Uuid::new_v4(),
@@ -646,6 +667,8 @@ mod tests {
                     source_out: 4.0,
                     timeline_start: 5.0,
                     volume: 1.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
                 },
             ],
         };
@@ -669,6 +692,46 @@ mod tests {
         assert!(f.contains("aformat=sample_rates=48000:channel_layouts=stereo"));
         assert!(f.contains("anullsrc=r=48000:cl=stereo:d=2"));
         assert!(!f.contains("[1:a]"));
+    }
+
+    #[test]
+    fn filter_complex_applies_fades_to_picture_and_audio() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let assets = vec![asset.clone()];
+        let track = Track {
+            id: Uuid::new_v4(),
+            kind: StreamKind::Video,
+            name: "V1".into(),
+            clips: vec![Clip {
+                id: Uuid::new_v4(),
+                asset_id: asset.id,
+                source_in: 0.0,
+                source_out: 10.0,
+                timeline_start: 0.0,
+                volume: 1.0,
+                fade_in: 0.5,
+                fade_out: 1.0,
+            }],
+        };
+
+        let fmt = export_format(&track, &assets, &ExportOptions::default());
+        let f = build_filter_complex(&track, &assets, &fmt);
+        // Picture fades sit just before the pixel-format normalize.
+        assert!(f.contains("fade=t=in:st=0:d=0.5,fade=t=out:st=9:d=1,format=yuv420p"));
+        // Audio fades sit just before the audio-format normalize. The out fade
+        // starts at (duration - fade_out) = 9s.
+        assert!(f.contains("afade=t=in:st=0:d=0.5,afade=t=out:st=9:d=1,aformat"));
+    }
+
+    #[test]
+    fn filter_complex_omits_fades_when_zero() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let assets = vec![asset.clone()];
+        let track = make_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let fmt = export_format(&track, &assets, &ExportOptions::default());
+        let f = build_filter_complex(&track, &assets, &fmt);
+        assert!(!f.contains("fade="), "no fade filter when fades are zero");
+        assert!(!f.contains("afade="), "no afade filter when fades are zero");
     }
 
     #[test]
@@ -701,6 +764,8 @@ mod tests {
             source_out,
             timeline_start,
             volume: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
         }
     }
 

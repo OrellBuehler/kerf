@@ -190,6 +190,19 @@ fn set_volume(state: State<'_, AppState>, clip_id: String, volume: f32) -> CmdRe
 }
 
 #[tauri::command]
+fn set_fade(
+    state: State<'_, AppState>,
+    clip_id: String,
+    fade_in: Option<f64>,
+    fade_out: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_fade(id, fade_in, fade_out).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
     let project = state.project()?;
@@ -360,6 +373,7 @@ pub fn run() {
             reorder_clip,
             remove_clip,
             set_volume,
+            set_fade,
             remove_silence,
             extract_audio,
             concatenate,

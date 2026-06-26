@@ -22,6 +22,7 @@ import {
 	reorderClip,
 	revertTo as apiRevertTo,
 	saveProjectAs as apiSaveProjectAs,
+	setFade,
 	setVolume,
 	splitClip,
 	trimClip,
@@ -235,6 +236,9 @@ class EditorState {
 	}
 	setVolume(clipId: string, volume: number) {
 		return this.#apply(setVolume(clipId, volume));
+	}
+	setFade(clipId: string, fadeIn?: number, fadeOut?: number) {
+		return this.#apply(setFade(clipId, fadeIn, fadeOut));
 	}
 	removeSilence(assetId: string) {
 		return this.#apply(removeSilence(assetId));

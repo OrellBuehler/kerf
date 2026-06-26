@@ -103,6 +103,13 @@ pub struct Clip {
     pub timeline_start: f64,
     /// Linear gain applied to this clip (1.0 = unchanged).
     pub volume: f32,
+    /// Fade-in duration at the clip's start (seconds); 0.0 = no fade. Applied to
+    /// both picture (fade from black) and audio (fade from silence) at export.
+    #[serde(default)]
+    pub fade_in: f64,
+    /// Fade-out duration at the clip's end (seconds); 0.0 = no fade.
+    #[serde(default)]
+    pub fade_out: f64,
 }
 
 impl Clip {

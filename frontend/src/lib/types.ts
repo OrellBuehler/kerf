@@ -47,6 +47,8 @@ export interface Clip {
 	source_out: number;
 	timeline_start: number;
 	volume: number;
+	fade_in: number;
+	fade_out: number;
 }
 
 export interface Track {

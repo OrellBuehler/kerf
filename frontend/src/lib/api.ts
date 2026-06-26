@@ -80,15 +80,15 @@ const sampleTimeline: Timeline = {
 			kind: 'video',
 			name: 'V1',
 			clips: [
-				{ id: 'c1', asset_id: sampleAssets[0].id, source_in: 0, source_out: 12.5, timeline_start: 0, volume: 1 },
-				{ id: 'c2', asset_id: sampleAssets[1].id, source_in: 0, source_out: 8, timeline_start: 12.5, volume: 1 }
+				{ id: 'c1', asset_id: sampleAssets[0].id, source_in: 0, source_out: 12.5, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 },
+				{ id: 'c2', asset_id: sampleAssets[1].id, source_in: 0, source_out: 8, timeline_start: 12.5, volume: 1, fade_in: 0.5, fade_out: 0.5 }
 			]
 		},
 		{
 			id: 'a1',
 			kind: 'audio',
 			name: 'A1',
-			clips: [{ id: 'c3', asset_id: sampleAssets[0].id, source_in: 0, source_out: 120, timeline_start: 0, volume: 1 }]
+			clips: [{ id: 'c3', asset_id: sampleAssets[0].id, source_in: 0, source_out: 120, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 }]
 		}
 	]
 };
@@ -269,7 +269,7 @@ export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 export async function cutClip(assetId: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
 		const track = trackForAsset(devTimeline, assetId);
-		track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1 });
+		track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
 		recordDev('Add clip');
 		return snapshot();
 	}
@@ -286,7 +286,7 @@ export async function addClip(
 	if (!inTauri()) {
 		const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
 		const start = timelineStart ?? trackEnd(track);
-		track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1 });
+		track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
 		recordDev('Add clip');
 		return snapshot();
 	}
@@ -363,6 +363,20 @@ export async function setVolume(clipId: string, volume: number): Promise<Timelin
 	return invoke<Timeline>('set_volume', { clipId, volume });
 }
 
+export async function setFade(clipId: string, fadeIn?: number, fadeOut?: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			if (fadeIn != null) clip.fade_in = fadeIn;
+			if (fadeOut != null) clip.fade_out = fadeOut;
+		}
+		recordDev('Set fade');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_fade', { clipId, fadeIn, fadeOut });
+}
+
 export async function removeSilence(assetId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const asset = assetById(assetId);
@@ -377,7 +391,7 @@ export async function removeSilence(assetId: string): Promise<Timeline> {
 		}
 		if (asset && cursor < asset.duration) keep.push([cursor, asset.duration]);
 		for (const [si, so] of keep) {
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: si, source_out: so, timeline_start: start, volume: 1 });
+			track.clips.push({ id: uid(), asset_id: assetId, source_in: si, source_out: so, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
 			start += so - si;
 		}
 		recordDev('Remove silence');
@@ -390,7 +404,7 @@ export async function extractAudio(assetId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const asset = assetById(assetId);
 		const track = devTimeline.tracks.find((t) => t.kind === 'audio') ?? devTimeline.tracks[0];
-		if (asset) track.clips.push({ id: uid(), asset_id: assetId, source_in: 0, source_out: asset.duration, timeline_start: trackEnd(track), volume: 1 });
+		if (asset) track.clips.push({ id: uid(), asset_id: assetId, source_in: 0, source_out: asset.duration, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
 		recordDev('Extract audio');
 		return snapshot();
 	}
