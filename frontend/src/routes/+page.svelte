@@ -6,6 +6,7 @@
 	import MediaBin from '$lib/components/editor/MediaBin.svelte';
 	import Preview from '$lib/components/editor/Preview.svelte';
 	import Timeline from '$lib/components/editor/Timeline.svelte';
+	import Inspector from '$lib/components/editor/Inspector.svelte';
 	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -141,6 +142,9 @@
 			<Preview />
 			<Timeline />
 		</div>
+		{#if editor.selectedClip}
+			<Inspector />
+		{/if}
 		{#if ui.agentOpen}
 			<AgentPanel />
 		{/if}
