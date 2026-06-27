@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
-use kerf_core::{EditSource, Project, StreamKind, Transition, TransitionKind};
+use kerf_core::{EditSource, ExportOptions, Project, StreamKind, Transition, TransitionKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
@@ -210,10 +210,18 @@ struct RevertParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportParams {
-    #[schemars(description = "Output file path for the rendered result")]
+    #[schemars(description = "Output file path for the rendered result. Its extension should match the chosen container.")]
     output_path: String,
-    #[schemars(description = "Container/format hint, e.g. \"mp4\"")]
-    format: String,
+    #[schemars(
+        description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
+                       Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
+                       (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif); audio_codec \
+                       (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); rate_control \
+                       (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); preset; \
+                       resolution ([w,h]); fps; audio_bitrate (\"192k\"); include_audio; faststart."
+    )]
+    #[serde(default)]
+    options: Option<ExportOptions>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -549,10 +557,15 @@ impl KerfMcp {
         json(&out)
     }
 
-    #[tool(description = "Render the timeline to a file (requires the ffmpeg feature)")]
+    #[tool(
+        description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
+                       rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
+                       safe H.264/AAC MP4 default."
+    )]
     fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
         let project = self.lock();
-        let output = project.export(&p.output_path, &p.format).map_err(core_err)?;
+        let opts = p.options.unwrap_or_default();
+        let output = project.export_with(&p.output_path, &opts).map_err(core_err)?;
         json(&serde_json::json!({ "output": output.to_string_lossy() }))
     }
 

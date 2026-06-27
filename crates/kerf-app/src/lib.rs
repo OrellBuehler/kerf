@@ -10,7 +10,9 @@ mod mcp;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use kerf_core::{Asset, AssetAnalysis, EditSource, Project, Revision, StreamKind, Task, Timeline, Transition, TransitionKind};
+use kerf_core::{
+    Asset, AssetAnalysis, EditSource, ExportOptions, Project, Revision, StreamKind, Task, Timeline, Transition, TransitionKind,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
@@ -417,8 +419,8 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
-fn export_timeline(state: State<'_, AppState>, output_path: String, format: String) -> CmdResult<String> {
-    let out = state.project()?.export(&output_path, &format).map_err(|e| e.to_string())?;
+fn export_timeline(state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
+    let out = state.project()?.export_with(&output_path, &options).map_err(|e| e.to_string())?;
     Ok(out.to_string_lossy().into_owned())
 }
 

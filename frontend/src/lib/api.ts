@@ -12,6 +12,7 @@ import type {
 	Clip,
 	Color,
 	EditSource,
+	ExportOptions,
 	Revision,
 	StreamKind,
 	Task,
@@ -686,9 +687,20 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 
 // ---- export ----------------------------------------------------------------
 
-export async function exportTimeline(outputPath: string, format: string): Promise<string> {
+export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<string> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
-	return invoke<string>('export_timeline', { outputPath, format });
+	return invoke<string>('export_timeline', { outputPath, options });
+}
+
+/** Open a save dialog defaulted to the given container extension. */
+export async function pickExportPath(ext: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({
+		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+		defaultPath: `kerf-export.${ext}`
+	});
+	return typeof path === 'string' ? path : null;
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
@@ -703,17 +715,4 @@ export async function logDir(): Promise<string | null> {
 export async function revealLogs(): Promise<void> {
 	if (!inTauri()) return;
 	await invoke('reveal_logs');
-}
-
-/** Open a save dialog and render the timeline to the chosen path. */
-export async function pickAndExport(): Promise<string | null> {
-	if (!inTauri()) return null;
-	const { save } = await import('@tauri-apps/plugin-dialog');
-	const path = await save({
-		filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'mkv'] }],
-		defaultPath: 'kerf-export.mp4'
-	});
-	if (typeof path !== 'string') return null;
-	const ext = path.split('.').pop() || 'mp4';
-	return exportTimeline(path, ext);
 }

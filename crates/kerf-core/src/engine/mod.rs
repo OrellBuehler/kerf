@@ -28,7 +28,7 @@ mod ffmpeg;
 
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
-pub use cli::{detect_scenes, detect_silence, frame_at, waveform, ExportOptions};
+pub use cli::{detect_scenes, detect_silence, frame_at, validate_export, waveform, Container, ExportOptions, RateControl};
 
 #[cfg(feature = "whisper")]
 pub use cli::decode_audio_16k_mono;

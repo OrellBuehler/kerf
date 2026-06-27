@@ -292,40 +292,315 @@ fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
 
 // ---- export ----------------------------------------------------------------
 
-/// Configurable options for the CLI export pipeline.
-///
-/// `Default` reproduces the original hard-coded behaviour exactly: no explicit
-/// codec flags (ffmpeg picks libx264 + aac from the container), no CRF
-/// override, and no resolution/fps override (both derived from the source
-/// clips).
-#[derive(Debug, Clone, Default)]
+/// Output container / muxer. Authoritative over the output path extension; it
+/// gates the codec allow-lists, faststart, the gif palette pipeline and whether
+/// a video / audio stream is produced at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Container {
+    #[default]
+    Mp4,
+    Mov,
+    Mkv,
+    Webm,
+    Gif,
+    Mp3,
+    M4a,
+    Wav,
+    Flac,
+}
+
+impl Container {
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+            Self::Mkv => "mkv",
+            Self::Webm => "webm",
+            Self::Gif => "gif",
+            Self::Mp3 => "mp3",
+            Self::M4a => "m4a",
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+        }
+    }
+    /// mp4 / mov / m4a benefit from a front-loaded moov atom; nothing else does.
+    pub fn supports_faststart(self) -> bool {
+        matches!(self, Self::Mp4 | Self::Mov | Self::M4a)
+    }
+    /// Audio-only containers never carry a video stream.
+    pub fn is_audio_only(self) -> bool {
+        matches!(self, Self::Mp3 | Self::M4a | Self::Wav | Self::Flac)
+    }
+    /// Gif is the only video-only container (no audio stream).
+    pub fn is_video_only(self) -> bool {
+        matches!(self, Self::Gif)
+    }
+    pub fn video_codecs(self) -> &'static [&'static str] {
+        match self {
+            Self::Mp4 => &["libx264", "libx265", "libsvtav1"],
+            Self::Mov => &["prores_ks", "libx264", "libx265"],
+            Self::Mkv => &["libx264", "libx265", "libvpx-vp9", "libsvtav1"],
+            Self::Webm => &["libvpx-vp9", "libsvtav1"],
+            Self::Gif => &["gif"],
+            _ => &[],
+        }
+    }
+    pub fn audio_codecs(self) -> &'static [&'static str] {
+        match self {
+            Self::Mp4 => &["aac", "alac"],
+            Self::Mov => &["aac", "alac", "pcm_s16le", "pcm_s24le"],
+            Self::Mkv => &["aac", "libopus", "libmp3lame", "flac", "pcm_s16le"],
+            Self::Webm => &["libopus"],
+            Self::Mp3 => &["libmp3lame"],
+            Self::M4a => &["aac", "alac"],
+            Self::Wav => &["pcm_s16le", "pcm_s24le"],
+            Self::Flac => &["flac"],
+            Self::Gif => &[],
+        }
+    }
+    pub fn video_ok(self, codec: &str) -> bool {
+        self.video_codecs().contains(&codec)
+    }
+    pub fn audio_ok(self, codec: &str) -> bool {
+        self.audio_codecs().contains(&codec)
+    }
+}
+
+/// Which video rate-control branch [`build_export_args`] emits. Ignored for
+/// `prores_ks` (driven by the ProRes profile) and `gif` (palette pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RateControl {
+    /// Constant quality: `-crf N` (libvpx-vp9 also gets `-b:v 0`). The default.
+    #[default]
+    Crf,
+    /// Single-pass average bitrate: `-b:v X` (+ optional `-maxrate`/`-bufsize`).
+    Bitrate,
+    /// Two-pass average bitrate (two ffmpeg runs sharing a passlog).
+    TwoPass,
+    /// Per-codec lossless: x264/x265/svt-av1 `-crf 0`; libvpx-vp9 `-lossless 1`.
+    Lossless,
+}
+
+/// Which ffmpeg invocation [`build_export_args`] is emitting for. Injected so
+/// the builder stays pure (no knowledge of the platform null device or the temp
+/// passlog file — [`render_with`] supplies those).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PassPhase {
+    /// One-shot encode (every mode except two-pass).
+    #[default]
+    Single,
+    /// Two-pass analysis pass: `-pass 1`, video-only, discarded output.
+    First,
+    /// Two-pass final pass: `-pass 2`, real output.
+    Second,
+}
+
+/// Everything the export menu can drive. `Default` reproduces the original
+/// hard-coded behaviour byte-for-byte (no `-c:v`/`-c:a`/`-crf`, no faststart),
+/// so the legacy [`render`] path and the existing unit tests are unaffected.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", default)]
 pub struct ExportOptions {
-    /// Container / muxer hint passed to ffmpeg via the output extension.
-    /// `None` means the extension on the output path determines the format
-    /// (current default behaviour).
+    /// Target container / muxer.
+    pub container: Container,
+
+    /// `-c:v` value. `None` lets ffmpeg pick the encoder from the container
+    /// (legacy behaviour); audio-only containers ignore it.
     pub video_codec: Option<String>,
+    /// `-c:a` value. `None` lets ffmpeg pick from the container.
     pub audio_codec: Option<String>,
-    /// Constant Rate Factor; `None` lets ffmpeg use its encoder default.
+
+    /// Video rate-control mode.
+    pub rate_control: RateControl,
+    /// `-crf N` (Crf / Lossless modes). `None` keeps the encoder default.
     pub crf: Option<u32>,
-    /// Force a specific output resolution, overriding the value derived from
-    /// the first video clip.
+    /// `-b:v` token, e.g. "8M" / "2500k". Required for Bitrate / TwoPass.
+    pub video_bitrate: Option<String>,
+    /// `-maxrate` VBV cap (bitrate modes).
+    pub max_rate: Option<String>,
+    /// `-bufsize` VBV buffer (pairs with `max_rate`).
+    pub buf_size: Option<String>,
+
+    /// `-preset` for x264/x265 (named) and svt-av1 (numeric); reinterpreted as
+    /// `-cpu-used` for libvpx-vp9.
+    pub preset: Option<String>,
+    /// ProRes quality `-profile:v 0..5` (prores_ks only).
+    pub prores_profile: Option<u8>,
+    /// `-tune` (x264 / x265 only).
+    pub tune: Option<String>,
+    /// `-profile:v` for h264 / hevc (not ProRes).
+    pub profile_v: Option<String>,
+
+    /// `-pix_fmt` AND the filtergraph terminal `format=` (dual-write). `None`
+    /// keeps the yuv420p path. yuv420p requires even dimensions.
+    pub pix_fmt: Option<String>,
+
+    /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
-    /// Force a specific output frame rate, overriding the value derived from
-    /// the first video clip.
+    /// Output fps, baked into the filtergraph; never emits `-r`.
     pub fps: Option<f64>,
+    /// `scale=…:flags=` scaler (bicubic / bilinear / lanczos / neighbor / spline).
+    pub scaler: Option<String>,
+    /// Forced audio sample rate, via the graph `aformat` (not `-ar`).
+    pub audio_sample_rate: Option<u32>,
+    /// Forced channel count, via the graph `aformat` (not `-ac`).
+    pub audio_channels: Option<u16>,
+
+    /// `-b:a` token (lossy codecs only).
+    pub audio_bitrate: Option<String>,
+    /// `-compression_level` for flac.
+    pub flac_compression: Option<u8>,
+    /// When false the audio map is dropped and `-an` emitted.
+    pub include_audio: bool,
+
+    /// `-movflags +faststart` (mp4 / mov / m4a only).
+    pub faststart: bool,
+    /// `paletteuse=dither=` for gif.
+    pub gif_dither: Option<String>,
+    /// gif `-loop 0` (true, infinite) vs `-loop -1` (false, play once).
+    pub gif_loop: bool,
+    /// `-metadata title=`.
+    pub metadata_title: Option<String>,
+}
+
+impl Default for ExportOptions {
+    // Reproduces the pre-existing argv exactly: no codecs, no crf, no faststart.
+    fn default() -> Self {
+        Self {
+            container: Container::Mp4,
+            video_codec: None,
+            audio_codec: None,
+            rate_control: RateControl::Crf,
+            crf: None,
+            video_bitrate: None,
+            max_rate: None,
+            buf_size: None,
+            preset: None,
+            prores_profile: None,
+            tune: None,
+            profile_v: None,
+            pix_fmt: None,
+            resolution: None,
+            fps: None,
+            scaler: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            audio_bitrate: None,
+            flac_compression: None,
+            include_audio: true,
+            faststart: false,
+            gif_dither: None,
+            gif_loop: true,
+            metadata_title: None,
+        }
+    }
+}
+
+/// Whether a bitrate token like "8M" / "2500k" / "800000" is well-formed.
+fn valid_bitrate(s: &str) -> bool {
+    let s = s.trim();
+    let digits = match s.char_indices().find(|(_, c)| !(c.is_ascii_digit() || *c == '.')) {
+        Some((i, c)) => {
+            // The only allowed trailing char is a single k/K/M unit suffix.
+            if !matches!(c, 'k' | 'K' | 'm' | 'M') || i + c.len_utf8() != s.len() {
+                return false;
+            }
+            &s[..i]
+        }
+        None => s,
+    };
+    !digits.is_empty() && digits.parse::<f64>().map(|v| v > 0.0).unwrap_or(false)
+}
+
+/// The `-tune` values each encoder accepts. x265 notably lacks x264's `film` /
+/// `stillimage`; feeding an unknown tune makes the encoder fail to initialise.
+fn video_tunes(vc: &str) -> &'static [&'static str] {
+    match vc {
+        "libx264" => &["film", "animation", "grain", "stillimage", "zerolatency", "fastdecode", "psnr", "ssim"],
+        "libx265" => &["psnr", "ssim", "grain", "zerolatency", "fastdecode", "animation"],
+        _ => &[],
+    }
+}
+
+/// Validate an option set against the timeline's available streams, returning a
+/// list of human-readable problems (empty = OK). Pure; called by the pre-launch
+/// guard in [`render_with`] and mirrored client-side by the export dialog.
+pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -> Vec<String> {
+    let mut issues = Vec::new();
+    let c = opts.container;
+    let want_video = has_video && !c.is_audio_only();
+    let want_audio = has_audio && !c.is_video_only() && opts.include_audio;
+
+    if c.is_audio_only() && !has_audio {
+        issues.push(format!("{} is audio-only, but the timeline has no audio.", c.ext().to_uppercase()));
+    }
+    if c.is_video_only() && !has_video {
+        issues.push("GIF export needs video, but the timeline has no video.".to_string());
+    }
+    if !want_video && !want_audio {
+        issues.push("These settings would export nothing.".to_string());
+    }
+    if want_video {
+        if let Some(vc) = opts.video_codec.as_deref() {
+            if !c.video_ok(vc) {
+                issues.push(format!("{vc} can't go in a .{} file.", c.ext()));
+            }
+        }
+        let rate_mode = !matches!(opts.video_codec.as_deref(), Some("prores_ks") | Some("gif"));
+        if rate_mode && matches!(opts.rate_control, RateControl::Bitrate | RateControl::TwoPass) && opts.video_bitrate.is_none() {
+            issues.push("A target video bitrate is required for bitrate / two-pass.".to_string());
+        }
+        if let (Some(vc), Some(t)) = (opts.video_codec.as_deref(), opts.tune.as_deref()) {
+            if matches!(vc, "libx264" | "libx265") && !t.is_empty() && !video_tunes(vc).contains(&t) {
+                issues.push(format!("tune \"{t}\" is not valid for {vc}."));
+            }
+        }
+    }
+    if let Some(b) = opts.video_bitrate.as_deref() {
+        if !valid_bitrate(b) {
+            issues.push(format!("Invalid video bitrate \"{b}\"."));
+        }
+    }
+    for (label, v) in [("max rate", &opts.max_rate), ("buffer size", &opts.buf_size)] {
+        if let Some(b) = v.as_deref() {
+            if !valid_bitrate(b) {
+                issues.push(format!("Invalid {label} \"{b}\"."));
+            }
+        }
+    }
+    if want_audio {
+        if let Some(ac) = opts.audio_codec.as_deref() {
+            if !c.audio_ok(ac) {
+                issues.push(format!("{ac} can't go in a .{} file.", c.ext()));
+            }
+        }
+        if let Some(b) = opts.audio_bitrate.as_deref() {
+            if !valid_bitrate(b) {
+                issues.push(format!("Invalid audio bitrate \"{b}\"."));
+            }
+        }
+    }
+    issues
 }
 
 /// The single output shape every clip is normalized to before `concat`. The
 /// `concat` filter requires identical resolution / frame rate / sample format
 /// across its inputs, and `concat`'s `a=1` requires every segment to carry
 /// audio — so clips from a video-only asset get synthesized silence.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ExportFormat {
     width: u32,
     height: u32,
     fps: f64,
     sample_rate: u32,
     channels: u16,
+    /// Terminal pixel format: argv `-pix_fmt` and the filtergraph terminal
+    /// `format=` are kept in sync through this single field.
+    pix_fmt: String,
+    /// Optional `scale=…:flags=` scaler.
+    scaler: Option<String>,
 }
 
 impl Default for ExportFormat {
@@ -336,16 +611,25 @@ impl Default for ExportFormat {
             fps: 30.0,
             sample_rate: 48_000,
             channels: 2,
+            pix_fmt: "yuv420p".to_string(),
+            scaler: None,
         }
     }
 }
 
 impl ExportFormat {
-    fn channel_layout(self) -> &'static str {
+    fn channel_layout(&self) -> &'static str {
         if self.channels <= 1 {
             "mono"
         } else {
             "stereo"
+        }
+    }
+    /// The `:flags=…` suffix to append to a `scale` filter, or empty.
+    fn scale_flags(&self) -> String {
+        match &self.scaler {
+            Some(s) => format!(":flags={s}"),
+            None => String::new(),
         }
     }
 }
@@ -387,44 +671,92 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
     if let Some(f) = opts.fps.filter(|f| *f > 0.0) {
         fmt.fps = f;
     }
+    if let Some(r) = opts.audio_sample_rate.filter(|r| *r > 0) {
+        fmt.sample_rate = r;
+    }
+    if let Some(c) = opts.audio_channels.filter(|c| *c > 0) {
+        fmt.channels = c;
+    }
+    // libopus only encodes at 48 kHz; force it regardless of source / override.
+    if opts.audio_codec.as_deref() == Some("libopus") {
+        fmt.sample_rate = 48_000;
+    }
+    // yuv420p (and most 4:2:0 formats) require even dimensions, so clamp both
+    // source-derived and custom sizes before they reach `scale=`/`color=s=`.
+    fmt.width = (fmt.width & !1).max(2);
+    fmt.height = (fmt.height & !1).max(2);
+    if let Some(pf) = opts.pix_fmt.clone() {
+        fmt.pix_fmt = pf;
+    } else if opts.video_codec.as_deref() == Some("prores_ks") {
+        // ProRes cannot encode 4:2:0; default a None pix_fmt to 10-bit 4:2:2 (or
+        // 4:4:4 for the 4444 profiles) so the graph terminal doesn't silently
+        // decimate a 10-bit / 4:2:2 source to 8-bit 4:2:0 before the encode.
+        fmt.pix_fmt = if matches!(opts.prores_profile, Some(4) | Some(5)) {
+            "yuva444p10le".to_string()
+        } else {
+            "yuv422p10le".to_string()
+        };
+    }
+    fmt.scaler = opts.scaler.clone();
     fmt
 }
 
 /// Build the complete argument list for `ffmpeg` (everything after the binary
-/// name) that renders the whole `timeline` to `output_path`.
+/// name) that renders the whole `timeline` to `output_path` with `opts`.
 ///
 /// One input (`-i`) is added per clip, in track-then-clip order; the filtergraph
 /// (see [`build_filter_complex`]) references those inputs by the same index. The
-/// `[outv]` / `[outa]` maps are added only for the streams the graph actually
-/// produces (a timeline with no audio-bearing clips yields no `[outa]`).
+/// `[outv]` / `[outa]` maps — and the codec / rate-control / muxer flags that
+/// follow them — are emitted only for the streams the chosen container actually
+/// carries, kept in lockstep with the graph so no produced pad is left unmapped.
 ///
 /// The function is pure — it performs no I/O and does not spawn ffmpeg —
 /// which makes it unit-testable without the binary being present. The actual
 /// render call feeds the returned `Vec<String>` straight to `Command::args`.
-pub fn build_export_args(
+pub fn build_export_args(timeline: &Timeline, assets: &[Asset], output_path: &str, opts: &ExportOptions) -> Result<Vec<String>> {
+    build_export_args_phase(timeline, assets, output_path, opts, PassPhase::Single, "", "")
+}
+
+/// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
+/// is the platform null device (`/dev/null` / `NUL`) used as the first-pass
+/// output, and `passlog` is the shared `-passlogfile` prefix — both injected by
+/// [`render_with`] so this builder stays pure. Single-pass callers pass
+/// `(Single, "", "")`.
+fn build_export_args_phase(
     timeline: &Timeline,
     assets: &[Asset],
     output_path: &str,
     opts: &ExportOptions,
+    pass: PassPhase,
+    null_sink: &str,
+    passlog: &str,
 ) -> Result<Vec<String>> {
     let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
+
+    // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
+    let timeline_has_video = timeline.tracks.iter().any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    let timeline_has_audio = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .any(|c| assets.iter().find(|a| a.id == c.asset_id).is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio)));
+    let c = opts.container;
+    let want_video = timeline_has_video && !c.is_audio_only();
+    let want_audio = timeline_has_audio && !c.is_video_only() && opts.include_audio && pass != PassPhase::First;
 
     // `-hide_banner -nostats` keep the captured stderr to genuine warnings/errors
     // (matching the probe/frame calls); without `-nostats` the per-frame progress
     // lines would accumulate unbounded in memory for a long export.
-    let mut args: Vec<String> = vec![
-        "-y".to_string(),
-        "-hide_banner".to_string(),
-        "-nostats".to_string(),
-    ];
+    let mut args: Vec<String> = vec!["-y".to_string(), "-hide_banner".to_string(), "-nostats".to_string()];
     for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         args.push("-i".to_string());
         args.push(path.to_string());
     }
+
     let fmt = export_format(timeline, assets, opts);
     let total = timeline.duration();
-    let graph = build_filter_complex(timeline, assets, &fmt, total);
+    let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio);
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     if graph.has_video {
@@ -435,20 +767,180 @@ pub fn build_export_args(
         args.push("-map".to_string());
         args.push("[outa]".to_string());
     }
-    if let Some(ref vc) = opts.video_codec {
-        args.push("-c:v".to_string());
-        args.push(vc.clone());
+
+    // ---- video output options (only when a codec is explicitly chosen; a bare
+    // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
+    if graph.has_video {
+        if let Some(vc) = opts.video_codec.as_deref() {
+            args.push("-c:v".to_string());
+            args.push(vc.to_string());
+            push_video_opts(&mut args, opts, vc, pass, passlog);
+            // `-pix_fmt` must equal the graph terminal `format=`; gif is pal8.
+            if vc != "gif" {
+                args.push("-pix_fmt".to_string());
+                args.push(fmt.pix_fmt.clone());
+            }
+        }
     }
-    if let Some(ref ac) = opts.audio_codec {
-        args.push("-c:a".to_string());
-        args.push(ac.clone());
+
+    // ---- audio output options ----
+    if graph.has_audio {
+        if let Some(ac) = opts.audio_codec.as_deref() {
+            args.push("-c:a".to_string());
+            args.push(ac.to_string());
+            match ac {
+                "aac" | "libmp3lame" | "libopus" => {
+                    if let Some(b) = &opts.audio_bitrate {
+                        args.push("-b:a".to_string());
+                        args.push(b.clone());
+                    }
+                }
+                "flac" => {
+                    if let Some(lvl) = opts.flac_compression {
+                        args.push("-compression_level".to_string());
+                        args.push(lvl.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    if let Some(crf) = opts.crf {
-        args.push("-crf".to_string());
-        args.push(crf.to_string());
+    // Explicit mute: the timeline has audio but the user dropped it (distinct
+    // from a timeline that simply has no audio).
+    if timeline_has_audio && !want_audio && pass != PassPhase::First && !c.is_video_only() {
+        args.push("-an".to_string());
     }
-    args.push(output_path.to_string());
+
+    // ---- muxer / misc (skipped on the two-pass analysis pass, whose output is
+    // the null muxer — it rejects mov/gif muxer options like -movflags) ----
+    if pass != PassPhase::First {
+        if opts.faststart && c.supports_faststart() {
+            args.push("-movflags".to_string());
+            args.push("+faststart".to_string());
+        }
+        if c == Container::Gif {
+            args.push("-loop".to_string());
+            args.push(if opts.gif_loop { "0" } else { "-1" }.to_string());
+        }
+        if let Some(title) = opts.metadata_title.as_deref().filter(|t| !t.is_empty()) {
+            // One argv token via Command::args — no shell quoting; spaces/= are safe.
+            args.push("-metadata".to_string());
+            args.push(format!("title={title}"));
+        }
+    }
+
+    if pass == PassPhase::First {
+        args.push("-an".to_string());
+        args.push("-f".to_string());
+        args.push("null".to_string());
+        args.push(null_sink.to_string());
+    } else {
+        args.push(output_path.to_string());
+    }
     Ok(args)
+}
+
+/// Append the `-c:v`-private options for `vc`: rate control, speed preset,
+/// tune / profile and the HEVC `hvc1` tag. Must run after `-c:v` is pushed or
+/// ffmpeg silently drops these.
+fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass: PassPhase, passlog: &str) {
+    // ProRes and gif drive quality elsewhere (profile / palette), not rate control.
+    if vc == "prores_ks" {
+        args.push("-profile:v".to_string());
+        args.push(opts.prores_profile.unwrap_or(3).to_string());
+        return;
+    }
+    if vc == "gif" {
+        return;
+    }
+
+    match opts.rate_control {
+        RateControl::Crf => {
+            if let Some(n) = opts.crf {
+                args.push("-crf".to_string());
+                args.push(n.to_string());
+            }
+            // VP9 constant-quality requires -crf paired with -b:v 0.
+            if vc == "libvpx-vp9" {
+                args.push("-b:v".to_string());
+                args.push("0".to_string());
+            }
+        }
+        RateControl::Bitrate => {
+            if let Some(b) = &opts.video_bitrate {
+                args.push("-b:v".to_string());
+                args.push(b.clone());
+            }
+            if let Some(m) = &opts.max_rate {
+                args.push("-maxrate".to_string());
+                args.push(m.clone());
+            }
+            if let Some(b) = &opts.buf_size {
+                args.push("-bufsize".to_string());
+                args.push(b.clone());
+            }
+        }
+        RateControl::TwoPass => {
+            if let Some(b) = &opts.video_bitrate {
+                args.push("-b:v".to_string());
+                args.push(b.clone());
+            }
+            args.push("-pass".to_string());
+            args.push(if pass == PassPhase::First { "1" } else { "2" }.to_string());
+            if !passlog.is_empty() {
+                args.push("-passlogfile".to_string());
+                args.push(passlog.to_string());
+            }
+        }
+        RateControl::Lossless => match vc {
+            "libx264" | "libx265" | "libsvtav1" => {
+                args.push("-crf".to_string());
+                args.push("0".to_string());
+            }
+            "libvpx-vp9" => {
+                args.push("-lossless".to_string());
+                args.push("1".to_string());
+            }
+            _ => {}
+        },
+    }
+
+    // Speed preset: named for x264/x265/svt-av1, -cpu-used for libvpx-vp9.
+    match vc {
+        "libx264" | "libx265" | "libsvtav1" => {
+            if let Some(p) = &opts.preset {
+                args.push("-preset".to_string());
+                args.push(p.clone());
+            }
+        }
+        "libvpx-vp9" => {
+            args.push("-cpu-used".to_string());
+            args.push(opts.preset.clone().unwrap_or_else(|| "4".to_string()));
+            args.push("-deadline".to_string());
+            args.push("good".to_string());
+            args.push("-row-mt".to_string());
+            args.push("1".to_string());
+        }
+        _ => {}
+    }
+
+    if matches!(vc, "libx264" | "libx265") {
+        // Only emit a tune the encoder actually accepts (x265 lacks film/stillimage)
+        // so a stale value never makes ffmpeg fail to open the encoder.
+        if let Some(t) = opts.tune.as_deref().filter(|t| video_tunes(vc).contains(t)) {
+            args.push("-tune".to_string());
+            args.push(t.to_string());
+        }
+        if let Some(p) = &opts.profile_v {
+            args.push("-profile:v".to_string());
+            args.push(p.clone());
+        }
+    }
+    // HEVC in mp4/mov needs the hvc1 tag or QuickTime / iOS refuse to play it.
+    if vc == "libx265" && matches!(opts.container, Container::Mp4 | Container::Mov) {
+        args.push("-tag:v".to_string());
+        args.push("hvc1".to_string());
+    }
 }
 
 /// Render the timeline by driving the `ffmpeg` binary with a generated
@@ -459,27 +951,61 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
     render_with(timeline, assets, output, &ExportOptions::default())
 }
 
-/// Like [`render`] but with explicit export options.
+/// Like [`render`] but with explicit export options. Validates the options
+/// against the timeline's available streams before launching, and runs ffmpeg
+/// twice for [`RateControl::TwoPass`].
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &ExportOptions) -> Result<()> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
 
+    let has_video = timeline.tracks.iter().any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    let has_audio = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .any(|c| assets.iter().find(|a| a.id == c.asset_id).is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio)));
+    let issues = validate_export(opts, has_video, has_audio);
+    if !issues.is_empty() {
+        return Err(Error::InvalidArgument(issues.join(" ")));
+    }
+
     let output_str = output
         .to_str()
         .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 output path: {}", output.display())))?;
 
-    let args = build_export_args(timeline, assets, output_str, opts)?;
+    let two_pass = matches!(opts.rate_control, RateControl::TwoPass)
+        && has_video
+        && !opts.container.is_audio_only()
+        && matches!(opts.video_codec.as_deref(), Some(vc) if vc != "prores_ks" && vc != "gif");
 
+    if two_pass {
+        let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        // ffmpeg appends "-N.log" to the passlog prefix; scope it to this process.
+        let passlog = std::env::temp_dir().join(format!("kerf-2pass-{}", std::process::id())).to_string_lossy().into_owned();
+        let a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
+        run_ffmpeg(&a1, output)?;
+        let a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
+        let res = run_ffmpeg(&a2, output);
+        for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
+            let _ = std::fs::remove_file(format!("{passlog}{suffix}"));
+        }
+        res
+    } else {
+        let args = build_export_args(timeline, assets, output_str, opts)?;
+        run_ffmpeg(&args, output)
+    }
+}
+
+/// Spawn the `ffmpeg` binary with `args`, capturing stderr so a failure's actual
+/// reason (rather than inherited console noise) ends up in the error and log.
+fn run_ffmpeg(args: &[String], output: &Path) -> Result<()> {
     let bin = ffmpeg_bin();
-    let clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
-    tracing::info!(output = %output.display(), clips, "exporting timeline");
+    tracing::info!(output = %output.display(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
-    // Capture output (rather than inheriting) so ffmpeg's stderr — the actual
-    // failure reason — ends up in the error and the log, not just the console.
-    let out = Command::new(&bin).args(&args).output().map_err(|e| launch_err(&bin, e))?;
+    let out = Command::new(&bin).args(args).output().map_err(|e| launch_err(&bin, e))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let mut tail: Vec<&str> = stderr.lines().rev().take(20).collect();
@@ -518,7 +1044,20 @@ struct FilterGraph {
 /// Each clip indexes the ffmpeg input list by its track-then-clip order, which
 /// matches how [`build_export_args`] adds the `-i` inputs. Kept pure (no I/O)
 /// so it is unit-testable without the binary present.
-fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportFormat, total: f64) -> FilterGraph {
+///
+/// `want_video` / `want_audio` gate stream emission so the graph never produces
+/// a pad the caller won't `-map` (e.g. an mp3 export of a video timeline emits
+/// no `[outv]`). For a gif container the picture pad is routed through a
+/// `palettegen` / `paletteuse` pair and audio is always dropped.
+fn build_filter_complex(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    total: f64,
+    opts: &ExportOptions,
+    want_video: bool,
+    want_audio: bool,
+) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| {
         assets
             .iter()
@@ -559,20 +1098,25 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
     let mut chains: Vec<String> = Vec::new();
 
     // ---- picture: black base + positioned overlays --------------------------
-    let has_video = !video.is_empty();
+    let gif = opts.container == Container::Gif;
+    let has_video = want_video && !video.is_empty();
     if has_video {
         chains.push(format!(
-            "color=c=black:s={w}x{h}:r={fps}:d={total},format=yuv420p[vbase]",
+            "color=c=black:s={w}x{h}:r={fps}:d={total},format={pf}[vbase]",
             w = fmt.width,
             h = fmt.height,
             fps = fmt.fps,
             total = total.max(0.0),
+            pf = fmt.pix_fmt,
         ));
         let mut cur = "vbase".to_string();
+        // For gif the composite lands on `vcomp`, then palettegen / paletteuse
+        // produce the real `[outv]`; otherwise the last overlay is `[outv]`.
+        let final_pad = if gif { "vcomp" } else { "outv" };
         let last = video.len() - 1;
         for (n, (i, clip)) in video.iter().enumerate() {
             chains.push(format!("[{i}:v]{chain}[v{i}]", i = i, chain = video_clip_chain(clip, fmt, &fx[*i])));
-            let out = if n == last { "outv".to_string() } else { format!("vov{n}") };
+            let out = if n == last { final_pad.to_string() } else { format!("vov{n}") };
             let end = clip.timeline_end() + fx[*i].tail;
             let overlay = if clip.transform.is_identity() {
                 format!("overlay=eof_action=pass:enable='between(t,{start},{end})'", start = clip.timeline_start)
@@ -589,10 +1133,18 @@ fn build_filter_complex(timeline: &Timeline, assets: &[Asset], fmt: &ExportForma
             chains.push(format!("[{cur}][v{i}]{overlay}[{out}]"));
             cur = out;
         }
+        if gif {
+            // A two-stream palette gives far better color than the default 216-color
+            // web palette: generate an optimized palette, then map onto it.
+            let dither = opts.gif_dither.as_deref().unwrap_or("bayer");
+            chains.push("[vcomp]split[gpsrc][gpuse]".to_string());
+            chains.push("[gpsrc]palettegen=stats_mode=diff[gpal]".to_string());
+            chains.push(format!("[gpuse][gpal]paletteuse=dither={dither}[outv]"));
+        }
     }
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
-    let has_audio_out = !audio.is_empty();
+    let has_audio_out = want_audio && !audio.is_empty();
     if has_audio_out {
         for (i, clip) in &audio {
             chains.push(format!("[{i}:a]{chain}[a{i}]", i = i, chain = audio_clip_chain(clip, fmt, &fx[*i], layout)));
@@ -725,13 +1277,14 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
     } else {
         p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
     }
+    let sf = fmt.scale_flags();
     if t.is_identity() {
-        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease", w = fmt.width, h = fmt.height));
+        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
         p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
     } else {
-        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease", w = fmt.width, h = fmt.height));
+        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
         if (t.scale - 1.0).abs() > 1e-9 {
-            p.push(format!("scale=iw*{sc}:ih*{sc}", sc = t.scale));
+            p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
         }
     }
     p.push("setsar=1".to_string());
@@ -773,7 +1326,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
         p.push(format!("fade=t=in:st=0:d={}:alpha=1", fx.xfade_in.clamp(0.0, dur)));
     }
     if !needs_alpha {
-        p.push("format=yuv420p".to_string());
+        // Terminal pixel format — kept equal to argv `-pix_fmt` so a 10-bit /
+        // 4:2:2 selection isn't silently bottlenecked back through 8-bit.
+        p.push(format!("format={}", fmt.pix_fmt));
     }
     p.join(",")
 }
@@ -941,7 +1496,7 @@ mod tests {
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.sample_rate, 48_000);
 
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration());
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
         assert!(g.has_video && g.has_audio);
         let f = g.filter;
         // A black canvas spanning the whole timeline, then one positioned
@@ -977,7 +1532,7 @@ mod tests {
             video_track(vec![make_clip(broll.id, 0.0, 6.0, 4.0)]), // overlaps 4..10
         ]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration());
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
         let f = g.filter;
         // Two overlays: B-roll (input 1) composites on top of the interview.
         assert_eq!(f.matches("overlay=eof_action=pass").count(), 2);
@@ -995,7 +1550,7 @@ mod tests {
         let assets = vec![audio_asset.clone()];
         let timeline = timeline_of(vec![audio_track(vec![make_clip(audio_asset.id, 0.0, 10.0, 3.0)])]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration());
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
         assert!(!g.has_video);
         assert!(g.has_audio);
         // Positioned at 3s on the timeline via adelay; no picture canvas.
@@ -1013,7 +1568,7 @@ mod tests {
         let timeline = single(vec![clip]);
 
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration()).filter;
+        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true).filter;
         // Picture fades sit just before the pixel-format normalize.
         assert!(f.contains("fade=t=in:st=0:d=0.5,fade=t=out:st=9:d=1,format=yuv420p"));
         // Audio fades sit just before the audio-format normalize. The out fade
@@ -1027,7 +1582,7 @@ mod tests {
         let assets = vec![asset.clone()];
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration()).filter;
+        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true).filter;
         assert!(!f.contains("fade="), "no fade filter when fades are zero");
         assert!(!f.contains("afade="), "no afade filter when fades are zero");
     }
@@ -1185,8 +1740,7 @@ mod tests {
             video_codec: Some("libx264".to_string()),
             audio_codec: Some("aac".to_string()),
             crf: Some(23),
-            resolution: None,
-            fps: None,
+            ..Default::default()
         };
 
         let args = build_export_args(&timeline, &assets, "/out/result.mp4", &opts).unwrap();
@@ -1212,11 +1766,9 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
         let opts = ExportOptions {
-            video_codec: None,
-            audio_codec: None,
-            crf: None,
             resolution: Some((1920, 1080)),
             fps: Some(30.0),
+            ..Default::default()
         };
 
         let args = build_export_args(&timeline, &assets, "/out/downscaled.mp4", &opts).unwrap();
@@ -1253,11 +1805,13 @@ mod tests {
             fps: 30.0,
             sample_rate: 48_000,
             channels: 2,
+            pix_fmt: "yuv420p".to_string(),
+            scaler: None,
         }
     }
 
     fn graph_of(timeline: &Timeline, assets: &[Asset]) -> String {
-        build_filter_complex(timeline, assets, &fmt_1080p(), timeline.duration()).filter
+        build_filter_complex(timeline, assets, &fmt_1080p(), timeline.duration(), &ExportOptions::default(), true, true).filter
     }
 
     #[test]
@@ -1413,5 +1967,309 @@ mod tests {
         // Outgoing A fades out to black at its end, incoming B fades up from black.
         assert!(g.contains("fade=t=out:st=9.5:d=0.5"), "{g}");
         assert!(g.contains("fade=t=in:st=0:d=0.5"), "{g}");
+    }
+
+    // ---- export option mapping -------------------------------------------
+
+    /// The token following `flag` in `args`, if present.
+    fn flag_val<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    /// Build the argv for `opts` against a single 1080p video+audio clip.
+    fn args_of(opts: &ExportOptions) -> Vec<String> {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        build_export_args(&timeline, &[asset], "/out/x", opts).unwrap()
+    }
+
+    #[test]
+    fn build_export_args_default_unchanged() {
+        // The bare default must reproduce the legacy argv: maps, but no codec /
+        // crf / pix_fmt / faststart flags.
+        let args = args_of(&ExportOptions::default());
+        assert!(args.contains(&"[outv]".to_string()) && args.contains(&"[outa]".to_string()));
+        assert!(!args.contains(&"-c:v".to_string()));
+        assert!(!args.contains(&"-c:a".to_string()));
+        assert!(!args.contains(&"-crf".to_string()));
+        assert!(!args.contains(&"-pix_fmt".to_string()));
+        assert!(!args.contains(&"-movflags".to_string()));
+        assert_eq!(args.last().unwrap(), "/out/x");
+    }
+
+    #[test]
+    fn build_export_args_h264_crf_in_order() {
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            audio_codec: Some("aac".into()),
+            crf: Some(20),
+            preset: Some("medium".into()),
+            pix_fmt: Some("yuv420p".into()),
+            audio_bitrate: Some("192k".into()),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert_eq!(flag_val(&args, "-c:v"), Some("libx264"));
+        assert_eq!(flag_val(&args, "-crf"), Some("20"));
+        assert_eq!(flag_val(&args, "-preset"), Some("medium"));
+        assert_eq!(flag_val(&args, "-pix_fmt"), Some("yuv420p"));
+        assert_eq!(flag_val(&args, "-c:a"), Some("aac"));
+        assert_eq!(flag_val(&args, "-b:a"), Some("192k"));
+        // The maps precede -c:v, which precedes its private -crf.
+        let map = args.iter().position(|a| a == "[outv]").unwrap();
+        let cv = args.iter().position(|a| a == "-c:v").unwrap();
+        let crf = args.iter().position(|a| a == "-crf").unwrap();
+        assert!(map < cv && cv < crf);
+    }
+
+    #[test]
+    fn build_export_args_vp9_crf_pairs_bv0_and_cpu_used() {
+        let opts = ExportOptions {
+            container: Container::Webm,
+            video_codec: Some("libvpx-vp9".into()),
+            audio_codec: Some("libopus".into()),
+            crf: Some(31),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert_eq!(flag_val(&args, "-crf"), Some("31"));
+        assert_eq!(flag_val(&args, "-b:v"), Some("0"));
+        assert_eq!(flag_val(&args, "-cpu-used"), Some("4"));
+        assert!(!args.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_x265_mp4_tags_hvc1_but_mkv_does_not() {
+        let mp4 = ExportOptions { video_codec: Some("libx265".into()), container: Container::Mp4, ..Default::default() };
+        assert_eq!(flag_val(&args_of(&mp4), "-tag:v"), Some("hvc1"));
+        let mkv = ExportOptions { video_codec: Some("libx265".into()), container: Container::Mkv, ..Default::default() };
+        assert!(!args_of(&mkv).contains(&"-tag:v".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_prores_uses_profile_not_crf() {
+        let opts = ExportOptions {
+            container: Container::Mov,
+            video_codec: Some("prores_ks".into()),
+            prores_profile: Some(3),
+            crf: Some(18), // ignored for prores
+            pix_fmt: Some("yuv422p10le".into()),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert_eq!(flag_val(&args, "-profile:v"), Some("3"));
+        assert!(!args.contains(&"-crf".to_string()));
+        assert!(!args.contains(&"-preset".to_string()));
+        assert_eq!(flag_val(&args, "-pix_fmt"), Some("yuv422p10le"));
+    }
+
+    #[test]
+    fn build_export_args_faststart_only_for_mp4_mov() {
+        let mp4 = ExportOptions { video_codec: Some("libx264".into()), faststart: true, ..Default::default() };
+        assert_eq!(flag_val(&args_of(&mp4), "-movflags"), Some("+faststart"));
+        let mkv = ExportOptions { container: Container::Mkv, video_codec: Some("libx264".into()), faststart: true, ..Default::default() };
+        assert!(!args_of(&mkv).contains(&"-movflags".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_audio_only_drops_video() {
+        let opts = ExportOptions {
+            container: Container::Mp3,
+            audio_codec: Some("libmp3lame".into()),
+            audio_bitrate: Some("320k".into()),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert!(!args.contains(&"[outv]".to_string()), "no video map for an audio-only container");
+        assert!(!args.contains(&"-c:v".to_string()));
+        assert!(!args.contains(&"-pix_fmt".to_string()));
+        assert!(args.contains(&"[outa]".to_string()));
+        assert_eq!(flag_val(&args, "-c:a"), Some("libmp3lame"));
+        assert_eq!(flag_val(&args, "-b:a"), Some("320k"));
+    }
+
+    #[test]
+    fn build_export_args_include_audio_false_emits_an() {
+        let opts = ExportOptions { video_codec: Some("libx264".into()), include_audio: false, ..Default::default() };
+        let args = args_of(&opts);
+        assert!(!args.contains(&"[outa]".to_string()));
+        assert!(args.contains(&"-an".to_string()));
+        assert!(!args.contains(&"-c:a".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_lossless_per_codec() {
+        let x264 = ExportOptions { video_codec: Some("libx264".into()), rate_control: RateControl::Lossless, ..Default::default() };
+        assert_eq!(flag_val(&args_of(&x264), "-crf"), Some("0"));
+        let vp9 = ExportOptions {
+            container: Container::Webm,
+            video_codec: Some("libvpx-vp9".into()),
+            audio_codec: Some("libopus".into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        };
+        assert_eq!(flag_val(&args_of(&vp9), "-lossless"), Some("1"));
+    }
+
+    #[test]
+    fn build_export_args_two_pass_first_and_second() {
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            audio_codec: Some("aac".into()),
+            rate_control: RateControl::TwoPass,
+            video_bitrate: Some("8M".into()),
+            faststart: true,
+            metadata_title: Some("Cut".into()),
+            ..Default::default()
+        };
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = [asset];
+        let p1 = build_export_args_phase(&timeline, &assets, "/out/x.mp4", &opts, PassPhase::First, "/dev/null", "/tmp/pl").unwrap();
+        assert_eq!(flag_val(&p1, "-b:v"), Some("8M"));
+        assert_eq!(flag_val(&p1, "-pass"), Some("1"));
+        assert_eq!(flag_val(&p1, "-passlogfile"), Some("/tmp/pl"));
+        assert!(!p1.contains(&"[outa]".to_string()), "the analysis pass is video-only");
+        assert!(p1.contains(&"-f".to_string()) && p1.contains(&"null".to_string()));
+        assert_eq!(p1.last().unwrap(), "/dev/null");
+        // The null muxer rejects mov/metadata options — they belong to pass 2 only.
+        assert!(!p1.contains(&"-movflags".to_string()) && !p1.contains(&"-metadata".to_string()));
+        let p2 = build_export_args_phase(&timeline, &assets, "/out/x.mp4", &opts, PassPhase::Second, "/dev/null", "/tmp/pl").unwrap();
+        assert_eq!(flag_val(&p2, "-pass"), Some("2"));
+        assert!(p2.contains(&"[outa]".to_string()));
+        assert_eq!(flag_val(&p2, "-movflags"), Some("+faststart"));
+        assert_eq!(p2.last().unwrap(), "/out/x.mp4");
+    }
+
+    #[test]
+    fn filter_pix_fmt_is_threaded_through_the_graph() {
+        let opts = ExportOptions { video_codec: Some("libx265".into()), pix_fmt: Some("yuv420p10le".into()), ..Default::default() };
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x", &opts).unwrap();
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        // Both the black base and the per-clip terminal track pix_fmt — no 8-bit
+        // bottleneck before the 10-bit encode.
+        assert!(filter.matches("yuv420p10le").count() >= 2, "{filter}");
+        assert_eq!(flag_val(&args, "-pix_fmt"), Some("yuv420p10le"));
+    }
+
+    #[test]
+    fn export_format_even_clamps_and_forces_opus_48k() {
+        let asset = test_asset(vec![video_stream(1921, 1081, 30.0), audio_stream(44_100, 2)]);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let opts = ExportOptions { resolution: Some((1921, 1081)), audio_codec: Some("libopus".into()), ..Default::default() };
+        let fmt = export_format(&timeline, &[asset], &opts);
+        assert_eq!((fmt.width, fmt.height), (1920, 1080));
+        assert_eq!(fmt.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn gif_uses_a_palette_and_drops_audio() {
+        let opts = ExportOptions { container: Container::Gif, video_codec: Some("gif".into()), include_audio: false, ..Default::default() };
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.gif", &opts).unwrap();
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("palettegen=stats_mode=diff"), "{filter}");
+        assert!(filter.contains("paletteuse=dither=bayer"), "{filter}");
+        assert!(!args.contains(&"[outa]".to_string()), "gif carries no audio");
+        assert!(!args.contains(&"-pix_fmt".to_string()), "gif is pal8");
+        assert_eq!(flag_val(&args, "-loop"), Some("0"));
+    }
+
+    #[test]
+    fn audio_bitrate_omitted_for_lossless_codecs() {
+        let flac = ExportOptions {
+            container: Container::Flac,
+            audio_codec: Some("flac".into()),
+            flac_compression: Some(8),
+            ..Default::default()
+        };
+        let a = args_of(&flac);
+        assert!(!a.contains(&"-b:a".to_string()));
+        assert_eq!(flag_val(&a, "-compression_level"), Some("8"));
+        let wav = ExportOptions {
+            container: Container::Wav,
+            audio_codec: Some("pcm_s16le".into()),
+            audio_bitrate: Some("192k".into()),
+            ..Default::default()
+        };
+        assert!(!args_of(&wav).contains(&"-b:a".to_string()), "pcm ignores a bitrate");
+    }
+
+    #[test]
+    fn metadata_title_is_a_single_token() {
+        let opts = ExportOptions { video_codec: Some("libx264".into()), metadata_title: Some("My Cut = v2".into()), ..Default::default() };
+        let args = args_of(&opts);
+        let i = args.iter().position(|a| a == "-metadata").unwrap();
+        assert_eq!(args[i + 1], "title=My Cut = v2");
+    }
+
+    #[test]
+    fn fps_never_emits_dash_r() {
+        let opts = ExportOptions { video_codec: Some("libx264".into()), fps: Some(24.0), ..Default::default() };
+        let args = args_of(&opts);
+        assert!(!args.contains(&"-r".to_string()), "fps lives only in the filtergraph");
+        assert!(flag_val(&args, "-filter_complex").unwrap().contains("fps=24"));
+    }
+
+    #[test]
+    fn validate_export_flags_bad_combinations() {
+        let webm_x264 = ExportOptions { container: Container::Webm, video_codec: Some("libx264".into()), ..Default::default() };
+        assert!(!validate_export(&webm_x264, true, true).is_empty());
+        let mp4_opus = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            audio_codec: Some("libopus".into()),
+            ..Default::default()
+        };
+        assert!(!validate_export(&mp4_opus, true, true).is_empty());
+        let two_pass_no_bitrate = ExportOptions { video_codec: Some("libx264".into()), rate_control: RateControl::TwoPass, ..Default::default() };
+        assert!(!validate_export(&two_pass_no_bitrate, true, true).is_empty());
+        let mp3_no_audio = ExportOptions { container: Container::Mp3, audio_codec: Some("libmp3lame".into()), ..Default::default() };
+        assert!(!validate_export(&mp3_no_audio, true, false).is_empty());
+        let ok = ExportOptions {
+            video_codec: Some("libx264".into()),
+            audio_codec: Some("aac".into()),
+            crf: Some(20),
+            ..Default::default()
+        };
+        assert!(validate_export(&ok, true, true).is_empty());
+    }
+
+    #[test]
+    fn prores_without_pix_fmt_defaults_to_10bit_422() {
+        let opts = ExportOptions { container: Container::Mov, video_codec: Some("prores_ks".into()), prores_profile: Some(3), ..Default::default() };
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mov", &opts).unwrap();
+        // Both the argv and the graph terminal use 4:2:2 10-bit — no 4:2:0 bottleneck.
+        assert_eq!(flag_val(&args, "-pix_fmt"), Some("yuv422p10le"));
+        assert!(flag_val(&args, "-filter_complex").unwrap().contains("yuv422p10le"));
+        assert!(!args.contains(&"yuv420p".to_string()));
+        // The 4444 profiles upgrade to 4:4:4 with alpha.
+        let xq = ExportOptions { container: Container::Mov, video_codec: Some("prores_ks".into()), prores_profile: Some(5), ..Default::default() };
+        assert_eq!(flag_val(&args_of_for(&timeline_mov(), &xq), "-pix_fmt"), Some("yuva444p10le"));
+    }
+
+    fn timeline_mov() -> (Timeline, Vec<Asset>) {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        (single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), vec![asset])
+    }
+    fn args_of_for(tl: &(Timeline, Vec<Asset>), opts: &ExportOptions) -> Vec<String> {
+        build_export_args(&tl.0, &tl.1, "/out/x.mov", opts).unwrap()
+    }
+
+    #[test]
+    fn x265_invalid_tune_is_dropped_and_flagged() {
+        // `film` is an x264-only tune; x265 would fail to open the encoder.
+        let opts = ExportOptions { video_codec: Some("libx265".into()), tune: Some("film".into()), ..Default::default() };
+        assert!(!args_of(&opts).contains(&"-tune".to_string()), "an invalid tune must not reach ffmpeg");
+        assert!(!validate_export(&opts, true, true).is_empty(), "validation must flag it");
+        // A valid x265 tune is kept.
+        let ok = ExportOptions { video_codec: Some("libx265".into()), tune: Some("grain".into()), ..Default::default() };
+        assert_eq!(flag_val(&args_of(&ok), "-tune"), Some("grain"));
+        assert!(validate_export(&ok, true, true).is_empty());
     }
 }

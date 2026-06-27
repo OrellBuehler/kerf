@@ -9,10 +9,13 @@
 	import Inspector from '$lib/components/editor/Inspector.svelte';
 	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
+	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
-	import { inTauri, pickAndExport } from '$lib/api';
+	import { inTauri } from '$lib/api';
+
+	let exportOpen = $state(false);
 
 	onMount(() => {
 		void editor.load();
@@ -78,21 +81,8 @@
 		}
 	}
 
-	async function onExport() {
-		if (!inTauri()) {
-			toast.info('Export renders the timeline with FFmpeg in the desktop app.');
-			return;
-		}
-		try {
-			const out = await toast.promise(pickAndExport(), {
-				loading: 'Rendering timeline…',
-				success: (p) => (p ? `Exported → ${p}` : 'Export cancelled'),
-				error: (e) => (e instanceof Error ? e.message : String(e))
-			});
-			void out;
-		} catch {
-			/* surfaced via toast */
-		}
+	function onExport() {
+		exportOpen = true;
 	}
 
 	function onKey(e: KeyboardEvent) {
@@ -153,3 +143,7 @@
 	</div>
 	<StatusBar />
 </div>
+
+{#if exportOpen}
+	<ExportDialog onClose={() => (exportOpen = false)} />
+{/if}

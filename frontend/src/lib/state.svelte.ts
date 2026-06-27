@@ -42,6 +42,7 @@ import type {
 	AssetMetadata,
 	Clip,
 	Color,
+	ExportOptions,
 	Revision,
 	StreamKind,
 	Timeline,
@@ -310,10 +311,10 @@ class EditorState {
 		return this.#apply(apiRevertTo(seq));
 	}
 
-	async export(outputPath: string, format: string): Promise<string> {
+	async export(outputPath: string, options: ExportOptions): Promise<string> {
 		this.busy = true;
 		try {
-			return await exportTimeline(outputPath, format);
+			return await exportTimeline(outputPath, options);
 		} finally {
 			this.busy = false;
 		}

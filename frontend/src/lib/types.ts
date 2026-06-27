@@ -134,6 +134,49 @@ export interface Task {
 	updated_at: string;
 }
 
+// ---- export options (mirrors kerf_core::engine::ExportOptions) -------------
+
+export type Container = 'mp4' | 'mov' | 'mkv' | 'webm' | 'gif' | 'mp3' | 'm4a' | 'wav' | 'flac';
+
+export type RateControl = 'crf' | 'bitrate' | 'two_pass' | 'lossless';
+
+export interface ExportOptions {
+	container: Container;
+	video_codec?: string | null;
+	audio_codec?: string | null;
+	rate_control: RateControl;
+	crf?: number | null;
+	video_bitrate?: string | null;
+	max_rate?: string | null;
+	buf_size?: string | null;
+	preset?: string | null;
+	prores_profile?: number | null;
+	tune?: string | null;
+	profile_v?: string | null;
+	pix_fmt?: string | null;
+	resolution?: [number, number] | null;
+	fps?: number | null;
+	scaler?: string | null;
+	audio_sample_rate?: number | null;
+	audio_channels?: number | null;
+	audio_bitrate?: string | null;
+	flac_compression?: number | null;
+	include_audio: boolean;
+	faststart: boolean;
+	gif_dither?: string | null;
+	gif_loop: boolean;
+	metadata_title?: string | null;
+}
+
+/** The bare Rust `Default` — the dialog opens by applying a preset over this. */
+export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
+	container: 'mp4',
+	rate_control: 'crf',
+	include_audio: true,
+	faststart: false,
+	gif_loop: true
+};
+
 export const clipDuration = (clip: Clip): number => {
 	const span = Math.max(0, clip.source_out - clip.source_in);
 	const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
