@@ -12,8 +12,12 @@ class EditorUi {
 	snap = $state(true);
 	agentOpen = $state(true);
 	playing = $state(false);
+	/** The asset being dragged from the media bin, while a drag is in flight. */
+	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);
 	/** Whether an analysis pass is currently running. */
 	analyzing = $state(false);
+	/** The asset currently being analyzed (so the bin badges the right one). */
+	analyzingId = $state<string | null>(null);
 	/** Analysis progress, 0–100. */
 	progress = $state(0);
 	/** Playhead position, seconds. */
@@ -33,6 +37,7 @@ class EditorUi {
 	async runAnalysis(assetId: string) {
 		this.#clear();
 		this.analyzing = true;
+		this.analyzingId = assetId;
 		this.progress = 6;
 		this.#timer = setInterval(() => {
 			this.progress = Math.min(94, this.progress + 6);
@@ -43,6 +48,7 @@ class EditorUi {
 			this.#clear();
 			this.progress = 100;
 			this.analyzing = false;
+			this.analyzingId = null;
 		}
 	}
 

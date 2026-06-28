@@ -241,7 +241,8 @@
 
 			<!-- summary -->
 			<div
-				style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+				data-selectable
+					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 			>
 				{summary}
 			</div>
@@ -477,6 +478,7 @@
 			>
 			{#if showCommand}
 				<pre
+					data-selectable
 					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
 			{/if}
 		</div>

@@ -52,10 +52,13 @@
 			return;
 		}
 		try {
-			const asset = await editor.importMedia();
-			if (asset) {
-				toast.success(`Imported ${asset.name}`);
-				await ui.runAnalysis(asset.id);
+			const { imported, failed } = await editor.importMedia();
+			for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
+			if (imported.length > 0) {
+				toast.success(
+					imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
+				);
+				for (const a of imported) await ui.runAnalysis(a.id);
 				toast.success('Analysis complete');
 			}
 		} catch (e) {
@@ -65,6 +68,24 @@
 
 	function onSelect(assetId: string) {
 		void editor.select(assetId);
+	}
+
+	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
+	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).
+	function onAssetDragStart(e: DragEvent, a: BinAsset) {
+		const asset = editor.assets.find((x) => x.id === a.id);
+		if (!asset) return;
+		ui.dndAsset = { id: a.id, kind: a.kind, duration: asset.duration };
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = 'copy';
+			// A custom MIME so an off-target drop on a text field doesn't paste the
+			// name; the drop is coordinated entirely via `ui.dndAsset`.
+			e.dataTransfer.setData('application/x-kerf-asset', a.id);
+		}
+	}
+
+	function onAssetDragEnd() {
+		ui.dndAsset = null;
 	}
 </script>
 
@@ -101,27 +122,42 @@
 	<div style="flex:1;overflow-y:auto;padding:12px">
 		{#if tab === 'bin'}
 			{#if !loaded}
-				<!-- dropzone -->
-				<div
-					onclick={onImport}
-					role="button"
-					tabindex="0"
-					onkeydown={(e) => e.key === 'Enter' && onImport()}
-					style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;cursor:pointer;background:var(--surface-inset);text-align:center"
-				>
+				{#if editor.importing}
+					<!-- import in flight -->
 					<div
-						style="width:40px;height:40px;border-radius:var(--radius-md);display:grid;place-items:center;background:var(--surface-hover);color:var(--text-muted)"
+						style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;background:var(--surface-inset);text-align:center"
 					>
-						<Icon n="film" s={20} />
-					</div>
-					<div>
-						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
-						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf transcribes & detects locally on import
+						<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={22} /></span>
+						<div>
+							<div style="font:var(--type-ui);color:var(--text-primary)">Importing media…</div>
+							<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
+								Probing streams locally
+							</div>
 						</div>
 					</div>
-					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
-				</div>
+				{:else}
+					<!-- dropzone -->
+					<div
+						onclick={onImport}
+						role="button"
+						tabindex="0"
+						onkeydown={(e) => e.key === 'Enter' && onImport()}
+						style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;cursor:pointer;background:var(--surface-inset);text-align:center"
+					>
+						<div
+							style="width:40px;height:40px;border-radius:var(--radius-md);display:grid;place-items:center;background:var(--surface-hover);color:var(--text-muted)"
+						>
+							<Icon n="film" s={20} />
+						</div>
+						<div>
+							<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
+							<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
+								Kerf transcribes & detects locally on import
+							</div>
+						</div>
+						<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
+					</div>
+				{/if}
 			{:else}
 				<!-- asset grid -->
 				<div style="display:flex;flex-direction:column;gap:8px">
@@ -130,16 +166,24 @@
 							style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
 							>{assets.length} assets</span
 						>
-						<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+						{#if editor.importing}
+							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+						{:else}
+							<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+						{/if}
 					</div>
 					{#each assets as a (a.id)}
 						{@const sel = a.id === editor.selectedAssetId}
 						<div
 							role="button"
 							tabindex="0"
+							draggable={true}
+							ondragstart={(e) => onAssetDragStart(e, a)}
+							ondragend={onAssetDragEnd}
 							onclick={() => onSelect(a.id)}
 							onkeydown={(e) => e.key === 'Enter' && onSelect(a.id)}
-							style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:pointer"
+							title="Drag onto a timeline track to add a clip"
+							style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 						>
 							<div
 								style="width:46px;height:30px;border-radius:3px;flex:none;background:{a.kind ===
@@ -157,7 +201,7 @@
 								</div>
 								<div style="display:flex;gap:6px;align-items:center;margin-top:3px">
 									<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{a.dur}</span>
-									{#if ui.analyzing && a.id === editor.selectedAssetId}
+									{#if ui.analyzingId === a.id}
 										<Badge tone="agent" dot>analyzing</Badge>
 									{:else}
 										<Badge tone="neutral">{a.tag}</Badge>
@@ -176,7 +220,7 @@
 					<Icon n="captions" s={22} /><span style="font-size:12px">Transcript appears after analysis</span>
 				</div>
 			{:else}
-				<div style="display:flex;flex-direction:column;gap:2px">
+				<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 					{#each txLines as l, i (i)}
 						<div style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm)">
 							<span

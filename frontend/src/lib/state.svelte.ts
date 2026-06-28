@@ -11,12 +11,13 @@ import {
 	getHistory,
 	getTimeline,
 	getWaveform,
+	importAsset,
 	listAssets,
 	addTrack,
 	moveClip,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
-	pickAndImport,
+	pickMediaPaths,
 	projectPath,
 	redo as apiRedo,
 	removeClip,
@@ -62,6 +63,8 @@ class EditorState {
 	currentPath = $state<string | null>(null);
 	loading = $state(false);
 	busy = $state(false);
+	/** Whether media is currently being imported (drives the bin spinner). */
+	importing = $state(false);
 	error = $state<string | null>(null);
 
 	#waveforms = new Map<string, number[]>();
@@ -187,13 +190,30 @@ class EditorState {
 		}
 	}
 
-	async importMedia(): Promise<Asset | null> {
-		const asset = await pickAndImport();
-		if (asset) {
-			this.assets = [...this.assets, asset];
-			await this.select(asset.id);
+	/** Pick one or more media files and import them. Imports continue past a
+	 *  failed file; resolves to the assets that succeeded plus per-file errors. */
+	async importMedia(): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
+		const paths = await pickMediaPaths();
+		if (paths.length === 0) return { imported: [], failed: [] };
+		this.importing = true;
+		this.error = null;
+		const imported: Asset[] = [];
+		const failed: { name: string; message: string }[] = [];
+		try {
+			for (const path of paths) {
+				try {
+					const asset = await importAsset(path);
+					this.assets = [...this.assets, asset];
+					imported.push(asset);
+				} catch (e) {
+					failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
+				}
+			}
+			if (imported.length > 0) await this.select(imported[imported.length - 1].id);
+		} finally {
+			this.importing = false;
 		}
-		return asset;
+		return { imported, failed };
 	}
 
 	/** Run analysis on an asset and merge the result into local caches. */

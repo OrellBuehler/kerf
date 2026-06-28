@@ -210,6 +210,65 @@
 		ui.seek(x / pxPerSec);
 	}
 
+	// ---- drop a bin asset onto a track (HTML5 drag-and-drop) ------------------
+
+	let dropGhost = $state<{ trackId: string; start: number; dur: number; ok: boolean } | null>(null);
+
+	// The bin clears `ui.dndAsset` on dragend; mirror that to drop the ghost.
+	$effect(() => {
+		if (!ui.dndAsset) dropGhost = null;
+	});
+
+	function dropStart(e: DragEvent, t: Track, dur: number): number {
+		const laneLeft = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
+		return snapStart(laneTime(e.clientX, laneLeft), t.id, '', dur);
+	}
+
+	/** Whether [start, start+dur) would overlap an existing clip on the track —
+	 *  the same invariant `move_clip` enforces, so adds stay consistent. */
+	function wouldOverlap(trackId: string, start: number, dur: number): boolean {
+		const track = editor.timeline.tracks.find((t) => t.id === trackId);
+		if (!track) return false;
+		const end = start + dur;
+		return track.clips.some((c) => start < c.timeline_start + clipDuration(c) && c.timeline_start < end);
+	}
+
+	function onLaneDragOver(e: DragEvent, t: Track) {
+		const a = ui.dndAsset;
+		if (!a || a.kind !== t.kind) {
+			dropGhost = null; // wrong-kind track: not a drop target
+			return;
+		}
+		// Always allow the drop so the drop event fires reliably across webview
+		// engines; onLaneDrop rejects overlaps. The ghost turns red to warn.
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		const start = dropStart(e, t, a.duration);
+		dropGhost = { trackId: t.id, start, dur: a.duration, ok: !wouldOverlap(t.id, start, a.duration) };
+	}
+
+	function onLaneDragLeave(e: DragEvent, t: Track) {
+		// Only clear when truly leaving the lane (not entering one of its clips).
+		const to = e.relatedTarget as Node | null;
+		if (!to || !(e.currentTarget as HTMLElement).contains(to)) {
+			if (dropGhost?.trackId === t.id) dropGhost = null;
+		}
+	}
+
+	function onLaneDrop(e: DragEvent, t: Track) {
+		const a = ui.dndAsset;
+		dropGhost = null;
+		ui.dndAsset = null;
+		if (!a || a.kind !== t.kind) return;
+		e.preventDefault();
+		const start = dropStart(e, t, a.duration);
+		if (wouldOverlap(t.id, start, a.duration)) {
+			toast.error('Drop into free space — a clip would overlap another here');
+			return;
+		}
+		void editor.add(a.id, 0, a.duration, t.id, start).catch(err);
+	}
+
 	// ---- tracks (add / remove) -----------------------------------------------
 
 	const onAddTrack = (kind: StreamKind) => void editor.addTrack(kind).catch(err);
@@ -337,7 +396,7 @@
 				<div
 					role="presentation"
 					onclick={onLaneSeek}
-					style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:relative;background:var(--surface-app);cursor:text"
+					style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:relative;background:var(--surface-app);cursor:pointer"
 				>
 					{#each ticks as t (t)}
 						<span
@@ -376,6 +435,9 @@
 						data-track-id={t.id}
 						data-kind={t.kind}
 						onclick={onLaneSeek}
+						ondragover={(e) => onLaneDragOver(e, t)}
+						ondragleave={(e) => onLaneDragLeave(e, t)}
+						ondrop={(e) => onLaneDrop(e, t)}
 						style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);position:relative"
 					>
 						{#each t.clips as c (c.id)}
@@ -451,6 +513,18 @@
 									6,
 									drag.dur * pxPerSec
 								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+							></div>
+						{/if}
+						{#if dropGhost && dropGhost.trackId === t.id}
+							<div
+								style="position:absolute;left:{dropGhost.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									6,
+									dropGhost.dur * pxPerSec
+								)}px;border:1.5px dashed {dropGhost.ok
+									? 'var(--kerf-400)'
+									: 'var(--red-500)'};border-radius:2px;background:{dropGhost.ok
+									? 'var(--selection-fill)'
+									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
 							></div>
 						{/if}
 					</div>

@@ -249,3 +249,19 @@
 		animation: none;
 	}
 }
+
+/* A plain rotating spinner for in-flight work (import, etc.). */
+@keyframes kerf-spin-kf {
+	to {
+		transform: rotate(360deg);
+	}
+}
+.kerf-spin {
+	display: inline-flex;
+	animation: kerf-spin-kf 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	.kerf-spin {
+		animation-duration: 1.8s;
+	}
+}

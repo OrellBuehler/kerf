@@ -56,7 +56,7 @@
 {#snippet readRow(label: string, value: string)}
 	<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
-		<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
+		<span data-selectable style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
 	</div>
 {/snippet}
 

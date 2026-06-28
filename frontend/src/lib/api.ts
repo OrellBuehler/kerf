@@ -210,16 +210,16 @@ export async function importAsset(path: string): Promise<Asset> {
 	return invoke<Asset>('import_asset', { path });
 }
 
-/** Open a native file picker and import the chosen media file. */
-export async function pickAndImport(): Promise<Asset | null> {
-	if (!inTauri()) return null;
+/** Open a native (multi-select) file picker and return the chosen media paths. */
+export async function pickMediaPaths(): Promise<string[]> {
+	if (!inTauri()) return [];
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
-		multiple: false,
+		multiple: true,
 		filters: [{ name: 'Media', extensions: ['mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac'] }]
 	});
-	if (typeof selected !== 'string') return null;
-	return importAsset(selected);
+	if (selected == null) return [];
+	return Array.isArray(selected) ? selected : [selected];
 }
 
 // ---- project file (open / save) --------------------------------------------

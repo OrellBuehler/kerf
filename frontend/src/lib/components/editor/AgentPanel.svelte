@@ -131,7 +131,7 @@
 			{/if}
 		</div>
 		{#if meta}
-			<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px">
+			<div data-selectable style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px">
 				{meta}
 			</div>
 		{/if}
