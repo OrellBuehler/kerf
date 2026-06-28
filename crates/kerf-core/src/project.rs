@@ -363,6 +363,44 @@ impl Project {
         engine::frame_at(Path::new(&asset.path), time_secs, max_width)
     }
 
+    /// Decode a single frame of an asset at `time_secs` as JPEG bytes (`quality`
+    /// = ffmpeg `-q:v`, 2 = best … 31 = worst), scaled to at most `max_width` px
+    /// wide. Smaller than [`frame_at`]'s PNG — for handing the frame to an LLM.
+    pub fn frame_jpeg(&self, asset_id: Uuid, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
+        let asset = self.require_asset(asset_id)?;
+        engine::frame_jpeg(Path::new(&asset.path), time_secs, max_width, quality)
+    }
+
+    /// Build a `columns`×`rows` contact sheet of an asset — frames sampled evenly
+    /// across `[start, end)` (defaulting to the whole asset) tiled into one JPEG,
+    /// each cell `cell_width` px wide. Returns the montage bytes and the row-major
+    /// per-cell timestamps, so an LLM can skim the footage and name good moments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skim_asset(
+        &self,
+        asset_id: Uuid,
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+    ) -> Result<(Vec<u8>, Vec<f64>)> {
+        let asset = self.require_asset(asset_id)?;
+        let start = start.unwrap_or(0.0).max(0.0);
+        let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
+        engine::contact_sheet(Path::new(&asset.path), start, end, columns, rows, cell_width, quality)
+    }
+
+    /// Composite a single still of the current timeline at timeline time `t` as
+    /// JPEG bytes (`quality` = ffmpeg `-q:v`), the canvas at most `max_width` px
+    /// wide — what the edit looks like on screen at `t`, for an LLM to review.
+    pub fn timeline_frame(&self, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
+        let timeline = self.timeline()?;
+        let assets = self.list_assets()?;
+        engine::timeline_frame(&timeline, &assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
+    }
+
     /// Reduce an asset's first audio stream to `buckets` peak magnitudes in
     /// `0.0..=1.0` for waveform rendering.
     pub fn waveform(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {

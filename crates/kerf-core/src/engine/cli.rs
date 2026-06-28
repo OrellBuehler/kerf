@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use super::ProbeResult;
 use crate::error::{Error, Result};
-use crate::model::{Asset, Clip, StreamInfo, StreamKind, TimeRange, Timeline, TransitionKind};
+use crate::model::{Asset, Clip, StreamInfo, StreamKind, TimeRange, Timeline, TransitionKind, Transform};
 
 fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
@@ -200,27 +200,37 @@ fn field_after(line: &str, key: &str) -> Option<f64> {
 /// Decode a single frame at `time_secs` and return it as PNG bytes, scaled to
 /// at most `max_width` pixels wide.
 pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
-    let bin = ffmpeg_bin();
     let scale = format!("scale='min({max_width},iw)':-2");
-    let output = Command::new(&bin)
-        .args(["-hide_banner", "-loglevel", "error", "-ss"])
+    decode_frame(path, time_secs, &scale, "png", None)
+}
+
+/// Decode a single frame at `time_secs` as **JPEG** bytes, scaled to at most
+/// `max_width` pixels wide, at `quality` (ffmpeg `-q:v`, 2 = best … 31 = worst).
+/// JPEG is dramatically smaller than the PNG of [`frame_at`], which matters when
+/// the frame is handed to an LLM as an image content block rather than rendered
+/// in the GUI.
+pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
+    let scale = format!("scale='min({max_width},iw)':-2");
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality))
+}
+
+/// Seek to `time_secs`, run the `-vf` chain on a single frame and pipe it out in
+/// the given image codec (`png` / `mjpeg`); `quality`, when set, becomes `-q:v`.
+/// Shared by [`frame_at`] and [`frame_jpeg`]. `-ss` is input-side (fast,
+/// keyframe-accurate) as for the preview path.
+fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>) -> Result<Vec<u8>> {
+    let bin = ffmpeg_bin();
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{:.3}", time_secs.max(0.0)))
         .arg("-i")
         .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            &scale,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ])
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
+        .args(["-frames:v", "1", "-vf", vf]);
+    if let Some(q) = quality {
+        cmd.args(["-q:v", q.to_string().as_str()]);
+    }
+    cmd.args(["-f", "image2pipe", "-vcodec", vcodec, "pipe:1"]).stderr(Stdio::piped());
+    let output = cmd.output().map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not extract frame at {time_secs:.3}s: {}",
@@ -228,6 +238,82 @@ pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> 
         )));
     }
     Ok(output.stdout)
+}
+
+/// Build a **contact sheet** of `path`: `columns`×`rows` frames sampled evenly
+/// across `[start, end)`, each cell scaled to `cell_width` px wide and tiled into
+/// one JPEG (`quality` = `-q:v`). Returns the montage bytes plus the per-cell
+/// timestamps in row-major order, so the caller can tell an LLM which moment each
+/// cell shows. One ffmpeg pass — lets the model skim a long clip cheaply.
+pub fn contact_sheet(
+    path: &Path,
+    start: f64,
+    end: f64,
+    columns: u32,
+    rows: u32,
+    cell_width: u32,
+    quality: u8,
+) -> Result<(Vec<u8>, Vec<f64>)> {
+    let path = path.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
+    let (args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
+    let bin = ffmpeg_bin();
+    let output = Command::new(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(Error::Engine(format!(
+            "could not build contact sheet: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok((output.stdout, times))
+}
+
+/// Pure arg builder for [`contact_sheet`] (no I/O, unit-tested): the ffmpeg
+/// argument list and the row-major per-cell timestamps. Frames are sampled at
+/// the start of each of `columns*rows` equal slices of the window via the `fps`
+/// filter over an `-ss`/`-t` window, then `tile`d into the single output frame.
+fn build_contact_sheet_args(
+    path: &str,
+    start: f64,
+    end: f64,
+    columns: u32,
+    rows: u32,
+    cell_width: u32,
+    quality: u8,
+) -> (Vec<String>, Vec<f64>) {
+    let columns = columns.max(1);
+    let rows = rows.max(1);
+    let cells = (columns * rows) as usize;
+    let start = start.max(0.0);
+    let window = (end - start).max(0.0);
+    let step = if window > 0.0 { window / cells as f64 } else { 0.0 };
+    let times: Vec<f64> = (0..cells).map(|k| start + step * k as f64).collect();
+    // `fps` = one frame per slice over the seeked window; `tile` packs them and
+    // `-frames:v 1` emits the single sheet. A degenerate window falls back to 1.
+    let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
+    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,tile={columns}x{rows}");
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        format!("{start:.3}"),
+        "-t".to_string(),
+        format!("{window:.3}"),
+        "-i".to_string(),
+        path.to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        "-vf".to_string(),
+        vf,
+        "-q:v".to_string(),
+        quality.to_string(),
+        "-f".to_string(),
+        "image2pipe".to_string(),
+        "-vcodec".to_string(),
+        "mjpeg".to_string(),
+        "pipe:1".to_string(),
+    ];
+    (args, times)
 }
 
 /// Decode the first audio stream to mono f32 PCM at `sample_rate` Hz and reduce
@@ -1333,6 +1419,176 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
     p.join(",")
 }
 
+/// Composite a single still of the `timeline` at timeline time `t` and return
+/// it as JPEG bytes (`quality` = `-q:v`), the canvas downscaled so it is at most
+/// `max_width` px wide. Lets an LLM *see the cut it is assembling* (which footage
+/// is on screen, framing, picture-in-picture placement, crop, color) rather than
+/// reasoning about timestamps blind.
+pub fn timeline_frame(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let args = build_timeline_frame_args(timeline, assets, opts, t, max_width, quality)?;
+    let bin = ffmpeg_bin();
+    let output = Command::new(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// Pure arg builder for [`timeline_frame`] (no I/O, unit-tested).
+///
+/// Every video clip whose timeline span contains `t` is decoded at its
+/// corresponding source time (`-ss` input seek), put through the same geometry /
+/// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
+/// minus the time-domain `trim`/`setpts`/`fps`/fade steps), then `overlay`d onto
+/// a black canvas in **track-then-timeline order** — so later tracks composite on
+/// top and gaps fall through to black, matching export framing. The output canvas
+/// keeps the export aspect ratio capped to `max_width`. Static blends
+/// (mid-crossfade dissolve, dip-to-black) are intentionally *not* reproduced; the
+/// still shows the frame each visible clip contributes at `t`.
+fn build_timeline_frame_args(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    quality: u8,
+) -> Result<Vec<String>> {
+    let fmt = export_format(timeline, assets, opts);
+    // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
+    let ow = (max_width.min(fmt.width).max(2)) & !1;
+    let oh = ((((ow as u64) * (fmt.height as u64)) / (fmt.width.max(1) as u64)) as u32).max(2) & !1;
+    let t = t.max(0.0);
+    let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
+
+    // Active video clips at `t`, in composite order (tracks in list order, clips
+    // within a track in timeline order), paired with their source time.
+    let mut active: Vec<(&Clip, f64)> = Vec::new();
+    for track in &timeline.tracks {
+        if track.kind != StreamKind::Video {
+            continue;
+        }
+        let mut order: Vec<usize> = (0..track.clips.len()).collect();
+        order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
+        for &ci in &order {
+            let clip = &track.clips[ci];
+            if t < clip.timeline_start || t >= clip.timeline_end() {
+                continue;
+            }
+            let off = (t - clip.timeline_start) * clip.speed_mag();
+            let raw = if clip.is_reversed() { clip.source_out - off } else { clip.source_in + off };
+            let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
+            active.push((clip, raw.clamp(0.0, dur.max(0.0))));
+        }
+    }
+
+    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
+    for (clip, src) in &active {
+        let path = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?.path.clone();
+        args.push("-ss".to_string());
+        args.push(format!("{src:.3}"));
+        args.push("-i".to_string());
+        args.push(path);
+    }
+
+    // Black base + each active clip's still chain, overlaid in order. With no
+    // visible clip the bare canvas is the output (a gap renders black).
+    let sf = fmt.scale_flags();
+    let filter = if active.is_empty() {
+        format!("color=c=black:s={ow}x{oh}:d=0.1[outv]")
+    } else {
+        let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
+        let mut cur = "base".to_string();
+        let last = active.len() - 1;
+        for (n, (clip, _)) in active.iter().enumerate() {
+            chains.push(format!("[{n}:v]{chain}[v{n}]", chain = still_clip_chain(clip, ow, oh, &sf)));
+            let out = if n == last { "outv".to_string() } else { format!("ov{n}") };
+            chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&clip.transform)));
+            cur = out;
+        }
+        chains.join(";")
+    };
+
+    args.extend([
+        "-filter_complex".to_string(),
+        filter,
+        "-map".to_string(),
+        "[outv]".to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        "-q:v".to_string(),
+        quality.to_string(),
+        "-f".to_string(),
+        "image2pipe".to_string(),
+        "-vcodec".to_string(),
+        "mjpeg".to_string(),
+        "pipe:1".to_string(),
+    ]);
+    Ok(args)
+}
+
+/// The still video chain for one clip in a [`timeline_frame`] composite: take a
+/// single decoded frame, then apply the same crop / fit-or-transform / color /
+/// opacity / rotation geometry as [`video_clip_chain`], minus every time-domain
+/// step (trim/setpts/fps/fades) since the `-ss` input seek already positioned it.
+fn still_clip_chain(clip: &Clip, ow: u32, oh: u32, sf: &str) -> String {
+    let t = &clip.transform;
+    let transform_alpha = !t.is_identity() && t.needs_alpha();
+    let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+    if t.has_crop() {
+        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
+        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
+        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = t.crop_left, ct = t.crop_top));
+    }
+    p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}"));
+    if t.is_identity() {
+        p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
+    } else if (t.scale - 1.0).abs() > 1e-9 {
+        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
+    }
+    p.push("setsar=1".to_string());
+    if !clip.color.is_identity() {
+        let c = &clip.color;
+        p.push(format!(
+            "eq=brightness={}:contrast={}:saturation={}:gamma={}",
+            c.brightness, c.contrast, c.saturation, c.gamma
+        ));
+    }
+    if !t.is_identity() {
+        if transform_alpha {
+            p.push("format=yuva420p".to_string());
+        }
+        if t.opacity < 1.0 {
+            p.push(format!("colorchannelmixer=aa={}", t.opacity));
+        }
+        if t.rotation != 0.0 {
+            let rad = t.rotation.to_radians();
+            p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
+        }
+    }
+    p.join(",")
+}
+
+/// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
+/// frame for an identity transform, else centered with the clip's fractional
+/// `pos_x`/`pos_y` offset (matching the export overlay positions).
+fn still_overlay(t: &Transform) -> String {
+    if t.is_identity() {
+        "overlay=(W-w)/2:(H-h)/2".to_string()
+    } else {
+        format!("overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H", px = t.pos_x, py = t.pos_y)
+    }
+}
+
 /// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
 /// optional reverse / tempo, gain, fades (including transition cross-fades) and
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
@@ -1624,6 +1880,90 @@ mod tests {
     /// A timeline with a single video track holding `clips`.
     fn single(clips: Vec<Clip>) -> Timeline {
         timeline_of(vec![video_track(clips)])
+    }
+
+    #[test]
+    fn contact_sheet_samples_evenly_and_tiles() {
+        let (args, times) = build_contact_sheet_args("/media/clip.mp4", 0.0, 40.0, 4, 4, 240, 5);
+        let joined = args.join(" ");
+        // 16 cells across 40s -> one frame every 2.5s, row-major.
+        assert_eq!(times.len(), 16);
+        assert!((times[0] - 0.0).abs() < 1e-9);
+        assert!((times[1] - 2.5).abs() < 1e-9);
+        assert!((times[15] - 37.5).abs() < 1e-9);
+        // Seek/limit to the window, sample with fps, scale cells, tile to one sheet.
+        assert!(joined.contains("-ss 0.000"));
+        assert!(joined.contains("-t 40.000"));
+        assert!(joined.contains("fps=0.4")); // 16 / 40
+        assert!(joined.contains("scale=240:-2"));
+        assert!(joined.contains("tile=4x4"));
+        assert!(joined.contains("-vcodec mjpeg"));
+        assert!(joined.contains("-q:v 5"));
+        assert!(joined.ends_with("pipe:1"));
+    }
+
+    #[test]
+    fn contact_sheet_respects_a_subrange() {
+        let (args, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3);
+        let joined = args.join(" ");
+        assert_eq!(times.len(), 4);
+        assert!((times[0] - 10.0).abs() < 1e-9); // window starts at `start`
+        assert!((times[3] - 17.5).abs() < 1e-9); // step = 10 / 4 = 2.5
+        assert!(joined.contains("-ss 10.000"));
+        assert!(joined.contains("-t 10.000"));
+        assert!(joined.contains("tile=2x2"));
+    }
+
+    #[test]
+    fn timeline_frame_composites_the_active_clip() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        // Source 5..15 at timeline 0; at t=2 the mapped source time is 7.
+        let timeline = single(vec![make_clip(asset.id, 5.0, 15.0, 0.0)]);
+        let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 2.0, 640, 4).unwrap();
+        let joined = args.join(" ");
+        assert_eq!(joined.matches("-i /x.mp4").count(), 1);
+        assert!(joined.contains("-ss 7.000"));
+        // 16:9 export shape capped to max_width 640 -> 640x360.
+        assert!(joined.contains("color=c=black:s=640x360"));
+        assert!(joined.contains("[0:v]trim=end_frame=1"));
+        assert!(joined.contains("scale=640:360:force_original_aspect_ratio=decrease"));
+        assert!(joined.contains("overlay=(W-w)/2:(H-h)/2[outv]"));
+        assert!(joined.contains("-vcodec mjpeg"));
+    }
+
+    #[test]
+    fn timeline_frame_renders_black_on_a_gap() {
+        let asset = test_asset(vec![video_stream(1280, 720, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]); // covers 0..5
+        let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 8.0, 640, 4).unwrap();
+        let joined = args.join(" ");
+        // Nothing visible at t=8 -> no inputs, bare black canvas straight to [outv].
+        assert!(!joined.contains("-i "));
+        assert!(joined.contains("color=c=black:s=640x360:d=0.1[outv]"));
+    }
+
+    #[test]
+    fn timeline_frame_layers_tracks_with_the_last_on_top() {
+        let base = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let pip = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![base.clone(), pip.clone()];
+        let mut top = make_clip(pip.id, 0.0, 10.0, 0.0);
+        top.transform.scale = 0.5;
+        top.transform.pos_x = 0.25;
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(base.id, 0.0, 10.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+        let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 1.0, 960, 4).unwrap();
+        let joined = args.join(" ");
+        // Both clips visible at t=1 -> two inputs; the V2 picture-in-picture is the
+        // second input, scaled down, offset, and overlaid last onto [outv].
+        assert_eq!(joined.matches("-i /x.mp4").count(), 2);
+        assert!(joined.contains("scale=iw*0.5:ih*0.5"));
+        assert!(joined.contains("[base][v0]overlay=(W-w)/2:(H-h)/2[ov0]"));
+        assert!(joined.contains("[v1]overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H[outv]"));
     }
 
     #[test]

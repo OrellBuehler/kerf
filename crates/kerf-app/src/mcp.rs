@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use base64::Engine as _;
 use kerf_core::{EditSource, ExportOptions, Project, StreamKind, Transition, TransitionKind};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
@@ -266,7 +266,31 @@ struct FrameParams {
     asset_id: String,
     #[schemars(description = "Time in the source asset to decode (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Maximum output width in pixels (default 960)")]
+    #[schemars(description = "Maximum output width in pixels (default 640)")]
+    max_width: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SkimParams {
+    #[schemars(description = "UUID of the asset to skim")]
+    asset_id: String,
+    #[schemars(description = "Start of the time range in seconds (default 0 = start of asset)")]
+    start: Option<f64>,
+    #[schemars(description = "End of the time range in seconds (default the asset's full duration)")]
+    end: Option<f64>,
+    #[schemars(description = "Grid columns (default 4, max 8)")]
+    columns: Option<u32>,
+    #[schemars(description = "Grid rows (default 4, max 8)")]
+    rows: Option<u32>,
+    #[schemars(description = "Width of each grid cell in pixels (default 240)")]
+    cell_width: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TimelineFrameParams {
+    #[schemars(description = "Timeline position to render (seconds)")]
+    time_secs: f64,
+    #[schemars(description = "Maximum output width in pixels (default 640)")]
     max_width: Option<u32>,
 }
 
@@ -637,15 +661,49 @@ impl KerfMcp {
         json(&buckets)
     }
 
-    #[tool(description = "Decode a single frame from an asset and return it as a base64 PNG data URL")]
-    fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<String, McpError> {
+    #[tool(
+        description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
+    )]
+    fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let png = project
-            .frame_at(id, p.time_secs, p.max_width.unwrap_or(960))
+        let jpeg = self
+            .lock()
+            .frame_jpeg(id, p.time_secs, p.max_width.unwrap_or(640), 4)
             .map_err(core_err)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        Ok(format!("data:image/png;base64,{b64}"))
+        Ok(image_result(format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0))), jpeg))
+    }
+
+    #[tool(
+        description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then call get_frame to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
+    )]
+    fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let columns = p.columns.unwrap_or(4).clamp(1, 8);
+        let rows = p.rows.unwrap_or(4).clamp(1, 8);
+        let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
+        let (jpeg, times) = self
+            .lock()
+            .skim_asset(id, p.start, p.end, columns, rows, cell_width, 5)
+            .map_err(core_err)?;
+        let index = times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("  cell {}: {}", i + 1, fmt_ts(*t)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let caption = format!("contact sheet {columns}x{rows} (row-major), cell -> source time:\n{index}");
+        Ok(image_result(caption, jpeg))
+    }
+
+    #[tool(
+        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. Mid-transition blends (crossfade/dip-to-black) are approximated."
+    )]
+    fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
+        let jpeg = self
+            .lock()
+            .timeline_frame(p.time_secs, p.max_width.unwrap_or(640), 4)
+            .map_err(core_err)?;
+        Ok(image_result(format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0))), jpeg))
     }
 
     #[tool(description = "Summarise the timeline: total duration, track count, clips per track, and any per-track gaps")]
@@ -706,8 +764,12 @@ impl ServerHandler for KerfMcp {
              call claim_next_task to take the oldest one (or list_tasks to see \
              the whole queue). To work a task, inspect loaded media with \
              list_assets / get_asset_metadata / get_timeline_state, run \
-             analyze_asset to populate silence / scene / transcript metadata, \
-             then assemble a non-destructive edit with the \
+             analyze_asset to populate silence / scene / transcript metadata. \
+             You can also SEE the footage: skim_asset returns a contact-sheet \
+             image of a clip (survey it to find the good parts), get_frame shows \
+             a single moment up close, and preview_timeline renders the cut you \
+             have assembled at a given time so you can check it on screen. \
+             Then assemble a non-destructive edit with the \
              cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
              (move_clip frees a clip to any position or same-kind track; \
              ripple_delete closes the gap). Layer footage with add_track / \
@@ -783,6 +845,41 @@ fn core_err(e: kerf_core::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
+/// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
+/// block followed by an image content block (rmcp expects bare base64 + MIME,
+/// not a `data:` URL).
+fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+    CallToolResult::success(vec![Content::text(caption), Content::image(b64, "image/jpeg")])
+}
+
+/// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
+/// Rounds to milliseconds *before* splitting so a value just under a minute
+/// carries into the minute (59.9999 → `01:00.000`, not `00:60.000`).
+fn fmt_ts(t: f64) -> String {
+    let ms = (t.max(0.0) * 1000.0).round() as i64;
+    let minutes = ms / 60_000;
+    let seconds = (ms % 60_000) as f64 / 1000.0;
+    format!("{minutes:02}:{seconds:06.3}")
+}
+
 fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string_pretty(value).map_err(|e| McpError::internal_error(e.to_string(), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_ts;
+
+    #[test]
+    fn fmt_ts_carries_at_minute_boundaries() {
+        assert_eq!(fmt_ts(0.0), "00:00.000");
+        assert_eq!(fmt_ts(12.5), "00:12.500");
+        assert_eq!(fmt_ts(-3.0), "00:00.000");
+        // Just under a minute must carry into minutes, not render ":60.000".
+        assert_eq!(fmt_ts(59.9999), "01:00.000");
+        assert_eq!(fmt_ts(119.9997), "02:00.000");
+        assert_eq!(fmt_ts(59.9994), "00:59.999");
+        assert_eq!(fmt_ts(125.25), "02:05.250");
+    }
 }

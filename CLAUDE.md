@@ -21,7 +21,12 @@ so the feature is **only** activated through these forwards — which is what ma
 
 - `cli.rs` is **always compiled** and drives the `ffmpeg` / `ffprobe` **binaries**
   (override with `KERF_FFMPEG` / `KERF_FFPROBE`). Probe, `silencedetect`, scene
-  detection, preview frames (`frame_at`), waveforms, and export all live here, so
+  detection, preview frames (`frame_at`; `frame_jpeg` for a low-res JPEG), the
+  per-asset **contact sheet** (`contact_sheet` — a `tile`d grid of frames sampled
+  across a range, for skimming footage) and the **composited timeline still**
+  (`timeline_frame` / `build_timeline_frame_args`, pure + unit-tested — overlays
+  every clip visible at a timeline time onto a black canvas, mirroring the export
+  geometry, so an agent can *see the cut*), waveforms, and export all live here, so
   they work in the `--no-default-features` build — only the binaries are needed,
   never the dev libraries. Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
@@ -116,7 +121,13 @@ hold, so the agent edits the project the user has open. Patterns that matter if 
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro calls `Self::tool_router()`).
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
-then mutates fields. Tools return `Result<String, McpError>` (pretty JSON). The `lock()`
+then mutates fields. Most tools return `Result<String, McpError>` (pretty JSON), but the
+three **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
+contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
+parts) and `preview_timeline` (the composited cut at a timeline time) — return
+`Result<CallToolResult, McpError>` built by the `image_result` helper: a caption
+`Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
+actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). The `lock()`
 helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
 helper sets `User` the same way); every **mutating** tool calls `self.changed()`, which
 emits a `project-changed` Tauri event so the webview re-fetches and the edit shows up
