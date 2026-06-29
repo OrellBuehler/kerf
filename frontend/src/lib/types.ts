@@ -35,11 +35,19 @@ export interface TranscriptSegment {
 	text: string;
 }
 
+export interface Loudness {
+	integrated_lufs: number;
+	loudness_range: number;
+	true_peak_dbtp: number;
+	threshold_lufs: number;
+}
+
 export interface AssetAnalysis {
 	asset_id: string;
 	silence_segments: TimeRange[];
 	scene_changes: number[];
 	transcript: TranscriptSegment[];
+	loudness: Loudness | null;
 }
 
 export interface Transform {

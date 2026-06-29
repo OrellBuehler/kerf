@@ -1298,6 +1298,12 @@ impl Project {
                     text: "Today we are talking about non-destructive editing.".to_string(),
                 },
             ],
+            loudness: Some(crate::model::Loudness {
+                integrated_lufs: -16.2,
+                loudness_range: 6.4,
+                true_peak_dbtp: -1.5,
+                threshold_lufs: -26.5,
+            }),
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.

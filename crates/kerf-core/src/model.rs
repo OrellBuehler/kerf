@@ -95,6 +95,21 @@ pub struct TranscriptSegment {
     pub text: String,
 }
 
+/// EBU R128 loudness measurement of an asset's audio, from a single `loudnorm`
+/// analysis pass. Lets an agent level a clip to a target or balance a voiceover
+/// against a music bed instead of guessing at a linear gain.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Loudness {
+    /// Integrated (program) loudness in LUFS.
+    pub integrated_lufs: f64,
+    /// Loudness range (LRA) in LU.
+    pub loudness_range: f64,
+    /// Maximum true peak in dBTP.
+    pub true_peak_dbtp: f64,
+    /// Gating threshold used for the measurement, in LUFS.
+    pub threshold_lufs: f64,
+}
+
 /// Cached, pluggable analysis results for an asset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetAnalysis {
@@ -105,6 +120,10 @@ pub struct AssetAnalysis {
     pub scene_changes: Vec<f64>,
     #[serde(default)]
     pub transcript: Vec<TranscriptSegment>,
+    /// EBU R128 loudness of the asset's audio, when it has any. `None` until the
+    /// asset is analyzed (and for silent / video-only assets).
+    #[serde(default)]
+    pub loudness: Option<Loudness>,
 }
 
 fn one() -> f64 {

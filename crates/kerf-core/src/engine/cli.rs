@@ -59,7 +59,7 @@ fn frame_cache() -> &'static Mutex<FrameCache> {
     })
 }
 
-fn ffmpeg_bin() -> String {
+pub(super) fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
 }
 
@@ -79,14 +79,14 @@ fn hwaccel() -> Option<String> {
     }
 }
 
-fn launch_err(bin: &str, e: std::io::Error) -> Error {
+pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
 
 /// Build a `Command` for an ffmpeg/ffprobe binary. On Windows this sets
 /// `CREATE_NO_WINDOW` so spawning the console subprocess doesn't flash a
 /// terminal window over the GUI; on other platforms it's a plain `Command`.
-fn command(bin: &str) -> Command {
+pub(super) fn command(bin: &str) -> Command {
     let cmd = Command::new(bin);
     #[cfg(windows)]
     let cmd = {

@@ -5,7 +5,7 @@
 //! be swapped in without touching the rest of the core.
 
 use crate::error::Result;
-use crate::model::{Asset, AssetAnalysis, TimeRange, TranscriptSegment};
+use crate::model::{Asset, AssetAnalysis, Loudness, TimeRange, TranscriptSegment};
 
 /// Detects silent spans in an asset's audio.
 pub trait SilenceDetector: Send + Sync {
@@ -20,6 +20,12 @@ pub trait SceneDetector: Send + Sync {
 /// Produces a timecoded transcript from an asset's audio.
 pub trait Transcriber: Send + Sync {
     fn transcribe(&self, asset: &Asset) -> Result<Vec<TranscriptSegment>>;
+}
+
+/// Measures EBU R128 loudness of an asset's audio (`None` for silent / video-only
+/// assets).
+pub trait LoudnessAnalyzer: Send + Sync {
+    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -61,6 +67,22 @@ impl Default for FfmpegSceneDetector {
 impl SceneDetector for FfmpegSceneDetector {
     fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>> {
         crate::engine::detect_scenes(std::path::Path::new(&asset.path), self.threshold)
+    }
+}
+
+/// Loudness measurement backed by FFmpeg's `loudnorm` analysis pass (run via the
+/// `ffmpeg` binary, so no dev libraries are required).
+pub struct FfmpegLoudnessAnalyzer;
+
+impl LoudnessAnalyzer for FfmpegLoudnessAnalyzer {
+    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>> {
+        if !asset.has_audio() {
+            return Ok(None);
+        }
+        let loudness = crate::engine::measure_loudness(std::path::Path::new(&asset.path))?;
+        // Silent material measures as non-finite LUFS, which is not meaningful
+        // (and would not round-trip through JSON): treat it as no measurement.
+        Ok(loudness.integrated_lufs.is_finite().then_some(loudness))
     }
 }
 
@@ -143,11 +165,18 @@ impl Transcriber for NullAnalyzer {
     }
 }
 
+impl LoudnessAnalyzer for NullAnalyzer {
+    fn measure(&self, _asset: &Asset) -> Result<Option<Loudness>> {
+        Ok(None)
+    }
+}
+
 /// A bundle of analysis providers to run against an asset.
 pub struct AnalysisProviders<'a> {
     pub silence: &'a dyn SilenceDetector,
     pub scene: &'a dyn SceneDetector,
     pub transcriber: &'a dyn Transcriber,
+    pub loudness: &'a dyn LoudnessAnalyzer,
 }
 
 impl<'a> AnalysisProviders<'a> {
@@ -157,6 +186,7 @@ impl<'a> AnalysisProviders<'a> {
             silence: null,
             scene: null,
             transcriber: null,
+            loudness: null,
         }
     }
 }
@@ -172,6 +202,7 @@ impl<'a> AnalysisProviders<'a> {
 pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
+    let loudness = FfmpegLoudnessAnalyzer;
     let null = NullAnalyzer;
 
     #[cfg(feature = "whisper")]
@@ -191,6 +222,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
         silence: &silence,
         scene: &scene,
         transcriber,
+        loudness: &loudness,
     };
     analyze(asset, &providers)
 }
@@ -202,5 +234,6 @@ pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnal
         silence_segments: providers.silence.detect_silence(asset)?,
         scene_changes: providers.scene.detect_scenes(asset)?,
         transcript: providers.transcriber.transcribe(asset)?,
+        loudness: providers.loudness.measure(asset)?,
     })
 }

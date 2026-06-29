@@ -23,6 +23,11 @@ pub struct ProbeResult {
 
 mod cli;
 
+// Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
+// based, available in every build like the rest of `cli`.
+mod audio;
+pub use audio::measure_loudness;
+
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
