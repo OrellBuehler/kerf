@@ -79,6 +79,13 @@ fn hwaccel() -> Option<String> {
     }
 }
 
+/// Cleared the first time an accelerated preview decode fails while the software
+/// retry succeeds — i.e. `-hwaccel` is broken on this machine (a misconfigured
+/// VAAPI / D3D11VA, an unsupported codec for the chosen accelerator). Once
+/// cleared, later preview frames skip the accelerated attempt so a broken
+/// `-hwaccel auto` doesn't double every frame's latency.
+static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
@@ -337,11 +344,56 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
         return Ok(hit);
     }
 
+    use std::sync::atomic::Ordering;
     let bin = ffmpeg_bin();
-    let mut cmd = command(&bin);
+    let hw = hwaccel();
+    let use_hw = hw.is_some() && HWACCEL_OK.load(Ordering::Relaxed);
+
+    let bytes = if use_hw {
+        match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, hw.as_deref()) {
+            Ok(b) => b,
+            Err(hw_err) => {
+                // The accelerated decode failed — retry in software. If *that*
+                // works, `-hwaccel` is the culprit on this machine, so disable it
+                // for subsequent frames; if it fails too, the error is genuine.
+                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None) {
+                    Ok(b) => {
+                        HWACCEL_OK.store(false, Ordering::Relaxed);
+                        tracing::warn!("hardware decode failed ({hw_err}); using software decode for previews");
+                        b
+                    }
+                    Err(_) => return Err(hw_err),
+                }
+            }
+        }
+    } else {
+        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None)?
+    };
+
+    if let Ok(mut c) = frame_cache().lock() {
+        c.put(key, bytes.clone());
+    }
+    Ok(bytes)
+}
+
+/// Run one `ffmpeg` single-frame decode (optionally with `-hwaccel hw`) and
+/// return the encoded image bytes. Split out of [`decode_frame`] so the same
+/// invocation can be retried in software when an accelerated attempt fails.
+#[allow(clippy::too_many_arguments)]
+fn run_frame_decode(
+    bin: &str,
+    path: &Path,
+    time_secs: f64,
+    vf: &str,
+    vcodec: &str,
+    quality: Option<u8>,
+    accurate: bool,
+    hw: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut cmd = command(bin);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
-    if let Some(hw) = hwaccel() {
-        cmd.args(["-hwaccel", hw.as_str()]);
+    if let Some(hw) = hw {
+        cmd.args(["-hwaccel", hw]);
     }
     if !accurate {
         cmd.arg("-noaccurate_seek");
@@ -355,15 +407,12 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
         cmd.args(["-q:v", q.to_string().as_str()]);
     }
     cmd.args(["-f", "image2pipe", "-vcodec", vcodec, "pipe:1"]).stderr(Stdio::piped());
-    let output = cmd.output().map_err(|e| launch_err(&bin, e))?;
+    let output = cmd.output().map_err(|e| launch_err(bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not extract frame at {time_secs:.3}s: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
-    }
-    if let Ok(mut c) = frame_cache().lock() {
-        c.put(key, output.stdout.clone());
     }
     Ok(output.stdout)
 }
