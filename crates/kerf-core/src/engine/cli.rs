@@ -890,8 +890,23 @@ fn build_export_args_phase(
     // (matching the probe/frame calls); without `-nostats` the per-frame progress
     // lines would accumulate unbounded in memory for a long export.
     let mut args: Vec<String> = vec!["-y".to_string(), "-hide_banner".to_string(), "-nostats".to_string()];
-    for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
+    // Per-input fast-seek: an input-side `-ss` to each clip's source-window start
+    // so ffmpeg decodes only the kept region instead of everything from t=0 — a
+    // 20-subclip cut from a 1h source no longer decodes the hour 20 times over.
+    // `-ss` before `-i` is keyframe-accurate-seek (decode+discard up to the point)
+    // and resets timestamps to ~0, so the in-graph trim is expressed relative to
+    // this same seek (see `video_clip_chain` / `audio_clip_chain`) and the two
+    // stay frame-accurate. Inputs are added in storage order, matching how
+    // `build_filter_complex` indexes them and how `fx` is indexed.
+    let fx = transition_fx(timeline, assets);
+    for (i, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
+        let (start, _) = clip_source_window(clip, &fx[i]);
+        let seek = clip_seek(start);
+        if seek > 0.0 {
+            args.push("-ss".to_string());
+            args.push(format!("{seek}"));
+        }
         args.push("-i".to_string());
         args.push(path.to_string());
     }
@@ -1382,6 +1397,34 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     fx
 }
 
+/// The source-time window `[start, end]` a clip needs from its asset, accounting
+/// for reverse playback and any crossfade tail (which borrows unused handle past
+/// `source_out`, or below `source_in` when reversed). The single source of truth
+/// for both the per-input `-ss` fast-seek and the in-graph `trim` / `atrim`, so
+/// the seek and the trim window can never drift out of lockstep.
+fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
+    let s = clip.speed_mag();
+    if clip.is_reversed() {
+        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
+    } else {
+        (clip.source_in, clip.source_out + fx.tail * s)
+    }
+}
+
+/// The input-side fast-seek for a clip's window start: seek there when it is past
+/// the head (so ffmpeg decodes from a nearby keyframe instead of t=0), else `0.0`
+/// for no seek — head clips keep byte-identical args. `SEEK_EPS` skips a
+/// pointless sub-millisecond seek. Callers must express the in-graph trim
+/// relative to this value.
+fn clip_seek(window_start: f64) -> f64 {
+    const SEEK_EPS: f64 = 1e-3;
+    if window_start > SEEK_EPS {
+        window_start
+    } else {
+        0.0
+    }
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, fit or
 /// transform geometry, color correction, fades and transition alpha. With all
@@ -1398,14 +1441,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
     // tail is at the low end).
-    let (trim_start, trim_end) = if clip.is_reversed() {
-        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
-    } else {
-        (clip.source_in, clip.source_out + fx.tail * s)
-    };
+    let (trim_start, trim_end) = clip_source_window(clip, fx);
+    // Relative to the input-side `-ss` (see `build_export_args_phase`): when the
+    // window is fast-seeked the trim starts at 0, otherwise it is unchanged.
+    let seek = clip_seek(trim_start);
 
     let mut p: Vec<String> = Vec::new();
-    p.push(format!("trim=start={trim_start}:end={trim_end}"));
+    p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
     if clip.is_reversed() {
         p.push("reverse".to_string());
     }
@@ -1651,19 +1693,16 @@ fn still_overlay(t: &Transform) -> String {
 fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) -> String {
     let s = clip.speed_mag();
     let dur = clip.duration() + fx.tail;
-    // Mirror the video crossfade tail: extend below source_in for a reversed clip,
-    // past source_out otherwise.
-    let (trim_start, trim_end) = if clip.is_reversed() {
-        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
-    } else {
-        (clip.source_in, clip.source_out + fx.tail * s)
-    };
+    // Mirror the video crossfade tail (extends below source_in when reversed) and
+    // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
+    let (trim_start, trim_end) = clip_source_window(clip, fx);
+    let seek = clip_seek(trim_start);
     let delay_ms = (clip.timeline_start * 1000.0).round().max(0.0) as i64;
     let fi = clip.fade_in + fx.black_in + fx.xfade_in;
     let fo = clip.fade_out + fx.black_out + fx.tail;
 
     let mut p: Vec<String> = Vec::new();
-    p.push(format!("atrim=start={trim_start}:end={trim_end}"));
+    p.push(format!("atrim=start={}:end={}", trim_start - seek, trim_end - seek));
     p.push("asetpts=PTS-STARTPTS".to_string());
     if clip.is_reversed() {
         p.push("areverse".to_string());
@@ -2346,8 +2385,38 @@ mod tests {
             duration: 1.0,
         });
         let g = graph_of(&single(vec![a, b]), &[asset]);
-        assert!(g.contains("trim=start=4:end=15"), "reversed tail extends below source_in: {g}");
+        // Window [4,15] is fast-seeked: the input gets `-ss 4` and the trim is
+        // expressed relative to it (start 0, 11s long).
+        assert!(g.contains("trim=start=0:end=11"), "reversed tail extends below source_in: {g}");
         assert!(g.contains(",reverse,"), "{g}");
+    }
+
+    #[test]
+    fn fast_seek_emits_input_ss_and_makes_the_trim_relative() {
+        let asset = av_asset(Uuid::new_v4(), 60.0);
+        // A subclip deep into the source: 30s..33s.
+        let timeline = single(vec![make_clip(asset.id, 30.0, 33.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+        // `-ss 30` precedes the input so ffmpeg decodes from ~30s, not from 0.
+        let ss = args.iter().position(|a| a == "-ss").expect("a fast-seek -ss");
+        assert_eq!(args[ss + 1], "30");
+        assert_eq!(args[ss + 2], "-i", "the -ss must immediately precede its input");
+        // The graph trim/atrim are relative to the seek: a 3s window from 0.
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("trim=start=0:end=3"), "video trim is seek-relative: {filter}");
+        assert!(filter.contains("atrim=start=0:end=3"), "audio trim is seek-relative: {filter}");
+    }
+
+    #[test]
+    fn head_clips_emit_no_fast_seek() {
+        // A clip that starts at the source head must not gain an -ss (decoding
+        // from 0 is free) — args stay byte-identical to the pre-fast-seek build.
+        let asset = av_asset(Uuid::new_v4(), 10.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+        assert!(!args.contains(&"-ss".to_string()), "no seek for a head clip: {args:?}");
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("trim=start=0:end=10"), "{filter}");
     }
 
     #[test]
