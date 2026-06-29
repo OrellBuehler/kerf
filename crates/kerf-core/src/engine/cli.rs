@@ -71,6 +71,22 @@ fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
 
+/// Build a `Command` for an ffmpeg/ffprobe binary. On Windows this sets
+/// `CREATE_NO_WINDOW` so spawning the console subprocess doesn't flash a
+/// terminal window over the GUI; on other platforms it's a plain `Command`.
+fn command(bin: &str) -> Command {
+    let cmd = Command::new(bin);
+    #[cfg(windows)]
+    let cmd = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = cmd;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    };
+    cmd
+}
+
 // ---- probe -----------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -104,7 +120,7 @@ struct ProbeStream {
 #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
 pub fn probe(path: &Path) -> Result<ProbeResult> {
     let bin = ffprobe_bin();
-    let output = Command::new(&bin)
+    let output = command(&bin)
         .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
         .arg(path)
         .output()
@@ -206,7 +222,7 @@ fn parse_rational(s: &str) -> Option<f64> {
 pub fn detect_silence(path: &Path, noise_db: f64, min_silence: f64) -> Result<Vec<TimeRange>> {
     let bin = ffmpeg_bin();
     let filter = format!("silencedetect=noise={noise_db}dB:d={min_silence}");
-    let output = Command::new(&bin)
+    let output = command(&bin)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)
@@ -239,7 +255,7 @@ fn parse_silence(stderr: &str) -> Vec<TimeRange> {
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
     let bin = ffmpeg_bin();
     let filter = format!("select='gt(scene,{threshold})',showinfo");
-    let output = Command::new(&bin)
+    let output = command(&bin)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)
@@ -305,7 +321,7 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
     }
 
     let bin = ffmpeg_bin();
-    let mut cmd = Command::new(&bin);
+    let mut cmd = command(&bin);
     cmd.args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{time_secs:.3}"))
         .arg("-i")
@@ -345,7 +361,7 @@ pub fn contact_sheet(
     let path = path.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
     let (args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
     let bin = ffmpeg_bin();
-    let output = Command::new(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not build contact sheet: {}",
@@ -433,7 +449,7 @@ pub fn decode_audio_16k_mono(path: &Path) -> Result<Vec<f32>> {
 
 fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
     let bin = ffmpeg_bin();
-    let output = Command::new(&bin)
+    let output = command(&bin)
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
@@ -1278,7 +1294,7 @@ fn run_ffmpeg_progress(
 
     // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
     // `-stats_period` bounds how often, and thus the cancel-poll latency.
-    let mut child = Command::new(&bin)
+    let mut child = command(&bin)
         .arg("-progress")
         .arg("pipe:1")
         .arg("-stats_period")
@@ -1700,7 +1716,7 @@ pub fn timeline_frame(
 ) -> Result<Vec<u8>> {
     let args = build_timeline_frame_args(timeline, assets, opts, t, max_width, quality)?;
     let bin = ffmpeg_bin();
-    let output = Command::new(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not render timeline frame at {t:.3}s: {}",
