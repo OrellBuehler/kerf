@@ -345,8 +345,12 @@ impl KerfMcp {
     #[tool(description = "Analyze an asset (silence + scene detection, and transcription when configured) and cache the result")]
     fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let analysis = project.analyze_asset(id).map_err(core_err)?;
+        // Probe under the lock, run the heavy ffmpeg analysis with the lock
+        // released, then re-lock only to cache it — so analysis doesn't freeze
+        // the GUI or stall other tools for its whole (multi-second) duration.
+        let asset = self.lock().require_asset(id).map_err(core_err)?;
+        let analysis = kerf_core::analyze_asset_media(&asset).map_err(core_err)?;
+        self.lock().set_analysis(&analysis).map_err(core_err)?;
         self.changed();
         json(&analysis)
     }
@@ -587,10 +591,16 @@ impl KerfMcp {
                        safe H.264/AAC MP4 default."
     )]
     fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
-        let project = self.lock();
         let opts = p.options.unwrap_or_default();
-        let output = project.export_with(&p.output_path, &opts).map_err(core_err)?;
-        json(&serde_json::json!({ "output": output.to_string_lossy() }))
+        // Snapshot the timeline + assets under the lock, then render with the
+        // lock released so a long export doesn't freeze the GUI (or block other
+        // agent tools) for its whole duration.
+        let (timeline, assets) = {
+            let project = self.lock();
+            (project.timeline().map_err(core_err)?, project.list_assets().map_err(core_err)?)
+        };
+        kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts).map_err(core_err)?;
+        json(&serde_json::json!({ "output": p.output_path }))
     }
 
     // ---- agent task queue --------------------------------------------------
@@ -741,7 +751,10 @@ impl KerfMcp {
     /// the agent. The GUI sets `User` the same way, and the mutex keeps the two
     /// from interleaving within a single operation.
     fn lock(&self) -> MutexGuard<'_, Project> {
-        let mut guard = self.project.lock().expect("project mutex poisoned");
+        // Recover from a poisoned mutex (a panic while another op held the lock)
+        // rather than panicking here too — a single failed op shouldn't brick the
+        // agent endpoint for the rest of the session.
+        let mut guard = self.project.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_actor(EditSource::Agent);
         guard
     }

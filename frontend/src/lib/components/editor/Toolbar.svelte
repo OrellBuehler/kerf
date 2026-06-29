@@ -15,8 +15,7 @@
 
 	const tools: [Tool, string, string][] = [
 		['pointer', 'MousePointer2', 'Select (V)'],
-		['razor', 'Scissors', 'Razor (C)'],
-		['bookmark', 'Bookmark', 'Marker (M)']
+		['razor', 'Scissors', 'Razor (C)']
 	];
 
 	function tc(s: number): string {

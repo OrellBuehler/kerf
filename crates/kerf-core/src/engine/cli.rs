@@ -7,12 +7,57 @@
 //! `--no-default-features` build. The binaries can be overridden with the
 //! `KERF_FFMPEG` / `KERF_FFPROBE` environment variables.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{Asset, Clip, StreamInfo, StreamKind, TimeRange, Timeline, TransitionKind, Transform};
+
+/// A small process-global LRU of decoded single frames. Decoded frames are a
+/// pure function of (source path, time, filter, codec, quality), so caching is
+/// always safe for immutable source media — and it turns scrubbing back over a
+/// region, pausing, or replaying into cache hits instead of a fresh `ffmpeg`
+/// spawn each time. Bounded so it never grows without limit.
+struct FrameCache {
+    map: HashMap<String, (u64, Vec<u8>)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl FrameCache {
+    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.map.get_mut(key)?;
+        entry.0 = tick; // mark recently used
+        Some(entry.1.clone())
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) {
+        self.tick += 1;
+        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
+            // Evict the least-recently-used entry.
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key, (self.tick, value));
+    }
+}
+
+fn frame_cache() -> &'static Mutex<FrameCache> {
+    static CACHE: OnceLock<Mutex<FrameCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(FrameCache {
+            map: HashMap::new(),
+            tick: 0,
+            cap: 96,
+        })
+    })
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
@@ -219,10 +264,18 @@ pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8) -> R
 /// Shared by [`frame_at`] and [`frame_jpeg`]. `-ss` is input-side (fast,
 /// keyframe-accurate) as for the preview path.
 fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>) -> Result<Vec<u8>> {
+    let time_secs = time_secs.max(0.0);
+    // Cache key captures everything that determines the bytes (path, time,
+    // filter — which includes the target width — codec and quality).
+    let key = format!("{}|{:.3}|{vf}|{vcodec}|{quality:?}", path.display(), time_secs);
+    if let Some(hit) = frame_cache().lock().ok().and_then(|mut c| c.get(&key)) {
+        return Ok(hit);
+    }
+
     let bin = ffmpeg_bin();
     let mut cmd = Command::new(&bin);
     cmd.args(["-hide_banner", "-loglevel", "error", "-ss"])
-        .arg(format!("{:.3}", time_secs.max(0.0)))
+        .arg(format!("{time_secs:.3}"))
         .arg("-i")
         .arg(path)
         .args(["-frames:v", "1", "-vf", vf]);
@@ -236,6 +289,9 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
             "could not extract frame at {time_secs:.3}s: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
+    }
+    if let Ok(mut c) = frame_cache().lock() {
+        c.put(key, output.stdout.clone());
     }
     Ok(output.stdout)
 }

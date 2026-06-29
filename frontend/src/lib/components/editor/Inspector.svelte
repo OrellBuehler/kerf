@@ -19,6 +19,13 @@
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
 
+	// While a slider is being dragged, show its live value (keyed by row label)
+	// without committing to the backend on every input event — commit happens on
+	// release (`onchange`). Otherwise the readout would sit frozen until release.
+	let liveDrag = $state<{ label: string; value: number } | null>(null);
+	const shown = (label: string, value: number) =>
+		liveDrag?.label === label ? liveDrag.value : value;
+
 	function tc(s: number): string {
 		const t = Math.max(0, s);
 		const m = Math.floor(t / 60);
@@ -32,6 +39,17 @@
 	async function run(op: () => Promise<unknown>) {
 		try {
 			await op();
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	/** Run a destructive op, then surface an Undo affordance (the edit is in the
+	 *  history, so Undo restores it). */
+	async function runUndoable(message: string, op: () => Promise<unknown>) {
+		try {
+			await op();
+			toast(message, { action: { label: 'Undo', onClick: () => void editor.undo() } });
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
@@ -84,7 +102,7 @@
 	min: number,
 	max: number,
 	step: number,
-	display: string,
+	format: (v: number) => string,
 	onCommit: (v: number) => void
 )}
 	<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
@@ -96,15 +114,20 @@
 			{step}
 			{value}
 			disabled={editor.busy}
+			oninput={(e) => {
+				const v = parseFloat(e.currentTarget.value);
+				if (Number.isFinite(v)) liveDrag = { label, value: v };
+			}}
 			onchange={(e) => {
 				const v = parseFloat(e.currentTarget.value);
+				liveDrag = null;
 				if (Number.isFinite(v)) onCommit(v);
 			}}
 			style="flex:1;accent-color:var(--kerf-500)"
 		/>
 		<span
 			style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
-			>{display}</span
+			>{format(shown(label, value))}</span
 		>
 	</label>
 {/snippet}
@@ -165,15 +188,20 @@
 						step="0.05"
 						value={clip.volume}
 						disabled={editor.busy}
+						oninput={(e) => {
+							const v = parseFloat(e.currentTarget.value);
+							if (Number.isFinite(v)) liveDrag = { label: 'Volume', value: v };
+						}}
 						onchange={(e) => {
 							const v = parseFloat(e.currentTarget.value);
+							liveDrag = null;
 							if (Number.isFinite(v)) void run(() => editor.setVolume(clip.id, v));
 						}}
 						style="flex:1;accent-color:var(--kerf-500)"
 					/>
 					<span
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
-						>{Math.round(clip.volume * 100)}%</span
+						>{Math.round(shown('Volume', clip.volume) * 100)}%</span
 					>
 				</label>
 			{/if}
@@ -187,7 +215,7 @@
 			)}
 
 			{@render secHead('Speed')}
-			{@render rangeRow('Rate', Math.abs(speed), 0.25, 4, 0.25, `${Math.abs(speed).toFixed(2)}×`, (v) =>
+			{@render rangeRow('Rate', Math.abs(speed), 0.25, 4, 0.25, (v) => `${v.toFixed(2)}×`, (v) =>
 				run(() => editor.setSpeed(clip.id, speed < 0 ? -v : v))
 			)}
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
@@ -203,45 +231,45 @@
 
 			{#if kind === 'video'}
 				{@render secHead('Transform')}
-				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, `${Math.round(tf.scale * 100)}%`, (v) =>
+				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					run(() => editor.setTransform(clip.id, { scale: v }))
 				)}
-				{@render rangeRow('Position X', tf.pos_x, -0.5, 0.5, 0.01, tf.pos_x.toFixed(2), (v) =>
+				{@render rangeRow('Position X', tf.pos_x, -0.5, 0.5, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { pos_x: v }))
 				)}
-				{@render rangeRow('Position Y', tf.pos_y, -0.5, 0.5, 0.01, tf.pos_y.toFixed(2), (v) =>
+				{@render rangeRow('Position Y', tf.pos_y, -0.5, 0.5, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { pos_y: v }))
 				)}
-				{@render rangeRow('Rotation', tf.rotation, -180, 180, 1, `${Math.round(tf.rotation)}°`, (v) =>
+				{@render rangeRow('Rotation', tf.rotation, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
 					run(() => editor.setTransform(clip.id, { rotation: v }))
 				)}
-				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, `${Math.round(tf.opacity * 100)}%`, (v) =>
+				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					run(() => editor.setTransform(clip.id, { opacity: v }))
 				)}
-				{@render rangeRow('Crop L', tf.crop_left, 0, 0.9, 0.01, tf.crop_left.toFixed(2), (v) =>
+				{@render rangeRow('Crop L', tf.crop_left, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_left: v }))
 				)}
-				{@render rangeRow('Crop R', tf.crop_right, 0, 0.9, 0.01, tf.crop_right.toFixed(2), (v) =>
+				{@render rangeRow('Crop R', tf.crop_right, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_right: v }))
 				)}
-				{@render rangeRow('Crop T', tf.crop_top, 0, 0.9, 0.01, tf.crop_top.toFixed(2), (v) =>
+				{@render rangeRow('Crop T', tf.crop_top, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_top: v }))
 				)}
-				{@render rangeRow('Crop B', tf.crop_bottom, 0, 0.9, 0.01, tf.crop_bottom.toFixed(2), (v) =>
+				{@render rangeRow('Crop B', tf.crop_bottom, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_bottom: v }))
 				)}
 
 				{@render secHead('Color')}
-				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, col.brightness.toFixed(2), (v) =>
+				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { brightness: v }))
 				)}
-				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, col.contrast.toFixed(2), (v) =>
+				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { contrast: v }))
 				)}
-				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, col.saturation.toFixed(2), (v) =>
+				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { saturation: v }))
 				)}
-				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, col.gamma.toFixed(2), (v) =>
+				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { gamma: v }))
 				)}
 			{/if}
@@ -278,14 +306,15 @@
 					iconSize={13}
 					style="width:100%"
 					disabled={editor.busy}
-					onclick={() => run(() => editor.remove(clip.id))}>Remove clip</Btn
+					onclick={() => runUndoable('Clip removed', () => editor.remove(clip.id))}>Remove clip</Btn
 				>
 				<Btn
 					variant="ghost"
 					size="sm"
 					style="width:100%"
 					disabled={editor.busy}
-					onclick={() => run(() => editor.rippleDelete(clip.id))}>Ripple delete · close gap</Btn
+					onclick={() => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(clip.id))}
+					>Ripple delete · close gap</Btn
 				>
 			</div>
 		{:else}

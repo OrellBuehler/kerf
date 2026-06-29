@@ -10,7 +10,18 @@
 	const pxPerSec = $derived(ui.zoom);
 	const duration = $derived(Math.max(editor.duration, 8));
 	const contentW = $derived(Math.max(760, Math.ceil(duration * pxPerSec) + 48));
-	const tickStep = $derived(pxPerSec >= 60 ? 2 : pxPerSec >= 28 ? 5 : 10);
+	// Tick spacing follows zoom for label density, but also steps up so the total
+	// tick count stays bounded on long timelines (otherwise a 1h cut at high zoom
+	// would render ~3600 spans, twice — ruler labels + grid lines).
+	const TICK_CAP = 240;
+	const tickStep = $derived.by(() => {
+		const base = pxPerSec >= 60 ? 2 : pxPerSec >= 28 ? 5 : 10;
+		const ladder = [2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
+		for (const step of ladder) {
+			if (step >= base && duration / step <= TICK_CAP) return step;
+		}
+		return ladder[ladder.length - 1];
+	});
 	const ticks = $derived(Array.from({ length: Math.floor(duration / tickStep) + 1 }, (_, i) => i * tickStep));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 
@@ -69,30 +80,54 @@
 	// ---- waveforms -----------------------------------------------------------
 
 	const WAVE_BUCKETS = 240;
+	// Resolved peaks per asset (reactive). In-flight requests are tracked in a
+	// plain Set, not written into `waveforms`, so the fetch effect doesn't
+	// re-trigger itself by mutating the very state it reads.
 	let waveforms = $state<Record<string, number[]>>({});
+	const inflight = new Set<string>();
 
 	$effect(() => {
-		const wanted = new Set<string>();
 		for (const t of editor.timeline.tracks) {
 			if (t.kind !== 'audio') continue;
-			for (const c of t.clips) wanted.add(c.asset_id);
-		}
-		for (const assetId of wanted) {
-			if (waveforms[assetId]) continue;
-			waveforms[assetId] = [];
-			editor.waveform(assetId, WAVE_BUCKETS).then((peaks) => {
-				waveforms = { ...waveforms, [assetId]: peaks };
-			});
+			for (const c of t.clips) {
+				const id = c.asset_id;
+				if (waveforms[id] || inflight.has(id)) continue;
+				inflight.add(id);
+				editor.waveform(id, WAVE_BUCKETS).then((peaks) => {
+					inflight.delete(id);
+					waveforms = { ...waveforms, [id]: peaks };
+				});
+			}
 		}
 	});
 
-	function clipPeaks(c: Clip): number[] {
+	const assetDuration = $derived.by(() => {
+		const m = new Map<string, number>();
+		for (const a of editor.assets) m.set(a.id, a.duration);
+		return m;
+	});
+
+	/** Peaks for a clip's source range, down-sampled to about one bar per rendered
+	 *  pixel (max-aggregated so loud transients survive at low zoom). Without this
+	 *  a clip emits up to WAVE_BUCKETS spans regardless of how wide it actually is. */
+	function clipPeaks(c: Clip, width: number): number[] {
 		const all = waveforms[c.asset_id];
-		const dur = editor.assets.find((a) => a.id === c.asset_id)?.duration ?? 0;
+		const dur = assetDuration.get(c.asset_id) ?? 0;
 		if (!all || all.length === 0 || dur <= 0) return [];
 		const lo = Math.floor((c.source_in / dur) * all.length);
 		const hi = Math.max(lo + 1, Math.ceil((c.source_out / dur) * all.length));
-		return all.slice(lo, Math.min(hi, all.length));
+		const slice = all.slice(lo, Math.min(hi, all.length));
+		const target = Math.max(1, Math.min(Math.ceil(width), slice.length));
+		if (target >= slice.length) return slice;
+		const out = new Array<number>(target);
+		for (let i = 0; i < target; i++) {
+			const start = Math.floor((i / target) * slice.length);
+			const end = Math.max(start + 1, Math.floor(((i + 1) / target) * slice.length));
+			let peak = 0;
+			for (let j = start; j < end && j < slice.length; j++) peak = Math.max(peak, slice[j]);
+			out[i] = peak;
+		}
+		return out;
 	}
 
 	// ---- interaction: select / razor split / drag-to-move --------------------
@@ -272,7 +307,15 @@
 	// ---- tracks (add / remove) -----------------------------------------------
 
 	const onAddTrack = (kind: StreamKind) => void editor.addTrack(kind).catch(err);
-	const onRemoveTrack = (t: Track) => void editor.removeTrack(t.id).catch(err);
+	const onRemoveTrack = (t: Track) =>
+		void editor
+			.removeTrack(t.id)
+			.then(() =>
+				toast(`Removed track ${t.name}`, {
+					action: { label: 'Undo', onClick: () => void editor.undo() }
+				})
+			)
+			.catch(err);
 
 	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
 
@@ -329,6 +372,7 @@
 		<div style="flex:1"></div>
 		<button
 			title="Zoom out"
+			aria-label="Zoom out"
 			onclick={() => (ui.zoom = Math.max(8, ui.zoom - 8))}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-out" s={14} /></button
@@ -340,6 +384,7 @@
 		</div>
 		<button
 			title="Zoom in"
+			aria-label="Zoom in"
 			onclick={() => (ui.zoom = Math.min(96, ui.zoom + 8))}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-in" s={14} /></button
@@ -453,7 +498,7 @@
 									: 1};cursor:{ui.tool === 'razor' ? 'crosshair' : drag ? 'grabbing' : 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 							>
 								{#if t.kind === 'audio'}
-									{@const peaks = clipPeaks(c)}
+									{@const peaks = clipPeaks(c, width)}
 									{#if peaks.length}
 										<div style="position:absolute;inset:0;display:flex;align-items:center;gap:1px;padding:0 2px;opacity:.5">
 											{#each peaks as p, i (i)}

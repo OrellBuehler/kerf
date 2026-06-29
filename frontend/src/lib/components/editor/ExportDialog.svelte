@@ -37,6 +37,13 @@
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
 
+	// Focus the dialog on open so its Escape handler (and the focus trap) actually
+	// receive keys — otherwise focus stays on whatever triggered Export.
+	let dialogEl = $state<HTMLDivElement | null>(null);
+	$effect(() => {
+		dialogEl?.focus();
+	});
+
 	const assets = $derived(editor.assets);
 	const hasVideo = $derived(editor.timeline.tracks.some((t) => t.kind === 'video' && t.clips.length > 0));
 	const hasAudio = $derived(
@@ -198,6 +205,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
+	bind:this={dialogEl}
 	role="dialog"
 	aria-modal="true"
 	tabindex="-1"

@@ -85,29 +85,87 @@
 		exportOpen = true;
 	}
 
+	async function onImport() {
+		if (!inTauri()) {
+			toast.info('Importing media is available in the desktop app.');
+			return;
+		}
+		try {
+			const { imported, failed } = await editor.importMedia();
+			for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
+			if (imported.length > 0) {
+				toast.success(
+					imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
+				);
+				for (const a of imported) await ui.runAnalysis(a.id);
+			}
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	/** One step for arrow-key seeking: a single source frame (derived from the
+	 *  selected asset's fps, default 30), or a whole second when Shift is held. */
+	function frameStep(coarse: boolean): number {
+		if (coarse) return 1;
+		const v = editor.selectedAsset?.streams.find((s) => s.kind === 'video');
+		const fps = v?.fps && v.fps > 0 ? v.fps : 30;
+		return 1 / fps;
+	}
+
 	function onKey(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 		const k = e.key.toLowerCase();
-		if ((e.metaKey || e.ctrlKey) && k === 'z') {
-			e.preventDefault();
-			if (e.shiftKey) {
+
+		// File operations (⌘/Ctrl). Handled first so they win over the bare-key
+		// tool shortcuts, and any other modified combo returns without falling
+		// through (so e.g. ⌘C doesn't get read as the razor 'c').
+		if (e.metaKey || e.ctrlKey) {
+			if (k === 'z') {
+				e.preventDefault();
+				if (e.shiftKey) {
+					if (editor.canRedo) void editor.redo();
+				} else if (editor.canUndo) void editor.undo();
+			} else if (k === 'y') {
+				e.preventDefault();
 				if (editor.canRedo) void editor.redo();
-			} else if (editor.canUndo) {
-				void editor.undo();
+			} else if (k === 's') {
+				e.preventDefault();
+				void onSave();
+			} else if (k === 'o') {
+				e.preventDefault();
+				void onOpen();
+			} else if (k === 'n') {
+				e.preventDefault();
+				void onNew();
+			} else if (k === 'e') {
+				e.preventDefault();
+				onExport();
+			} else if (k === 'i') {
+				e.preventDefault();
+				void onImport();
 			}
 			return;
 		}
-		if ((e.metaKey || e.ctrlKey) && k === 'y') {
-			e.preventDefault();
-			if (editor.canRedo) void editor.redo();
-			return;
-		}
+
+		// Tools / transport (bare keys).
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
-		else if (k === 'm') ui.tool = 'bookmark';
 		else if (e.key === ' ') {
 			e.preventDefault();
 			ui.togglePlay();
+		} else if (e.key === 'ArrowLeft') {
+			e.preventDefault();
+			ui.seek(ui.time - frameStep(e.shiftKey));
+		} else if (e.key === 'ArrowRight') {
+			e.preventDefault();
+			ui.seek(ui.time + frameStep(e.shiftKey));
+		} else if (e.key === 'Home') {
+			e.preventDefault();
+			ui.seek(0);
+		} else if (e.key === 'End') {
+			e.preventDefault();
+			ui.seek(editor.duration);
 		} else if (e.key === '+' || e.key === '=') {
 			e.preventDefault();
 			ui.zoom = Math.min(96, ui.zoom + 8);
@@ -117,8 +175,10 @@
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipId) {
 			e.preventDefault();
 			// Shift+Delete ripples (closes the gap); plain Delete leaves a gap.
-			if (e.shiftKey) void editor.rippleDelete(editor.selectedClipId);
-			else void editor.remove(editor.selectedClipId);
+			const id = editor.selectedClipId;
+			void (e.shiftKey ? editor.rippleDelete(id) : editor.remove(id))
+				.then(() => toast('Clip removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
 		}
 	}
 </script>

@@ -161,6 +161,40 @@ impl<'a> AnalysisProviders<'a> {
     }
 }
 
+/// Run the default analysis providers (FFmpeg silence + scene detection, and
+/// `whisper` transcription when the feature is on and `KERF_WHISPER_MODEL` is
+/// set) against an asset's media file and assemble an [`AssetAnalysis`].
+///
+/// This is the heavy, ffmpeg-bound part of [`crate::project::Project::analyze_asset`],
+/// pulled out as a free function so a caller holding the shared `Project` lock
+/// can release it before running this and re-acquire it only to cache the
+/// result.
+pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
+    let silence = FfmpegSilenceDetector::default();
+    let scene = FfmpegSceneDetector::default();
+    let null = NullAnalyzer;
+
+    #[cfg(feature = "whisper")]
+    let whisper = std::env::var("KERF_WHISPER_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .map(|m| WhisperTranscriber {
+            model_path: m.into(),
+            language: None,
+        });
+    #[cfg(feature = "whisper")]
+    let transcriber: &dyn Transcriber = whisper.as_ref().map(|w| w as &dyn Transcriber).unwrap_or(&null);
+    #[cfg(not(feature = "whisper"))]
+    let transcriber: &dyn Transcriber = &null;
+
+    let providers = AnalysisProviders {
+        silence: &silence,
+        scene: &scene,
+        transcriber,
+    };
+    analyze(asset, &providers)
+}
+
 /// Run every configured provider and assemble an [`AssetAnalysis`].
 pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnalysis> {
     Ok(AssetAnalysis {

@@ -81,13 +81,16 @@ class EditorState {
 		return undefined;
 	}
 
-	get duration(): number {
+	/** Timeline length in seconds. Memoized: `timeline` is reassigned wholesale
+	 *  on every edit, so this recomputes only then — not on every playhead tick
+	 *  (the rAF playback loop reads it ~60×/sec). */
+	duration = $derived.by(() => {
 		let max = 0;
 		for (const t of this.timeline.tracks) {
 			for (const c of t.clips) max = Math.max(max, c.timeline_start + clipDuration(c));
 		}
 		return max;
-	}
+	});
 
 	/** Whether the project is backed by a file on disk (vs the in-memory sample). */
 	get saved(): boolean {

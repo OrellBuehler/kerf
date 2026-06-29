@@ -5,7 +5,7 @@
 
 import { editor } from './state.svelte';
 
-export type Tool = 'pointer' | 'razor' | 'bookmark';
+export type Tool = 'pointer' | 'razor';
 
 class EditorUi {
 	tool = $state<Tool>('pointer');
@@ -18,35 +18,22 @@ class EditorUi {
 	analyzing = $state(false);
 	/** The asset currently being analyzed (so the bin badges the right one). */
 	analyzingId = $state<string | null>(null);
-	/** Analysis progress, 0–100. */
-	progress = $state(0);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
 
-	#timer: ReturnType<typeof setInterval> | null = null;
 	#raf: number | null = null;
 
-	#clear() {
-		if (this.#timer) clearInterval(this.#timer);
-		this.#timer = null;
-	}
-
-	/** Analyze an asset, animating progress while kerf-core works. */
+	/** Analyze an asset, flagging `analyzing` while kerf-core works. The work has
+	 *  no real progress signal, so the UI shows an indeterminate state rather than
+	 *  a fabricated percentage. */
 	async runAnalysis(assetId: string) {
-		this.#clear();
 		this.analyzing = true;
 		this.analyzingId = assetId;
-		this.progress = 6;
-		this.#timer = setInterval(() => {
-			this.progress = Math.min(94, this.progress + 6);
-		}, 200);
 		try {
 			await editor.analyze(assetId);
 		} finally {
-			this.#clear();
-			this.progress = 100;
 			this.analyzing = false;
 			this.analyzingId = null;
 		}
@@ -54,8 +41,10 @@ class EditorUi {
 
 	// ---- playback ----------------------------------------------------------
 
+	/** Move the playhead, clamped to the timeline so it can't park past the end
+	 *  or before zero. */
 	seek(t: number) {
-		this.time = Math.max(0, t);
+		this.time = Math.min(Math.max(0, t), Math.max(0, editor.duration));
 	}
 
 	togglePlay() {

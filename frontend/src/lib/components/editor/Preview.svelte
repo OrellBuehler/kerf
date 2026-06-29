@@ -49,23 +49,51 @@
 
 	let frameUrl = $state<string | null>(null);
 	let token = 0;
+	let lastFetchAt = 0;
+	let pending: ReturnType<typeof setTimeout> | null = null;
 
-	// Fetch a real frame shortly after the playhead settles (desktop app only).
+	function fetchFrame(assetId: string, srcTime: number) {
+		const mine = ++token;
+		lastFetchAt = performance.now();
+		getFrame(assetId, srcTime)
+			.then((url) => {
+				// Only apply the freshest request, so out-of-order decodes don't flash
+				// a stale frame (frames are cached backend-side, so replays are cheap).
+				if (mine === token && url) frameUrl = url;
+			})
+			.catch(() => {});
+	}
+
+	// Keep the preview frame in step with the playhead. A leading-edge throttle
+	// caps how often we decode: during playback it updates the image a few times
+	// a second (a moving preview), and a trailing call lands the exact frame once
+	// scrubbing settles. (Desktop only — getFrame returns null in the browser.)
 	$effect(() => {
 		const target = atPlayhead;
 		if (!target) {
 			frameUrl = null;
 			return;
 		}
-		const mine = ++token;
-		const handle = setTimeout(() => {
-			getFrame(target.assetId, target.srcTime)
-				.then((url) => {
-					if (mine === token && url) frameUrl = url;
-				})
-				.catch(() => {});
-		}, 90);
-		return () => clearTimeout(handle);
+		const throttle = ui.playing ? 130 : 70;
+		const since = performance.now() - lastFetchAt;
+		if (pending) {
+			clearTimeout(pending);
+			pending = null;
+		}
+		if (since >= throttle) {
+			fetchFrame(target.assetId, target.srcTime);
+		} else {
+			pending = setTimeout(() => {
+				pending = null;
+				fetchFrame(target.assetId, target.srcTime);
+			}, throttle - since);
+		}
+		return () => {
+			if (pending) {
+				clearTimeout(pending);
+				pending = null;
+			}
+		};
 	});
 
 	function scrub(e: MouseEvent) {
@@ -115,6 +143,7 @@
 	>
 		<button
 			title={ui.playing ? 'Pause' : 'Play'}
+			aria-label={ui.playing ? 'Pause' : 'Play'}
 			onclick={() => ui.togglePlay()}
 			style="background:none;border:none;cursor:pointer;color:var(--text-primary);display:grid;place-items:center"
 		>

@@ -46,8 +46,8 @@
 	<div style="flex:1"></div>
 	{#if ui.analyzing}
 		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--agent-300)">
-			<span style="width:6px;height:6px;border-radius:50%;background:var(--agent-400)"></span>
-			Analyzing… {Math.round(ui.progress)}%
+			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
+			Analyzing…
 		</span>
 	{:else}
 		<span style="font-size:10px;color:var(--text-disabled)">

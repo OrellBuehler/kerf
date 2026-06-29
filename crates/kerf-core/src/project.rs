@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Covers `claim_next_task` (WHERE status = 'queued' ORDER BY created_at LIMIT 1)
+-- and the queue/asset list sorts. Idempotent, so safe to apply to older files.
+CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_created       ON tasks (created_at);
+CREATE INDEX IF NOT EXISTS idx_assets_imported     ON assets (imported_at);
 "#;
 
 /// `meta` key holding the seq of the currently-applied revision.
@@ -321,35 +327,11 @@ impl Project {
     /// `KERF_WHISPER_MODEL` model, transcription) against an asset's media file,
     /// cache the result, and return it.
     pub fn analyze_asset(&self, asset_id: Uuid) -> Result<AssetAnalysis> {
-        use crate::analysis::{
-            analyze, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, Transcriber,
-        };
-
         let asset = self.require_asset(asset_id)?;
-        let silence = FfmpegSilenceDetector::default();
-        let scene = FfmpegSceneDetector::default();
-        let null = NullAnalyzer;
-
-        #[cfg(feature = "whisper")]
-        let whisper =
-            std::env::var("KERF_WHISPER_MODEL")
-                .ok()
-                .filter(|m| !m.is_empty())
-                .map(|m| crate::analysis::WhisperTranscriber {
-                    model_path: m.into(),
-                    language: None,
-                });
-        #[cfg(feature = "whisper")]
-        let transcriber: &dyn Transcriber = whisper.as_ref().map(|w| w as &dyn Transcriber).unwrap_or(&null);
-        #[cfg(not(feature = "whisper"))]
-        let transcriber: &dyn Transcriber = &null;
-
-        let providers = AnalysisProviders {
-            silence: &silence,
-            scene: &scene,
-            transcriber,
-        };
-        let analysis = analyze(&asset, &providers)?;
+        // The heavy ffmpeg work lives in `analysis::analyze_asset_media`, a free
+        // function — so the GUI/MCP adapters can run it without holding the
+        // shared Project lock and then re-lock only for the quick `set_analysis`.
+        let analysis = crate::analysis::analyze_asset_media(&asset)?;
         self.set_analysis(&analysis)?;
         Ok(analysis)
     }
@@ -418,27 +400,52 @@ impl Project {
     }
 
     pub fn save_timeline(&self, timeline: &Timeline) -> Result<()> {
+        self.save_timeline_str(&serde_json::to_string(timeline)?)
+    }
+
+    /// Persist a pre-serialized timeline blob, so callers that already hold the
+    /// JSON (an edit + its history snapshot) don't serialize the same timeline
+    /// twice.
+    fn save_timeline_str(&self, json: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)",
-            params![serde_json::to_string(timeline)?],
+            params![json],
         )?;
         Ok(())
     }
 
     /// Apply a mutation to the timeline, persist it, and record a new revision
-    /// in the history (attributed to the current [`Project::actor`]).
+    /// in the history (attributed to the current [`Project::actor`]). The blob
+    /// write and the history append are wrapped in a single transaction — so an
+    /// edit and its history head move atomically — and the timeline is
+    /// serialized once and reused for both writes.
     fn edit_timeline<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        let tx = self.conn.unchecked_transaction()?;
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
-        self.save_timeline(&timeline)?;
-        self.record_revision(label, self.actor, &serde_json::to_string(&timeline)?)?;
+        let json = serde_json::to_string(&timeline)?;
+        self.save_timeline_str(&json)?;
+        self.record_revision(label, self.actor, &json)?;
+        tx.commit()?;
         Ok(result)
     }
 
     // ---- history ----------------------------------------------------------
 
     fn head(&self) -> Result<i64> {
-        Ok(self.meta(HISTORY_HEAD)?.and_then(|s| s.parse().ok()).unwrap_or(0))
+        match self.meta(HISTORY_HEAD)?.and_then(|s| s.parse::<i64>().ok()) {
+            Some(seq) => Ok(seq),
+            // A missing/corrupt head must not be read as 0 — `record_revision`
+            // would then `DELETE FROM history WHERE seq > 0` and wipe the whole
+            // edit log. Recover the real tip from the history table and persist it.
+            None => {
+                let seq: i64 = self
+                    .conn
+                    .query_row("SELECT COALESCE(MAX(seq), 0) FROM history", [], |r| r.get(0))?;
+                self.set_head(seq)?;
+                Ok(seq)
+            }
+        }
     }
 
     fn set_head(&self, seq: i64) -> Result<()> {
@@ -468,8 +475,10 @@ impl Project {
             .optional()?;
         let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
         let timeline: Timeline = serde_json::from_str(&snapshot)?;
-        self.save_timeline(&timeline)?;
+        let tx = self.conn.unchecked_transaction()?;
+        self.save_timeline_str(&snapshot)?;
         self.set_head(seq)?;
+        tx.commit()?;
         Ok(timeline)
     }
 
@@ -1003,14 +1012,30 @@ impl Project {
         })
     }
 
-    /// Append the full length of each asset sequentially (stitch).
+    /// Append the full length of each asset sequentially (stitch). One atomic
+    /// edit — a single timeline write and one "Concatenate" revision — rather
+    /// than one `cut_clip` (and one undo step) per asset.
     pub fn concatenate(&self, asset_ids: &[Uuid]) -> Result<Vec<Clip>> {
-        let mut clips = Vec::new();
+        // Validate every asset up front so the edit either fully applies or not
+        // at all (no partial stitch left behind on a bad id).
+        let mut plan = Vec::with_capacity(asset_ids.len());
         for &asset_id in asset_ids {
             let asset = self.require_asset(asset_id)?;
-            clips.push(self.cut_clip(asset_id, 0.0, asset.duration)?);
+            plan.push((asset_id, asset.primary_kind(), asset.duration));
         }
-        Ok(clips)
+        self.edit_timeline("Concatenate", |timeline| {
+            let mut clips = Vec::with_capacity(plan.len());
+            for (asset_id, primary, duration) in &plan {
+                let tid = timeline
+                    .first_track_of(*primary)
+                    .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?;
+                let start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
+                let clip = Clip::new(*asset_id, 0.0, *duration, start);
+                timeline.track_mut(tid).unwrap().clips.push(clip.clone());
+                clips.push(clip);
+            }
+            Ok(clips)
+        })
     }
 
     /// Render the timeline to `output_path`. Requires the `ffmpeg` feature.

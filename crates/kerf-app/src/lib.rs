@@ -135,7 +135,13 @@ fn import_asset(state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
 #[tauri::command]
 fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
-    state.project()?.analyze_asset(id).map_err(|e| e.to_string())
+    // Probe the asset under the lock, run the multi-second ffmpeg analysis with
+    // the lock released, then re-acquire it only to cache the result — so the
+    // GUI and the MCP agent stay responsive while analysis runs.
+    let asset = state.project()?.require_asset(id).map_err(|e| e.to_string())?;
+    let analysis = kerf_core::analyze_asset_media(&asset).map_err(|e| e.to_string())?;
+    state.project()?.set_analysis(&analysis).map_err(|e| e.to_string())?;
+    Ok(analysis)
 }
 
 // ---- timeline editing (each returns the refreshed timeline) ----------------
@@ -374,12 +380,15 @@ fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
 #[tauri::command]
 fn get_frame(state: State<'_, AppState>, asset_id: String, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
     let id = id(&asset_id)?;
-    let png = state
+    // JPEG rather than PNG: the preview pane never needs lossless frames, and a
+    // q=4 JPEG is ~5–10× smaller to encode and ship over IPC — which matters now
+    // that the preview fetches frames continuously during playback.
+    let jpeg = state
         .project()?
-        .frame_at(id, time_secs, max_width.unwrap_or(960))
+        .frame_jpeg(id, time_secs, max_width.unwrap_or(960), 4)
         .map_err(|e| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-    Ok(format!("data:image/png;base64,{b64}"))
+    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+    Ok(format!("data:image/jpeg;base64,{b64}"))
 }
 
 #[tauri::command]
@@ -420,8 +429,20 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 
 #[tauri::command]
 fn export_timeline(state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
-    let out = state.project()?.export_with(&output_path, &options).map_err(|e| e.to_string())?;
-    Ok(out.to_string_lossy().into_owned())
+    // Snapshot the timeline + assets under the lock, then release it before the
+    // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
+    // shared Project mutex for its whole duration and freeze every other GUI
+    // command and the MCP agent until it finished.
+    let (timeline, assets) = {
+        let project = state.project()?;
+        (
+            project.timeline().map_err(|e| e.to_string())?,
+            project.list_assets().map_err(|e| e.to_string())?,
+        )
+    };
+    kerf_core::render_with(&timeline, &assets, std::path::Path::new(&output_path), &options)
+        .map_err(|e| e.to_string())?;
+    Ok(output_path)
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
