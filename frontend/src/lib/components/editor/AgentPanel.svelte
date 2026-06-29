@@ -5,6 +5,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { mcpEndpoint } from '$lib/api';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { EditSource, Task, TaskStatus } from '$lib/types';
 
@@ -12,6 +13,29 @@
 	const disabled = $derived(editor.assets.length === 0);
 
 	let draft = $state('');
+
+	// How to connect an agent: the local MCP endpoint + a ready-to-run Claude Code
+	// command. Loaded from the backend so the displayed URL honors KERF_MCP_ADDR.
+	let endpoint = $state('http://127.0.0.1:7777/mcp');
+	let showConnect = $state(true);
+	let copied = $state<string | null>(null);
+	const claudeCmd = $derived(`claude mcp add --transport http kerf ${endpoint}`);
+
+	$effect(() => {
+		mcpEndpoint().then((e) => (endpoint = e)).catch(() => {});
+	});
+
+	async function copy(text: string, key: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			copied = key;
+			setTimeout(() => {
+				if (copied === key) copied = null;
+			}, 1400);
+		} catch {
+			toast.error('Could not copy — select the text and copy manually');
+		}
+	}
 
 	// Most actionable first: the agent's current work and anything awaiting review.
 	const RANK: Record<TaskStatus, number> = { working: 0, ready: 1, queued: 2, failed: 3, done: 4 };
@@ -101,6 +125,28 @@
 		>
 		<div style="flex:1;height:1px;background:var(--border-subtle)"></div>
 		{#if right}<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{right}</span>{/if}
+	</div>
+{/snippet}
+
+{#snippet copyRow(value: string, key: string)}
+	<div
+		style="display:flex;align-items:center;gap:6px;background:var(--surface-inset);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:6px 6px 6px 9px"
+	>
+		<code
+			data-selectable
+			style="flex:1;min-width:0;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:nowrap;overflow-x:auto"
+			>{value}</code
+		>
+		<button
+			title="Copy to clipboard"
+			onclick={() => copy(value, key)}
+			style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;flex:none;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:var(--surface-raised);color:{copied ===
+			key
+				? 'var(--green-400)'
+				: 'var(--text-secondary)'};cursor:pointer"
+		>
+			<Icon n={copied === key ? 'check' : 'copy'} s={13} />
+		</button>
 	</div>
 {/snippet}
 
@@ -212,6 +258,45 @@
 				></span>
 				{working ? 'working' : 'live'}
 			</span>
+		</div>
+
+		<!-- how to connect an agent -->
+		<div
+			style="border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);overflow:hidden"
+		>
+			<button
+				onclick={() => (showConnect = !showConnect)}
+				style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 11px;background:transparent;border:none;cursor:pointer;text-align:left"
+			>
+				<Icon n="plug" s={13} color="var(--agent-300)" />
+				<span style="flex:1;font-size:12px;font-weight:600;color:var(--text-primary)">Connect an agent</span>
+				<Icon
+					n="chevron-down"
+					s={15}
+					color="var(--text-muted)"
+					style="transition:transform .15s;transform:rotate({showConnect ? 180 : 0}deg)"
+				/>
+			</button>
+			{#if showConnect}
+				<div style="padding:0 11px 12px;display:flex;flex-direction:column;gap:11px">
+					<div>
+						<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+							Point any MCP client at this local endpoint:
+						</div>
+						{@render copyRow(endpoint, 'endpoint')}
+					</div>
+					<div>
+						<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+							Using <span style="color:var(--text-secondary)">Claude Code</span>? Run this in your terminal:
+						</div>
+						{@render copyRow(claudeCmd, 'cmd')}
+					</div>
+					<div style="font-size:10px;color:var(--text-disabled);line-height:1.5">
+						The agent edits the project you have open and proposes cuts you review here. Override the address
+						with <span style="font-family:var(--font-mono)">KERF_MCP_ADDR</span>.
+					</div>
+				</div>
+			{/if}
 		</div>
 
 		<!-- queue -->

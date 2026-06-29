@@ -802,10 +802,21 @@ impl ServerHandler for KerfMcp {
 
 // ---- server ----------------------------------------------------------------
 
+/// The MCP bind address, honoring the `KERF_MCP_ADDR` override.
+fn bind_addr() -> String {
+    std::env::var("KERF_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string())
+}
+
+/// The full URL a client connects to (`http://<addr>/mcp`). The GUI shows this
+/// so the user knows where to point their agent.
+pub fn endpoint_url() -> String {
+    format!("http://{}/mcp", bind_addr())
+}
+
 /// Serve the MCP tools over streamable HTTP at `/mcp`, sharing `project` with
 /// the Tauri commands. Runs until the process exits.
 pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
-    let addr = std::env::var("KERF_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let addr = bind_addr();
 
     let service = StreamableHttpService::new(
         move || Ok(KerfMcp::new(project.clone(), app.clone())),

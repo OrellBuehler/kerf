@@ -482,6 +482,16 @@ fn cancel_export(state: State<'_, AppState>) {
     state.export_cancel.store(true, Ordering::SeqCst);
 }
 
+// ---- agent connection (MCP endpoint) ---------------------------------------
+
+/// The local MCP endpoint URL a connected LLM points at (e.g.
+/// `http://127.0.0.1:7777/mcp`), honoring the `KERF_MCP_ADDR` override. The
+/// agent panel surfaces this so the user knows how to connect their agent.
+#[tauri::command]
+fn mcp_endpoint() -> String {
+    mcp::endpoint_url()
+}
+
 // ---- diagnostics (logs) ----------------------------------------------------
 
 #[tauri::command]
@@ -657,6 +667,7 @@ pub fn run() {
             remove_task,
             export_timeline,
             cancel_export,
+            mcp_endpoint,
             log_dir,
             reveal_logs
         ])

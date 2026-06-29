@@ -717,6 +717,14 @@ export async function pickExportPath(ext: string): Promise<string | null> {
 	return typeof path === 'string' ? path : null;
 }
 
+// ---- agent connection (MCP endpoint) ---------------------------------------
+
+/** The local MCP endpoint a connected agent points at (e.g. http://127.0.0.1:7777/mcp). */
+export async function mcpEndpoint(): Promise<string> {
+	if (!inTauri()) return 'http://127.0.0.1:7777/mcp';
+	return invoke<string>('mcp_endpoint');
+}
+
 // ---- diagnostics (logs) ----------------------------------------------------
 
 /** The platform log directory Kerf writes its logfile to, or `null` in the browser. */

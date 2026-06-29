@@ -41,6 +41,8 @@ import {
 	ZoomIn,
 	ZoomOut,
 	Trash2,
+	Copy,
+	ChevronDown,
 	X
 } from '@lucide/svelte';
 
@@ -87,6 +89,8 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'zoom-in': ZoomIn,
 	'zoom-out': ZoomOut,
 	'trash': Trash2,
+	'copy': Copy,
+	'chevron-down': ChevronDown,
 	'x': X
 };
 
