@@ -327,7 +327,7 @@ impl KerfMcp {
         json(&project.list_assets().map_err(core_err)?)
     }
 
-    #[tool(description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times)")]
+    #[tool(description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid)")]
     fn get_asset_metadata(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
@@ -342,7 +342,7 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
-    #[tool(description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, and transcription when configured) and cache the result")]
+    #[tool(description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, and transcription when configured) and cache the result")]
     fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         // Probe under the lock, run the heavy ffmpeg analysis with the lock
@@ -788,7 +788,7 @@ impl ServerHandler for KerfMcp {
              the whole queue). To work a task, inspect loaded media with \
              list_assets / get_asset_metadata / get_timeline_state, run \
              analyze_asset to populate silence / scene / transcript / loudness \
-             (EBU R128 LUFS) / onset metadata. \
+             (EBU R128 LUFS) / onset / tempo (BPM + beat grid) metadata. \
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \

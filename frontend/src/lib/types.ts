@@ -42,6 +42,12 @@ export interface Loudness {
 	threshold_lufs: number;
 }
 
+export interface Tempo {
+	bpm: number;
+	beats: number[];
+	confidence: number;
+}
+
 export interface AssetAnalysis {
 	asset_id: string;
 	silence_segments: TimeRange[];
@@ -49,6 +55,7 @@ export interface AssetAnalysis {
 	transcript: TranscriptSegment[];
 	loudness: Loudness | null;
 	onsets: number[];
+	tempo: Tempo | null;
 }
 
 export interface Transform {

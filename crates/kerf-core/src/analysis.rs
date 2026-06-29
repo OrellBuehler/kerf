@@ -5,7 +5,7 @@
 //! be swapped in without touching the rest of the core.
 
 use crate::error::Result;
-use crate::model::{Asset, AssetAnalysis, Loudness, TimeRange, TranscriptSegment};
+use crate::model::{Asset, AssetAnalysis, Loudness, Tempo, TimeRange, TranscriptSegment};
 
 /// Detects silent spans in an asset's audio.
 pub trait SilenceDetector: Send + Sync {
@@ -31,6 +31,12 @@ pub trait LoudnessAnalyzer: Send + Sync {
 /// Detects onset (transient) timestamps in an asset's audio.
 pub trait OnsetDetector: Send + Sync {
     fn detect_onsets(&self, asset: &Asset) -> Result<Vec<f64>>;
+}
+
+/// Estimates tempo and a beat grid for an asset's audio (`None` when it has no
+/// usable rhythm).
+pub trait TempoDetector: Send + Sync {
+    fn detect_tempo(&self, asset: &Asset) -> Result<Option<Tempo>>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -110,6 +116,19 @@ impl OnsetDetector for FfmpegOnsetDetector {
             return Ok(Vec::new());
         }
         crate::engine::detect_onsets(std::path::Path::new(&asset.path), self.sensitivity)
+    }
+}
+
+/// Tempo estimation backed by autocorrelation of the onset envelope (PCM decoded
+/// with the `ffmpeg` binary), so no dev libraries are required.
+pub struct FfmpegTempoDetector;
+
+impl TempoDetector for FfmpegTempoDetector {
+    fn detect_tempo(&self, asset: &Asset) -> Result<Option<Tempo>> {
+        if !asset.has_audio() {
+            return Ok(None);
+        }
+        crate::engine::detect_tempo(std::path::Path::new(&asset.path))
     }
 }
 
@@ -204,6 +223,12 @@ impl OnsetDetector for NullAnalyzer {
     }
 }
 
+impl TempoDetector for NullAnalyzer {
+    fn detect_tempo(&self, _asset: &Asset) -> Result<Option<Tempo>> {
+        Ok(None)
+    }
+}
+
 /// A bundle of analysis providers to run against an asset.
 pub struct AnalysisProviders<'a> {
     pub silence: &'a dyn SilenceDetector,
@@ -211,6 +236,7 @@ pub struct AnalysisProviders<'a> {
     pub transcriber: &'a dyn Transcriber,
     pub loudness: &'a dyn LoudnessAnalyzer,
     pub onset: &'a dyn OnsetDetector,
+    pub tempo: &'a dyn TempoDetector,
 }
 
 impl<'a> AnalysisProviders<'a> {
@@ -222,6 +248,7 @@ impl<'a> AnalysisProviders<'a> {
             transcriber: null,
             loudness: null,
             onset: null,
+            tempo: null,
         }
     }
 }
@@ -239,6 +266,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
     let onset = FfmpegOnsetDetector::default();
+    let tempo = FfmpegTempoDetector;
     let null = NullAnalyzer;
 
     #[cfg(feature = "whisper")]
@@ -260,6 +288,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
         transcriber,
         loudness: &loudness,
         onset: &onset,
+        tempo: &tempo,
     };
     analyze(asset, &providers)
 }
@@ -273,5 +302,6 @@ pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnal
         transcript: providers.transcriber.transcribe(asset)?,
         loudness: providers.loudness.measure(asset)?,
         onsets: providers.onset.detect_onsets(asset)?,
+        tempo: providers.tempo.detect_tempo(asset)?,
     })
 }

@@ -1348,6 +1348,11 @@ impl Project {
                 threshold_lufs: -26.5,
             }),
             onsets: vec![0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
+            tempo: Some(crate::model::Tempo {
+                bpm: 120.0,
+                beats: vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+                confidence: 0.62,
+            }),
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.

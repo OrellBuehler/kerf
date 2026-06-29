@@ -71,7 +71,8 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.' }
 		],
 		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
-		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6]
+		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
+		tempo: { bpm: 120, beats: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], confidence: 0.62 }
 	},
 	[sampleAssets[1].id]: {
 		asset_id: sampleAssets[1].id,
@@ -79,7 +80,8 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		scene_changes: [0, 8, 20, 33],
 		transcript: [],
 		loudness: { integrated_lufs: -11.8, loudness_range: 9.1, true_peak_dbtp: -0.8, threshold_lufs: -22.0 },
-		onsets: [0.4, 0.9, 1.5, 2.1, 2.7, 3.3, 3.9]
+		onsets: [0.4, 0.9, 1.5, 2.1, 2.7, 3.3, 3.9],
+		tempo: { bpm: 128, beats: [0.23, 0.7, 1.17, 1.64, 2.11, 2.58, 3.05, 3.52], confidence: 0.78 }
 	}
 };
 
@@ -284,7 +286,8 @@ export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 				scene_changes: [],
 				transcript: [],
 				loudness: null,
-				onsets: []
+				onsets: [],
+				tempo: null
 			}
 		);
 	}

@@ -9,7 +9,7 @@ use std::process::Stdio;
 
 use super::cli::{command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use crate::error::{Error, Result};
-use crate::model::Loudness;
+use crate::model::{Loudness, Tempo};
 
 // ---- loudness (EBU R128) ---------------------------------------------------
 
@@ -146,9 +146,87 @@ fn pick_onsets(env: &[f32], frame_rate: f64, sensitivity: f64) -> Vec<f64> {
     onsets
 }
 
+// ---- tempo / beat grid -----------------------------------------------------
+
+/// Estimate tempo (BPM) and a beat grid for an asset's audio, or `None` when it
+/// has no usable rhythm. Autocorrelates the onset envelope to find the dominant
+/// period in a 60–180 BPM band, then a phase search places the beats. See
+/// [`crate::model::Tempo`] for the best-effort / octave caveats.
+pub fn detect_tempo(path: &Path) -> Result<Option<Tempo>> {
+    const SR: u32 = 22_050;
+    let samples = decode_audio_mono_f32(path, SR)?;
+    let (env, frame_rate) = onset_envelope(&samples, SR);
+    Ok(estimate_tempo(&env, frame_rate))
+}
+
+/// Autocorrelation tempo + phase estimation on an onset envelope. Pure, tested.
+fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
+    const MIN_BPM: f64 = 60.0;
+    const MAX_BPM: f64 = 180.0;
+    if frame_rate <= 0.0 {
+        return None;
+    }
+    let min_lag = ((frame_rate * 60.0 / MAX_BPM).floor() as usize).max(1);
+    let max_lag = (frame_rate * 60.0 / MIN_BPM).ceil() as usize;
+    if env.len() <= max_lag + 1 {
+        return None;
+    }
+    let energy: f64 = env.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+    if energy <= 0.0 {
+        return None;
+    }
+    let (mut best_lag, mut best_corr) = (0usize, 0.0_f64);
+    for lag in min_lag..=max_lag {
+        let corr: f64 = (0..env.len() - lag).map(|i| env[i] as f64 * env[i + lag] as f64).sum();
+        if corr > best_corr {
+            best_corr = corr;
+            best_lag = lag;
+        }
+    }
+    if best_lag == 0 {
+        return None;
+    }
+    let period = best_lag as f64;
+    let bpm = 60.0 * frame_rate / period;
+    let confidence = (best_corr / energy).clamp(0.0, 1.0);
+    // Phase: the offset whose pulse train best matches the envelope energy.
+    let (mut best_phase, mut best_sum) = (0usize, -1.0_f64);
+    for phase in 0..best_lag {
+        let sum: f64 = (phase..env.len()).step_by(best_lag).map(|k| env[k] as f64).sum();
+        if sum > best_sum {
+            best_sum = sum;
+            best_phase = phase;
+        }
+    }
+    let mut beats = Vec::new();
+    let mut t = best_phase as f64;
+    while (t as usize) < env.len() {
+        beats.push(t / frame_rate);
+        t += period;
+    }
+    Some(Tempo { bpm, beats, confidence })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_tempo_recovers_synthetic_pulse() {
+        // 120 BPM at a 100 Hz frame rate → a 0.5 s = 50-frame period.
+        let (frame_rate, period) = (100.0, 50usize);
+        let mut env = vec![0.0_f32; 1000];
+        let mut i = 7; // arbitrary phase offset
+        while i < env.len() {
+            env[i] = 1.0;
+            i += period;
+        }
+        let tempo = estimate_tempo(&env, frame_rate).expect("tempo");
+        assert!((tempo.bpm - 120.0).abs() < 2.0, "bpm {}", tempo.bpm);
+        assert!(tempo.confidence > 0.3, "confidence {}", tempo.confidence);
+        assert!(tempo.beats[0] < 0.1, "first beat {}", tempo.beats[0]);
+        assert!(estimate_tempo(&[], frame_rate).is_none());
+    }
 
     #[test]
     fn pick_onsets_finds_isolated_spikes() {

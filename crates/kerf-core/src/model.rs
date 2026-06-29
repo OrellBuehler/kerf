@@ -110,6 +110,19 @@ pub struct Loudness {
     pub threshold_lufs: f64,
 }
 
+/// Estimated tempo and beat grid for an asset's audio. Best-effort: derived by
+/// autocorrelating the onset envelope, so it is most reliable on percussive
+/// music and may land on a tempo octave — gate on `confidence`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tempo {
+    /// Estimated tempo in beats per minute.
+    pub bpm: f64,
+    /// Beat timestamps in seconds across the asset.
+    pub beats: Vec<f64>,
+    /// How periodic the audio is, 0.0–1.0 (the normalized autocorrelation peak).
+    pub confidence: f64,
+}
+
 /// Cached, pluggable analysis results for an asset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetAnalysis {
@@ -128,6 +141,10 @@ pub struct AssetAnalysis {
     /// arrives. Snap cut points to these to land edits on the beat.
     #[serde(default)]
     pub onsets: Vec<f64>,
+    /// Estimated tempo and beat grid, when the audio is rhythmic enough. `None`
+    /// for silent / video-only assets and non-rhythmic material.
+    #[serde(default)]
+    pub tempo: Option<Tempo>,
 }
 
 fn one() -> f64 {
