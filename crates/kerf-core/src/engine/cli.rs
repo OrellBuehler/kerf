@@ -447,8 +447,108 @@ fn build_contact_sheet_args(
 /// Decode the first audio stream to mono f32 PCM at `sample_rate` Hz and reduce
 /// it to `buckets` peak magnitudes in `0.0..=1.0` (for waveform rendering).
 pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
-    let samples = decode_audio_mono_f32(path, sample_rate)?;
-    Ok(peaks(&samples, buckets.max(1)))
+    use std::io::Read;
+
+    let buckets = buckets.max(1);
+    // Stream the decoded PCM through a bounded peak-downsampler instead of
+    // buffering the whole signal: a 1h file at 8 kHz mono is ~115 MB of f32
+    // otherwise (held twice — raw stdout then the parsed Vec). Here memory is
+    // O(buckets) regardless of length, and ffmpeg's decode is the only cost.
+    let bin = ffmpeg_bin();
+    let mut child = command(&bin)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(path)
+        .args(["-map", "0:a:0", "-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| launch_err(&bin, e))?;
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut s);
+        s
+    });
+
+    let mut down = PeakDownsampler::new(buckets);
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    // Read in fixed blocks and parse 4-byte f32le samples, carrying any straddling
+    // tail bytes (a pipe read need not land on a sample boundary) into the next read.
+    let mut block = [0u8; 1 << 16];
+    let mut leftover: Vec<u8> = Vec::with_capacity(4);
+    loop {
+        let n = stdout.read(&mut block).map_err(|e| Error::Engine(format!("waveform read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        leftover.extend_from_slice(&block[..n]);
+        for s in leftover.chunks_exact(4) {
+            down.push(f32::from_le_bytes([s[0], s[1], s[2], s[3]]).abs());
+        }
+        let consumed = (leftover.len() / 4) * 4;
+        leftover.copy_within(consumed.., 0);
+        leftover.truncate(leftover.len() - consumed);
+    }
+
+    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    if !status.success() {
+        let err = stderr_handle.join().unwrap_or_default();
+        return Err(Error::Engine(format!("could not decode audio: {}", err.trim())));
+    }
+    Ok(down.finish())
+}
+
+/// Folds an unbounded stream of sample magnitudes into exactly `buckets` peak
+/// values, holding only `2*buckets` floats. Each incoming sample updates the
+/// running peak of the current bucket; once the buffer fills it halves
+/// resolution (merging adjacent buckets, doubling samples-per-bucket) and keeps
+/// going — so the output is length-independent without knowing the total up
+/// front. [`finish`] resamples the filled region down to `buckets`.
+struct PeakDownsampler {
+    buf: Vec<f32>,
+    buckets: usize,
+    write: usize,
+    samples_per_bucket: u64,
+    in_bucket: u64,
+}
+
+impl PeakDownsampler {
+    fn new(buckets: usize) -> Self {
+        let buckets = buckets.max(1);
+        Self { buf: vec![0.0; buckets * 2], buckets, write: 0, samples_per_bucket: 1, in_bucket: 0 }
+    }
+
+    fn push(&mut self, magnitude: f32) {
+        let a = magnitude.clamp(0.0, 1.0);
+        self.buf[self.write] = self.buf[self.write].max(a);
+        self.in_bucket += 1;
+        if self.in_bucket < self.samples_per_bucket {
+            return;
+        }
+        self.in_bucket = 0;
+        self.write += 1;
+        if self.write == self.buf.len() {
+            // Buffer full: merge each adjacent pair into the first half (peak of
+            // peaks), clear the rest, and halve the resolution.
+            for i in 0..self.buckets {
+                self.buf[i] = self.buf[2 * i].max(self.buf[2 * i + 1]);
+            }
+            for slot in self.buf[self.buckets..].iter_mut() {
+                *slot = 0.0;
+            }
+            self.write = self.buckets;
+            self.samples_per_bucket *= 2;
+        }
+    }
+
+    fn finish(self) -> Vec<f32> {
+        // `write` complete buckets plus an in-progress partial one, all at the
+        // current resolution; collapse to exactly `buckets`.
+        let len = self.write + if self.in_bucket > 0 { 1 } else { 0 };
+        peaks(&self.buf[..len], self.buckets)
+    }
 }
 
 fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
@@ -2291,6 +2391,37 @@ mod tests {
         let p = peaks(&samples, 16);
         assert_eq!(p.len(), 16);
         assert!(p.iter().all(|&v| (0.0..=1.0).contains(&v)));
+    }
+
+    #[test]
+    fn peak_downsampler_is_length_independent_and_keeps_the_peak() {
+        // Stream far more samples than 2*buckets so the halving path runs many
+        // times, with one clipping spike buried in the middle.
+        let buckets = 16;
+        let mut down = PeakDownsampler::new(buckets);
+        for i in 0..100_000u32 {
+            let s = if i == 40_000 { 2.0 } else { ((i % 7) as f32) / 50.0 };
+            down.push(s);
+        }
+        let out = down.finish();
+        // Exactly `buckets` long regardless of how many samples streamed through.
+        assert_eq!(out.len(), buckets);
+        assert!(out.iter().all(|&v| (0.0..=1.0).contains(&v)));
+        // The clipping spike survives the downsample, clamped into range.
+        let max = out.iter().cloned().fold(0.0_f32, f32::max);
+        assert!((max - 1.0).abs() < 1e-6, "peak should be preserved, got {max}");
+    }
+
+    #[test]
+    fn peak_downsampler_handles_fewer_samples_than_buckets() {
+        let mut down = PeakDownsampler::new(16);
+        for &s in &[0.1, 0.9, 0.3] {
+            down.push(s);
+        }
+        let out = down.finish();
+        assert_eq!(out.len(), 16);
+        let max = out.iter().cloned().fold(0.0_f32, f32::max);
+        assert!((max - 0.9).abs() < 1e-6, "got {max}");
     }
 
     #[test]
