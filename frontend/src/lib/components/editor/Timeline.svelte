@@ -458,11 +458,13 @@
 				</div>
 
 				<!-- grid lines -->
-				{#each ticks as t, i (t)}
-					<span
-						style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:1px;background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
-					></span>
-				{/each}
+				{#if hasClips}
+					{#each ticks as t, i (t)}
+						<span
+							style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:1px;background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
+						></span>
+					{/each}
+				{/if}
 
 				{#if !hasClips}
 					<div
