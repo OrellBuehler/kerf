@@ -30,7 +30,7 @@ mod ffmpeg;
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
     contact_sheet, detect_scenes, detect_silence, frame_at, frame_jpeg, timeline_frame, validate_export, waveform,
-    Container, ExportOptions, RateControl,
+    Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
 };
 
 #[cfg(feature = "whisper")]
@@ -71,4 +71,17 @@ pub fn render_with(
     opts: &ExportOptions,
 ) -> Result<()> {
     cli::render_with(timeline, assets, output, opts)
+}
+
+/// Like [`render_with`] but streams [`ExportProgress`] and polls `cancel`.
+/// Always the CLI backend.
+pub fn render_with_progress(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
+    cli::render_with_progress(timeline, assets, output, opts, progress, cancel)
 }

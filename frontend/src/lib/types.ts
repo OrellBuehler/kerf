@@ -168,6 +168,13 @@ export interface ExportOptions {
 	metadata_title?: string | null;
 }
 
+/** Payload of the `export-progress` event streamed during a render. */
+export interface ExportProgress {
+	fraction: number;
+	elapsed_secs: number;
+	eta_secs?: number | null;
+}
+
 /** The bare Rust `Default` — the dialog opens by applying a preset over this. */
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
 	container: 'mp4',

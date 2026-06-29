@@ -7,6 +7,7 @@
 
 mod mcp;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -14,11 +15,14 @@ use kerf_core::{
     Asset, AssetAnalysis, EditSource, ExportOptions, Project, Revision, StreamKind, Task, Timeline, Transition, TransitionKind,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 struct AppState {
     project: Arc<Mutex<Project>>,
+    /// Set by `cancel_export` and polled by the in-flight export; lives outside
+    /// the project lock so a cancel lands even while a render holds it.
+    export_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -428,7 +432,7 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
-fn export_timeline(state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
+fn export_timeline(app: AppHandle, state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
@@ -440,9 +444,42 @@ fn export_timeline(state: State<'_, AppState>, output_path: String, options: Exp
             project.list_assets().map_err(|e| e.to_string())?,
         )
     };
-    kerf_core::render_with(&timeline, &assets, std::path::Path::new(&output_path), &options)
-        .map_err(|e| e.to_string())?;
-    Ok(output_path)
+
+    // Fresh cancel flag for this run; `cancel_export` flips it from another thread.
+    let cancel = state.export_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    // Stream `export-progress` events ({ fraction, elapsed_secs, eta_secs }) so
+    // the UI can show a bar + ETA. ffmpeg emits ~2/sec, no extra throttle needed.
+    let mut on_progress = |p: kerf_core::ExportProgress| {
+        let _ = app.emit("export-progress", p);
+    };
+    let status = kerf_core::render_with_progress(
+        &timeline,
+        &assets,
+        std::path::Path::new(&output_path),
+        &options,
+        &mut on_progress,
+        &|| cancel.load(Ordering::SeqCst),
+    )
+    .map_err(|e| e.to_string())?;
+
+    match status {
+        kerf_core::RenderStatus::Completed => Ok(output_path),
+        kerf_core::RenderStatus::Cancelled => {
+            // Drop the half-written file so a cancelled export leaves no debris.
+            let _ = std::fs::remove_file(&output_path);
+            Err("export cancelled".to_string())
+        }
+    }
+}
+
+/// Request cancellation of the in-flight export (if any). The running
+/// [`export_timeline`] observes the flag on its next progress poll, stops
+/// ffmpeg, and returns the `"export cancelled"` error.
+#[tauri::command]
+fn cancel_export(state: State<'_, AppState>) {
+    state.export_cancel.store(true, Ordering::SeqCst);
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
@@ -553,6 +590,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             project: project.clone(),
+            export_cancel: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
             // Logging needs the resolved platform log directory, so set it up here
@@ -618,6 +656,7 @@ pub fn run() {
             resolve_task,
             remove_task,
             export_timeline,
+            cancel_export,
             log_dir,
             reveal_logs
         ])

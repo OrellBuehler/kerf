@@ -18,7 +18,9 @@ pub use analysis::{
     analyze, analyze_asset_media, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
     SceneDetector, SilenceDetector, Transcriber,
 };
-pub use engine::{render_with, validate_export, Container, ExportOptions, RateControl};
+pub use engine::{
+    render_with, render_with_progress, validate_export, Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
+};
 pub use error::{Error, Result};
 pub use model::{
     Asset, AssetAnalysis, Clip, Color, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline,

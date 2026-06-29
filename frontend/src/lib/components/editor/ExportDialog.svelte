@@ -2,9 +2,9 @@
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { inTauri, pickExportPath } from '$lib/api';
+	import { inTauri, pickExportPath, cancelExport, onExportProgress } from '$lib/api';
 	import { toast } from 'svelte-sonner';
-	import type { Container, ExportOptions, RateControl } from '$lib/types';
+	import type { Container, ExportOptions, ExportProgress, RateControl } from '$lib/types';
 	import {
 		PRESETS,
 		CONTAINERS,
@@ -34,8 +34,16 @@
 	let activePreset = $state('web_1080p');
 	let customRes = $state(false);
 	let rendering = $state(false);
+	let progress = $state<ExportProgress | null>(null);
+	let cancelling = $state(false);
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
+
+	function fmtEta(s: number | null | undefined): string {
+		if (s == null || !isFinite(s)) return '';
+		const r = Math.max(0, Math.round(s));
+		return r >= 60 ? `${Math.floor(r / 60)}m ${String(r % 60).padStart(2, '0')}s` : `${r}s`;
+	}
 
 	// Focus the dialog on open so its Escape handler (and the focus trap) actually
 	// receive keys — otherwise focus stays on whatever triggered Export.
@@ -128,15 +136,30 @@
 			if (!outputPath) return;
 		}
 		rendering = true;
+		cancelling = false;
+		progress = null;
+		const unlisten = await onExportProgress((p) => {
+			progress = p;
+		});
 		try {
 			const out = await editor.export(outputPath, opts);
 			toast.success(`Exported → ${out}`);
 			onClose();
 		} catch (e) {
-			toast.error(msg(e));
+			const m = msg(e);
+			// A user-requested stop is not a failure — keep the dialog open quietly.
+			if (m === 'export cancelled') toast.info('Export cancelled');
+			else toast.error(m);
 		} finally {
+			unlisten();
 			rendering = false;
+			cancelling = false;
+			progress = null;
 		}
+	}
+	async function stop() {
+		cancelling = true;
+		await cancelExport();
 	}
 </script>
 
@@ -501,11 +524,31 @@
 				</div>
 			{/if}
 			<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
-				<div style="flex:1"></div>
-				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-				<Btn variant="primary" size="md" icon={rendering ? 'loader' : 'upload'} disabled={!canExport} onclick={doExport}>
-					{rendering ? 'Rendering…' : 'Export'}
-				</Btn>
+				{#if rendering}
+					<div style="flex:1;display:flex;align-items:center;gap:10px">
+						<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
+							<div
+								style="height:100%;width:{Math.round(
+									(progress?.fraction ?? 0) * 100
+								)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
+							></div>
+						</div>
+						<span
+							style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
+						>
+							{Math.round((progress?.fraction ?? 0) * 100)}%{progress?.eta_secs != null
+								? ` · ${fmtEta(progress.eta_secs)} left`
+								: ''}
+						</span>
+					</div>
+					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>
+						{cancelling ? 'Stopping…' : 'Stop'}
+					</Btn>
+				{:else}
+					<div style="flex:1"></div>
+					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
+					<Btn variant="primary" size="md" icon="upload" disabled={!canExport} onclick={doExport}>Export</Btn>
+				{/if}
 			</div>
 		</div>
 	</div>

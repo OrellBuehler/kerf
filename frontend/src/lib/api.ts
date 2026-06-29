@@ -13,6 +13,7 @@ import type {
 	Color,
 	EditSource,
 	ExportOptions,
+	ExportProgress,
 	Revision,
 	StreamKind,
 	Task,
@@ -690,6 +691,19 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<string> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
 	return invoke<string>('export_timeline', { outputPath, options });
+}
+
+/** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */
+export async function cancelExport(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_export');
+}
+
+/** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
+export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
 }
 
 /** Open a save dialog defaulted to the given container extension. */

@@ -1108,11 +1108,44 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
     render_with(timeline, assets, output, &ExportOptions::default())
 }
 
+/// Progress emitted during an export: `fraction` in `0.0..=1.0`, wall-clock
+/// `elapsed_secs`, and an `eta_secs` estimate once enough has rendered to
+/// extrapolate. Derived from ffmpeg's `-progress` stream.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ExportProgress {
+    pub fraction: f64,
+    pub elapsed_secs: f64,
+    pub eta_secs: Option<f64>,
+}
+
+/// Whether an export ran to completion or was stopped by the cancel callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderStatus {
+    Completed,
+    Cancelled,
+}
+
 /// Like [`render`] but with explicit export options. Validates the options
 /// against the timeline's available streams before launching, and runs ffmpeg
-/// twice for [`RateControl::TwoPass`].
+/// twice for [`RateControl::TwoPass`]. The no-op-callback wrapper over
+/// [`render_with_progress`], so both share one code path.
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &ExportOptions) -> Result<()> {
+    render_with_progress(timeline, assets, output, opts, &mut |_| {}, &|| false).map(|_| ())
+}
+
+/// Like [`render_with`] but streams [`ExportProgress`] to `progress` and polls
+/// `cancel` between updates — returning [`RenderStatus::Cancelled`] (and leaving
+/// the partial output for the caller to remove) when it trips.
+#[cfg_attr(feature = "libav-render", allow(dead_code))]
+pub fn render_with_progress(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
@@ -1137,42 +1170,127 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
         && !opts.container.is_audio_only()
         && matches!(opts.video_codec.as_deref(), Some(vc) if vc != "prores_ks" && vc != "gif");
 
+    let total = timeline.duration();
+    let start = std::time::Instant::now();
+
     if two_pass {
         let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
         // ffmpeg appends "-N.log" to the passlog prefix; scope it to this process.
         let passlog = std::env::temp_dir().join(format!("kerf-2pass-{}", std::process::id())).to_string_lossy().into_owned();
+        let cleanup = || {
+            for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
+                let _ = std::fs::remove_file(format!("{passlog}{suffix}"));
+            }
+        };
+        // Analysis pass fills the first half of the bar, the encode the second.
         let a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
-        run_ffmpeg(&a1, output)?;
-        let a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
-        let res = run_ffmpeg(&a2, output);
-        for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
-            let _ = std::fs::remove_file(format!("{passlog}{suffix}"));
+        let s1 = run_ffmpeg_progress(&a1, output, Bar { total, offset: 0.0, width: 0.5, start }, progress, cancel)?;
+        if s1 == RenderStatus::Cancelled {
+            cleanup();
+            return Ok(RenderStatus::Cancelled);
         }
+        let a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
+        let res = run_ffmpeg_progress(&a2, output, Bar { total, offset: 0.5, width: 0.5, start }, progress, cancel);
+        cleanup();
         res
     } else {
         let args = build_export_args(timeline, assets, output_str, opts)?;
-        run_ffmpeg(&args, output)
+        run_ffmpeg_progress(&args, output, Bar { total, offset: 0.0, width: 1.0, start }, progress, cancel)
     }
 }
 
-/// Spawn the `ffmpeg` binary with `args`, capturing stderr so a failure's actual
-/// reason (rather than inherited console noise) ends up in the error and log.
-fn run_ffmpeg(args: &[String], output: &Path) -> Result<()> {
+/// Where one ffmpeg invocation's reported `out_time` maps onto the overall
+/// export bar: `[offset, offset+width]` of `[0,1]`, against an output of `total`
+/// seconds, timed from `start`. (A single-pass export is the whole bar; a
+/// two-pass export splits it into two halves.)
+#[derive(Clone, Copy)]
+struct Bar {
+    total: f64,
+    offset: f64,
+    width: f64,
+    start: std::time::Instant,
+}
+
+/// Spawn the `ffmpeg` binary with `args`, streaming `-progress` from stdout to
+/// map elapsed render time onto `bar`, and polling `cancel` between updates
+/// (killing ffmpeg when it trips). stderr is drained on a side thread so a
+/// warning flood can't deadlock the stdout read, and its tail still surfaces in
+/// a failure's error.
+fn run_ffmpeg_progress(
+    args: &[String],
+    output: &Path,
+    bar: Bar,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
     let bin = ffmpeg_bin();
     tracing::info!(output = %output.display(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
-    let out = Command::new(&bin).args(args).output().map_err(|e| launch_err(&bin, e))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let mut tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+    // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
+    // `-stats_period` bounds how often, and thus the cancel-poll latency.
+    let mut child = Command::new(&bin)
+        .arg("-progress")
+        .arg("pipe:1")
+        .arg("-stats_period")
+        .arg("0.5")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| launch_err(&bin, e))?;
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut buf);
+        buf
+    });
+
+    let total = bar.total.max(1e-9);
+    let mut cancelled = false;
+    let stdout = child.stdout.take().expect("stdout piped");
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if line == "progress=end" {
+            break;
+        }
+        // `out_time_us` is the output timeline position in microseconds (printed
+        // as `N/A` before the first frame, which `parse` skips).
+        if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
+            let pass = (us.max(0) as f64 / 1_000_000.0 / total).clamp(0.0, 1.0);
+            let fraction = (bar.offset + bar.width * pass).clamp(0.0, 1.0);
+            let elapsed = bar.start.elapsed().as_secs_f64();
+            let eta = (fraction > 1e-3).then(|| elapsed * (1.0 - fraction) / fraction);
+            progress(ExportProgress { fraction, elapsed_secs: elapsed, eta_secs: eta });
+        }
+        if cancel() {
+            let _ = child.kill();
+            cancelled = true;
+            break;
+        }
+    }
+
+    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    if cancelled {
+        tracing::info!(output = %output.display(), "export cancelled");
+        return Ok(RenderStatus::Cancelled);
+    }
+    if !status.success() {
+        let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
         tail.reverse();
         let tail = tail.join("\n");
-        tracing::error!(status = %out.status, "ffmpeg export failed:\n{tail}");
-        return Err(Error::Engine(format!("ffmpeg exited with {}: {}", out.status, tail.trim())));
+        tracing::error!(status = %status, "ffmpeg export failed:\n{tail}");
+        return Err(Error::Engine(format!("ffmpeg exited with {}: {}", status, tail.trim())));
     }
     tracing::info!(output = %output.display(), "export complete");
-    Ok(())
+    Ok(RenderStatus::Completed)
 }
 
 /// The result of [`build_filter_complex`]: the `-filter_complex` string plus
