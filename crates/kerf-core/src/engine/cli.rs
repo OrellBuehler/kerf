@@ -1220,6 +1220,48 @@ pub fn build_export_args(timeline: &Timeline, assets: &[Asset], output_path: &st
     build_export_args_phase(timeline, assets, output_path, opts, PassPhase::Single, "", "")
 }
 
+/// Maps each timeline clip (in track-then-storage order, the flat indexing the
+/// graph and `fx` already use) onto an ffmpeg input, **deduplicating** clips that
+/// would emit byte-identical `-i` arguments — the same asset fast-seeked to the
+/// same point — so a source decoded for several clips (e.g. composited on two
+/// tracks, or a duplicated clip) is opened and decoded **once** and fanned out
+/// with `split`. Clips with *different* seeks deliberately stay separate: the
+/// per-input `-ss` already decodes only each one's kept region, and collapsing
+/// them would force decoding the whole span between the first and last cut. Still
+/// images are never shared (their input encodes a per-clip `-t` window).
+struct InputPlan {
+    /// The representative clip flat-index for each unique input, in `-i` order.
+    representatives: Vec<usize>,
+    /// Per clip flat-index → its unique input index (position in `representatives`).
+    clip_input: Vec<usize>,
+}
+
+fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPlan {
+    let image_of = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
+    let mut representatives: Vec<usize> = Vec::new();
+    let mut clip_input: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashMap<(uuid::Uuid, String), usize> = std::collections::HashMap::new();
+    for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+        let input = if image_of(clip.asset_id) {
+            let i = representatives.len();
+            representatives.push(flat);
+            i
+        } else {
+            let (start, _) = clip_source_window(clip, &fx[flat]);
+            // Key on the exact emitted seek string: two clips share an input iff
+            // their `-i` arguments (path is implied by asset_id) are identical.
+            let key = (clip.asset_id, format!("{}", clip_seek(start)));
+            *seen.entry(key).or_insert_with(|| {
+                let i = representatives.len();
+                representatives.push(flat);
+                i
+            })
+        };
+        clip_input.push(input);
+    }
+    InputPlan { representatives, clip_input }
+}
+
 /// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
 /// is the platform null device (`/dev/null` / `NUL`) used as the first-pass
 /// output, and `passlog` is the shared `-passlogfile` prefix — both injected by
@@ -1262,9 +1304,14 @@ fn build_export_args_phase(
     let fmt = export_format(timeline, assets, opts);
     let image_of = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
     let fx = transition_fx(timeline, assets);
-    for (i, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+    // Deduplicate inputs: clips whose `-i` args are identical (same asset, same
+    // fast-seek) share one decoded input, fanned out in the graph with `split`.
+    let plan = plan_inputs(timeline, assets, &fx);
+    let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
+    for &rep in &plan.representatives {
+        let clip = clips[rep];
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        let (start, end) = clip_source_window(clip, &fx[i]);
+        let (start, end) = clip_source_window(clip, &fx[rep]);
         if image_of(clip.asset_id) {
             // A still has no timeline of its own: loop the single frame and read it
             // for the clip's whole source window. The in-graph trim (with the seek
@@ -1297,7 +1344,7 @@ fn build_export_args_phase(
     }
 
     let total = timeline.duration();
-    let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio);
+    let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     if graph.has_video {
@@ -1798,6 +1845,7 @@ struct FilterGraph {
 /// a pad the caller won't `-map` (e.g. an mp3 export of a video timeline emits
 /// no `[outv]`). For a gif container the picture pad is routed through a
 /// `palettegen` / `paletteuse` pair and audio is always dropped.
+#[allow(clippy::too_many_arguments)]
 fn build_filter_complex(
     timeline: &Timeline,
     assets: &[Asset],
@@ -1806,6 +1854,7 @@ fn build_filter_complex(
     opts: &ExportOptions,
     want_video: bool,
     want_audio: bool,
+    plan: &InputPlan,
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| {
         assets
@@ -1824,20 +1873,25 @@ fn build_filter_complex(
     // composite in timeline order (a later clip on top of an earlier one's tail,
     // e.g. during a crossfade); tracks keep their list order so a later track
     // still composites on top.
-    let mut video: Vec<(usize, &crate::model::Clip)> = Vec::new();
-    let mut audio: Vec<(usize, &crate::model::Clip)> = Vec::new();
+    // Each entry is `(flat, input, clip)`: `flat` is the storage-order clip index
+    // (keys `fx` and the per-clip pad labels — unique per clip); `input` is the
+    // deduplicated ffmpeg input index (may be shared, so the `[input:v]` source is
+    // fanned out with `split` below).
+    let mut video: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
+    let mut audio: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
     let mut base = 0;
     for track in &timeline.tracks {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
         order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
         for &cj in &order {
             let clip = &track.clips[cj];
-            let i = base + cj; // storage-order input index
+            let flat = base + cj;
+            let input = plan.clip_input[flat];
             if track.kind == StreamKind::Video {
-                video.push((i, clip));
+                video.push((flat, input, clip));
             }
             if has_audio(clip) {
-                audio.push((i, clip));
+                audio.push((flat, input, clip));
             }
         }
         base += track.clips.len();
@@ -1847,11 +1901,47 @@ fn build_filter_complex(
     // fades), computed per track from each clip's `transition_in`.
     let fx = transition_fx(timeline, assets);
 
-    let mut chains: Vec<String> = Vec::new();
-
-    // ---- picture: black base + positioned overlays --------------------------
     let gif = opts.container == Container::Gif;
     let has_video = want_video && !video.is_empty();
+    let has_audio_out = want_audio && !audio.is_empty();
+
+    // How many clips consume each input as video / as audio. An input used by
+    // more than one must be fanned out with `split` / `asplit` — ffmpeg forbids
+    // reusing an input pad across filters. When nothing is shared (the common
+    // case) every count is ≤ 1 and no split is emitted, so the graph is identical.
+    let n_inputs = plan.representatives.len();
+    let mut vcount = vec![0usize; n_inputs];
+    let mut acount = vec![0usize; n_inputs];
+    for (_, input, _) in &video {
+        vcount[*input] += 1;
+    }
+    for (_, input, _) in &audio {
+        acount[*input] += 1;
+    }
+
+    let mut chains: Vec<String> = Vec::new();
+    if has_video {
+        for (i, &cnt) in vcount.iter().enumerate() {
+            if cnt > 1 {
+                let outs: String = (0..cnt).map(|k| format!("[vsp{i}_{k}]")).collect();
+                chains.push(format!("[{i}:v]split={cnt}{outs}"));
+            }
+        }
+    }
+    if has_audio_out {
+        for (i, &cnt) in acount.iter().enumerate() {
+            if cnt > 1 {
+                let outs: String = (0..cnt).map(|k| format!("[asp{i}_{k}]")).collect();
+                chains.push(format!("[{i}:a]asplit={cnt}{outs}"));
+            }
+        }
+    }
+    // A clip's source pad: its own input, or the next `split` output when that
+    // input is shared. `vnext`/`anext` hand out the split outputs in clip order.
+    let mut vnext = vec![0usize; n_inputs];
+    let mut anext = vec![0usize; n_inputs];
+
+    // ---- picture: black base + positioned overlays --------------------------
     if has_video {
         chains.push(format!(
             "color=c=black:s={w}x{h}:r={fps}:d={total},format={pf}[vbase]",
@@ -1866,10 +1956,17 @@ fn build_filter_complex(
         // produce the real `[outv]`; otherwise the last overlay is `[outv]`.
         let final_pad = if gif { "vcomp" } else { "outv" };
         let last = video.len() - 1;
-        for (n, (i, clip)) in video.iter().enumerate() {
-            chains.push(format!("[{i}:v]{chain}[v{i}]", i = i, chain = video_clip_chain(clip, fmt, &fx[*i], is_image(clip))));
+        for (n, (flat, input, clip)) in video.iter().enumerate() {
+            let src = if vcount[*input] > 1 {
+                let k = vnext[*input];
+                vnext[*input] += 1;
+                format!("vsp{input}_{k}")
+            } else {
+                format!("{input}:v")
+            };
+            chains.push(format!("[{src}]{chain}[v{flat}]", chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip))));
             let out = if n == last { final_pad.to_string() } else { format!("vov{n}") };
-            let end = clip.timeline_end() + fx[*i].tail;
+            let end = clip.timeline_end() + fx[*flat].tail;
             let overlay = if clip.transform.is_identity() {
                 format!("overlay=eof_action=pass:enable='between(t,{start},{end})'", start = clip.timeline_start)
             } else {
@@ -1882,7 +1979,7 @@ fn build_filter_complex(
                     start = clip.timeline_start,
                 )
             };
-            chains.push(format!("[{cur}][v{i}]{overlay}[{out}]"));
+            chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
             cur = out;
         }
         if gif {
@@ -1896,12 +1993,18 @@ fn build_filter_complex(
     }
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
-    let has_audio_out = want_audio && !audio.is_empty();
     if has_audio_out {
-        for (i, clip) in &audio {
-            chains.push(format!("[{i}:a]{chain}[a{i}]", i = i, chain = audio_clip_chain(clip, fmt, &fx[*i], layout)));
+        for (flat, input, clip) in &audio {
+            let src = if acount[*input] > 1 {
+                let k = anext[*input];
+                anext[*input] += 1;
+                format!("asp{input}_{k}")
+            } else {
+                format!("{input}:a")
+            };
+            chains.push(format!("[{src}]{chain}[a{flat}]", chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)));
         }
-        let inputs: String = audio.iter().map(|(i, _)| format!("[a{i}]")).collect();
+        let inputs: String = audio.iter().map(|(flat, _, _)| format!("[a{flat}]")).collect();
         chains.push(format!(
             "{inputs}amix=inputs={n}:normalize=0:dropout_transition=0[outa]",
             inputs = inputs,
@@ -2533,7 +2636,7 @@ mod tests {
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.sample_rate, 48_000);
 
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
         assert!(g.has_video && g.has_audio);
         let f = g.filter;
         // A black canvas spanning the whole timeline, then one positioned
@@ -2569,7 +2672,7 @@ mod tests {
             video_track(vec![make_clip(broll.id, 0.0, 6.0, 4.0)]), // overlaps 4..10
         ]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
         let f = g.filter;
         // Two overlays: B-roll (input 1) composites on top of the interview.
         assert_eq!(f.matches("overlay=eof_action=pass").count(), 2);
@@ -2587,7 +2690,7 @@ mod tests {
         let assets = vec![audio_asset.clone()];
         let timeline = timeline_of(vec![audio_track(vec![make_clip(audio_asset.id, 0.0, 10.0, 3.0)])]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true);
+        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
         assert!(!g.has_video);
         assert!(g.has_audio);
         // Positioned at 3s on the timeline via adelay; no picture canvas.
@@ -2605,7 +2708,7 @@ mod tests {
         let timeline = single(vec![clip]);
 
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true).filter;
+        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets))).filter;
         // Picture fades sit just before the pixel-format normalize.
         assert!(f.contains("fade=t=in:st=0:d=0.5,fade=t=out:st=9:d=1,format=yuv420p"));
         // Audio fades sit just before the audio-format normalize. The out fade
@@ -2619,7 +2722,7 @@ mod tests {
         let assets = vec![asset.clone()];
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true).filter;
+        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets))).filter;
         assert!(!f.contains("fade="), "no fade filter when fades are zero");
         assert!(!f.contains("afade="), "no afade filter when fades are zero");
     }
@@ -2958,7 +3061,17 @@ mod tests {
     }
 
     fn graph_of(timeline: &Timeline, assets: &[Asset]) -> String {
-        build_filter_complex(timeline, assets, &fmt_1080p(), timeline.duration(), &ExportOptions::default(), true, true).filter
+        build_filter_complex(
+            timeline,
+            assets,
+            &fmt_1080p(),
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(timeline, assets, &transition_fx(timeline, assets)),
+        )
+        .filter
     }
 
     #[test]
@@ -3357,6 +3470,39 @@ mod tests {
         // "none" is treated as software (no flag emitted).
         let none = args_of(&ExportOptions { hwaccel: Some("none".into()), ..Default::default() });
         assert!(!none.contains(&"-hwaccel".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_dedupes_identical_inputs_with_split() {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        // The same source window on two video tracks (e.g. a composite) must decode
+        // once: one `-i`, fanned out to both consumers with split / asplit.
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]),
+            video_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]),
+        ]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-i").count(), 1, "the shared source must be one input");
+        let f = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(f.contains("[0:v]split=2[vsp0_0][vsp0_1]"), "{f}");
+        assert!(f.contains("[0:a]asplit=2[asp0_0][asp0_1]"), "{f}");
+        // Each clip's chain reads its own fan-out pad — never the input pad twice.
+        assert!(f.contains("[vsp0_0]trim") && f.contains("[vsp0_1]trim"), "{f}");
+    }
+
+    #[test]
+    fn build_export_args_keeps_distinct_seeks_separate() {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        // Same asset but different source_in → different fast-seek: two inputs, no
+        // fan-out, so each still decodes only its own kept region.
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]),
+            video_track(vec![make_clip(asset.id, 10.0, 15.0, 0.0)]),
+        ]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-i").count(), 2);
+        let f = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(!f.contains("split="), "distinct seeks must not be fanned out: {f}");
     }
 
     #[test]
