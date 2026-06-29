@@ -446,6 +446,14 @@ impl Project {
         engine::waveform(Path::new(&asset.path), buckets, 8_000)
     }
 
+    /// Reduce an asset's first audio stream to `buckets` RMS magnitudes in
+    /// `0.0..=1.0` — a perceptual energy-over-time curve. Companion to
+    /// [`Self::waveform`] (which returns peaks); RMS better reflects loudness.
+    pub fn energy(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
+        let asset = self.require_asset(asset_id)?;
+        engine::energy_envelope(Path::new(&asset.path), buckets, 8_000)
+    }
+
     // ---- timeline ---------------------------------------------------------
 
     pub fn timeline(&self) -> Result<Timeline> {

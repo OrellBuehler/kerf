@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use super::cli::{command, ffmpeg_bin, launch_err};
+use super::cli::{command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use crate::error::{Error, Result};
 use crate::model::Loudness;
 
@@ -48,9 +48,49 @@ fn parse_loudness(stderr: &str) -> Option<Loudness> {
     })
 }
 
+// ---- energy / RMS envelope -------------------------------------------------
+
+/// Decode the first audio stream and reduce it to `buckets` RMS magnitudes in
+/// `0.0..=1.0` — a perceptual loudness-over-time curve. Peaks (see
+/// [`super::cli::waveform`]) overstate brief transients; RMS tracks how loud each
+/// slice actually feels, so an agent can match cut pacing to musical energy or
+/// find the quiet/loud passages. Same shape as the waveform so both render alike.
+pub fn energy_envelope(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
+    let samples = decode_audio_mono_f32(path, sample_rate)?;
+    Ok(rms_buckets(&samples, buckets.max(1)))
+}
+
+/// Root-mean-square magnitude per evenly divided bucket. Pure, so it is tested.
+fn rms_buckets(samples: &[f32], buckets: usize) -> Vec<f32> {
+    if samples.is_empty() {
+        return vec![0.0; buckets];
+    }
+    let mut out = Vec::with_capacity(buckets);
+    for b in 0..buckets {
+        let lo = b * samples.len() / buckets;
+        let hi = ((b + 1) * samples.len() / buckets).max(lo + 1).min(samples.len());
+        let sum_sq: f64 = samples[lo..hi].iter().map(|s| (*s as f64) * (*s as f64)).sum();
+        let rms = (sum_sq / (hi - lo) as f64).sqrt();
+        out.push((rms as f32).clamp(0.0, 1.0));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rms_buckets_have_requested_length_and_track_amplitude() {
+        // A constant-amplitude signal has RMS equal to that amplitude.
+        let samples = vec![0.5_f32; 1000];
+        let buckets = rms_buckets(&samples, 8);
+        assert_eq!(buckets.len(), 8);
+        for b in buckets {
+            assert!((b - 0.5).abs() < 1e-4, "constant 0.5 signal should give RMS 0.5, got {b}");
+        }
+        assert_eq!(rms_buckets(&[], 4), vec![0.0; 4]);
+    }
 
     #[test]
     fn parses_loudnorm_json_block() {

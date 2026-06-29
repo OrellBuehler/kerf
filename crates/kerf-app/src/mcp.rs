@@ -672,6 +672,16 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Get an RMS energy envelope (0.0–1.0 per bucket) for an asset's first audio stream — a perceptual loudness-over-time curve. Unlike the peak waveform, it tracks how loud each slice feels, so use it to find quiet/loud passages and match cut pacing to musical energy."
+    )]
+    fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.lock();
+        let energy = project.energy(id, p.buckets).map_err(core_err)?;
+        json(&energy)
+    }
+
+    #[tool(
         description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
     )]
     fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {

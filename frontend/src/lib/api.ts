@@ -713,6 +713,17 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 	return invoke<number[]>('get_waveform', { assetId, buckets });
 }
 
+export async function getEnergy(assetId: string, buckets: number): Promise<number[]> {
+	if (!inTauri()) {
+		// Synthetic but deterministic RMS-like curve for the browser demo.
+		return Array.from({ length: buckets }, (_, i) => {
+			const env = 0.4 + 0.4 * Math.sin(i * 0.11);
+			return Math.min(1, Math.max(0.05, env));
+		});
+	}
+	return invoke<number[]>('get_energy', { assetId, buckets });
+}
+
 // ---- export ----------------------------------------------------------------
 
 export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<string> {

@@ -444,6 +444,12 @@ fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) ->
     state.project()?.waveform(id, buckets).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
+    let id = id(&asset_id)?;
+    state.project()?.energy(id, buckets).map_err(|e| e.to_string())
+}
+
 // ---- agent task queue (mutations return the refreshed queue) ---------------
 
 #[tauri::command]
@@ -704,6 +710,7 @@ pub fn run() {
             revert_to,
             get_frame,
             get_waveform,
+            get_energy,
             list_tasks,
             add_task,
             resolve_task,
