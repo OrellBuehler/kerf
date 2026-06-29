@@ -180,6 +180,7 @@ export interface ExportOptions {
 	tune?: string | null;
 	profile_v?: string | null;
 	pix_fmt?: string | null;
+	hwaccel?: string | null;
 	resolution?: [number, number] | null;
 	fps?: number | null;
 	scaler?: string | null;

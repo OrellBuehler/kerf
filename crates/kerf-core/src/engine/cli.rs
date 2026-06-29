@@ -668,11 +668,23 @@ impl Container {
         matches!(self, Self::Gif)
     }
     pub fn video_codecs(self) -> &'static [&'static str] {
+        // Hardware encoders sit alongside the software ones — they emit the same
+        // h264 / hevc / av1 bitstreams, so a container accepts a codec's HW
+        // variants wherever it accepts the software one.
         match self {
-            Self::Mp4 => &["libx264", "libx265", "libsvtav1"],
-            Self::Mov => &["prores_ks", "libx264", "libx265"],
-            Self::Mkv => &["libx264", "libx265", "libvpx-vp9", "libsvtav1"],
-            Self::Webm => &["libvpx-vp9", "libsvtav1"],
+            Self::Mp4 => &[
+                "libx264", "libx265", "libsvtav1", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv", "hevc_qsv",
+                "av1_qsv", "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+            ],
+            Self::Mov => &[
+                "prores_ks", "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv",
+                "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+            ],
+            Self::Mkv => &[
+                "libx264", "libx265", "libvpx-vp9", "libsvtav1", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv",
+                "hevc_qsv", "av1_qsv", "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+            ],
+            Self::Webm => &["libvpx-vp9", "libsvtav1", "av1_nvenc", "av1_qsv"],
             Self::Gif => &["gif"],
             _ => &[],
         }
@@ -768,6 +780,13 @@ pub struct ExportOptions {
     /// keeps the yuv420p path. yuv420p requires even dimensions.
     pub pix_fmt: Option<String>,
 
+    /// `-hwaccel` for input **decode** on export ("auto", "cuda", "vaapi",
+    /// "videotoolbox", "qsv", "d3d11va", …). `None` / "none" decodes in software
+    /// (the default, byte-for-byte as before). Independent of the encoder: GPU
+    /// decode composes with a software encode. Frames are downloaded to system
+    /// memory (no `-hwaccel_output_format`) so the CPU filtergraph still runs.
+    pub hwaccel: Option<String>,
+
     /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
     /// Output fps, baked into the filtergraph; never emits `-r`.
@@ -813,6 +832,7 @@ impl Default for ExportOptions {
             tune: None,
             profile_v: None,
             pix_fmt: None,
+            hwaccel: None,
             resolution: None,
             fps: None,
             scaler: None,
@@ -855,6 +875,53 @@ fn video_tunes(vc: &str) -> &'static [&'static str] {
     }
 }
 
+/// The hardware-encoder family a `-c:v` value belongs to, read from its ffmpeg
+/// suffix. Software encoders (libx264 / libx265 / libsvtav1 / libvpx-vp9) and
+/// the prores / gif pipelines are [`EncFamily::Software`]. The family decides how
+/// the constant-quality knob, VBV caps and speed preset are spelled — each HW
+/// encoder names the same intent differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncFamily {
+    Software,
+    Nvenc,
+    Qsv,
+    VideoToolbox,
+    Amf,
+}
+
+fn enc_family(vc: &str) -> EncFamily {
+    if vc.ends_with("_nvenc") {
+        EncFamily::Nvenc
+    } else if vc.ends_with("_qsv") {
+        EncFamily::Qsv
+    } else if vc.ends_with("_videotoolbox") {
+        EncFamily::VideoToolbox
+    } else if vc.ends_with("_amf") {
+        EncFamily::Amf
+    } else {
+        EncFamily::Software
+    }
+}
+
+/// Whether `vc` produces an H.264 bitstream (software or any HW family).
+fn is_h264(vc: &str) -> bool {
+    vc == "libx264" || vc.starts_with("h264_")
+}
+
+/// Whether `vc` produces an HEVC bitstream (software or any HW family) — these
+/// need the `hvc1` tag in mp4 / mov so QuickTime / iOS will play them.
+fn is_hevc(vc: &str) -> bool {
+    vc == "libx265" || vc.starts_with("hevc_")
+}
+
+/// Map a 0..51 CRF (lower = better) onto VideoToolbox's 1..100 constant-quality
+/// scale (higher = better). VideoToolbox has no CRF; this preserves the intent
+/// so the same `crf` field drives every encoder.
+fn crf_to_vt_quality(crf: u32) -> u32 {
+    let crf = crf.min(51) as f64;
+    (((1.0 - crf / 51.0) * 100.0).round() as u32).clamp(1, 100)
+}
+
 /// Validate an option set against the timeline's available streams, returning a
 /// list of human-readable problems (empty = OK). Pure; called by the pre-launch
 /// guard in [`render_with`] and mirrored client-side by the export dialog.
@@ -882,6 +949,11 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
         let rate_mode = !matches!(opts.video_codec.as_deref(), Some("prores_ks") | Some("gif"));
         if rate_mode && matches!(opts.rate_control, RateControl::Bitrate | RateControl::TwoPass) && opts.video_bitrate.is_none() {
             issues.push("A target video bitrate is required for bitrate / two-pass.".to_string());
+        }
+        if let Some(vc) = opts.video_codec.as_deref() {
+            if matches!(opts.rate_control, RateControl::TwoPass) && enc_family(vc) != EncFamily::Software {
+                issues.push(format!("Two-pass encoding isn't supported for hardware encoder {vc}; use crf or bitrate."));
+            }
         }
         if let (Some(vc), Some(t)) = (opts.video_codec.as_deref(), opts.tune.as_deref()) {
             if matches!(vc, "libx264" | "libx265") && !t.is_empty() && !video_tunes(vc).contains(&t) {
@@ -1105,6 +1177,15 @@ fn build_export_args_phase(
             args.push("-t".to_string());
             args.push(format!("{}", end.max(1.0 / fmt.fps)));
         } else {
+            // Hardware-accelerated decode for this input when requested. `-hwaccel`
+            // is an input option (applies to the next `-i`), so it's emitted
+            // per-input and only for real media — a still gains nothing. Frames
+            // are downloaded to system memory (no `-hwaccel_output_format`), so the
+            // per-input `-ss` fast-seek and the CPU filtergraph still work.
+            if let Some(hw) = opts.hwaccel.as_deref().filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none")) {
+                args.push("-hwaccel".to_string());
+                args.push(hw.to_string());
+            }
             let seek = clip_seek(start);
             if seek > 0.0 {
                 args.push("-ss".to_string());
@@ -1214,32 +1295,81 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
         return;
     }
 
+    let fam = enc_family(vc);
+
+    // ---- rate control / quality (spelled per encoder family) ----
     match opts.rate_control {
-        RateControl::Crf => {
-            if let Some(n) = opts.crf {
-                args.push("-crf".to_string());
-                args.push(n.to_string());
+        RateControl::Crf => match fam {
+            EncFamily::Software => {
+                if let Some(n) = opts.crf {
+                    args.push("-crf".to_string());
+                    args.push(n.to_string());
+                }
+                // VP9 constant-quality requires -crf paired with -b:v 0.
+                if vc == "libvpx-vp9" {
+                    args.push("-b:v".to_string());
+                    args.push("0".to_string());
+                }
             }
-            // VP9 constant-quality requires -crf paired with -b:v 0.
-            if vc == "libvpx-vp9" {
+            // NVENC: VBR steered by a constant-quality target (`-cq`), with no
+            // average-bitrate target so quality (not size) drives the encode.
+            EncFamily::Nvenc => {
+                args.push("-rc".to_string());
+                args.push("vbr".to_string());
+                if let Some(n) = opts.crf {
+                    args.push("-cq".to_string());
+                    args.push(n.to_string());
+                }
                 args.push("-b:v".to_string());
                 args.push("0".to_string());
             }
-        }
+            // QSV: `-global_quality` is its CRF analogue (ICQ mode).
+            EncFamily::Qsv => {
+                if let Some(n) = opts.crf {
+                    args.push("-global_quality".to_string());
+                    args.push(n.to_string());
+                }
+            }
+            // VideoToolbox has no CRF — map onto its 1..100 quality scale.
+            EncFamily::VideoToolbox => {
+                if let Some(n) = opts.crf {
+                    args.push("-q:v".to_string());
+                    args.push(crf_to_vt_quality(n).to_string());
+                }
+            }
+            // AMF: constant QP.
+            EncFamily::Amf => {
+                args.push("-rc".to_string());
+                args.push("cqp".to_string());
+                if let Some(n) = opts.crf {
+                    let qp = n.to_string();
+                    args.push("-qp_i".to_string());
+                    args.push(qp.clone());
+                    args.push("-qp_p".to_string());
+                    args.push(qp);
+                }
+            }
+        },
         RateControl::Bitrate => {
             if let Some(b) = &opts.video_bitrate {
                 args.push("-b:v".to_string());
                 args.push(b.clone());
             }
-            if let Some(m) = &opts.max_rate {
-                args.push("-maxrate".to_string());
-                args.push(m.clone());
-            }
-            if let Some(b) = &opts.buf_size {
-                args.push("-bufsize".to_string());
-                args.push(b.clone());
+            // VBV caps: x264 / x265 and NVENC honour -maxrate/-bufsize; the other
+            // HW families ignore or reject them, so only emit where they apply.
+            if matches!(fam, EncFamily::Software | EncFamily::Nvenc) {
+                if let Some(m) = &opts.max_rate {
+                    args.push("-maxrate".to_string());
+                    args.push(m.clone());
+                }
+                if let Some(b) = &opts.buf_size {
+                    args.push("-bufsize".to_string());
+                    args.push(b.clone());
+                }
             }
         }
+        // Two-pass is gated to software encoders (validate_export rejects it for
+        // HW families, whose multi-pass uses different flags).
         RateControl::TwoPass => {
             if let Some(b) = &opts.video_bitrate {
                 args.push("-b:v".to_string());
@@ -1252,52 +1382,93 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
                 args.push(passlog.to_string());
             }
         }
-        RateControl::Lossless => match vc {
-            "libx264" | "libx265" | "libsvtav1" => {
-                args.push("-crf".to_string());
+        RateControl::Lossless => match fam {
+            EncFamily::Software => match vc {
+                "libx264" | "libx265" | "libsvtav1" => {
+                    args.push("-crf".to_string());
+                    args.push("0".to_string());
+                }
+                "libvpx-vp9" => {
+                    args.push("-lossless".to_string());
+                    args.push("1".to_string());
+                }
+                _ => {}
+            },
+            // The extreme of each HW family's quality knob (visually lossless,
+            // not necessarily bit-exact).
+            EncFamily::Nvenc => {
+                args.push("-rc".to_string());
+                args.push("constqp".to_string());
+                args.push("-qp".to_string());
                 args.push("0".to_string());
             }
+            EncFamily::Qsv => {
+                args.push("-global_quality".to_string());
+                args.push("1".to_string());
+            }
+            EncFamily::VideoToolbox => {
+                args.push("-q:v".to_string());
+                args.push("100".to_string());
+            }
+            EncFamily::Amf => {
+                args.push("-rc".to_string());
+                args.push("cqp".to_string());
+                args.push("-qp_i".to_string());
+                args.push("0".to_string());
+                args.push("-qp_p".to_string());
+                args.push("0".to_string());
+            }
+        },
+    }
+
+    // ---- speed preset ----
+    match fam {
+        EncFamily::Software => match vc {
+            // Named for x264 / x265 / svt-av1, -cpu-used for libvpx-vp9.
+            "libx264" | "libx265" | "libsvtav1" => {
+                if let Some(p) = &opts.preset {
+                    args.push("-preset".to_string());
+                    args.push(p.clone());
+                }
+            }
             "libvpx-vp9" => {
-                args.push("-lossless".to_string());
+                args.push("-cpu-used".to_string());
+                args.push(opts.preset.clone().unwrap_or_else(|| "4".to_string()));
+                args.push("-deadline".to_string());
+                args.push("good".to_string());
+                args.push("-row-mt".to_string());
                 args.push("1".to_string());
             }
             _ => {}
         },
-    }
-
-    // Speed preset: named for x264/x265/svt-av1, -cpu-used for libvpx-vp9.
-    match vc {
-        "libx264" | "libx265" | "libsvtav1" => {
+        // NVENC (p1..p7 / named) and QSV (veryfast..veryslow) take `-preset`.
+        EncFamily::Nvenc | EncFamily::Qsv => {
             if let Some(p) = &opts.preset {
                 args.push("-preset".to_string());
                 args.push(p.clone());
             }
         }
-        "libvpx-vp9" => {
-            args.push("-cpu-used".to_string());
-            args.push(opts.preset.clone().unwrap_or_else(|| "4".to_string()));
-            args.push("-deadline".to_string());
-            args.push("good".to_string());
-            args.push("-row-mt".to_string());
-            args.push("1".to_string());
-        }
-        _ => {}
+        // VideoToolbox / AMF have no `-preset` knob in this shape.
+        EncFamily::VideoToolbox | EncFamily::Amf => {}
     }
 
+    // -tune: software x264 / x265 only. Emit only a tune the encoder accepts
+    // (x265 lacks film/stillimage) so a stale value never fails encoder open.
     if matches!(vc, "libx264" | "libx265") {
-        // Only emit a tune the encoder actually accepts (x265 lacks film/stillimage)
-        // so a stale value never makes ffmpeg fail to open the encoder.
         if let Some(t) = opts.tune.as_deref().filter(|t| video_tunes(vc).contains(t)) {
             args.push("-tune".to_string());
             args.push(t.to_string());
         }
+    }
+    // -profile:v applies to every h264 / hevc encoder (software and hardware).
+    if is_h264(vc) || is_hevc(vc) {
         if let Some(p) = &opts.profile_v {
             args.push("-profile:v".to_string());
             args.push(p.clone());
         }
     }
     // HEVC in mp4/mov needs the hvc1 tag or QuickTime / iOS refuse to play it.
-    if vc == "libx265" && matches!(opts.container, Container::Mp4 | Container::Mov) {
+    if is_hevc(vc) && matches!(opts.container, Container::Mp4 | Container::Mov) {
         args.push("-tag:v".to_string());
         args.push("hvc1".to_string());
     }
@@ -1371,7 +1542,7 @@ pub fn render_with_progress(
     let two_pass = matches!(opts.rate_control, RateControl::TwoPass)
         && has_video
         && !opts.container.is_audio_only()
-        && matches!(opts.video_codec.as_deref(), Some(vc) if vc != "prores_ks" && vc != "gif");
+        && matches!(opts.video_codec.as_deref(), Some(vc) if vc != "prores_ks" && vc != "gif" && enc_family(vc) == EncFamily::Software);
 
     let total = timeline.duration();
     let start = std::time::Instant::now();
@@ -2980,6 +3151,93 @@ mod tests {
         assert_eq!(flag_val(&args, "-b:v"), Some("0"));
         assert_eq!(flag_val(&args, "-cpu-used"), Some("4"));
         assert!(!args.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn build_export_args_nvenc_crf_uses_cq_not_crf() {
+        let opts = ExportOptions {
+            video_codec: Some("h264_nvenc".into()),
+            crf: Some(20),
+            preset: Some("p5".into()),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert_eq!(flag_val(&args, "-c:v"), Some("h264_nvenc"));
+        // NVENC: VBR steered by -cq with -b:v 0; never the software -crf.
+        assert!(!args.contains(&"-crf".to_string()));
+        assert_eq!(flag_val(&args, "-rc"), Some("vbr"));
+        assert_eq!(flag_val(&args, "-cq"), Some("20"));
+        assert_eq!(flag_val(&args, "-b:v"), Some("0"));
+        assert_eq!(flag_val(&args, "-preset"), Some("p5"));
+    }
+
+    #[test]
+    fn build_export_args_qsv_crf_uses_global_quality() {
+        let opts = ExportOptions {
+            video_codec: Some("h264_qsv".into()),
+            crf: Some(23),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert!(!args.contains(&"-crf".to_string()));
+        assert_eq!(flag_val(&args, "-global_quality"), Some("23"));
+    }
+
+    #[test]
+    fn build_export_args_videotoolbox_crf_maps_to_quality() {
+        let opts = ExportOptions {
+            video_codec: Some("h264_videotoolbox".into()),
+            crf: Some(23),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        assert!(!args.contains(&"-crf".to_string()));
+        // crf 23 → round((1 - 23/51) * 100) = 55 on the 1..100 scale.
+        assert_eq!(flag_val(&args, "-q:v"), Some("55"));
+        assert!(!args.contains(&"-preset".to_string()), "videotoolbox has no -preset");
+    }
+
+    #[test]
+    fn build_export_args_hevc_hw_gets_hvc1_tag() {
+        let opts = ExportOptions {
+            video_codec: Some("hevc_nvenc".into()),
+            crf: Some(24),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        // The hvc1 tag must follow HEVC into mp4 for every encoder, not just libx265.
+        assert_eq!(flag_val(&args, "-tag:v"), Some("hvc1"));
+    }
+
+    #[test]
+    fn build_export_args_hwaccel_decode_is_per_input_and_opt_in() {
+        // Default: no -hwaccel at all (byte-for-byte legacy decode).
+        let plain = args_of(&ExportOptions::default());
+        assert!(!plain.contains(&"-hwaccel".to_string()));
+
+        let opts = ExportOptions { hwaccel: Some("cuda".into()), ..Default::default() };
+        let args = args_of(&opts);
+        assert_eq!(flag_val(&args, "-hwaccel"), Some("cuda"));
+        // It's an input option: must precede the `-i` it accelerates.
+        let hw = args.iter().position(|a| a == "-hwaccel").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(hw < input);
+
+        // "none" is treated as software (no flag emitted).
+        let none = args_of(&ExportOptions { hwaccel: Some("none".into()), ..Default::default() });
+        assert!(!none.contains(&"-hwaccel".to_string()));
+    }
+
+    #[test]
+    fn validate_export_rejects_two_pass_for_hardware_encoders() {
+        let opts = ExportOptions {
+            video_codec: Some("h264_nvenc".into()),
+            rate_control: RateControl::TwoPass,
+            video_bitrate: Some("8M".into()),
+            ..Default::default()
+        };
+        let issues = validate_export(&opts, true, true);
+        assert!(issues.iter().any(|i| i.contains("Two-pass")), "{issues:?}");
     }
 
     #[test]

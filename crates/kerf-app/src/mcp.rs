@@ -215,10 +215,14 @@ struct ExportParams {
     #[schemars(
         description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
                        Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
-                       (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif); audio_codec \
-                       (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); rate_control \
-                       (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); preset; \
-                       resolution ([w,h]); fps; audio_bitrate (\"192k\"); include_audio; faststart."
+                       (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif, plus GPU encoders \
+                       h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/h264_videotoolbox/\
+                       hevc_videotoolbox/h264_amf/hevc_amf — far faster, crf still applies); \
+                       audio_codec (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); \
+                       rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
+                       preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
+                       decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
+                       (\"192k\"); include_audio; faststart."
     )]
     #[serde(default)]
     options: Option<ExportOptions>,
