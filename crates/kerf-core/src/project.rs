@@ -360,9 +360,18 @@ impl Project {
     /// wide. Smaller than [`frame_at`]'s PNG — for handing the frame to an LLM.
     pub fn frame_jpeg(&self, asset_id: Uuid, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_preview_frame(&asset, time_secs, max_width, quality, true)
+    }
+
+    /// Decode a preview frame for an already-resolved [`Asset`] as JPEG bytes,
+    /// *without* needing `&self` — so the caller can release the project lock
+    /// before the (potentially slow) ffmpeg decode runs, instead of freezing
+    /// every other project op for its duration. `accurate = false` snaps to the
+    /// nearest keyframe for fast scrubbing; a still decodes its one frame at t=0.
+    pub fn decode_preview_frame(asset: &Asset, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
         // A still image has one frame at t=0; seeking past it decodes nothing.
         let time_secs = if asset.is_image() { 0.0 } else { time_secs };
-        engine::frame_jpeg(Path::new(&asset.path), time_secs, max_width, quality)
+        engine::frame_jpeg(Path::new(&asset.path), time_secs, max_width, quality, accurate)
     }
 
     /// Build a `columns`×`rows` contact sheet of an asset — frames sampled evenly

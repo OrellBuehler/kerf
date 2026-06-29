@@ -67,6 +67,18 @@ fn ffprobe_bin() -> String {
     std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
 }
 
+/// The decode hardware-acceleration to request for preview frames. Defaults to
+/// ffmpeg's `auto` (D3D11VA on Windows, VAAPI / VideoToolbox elsewhere; falls
+/// back to software when none is usable), which offloads 4K decode off the CPU.
+/// Set `KERF_HWACCEL=none` (or empty) to force software decoding.
+fn hwaccel() -> Option<String> {
+    match std::env::var("KERF_HWACCEL") {
+        Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("none") => None,
+        Ok(v) => Some(v),
+        Err(_) => Some("auto".to_string()),
+    }
+}
+
 fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
 }
@@ -294,35 +306,47 @@ fn field_after(line: &str, key: &str) -> Option<f64> {
 /// at most `max_width` pixels wide.
 pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "png", None)
+    decode_frame(path, time_secs, &scale, "png", None, true)
 }
 
 /// Decode a single frame at `time_secs` as **JPEG** bytes, scaled to at most
 /// `max_width` pixels wide, at `quality` (ffmpeg `-q:v`, 2 = best … 31 = worst).
 /// JPEG is dramatically smaller than the PNG of [`frame_at`], which matters when
 /// the frame is handed to an LLM as an image content block rather than rendered
-/// in the GUI.
-pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
+/// in the GUI. `accurate = false` snaps to the nearest keyframe (fast scrubbing);
+/// see [`decode_frame`].
+pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality))
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate)
 }
 
 /// Seek to `time_secs`, run the `-vf` chain on a single frame and pipe it out in
 /// the given image codec (`png` / `mjpeg`); `quality`, when set, becomes `-q:v`.
-/// Shared by [`frame_at`] and [`frame_jpeg`]. `-ss` is input-side (fast,
-/// keyframe-accurate) as for the preview path.
-fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>) -> Result<Vec<u8>> {
+/// Shared by [`frame_at`] and [`frame_jpeg`]. `-ss` is input-side (fast). With
+/// `accurate` ffmpeg decodes forward from the keyframe to the exact frame; with
+/// `accurate = false` it snaps to the keyframe (`-noaccurate_seek`, no forward
+/// decode) — tens of ms even on long-GOP 4K, for responsive scrubbing. Decode is
+/// hardware-accelerated per [`hwaccel`].
+fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>, accurate: bool) -> Result<Vec<u8>> {
     let time_secs = time_secs.max(0.0);
     // Cache key captures everything that determines the bytes (path, time,
-    // filter — which includes the target width — codec and quality).
-    let key = format!("{}|{:.3}|{vf}|{vcodec}|{quality:?}", path.display(), time_secs);
+    // filter — which includes the target width — codec, quality and whether the
+    // seek was exact or keyframe-snapped).
+    let key = format!("{}|{:.3}|{vf}|{vcodec}|{quality:?}|{accurate}", path.display(), time_secs);
     if let Some(hit) = frame_cache().lock().ok().and_then(|mut c| c.get(&key)) {
         return Ok(hit);
     }
 
     let bin = ffmpeg_bin();
     let mut cmd = command(&bin);
-    cmd.args(["-hide_banner", "-loglevel", "error", "-ss"])
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if let Some(hw) = hwaccel() {
+        cmd.args(["-hwaccel", hw.as_str()]);
+    }
+    if !accurate {
+        cmd.arg("-noaccurate_seek");
+    }
+    cmd.arg("-ss")
         .arg(format!("{time_secs:.3}"))
         .arg("-i")
         .arg(path)

@@ -677,10 +677,19 @@ export async function removeTask(taskId: string): Promise<Task[]> {
 
 // ---- media (preview frames, waveforms) -------------------------------------
 
-/** A PNG `data:` URL for one decoded frame, or `null` outside the desktop app. */
-export async function getFrame(assetId: string, timeSecs: number, maxWidth = 960): Promise<string | null> {
+/**
+ * A JPEG `data:` URL for one decoded frame, or `null` outside the desktop app.
+ * `accurate = false` returns a fast keyframe-snapped frame (for scrubbing); the
+ * exact frame is fetched once the playhead settles.
+ */
+export async function getFrame(
+	assetId: string,
+	timeSecs: number,
+	maxWidth = 960,
+	accurate = true
+): Promise<string | null> {
 	if (!inTauri()) return null;
-	return invoke<string>('get_frame', { assetId, timeSecs, maxWidth });
+	return invoke<string>('get_frame', { assetId, timeSecs, maxWidth, accurate });
 }
 
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {

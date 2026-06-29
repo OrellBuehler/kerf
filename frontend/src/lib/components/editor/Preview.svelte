@@ -48,50 +48,57 @@
 	}
 
 	let frameUrl = $state<string | null>(null);
-	let token = 0;
-	let lastFetchAt = 0;
-	let pending: ReturnType<typeof setTimeout> | null = null;
+	let inFlight = false;
+	let queued: { assetId: string; srcTime: number; accurate: boolean } | null = null;
+	let settle: ReturnType<typeof setTimeout> | null = null;
 
-	function fetchFrame(assetId: string, srcTime: number) {
-		const mine = ++token;
-		lastFetchAt = performance.now();
-		getFrame(assetId, srcTime)
-			.then((url) => {
-				// Only apply the freshest request, so out-of-order decodes don't flash
-				// a stale frame (frames are cached backend-side, so replays are cheap).
-				if (mine === token && url) frameUrl = url;
-			})
-			.catch(() => {});
+	// Single-flight decode: only ever one frame request in flight, and `queued`
+	// always holds the *latest* wanted frame. Scrubbing collapses to one decode +
+	// one pending target instead of a backlog of stale frames that must all drain
+	// before the frame under the cursor appears (the cause of multi-second lag).
+	async function pump() {
+		if (inFlight || !queued) return;
+		const { assetId, srcTime, accurate } = queued;
+		queued = null;
+		inFlight = true;
+		try {
+			const url = await getFrame(assetId, srcTime, 960, accurate);
+			if (url) frameUrl = url;
+		} catch {
+			/* ignore decode errors — keep the last good frame */
+		}
+		inFlight = false;
+		if (queued) pump(); // a newer target arrived mid-decode — go to the latest
 	}
 
-	// Keep the preview frame in step with the playhead. A leading-edge throttle
-	// caps how often we decode: during playback it updates the image a few times
-	// a second (a moving preview), and a trailing call lands the exact frame once
-	// scrubbing settles. (Desktop only — getFrame returns null in the browser.)
+	// Keep the preview frame in step with the playhead. While it moves (scrub or
+	// playback) we request a *rough* keyframe-snapped frame — fast even on long-GOP
+	// 4K. Once it settles (no change for ~150ms, and not mid-playback) we request
+	// the exact frame to correct the snap. (Desktop only — getFrame is null in browser.)
 	$effect(() => {
 		const target = atPlayhead;
+		if (settle) {
+			clearTimeout(settle);
+			settle = null;
+		}
 		if (!target) {
 			frameUrl = null;
+			queued = null;
 			return;
 		}
-		const throttle = ui.playing ? 130 : 70;
-		const since = performance.now() - lastFetchAt;
-		if (pending) {
-			clearTimeout(pending);
-			pending = null;
-		}
-		if (since >= throttle) {
-			fetchFrame(target.assetId, target.srcTime);
-		} else {
-			pending = setTimeout(() => {
-				pending = null;
-				fetchFrame(target.assetId, target.srcTime);
-			}, throttle - since);
+		queued = { assetId: target.assetId, srcTime: target.srcTime, accurate: false };
+		pump();
+		if (!ui.playing) {
+			settle = setTimeout(() => {
+				settle = null;
+				queued = { assetId: target.assetId, srcTime: target.srcTime, accurate: true };
+				pump();
+			}, 150);
 		}
 		return () => {
-			if (pending) {
-				clearTimeout(pending);
-				pending = null;
+			if (settle) {
+				clearTimeout(settle);
+				settle = null;
 			}
 		};
 	});

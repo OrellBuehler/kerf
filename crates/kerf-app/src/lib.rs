@@ -382,14 +382,23 @@ fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
-fn get_frame(state: State<'_, AppState>, asset_id: String, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
+fn get_frame(
+    state: State<'_, AppState>,
+    asset_id: String,
+    time_secs: f64,
+    max_width: Option<u32>,
+    accurate: Option<bool>,
+) -> CmdResult<String> {
     let id = id(&asset_id)?;
+    // Resolve the asset under the lock, then *drop the guard* before decoding: the
+    // ffmpeg run must not hold the shared Project mutex for its whole duration, or
+    // it freezes every other op (timeline edits, MCP, the next scrub frame).
+    let asset = state.project()?.require_asset(id).map_err(|e| e.to_string())?;
     // JPEG rather than PNG: the preview pane never needs lossless frames, and a
     // q=4 JPEG is ~5–10× smaller to encode and ship over IPC — which matters now
-    // that the preview fetches frames continuously during playback.
-    let jpeg = state
-        .project()?
-        .frame_jpeg(id, time_secs, max_width.unwrap_or(960), 4)
+    // that the preview fetches frames continuously during playback. `accurate`
+    // is false for rough scrub frames (keyframe-snap), true for the settled frame.
+    let jpeg = Project::decode_preview_frame(&asset, time_secs, max_width.unwrap_or(960), 4, accurate.unwrap_or(true))
         .map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
     Ok(format!("data:image/jpeg;base64,{b64}"))
