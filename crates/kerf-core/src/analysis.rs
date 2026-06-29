@@ -5,7 +5,7 @@
 //! be swapped in without touching the rest of the core.
 
 use crate::error::Result;
-use crate::model::{Asset, AssetAnalysis, Loudness, Tempo, TimeRange, TranscriptSegment};
+use crate::model::{Asset, AssetAnalysis, AudioClassification, Loudness, Tempo, TimeRange, TranscriptSegment};
 
 /// Detects silent spans in an asset's audio.
 pub trait SilenceDetector: Send + Sync {
@@ -37,6 +37,12 @@ pub trait OnsetDetector: Send + Sync {
 /// usable rhythm).
 pub trait TempoDetector: Send + Sync {
     fn detect_tempo(&self, asset: &Asset) -> Result<Option<Tempo>>;
+}
+
+/// Classifies an asset's audio as speech / music / mixed (`None` for silent /
+/// video-only assets).
+pub trait AudioClassifier: Send + Sync {
+    fn classify(&self, asset: &Asset) -> Result<Option<AudioClassification>>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -129,6 +135,19 @@ impl TempoDetector for FfmpegTempoDetector {
             return Ok(None);
         }
         crate::engine::detect_tempo(std::path::Path::new(&asset.path))
+    }
+}
+
+/// Speech/music classification by light DSP on PCM decoded with the `ffmpeg`
+/// binary, so no dev libraries are required.
+pub struct HeuristicAudioClassifier;
+
+impl AudioClassifier for HeuristicAudioClassifier {
+    fn classify(&self, asset: &Asset) -> Result<Option<AudioClassification>> {
+        if !asset.has_audio() {
+            return Ok(None);
+        }
+        crate::engine::classify_audio(std::path::Path::new(&asset.path))
     }
 }
 
@@ -229,6 +248,12 @@ impl TempoDetector for NullAnalyzer {
     }
 }
 
+impl AudioClassifier for NullAnalyzer {
+    fn classify(&self, _asset: &Asset) -> Result<Option<AudioClassification>> {
+        Ok(None)
+    }
+}
+
 /// A bundle of analysis providers to run against an asset.
 pub struct AnalysisProviders<'a> {
     pub silence: &'a dyn SilenceDetector,
@@ -237,6 +262,7 @@ pub struct AnalysisProviders<'a> {
     pub loudness: &'a dyn LoudnessAnalyzer,
     pub onset: &'a dyn OnsetDetector,
     pub tempo: &'a dyn TempoDetector,
+    pub classifier: &'a dyn AudioClassifier,
 }
 
 impl<'a> AnalysisProviders<'a> {
@@ -249,6 +275,7 @@ impl<'a> AnalysisProviders<'a> {
             loudness: null,
             onset: null,
             tempo: null,
+            classifier: null,
         }
     }
 }
@@ -267,6 +294,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
     let loudness = FfmpegLoudnessAnalyzer;
     let onset = FfmpegOnsetDetector::default();
     let tempo = FfmpegTempoDetector;
+    let classifier = HeuristicAudioClassifier;
     let null = NullAnalyzer;
 
     #[cfg(feature = "whisper")]
@@ -289,6 +317,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
         loudness: &loudness,
         onset: &onset,
         tempo: &tempo,
+        classifier: &classifier,
     };
     analyze(asset, &providers)
 }
@@ -303,5 +332,6 @@ pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnal
         loudness: providers.loudness.measure(asset)?,
         onsets: providers.onset.detect_onsets(asset)?,
         tempo: providers.tempo.detect_tempo(asset)?,
+        audio_class: providers.classifier.classify(asset)?,
     })
 }

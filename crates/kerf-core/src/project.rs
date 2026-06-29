@@ -1353,6 +1353,10 @@ impl Project {
                 beats: vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
                 confidence: 0.62,
             }),
+            audio_class: Some(crate::model::AudioClassification {
+                class: crate::model::AudioClass::Speech,
+                confidence: 0.71,
+            }),
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.

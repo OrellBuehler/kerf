@@ -110,6 +110,28 @@ pub struct Loudness {
     pub threshold_lufs: f64,
 }
 
+/// Coarse content class of an asset's audio. Heuristic (energy continuity +
+/// zero-crossing-rate variability), so it is a hint, not a trained classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioClass {
+    /// Predominantly spoken word (gappy energy, variable ZCR).
+    Speech,
+    /// Predominantly music (continuous energy, steady ZCR).
+    Music,
+    /// Both present (e.g. dialogue over a music bed).
+    Mixed,
+    /// Could not be determined.
+    Unknown,
+}
+
+/// An [`AudioClass`] verdict with a confidence in 0.0–1.0.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AudioClassification {
+    pub class: AudioClass,
+    pub confidence: f64,
+}
+
 /// Estimated tempo and beat grid for an asset's audio. Best-effort: derived by
 /// autocorrelating the onset envelope, so it is most reliable on percussive
 /// music and may land on a tempo octave — gate on `confidence`.
@@ -145,6 +167,10 @@ pub struct AssetAnalysis {
     /// for silent / video-only assets and non-rhythmic material.
     #[serde(default)]
     pub tempo: Option<Tempo>,
+    /// Coarse speech/music classification of the audio. `None` for silent /
+    /// video-only assets. Route ducking/leveling decisions off this.
+    #[serde(default)]
+    pub audio_class: Option<AudioClassification>,
 }
 
 fn one() -> f64 {

@@ -48,6 +48,13 @@ export interface Tempo {
 	confidence: number;
 }
 
+export type AudioClass = 'speech' | 'music' | 'mixed' | 'unknown';
+
+export interface AudioClassification {
+	class: AudioClass;
+	confidence: number;
+}
+
 export interface AssetAnalysis {
 	asset_id: string;
 	silence_segments: TimeRange[];
@@ -56,6 +63,7 @@ export interface AssetAnalysis {
 	loudness: Loudness | null;
 	onsets: number[];
 	tempo: Tempo | null;
+	audio_class: AudioClassification | null;
 }
 
 export interface Transform {

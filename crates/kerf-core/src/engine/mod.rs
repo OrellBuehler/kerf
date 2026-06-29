@@ -26,7 +26,7 @@ mod cli;
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
-pub use audio::{detect_onsets, detect_tempo, energy_envelope, measure_loudness};
+pub use audio::{classify_audio, detect_onsets, detect_tempo, energy_envelope, measure_loudness};
 
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;

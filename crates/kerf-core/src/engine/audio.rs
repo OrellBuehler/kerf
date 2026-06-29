@@ -9,7 +9,7 @@ use std::process::Stdio;
 
 use super::cli::{command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use crate::error::{Error, Result};
-use crate::model::{Loudness, Tempo};
+use crate::model::{AudioClass, AudioClassification, Loudness, Tempo};
 
 // ---- loudness (EBU R128) ---------------------------------------------------
 
@@ -207,9 +207,85 @@ fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
     Some(Tempo { bpm, beats, confidence })
 }
 
+// ---- speech vs. music classification ---------------------------------------
+
+/// Classify an asset's audio as speech / music / mixed using two cheap cues:
+/// how often the energy drops into a gap (speech is gappy, music continuous) and
+/// how variable the zero-crossing rate is (speech alternates voiced/unvoiced).
+/// A hint, not a trained model — see [`crate::model::AudioClass`].
+pub fn classify_audio(path: &Path) -> Result<Option<AudioClassification>> {
+    const SR: u32 = 22_050;
+    const FRAME: usize = 1024; // ~46 ms
+    let samples = decode_audio_mono_f32(path, SR)?;
+    if samples.len() < FRAME * 4 {
+        return Ok(None);
+    }
+    let n = samples.len() / FRAME;
+    let mut energies = Vec::with_capacity(n);
+    let mut zcrs = Vec::with_capacity(n);
+    for f in 0..n {
+        let frame = &samples[f * FRAME..(f + 1) * FRAME];
+        let energy = frame.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / FRAME as f64;
+        let crossings = frame.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        energies.push(energy);
+        zcrs.push(crossings as f64 / (FRAME - 1) as f64);
+    }
+    Ok(classify_frames(&energies, &zcrs))
+}
+
+/// Decide a class from per-frame energy and zero-crossing-rate series. Pure, so
+/// it is unit-tested. `None` for empty / silent input.
+fn classify_frames(energies: &[f64], zcrs: &[f64]) -> Option<AudioClassification> {
+    if energies.is_empty() {
+        return None;
+    }
+    let mean_e = energies.iter().sum::<f64>() / energies.len() as f64;
+    if mean_e <= 0.0 {
+        return None;
+    }
+    // Fraction of frames sitting in an energy gap (below 10% of mean).
+    let low_energy_ratio = energies.iter().filter(|&&e| e < 0.1 * mean_e).count() as f64 / energies.len() as f64;
+    // Coefficient of variation of the zero-crossing rate.
+    let mean_z = zcrs.iter().sum::<f64>() / zcrs.len() as f64;
+    let var_z = zcrs.iter().map(|z| (z - mean_z) * (z - mean_z)).sum::<f64>() / zcrs.len() as f64;
+    let zcr_cv = var_z.sqrt() / (mean_z + 1e-6);
+
+    let (class, confidence) = if low_energy_ratio > 0.22 && zcr_cv > 0.45 {
+        (AudioClass::Speech, ((low_energy_ratio - 0.22) * 2.0 + (zcr_cv - 0.45)).clamp(0.3, 1.0))
+    } else if low_energy_ratio < 0.12 {
+        (AudioClass::Music, ((0.12 - low_energy_ratio) * 4.0 + 0.4).clamp(0.3, 1.0))
+    } else {
+        (AudioClass::Mixed, 0.4)
+    };
+    Some(AudioClassification { class, confidence })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_frames_separates_speech_and_music() {
+        // Speech-like: frequent energy gaps and a swinging zero-crossing rate.
+        let mut e = vec![1.0_f64; 100];
+        let mut z = vec![0.05_f64; 100];
+        for i in 0..100 {
+            if i % 3 == 0 {
+                e[i] = 0.0;
+            }
+            if i % 2 == 0 {
+                z[i] = 0.4;
+            }
+        }
+        assert_eq!(classify_frames(&e, &z).unwrap().class, AudioClass::Speech);
+
+        // Music-like: continuous energy, steady zero-crossing rate.
+        let e2 = vec![1.0_f64; 100];
+        let z2 = vec![0.1_f64; 100];
+        assert_eq!(classify_frames(&e2, &z2).unwrap().class, AudioClass::Music);
+
+        assert!(classify_frames(&[], &[]).is_none());
+    }
 
     #[test]
     fn estimate_tempo_recovers_synthetic_pulse() {
