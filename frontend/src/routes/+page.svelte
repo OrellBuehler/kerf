@@ -24,19 +24,24 @@
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
 		// the timeline, history, and task queue so the GUI reflects agent edits.
-		let unlisten: (() => void) | undefined;
+		// It also emits `proxy-ready` once a background preview proxy finishes, so
+		// the preview re-decodes the current frame from the faster proxy.
+		const unlisteners: Array<() => void> = [];
 		if (inTauri()) {
-			void import('@tauri-apps/api/event').then(({ listen }) =>
-				listen('project-changed', () => {
-					void editor.refreshTimeline();
-					void editor.refreshHistory();
-					void agent.load();
-				}).then((un) => {
-					unlisten = un;
-				})
-			);
+			void import('@tauri-apps/api/event').then(async ({ listen }) => {
+				unlisteners.push(
+					await listen('project-changed', () => {
+						void editor.refreshTimeline();
+						void editor.refreshHistory();
+						void agent.load();
+					}),
+					await listen('proxy-ready', () => ui.refreshPreview())
+				);
+			});
 		}
-		return () => unlisten?.();
+		return () => {
+			for (const un of unlisteners) un();
+		};
 	});
 
 	async function onNew() {

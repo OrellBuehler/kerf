@@ -19,7 +19,8 @@ pub use analysis::{
     SceneDetector, SilenceDetector, Transcriber,
 };
 pub use engine::{
-    render_with, render_with_progress, validate_export, Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
+    generate_proxy, proxy_path, render_with, render_with_progress, validate_export, Container, ExportOptions,
+    ExportProgress, RateControl, RenderStatus,
 };
 pub use error::{Error, Result};
 pub use model::{

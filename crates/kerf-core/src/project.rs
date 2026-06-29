@@ -371,7 +371,28 @@ impl Project {
     pub fn decode_preview_frame(asset: &Asset, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
         // A still image has one frame at t=0; seeking past it decodes nothing.
         let time_secs = if asset.is_image() { 0.0 } else { time_secs };
-        engine::frame_jpeg(Path::new(&asset.path), time_secs, max_width, quality, accurate)
+        // Decode from the all-intra proxy when one is ready (every frame a
+        // keyframe → the seek decodes exactly one frame); export always reads the
+        // original — only previews consult the proxy.
+        let path = Self::preview_source(asset);
+        engine::frame_jpeg(&path, time_secs, max_width, quality, accurate)
+    }
+
+    /// The media path a preview should decode for `asset`: its generated proxy
+    /// when one is ready on disk, else the original source. Only the preview
+    /// paths ([`Project::decode_preview_frame`] and the [`Project::timeline_frame`]
+    /// compositor) consult this — export always uses the original `asset.path`.
+    /// Stills and audio-only assets never get a proxy, so they resolve to the
+    /// original. Falls back to the original whenever no proxy exists yet, so a
+    /// preview never blocks waiting on generation.
+    fn preview_source(asset: &Asset) -> PathBuf {
+        let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
+        if has_video && !asset.is_image() {
+            if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path)) {
+                return proxy;
+            }
+        }
+        PathBuf::from(&asset.path)
     }
 
     /// Build a `columns`×`rows` contact sheet of an asset — frames sampled evenly
@@ -400,8 +421,22 @@ impl Project {
     /// wide — what the edit looks like on screen at `t`, for an LLM to review.
     pub fn timeline_frame(&self, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
         let timeline = self.timeline()?;
-        let assets = self.list_assets()?;
+        let assets = self.preview_assets()?;
         engine::timeline_frame(&timeline, &assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
+    }
+
+    /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
+    /// its ready proxy — the asset list the timeline-preview compositor decodes
+    /// from. Stream metadata (resolution / fps) is kept from the original, so the
+    /// composite geometry and source-time mapping match the export exactly; only
+    /// the decoded pixels come from the lighter all-intra proxy. Export reads
+    /// [`Project::list_assets`] (originals) and is unaffected.
+    fn preview_assets(&self) -> Result<Vec<Asset>> {
+        let mut assets = self.list_assets()?;
+        for asset in &mut assets {
+            asset.path = Self::preview_source(asset).to_string_lossy().into_owned();
+        }
+        Ok(assets)
     }
 
     /// Reduce an asset's first audio stream to `buckets` peak magnitudes in
@@ -1388,6 +1423,79 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
         assert!(total_clips >= 3);
+    }
+
+    fn asset_with(path: &str, streams: Vec<StreamInfo>) -> Asset {
+        Asset {
+            id: Uuid::new_v4(),
+            path: path.into(),
+            name: "x".into(),
+            duration: 10.0,
+            streams,
+            imported_at: Utc::now(),
+        }
+    }
+
+    fn vid_stream(image: bool) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: if image { "png".into() } else { "h264".into() },
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            sample_rate: None,
+            channels: None,
+            image,
+        }
+    }
+
+    fn aud_stream() -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Audio,
+            codec: "aac".into(),
+            width: None,
+            height: None,
+            fps: None,
+            sample_rate: Some(48_000),
+            channels: Some(2),
+            image: false,
+        }
+    }
+
+    #[test]
+    fn preview_source_falls_back_to_original_without_a_proxy() {
+        // A video asset with no generated proxy decodes from the original, so a
+        // preview never breaks or blocks on a proxy that hasn't landed yet.
+        let asset = asset_with("/no-such-kerf-source.mp4", vec![vid_stream(false)]);
+        assert_eq!(Project::preview_source(&asset), PathBuf::from(&asset.path));
+    }
+
+    #[test]
+    fn preview_source_skips_proxy_for_stills_and_audio_only() {
+        let image = asset_with("/still.png", vec![vid_stream(true)]);
+        let audio = asset_with("/voice.wav", vec![aud_stream()]);
+        assert_eq!(Project::preview_source(&image), PathBuf::from(&image.path));
+        assert_eq!(Project::preview_source(&audio), PathBuf::from(&audio.path));
+    }
+
+    #[test]
+    fn preview_source_uses_proxy_once_one_exists() {
+        // A unique per-process source path keeps the deterministic proxy path
+        // distinct across concurrent test runs (no shared-file race).
+        let path = format!("/kerf-test-proxy-source-{}.mp4", std::process::id());
+        let asset = asset_with(&path, vec![vid_stream(false)]);
+        let Some(proxy) = crate::engine::proxy_path(Path::new(&asset.path)) else {
+            return; // no cache dir on this platform — nothing to resolve to
+        };
+        if let Some(dir) = proxy.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&proxy, b"stub").unwrap();
+        let resolved = Project::preview_source(&asset);
+        let _ = std::fs::remove_file(&proxy);
+        assert_eq!(resolved, proxy);
     }
 
     #[test]

@@ -2082,6 +2082,7 @@ name = "kerf-core"
 version = "0.9.0"
 dependencies = [
  "chrono",
+ "dirs",
  "ffmpeg-next",
  "rusqlite",
  "schemars 1.2.1",

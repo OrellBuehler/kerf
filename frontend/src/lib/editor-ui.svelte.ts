@@ -22,8 +22,17 @@ class EditorUi {
 	time = $state(0);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
+	/** Bumped when a preview proxy finishes generating, to nudge the preview into
+	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
+	previewEpoch = $state(0);
 
 	#raf: number | null = null;
+
+	/** Force the preview to re-fetch the frame under the playhead. Called when a
+	 *  background proxy becomes ready so the still updates without a manual scrub. */
+	refreshPreview() {
+		this.previewEpoch++;
+	}
 
 	/** Analyze an asset, flagging `analyzing` while kerf-core works. The work has
 	 *  no real progress signal, so the UI shows an indeterminate state rather than

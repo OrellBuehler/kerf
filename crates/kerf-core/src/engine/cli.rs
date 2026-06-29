@@ -8,7 +8,7 @@
 //! `KERF_FFMPEG` / `KERF_FFPROBE` environment variables.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
@@ -471,7 +471,7 @@ pub fn decode_audio_16k_mono(path: &Path) -> Result<Vec<f32>> {
     decode_audio_mono_f32(path, 16_000)
 }
 
-fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
+pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
     let bin = ffmpeg_bin();
     let output = command(&bin)
         .args(["-hide_banner", "-loglevel", "error"])
@@ -502,6 +502,123 @@ fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
+}
+
+// ---- preview proxies -------------------------------------------------------
+
+/// Cap on the proxy's width, in pixels (`scale='min(W,iw)'`). ~720p: small
+/// enough that one frame decodes in a few ms, large enough to preview framing.
+const PROXY_MAX_WIDTH: u32 = 1280;
+
+/// FNV-1a over `s`. A small, dependency-free, deterministic hash for naming a
+/// source's proxy file — stability across sessions is what lets a re-import
+/// reuse the cached proxy (a non-deterministic hasher would orphan it).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A content key for `src` that changes whenever the file is replaced: its path
+/// plus size and modified time. Hashed into the proxy filename so re-imports of
+/// the same file reuse the proxy, while a swapped-out source regenerates one.
+fn proxy_key(src: &Path) -> String {
+    let meta = std::fs::metadata(src).ok();
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}|{len}|{mtime}", src.display())
+}
+
+/// The on-disk path of `src`'s preview proxy (whether or not it exists yet):
+/// `<cache>/kerf/proxies/<hash>.mp4`. `None` when no OS cache directory is
+/// resolvable (a proxy simply can't be cached — preview falls back to original).
+pub fn proxy_path(src: &Path) -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("kerf").join("proxies");
+    Some(dir.join(format!("{:016x}.mp4", fnv1a(&proxy_key(src)))))
+}
+
+/// The proxy for `src` **if it has already been generated** (the file exists),
+/// for a preview path to decode from instead of the original; `None` otherwise.
+/// Preview must never block on generation, so this is a pure existence check.
+pub fn ready_proxy(src: &Path) -> Option<PathBuf> {
+    proxy_path(src).filter(|p| p.is_file())
+}
+
+/// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
+/// an all-intra, audio-less, ~720p preview proxy at `dst`. `-g 1` makes every
+/// frame a keyframe, so a seek decodes exactly one frame (instant scrub even on
+/// long-GOP 4K/HEVC). fps and duration are left untouched — no `-r`, no `-t`, no
+/// trim — so a source time maps 1:1 onto the proxy and a preview seek lands on
+/// the same frame the export (which always reads the original) would.
+fn build_proxy_args(src: &str, dst: &str) -> Vec<String> {
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+        "-i".to_string(),
+        src.to_string(),
+        "-an".to_string(),
+        "-vf".to_string(),
+        format!("scale='min({PROXY_MAX_WIDTH},iw)':-2:flags=bilinear"),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-crf".to_string(),
+        "24".to_string(),
+        "-g".to_string(),
+        "1".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        dst.to_string(),
+    ]
+}
+
+/// Generate the preview proxy for `src` if it isn't cached yet, returning its
+/// path. A cache hit (the proxy already on disk) returns immediately — so this
+/// is cheap to call for every asset on project open. The encode writes to a
+/// per-process temp file and atomically renames it into place, so a partial /
+/// interrupted / concurrent encode never leaves a half-written file that
+/// [`ready_proxy`] would mistake for a finished proxy. Blocking; callers run it
+/// off the project lock (e.g. on a background thread).
+pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
+    let dst = proxy_path(src)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    if dst.is_file() {
+        return Ok(dst);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create proxy cache dir: {e}")))?;
+    }
+    let src_str = src.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
+    let tmp = dst.with_extension(format!("{}.part", std::process::id()));
+    let tmp_str = tmp.to_str().ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
+    let args = build_proxy_args(src_str, tmp_str);
+    let bin = ffmpeg_bin();
+    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Engine(format!(
+            "could not generate preview proxy: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    // Another generator may have finished the same proxy while we encoded; if so
+    // ours is redundant — drop the temp and use the existing file.
+    if dst.is_file() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(dst);
+    }
+    std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
+    Ok(dst)
 }
 
 // ---- export ----------------------------------------------------------------
@@ -2005,6 +2122,45 @@ mod tests {
         assert!(p.iter().all(|&v| (0.0..=1.0).contains(&v)));
     }
 
+    #[test]
+    fn proxy_args_are_all_intra_audioless_and_keep_timing() {
+        let args = build_proxy_args("/in.mov", "/out.mp4");
+        // All-intra: every frame a keyframe, so a preview seek decodes one frame.
+        let gop = args.iter().position(|a| a == "-g").expect("-g present");
+        assert_eq!(args[gop + 1], "1");
+        // Audio is dropped — the proxy is only ever decoded for video frames.
+        assert!(args.contains(&"-an".to_string()));
+        // Downscale only: the proxy must NOT retime, trim or seek, or a source
+        // time would no longer map 1:1 onto it (the invariant preview seek math
+        // and the shared clip source-window math both rely on).
+        assert!(!args.contains(&"-r".to_string()), "proxy must not change fps");
+        assert!(!args.contains(&"-t".to_string()), "proxy must not trim duration");
+        assert!(!args.contains(&"-ss".to_string()), "proxy must not seek");
+        assert!(args.iter().any(|a| a.contains("scale='min(1280,iw)':-2")));
+        assert!(args.contains(&"libx264".to_string()));
+        // The source is the input; the proxy is the (final) output.
+        let input = args.iter().position(|a| a == "-i").expect("-i present");
+        assert_eq!(args[input + 1], "/in.mov");
+        assert_eq!(args.last().unwrap(), "/out.mp4");
+    }
+
+    #[test]
+    fn proxy_path_is_deterministic_and_distinct_per_source() {
+        // Same source → same proxy path on every call (so a re-import / new
+        // session reuses the cached proxy); different sources → different files.
+        // Skipped when the platform exposes no cache directory.
+        if let (Some(a1), Some(a2), Some(b)) = (
+            proxy_path(Path::new("/media/a.mov")),
+            proxy_path(Path::new("/media/a.mov")),
+            proxy_path(Path::new("/media/b.mov")),
+        ) {
+            assert_eq!(a1, a2);
+            assert_ne!(a1, b);
+            assert!(a1.to_string_lossy().contains("proxies"));
+            assert_eq!(a1.extension().and_then(|e| e.to_str()), Some("mp4"));
+        }
+    }
+
     fn test_asset(streams: Vec<StreamInfo>) -> Asset {
         Asset {
             id: Uuid::new_v4(),
@@ -2172,6 +2328,21 @@ mod tests {
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.channel_layout(), "stereo");
+    }
+
+    #[test]
+    fn export_args_reference_the_original_source_not_a_proxy() {
+        // Hard invariant: export always reads the original asset; preview proxies
+        // are a preview-only optimisation. The export builder has no proxy
+        // knowledge, so its `-i` inputs are the asset paths verbatim and never a
+        // cached file under .../proxies/.
+        let asset = test_asset(vec![video_stream(3840, 2160, 60.0), audio_stream(48_000, 2)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 1.0, 5.0, 0.0)]);
+        let args = build_export_args(&timeline, &assets, "/out.mp4", &ExportOptions::default()).unwrap();
+        let input = args.iter().position(|a| a == "-i").expect("-i present");
+        assert_eq!(args[input + 1], asset.path);
+        assert!(!args.iter().any(|a| a.contains("proxies")), "export must not reference a proxy");
     }
 
     fn make_clip(asset_id: uuid::Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {

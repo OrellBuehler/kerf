@@ -77,6 +77,8 @@
 	// the exact frame to correct the snap. (Desktop only — getFrame is null in browser.)
 	$effect(() => {
 		const target = atPlayhead;
+		// Re-run when a proxy becomes ready so the still re-decodes from it.
+		void ui.previewEpoch;
 		if (settle) {
 			clearTimeout(settle);
 			settle = null;

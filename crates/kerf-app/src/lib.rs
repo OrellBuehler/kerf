@@ -112,10 +112,18 @@ fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 /// and the embedded MCP server share this `Project`, so both now operate on —
 /// and persist to — the opened file. Returns its path.
 #[tauri::command]
-fn open_project(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
     let mut project = state.project()?;
     *project = Project::open(&path).map_err(|e| e.to_string())?;
-    Ok(project.path().map(|p| p.display().to_string()))
+    let result = project.path().map(|p| p.display().to_string());
+    let assets = project.list_assets().unwrap_or_default();
+    drop(project);
+    // Make sure every video asset in the reopened project has a preview proxy
+    // (a cached one is a cheap no-op; a missing one regenerates in the background).
+    for asset in &assets {
+        spawn_proxy(&app, asset);
+    }
+    Ok(result)
 }
 
 /// Snapshot the current project to a new `.kerf` file and switch to it, so
@@ -132,8 +140,34 @@ fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option
 // ---- import / analysis -----------------------------------------------------
 
 #[tauri::command]
-fn import_asset(state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
-    state.project()?.import_asset(path).map_err(|e| e.to_string())
+fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
+    let asset = state.project()?.import_asset(path).map_err(|e| e.to_string())?;
+    // Kick off the preview proxy in the background; preview uses the original
+    // until it lands (see `spawn_proxy`).
+    spawn_proxy(&app, &asset);
+    Ok(asset)
+}
+
+/// Generate an asset's preview proxy (all-intra, ~720p) on a background thread so
+/// scrubbing decodes one keyframe instead of seeking a long GOP. Non-blocking and
+/// best-effort: previews fall back to the original source until the proxy lands,
+/// at which point we emit `proxy-ready` so the webview re-fetches the current
+/// frame. Stills and audio-only assets are skipped (they get no proxy).
+fn spawn_proxy(app: &AppHandle, asset: &Asset) {
+    let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
+    if !has_video || asset.is_image() {
+        return;
+    }
+    let app = app.clone();
+    let path = asset.path.clone();
+    std::thread::spawn(move || match kerf_core::generate_proxy(std::path::Path::new(&path)) {
+        Ok(_) => {
+            if let Err(e) = app.emit("proxy-ready", ()) {
+                tracing::warn!(error = %e, "failed to emit proxy-ready");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, path = %path, "preview proxy generation failed"),
+    });
 }
 
 #[tauri::command]
