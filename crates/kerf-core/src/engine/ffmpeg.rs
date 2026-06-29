@@ -15,7 +15,7 @@ use std::sync::Once;
 use ffmpeg_next as ff;
 
 use super::ProbeResult;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::{StreamInfo, StreamKind};
 
 static INIT: Once = Once::new();
