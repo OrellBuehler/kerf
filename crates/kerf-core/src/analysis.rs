@@ -28,6 +28,11 @@ pub trait LoudnessAnalyzer: Send + Sync {
     fn measure(&self, asset: &Asset) -> Result<Option<Loudness>>;
 }
 
+/// Detects onset (transient) timestamps in an asset's audio.
+pub trait OnsetDetector: Send + Sync {
+    fn detect_onsets(&self, asset: &Asset) -> Result<Vec<f64>>;
+}
+
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
 /// `ffmpeg` binary, so no dev libraries are required).
 pub struct FfmpegSilenceDetector {
@@ -83,6 +88,28 @@ impl LoudnessAnalyzer for FfmpegLoudnessAnalyzer {
         // Silent material measures as non-finite LUFS, which is not meaningful
         // (and would not round-trip through JSON): treat it as no measurement.
         Ok(loudness.integrated_lufs.is_finite().then_some(loudness))
+    }
+}
+
+/// Onset detection backed by light DSP (energy flux) on PCM decoded with the
+/// `ffmpeg` binary, so no dev libraries are required.
+pub struct FfmpegOnsetDetector {
+    /// Adaptive-threshold std-dev multiplier; higher = fewer, stronger onsets.
+    pub sensitivity: f64,
+}
+
+impl Default for FfmpegOnsetDetector {
+    fn default() -> Self {
+        Self { sensitivity: 1.5 }
+    }
+}
+
+impl OnsetDetector for FfmpegOnsetDetector {
+    fn detect_onsets(&self, asset: &Asset) -> Result<Vec<f64>> {
+        if !asset.has_audio() {
+            return Ok(Vec::new());
+        }
+        crate::engine::detect_onsets(std::path::Path::new(&asset.path), self.sensitivity)
     }
 }
 
@@ -171,12 +198,19 @@ impl LoudnessAnalyzer for NullAnalyzer {
     }
 }
 
+impl OnsetDetector for NullAnalyzer {
+    fn detect_onsets(&self, _asset: &Asset) -> Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+}
+
 /// A bundle of analysis providers to run against an asset.
 pub struct AnalysisProviders<'a> {
     pub silence: &'a dyn SilenceDetector,
     pub scene: &'a dyn SceneDetector,
     pub transcriber: &'a dyn Transcriber,
     pub loudness: &'a dyn LoudnessAnalyzer,
+    pub onset: &'a dyn OnsetDetector,
 }
 
 impl<'a> AnalysisProviders<'a> {
@@ -187,6 +221,7 @@ impl<'a> AnalysisProviders<'a> {
             scene: null,
             transcriber: null,
             loudness: null,
+            onset: null,
         }
     }
 }
@@ -203,6 +238,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
+    let onset = FfmpegOnsetDetector::default();
     let null = NullAnalyzer;
 
     #[cfg(feature = "whisper")]
@@ -223,6 +259,7 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
         scene: &scene,
         transcriber,
         loudness: &loudness,
+        onset: &onset,
     };
     analyze(asset, &providers)
 }
@@ -235,5 +272,6 @@ pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnal
         scene_changes: providers.scene.detect_scenes(asset)?,
         transcript: providers.transcriber.transcribe(asset)?,
         loudness: providers.loudness.measure(asset)?,
+        onsets: providers.onset.detect_onsets(asset)?,
     })
 }

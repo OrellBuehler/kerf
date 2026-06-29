@@ -1347,6 +1347,7 @@ impl Project {
                 true_peak_dbtp: -1.5,
                 threshold_lufs: -26.5,
             }),
+            onsets: vec![0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.

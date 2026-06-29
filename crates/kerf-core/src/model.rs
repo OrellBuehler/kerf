@@ -124,6 +124,10 @@ pub struct AssetAnalysis {
     /// asset is analyzed (and for silent / video-only assets).
     #[serde(default)]
     pub loudness: Option<Loudness>,
+    /// Onset (transient) timestamps in seconds — moments where new sound energy
+    /// arrives. Snap cut points to these to land edits on the beat.
+    #[serde(default)]
+    pub onsets: Vec<f64>,
 }
 
 fn one() -> f64 {

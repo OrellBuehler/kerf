@@ -76,9 +76,94 @@ fn rms_buckets(samples: &[f32], buckets: usize) -> Vec<f32> {
     out
 }
 
+// ---- onset / transient detection -------------------------------------------
+
+/// Detect onset (transient) timestamps in seconds — the moments where new sound
+/// energy arrives (a drum hit, a note attack, a hard edit point). An agent can
+/// snap cut points to these so edits land on the beat rather than mid-phrase.
+/// `sensitivity` is the adaptive-threshold std-dev multiplier; higher = fewer,
+/// stronger onsets.
+pub fn detect_onsets(path: &Path, sensitivity: f64) -> Result<Vec<f64>> {
+    const SR: u32 = 22_050;
+    let samples = decode_audio_mono_f32(path, SR)?;
+    let (env, frame_rate) = onset_envelope(&samples, SR);
+    Ok(pick_onsets(&env, frame_rate, sensitivity))
+}
+
+/// Frame hop for the onset / tempo envelopes. At 22.05 kHz this is a ~43 Hz
+/// envelope (~23 ms per frame) — fine enough for transients, cheap to compute.
+pub(super) const ONSET_HOP: usize = 512;
+
+/// Build an onset-strength envelope: per-frame positive change in log energy
+/// (half-wave-rectified energy flux). Returns the envelope and its frame rate in
+/// Hz. Pure (no I/O), so it is unit-tested and shared with tempo estimation.
+pub(super) fn onset_envelope(samples: &[f32], sample_rate: u32) -> (Vec<f32>, f64) {
+    let frame_rate = sample_rate as f64 / ONSET_HOP as f64;
+    if samples.len() < ONSET_HOP * 2 {
+        return (Vec::new(), frame_rate);
+    }
+    let n_frames = samples.len() / ONSET_HOP;
+    let mut log_energy = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let frame = &samples[f * ONSET_HOP..(f + 1) * ONSET_HOP];
+        let energy: f64 = frame.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+        log_energy.push((1.0 + energy).ln());
+    }
+    let mut env = Vec::with_capacity(n_frames);
+    env.push(0.0);
+    for i in 1..log_energy.len() {
+        env.push((log_energy[i] - log_energy[i - 1]).max(0.0) as f32);
+    }
+    (env, frame_rate)
+}
+
+/// Pick onset times (seconds) from an envelope: local maxima that clear an
+/// adaptive threshold (local mean + `sensitivity`·std), debounced by ~30 ms.
+/// Pure, so it is unit-tested.
+fn pick_onsets(env: &[f32], frame_rate: f64, sensitivity: f64) -> Vec<f64> {
+    if env.is_empty() || frame_rate <= 0.0 {
+        return Vec::new();
+    }
+    let win = ((frame_rate * 0.1).round() as usize).max(1); // ~100 ms half-window
+    let min_gap = ((frame_rate * 0.03).round() as usize).max(1); // ~30 ms debounce
+    let mut onsets = Vec::new();
+    let mut last: Option<usize> = None;
+    for i in 0..env.len() {
+        let lo = i.saturating_sub(win);
+        let hi = (i + win + 1).min(env.len());
+        let slice = &env[lo..hi];
+        let mean = slice.iter().copied().sum::<f32>() / slice.len() as f32;
+        let var = slice.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / slice.len() as f32;
+        let threshold = mean + sensitivity as f32 * var.sqrt();
+        let is_peak = env[i] > threshold
+            && (i == 0 || env[i] >= env[i - 1])
+            && (i + 1 >= env.len() || env[i] >= env[i + 1]);
+        if is_peak && last.map_or(true, |p| i - p >= min_gap) {
+            onsets.push(i as f64 / frame_rate);
+            last = Some(i);
+        }
+    }
+    onsets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_onsets_finds_isolated_spikes() {
+        // Flat low background with three strong spikes 1 s apart at 100 Hz.
+        let mut env = vec![0.01_f32; 300];
+        for &i in &[50usize, 150, 250] {
+            env[i] = 1.0;
+        }
+        let onsets = pick_onsets(&env, 100.0, 1.5);
+        assert_eq!(onsets.len(), 3, "got {onsets:?}");
+        for (got, want) in onsets.iter().zip([0.5, 1.5, 2.5]) {
+            assert!((got - want).abs() < 0.02, "onset {got} ~ {want}");
+        }
+        assert!(pick_onsets(&[], 100.0, 1.5).is_empty());
+    }
 
     #[test]
     fn rms_buckets_have_requested_length_and_track_amplitude() {

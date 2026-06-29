@@ -70,14 +70,16 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.' },
 			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.' }
 		],
-		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 }
+		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
+		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6]
 	},
 	[sampleAssets[1].id]: {
 		asset_id: sampleAssets[1].id,
 		silence_segments: [],
 		scene_changes: [0, 8, 20, 33],
 		transcript: [],
-		loudness: { integrated_lufs: -11.8, loudness_range: 9.1, true_peak_dbtp: -0.8, threshold_lufs: -22.0 }
+		loudness: { integrated_lufs: -11.8, loudness_range: 9.1, true_peak_dbtp: -0.8, threshold_lufs: -22.0 },
+		onsets: [0.4, 0.9, 1.5, 2.1, 2.7, 3.3, 3.9]
 	}
 };
 
@@ -281,7 +283,8 @@ export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 				silence_segments: [],
 				scene_changes: [],
 				transcript: [],
-				loudness: null
+				loudness: null,
+				onsets: []
 			}
 		);
 	}

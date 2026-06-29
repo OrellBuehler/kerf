@@ -48,6 +48,7 @@ export interface AssetAnalysis {
 	scene_changes: number[];
 	transcript: TranscriptSegment[];
 	loudness: Loudness | null;
+	onsets: number[];
 }
 
 export interface Transform {
