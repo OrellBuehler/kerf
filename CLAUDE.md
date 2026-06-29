@@ -33,7 +33,13 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render.
+  render. Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
+  start (shared `clip_source_window`/`clip_seek`, frame-accurate against the
+  seek-relative `trim`), so a cut from deep in a long source decodes only the kept
+  region, not everything from `t=0`. `render_with_progress` streams ffmpeg's
+  `-progress` to report `{fraction, elapsed_secs, eta_secs}` and polls a cancel
+  callback (killing ffmpeg → `RenderStatus::Cancelled`); `render_with` is the
+  no-op-callback wrapper.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -144,7 +150,8 @@ op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `move_cli
 `remove_silence`, `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
-`remove_task` → the refreshed `Task[]`), and `export_timeline`. Tauri auto-converts JS camelCase args to Rust
+`remove_task` → the refreshed `Task[]`), and `export_timeline` (emits `export-progress`
+events) / `cancel_export`. Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
 `beforeDevCommand`/`beforeBuildCommand` hooks, however, run from Tauri's *app dir* —
