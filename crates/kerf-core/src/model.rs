@@ -31,6 +31,12 @@ pub struct StreamInfo {
     pub sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channels: Option<u16>,
+    /// True for a single-frame still image (PNG/JPEG/…): the stream has no real
+    /// duration, so the engine loops it for the clip's length on export and never
+    /// seeks into it. Defaulted (and omitted when false) so older `.kerf` JSON —
+    /// which predates the flag — still deserializes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image: bool,
 }
 
 /// An imported media file plus the structured metadata probed from it.
@@ -61,7 +67,18 @@ impl Asset {
     pub fn has_audio(&self) -> bool {
         self.streams.iter().any(|s| s.kind == StreamKind::Audio)
     }
+
+    /// True when this asset is a still image (a single-frame PNG/JPEG/…). Such an
+    /// asset has no intrinsic duration, so it is placed on the timeline with a
+    /// default length and looped — not seeked — on export.
+    pub fn is_image(&self) -> bool {
+        self.streams.iter().any(|s| s.image)
+    }
 }
+
+/// Default timeline length, in seconds, given to a still image on import (it has
+/// no intrinsic duration). The clip can be trimmed like any other afterwards.
+pub const DEFAULT_IMAGE_DURATION: f64 = 5.0;
 
 /// A half-open time range `[start, end)` in seconds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

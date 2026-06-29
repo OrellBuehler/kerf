@@ -43,6 +43,7 @@ import {
 	Trash2,
 	Copy,
 	ChevronDown,
+	Image,
 	X
 } from '@lucide/svelte';
 
@@ -91,6 +92,7 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'trash': Trash2,
 	'copy': Copy,
 	'chevron-down': ChevronDown,
+	'image': Image,
 	'x': X
 };
 

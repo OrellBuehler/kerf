@@ -217,7 +217,15 @@ export async function pickMediaPaths(): Promise<string[]> {
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
-		filters: [{ name: 'Media', extensions: ['mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac'] }]
+		filters: [
+			{
+				name: 'Media',
+				extensions: [
+					'mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac',
+					'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif'
+				]
+			}
+		]
 	});
 	if (selected == null) return [];
 	return Array.isArray(selected) ? selected : [selected];

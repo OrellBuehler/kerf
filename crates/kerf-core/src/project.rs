@@ -217,11 +217,19 @@ impl Project {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".to_string());
+        // A still image probes with no duration; give it a default timeline length
+        // so it's placeable (the clip can be trimmed afterwards like any other).
+        let is_image = probe.streams.iter().any(|s| s.image);
+        let duration = if is_image && probe.duration <= 0.0 {
+            crate::model::DEFAULT_IMAGE_DURATION
+        } else {
+            probe.duration
+        };
         let asset = Asset {
             id: Uuid::new_v4(),
             path: path.to_string_lossy().into_owned(),
             name,
-            duration: probe.duration,
+            duration,
             streams: probe.streams,
             imported_at: Utc::now(),
         };
@@ -342,6 +350,8 @@ impl Project {
     /// at most `max_width` px wide.
     pub fn frame_at(&self, asset_id: Uuid, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
         let asset = self.require_asset(asset_id)?;
+        // A still image has one frame at t=0; seeking past it decodes nothing.
+        let time_secs = if asset.is_image() { 0.0 } else { time_secs };
         engine::frame_at(Path::new(&asset.path), time_secs, max_width)
     }
 
@@ -350,6 +360,8 @@ impl Project {
     /// wide. Smaller than [`frame_at`]'s PNG — for handing the frame to an LLM.
     pub fn frame_jpeg(&self, asset_id: Uuid, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
         let asset = self.require_asset(asset_id)?;
+        // A still image has one frame at t=0; seeking past it decodes nothing.
+        let time_secs = if asset.is_image() { 0.0 } else { time_secs };
         engine::frame_jpeg(Path::new(&asset.path), time_secs, max_width, quality)
     }
 
@@ -1222,6 +1234,7 @@ impl Project {
                     fps: Some(30.0),
                     sample_rate: None,
                     channels: None,
+                    image: false,
                 },
                 StreamInfo {
                     index: 1,
@@ -1232,6 +1245,7 @@ impl Project {
                     fps: None,
                     sample_rate: Some(48_000),
                     channels: Some(2),
+                    image: false,
                 },
             ],
             imported_at: Utc::now(),
@@ -1251,6 +1265,7 @@ impl Project {
                 fps: Some(24.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1377,6 +1392,7 @@ mod tests {
                 fps: Some(25.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1408,6 +1424,7 @@ mod tests {
                 fps: Some(25.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1445,6 +1462,7 @@ mod tests {
                 fps: Some(25.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1489,6 +1507,7 @@ mod tests {
                 fps: Some(30.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1588,6 +1607,7 @@ mod tests {
                 fps: Some(25.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };
@@ -1642,6 +1662,7 @@ mod tests {
                 fps: Some(25.0),
                 sample_rate: None,
                 channels: None,
+                image: false,
             }],
             imported_at: Utc::now(),
         };

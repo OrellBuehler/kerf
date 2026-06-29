@@ -11,6 +11,8 @@ export interface StreamInfo {
 	fps?: number;
 	sample_rate?: number;
 	channels?: number;
+	/** True for a single-frame still image (looped, not seeked, on export). */
+	image?: boolean;
 }
 
 export interface Asset {

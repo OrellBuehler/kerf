@@ -52,6 +52,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             fps: None,
             sample_rate: None,
             channels: None,
+            image: false,
         };
 
         match medium {
@@ -75,6 +76,20 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
         }
 
         streams.push(info);
+    }
+
+    // Flag a lone, audio-less still-image stream so the engine loops rather than
+    // seeks it on export — mirroring the ffprobe path in `super::cli`.
+    let video_count = streams.iter().filter(|s| s.kind == StreamKind::Video).count();
+    let has_audio = streams.iter().any(|s| s.kind == StreamKind::Audio);
+    if video_count == 1
+        && !has_audio
+        && duration < super::cli::STILL_MAX_DURATION
+        && streams.iter().any(|s| s.kind == StreamKind::Video && super::cli::is_still_codec(Some(&s.codec)))
+    {
+        for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            s.image = true;
+        }
     }
 
     Ok(ProbeResult { duration, streams })

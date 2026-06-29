@@ -36,10 +36,15 @@ so the feature is **only** activated through these forwards — which is what ma
   render. Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
   start (shared `clip_source_window`/`clip_seek`, frame-accurate against the
   seek-relative `trim`), so a cut from deep in a long source decodes only the kept
-  region, not everything from `t=0`. `render_with_progress` streams ffmpeg's
-  `-progress` to report `{fraction, elapsed_secs, eta_secs}` and polls a cancel
-  callback (killing ffmpeg → `RenderStatus::Cancelled`); `render_with` is the
-  no-op-callback wrapper.
+  region, not everything from `t=0`. **Still images** (PNG/JPEG/… — detected at
+  probe time via `is_still_codec` + no audio + sub-second duration, flagged on the
+  stream as `StreamInfo.image` and given `DEFAULT_IMAGE_DURATION` on import) are the
+  exception: a still has no source timeline, so its input is `-loop 1 -framerate
+  fps -t <window>` instead of `-ss`'d, and its in-graph `trim` stays absolute (seek
+  forced to 0); `frame_*`/`timeline_frame` likewise decode the single frame without
+  seeking. `render_with_progress` streams ffmpeg's `-progress` to report
+  `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
+  `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

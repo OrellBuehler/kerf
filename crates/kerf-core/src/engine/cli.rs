@@ -121,6 +121,24 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
 }
 
 fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
+    let format_dur = parsed.format.as_ref().and_then(|f| f.duration.as_deref()).and_then(|d| d.parse::<f64>().ok());
+
+    // A still image probes as a lone video stream in an image codec with no
+    // playable duration and no audio. We mark that stream so the engine loops it
+    // for the clip length on export and decodes its single frame without seeking.
+    // A still has no real timeline; we treat a sub-second duration as "none" so the
+    // probe is robust whether the demuxer reports N/A (ffprobe) or a single frame's
+    // worth (libav). The image-codec guard keeps short *videos* from being misread.
+    let video_count = parsed.streams.iter().filter(|s| s.codec_type.as_deref() == Some("video")).count();
+    let has_audio = parsed.streams.iter().any(|s| s.codec_type.as_deref() == Some("audio"));
+    let still = video_count == 1
+        && !has_audio
+        && format_dur.unwrap_or(0.0) < STILL_MAX_DURATION
+        && parsed
+            .streams
+            .iter()
+            .any(|s| s.codec_type.as_deref() == Some("video") && is_still_codec(s.codec_name.as_deref()));
+
     let mut streams = Vec::new();
     let mut max_stream_dur = 0.0_f64;
     for s in &parsed.streams {
@@ -142,15 +160,29 @@ fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
             fps: s.r_frame_rate.as_deref().and_then(parse_rational),
             sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse().ok()),
             channels: s.channels,
+            image: still && kind == StreamKind::Video,
         });
     }
-    let duration = parsed
-        .format
-        .and_then(|f| f.duration)
-        .and_then(|d| d.parse::<f64>().ok())
-        .unwrap_or(max_stream_dur)
-        .max(0.0);
+    let duration = format_dur.unwrap_or(max_stream_dur).max(0.0);
     ProbeResult { duration, streams }
+}
+
+/// FFmpeg `codec_name`s for single-frame still images. Animated containers
+/// (gif/webp/apng) only land here when they probe with no playable duration —
+/// i.e. they really are one frame; an animated one keeps a real duration and is
+/// treated as ordinary video.
+/// A probed duration below this (seconds) counts as "no real duration" when
+/// deciding whether an image-codec stream is a still vs. an animated/looping one.
+pub(crate) const STILL_MAX_DURATION: f64 = 1.0;
+
+pub(crate) fn is_still_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec,
+        Some(
+            "png" | "mjpeg" | "jpeg" | "jpegls" | "bmp" | "gif" | "webp" | "tiff" | "ppm" | "pgm" | "pgmyuv" | "pam"
+                | "targa" | "tga" | "qoi" | "apng" | "jpeg2000" | "j2k" | "heif" | "heic"
+        )
+    )
 }
 
 /// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
@@ -898,20 +930,34 @@ fn build_export_args_phase(
     // this same seek (see `video_clip_chain` / `audio_clip_chain`) and the two
     // stay frame-accurate. Inputs are added in storage order, matching how
     // `build_filter_complex` indexes them and how `fx` is indexed.
+    let fmt = export_format(timeline, assets, opts);
+    let image_of = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
     let fx = transition_fx(timeline, assets);
     for (i, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        let (start, _) = clip_source_window(clip, &fx[i]);
-        let seek = clip_seek(start);
-        if seek > 0.0 {
-            args.push("-ss".to_string());
-            args.push(format!("{seek}"));
+        let (start, end) = clip_source_window(clip, &fx[i]);
+        if image_of(clip.asset_id) {
+            // A still has no timeline of its own: loop the single frame and read it
+            // for the clip's whole source window. The in-graph trim (with the seek
+            // forced to 0 for images) then carves the clip's duration out of it.
+            // No `-ss` — seeking into a one-frame input decodes nothing.
+            args.push("-loop".to_string());
+            args.push("1".to_string());
+            args.push("-framerate".to_string());
+            args.push(format!("{}", fmt.fps));
+            args.push("-t".to_string());
+            args.push(format!("{}", end.max(1.0 / fmt.fps)));
+        } else {
+            let seek = clip_seek(start);
+            if seek > 0.0 {
+                args.push("-ss".to_string());
+                args.push(format!("{seek}"));
+            }
         }
         args.push("-i".to_string());
         args.push(path.to_string());
     }
 
-    let fmt = export_format(timeline, assets, opts);
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio);
     args.push("-filter_complex".to_string());
@@ -1339,6 +1385,9 @@ fn build_filter_complex(
             .find(|a| a.id == clip.asset_id)
             .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
     };
+    let is_image = |clip: &crate::model::Clip| {
+        assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image())
+    };
     let layout = fmt.channel_layout();
 
     // Assign each clip its ffmpeg input index (track-then-storage order, matching
@@ -1390,7 +1439,7 @@ fn build_filter_complex(
         let final_pad = if gif { "vcomp" } else { "outv" };
         let last = video.len() - 1;
         for (n, (i, clip)) in video.iter().enumerate() {
-            chains.push(format!("[{i}:v]{chain}[v{i}]", i = i, chain = video_clip_chain(clip, fmt, &fx[*i])));
+            chains.push(format!("[{i}:v]{chain}[v{i}]", i = i, chain = video_clip_chain(clip, fmt, &fx[*i], is_image(clip))));
             let out = if n == last { final_pad.to_string() } else { format!("vov{n}") };
             let end = clip.timeline_end() + fx[*i].tail;
             let overlay = if clip.transform.is_identity() {
@@ -1548,7 +1597,7 @@ fn clip_seek(window_start: f64) -> f64 {
 /// transform geometry, color correction, fades and transition alpha. With all
 /// new properties at their defaults this reduces to the original
 /// fit-and-letterbox chain.
-fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
+fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
     // `transform_alpha` is alpha from opacity/rotation (established in the geometry
@@ -1561,8 +1610,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
     // tail is at the low end).
     let (trim_start, trim_end) = clip_source_window(clip, fx);
     // Relative to the input-side `-ss` (see `build_export_args_phase`): when the
-    // window is fast-seeked the trim starts at 0, otherwise it is unchanged.
-    let seek = clip_seek(trim_start);
+    // window is fast-seeked the trim starts at 0, otherwise it is unchanged. A still
+    // image is never seeked (it is `-loop`ed from t=0), so its trim stays absolute.
+    let seek = if is_image { 0.0 } else { clip_seek(trim_start) };
 
     let mut p: Vec<String> = Vec::new();
     p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
@@ -1709,11 +1759,15 @@ fn build_timeline_frame_args(
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
     for (clip, src) in &active {
-        let path = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?.path.clone();
-        args.push("-ss".to_string());
-        args.push(format!("{src:.3}"));
+        let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
+        // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
+        // it up); seeking into it decodes nothing, so skip the `-ss` for images.
+        if !asset.is_image() {
+            args.push("-ss".to_string());
+            args.push(format!("{src:.3}"));
+        }
         args.push("-i".to_string());
-        args.push(path);
+        args.push(asset.path.clone());
     }
 
     // Black base + each active clip's still chain, overlaid in order. With no
@@ -1932,6 +1986,7 @@ mod tests {
             fps: Some(fps),
             sample_rate: None,
             channels: None,
+            image: false,
         }
     }
 
@@ -1945,6 +2000,21 @@ mod tests {
             fps: None,
             sample_rate: Some(rate),
             channels: Some(channels),
+            image: false,
+        }
+    }
+
+    fn image_stream(w: u32, h: u32) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "png".into(),
+            width: Some(w),
+            height: Some(h),
+            fps: None,
+            sample_rate: None,
+            channels: None,
+            image: true,
         }
     }
 
@@ -2351,6 +2421,17 @@ mod tests {
         }
     }
 
+    fn img_asset(id: Uuid) -> Asset {
+        Asset {
+            id,
+            path: "/media/title.png".into(),
+            name: "title.png".into(),
+            duration: crate::model::DEFAULT_IMAGE_DURATION,
+            streams: vec![image_stream(1920, 1080)],
+            imported_at: Utc::now(),
+        }
+    }
+
     fn fmt_1080p() -> ExportFormat {
         ExportFormat {
             width: 1920,
@@ -2535,6 +2616,75 @@ mod tests {
         assert!(!args.contains(&"-ss".to_string()), "no seek for a head clip: {args:?}");
         let filter = flag_val(&args, "-filter_complex").unwrap();
         assert!(filter.contains("trim=start=0:end=10"), "{filter}");
+    }
+
+    #[test]
+    fn a_still_image_is_looped_not_seeked() {
+        let asset = img_asset(Uuid::new_v4());
+        // A full-length still placed deep in the timeline (t=12) — a non-image
+        // clip there would gain an `-ss`; a still must not.
+        let timeline = single(vec![make_clip(asset.id, 0.0, crate::model::DEFAULT_IMAGE_DURATION, 12.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+
+        assert!(!args.contains(&"-ss".to_string()), "a still is looped, never seeked: {args:?}");
+        let loop_pos = args.iter().position(|a| a == "-loop").expect("a -loop flag");
+        assert_eq!(args[loop_pos + 1], "1");
+        assert!(args.contains(&"-framerate".to_string()), "the looped still gets an input framerate");
+        // `-t` bounds how long the looped still is read — its source window end.
+        assert_eq!(flag_val(&args, "-t"), Some("5"));
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[i_pos + 1], "/media/title.png");
+        // No seek to subtract, so the trim window stays absolute, positioned at t=12.
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("trim=start=0:end=5"), "{filter}");
+        assert!(filter.contains("+12/TB"), "still composited at its timeline start: {filter}");
+    }
+
+    #[test]
+    fn a_trimmed_still_keeps_an_absolute_trim() {
+        let asset = img_asset(Uuid::new_v4());
+        // The user trimmed the still to its 1s..4s window — for a real video that
+        // window would be fast-seeked; for a still the trim stays absolute.
+        let timeline = single(vec![make_clip(asset.id, 1.0, 4.0, 0.0)]);
+        let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
+        assert!(!args.contains(&"-ss".to_string()));
+        assert_eq!(flag_val(&args, "-t"), Some("4"), "read the looped still up to source_out");
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("trim=start=1:end=4"), "absolute, not seek-relative: {filter}");
+    }
+
+    #[test]
+    fn timeline_frame_does_not_seek_a_still() {
+        let asset = img_asset(Uuid::new_v4());
+        let timeline = single(vec![make_clip(asset.id, 0.0, crate::model::DEFAULT_IMAGE_DURATION, 0.0)]);
+        // Composite at t=2: a still has one frame, so it must be read without `-ss`.
+        let args = build_timeline_frame_args(&timeline, &[asset], &ExportOptions::default(), 2.0, 640, 4).unwrap();
+        assert!(!args.contains(&"-ss".to_string()), "a still has one frame; don't seek it: {args:?}");
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[i_pos + 1], "/media/title.png");
+    }
+
+    #[test]
+    fn probe_flags_a_lone_still_image() {
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":1920,"height":1080,"r_frame_rate":"25/1"}],"format":{}}"#;
+        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        assert_eq!(r.duration, 0.0, "a still probes with no duration");
+        assert!(r.streams[0].image, "a lone, audio-less png is a still");
+    }
+
+    #[test]
+    fn probe_does_not_flag_ordinary_video() {
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"r_frame_rate":"30/1","duration":"12.0"}],"format":{"duration":"12.0"}}"#;
+        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        assert!(!r.streams[0].image);
+    }
+
+    #[test]
+    fn probe_does_not_flag_an_animated_gif() {
+        // A multi-frame gif probes with a real duration, so it is treated as video.
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"gif","width":480,"height":270,"r_frame_rate":"10/1"}],"format":{"duration":"3.0"}}"#;
+        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        assert!(!r.streams[0].image);
     }
 
     #[test]

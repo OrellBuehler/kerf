@@ -8,7 +8,7 @@
 	import { inTauri } from '$lib/api';
 	import { toast } from 'svelte-sonner';
 
-	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; tag: string };
+	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; image: boolean; tag: string };
 
 	let tab = $state<'bin' | 'tx'>('bin');
 
@@ -23,13 +23,15 @@
 	const assets = $derived<BinAsset[]>(
 		editor.assets.map((a) => {
 			const hasVideo = a.streams.some((s) => s.kind === 'video');
+			const isImage = a.streams.some((s) => s.image);
 			const primary = a.streams[0];
 			return {
 				id: a.id,
 				name: a.name,
 				dur: fmt(a.duration),
 				kind: hasVideo ? 'video' : 'audio',
-				tag: primary?.codec ?? (hasVideo ? 'video' : 'audio')
+				image: isImage,
+				tag: isImage ? 'image' : (primary?.codec ?? (hasVideo ? 'video' : 'audio'))
 			};
 		})
 	);
@@ -191,7 +193,7 @@
 									? 'var(--track-audio)'
 									: 'linear-gradient(135deg,#22303f,#33424f)'};display:grid;place-items:center;color:rgba(255,255,255,.8)"
 							>
-								<Icon n={a.kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
+								<Icon n={a.image ? 'image' : a.kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
 							</div>
 							<div style="flex:1;min-width:0">
 								<div
