@@ -420,9 +420,31 @@ impl Project {
     /// JPEG bytes (`quality` = ffmpeg `-q:v`), the canvas at most `max_width` px
     /// wide — what the edit looks like on screen at `t`, for an LLM to review.
     pub fn timeline_frame(&self, time_secs: f64, max_width: u32, quality: u8) -> Result<Vec<u8>> {
-        let timeline = self.timeline()?;
-        let assets = self.preview_assets()?;
-        engine::timeline_frame(&timeline, &assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
+        let (timeline, assets) = self.timeline_frame_inputs()?;
+        Self::composite_timeline_frame(&timeline, &assets, time_secs, max_width, quality)
+    }
+
+    /// The owned inputs the timeline-frame compositor needs (timeline + the
+    /// proxy-swapped preview asset list), resolved together so a caller can pull
+    /// them out under the project lock and then **drop the guard** before running
+    /// the slow ffmpeg composite — see [`Project::composite_timeline_frame`].
+    pub fn timeline_frame_inputs(&self) -> Result<(Timeline, Vec<Asset>)> {
+        Ok((self.timeline()?, self.preview_assets()?))
+    }
+
+    /// Composite a timeline still from already-resolved inputs, **without**
+    /// `&self` — so the GUI preview (which fetches frames continuously during
+    /// playback) can release the shared project lock before this ffmpeg decode,
+    /// instead of freezing every other op for its duration. Mirrors
+    /// [`Project::decode_preview_frame`]'s lock-free shape for single frames.
+    pub fn composite_timeline_frame(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        max_width: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>> {
+        engine::timeline_frame(timeline, assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
     }
 
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to

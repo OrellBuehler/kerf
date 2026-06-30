@@ -898,6 +898,17 @@ export async function getFrame(
 	return invoke<string>('get_frame', { assetId, timeSecs, maxWidth, accurate });
 }
 
+/**
+ * A JPEG `data:` URL for the **composited timeline** at `timeSecs` — every visible
+ * clip with its color / effects / transform / overlays applied, so the preview
+ * reflects Inspector edits. `null` outside the desktop app. Heavier than
+ * {@link getFrame} (a raw source decode), so callers should single-flight it.
+ */
+export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promise<string | null> {
+	if (!inTauri()) return null;
+	return invoke<string>('get_timeline_frame', { timeSecs, maxWidth });
+}
+
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {
 	if (!inTauri()) {
 		// Synthetic but deterministic peaks so the browser demo shows a waveform.

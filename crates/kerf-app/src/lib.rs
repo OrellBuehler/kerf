@@ -554,6 +554,22 @@ fn get_frame(
     Ok(format!("data:image/jpeg;base64,{b64}"))
 }
 
+/// The composited timeline still at `time_secs` — every visible clip put through
+/// the same color / effect / transform / overlay chain the export uses, so the
+/// preview reflects Inspector edits live (unlike `get_frame`, a raw source decode).
+#[tauri::command]
+fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
+    // Resolve the inputs under the lock, then *drop the guard* before the ffmpeg
+    // composite — the preview fetches frames continuously during playback, and
+    // holding the shared Project mutex for the whole decode would freeze every
+    // other op (timeline edits, MCP, the next scrub frame). Mirrors `get_frame`.
+    let (timeline, assets) = state.project()?.timeline_frame_inputs().map_err(|e| e.to_string())?;
+    let jpeg = Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width.unwrap_or(960), 4)
+        .map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+    Ok(format!("data:image/jpeg;base64,{b64}"))
+}
+
 #[tauri::command]
 fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
@@ -836,6 +852,7 @@ pub fn run() {
             redo,
             revert_to,
             get_frame,
+            get_timeline_frame,
             get_waveform,
             get_energy,
             list_tasks,

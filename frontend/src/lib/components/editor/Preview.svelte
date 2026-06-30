@@ -3,7 +3,7 @@
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { getFrame } from '$lib/api';
+	import { getTimelineFrame } from '$lib/api';
 	import { clipDuration } from '$lib/types';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
@@ -55,60 +55,44 @@
 
 	let frameUrl = $state<string | null>(null);
 	let inFlight = false;
-	let queued: { assetId: string; srcTime: number; accurate: boolean } | null = null;
-	let settle: ReturnType<typeof setTimeout> | null = null;
+	let queued: number | null = null; // latest wanted timeline time, or null to clear
 
-	// Single-flight decode: only ever one frame request in flight, and `queued`
-	// always holds the *latest* wanted frame. Scrubbing collapses to one decode +
-	// one pending target instead of a backlog of stale frames that must all drain
-	// before the frame under the cursor appears (the cause of multi-second lag).
+	// Single-flight decode: only ever one composite in flight, and `queued` always
+	// holds the *latest* wanted timeline time. Scrubbing/playback collapses to one
+	// render + one pending target instead of a backlog of stale frames that must
+	// all drain before the frame under the cursor appears (the cause of lag).
 	async function pump() {
-		if (inFlight || !queued) return;
-		const { assetId, srcTime, accurate } = queued;
+		if (inFlight || queued === null) return;
+		const t = queued;
 		queued = null;
 		inFlight = true;
 		try {
-			const url = await getFrame(assetId, srcTime, 960, accurate);
+			// The *composited* timeline still — every visible clip with its color,
+			// effects, transform and overlays applied, so Inspector edits show up
+			// live. (Desktop only — null in the browser.)
+			const url = await getTimelineFrame(t, 960);
 			if (url) frameUrl = url;
 		} catch {
 			/* ignore decode errors — keep the last good frame */
 		}
 		inFlight = false;
-		if (queued) pump(); // a newer target arrived mid-decode — go to the latest
+		if (queued !== null) pump(); // a newer target arrived mid-decode — go to it
 	}
 
-	// Keep the preview frame in step with the playhead. While it moves (scrub or
-	// playback) we request a *rough* keyframe-snapped frame — fast even on long-GOP
-	// 4K. Once it settles (no change for ~150ms, and not mid-playback) we request
-	// the exact frame to correct the snap. (Desktop only — getFrame is null in browser.)
+	// Keep the preview in step with the playhead *and* the edit state: re-render on
+	// every playhead move, on every timeline change (an Inspector edit reassigns
+	// `editor.timeline`), and when a proxy becomes ready.
 	$effect(() => {
-		const target = atPlayhead;
-		// Re-run when a proxy becomes ready so the still re-decodes from it.
+		const t = ui.time;
+		void editor.timeline;
 		void ui.previewEpoch;
-		if (settle) {
-			clearTimeout(settle);
-			settle = null;
-		}
-		if (!target) {
+		if (!hasClips) {
 			frameUrl = null;
 			queued = null;
 			return;
 		}
-		queued = { assetId: target.assetId, srcTime: target.srcTime, accurate: false };
+		queued = t;
 		pump();
-		if (!ui.playing) {
-			settle = setTimeout(() => {
-				settle = null;
-				queued = { assetId: target.assetId, srcTime: target.srcTime, accurate: true };
-				pump();
-			}, 150);
-		}
-		return () => {
-			if (settle) {
-				clearTimeout(settle);
-				settle = null;
-			}
-		};
 	});
 
 	function scrub(e: MouseEvent) {
