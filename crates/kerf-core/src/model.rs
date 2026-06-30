@@ -314,6 +314,237 @@ pub struct Transition {
     pub duration: f64,
 }
 
+/// A per-clip video effect, realized as a filter inserted into the clip's video
+/// chain at export (after color correction). The order in `Clip::effects` is the
+/// order they are applied. `ChromaKey` is the one effect that establishes an
+/// alpha channel, so the clip composites with transparency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VideoEffect {
+    /// Gaussian blur (`gblur`); larger `sigma` = softer.
+    Blur { sigma: f64 },
+    /// Unsharp-mask sharpen; `amount` is the luma strength.
+    Sharpen { amount: f64 },
+    /// Desaturate to grayscale.
+    Grayscale,
+    /// Invert colors (negative).
+    Invert,
+    /// Darken the frame edges.
+    Vignette,
+    /// Key out a color to transparency (green/blue screen). `color` is any ffmpeg
+    /// color (e.g. `green`, `0x00ff00`); `similarity`/`blend` in 0.0–1.0.
+    ChromaKey { color: String, similarity: f64, blend: f64 },
+}
+
+impl VideoEffect {
+    /// True when applying this effect leaves the frame with an alpha channel.
+    pub fn produces_alpha(&self) -> bool {
+        matches!(self, VideoEffect::ChromaKey { .. })
+    }
+}
+
+/// A per-clip audio effect, realized as a filter inserted into the clip's audio
+/// chain at export (after the clip gain). The order in `Clip::audio` is the order
+/// they are applied. Thresholds/gains are in dB at the model boundary and
+/// converted to the linear units ffmpeg's dynamics filters want by the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AudioEffect {
+    /// High-pass: attenuate below `hz` (cut rumble / handling noise).
+    Highpass { hz: f64 },
+    /// Low-pass: attenuate above `hz` (cut hiss).
+    Lowpass { hz: f64 },
+    /// Single parametric EQ band at `hz`, `width` Hz wide, `gain_db` boost/cut.
+    Equalizer { hz: f64, width: f64, gain_db: f64 },
+    /// Dynamic-range compressor.
+    Compressor {
+        threshold_db: f64,
+        ratio: f64,
+        attack_ms: f64,
+        release_ms: f64,
+        makeup_db: f64,
+    },
+    /// Noise gate: silence audio below `threshold_db`.
+    Gate { threshold_db: f64 },
+}
+
+fn half() -> f64 {
+    0.5
+}
+fn lower_third_y() -> f64 {
+    0.82
+}
+fn default_text_size() -> f64 {
+    0.06
+}
+fn default_text_color() -> String {
+    "white".to_string()
+}
+
+/// One keyframe of a clip's animated transform: the value of each animatable
+/// channel at `time` (seconds from the clip's start). With two or more keyframes
+/// the engine interpolates linearly between them and renders the motion with
+/// per-frame ffmpeg expressions; crop and the rest of the static [`Transform`]
+/// are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Keyframe {
+    /// Offset from the clip's `timeline_start`, in seconds.
+    pub time: f64,
+    #[serde(default = "one")]
+    pub scale: f64,
+    #[serde(default)]
+    pub pos_x: f64,
+    #[serde(default)]
+    pub pos_y: f64,
+    #[serde(default)]
+    pub rotation: f64,
+    #[serde(default = "one")]
+    pub opacity: f64,
+}
+
+impl Keyframe {
+    /// A keyframe at `time` carrying the values of `transform`'s animatable
+    /// channels (the static defaults for a fresh keyframe).
+    pub fn from_transform(time: f64, t: &Transform) -> Self {
+        Self {
+            time,
+            scale: t.scale,
+            pos_x: t.pos_x,
+            pos_y: t.pos_y,
+            rotation: t.rotation,
+            opacity: t.opacity,
+        }
+    }
+}
+
+/// One keyframe of an animated [`TextOverlay`]: position and opacity at `time`
+/// (seconds from the overlay's `start`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextKeyframe {
+    pub time: f64,
+    #[serde(default = "half")]
+    pub pos_x: f64,
+    #[serde(default = "lower_third_y")]
+    pub pos_y: f64,
+    #[serde(default = "one")]
+    pub opacity: f64,
+}
+
+/// A timed text element drawn over the composited picture at export (titles,
+/// lower-thirds, captions, watermarks). Positions are fractions of the output
+/// frame with the text centered on `(pos_x, pos_y)`; `size` is the font height
+/// as a fraction of the frame height. Rendered with `drawtext`. Captions are
+/// just a batch of these generated from a transcript (see
+/// `Project::captions_from_transcript`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextOverlay {
+    pub id: Uuid,
+    pub text: String,
+    /// When the overlay appears / disappears, in timeline seconds.
+    pub start: f64,
+    pub end: f64,
+    #[serde(default = "half")]
+    pub pos_x: f64,
+    #[serde(default = "lower_third_y")]
+    pub pos_y: f64,
+    /// Font height as a fraction of the frame height.
+    #[serde(default = "default_text_size")]
+    pub size: f64,
+    /// Any ffmpeg color (e.g. `white`, `#ffcc00`, `yellow@0.9`).
+    #[serde(default = "default_text_color")]
+    pub color: String,
+    /// Optional box color behind the text (e.g. `black@0.5`); `None` = no box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default)]
+    pub bold: bool,
+    /// Optional position/opacity animation; with ≥1 keyframe the position and
+    /// opacity animate over the overlay's lifetime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<TextKeyframe>,
+}
+
+impl TextOverlay {
+    pub fn new(text: impl Into<String>, start: f64, end: f64) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            text: text.into(),
+            start,
+            end,
+            pos_x: 0.5,
+            pos_y: 0.82,
+            size: 0.06,
+            color: "white".to_string(),
+            bg: None,
+            bold: false,
+            keyframes: Vec::new(),
+        }
+    }
+
+    /// Sample `(pos_x, pos_y, opacity)` at timeline time `t`. Static fields when
+    /// the overlay is not animated; the interpolated keyframe values otherwise.
+    /// Used by the still / preview path, which can't evaluate the export's
+    /// per-frame `drawtext` expressions.
+    pub fn sample(&self, t: f64) -> (f64, f64, f64) {
+        if self.keyframes.is_empty() {
+            return (self.pos_x, self.pos_y, 1.0);
+        }
+        let local = t - self.start;
+        let chan = |get: fn(&TextKeyframe) -> f64, fallback: f64| {
+            interpolate(&self.keyframes.iter().map(|k| (k.time, get(k))).collect::<Vec<_>>(), local).unwrap_or(fallback)
+        };
+        (chan(|k| k.pos_x, self.pos_x), chan(|k| k.pos_y, self.pos_y), chan(|k| k.opacity, 1.0))
+    }
+}
+
+/// Linearly interpolate a channel of `(time, value)` keyframes at `at`, holding
+/// the end values flat beyond the first / last keyframe. Empty input → `None`.
+pub fn interpolate(points: &[(f64, f64)], at: f64) -> Option<f64> {
+    match points {
+        [] => None,
+        [single] => Some(single.1),
+        _ => {
+            if at <= points[0].0 {
+                return Some(points[0].1);
+            }
+            for pair in points.windows(2) {
+                let (t0, v0) = pair[0];
+                let (t1, v1) = pair[1];
+                if at < t1 {
+                    if t1 <= t0 {
+                        return Some(v0);
+                    }
+                    return Some(v0 + (v1 - v0) * (at - t0) / (t1 - t0));
+                }
+            }
+            Some(points[points.len() - 1].1)
+        }
+    }
+}
+
+/// Render a transcript as a SubRip (`.srt`) subtitle document.
+pub fn transcript_to_srt(segments: &[TranscriptSegment]) -> String {
+    fn ts(seconds: f64) -> String {
+        let s = seconds.max(0.0);
+        let ms = (s * 1000.0).round() as u64;
+        let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+        let (m, rem) = (rem / 60_000, rem % 60_000);
+        let (sec, milli) = (rem / 1000, rem % 1000);
+        format!("{h:02}:{m:02}:{sec:02},{milli:03}")
+    }
+    let mut out = String::new();
+    for (i, seg) in segments.iter().enumerate() {
+        out.push_str(&format!(
+            "{n}\n{start} --> {end}\n{text}\n\n",
+            n = i + 1,
+            start = ts(seg.start),
+            end = ts(seg.end),
+            text = seg.text.trim(),
+        ));
+    }
+    out
+}
+
 /// A single non-destructive edit referencing a source range of an asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Clip {
@@ -348,6 +579,17 @@ pub struct Clip {
     /// Transition blending this clip's start with the preceding clip, if any.
     #[serde(default)]
     pub transition_in: Option<Transition>,
+    /// Video effects applied in order at export (blur, chroma key, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<VideoEffect>,
+    /// Audio effects applied in order at export (EQ, compressor, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<AudioEffect>,
+    /// Transform animation. Empty = the static `transform` is used; otherwise the
+    /// engine interpolates these keyframes to animate scale / position / rotation
+    /// / opacity over the clip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<Keyframe>,
 }
 
 /// Smallest speed magnitude allowed, to keep clip durations finite.
@@ -370,7 +612,55 @@ impl Clip {
             transform: Transform::default(),
             color: Color::default(),
             transition_in: None,
+            effects: Vec::new(),
+            audio: Vec::new(),
+            keyframes: Vec::new(),
         }
+    }
+
+    /// True when the clip carries transform keyframes (i.e. is animated).
+    pub fn is_animated(&self) -> bool {
+        !self.keyframes.is_empty()
+    }
+
+    /// The clip's keyframes sorted by time (the stored order is kept sorted by
+    /// the editing op, but render code must not assume it).
+    pub fn sorted_keyframes(&self) -> Vec<Keyframe> {
+        let mut k = self.keyframes.clone();
+        k.sort_by(|a, b| a.time.total_cmp(&b.time));
+        k
+    }
+
+    /// Sample the (possibly animated) transform at `local` seconds from the
+    /// clip's start: the static [`Transform`] with its animatable channels
+    /// (scale / position / rotation / opacity) overridden by the interpolated
+    /// keyframe values when the clip is animated. Used by the still / preview
+    /// path, which cannot evaluate the export's per-frame expressions.
+    pub fn transform_at(&self, local: f64) -> Transform {
+        let mut t = self.transform;
+        if self.keyframes.is_empty() {
+            return t;
+        }
+        let k = self.sorted_keyframes();
+        let chan = |get: fn(&Keyframe) -> f64| {
+            interpolate(&k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>(), local)
+        };
+        if let Some(v) = chan(|kf| kf.scale) {
+            t.scale = v;
+        }
+        if let Some(v) = chan(|kf| kf.pos_x) {
+            t.pos_x = v;
+        }
+        if let Some(v) = chan(|kf| kf.pos_y) {
+            t.pos_y = v;
+        }
+        if let Some(v) = chan(|kf| kf.rotation) {
+            t.rotation = v;
+        }
+        if let Some(v) = chan(|kf| kf.opacity) {
+            t.opacity = v;
+        }
+        t
     }
 
     /// Length of the referenced source span (seconds), ignoring speed.
@@ -463,10 +753,13 @@ pub struct Revision {
     pub current: bool,
 }
 
-/// The non-destructive timeline (EDL): a set of multi-kind tracks.
+/// The non-destructive timeline (EDL): a set of multi-kind tracks plus the text
+/// overlays (titles / lower-thirds / captions) drawn over the composited picture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<TextOverlay>,
 }
 
 impl Default for Timeline {
@@ -493,7 +786,12 @@ impl Timeline {
                     clips: Vec::new(),
                 },
             ],
+            overlays: Vec::new(),
         }
+    }
+
+    pub fn overlay(&self, id: Uuid) -> Option<&TextOverlay> {
+        self.overlays.iter().find(|o| o.id == id)
     }
 
     pub fn track(&self, id: Uuid) -> Option<&Track> {

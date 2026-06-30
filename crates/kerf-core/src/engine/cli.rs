@@ -14,7 +14,10 @@ use std::sync::{Mutex, OnceLock};
 
 use super::ProbeResult;
 use crate::error::{Error, Result};
-use crate::model::{Asset, Clip, StreamInfo, StreamKind, TimeRange, Timeline, TransitionKind, Transform};
+use crate::model::{
+    Asset, AudioEffect, Clip, Color, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, TransitionKind, Transform,
+    VideoEffect,
+};
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
 /// pure function of (source path, time, filter, codec, quality), so caching is
@@ -2001,9 +2004,16 @@ fn build_filter_complex(
             pf = fmt.pix_fmt,
         ));
         let mut cur = "vbase".to_string();
-        // For gif the composite lands on `vcomp`, then palettegen / paletteuse
-        // produce the real `[outv]`; otherwise the last overlay is `[outv]`.
-        let final_pad = if gif { "vcomp" } else { "outv" };
+        let draw = !timeline.overlays.is_empty();
+        // The composite lands on `vcomp` for gif (palettegen follows), on `vtext`
+        // when text overlays will be drawn on top, else directly on `[outv]`.
+        let composite_pad = if draw {
+            "vtext"
+        } else if gif {
+            "vcomp"
+        } else {
+            "outv"
+        };
         let last = video.len() - 1;
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
@@ -2014,9 +2024,21 @@ fn build_filter_complex(
                 format!("{input}:v")
             };
             chains.push(format!("[{src}]{chain}[v{flat}]", chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip))));
-            let out = if n == last { final_pad.to_string() } else { format!("vov{n}") };
+            let out = if n == last { composite_pad.to_string() } else { format!("vov{n}") };
             let end = clip.timeline_end() + fx[*flat].tail;
-            let overlay = if clip.transform.is_identity() {
+            let overlay = if clip.is_animated() {
+                // Animated picture position: per-frame overlay x / y expressions.
+                let kf = clip.sorted_keyframes();
+                let xs: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_x)).collect();
+                let ys: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_y)).collect();
+                format!(
+                    "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H:\
+                     eof_action=pass:enable='between(t,{start},{end})'",
+                    px = keyframe_expr(&xs, "t", clip.timeline_start),
+                    py = keyframe_expr(&ys, "t", clip.timeline_start),
+                    start = clip.timeline_start,
+                )
+            } else if clip.transform.is_identity() {
                 format!("overlay=eof_action=pass:enable='between(t,{start},{end})'", start = clip.timeline_start)
             } else {
                 let t = &clip.transform;
@@ -2030,6 +2052,18 @@ fn build_filter_complex(
             };
             chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
             cur = out;
+        }
+        // Text overlays (titles / lower-thirds / captions) drawn on the composited
+        // picture in order; the last produces the gif source `vcomp` or `[outv]`.
+        if draw {
+            let mut tcur = composite_pad.to_string();
+            let last_o = timeline.overlays.len() - 1;
+            let text_final = if gif { "vcomp" } else { "outv" };
+            for (oi, ov) in timeline.overlays.iter().enumerate() {
+                let out = if oi == last_o { text_final.to_string() } else { format!("vtxt{oi}") };
+                chains.push(format!("[{tcur}]{f}[{out}]", f = drawtext_export(ov, fmt)));
+                tcur = out;
+            }
         }
         if gif {
             // A two-stream palette gives far better color than the default 216-color
@@ -2172,17 +2206,191 @@ fn clip_seek(window_start: f64) -> f64 {
     }
 }
 
+/// Format an f64 for an ffmpeg filter argument / expression (Rust's default
+/// `{}` avoids scientific notation for the ranges used here; `-0` is normalized).
+fn fnum(v: f64) -> String {
+    let s = format!("{v}");
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
+/// Build a piecewise-linear ffmpeg expression over **clip-local time** for a
+/// channel of keyframes. `points` are `(seconds_from_clip_start, value)` and are
+/// sorted here. `tvar` is the time variable the target filter exposes (`t` for
+/// overlay / scale / rotate, `T` for geq); `start` is the clip's `timeline_start`
+/// so the expression reads time relative to the clip. Values hold flat before the
+/// first and after the last keyframe.
+fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
+    let mut pts = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if pts.is_empty() {
+        return "0".to_string();
+    }
+    if pts.len() == 1 {
+        return fnum(pts[0].1);
+    }
+    let lt = format!("({tvar}-{})", fnum(start));
+    // Fold segments in from the end; `expr` starts as the value held after the
+    // last keyframe.
+    let mut expr = fnum(pts[pts.len() - 1].1);
+    for w in (0..pts.len() - 1).rev() {
+        let (t0, v0) = pts[w];
+        let (t1, v1) = pts[w + 1];
+        let seg = if (t1 - t0).abs() < 1e-9 {
+            fnum(v0)
+        } else {
+            format!(
+                "({v0}+({dv})*({lt}-{t0})/({dt}))",
+                v0 = fnum(v0),
+                dv = fnum(v1 - v0),
+                lt = lt,
+                t0 = fnum(t0),
+                dt = fnum(t1 - t0),
+            )
+        };
+        expr = format!("if(lt({lt},{t1}),{seg},{expr})", lt = lt, t1 = fnum(t1), seg = seg, expr = expr);
+    }
+    // Hold the first value before the first keyframe.
+    format!("if(lt({lt},{t0}),{v0},{expr})", lt = lt, t0 = fnum(pts[0].0), v0 = fnum(pts[0].1), expr = expr)
+}
+
+fn db_to_linear(db: f64) -> f64 {
+    10f64.powf(db / 20.0)
+}
+
+/// The filter for a non-alpha video effect, or `None` for chroma key (which
+/// establishes alpha and is emitted separately, after the alpha plane exists).
+fn video_effect_filter(e: &VideoEffect) -> Option<String> {
+    Some(match e {
+        VideoEffect::Blur { sigma } => format!("gblur=sigma={}", fnum(*sigma)),
+        VideoEffect::Sharpen { amount } => {
+            format!("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={}", fnum(*amount))
+        }
+        VideoEffect::Grayscale => "hue=s=0".to_string(),
+        VideoEffect::Invert => "negate".to_string(),
+        VideoEffect::Vignette => "vignette".to_string(),
+        VideoEffect::ChromaKey { .. } => return None,
+    })
+}
+
+/// The `chromakey` filter for a chroma-key effect, or `None` for any other.
+fn chroma_filter(e: &VideoEffect) -> Option<String> {
+    match e {
+        VideoEffect::ChromaKey { color, similarity, blend } => {
+            Some(format!("chromakey={color}:{}:{}", fnum(*similarity), fnum(*blend)))
+        }
+        _ => None,
+    }
+}
+
+/// The filter for one audio effect. dB thresholds / make-up gain are converted to
+/// the linear units ffmpeg's dynamics filters expect.
+fn audio_effect_filter(e: &AudioEffect) -> String {
+    match e {
+        AudioEffect::Highpass { hz } => format!("highpass=f={}", fnum(*hz)),
+        AudioEffect::Lowpass { hz } => format!("lowpass=f={}", fnum(*hz)),
+        AudioEffect::Equalizer { hz, width, gain_db } => {
+            format!("equalizer=f={}:width_type=h:width={}:g={}", fnum(*hz), fnum(*width), fnum(*gain_db))
+        }
+        AudioEffect::Compressor { threshold_db, ratio, attack_ms, release_ms, makeup_db } => format!(
+            "acompressor=threshold={}:ratio={}:attack={}:release={}:makeup={}",
+            fnum(db_to_linear(*threshold_db)),
+            fnum(*ratio),
+            fnum(*attack_ms),
+            fnum(*release_ms),
+            fnum(db_to_linear(*makeup_db)),
+        ),
+        AudioEffect::Gate { threshold_db } => format!("agate=threshold={}", fnum(db_to_linear(*threshold_db))),
+    }
+}
+
+/// Escape user text for a single-quoted `drawtext` value inside a filtergraph
+/// passed as one argv argument: backslashes (drawtext layer), then apostrophes
+/// (filtergraph single-quote layer). Newlines collapse to spaces — drawtext here
+/// is single-line.
+fn escape_drawtext(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', " ").replace('\'', "'\\''")
+}
+
+/// `drawtext` options shared by the export and still paths (text, size, color,
+/// bold approximation, box) — everything except position / alpha / enable.
+/// `frame_h` is the target canvas height (export height, or the still's height).
+fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
+    let fontsize = (frame_h * o.size).round().max(1.0);
+    let mut parts = vec![
+        format!("text='{}'", escape_drawtext(&o.text)),
+        format!("fontsize={}", fnum(fontsize)),
+        format!("fontcolor={}", o.color),
+    ];
+    if o.bold {
+        // No font-file dependency: a same-color border thickens the glyphs.
+        parts.push("borderw=2".to_string());
+        parts.push(format!("bordercolor={}", o.color));
+    }
+    if let Some(bg) = &o.bg {
+        parts.push("box=1".to_string());
+        parts.push(format!("boxcolor={bg}"));
+        parts.push("boxborderw=12".to_string());
+    }
+    parts
+}
+
+/// The export-path `drawtext` for an overlay: `enable`-gated to its lifetime,
+/// with per-frame position / alpha expressions when it is animated.
+fn drawtext_export(o: &TextOverlay, fmt: &ExportFormat) -> String {
+    let mut parts = drawtext_common(o, fmt.height as f64);
+    if o.keyframes.is_empty() {
+        parts.push(format!("x=(w*{}-text_w/2)", fnum(o.pos_x)));
+        parts.push(format!("y=(h*{}-text_h/2)", fnum(o.pos_y)));
+    } else {
+        let xs: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_x)).collect();
+        let ys: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_y)).collect();
+        let al: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.opacity)).collect();
+        parts.push(format!("x=(w*({})-text_w/2)", keyframe_expr(&xs, "t", o.start)));
+        parts.push(format!("y=(h*({})-text_h/2)", keyframe_expr(&ys, "t", o.start)));
+        parts.push(format!("alpha='{}'", keyframe_expr(&al, "t", o.start)));
+    }
+    parts.push(format!("enable='between(t,{},{})'", fnum(o.start), fnum(o.end)));
+    format!("drawtext={}", parts.join(":"))
+}
+
+/// The still-path `drawtext` for an overlay active at time `t`: position / alpha
+/// sampled to constants (the still pipeline has no timeline clock), no `enable`.
+fn drawtext_still(o: &TextOverlay, frame_h: u32, t: f64) -> String {
+    let mut parts = drawtext_common(o, frame_h as f64);
+    let (px, py, op) = o.sample(t);
+    parts.push(format!("x=(w*{}-text_w/2)", fnum(px)));
+    parts.push(format!("y=(h*{}-text_h/2)", fnum(py)));
+    if op < 1.0 {
+        parts.push(format!("alpha={}", fnum(op)));
+    }
+    format!("drawtext={}", parts.join(":"))
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, fit or
-/// transform geometry, color correction, fades and transition alpha. With all
-/// new properties at their defaults this reduces to the original
-/// fit-and-letterbox chain.
+/// transform geometry, color correction, per-clip video effects, keyframe
+/// animation, fades and transition alpha. With all properties at their defaults
+/// this reduces to the original fit-and-letterbox chain.
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
-    // `transform_alpha` is alpha from opacity/rotation (established in the geometry
-    // step); `needs_alpha` also covers the crossfade alpha dissolve.
-    let transform_alpha = !t.is_identity() && t.needs_alpha();
+    let anim = clip.is_animated();
+    let kf = clip.sorted_keyframes();
+    // Which animated channels actually move (so alpha / per-frame geometry is only
+    // forced when needed). A keyframed clip's scale / position always come from the
+    // keyframes (a fresh keyframe captures the static transform), so `anim` alone
+    // drives the geometry; rotation / opacity additionally need an alpha plane.
+    let anim_rotation = anim && kf.iter().any(|k| k.rotation != 0.0);
+    let anim_opacity = anim && kf.iter().any(|k| k.opacity < 1.0);
+    let chroma = clip.effects.iter().any(|e| e.produces_alpha());
+    // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
+    // chroma key, or a crossfade dissolve.
+    let transform_alpha =
+        (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
     let needs_alpha = transform_alpha || fx.xfade_in > 0.0;
     let dur = clip.duration() + fx.tail;
     // A crossfade tail borrows unused source: forward clips extend past source_out,
@@ -2210,14 +2418,18 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
     }
     let sf = fmt.scale_flags();
-    if t.is_identity() {
-        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
+    // A keyframed clip is treated as non-identity so its picture is centered by
+    // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
+    let geom_identity = t.is_identity() && !anim;
+    p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
+    if geom_identity {
         p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
-    } else {
-        p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
-        if (t.scale - 1.0).abs() > 1e-9 {
-            p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
-        }
+    } else if anim {
+        // Per-frame zoom: re-evaluate the scale expression every frame.
+        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(), "t", clip.timeline_start);
+        p.push(format!("scale=w='iw*({expr})':h='ih*({expr})':eval=frame{sf}"));
+    } else if (t.scale - 1.0).abs() > 1e-9 {
+        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
     }
     p.push("setsar=1".to_string());
     p.push(format!("fps={}", fmt.fps));
@@ -2231,17 +2443,40 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             c.brightness, c.contrast, c.saturation, c.gamma
         ));
     }
-    if !t.is_identity() {
-        if transform_alpha {
-            p.push("format=yuva420p".to_string());
+    // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
+    // applied in author order, before any alpha plane.
+    for e in &clip.effects {
+        if let Some(f) = video_effect_filter(e) {
+            p.push(f);
         }
-        if t.opacity < 1.0 {
-            p.push(format!("colorchannelmixer=aa={}", t.opacity));
+    }
+    // Establish alpha once, before any alpha-producing step (chroma key, opacity,
+    // rotation fill, crossfade dissolve).
+    if needs_alpha {
+        p.push("format=yuva420p".to_string());
+    }
+    // Chroma key (color → transparency) after alpha is available.
+    for e in &clip.effects {
+        if let Some(f) = chroma_filter(e) {
+            p.push(f);
         }
-        if t.rotation != 0.0 {
-            let rad = t.rotation.to_radians();
-            p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
-        }
+    }
+    // Opacity: animated via a per-frame geq alpha (geq's time var is `T`), else a
+    // constant alpha mix.
+    if anim_opacity {
+        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(), "T", clip.timeline_start);
+        p.push(format!("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"));
+    } else if !anim && t.opacity < 1.0 {
+        p.push(format!("colorchannelmixer=aa={}", t.opacity));
+    }
+    // Rotation: animated angle expression (degrees → radians), else a constant
+    // rotate. Animated rotation uses a fixed bounding box (the frame diagonal).
+    if anim_rotation {
+        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.rotation)).collect::<Vec<_>>(), "t", clip.timeline_start);
+        p.push(format!("rotate=a='({expr})*PI/180':fillcolor=none:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"));
+    } else if !anim && t.rotation != 0.0 {
+        let rad = t.rotation.to_radians();
+        p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
     let fi = clip.fade_in + fx.black_in;
     let fo = clip.fade_out + fx.black_out;
@@ -2252,9 +2487,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         p.push(format!("fade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
     if fx.xfade_in > 0.0 {
-        if !transform_alpha {
-            p.push("format=yuva420p".to_string());
-        }
+        // The alpha plane is already established above (xfade implies needs_alpha).
         p.push(format!("fade=t=in:st=0:d={}:alpha=1", fx.xfade_in.clamp(0.0, dur)));
     }
     if !needs_alpha {
@@ -2350,23 +2583,31 @@ fn build_timeline_frame_args(
         args.push(asset.path.clone());
     }
 
-    // Black base + each active clip's still chain, overlaid in order. With no
-    // visible clip the bare canvas is the output (a gap renders black).
+    // Black base + each active clip's still chain (its transform sampled at `t`,
+    // so a keyframed clip shows its pose), overlaid in order, then the text
+    // overlays live at `t`. A trailing `null` makes the final label always
+    // `[outv]` (so an empty timeline still maps cleanly).
+    let live: Vec<&TextOverlay> = timeline.overlays.iter().filter(|o| t >= o.start && t < o.end).collect();
     let sf = fmt.scale_flags();
-    let filter = if active.is_empty() {
-        format!("color=c=black:s={ow}x{oh}:d=0.1[outv]")
-    } else {
-        let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
-        let mut cur = "base".to_string();
-        let last = active.len() - 1;
-        for (n, (clip, _)) in active.iter().enumerate() {
-            chains.push(format!("[{n}:v]{chain}[v{n}]", chain = still_clip_chain(clip, ow, oh, &sf)));
-            let out = if n == last { "outv".to_string() } else { format!("ov{n}") };
-            chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&clip.transform)));
-            cur = out;
-        }
-        chains.join(";")
-    };
+    let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
+    let mut cur = "base".to_string();
+    for (n, (clip, _)) in active.iter().enumerate() {
+        let tf = clip.transform_at((t - clip.timeline_start).max(0.0));
+        chains.push(format!(
+            "[{n}:v]{chain}[v{n}]",
+            chain = still_clip_chain(&tf, &clip.color, &clip.effects, ow, oh, &sf)
+        ));
+        let out = format!("ov{n}");
+        chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
+        cur = out;
+    }
+    for (oi, ov) in live.iter().enumerate() {
+        let out = format!("txt{oi}");
+        chains.push(format!("[{cur}]{f}[{out}]", f = drawtext_still(ov, oh, t)));
+        cur = out;
+    }
+    chains.push(format!("[{cur}]null[outv]"));
+    let filter = chains.join(";");
 
     args.extend([
         "-filter_complex".to_string(),
@@ -2390,40 +2631,47 @@ fn build_timeline_frame_args(
 /// single decoded frame, then apply the same crop / fit-or-transform / color /
 /// opacity / rotation geometry as [`video_clip_chain`], minus every time-domain
 /// step (trim/setpts/fps/fades) since the `-ss` input seek already positioned it.
-fn still_clip_chain(clip: &Clip, ow: u32, oh: u32, sf: &str) -> String {
-    let t = &clip.transform;
-    let transform_alpha = !t.is_identity() && t.needs_alpha();
+fn still_clip_chain(tf: &Transform, color: &Color, effects: &[VideoEffect], ow: u32, oh: u32, sf: &str) -> String {
+    let chroma = effects.iter().any(|e| e.produces_alpha());
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma;
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
-    if t.has_crop() {
-        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
-        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
-        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = t.crop_left, ct = t.crop_top));
+    if tf.has_crop() {
+        let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
+        let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
+        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = tf.crop_left, ct = tf.crop_top));
     }
     p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}"));
-    if t.is_identity() {
+    if tf.is_identity() {
         p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
-    } else if (t.scale - 1.0).abs() > 1e-9 {
-        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
+    } else if (tf.scale - 1.0).abs() > 1e-9 {
+        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = tf.scale));
     }
     p.push("setsar=1".to_string());
-    if !clip.color.is_identity() {
-        let c = &clip.color;
+    if !color.is_identity() {
         p.push(format!(
             "eq=brightness={}:contrast={}:saturation={}:gamma={}",
-            c.brightness, c.contrast, c.saturation, c.gamma
+            color.brightness, color.contrast, color.saturation, color.gamma
         ));
     }
-    if !t.is_identity() {
-        if transform_alpha {
-            p.push("format=yuva420p".to_string());
+    for e in effects {
+        if let Some(f) = video_effect_filter(e) {
+            p.push(f);
         }
-        if t.opacity < 1.0 {
-            p.push(format!("colorchannelmixer=aa={}", t.opacity));
+    }
+    if needs_alpha {
+        p.push("format=yuva420p".to_string());
+    }
+    for e in effects {
+        if let Some(f) = chroma_filter(e) {
+            p.push(f);
         }
-        if t.rotation != 0.0 {
-            let rad = t.rotation.to_radians();
-            p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
-        }
+    }
+    if tf.opacity < 1.0 {
+        p.push(format!("colorchannelmixer=aa={}", tf.opacity));
+    }
+    if tf.rotation != 0.0 {
+        let rad = tf.rotation.to_radians();
+        p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
     p.join(",")
 }
@@ -2463,6 +2711,11 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) 
         p.push(atempo_chain(s));
     }
     p.push(format!("volume={}", clip.volume));
+    // Per-clip audio effects (EQ / compressor / gate / filters) in author order,
+    // after the clip gain.
+    for e in &clip.audio {
+        p.push(audio_effect_filter(e));
+    }
     if fi > 0.0 {
         p.push(format!("afade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
     }
@@ -2778,7 +3031,7 @@ mod tests {
 
     #[test]
     fn export_format_falls_back_to_defaults() {
-        let timeline = Timeline { tracks: Vec::new() };
+        let timeline = Timeline { tracks: Vec::new(), overlays: Vec::new() };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.channel_layout(), "stereo");
@@ -2822,12 +3075,145 @@ mod tests {
     }
 
     fn timeline_of(tracks: Vec<Track>) -> Timeline {
-        Timeline { tracks }
+        Timeline { tracks, overlays: Vec::new() }
     }
 
     /// A timeline with a single video track holding `clips`.
     fn single(clips: Vec<Clip>) -> Timeline {
         timeline_of(vec![video_track(clips)])
+    }
+
+    // ---- per-clip video / audio effects, keyframes, text overlays -----------
+
+    #[test]
+    fn video_effects_render_with_chroma_keeping_alpha() {
+        let fmt = ExportFormat::default();
+        let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
+        clip.effects = vec![
+            VideoEffect::Blur { sigma: 8.0 },
+            VideoEffect::ChromaKey { color: "green".into(), similarity: 0.1, blend: 0.0 },
+        ];
+        let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false);
+        // Color-space blur runs before the alpha plane is established, chroma key
+        // after it; the terminal yuv420p flatten is suppressed so alpha survives.
+        let gi = chain.find("gblur=sigma=8").expect("blur");
+        let yi = chain.find("format=yuva420p").expect("alpha plane");
+        let ci = chain.find("chromakey=green:0.1:0").expect("chroma key");
+        assert!(gi < yi && yi < ci, "order: blur < yuva < chroma in {chain}");
+        assert!(!chain.contains("format=yuv420p"), "alpha must not be flattened: {chain}");
+    }
+
+    #[test]
+    fn audio_effects_chain_after_gain_in_order() {
+        let fmt = ExportFormat::default();
+        let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 1.0);
+        clip.audio = vec![
+            AudioEffect::Highpass { hz: 80.0 },
+            AudioEffect::Compressor {
+                threshold_db: -18.0,
+                ratio: 3.0,
+                attack_ms: 20.0,
+                release_ms: 250.0,
+                makeup_db: 6.0,
+            },
+        ];
+        let chain = audio_clip_chain(&clip, &fmt, &ClipFx::default(), "stereo");
+        let vi = chain.find("volume=").expect("gain");
+        let hi = chain.find("highpass=f=80").expect("highpass");
+        let ai = chain.find("acompressor=").expect("compressor");
+        assert!(vi < hi && hi < ai, "effects follow the gain in author order: {chain}");
+        assert!(chain.contains("ratio=3"));
+    }
+
+    #[test]
+    fn keyframe_expr_is_piecewise_linear_and_clamped() {
+        let e = keyframe_expr(&[(0.0, 10.0), (4.0, 20.0)], "t", 2.0);
+        // Local time is (t - start); the first value is held before the first key.
+        assert!(e.contains("(t-2)"), "local time relative to clip start: {e}");
+        assert!(e.starts_with("if(lt((t-2),0),10,"), "holds first value before t0: {e}");
+        assert!(e.contains("10+(10)*"), "linear segment v0 + dv*…: {e}");
+        // A single keyframe degenerates to a constant.
+        assert_eq!(keyframe_expr(&[(1.0, 0.5)], "t", 0.0), "0.5");
+    }
+
+    #[test]
+    fn keyframed_clip_animates_scale_and_position() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 2.0);
+        clip.keyframes = vec![
+            crate::model::Keyframe { time: 0.0, scale: 1.0, pos_x: -0.3, pos_y: 0.0, rotation: 0.0, opacity: 1.0 },
+            crate::model::Keyframe { time: 4.0, scale: 1.5, pos_x: 0.3, pos_y: 0.0, rotation: 0.0, opacity: 1.0 },
+        ];
+        // Per-frame zoom is in the clip chain…
+        let chain = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false);
+        assert!(chain.contains("scale=w='iw*(") && chain.contains("eval=frame"), "animated zoom: {chain}");
+        // …and the animated position is an expression on the overlay.
+        let timeline = single(vec![clip]);
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &ExportFormat::default(),
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            false,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
+        assert!(g.filter.contains("overlay=x=(W-w)/2+(if(lt((t-2)"), "animated overlay x: {}", g.filter);
+    }
+
+    #[test]
+    fn text_overlay_drawn_over_composite() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        timeline.overlays = vec![TextOverlay::new("Hello", 1.0, 4.0)];
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &ExportFormat::default(),
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            false,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
+        let f = g.filter;
+        // The composite lands on `vtext`, then drawtext writes the final `[outv]`.
+        assert!(f.contains("[vtext]"), "composite pad before text: {f}");
+        assert!(f.contains("drawtext=") && f.contains("text='Hello'"), "{f}");
+        assert!(f.contains("enable='between(t,1,4)'"), "gated to its lifetime: {f}");
+        assert!(f.contains("[outv]"));
+    }
+
+    #[test]
+    fn drawtext_escapes_apostrophes() {
+        // close-quote, escaped quote, reopen — the ffmpeg-safe single-quote escape.
+        assert_eq!(escape_drawtext("a'b"), "a'\\''b");
+    }
+
+    #[test]
+    fn still_frame_samples_keyframes_and_draws_overlays() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        timeline.overlays = vec![TextOverlay::new("Caption", 0.0, 10.0)];
+        let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 3.0, 640, 4).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("drawtext=") && joined.contains("text='Caption'"), "still draws overlays: {joined}");
+        assert!(joined.contains("null[outv]"), "still terminates on [outv]: {joined}");
+    }
+
+    #[test]
+    fn srt_export_formats_timecodes() {
+        use crate::model::TranscriptSegment;
+        let srt = crate::model::transcript_to_srt(&[
+            TranscriptSegment { start: 1.5, end: 3.0, text: "first".into() },
+            TranscriptSegment { start: 3.0, end: 4.25, text: "second".into() },
+        ]);
+        assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");
+        assert!(srt.contains("2\n00:00:03,000 --> 00:00:04,250\nsecond"), "{srt}");
     }
 
     #[test]
@@ -2876,7 +3262,9 @@ mod tests {
         assert!(joined.contains("color=c=black:s=640x360"));
         assert!(joined.contains("[0:v]trim=end_frame=1"));
         assert!(joined.contains("scale=640:360:force_original_aspect_ratio=decrease"));
-        assert!(joined.contains("overlay=(W-w)/2:(H-h)/2[outv]"));
+        // The composite overlays onto a pad, then a trailing `null` names [outv].
+        assert!(joined.contains("overlay=(W-w)/2:(H-h)/2[ov0]"));
+        assert!(joined.contains("null[outv]"));
         assert!(joined.contains("-vcodec mjpeg"));
     }
 
@@ -2887,9 +3275,10 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]); // covers 0..5
         let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 8.0, 640, 4).unwrap();
         let joined = args.join(" ");
-        // Nothing visible at t=8 -> no inputs, bare black canvas straight to [outv].
+        // Nothing visible at t=8 -> no inputs, bare black canvas renamed to [outv].
         assert!(!joined.contains("-i "));
-        assert!(joined.contains("color=c=black:s=640x360:d=0.1[outv]"));
+        assert!(joined.contains("color=c=black:s=640x360:d=0.1[base]"));
+        assert!(joined.contains("[base]null[outv]"));
     }
 
     #[test]
@@ -2911,7 +3300,8 @@ mod tests {
         assert_eq!(joined.matches("-i /x.mp4").count(), 2);
         assert!(joined.contains("scale=iw*0.5:ih*0.5"));
         assert!(joined.contains("[base][v0]overlay=(W-w)/2:(H-h)/2[ov0]"));
-        assert!(joined.contains("[v1]overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H[outv]"));
+        assert!(joined.contains("[v1]overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H[ov1]"));
+        assert!(joined.contains("[ov1]null[outv]"));
     }
 
     #[test]
