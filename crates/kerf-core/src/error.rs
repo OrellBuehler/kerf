@@ -22,6 +22,9 @@ pub enum Error {
     #[error("track not found: {0}")]
     TrackNotFound(uuid::Uuid),
 
+    #[error("overlay not found: {0}")]
+    OverlayNotFound(uuid::Uuid),
+
     #[error("revision not found: {0}")]
     RevisionNotFound(i64),
 

@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, Clip, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline, Track,
-    Transition,
+    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task, TaskStatus,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect,
 };
 
 const SCHEMA: &str = r#"
@@ -1379,6 +1379,330 @@ impl Project {
 
         Ok(())
     }
+
+    // ---- per-clip video / audio effects -----------------------------------
+
+    /// Replace a clip's video effect chain (applied in order at export).
+    pub fn set_video_effects(&self, clip_id: Uuid, effects: Vec<VideoEffect>) -> Result<Clip> {
+        for e in &effects {
+            validate_video_effect(e)?;
+        }
+        self.edit_timeline("Set video effects", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].effects = effects;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Replace a clip's audio effect chain (applied in order at export).
+    pub fn set_audio_effects(&self, clip_id: Uuid, effects: Vec<AudioEffect>) -> Result<Clip> {
+        for e in &effects {
+            validate_audio_effect(e)?;
+        }
+        self.edit_timeline("Set audio effects", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].audio = effects;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    // ---- transform keyframes (animation) ----------------------------------
+
+    /// Replace a clip's transform keyframes (re-sorted by time). An empty list
+    /// clears the animation, so the static transform is used again.
+    pub fn set_keyframes(&self, clip_id: Uuid, mut keyframes: Vec<Keyframe>) -> Result<Clip> {
+        for k in &keyframes {
+            validate_keyframe(k)?;
+        }
+        keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+        self.edit_timeline("Set keyframes", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].keyframes = keyframes;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Add a keyframe at `time` seconds from the clip's start (replacing any
+    /// keyframe already at that time). Each `None` channel captures the clip's
+    /// current sampled transform there, so a lone keyframe "pins" the present
+    /// pose. Realized as animation at export when ≥1 keyframe exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_keyframe(
+        &self,
+        clip_id: Uuid,
+        time: f64,
+        scale: Option<f64>,
+        pos_x: Option<f64>,
+        pos_y: Option<f64>,
+        rotation: Option<f64>,
+        opacity: Option<f64>,
+    ) -> Result<Clip> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+        }
+        if scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(Error::InvalidArgument("scale must be a finite value > 0".to_string()));
+        }
+        if opacity.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+            return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
+        }
+        self.edit_timeline("Add keyframe", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let mut kf = Keyframe::from_transform(time, &clip.transform_at(time));
+            if let Some(v) = scale {
+                kf.scale = v;
+            }
+            if let Some(v) = pos_x {
+                kf.pos_x = v;
+            }
+            if let Some(v) = pos_y {
+                kf.pos_y = v;
+            }
+            if let Some(v) = rotation {
+                kf.rotation = v;
+            }
+            if let Some(v) = opacity {
+                kf.opacity = v;
+            }
+            clip.keyframes.retain(|k| (k.time - time).abs() > 1e-6);
+            clip.keyframes.push(kf);
+            clip.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+            Ok(clip.clone())
+        })
+    }
+
+    /// Remove all transform keyframes from a clip (back to the static transform).
+    pub fn clear_keyframes(&self, clip_id: Uuid) -> Result<Clip> {
+        self.edit_timeline("Clear keyframes", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].keyframes.clear();
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    // ---- text overlays (titles / lower-thirds / captions) -----------------
+
+    /// Add a text overlay drawn over the composited picture, returning it.
+    pub fn add_overlay(&self, text: String, start: f64, end: f64) -> Result<TextOverlay> {
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
+        }
+        let overlay = TextOverlay::new(text, start.max(0.0), end);
+        self.edit_timeline("Add text overlay", move |timeline| {
+            timeline.overlays.push(overlay.clone());
+            Ok(overlay)
+        })
+    }
+
+    /// Update mutable fields of a text overlay; each `None` leaves a field
+    /// unchanged. Pass an empty `bg` to clear the box background.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_overlay(
+        &self,
+        overlay_id: Uuid,
+        text: Option<String>,
+        start: Option<f64>,
+        end: Option<f64>,
+        pos_x: Option<f64>,
+        pos_y: Option<f64>,
+        size: Option<f64>,
+        color: Option<String>,
+        bg: Option<String>,
+        bold: Option<bool>,
+    ) -> Result<TextOverlay> {
+        if size.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(Error::InvalidArgument("size must be a finite value > 0".to_string()));
+        }
+        self.edit_timeline("Update text overlay", move |timeline| {
+            let o = timeline
+                .overlays
+                .iter_mut()
+                .find(|o| o.id == overlay_id)
+                .ok_or(Error::OverlayNotFound(overlay_id))?;
+            if let Some(v) = text {
+                o.text = v;
+            }
+            if let Some(v) = start {
+                o.start = v.max(0.0);
+            }
+            if let Some(v) = end {
+                o.end = v;
+            }
+            if let Some(v) = pos_x {
+                o.pos_x = v;
+            }
+            if let Some(v) = pos_y {
+                o.pos_y = v;
+            }
+            if let Some(v) = size {
+                o.size = v;
+            }
+            if let Some(v) = color {
+                o.color = v;
+            }
+            if let Some(v) = bg {
+                o.bg = if v.is_empty() { None } else { Some(v) };
+            }
+            if let Some(v) = bold {
+                o.bold = v;
+            }
+            if o.end <= o.start {
+                return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
+            }
+            Ok(o.clone())
+        })
+    }
+
+    /// Remove a text overlay.
+    pub fn remove_overlay(&self, overlay_id: Uuid) -> Result<()> {
+        self.edit_timeline("Remove text overlay", move |timeline| {
+            let before = timeline.overlays.len();
+            timeline.overlays.retain(|o| o.id != overlay_id);
+            if timeline.overlays.len() == before {
+                return Err(Error::OverlayNotFound(overlay_id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Set (or clear, with an empty list) an overlay's position/opacity keyframes.
+    pub fn set_overlay_keyframes(&self, overlay_id: Uuid, mut keyframes: Vec<TextKeyframe>) -> Result<TextOverlay> {
+        for k in &keyframes {
+            if !k.time.is_finite() || k.time < 0.0 {
+                return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+            }
+            if !(0.0..=1.0).contains(&k.opacity) {
+                return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
+            }
+        }
+        keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+        self.edit_timeline("Set overlay keyframes", move |timeline| {
+            let o = timeline
+                .overlays
+                .iter_mut()
+                .find(|o| o.id == overlay_id)
+                .ok_or(Error::OverlayNotFound(overlay_id))?;
+            o.keyframes = keyframes;
+            Ok(o.clone())
+        })
+    }
+
+    /// Generate caption overlays from an asset's cached transcript — one per
+    /// segment, low-center with a translucent box. The segments keep the
+    /// transcript's own timestamps, so they line up when the asset sits at the
+    /// start of the timeline at normal speed. Returns the overlays created.
+    pub fn captions_from_transcript(&self, asset_id: Uuid) -> Result<Vec<TextOverlay>> {
+        let analysis = self
+            .get_analysis(asset_id)?
+            .ok_or_else(|| Error::InvalidArgument("no analysis available for asset; run analysis first".to_string()))?;
+        let overlays: Vec<TextOverlay> = analysis
+            .transcript
+            .iter()
+            .filter(|s| !s.text.trim().is_empty() && s.end > s.start)
+            .map(|s| {
+                let mut o = TextOverlay::new(s.text.trim().to_string(), s.start.max(0.0), s.end);
+                o.pos_y = 0.88;
+                o.size = 0.05;
+                o.bg = Some("black@0.5".to_string());
+                o
+            })
+            .collect();
+        if overlays.is_empty() {
+            return Err(Error::InvalidArgument("asset has no usable transcript".to_string()));
+        }
+        let created = overlays.clone();
+        self.edit_timeline("Add captions from transcript", move |timeline| {
+            timeline.overlays.extend(overlays);
+            Ok(())
+        })?;
+        Ok(created)
+    }
+
+    /// Render an asset's cached transcript as a SubRip (`.srt`) document.
+    pub fn transcript_srt(&self, asset_id: Uuid) -> Result<String> {
+        let analysis = self
+            .get_analysis(asset_id)?
+            .ok_or_else(|| Error::InvalidArgument("no analysis available for asset; run analysis first".to_string()))?;
+        if analysis.transcript.is_empty() {
+            return Err(Error::InvalidArgument("asset has no transcript".to_string()));
+        }
+        Ok(crate::model::transcript_to_srt(&analysis.transcript))
+    }
+}
+
+fn validate_video_effect(e: &VideoEffect) -> Result<()> {
+    match e {
+        VideoEffect::Blur { sigma } => {
+            if !sigma.is_finite() || *sigma < 0.0 {
+                return Err(Error::InvalidArgument("blur sigma must be a finite value >= 0".to_string()));
+            }
+        }
+        VideoEffect::Sharpen { amount } => {
+            if !amount.is_finite() {
+                return Err(Error::InvalidArgument("sharpen amount must be finite".to_string()));
+            }
+        }
+        VideoEffect::ChromaKey { similarity, blend, .. } => {
+            if !(0.0..=1.0).contains(similarity) || !(0.0..=1.0).contains(blend) {
+                return Err(Error::InvalidArgument("chroma key similarity / blend must be within 0.0..=1.0".to_string()));
+            }
+        }
+        VideoEffect::Grayscale | VideoEffect::Invert | VideoEffect::Vignette => {}
+    }
+    Ok(())
+}
+
+fn validate_audio_effect(e: &AudioEffect) -> Result<()> {
+    let positive = |v: f64, name: &str| {
+        if v.is_finite() && v > 0.0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(format!("{name} must be a finite value > 0")))
+        }
+    };
+    match e {
+        AudioEffect::Highpass { hz } | AudioEffect::Lowpass { hz } => positive(*hz, "frequency")?,
+        AudioEffect::Equalizer { hz, width, gain_db } => {
+            positive(*hz, "frequency")?;
+            positive(*width, "width")?;
+            if !gain_db.is_finite() {
+                return Err(Error::InvalidArgument("gain_db must be finite".to_string()));
+            }
+        }
+        AudioEffect::Compressor { threshold_db, ratio, attack_ms, release_ms, makeup_db } => {
+            if !threshold_db.is_finite() || !makeup_db.is_finite() {
+                return Err(Error::InvalidArgument("compressor dB values must be finite".to_string()));
+            }
+            if !ratio.is_finite() || *ratio < 1.0 {
+                return Err(Error::InvalidArgument("compressor ratio must be >= 1".to_string()));
+            }
+            positive(*attack_ms, "attack_ms")?;
+            positive(*release_ms, "release_ms")?;
+        }
+        AudioEffect::Gate { threshold_db } => {
+            if !threshold_db.is_finite() {
+                return Err(Error::InvalidArgument("gate threshold_db must be finite".to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_keyframe(k: &Keyframe) -> Result<()> {
+    if !k.time.is_finite() || k.time < 0.0 {
+        return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+    }
+    if !k.scale.is_finite() || k.scale <= 0.0 {
+        return Err(Error::InvalidArgument("keyframe scale must be a finite value > 0".to_string()));
+    }
+    if !(0.0..=1.0).contains(&k.opacity) {
+        return Err(Error::InvalidArgument("keyframe opacity must be within 0.0..=1.0".to_string()));
+    }
+    if ![k.pos_x, k.pos_y, k.rotation].iter().all(|v| v.is_finite()) {
+        return Err(Error::InvalidArgument("keyframe values must be finite".to_string()));
+    }
+    Ok(())
 }
 
 fn row_to_task(
@@ -1546,6 +1870,67 @@ mod tests {
 
         project.remove(right.id).unwrap();
         assert!(project.timeline().unwrap().clip(right.id).is_none());
+    }
+
+    #[test]
+    fn text_overlay_add_update_remove_roundtrip() {
+        let project = Project::open_in_memory().unwrap();
+        let o = project.add_overlay("Hello".into(), 1.0, 4.0).unwrap();
+        assert_eq!(project.timeline().unwrap().overlays.len(), 1);
+        let updated = project
+            .update_overlay(o.id, Some("Hi".into()), None, Some(5.0), None, None, None, None, Some("black@0.5".into()), Some(true))
+            .unwrap();
+        assert_eq!(updated.text, "Hi");
+        assert!((updated.end - 5.0).abs() < 1e-9);
+        assert_eq!(updated.bg.as_deref(), Some("black@0.5"));
+        assert!(updated.bold);
+        // An empty bg string clears the box.
+        let cleared = project
+            .update_overlay(o.id, None, None, None, None, None, None, None, Some(String::new()), None)
+            .unwrap();
+        assert!(cleared.bg.is_none());
+        project.remove_overlay(o.id).unwrap();
+        assert!(project.timeline().unwrap().overlays.is_empty());
+        assert!(project.remove_overlay(o.id).is_err());
+    }
+
+    #[test]
+    fn keyframes_add_pins_pose_and_clear_resets() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        // Pin the current (static) scale at t=0, then animate to 1.5 at t=4.
+        project.set_transform(clip.id, Some(1.2), None, None, None, None, None, None, None, None).unwrap();
+        let pinned = project.add_keyframe(clip.id, 0.0, None, None, None, None, None).unwrap();
+        assert_eq!(pinned.keyframes.len(), 1);
+        assert!((pinned.keyframes[0].scale - 1.2).abs() < 1e-9); // captured the static pose
+        let animated = project.add_keyframe(clip.id, 4.0, Some(1.5), None, None, None, None).unwrap();
+        assert_eq!(animated.keyframes.len(), 2);
+        assert!(animated.is_animated());
+        // Re-adding at the same time replaces (no duplicate).
+        let replaced = project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        assert_eq!(replaced.keyframes.len(), 2);
+        assert!(!project.clear_keyframes(clip.id).unwrap().is_animated());
+    }
+
+    #[test]
+    fn video_and_audio_effects_persist_and_validate() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false), aud_stream()]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let updated = project
+            .set_video_effects(clip.id, vec![VideoEffect::Blur { sigma: 5.0 }, VideoEffect::Grayscale])
+            .unwrap();
+        assert_eq!(updated.effects.len(), 2);
+        // An out-of-range chroma key is rejected.
+        assert!(project
+            .set_video_effects(clip.id, vec![VideoEffect::ChromaKey { color: "green".into(), similarity: 2.0, blend: 0.0 }])
+            .is_err());
+        let a = project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: 80.0 }]).unwrap();
+        assert_eq!(a.audio.len(), 1);
+        assert!(project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: -1.0 }]).is_err());
     }
 
     #[test]
