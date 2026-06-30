@@ -3,6 +3,7 @@
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
 	import { getTimelineFrame } from '$lib/api';
 	import { clipDuration } from '$lib/types';
 
@@ -100,10 +101,35 @@
 		const x = e.clientX - el.getBoundingClientRect().left;
 		ui.seek((x / el.clientWidth) * duration);
 	}
+
+	function onPreviewContextMenu(e: MouseEvent) {
+		contextMenu.show(e, [
+			{
+				label: ui.playing ? 'Pause' : 'Play',
+				icon: ui.playing ? 'pause' : 'play',
+				shortcut: 'Space',
+				disabled: empty,
+				action: () => ui.togglePlay()
+			},
+			{ type: 'separator' },
+			{ label: 'Go to start', icon: 'skip-back', shortcut: 'Home', disabled: empty, action: () => ui.seek(0) },
+			{
+				label: 'Go to end',
+				icon: 'skip-forward',
+				shortcut: 'End',
+				disabled: empty,
+				action: () => ui.seek(editor.duration)
+			}
+		]);
+	}
 </script>
 
 <div style="flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-void)">
-	<div style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative">
+	<div
+		role="presentation"
+		oncontextmenu={onPreviewContextMenu}
+		style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative"
+	>
 		{#if empty}
 			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-disabled)">
 				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>

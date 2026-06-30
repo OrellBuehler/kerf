@@ -5,6 +5,7 @@
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
 	import { inTauri } from '$lib/api';
 	import { toast } from 'svelte-sonner';
 
@@ -88,6 +89,33 @@
 
 	function onAssetDragEnd() {
 		ui.dndAsset = null;
+	}
+
+	function onAssetContextMenu(e: MouseEvent, a: BinAsset) {
+		void editor.select(a.id);
+		const asset = editor.assets.find((x) => x.id === a.id);
+		const analyzed = !!editor.analysisFor(a.id);
+		contextMenu.show(e, [
+			{
+				label: 'Add to timeline',
+				icon: 'plus',
+				disabled: !asset,
+				action: () => {
+					if (asset)
+						void editor
+							.add(a.id, 0, asset.duration)
+							.then(() => toast.success(`Added ${a.name}`))
+							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
+				}
+			},
+			{ type: 'separator' },
+			{
+				label: analyzed ? 'Re-analyze' : 'Analyze',
+				icon: 'scan-line',
+				disabled: ui.analyzingId === a.id,
+				action: () => void ui.runAnalysis(a.id)
+			}
+		]);
 	}
 </script>
 
@@ -182,6 +210,7 @@
 							draggable={true}
 							ondragstart={(e) => onAssetDragStart(e, a)}
 							ondragend={onAssetDragEnd}
+							oncontextmenu={(e) => onAssetContextMenu(e, a)}
 							onclick={() => onSelect(a.id)}
 							onkeydown={(e) => e.key === 'Enter' && onSelect(a.id)}
 							title="Drag onto a timeline track to add a clip"

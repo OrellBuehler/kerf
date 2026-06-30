@@ -10,6 +10,7 @@
 	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
+	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
@@ -118,6 +119,15 @@
 		return 1 / fps;
 	}
 
+	// Suppress the native browser context menu app-wide so views can supply their
+	// own (Timeline, MediaBin, Preview each open one). Editable / selectable text
+	// keeps the native menu so copy / paste / spell-check still work there.
+	function onContextMenu(e: MouseEvent) {
+		const t = e.target as Element | null;
+		if (t?.closest('input, textarea, [contenteditable="true"], [data-selectable]')) return;
+		e.preventDefault();
+	}
+
 	function onKey(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 		const k = e.key.toLowerCase();
@@ -188,7 +198,7 @@
 	}
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} />
 
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />
@@ -212,3 +222,5 @@
 {#if exportOpen}
 	<ExportDialog onClose={() => (exportOpen = false)} />
 {/if}
+
+<ContextMenu />

@@ -4,6 +4,8 @@
 	import { toast } from 'svelte-sonner';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
+	import type { MenuItem } from '$lib/context-menu.svelte';
 	import type { Clip, StreamKind, Track } from '$lib/types';
 	import { clipDuration } from '$lib/types';
 
@@ -328,6 +330,59 @@
 		const c = editor.selectedClip;
 		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT);
 	}
+
+	// ---- context menus -------------------------------------------------------
+
+	function removeClip(id: string, ripple: boolean) {
+		void (ripple ? editor.rippleDelete(id) : editor.remove(id))
+			.then(() => toast('Clip removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+			.catch(err);
+	}
+
+	function trackItems(t: Track): MenuItem[] {
+		return [
+			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+			{ type: 'separator' },
+			{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }
+		];
+	}
+
+	function onClipContextMenu(e: MouseEvent, c: Clip, t: Track) {
+		editor.selectedClipId = c.id;
+		void editor.select(c.asset_id);
+		const within = ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c);
+		contextMenu.show(e, [
+			{
+				label: 'Split at playhead',
+				icon: 'Scissors',
+				shortcut: 'C',
+				disabled: !within,
+				action: () => void editor.split(c.id, ui.time).catch(err)
+			},
+			{ type: 'separator' },
+			{
+				label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
+				action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
+			},
+			{
+				label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
+				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
+			},
+			{ type: 'separator' },
+			{ label: 'Remove', icon: 'trash', shortcut: 'Del', danger: true, action: () => removeClip(c.id, false) },
+			{
+				label: 'Ripple delete',
+				icon: 'trash',
+				shortcut: '⇧Del',
+				danger: true,
+				action: () => removeClip(c.id, true)
+			}
+		]);
+	}
+
+	const onLaneContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
+	const onTrackHeaderContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
 </script>
 
 <svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
@@ -415,6 +470,8 @@
 			<div style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle)"></div>
 			{#each editor.timeline.tracks as t (t.id)}
 				<div
+					role="presentation"
+					oncontextmenu={(e) => onTrackHeaderContextMenu(e, t)}
 					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:8px;padding:0 10px"
 				>
 					<span
@@ -482,6 +539,7 @@
 						data-track-id={t.id}
 						data-kind={t.kind}
 						onclick={onLaneSeek}
+						oncontextmenu={(e) => onLaneContextMenu(e, t)}
 						ondragover={(e) => onLaneDragOver(e, t)}
 						ondragleave={(e) => onLaneDragLeave(e, t)}
 						ondrop={(e) => onLaneDrop(e, t)}
@@ -494,6 +552,7 @@
 							{@const dragging = drag?.moved && drag.clipId === c.id}
 							<button
 								onpointerdown={(e) => onClipPointerDown(e, c, t)}
+								oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 								onclick={(e) => e.stopPropagation()}
 								style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{dragging
 									? 0.4
