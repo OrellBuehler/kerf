@@ -287,6 +287,10 @@ struct UpdateOverlayParams {
     color: Option<String>,
     #[schemars(description = "Box color behind the text (e.g. \"black@0.5\"); empty string clears it; omit to leave unchanged")]
     bg: Option<String>,
+    #[schemars(
+        description = "System font family name (see list_fonts); empty string reverts to the default font; omit to leave unchanged"
+    )]
+    font: Option<String>,
     #[schemars(description = "Bold (thickened) text; omit to leave unchanged")]
     bold: Option<bool>,
 }
@@ -445,6 +449,11 @@ struct TimelineSummary {
 
 #[tool_router]
 impl KerfMcp {
+    #[tool(description = "List the system font family names available for text overlays (pass one as `font` to add_overlay / update_overlay)")]
+    fn list_fonts(&self) -> Result<String, McpError> {
+        json(&kerf_core::list_system_fonts())
+    }
+
     #[tool(description = "List all media assets in the project")]
     fn list_assets(&self) -> Result<String, McpError> {
         let project = self.lock();
@@ -718,13 +727,15 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Update a text overlay's text, timing, position (pos_x / pos_y as 0–1 frame fractions), size (font height fraction), color, box background (bg, empty string clears) or bold. Omit a field to leave it unchanged."
+        description = "Update a text overlay's text, timing, position (pos_x / pos_y as 0–1 frame fractions), size (font height fraction), color, box background (bg, empty string clears), font (system font family from list_fonts, empty string clears) or bold. Omit a field to leave it unchanged."
     )]
     fn update_overlay(&self, Parameters(p): Parameters<UpdateOverlayParams>) -> Result<String, McpError> {
         let overlay_id = parse_id(&p.overlay_id)?;
         let project = self.lock();
         let out = project
-            .update_overlay(overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.bold)
+            .update_overlay(
+                overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.font, p.bold,
+            )
             .map_err(core_err)?;
         self.changed();
         json(&out)
@@ -1052,7 +1063,8 @@ impl ServerHandler for KerfMcp {
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
              Burns zoom, a moving picture-in-picture). Add titles, lower-thirds \
              and captions with add_overlay / update_overlay / set_overlay_keyframes \
-             (drawn over the cut), or captions_from_transcript to caption an \
+             (drawn over the cut; list_fonts lists installed system fonts to pass \
+             as update_overlay's font), or captions_from_transcript to caption an \
              analyzed asset in one call; export_srt writes a subtitle file. \
              Every edit is tracked: use \
              history to list revisions and undo / redo / revert_to to roll \

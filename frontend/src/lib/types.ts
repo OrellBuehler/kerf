@@ -145,6 +145,7 @@ export interface TextOverlay {
 	size: number;
 	color: string;
 	bg?: string | null;
+	font?: string | null;
 	bold: boolean;
 	keyframes?: TextKeyframe[];
 }

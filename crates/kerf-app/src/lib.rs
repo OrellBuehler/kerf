@@ -76,6 +76,13 @@ fn list_assets(state: State<'_, AppState>) -> CmdResult<Vec<Asset>> {
     state.project()?.list_assets().map_err(|e| e.to_string())
 }
 
+/// Distinct family names of every font installed on this machine, for the
+/// text overlay font picker.
+#[tauri::command]
+fn list_fonts() -> CmdResult<Vec<String>> {
+    Ok(kerf_core::list_system_fonts())
+}
+
 #[tauri::command]
 fn get_timeline(state: State<'_, AppState>) -> CmdResult<Timeline> {
     state.project()?.timeline().map_err(|e| e.to_string())
@@ -480,12 +487,13 @@ fn update_overlay(
     size: Option<f64>,
     color: Option<String>,
     bg: Option<String>,
+    font: Option<String>,
     bold: Option<bool>,
 ) -> CmdResult<Timeline> {
     let oid = id(&overlay_id)?;
     let project = state.project()?;
     project
-        .update_overlay(oid, text, start, end, pos_x, pos_y, size, color, bg, bold)
+        .update_overlay(oid, text, start, end, pos_x, pos_y, size, color, bg, font, bold)
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
@@ -851,6 +859,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_assets,
+            list_fonts,
             get_timeline,
             get_asset_metadata,
             project_path,

@@ -7,6 +7,7 @@
 
 pub mod analysis;
 pub mod error;
+pub mod fonts;
 pub mod model;
 pub mod project;
 
@@ -23,6 +24,7 @@ pub use engine::{
     ExportProgress, RateControl, RenderStatus,
 };
 pub use error::{Error, Result};
+pub use fonts::list_system_fonts;
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, Clip, Color, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task,
     TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, TranscriptSegment, Transform, Transition,

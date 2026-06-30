@@ -4,6 +4,7 @@
    in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
+import { listFonts } from './api';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -25,8 +26,15 @@ class EditorUi {
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
+	/** System font family names available for the text overlay font picker. */
+	availableFonts = $state<string[]>([]);
 
 	#raf: number | null = null;
+
+	/** Fetch the installed system fonts once at startup. */
+	async loadFonts() {
+		this.availableFonts = await listFonts();
+	}
 
 	/** Force the preview to re-fetch the frame under the playhead. Called when a
 	 *  background proxy becomes ready so the still updates without a manual scrub. */

@@ -21,6 +21,7 @@
 	onMount(() => {
 		void editor.load();
 		void agent.load();
+		void ui.loadFonts();
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch

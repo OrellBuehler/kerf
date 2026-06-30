@@ -1518,7 +1518,8 @@ impl Project {
     }
 
     /// Update mutable fields of a text overlay; each `None` leaves a field
-    /// unchanged. Pass an empty `bg` to clear the box background.
+    /// unchanged. Pass an empty `bg` to clear the box background, or an empty
+    /// `font` to revert to the default font.
     #[allow(clippy::too_many_arguments)]
     pub fn update_overlay(
         &self,
@@ -1531,6 +1532,7 @@ impl Project {
         size: Option<f64>,
         color: Option<String>,
         bg: Option<String>,
+        font: Option<String>,
         bold: Option<bool>,
     ) -> Result<TextOverlay> {
         if size.is_some_and(|v| !v.is_finite() || v <= 0.0) {
@@ -1565,6 +1567,9 @@ impl Project {
             }
             if let Some(v) = bg {
                 o.bg = if v.is_empty() { None } else { Some(v) };
+            }
+            if let Some(v) = font {
+                o.font = if v.is_empty() { None } else { Some(v) };
             }
             if let Some(v) = bold {
                 o.bold = v;
@@ -1900,17 +1905,43 @@ mod tests {
         let o = project.add_overlay("Hello".into(), 1.0, 4.0).unwrap();
         assert_eq!(project.timeline().unwrap().overlays.len(), 1);
         let updated = project
-            .update_overlay(o.id, Some("Hi".into()), None, Some(5.0), None, None, None, None, Some("black@0.5".into()), Some(true))
+            .update_overlay(
+                o.id,
+                Some("Hi".into()),
+                None,
+                Some(5.0),
+                None,
+                None,
+                None,
+                None,
+                Some("black@0.5".into()),
+                Some("Arial".into()),
+                Some(true),
+            )
             .unwrap();
         assert_eq!(updated.text, "Hi");
         assert!((updated.end - 5.0).abs() < 1e-9);
         assert_eq!(updated.bg.as_deref(), Some("black@0.5"));
+        assert_eq!(updated.font.as_deref(), Some("Arial"));
         assert!(updated.bold);
-        // An empty bg string clears the box.
+        // An empty bg / font string clears it back to the default.
         let cleared = project
-            .update_overlay(o.id, None, None, None, None, None, None, None, Some(String::new()), None)
+            .update_overlay(
+                o.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(String::new()),
+                Some(String::new()),
+                None,
+            )
             .unwrap();
         assert!(cleared.bg.is_none());
+        assert!(cleared.font.is_none());
         project.remove_overlay(o.id).unwrap();
         assert!(project.timeline().unwrap().overlays.is_empty());
         assert!(project.remove_overlay(o.id).is_err());

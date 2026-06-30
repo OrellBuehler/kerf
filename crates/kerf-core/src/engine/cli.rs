@@ -2334,8 +2334,9 @@ fn escape_drawtext(s: &str) -> String {
 }
 
 /// `drawtext` options shared by the export and still paths (text, size, color,
-/// bold approximation, box) — everything except position / alpha / enable.
-/// `frame_h` is the target canvas height (export height, or the still's height).
+/// font, bold approximation, box) — everything except position / alpha /
+/// enable. `frame_h` is the target canvas height (export height, or the
+/// still's height).
 fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
     let fontsize = (frame_h * o.size).round().max(1.0);
     let mut parts = vec![
@@ -2343,8 +2344,16 @@ fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
         format!("fontsize={}", fnum(fontsize)),
         format!("fontcolor={}", o.color),
     ];
-    if o.bold {
-        // No font-file dependency: a same-color border thickens the glyphs.
+    // Resolve a chosen system font to its file on disk; falls through to
+    // FFmpeg's drawtext default if unset or no longer installed.
+    let resolved_bold = o.font.as_deref().and_then(|family| crate::fonts::resolve_font_file(family, o.bold)).map(
+        |(path, matched_bold)| {
+            parts.push(format!("fontfile='{}'", escape_drawtext(&path.to_string_lossy())));
+            matched_bold
+        },
+    );
+    if o.bold && resolved_bold != Some(true) {
+        // No real bold face available: a same-color border thickens the glyphs.
         parts.push("borderw=2".to_string());
         parts.push(format!("bordercolor={}", o.color));
     }
@@ -3212,6 +3221,36 @@ mod tests {
     fn drawtext_escapes_apostrophes() {
         // close-quote, escaped quote, reopen — the ffmpeg-safe single-quote escape.
         assert_eq!(escape_drawtext("a'b"), "a'\\''b");
+    }
+
+    #[test]
+    fn drawtext_falls_back_when_font_unknown() {
+        let mut o = TextOverlay::new("Hi", 0.0, 1.0);
+        o.font = Some("Definitely Not An Installed Font XYZ123".to_string());
+        let f = drawtext_export(&o, &ExportFormat::default());
+        assert!(!f.contains("fontfile="), "unresolvable font omits fontfile: {f}");
+    }
+
+    #[test]
+    fn drawtext_bold_without_font_uses_border_fallback() {
+        let mut o = TextOverlay::new("Hi", 0.0, 1.0);
+        o.bold = true;
+        let f = drawtext_export(&o, &ExportFormat::default());
+        assert!(f.contains("borderw=2"), "bold with no font resolved approximates via border: {f}");
+    }
+
+    #[test]
+    fn drawtext_resolves_installed_font_to_fontfile() {
+        // Environment-dependent: skip if this machine has no fonts installed
+        // at all, rather than hardcoding a family that may be absent on some
+        // CI runner OS.
+        let Some(family) = crate::fonts::list_system_fonts().into_iter().next() else {
+            return;
+        };
+        let mut o = TextOverlay::new("Hi", 0.0, 1.0);
+        o.font = Some(family);
+        let f = drawtext_export(&o, &ExportFormat::default());
+        assert!(f.contains("fontfile='"), "installed font resolves to a fontfile: {f}");
     }
 
     #[test]

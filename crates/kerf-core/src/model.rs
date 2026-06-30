@@ -456,6 +456,10 @@ pub struct TextOverlay {
     /// Optional box color behind the text (e.g. `black@0.5`); `None` = no box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
+    /// Optional system font family name (see `fonts::list_system_fonts`);
+    /// `None` = FFmpeg's `drawtext` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
     #[serde(default)]
     pub bold: bool,
     /// Optional position/opacity animation; with ≥1 keyframe the position and
@@ -476,6 +480,7 @@ impl TextOverlay {
             size: 0.06,
             color: "white".to_string(),
             bg: None,
+            font: None,
             bold: false,
             keyframes: Vec::new(),
         }

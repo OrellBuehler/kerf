@@ -40,6 +40,10 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 // ---- sample fallback (browser dev) ----------------------------------------
 
+// No real system font enumeration is available outside Tauri; a small static
+// list keeps the font picker non-empty in the browser dev harness.
+const DEV_FONTS = ['Arial', 'Georgia', 'Helvetica', 'Times New Roman', 'Verdana'];
+
 const sampleAssets: Asset[] = [
 	{
 		id: '11111111-1111-1111-1111-111111111111',
@@ -202,6 +206,12 @@ function trackForAsset(tl: Timeline, assetId: string): Track {
 export async function listAssets(): Promise<Asset[]> {
 	if (!inTauri()) return structuredClone(sampleAssets);
 	return invoke<Asset[]>('list_assets');
+}
+
+/** Distinct system font family names for the text overlay font picker. */
+export async function listFonts(): Promise<string[]> {
+	if (!inTauri()) return DEV_FONTS;
+	return invoke<string[]>('list_fonts');
 }
 
 export async function getTimeline(): Promise<Timeline> {
@@ -684,7 +694,7 @@ export async function addOverlay(text: string, start: number, end: number): Prom
 	return invoke<Timeline>('add_overlay', { text, start, end });
 }
 
-/** Update an overlay; only provided fields change. Pass `bg: ''` to clear the box. */
+/** Update an overlay; only provided fields change. Pass `bg: ''` / `font: ''` to clear them. */
 export async function updateOverlay(
 	overlayId: string,
 	patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>
@@ -694,6 +704,7 @@ export async function updateOverlay(
 		if (o) {
 			Object.assign(o, patch);
 			if (patch.bg === '') o.bg = null;
+			if (patch.font === '') o.font = null;
 		}
 		recordDev('Update text overlay');
 		return snapshot();
@@ -708,6 +719,7 @@ export async function updateOverlay(
 		size: patch.size,
 		color: patch.color,
 		bg: patch.bg ?? undefined,
+		font: patch.font ?? undefined,
 		bold: patch.bold
 	});
 }

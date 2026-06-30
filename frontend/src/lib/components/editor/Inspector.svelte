@@ -414,6 +414,20 @@
 						style={fxTxt}
 					/>
 				</label>
+				<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
+					<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Font</span>
+					<select
+						value={o.font ?? ''}
+						disabled={editor.busy}
+						onchange={(e) => run(() => editor.updateOverlay(o.id, { font: e.currentTarget.value }))}
+						style={selectCss + ';flex:1'}
+					>
+						<option value="">Default</option>
+						{#each ui.availableFonts as f (f)}
+							<option value={f}>{f}</option>
+						{/each}
+					</select>
+				</label>
 				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 					<span style="font-size:12px;color:var(--text-muted)">Bold</span>
 					<input
