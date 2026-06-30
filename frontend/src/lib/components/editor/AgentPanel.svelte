@@ -6,6 +6,8 @@
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { mcpEndpoint } from '$lib/api';
+	import { contextMenu } from '$lib/context-menu.svelte';
+	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { EditSource, Task, TaskStatus } from '$lib/types';
 
@@ -115,6 +117,22 @@
 		if (status === 'ready') return 'var(--green-400)';
 		return 'var(--text-muted)';
 	}
+
+	// Right-click on the panel (outside text fields): copy the connection details
+	// and quick-queue a preset task.
+	function onAgentContextMenu(e: MouseEvent) {
+		const t = e.target as Element | null;
+		if (t?.closest('input, textarea, [contenteditable="true"], [data-selectable]')) return;
+		const items: MenuItem[] = [
+			{ label: 'Copy MCP endpoint', icon: 'copy', action: () => void copy(endpoint, 'endpoint') },
+			{ label: 'Copy connect command', icon: 'copy', action: () => void copy(claudeCmd, 'cmd') },
+			{ type: 'separator' },
+			...PRESETS.map(
+				(p): MenuItem => ({ label: `Queue: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
+			)
+		];
+		contextMenu.show(e, items);
+	}
 </script>
 
 {#snippet secHead(label: string, right: string | null)}
@@ -211,6 +229,8 @@
 {/snippet}
 
 <div
+	role="presentation"
+	oncontextmenu={onAgentContextMenu}
 	style="width:var(--agent-panel-w);flex:none;background:var(--surface-panel);border-left:1px solid var(--border-default);display:flex;flex-direction:column;overflow:hidden"
 >
 	<div

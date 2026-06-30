@@ -383,6 +383,21 @@
 
 	const onLaneContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
 	const onTrackHeaderContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
+
+	// Right-click on empty timeline canvas (ruler / grid / below the tracks). Clip
+	// and lane menus stopPropagation, so only the bare background reaches this.
+	function onTimelineContextMenu(e: MouseEvent) {
+		contextMenu.show(e, [
+			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+			{ type: 'separator' },
+			{
+				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
+				icon: 'magnet',
+				action: () => (ui.snap = !ui.snap)
+			}
+		]);
+	}
 </script>
 
 <svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
@@ -493,7 +508,11 @@
 
 		<!-- scrollable track area -->
 		<div style="flex:1;overflow-x:auto;overflow-y:hidden;position:relative">
-			<div style="width:{contentW}px;position:relative">
+			<div
+				role="presentation"
+				oncontextmenu={onTimelineContextMenu}
+				style="width:{contentW}px;position:relative"
+			>
 				<!-- ruler -->
 				<div
 					role="presentation"

@@ -4,6 +4,8 @@
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
+	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from '$lib/types';
 	import type { AudioEffect, Transform, TransitionKind, VideoEffect } from '$lib/types';
 	import { toast } from 'svelte-sonner';
@@ -161,6 +163,34 @@
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
+	}
+
+	// Right-click anywhere on the panel that isn't an editable field (those keep
+	// the native menu for copy / paste). Adapts to whether a clip is selected.
+	function onInspectorContextMenu(e: MouseEvent) {
+		const t = e.target as Element | null;
+		if (t?.closest('input, textarea, select, [contenteditable="true"], [data-selectable]')) return;
+		const c = clip;
+		const items: MenuItem[] = [];
+		if (c) {
+			if (kind === 'video') {
+				items.push(
+					{ label: 'Reset transform', icon: 'rotate-ccw', action: () => run(() => editor.setTransform(c.id, DEFAULT_TRANSFORM)) },
+					{ label: 'Reset color', icon: 'rotate-ccw', action: () => run(() => editor.setColor(c.id, DEFAULT_COLOR)) },
+					{ type: 'separator' }
+				);
+			}
+			items.push(
+				{ label: 'Remove clip', icon: 'trash', danger: true, action: () => runUndoable('Clip removed', () => editor.remove(c.id)) },
+				{ label: 'Ripple delete', icon: 'trash', danger: true, action: () => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(c.id)) },
+				{ type: 'separator' }
+			);
+		}
+		items.push(
+			{ label: 'Add text overlay', icon: 'captions', action: addOverlayHere },
+			{ label: 'Generate captions', icon: 'captions', action: makeCaptions }
+		);
+		contextMenu.show(e, items);
 	}
 
 	/** Run a destructive op, then surface an Undo affordance (the edit is in the
@@ -400,6 +430,8 @@
 {/snippet}
 
 <div
+	role="presentation"
+	oncontextmenu={onInspectorContextMenu}
 	style="width:var(--inspector-w);flex:none;background:var(--surface-panel);border-left:1px solid var(--border-default);display:flex;flex-direction:column;overflow:hidden"
 >
 	<div
