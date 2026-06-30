@@ -30,12 +30,18 @@
 		return null;
 	});
 
+	// The asset actually shown in the preview is the clip's source under the
+	// playhead — not the media-bin selection, which may be a different asset.
+	const previewAsset = $derived(
+		atPlayhead ? editor.assets.find((a) => a.id === atPlayhead.assetId) : undefined
+	);
+
 	const resolution = $derived.by(() => {
-		const v = editor.selectedAsset?.streams.find((s) => s.kind === 'video');
+		const v = previewAsset?.streams.find((s) => s.kind === 'video');
 		return v?.width && v?.height ? `${v.width}×${v.height}` : '—';
 	});
 	const fpsLabel = $derived.by(() => {
-		const v = editor.selectedAsset?.streams.find((s) => s.kind === 'video');
+		const v = previewAsset?.streams.find((s) => s.kind === 'video');
 		return v?.fps ? v.fps.toFixed(3) : '';
 	});
 
@@ -131,7 +137,7 @@
 					</div>
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
-					<Badge tone="kerf">{editor.selectedAsset?.name ?? 'preview'}</Badge>
+					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
 					{#if ui.analyzing}<Badge tone="agent" dot>analyzing</Badge>{/if}
 				</div>
 				<div
