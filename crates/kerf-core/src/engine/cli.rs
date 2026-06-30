@@ -703,13 +703,29 @@ pub fn ready_proxy(src: &Path) -> Option<PathBuf> {
     proxy_path(src).filter(|p| p.is_file())
 }
 
+/// How many CPU threads a single preview-proxy encode may use. Capped to leave
+/// at least one core free so the GUI and a working agent stay responsive while a
+/// proxy transcodes in the background (an uncapped `libx264` grabs every core).
+/// Override with `KERF_PROXY_THREADS` (clamped to >= 1).
+fn proxy_threads() -> usize {
+    if let Ok(n) = std::env::var("KERF_PROXY_THREADS").map(|v| v.parse::<usize>()) {
+        if let Ok(n) = n {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+}
+
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
-/// an all-intra, audio-less, ~720p preview proxy at `dst`. `-g 1` makes every
-/// frame a keyframe, so a seek decodes exactly one frame (instant scrub even on
-/// long-GOP 4K/HEVC). fps and duration are left untouched — no `-r`, no `-t`, no
-/// trim — so a source time maps 1:1 onto the proxy and a preview seek lands on
-/// the same frame the export (which always reads the original) would.
-fn build_proxy_args(src: &str, dst: &str) -> Vec<String> {
+/// an all-intra, audio-less, ~720p preview proxy at `dst`, using at most
+/// `threads` CPU threads. `-g 1` makes every frame a keyframe, so a seek decodes
+/// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
+/// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
+/// onto the proxy and a preview seek lands on the same frame the export (which
+/// always reads the original) would.
+fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
     vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -728,6 +744,8 @@ fn build_proxy_args(src: &str, dst: &str) -> Vec<String> {
         "24".to_string(),
         "-g".to_string(),
         "1".to_string(),
+        "-threads".to_string(),
+        threads.max(1).to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         dst.to_string(),
@@ -753,7 +771,7 @@ pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
     let src_str = src.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
     let tmp = dst.with_extension(format!("{}.part", std::process::id()));
     let tmp_str = tmp.to_str().ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
-    let args = build_proxy_args(src_str, tmp_str);
+    let args = build_proxy_args(src_str, tmp_str, proxy_threads());
     let bin = ffmpeg_bin();
     let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() {
@@ -2831,10 +2849,13 @@ mod tests {
 
     #[test]
     fn proxy_args_are_all_intra_audioless_and_keep_timing() {
-        let args = build_proxy_args("/in.mov", "/out.mp4");
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3);
         // All-intra: every frame a keyframe, so a preview seek decodes one frame.
         let gop = args.iter().position(|a| a == "-g").expect("-g present");
         assert_eq!(args[gop + 1], "1");
+        // Thread-capped so a background proxy encode leaves cores for the GUI/agent.
+        let threads = args.iter().position(|a| a == "-threads").expect("-threads present");
+        assert_eq!(args[threads + 1], "3");
         // Audio is dropped — the proxy is only ever decoded for video frames.
         assert!(args.contains(&"-an".to_string()));
         // Downscale only: the proxy must NOT retime, trim or seek, or a source

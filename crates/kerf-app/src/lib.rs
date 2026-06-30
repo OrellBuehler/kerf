@@ -149,7 +149,7 @@ fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> Cmd
     Ok(asset)
 }
 
-/// Generate an asset's preview proxy (all-intra, ~720p) on a background thread so
+/// Queue an asset's preview proxy (all-intra, ~720p) for background generation so
 /// scrubbing decodes one keyframe instead of seeking a long GOP. Non-blocking and
 /// best-effort: previews fall back to the original source until the proxy lands,
 /// at which point we emit `proxy-ready` so the webview re-fetches the current
@@ -159,16 +159,37 @@ fn spawn_proxy(app: &AppHandle, asset: &Asset) {
     if !has_video || asset.is_image() {
         return;
     }
-    let app = app.clone();
-    let path = asset.path.clone();
-    std::thread::spawn(move || match kerf_core::generate_proxy(std::path::Path::new(&path)) {
-        Ok(_) => {
-            if let Err(e) = app.emit("proxy-ready", ()) {
-                tracing::warn!(error = %e, "failed to emit proxy-ready");
+    if let Err(e) = proxy_jobs().send((app.clone(), asset.path.clone())) {
+        tracing::warn!(error = %e, "preview proxy queue is closed");
+    }
+}
+
+/// The serial background worker that generates preview proxies. Importing many
+/// large sources (or reopening a project full of them) would otherwise spawn one
+/// full-file re-encode per file *at once* — and each ffmpeg grabs every core — so
+/// the CPU saturates and both the GUI and the agent freeze. Funnelling every
+/// proxy job through a single worker (each encode also thread-capped in the
+/// engine) keeps at most one encode running, leaving the machine responsive while
+/// proxies trickle in; previews use the original source until each one lands.
+fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> =
+        std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String)>();
+        std::thread::spawn(move || {
+            for (app, path) in rx {
+                match kerf_core::generate_proxy(std::path::Path::new(&path)) {
+                    Ok(_) => {
+                        if let Err(e) = app.emit("proxy-ready", ()) {
+                            tracing::warn!(error = %e, "failed to emit proxy-ready");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, path = %path, "preview proxy generation failed"),
+                }
             }
-        }
-        Err(e) => tracing::warn!(error = %e, path = %path, "preview proxy generation failed"),
-    });
+        });
+        tx
+    })
 }
 
 #[tauri::command]
