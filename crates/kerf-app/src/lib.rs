@@ -164,20 +164,41 @@ fn spawn_proxy(app: &AppHandle, asset: &Asset) {
     }
 }
 
-/// The serial background worker that generates preview proxies. Importing many
-/// large sources (or reopening a project full of them) would otherwise spawn one
-/// full-file re-encode per file *at once* — and each ffmpeg grabs every core — so
-/// the CPU saturates and both the GUI and the agent freeze. Funnelling every
-/// proxy job through a single worker (each encode also thread-capped in the
-/// engine) keeps at most one encode running, leaving the machine responsive while
-/// proxies trickle in; previews use the original source until each one lands.
+/// How many proxy encodes may run at once. Importing many large sources (or
+/// reopening a project full of them) would otherwise spawn one full-file
+/// re-encode per file *at once* — and each ffmpeg grabs every core — so the CPU
+/// saturates and both the GUI and the agent freeze. The default of 1 keeps at
+/// most one encode running; raise it with `KERF_PROXY_WORKERS` on a machine with
+/// cores to spare (pair with `KERF_PROXY_THREADS` so workers × threads stays
+/// under your core count, or you're back to oversubscribing).
+fn proxy_workers() -> usize {
+    std::env::var("KERF_PROXY_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(1)
+}
+
+/// The bounded background worker pool that generates preview proxies. Every proxy
+/// job is funnelled through `proxy_workers()` workers (each encode also
+/// thread-capped in the engine), leaving the machine responsive while proxies
+/// trickle in; previews use the original source until each one lands.
 fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
     static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> =
         std::sync::OnceLock::new();
     QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String)>();
-        std::thread::spawn(move || {
-            for (app, path) in rx {
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..proxy_workers() {
+            let rx = Arc::clone(&rx);
+            std::thread::spawn(move || loop {
+                // Hold the lock only to dequeue, then release it before the encode
+                // so the other workers can pull the next job concurrently.
+                let job = match rx.lock() {
+                    Ok(guard) => guard.recv(),
+                    Err(_) => break,
+                };
+                let Ok((app, path)) = job else { break };
                 match kerf_core::generate_proxy(std::path::Path::new(&path)) {
                     Ok(_) => {
                         if let Err(e) = app.emit("proxy-ready", ()) {
@@ -186,8 +207,8 @@ fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
                     }
                     Err(e) => tracing::warn!(error = %e, path = %path, "preview proxy generation failed"),
                 }
-            }
-        });
+            });
+        }
         tx
     })
 }
