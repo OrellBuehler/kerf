@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, EditSource, ExportOptions, Project, Revision, StreamKind, Task, Timeline, Transition, TransitionKind,
+    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task,
+    TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -368,6 +369,121 @@ fn set_transition(
 }
 
 #[tauri::command]
+fn set_video_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<VideoEffect>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_video_effects(id, effects).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_audio_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<AudioEffect>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_audio_effects(id, effects).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_keyframes(state: State<'_, AppState>, clip_id: String, keyframes: Vec<Keyframe>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.set_keyframes(id, keyframes).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn add_keyframe(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    scale: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    rotation: Option<f64>,
+    opacity: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.clear_keyframes(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_overlay(state: State<'_, AppState>, text: String, start: f64, end: f64) -> CmdResult<Timeline> {
+    let project = state.project()?;
+    project.add_overlay(text, start, end).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_overlay(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    text: Option<String>,
+    start: Option<f64>,
+    end: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    size: Option<f64>,
+    color: Option<String>,
+    bg: Option<String>,
+    bold: Option<bool>,
+) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project()?;
+    project
+        .update_overlay(oid, text, start, end, pos_x, pos_y, size, color, bg, bold)
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project()?;
+    project.remove_overlay(oid).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyframes: Vec<TextKeyframe>) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project()?;
+    project.set_overlay_keyframes(oid, keyframes).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn captions_from_transcript(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
+    let id = id(&asset_id)?;
+    let project = state.project()?;
+    project.captions_from_transcript(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: String) -> CmdResult<String> {
+    let id = id(&asset_id)?;
+    let srt = {
+        let project = state.project()?;
+        project.transcript_srt(id).map_err(|e| e.to_string())?
+    };
+    std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
+    Ok(output_path)
+}
+
+#[tauri::command]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
     let project = state.project()?;
@@ -701,6 +817,17 @@ pub fn run() {
             set_transform,
             set_color,
             set_transition,
+            set_video_effects,
+            set_audio_effects,
+            set_keyframes,
+            add_keyframe,
+            clear_keyframes,
+            add_overlay,
+            update_overlay,
+            remove_overlay,
+            set_overlay_keyframes,
+            captions_from_transcript,
+            export_srt,
             remove_silence,
             extract_audio,
             concatenate,

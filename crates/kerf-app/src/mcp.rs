@@ -14,7 +14,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
-use kerf_core::{EditSource, ExportOptions, Project, StreamKind, Transition, TransitionKind};
+use kerf_core::{
+    AudioEffect, EditSource, ExportOptions, Keyframe, Project, StreamKind, TextKeyframe, Transition, TransitionKind,
+    VideoEffect,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
@@ -194,6 +197,123 @@ struct TransitionParams {
     kind: Option<String>,
     #[schemars(description = "Transition duration in seconds (required when a kind is given)")]
     duration: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct VideoEffectsParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Ordered list of video effects (replaces the clip's chain). Each is an object with a \"type\": \
+                       {\"type\":\"blur\",\"sigma\":8}, {\"type\":\"sharpen\",\"amount\":1.0}, {\"type\":\"grayscale\"}, \
+                       {\"type\":\"invert\"}, {\"type\":\"vignette\"}, or \
+                       {\"type\":\"chroma_key\",\"color\":\"green\",\"similarity\":0.1,\"blend\":0.0} (keys a color to \
+                       transparency so a lower track shows through). Pass [] to clear."
+    )]
+    effects: Vec<VideoEffect>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AudioEffectsParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Ordered list of audio effects (replaces the clip's chain). Each is an object with a \"type\": \
+                       {\"type\":\"highpass\",\"hz\":80}, {\"type\":\"lowpass\",\"hz\":12000}, \
+                       {\"type\":\"equalizer\",\"hz\":3000,\"width\":1000,\"gain_db\":3}, \
+                       {\"type\":\"compressor\",\"threshold_db\":-18,\"ratio\":3,\"attack_ms\":20,\"release_ms\":250,\"makeup_db\":6}, \
+                       or {\"type\":\"gate\",\"threshold_db\":-40}. Pass [] to clear."
+    )]
+    effects: Vec<AudioEffect>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct KeyframesParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Transform keyframes (replaces the clip's animation). Each: {\"time\":seconds_from_clip_start, \
+                       \"scale\":1.0,\"pos_x\":0.0,\"pos_y\":0.0,\"rotation\":0.0,\"opacity\":1.0}. Two or more animate \
+                       the clip; pass [] to clear and use the static transform."
+    )]
+    keyframes: Vec<Keyframe>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddKeyframeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Keyframe time in seconds from the clip's start")]
+    time: f64,
+    #[schemars(description = "Scale at this time (1.0 = fit); omit to capture the current value")]
+    scale: Option<f64>,
+    #[schemars(description = "Horizontal position as a frame-width fraction (0 = centered); omit to capture current")]
+    pos_x: Option<f64>,
+    #[schemars(description = "Vertical position as a frame-height fraction (0 = centered); omit to capture current")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Rotation in degrees; omit to capture current")]
+    rotation: Option<f64>,
+    #[schemars(description = "Opacity 0.0–1.0; omit to capture current")]
+    opacity: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddOverlayParams {
+    #[schemars(description = "The text to display")]
+    text: String,
+    #[schemars(description = "When the overlay appears, in timeline seconds")]
+    start: f64,
+    #[schemars(description = "When the overlay disappears, in timeline seconds")]
+    end: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdateOverlayParams {
+    #[schemars(description = "UUID of the overlay")]
+    overlay_id: String,
+    #[schemars(description = "New text; omit to leave unchanged")]
+    text: Option<String>,
+    #[schemars(description = "New start time (seconds); omit to leave unchanged")]
+    start: Option<f64>,
+    #[schemars(description = "New end time (seconds); omit to leave unchanged")]
+    end: Option<f64>,
+    #[schemars(description = "Center X as a fraction of frame width (0–1); omit to leave unchanged")]
+    pos_x: Option<f64>,
+    #[schemars(description = "Center Y as a fraction of frame height (0–1, ~0.85 = lower third); omit to leave unchanged")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Font height as a fraction of frame height (e.g. 0.06); omit to leave unchanged")]
+    size: Option<f64>,
+    #[schemars(description = "Text color (e.g. \"white\", \"#ffcc00\", \"yellow@0.9\"); omit to leave unchanged")]
+    color: Option<String>,
+    #[schemars(description = "Box color behind the text (e.g. \"black@0.5\"); empty string clears it; omit to leave unchanged")]
+    bg: Option<String>,
+    #[schemars(description = "Bold (thickened) text; omit to leave unchanged")]
+    bold: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OverlayIdParams {
+    #[schemars(description = "UUID of the overlay")]
+    overlay_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct OverlayKeyframesParams {
+    #[schemars(description = "UUID of the overlay")]
+    overlay_id: String,
+    #[schemars(
+        description = "Position/opacity keyframes (replaces the overlay's animation). Each: \
+                       {\"time\":seconds_from_overlay_start,\"pos_x\":0.5,\"pos_y\":0.85,\"opacity\":1.0}. Pass [] to clear."
+    )]
+    keyframes: Vec<TextKeyframe>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportSrtParams {
+    #[schemars(description = "UUID of the asset whose transcript to export")]
+    asset_id: String,
+    #[schemars(description = "Output .srt file path to write")]
+    output_path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -530,6 +650,124 @@ impl KerfMcp {
         let out = project.set_transition(clip_id, transition).map_err(core_err)?;
         self.changed();
         json(&out)
+    }
+
+    #[tool(
+        description = "Replace a clip's video effect chain (applied in order at export): blur, sharpen, grayscale, invert, vignette, or chroma_key (key a color to transparency so footage on a lower track shows through). Pass an empty list to clear."
+    )]
+    fn set_video_effects(&self, Parameters(p): Parameters<VideoEffectsParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics) or gate (noise gate). Pass an empty list to clear."
+    )]
+    fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Replace a clip's transform keyframes to animate scale / position / rotation / opacity over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). Pass an empty list to clear the animation."
+    )]
+    fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses."
+    )]
+    fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project
+            .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(description = "Remove all transform keyframes from a clip (back to its static transform)")]
+    fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.clear_keyframes(clip_id).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Add a text overlay (title / lower-third / caption / watermark) drawn over the composited picture between start and end (timeline seconds). Returns the overlay; style or animate it with update_overlay / set_overlay_keyframes."
+    )]
+    fn add_overlay(&self, Parameters(p): Parameters<AddOverlayParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        let out = project.add_overlay(p.text, p.start, p.end).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Update a text overlay's text, timing, position (pos_x / pos_y as 0–1 frame fractions), size (font height fraction), color, box background (bg, empty string clears) or bold. Omit a field to leave it unchanged."
+    )]
+    fn update_overlay(&self, Parameters(p): Parameters<UpdateOverlayParams>) -> Result<String, McpError> {
+        let overlay_id = parse_id(&p.overlay_id)?;
+        let project = self.lock();
+        let out = project
+            .update_overlay(overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.bold)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(description = "Remove a text overlay")]
+    fn remove_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
+        let overlay_id = parse_id(&p.overlay_id)?;
+        let project = self.lock();
+        project.remove_overlay(overlay_id).map_err(core_err)?;
+        self.changed();
+        Ok("ok".to_string())
+    }
+
+    #[tool(description = "Set or clear (empty list) a text overlay's position/opacity keyframes, to animate it over its lifetime (e.g. a title that slides in and fades out)")]
+    fn set_overlay_keyframes(&self, Parameters(p): Parameters<OverlayKeyframesParams>) -> Result<String, McpError> {
+        let overlay_id = parse_id(&p.overlay_id)?;
+        let project = self.lock();
+        let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Generate caption overlays from an asset's cached transcript (run analyze_asset first), one per segment, low-center with a translucent box. Captions use the transcript's timestamps, so they align when the asset sits at the start of the timeline at normal speed. Returns the overlays created."
+    )]
+    fn captions_from_transcript(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.lock();
+        let out = project.captions_from_transcript(id).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first)")]
+    fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let srt = {
+            let project = self.lock();
+            project.transcript_srt(id).map_err(core_err)?
+        };
+        std::fs::write(&p.output_path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(format!("wrote {}", p.output_path))
     }
 
     #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]

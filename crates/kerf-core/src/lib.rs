@@ -24,7 +24,8 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use model::{
-    Asset, AssetAnalysis, Clip, Color, EditSource, Revision, StreamInfo, StreamKind, Task, TaskStatus, TimeRange, Timeline,
-    Track, TranscriptSegment, Transform, Transition, TransitionKind,
+    Asset, AssetAnalysis, AudioEffect, Clip, Color, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task,
+    TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, TranscriptSegment, Transform, Transition,
+    TransitionKind, VideoEffect,
 };
 pub use project::Project;

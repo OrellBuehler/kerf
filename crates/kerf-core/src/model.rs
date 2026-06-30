@@ -318,7 +318,7 @@ pub struct Transition {
 /// chain at export (after color correction). The order in `Clip::effects` is the
 /// order they are applied. `ChromaKey` is the one effect that establishes an
 /// alpha channel, so the clip composites with transparency.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VideoEffect {
     /// Gaussian blur (`gblur`); larger `sigma` = softer.
@@ -347,7 +347,7 @@ impl VideoEffect {
 /// chain at export (after the clip gain). The order in `Clip::audio` is the order
 /// they are applied. Thresholds/gains are in dB at the model boundary and
 /// converted to the linear units ffmpeg's dynamics filters want by the engine.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AudioEffect {
     /// High-pass: attenuate below `hz` (cut rumble / handling noise).
@@ -386,7 +386,7 @@ fn default_text_color() -> String {
 /// the engine interpolates linearly between them and renders the motion with
 /// per-frame ffmpeg expressions; crop and the rest of the static [`Transform`]
 /// are unaffected.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Keyframe {
     /// Offset from the clip's `timeline_start`, in seconds.
     pub time: f64,
@@ -419,7 +419,7 @@ impl Keyframe {
 
 /// One keyframe of an animated [`TextOverlay`]: position and opacity at `time`
 /// (seconds from the overlay's `start`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TextKeyframe {
     pub time: f64,
     #[serde(default = "half")]
