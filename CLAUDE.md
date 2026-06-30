@@ -33,7 +33,16 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render. Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
+  render. The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
+  each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
+  `chromakey` which keeps alpha so a lower track shows through), **audio effects**
+  (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
+  — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
+  expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
+  `keyframe_expr` over clip-local time). **Text overlays** (`Timeline.overlays`) are
+  `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
+  still / preview path samples `Clip::transform_at` and draws overlays statically.
+  Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
   start (shared `clip_source_window`/`clip_seek`, frame-accurate against the
   seek-relative `trim`), so a cut from deep in a long source decodes only the kept
   region, not everything from `t=0`. **Still images** (PNG/JPEG/… — detected at
@@ -98,8 +107,15 @@ no editing logic in the adapter.
 - `model.rs` — the domain types and the only place timeline math lives: `Asset`,
   `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A `Clip`
   references a source range (`source_in`/`source_out`) of an asset at a
-  `timeline_start` — non-destructive. Inherent helpers (`Timeline::locate`,
-  `Track::end`/`reflow`, `Clip::duration`) back the operations.
+  `timeline_start` — non-destructive. Besides the geometry (`Transform`) / color
+  (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
+  `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
+  **animation** — `Clip::transform_at` interpolates it, the engine renders the
+  motion). Text titles / lower-thirds / captions live on the timeline itself as
+  `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
+  animation); `transcript_to_srt` serializes a transcript to SubRip. Inherent
+  helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`) back the
+  operations.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -152,7 +168,11 @@ registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `move_clip`,
 `ripple_delete`, `add_track`, `remove_track`, `remove_clip`, `set_volume`, `set_fade`,
-`remove_silence`, `extract_audio`, `concatenate` — each returns the
+`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
+`set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
+`add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
+`captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
+`concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), and `export_timeline` (emits `export-progress`
@@ -181,7 +201,13 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): a dark,
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
-`Preview`, `Timeline`, `AgentPanel`, `StatusBar`, composed by `routes/+page.svelte`.
+`Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
+`routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
+trim, volume, fades, speed, transform, color, transition, plus **video / audio
+effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
+auto-keyframes at the playhead and shows the sampled pose), and an always-visible
+**Text overlays** section (add titles / lower-thirds, generate captions, edit
+text / timing / position / size / color / box / bold).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`

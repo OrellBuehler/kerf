@@ -1042,7 +1042,18 @@ impl ServerHandler for KerfMcp {
              ripple_delete closes the gap). Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \
              over the interview (later video tracks composite on top). Polish \
-             with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts). \
+             with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
+             set_speed, set_transform (scale / position / rotation / opacity / \
+             crop — picture-in-picture), set_color and set_transition (crossfade \
+             / dip-to-black). Go further: set_video_effects (blur / sharpen / \
+             grayscale / invert / vignette / chroma_key — green-screen so a lower \
+             track shows through), set_audio_effects (highpass / lowpass / EQ / \
+             compressor / gate), and animate a clip with set_keyframes / \
+             add_keyframe (scale / position / rotation / opacity over time — a Ken \
+             Burns zoom, a moving picture-in-picture). Add titles, lower-thirds \
+             and captions with add_overlay / update_overlay / set_overlay_keyframes \
+             (drawn over the cut), or captions_from_transcript to caption an \
+             analyzed asset in one call; export_srt writes a subtitle file. \
              Every edit is tracked: use \
              history to list revisions and undo / redo / revert_to to roll \
              changes back. When finished call complete_task with a short summary \
