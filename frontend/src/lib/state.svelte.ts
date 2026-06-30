@@ -2,9 +2,14 @@
 
 import {
 	addClip,
+	addKeyframe,
+	addOverlay,
 	analyzeAsset,
+	captionsFromTranscript,
+	clearKeyframes,
 	concatenate,
 	cutClip,
+	exportSrt,
 	exportTimeline,
 	extractAudio,
 	getAssetMetadata,
@@ -15,6 +20,12 @@ import {
 	listAssets,
 	addTrack,
 	moveClip,
+	removeOverlay,
+	setAudioEffects,
+	setKeyframes,
+	setOverlayKeyframes,
+	setVideoEffects,
+	updateOverlay,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
 	pickMediaPaths,
@@ -41,14 +52,19 @@ import type {
 	Asset,
 	AssetAnalysis,
 	AssetMetadata,
+	AudioEffect,
 	Clip,
 	Color,
 	ExportOptions,
+	Keyframe,
 	Revision,
 	StreamKind,
+	TextKeyframe,
+	TextOverlay,
 	Timeline,
 	Transform,
-	Transition
+	Transition,
+	VideoEffect
 } from './types';
 import { clipDuration } from './types';
 
@@ -57,6 +73,7 @@ class EditorState {
 	timeline = $state<Timeline>({ tracks: [] });
 	selectedAssetId = $state<string | null>(null);
 	selectedClipId = $state<string | null>(null);
+	selectedOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
@@ -79,6 +96,14 @@ class EditorState {
 			if (c) return c;
 		}
 		return undefined;
+	}
+
+	get overlays(): TextOverlay[] {
+		return this.timeline.overlays ?? [];
+	}
+
+	get selectedOverlay(): TextOverlay | undefined {
+		return this.overlays.find((o) => o.id === this.selectedOverlayId);
 	}
 
 	/** Timeline length in seconds. Memoized: `timeline` is reassigned wholesale
@@ -308,6 +333,41 @@ class EditorState {
 	}
 	setTransition(clipId: string, transition: Transition | null) {
 		return this.#apply(setTransition(clipId, transition));
+	}
+	setVideoEffects(clipId: string, effects: VideoEffect[]) {
+		return this.#apply(setVideoEffects(clipId, effects));
+	}
+	setAudioEffects(clipId: string, effects: AudioEffect[]) {
+		return this.#apply(setAudioEffects(clipId, effects));
+	}
+	setKeyframes(clipId: string, keyframes: Keyframe[]) {
+		return this.#apply(setKeyframes(clipId, keyframes));
+	}
+	addKeyframe(clipId: string, time: number, patch: Partial<Omit<Keyframe, 'time'>> = {}) {
+		return this.#apply(addKeyframe(clipId, time, patch));
+	}
+	clearKeyframes(clipId: string) {
+		return this.#apply(clearKeyframes(clipId));
+	}
+	addOverlay(text: string, start: number, end: number) {
+		return this.#apply(addOverlay(text, start, end));
+	}
+	updateOverlay(overlayId: string, patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
+		return this.#apply(updateOverlay(overlayId, patch));
+	}
+	removeOverlay(overlayId: string) {
+		if (this.selectedOverlayId === overlayId) this.selectedOverlayId = null;
+		return this.#apply(removeOverlay(overlayId));
+	}
+	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
+		return this.#apply(setOverlayKeyframes(overlayId, keyframes));
+	}
+	captionsFromTranscript(assetId: string) {
+		return this.#apply(captionsFromTranscript(assetId));
+	}
+	/** Write the asset's transcript to `.srt`; returns the path (no timeline change). */
+	exportSrt(assetId: string, outputPath: string) {
+		return exportSrt(assetId, outputPath);
 	}
 	removeSilence(assetId: string) {
 		return this.#apply(removeSilence(assetId));

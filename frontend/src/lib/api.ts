@@ -9,18 +9,23 @@ import type {
 	Asset,
 	AssetAnalysis,
 	AssetMetadata,
+	AudioEffect,
 	Clip,
 	Color,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
+	Keyframe,
 	Revision,
 	StreamKind,
 	Task,
+	TextKeyframe,
+	TextOverlay,
 	Timeline,
 	Track,
 	Transform,
-	Transition
+	Transition,
+	VideoEffect
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
 
@@ -574,6 +579,188 @@ export async function setTransition(clipId: string, transition: Transition | nul
 		kind: transition?.kind,
 		duration: transition?.duration
 	});
+}
+
+/** Replace a clip's video effect chain (empty list clears it). */
+export async function setVideoEffects(clipId: string, effects: VideoEffect[]): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].effects = effects;
+		recordDev('Set video effects');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_video_effects', { clipId, effects });
+}
+
+/** Replace a clip's audio effect chain (empty list clears it). */
+export async function setAudioEffects(clipId: string, effects: AudioEffect[]): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].audio = effects;
+		recordDev('Set audio effects');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_audio_effects', { clipId, effects });
+}
+
+/** Replace a clip's transform keyframes (empty list clears the animation). */
+export async function setKeyframes(clipId: string, keyframes: Keyframe[]): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].keyframes = [...keyframes].sort((a, b) => a.time - b.time);
+		recordDev('Set keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_keyframes', { clipId, keyframes });
+}
+
+/** Add (or replace) a keyframe at `time`; unspecified channels capture the
+ *  clip's current static transform. */
+export async function addKeyframe(
+	clipId: string,
+	time: number,
+	patch: Partial<Omit<Keyframe, 'time'>> = {}
+): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			const tf = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
+			const base: Keyframe = {
+				time,
+				scale: tf.scale,
+				pos_x: tf.pos_x,
+				pos_y: tf.pos_y,
+				rotation: tf.rotation,
+				opacity: tf.opacity,
+				...patch
+			};
+			const kfs = (clip.keyframes ?? []).filter((k) => Math.abs(k.time - time) > 1e-6);
+			kfs.push(base);
+			kfs.sort((a, b) => a.time - b.time);
+			clip.keyframes = kfs;
+		}
+		recordDev('Add keyframe');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_keyframe', {
+		clipId,
+		time,
+		scale: patch.scale,
+		posX: patch.pos_x,
+		posY: patch.pos_y,
+		rotation: patch.rotation,
+		opacity: patch.opacity
+	});
+}
+
+export async function clearKeyframes(clipId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].keyframes = [];
+		recordDev('Clear keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('clear_keyframes', { clipId });
+}
+
+/** Add a text overlay (title / lower-third / caption). */
+export async function addOverlay(text: string, start: number, end: number): Promise<Timeline> {
+	if (!inTauri()) {
+		(devTimeline.overlays ??= []).push({
+			id: uid(),
+			text,
+			start,
+			end,
+			pos_x: 0.5,
+			pos_y: 0.82,
+			size: 0.06,
+			color: 'white',
+			bold: false
+		});
+		recordDev('Add text overlay');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_overlay', { text, start, end });
+}
+
+/** Update an overlay; only provided fields change. Pass `bg: ''` to clear the box. */
+export async function updateOverlay(
+	overlayId: string,
+	patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>
+): Promise<Timeline> {
+	if (!inTauri()) {
+		const o = devTimeline.overlays?.find((ov) => ov.id === overlayId);
+		if (o) {
+			Object.assign(o, patch);
+			if (patch.bg === '') o.bg = null;
+		}
+		recordDev('Update text overlay');
+		return snapshot();
+	}
+	return invoke<Timeline>('update_overlay', {
+		overlayId,
+		text: patch.text,
+		start: patch.start,
+		end: patch.end,
+		posX: patch.pos_x,
+		posY: patch.pos_y,
+		size: patch.size,
+		color: patch.color,
+		bg: patch.bg ?? undefined,
+		bold: patch.bold
+	});
+}
+
+export async function removeOverlay(overlayId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		if (devTimeline.overlays) devTimeline.overlays = devTimeline.overlays.filter((o) => o.id !== overlayId);
+		recordDev('Remove text overlay');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_overlay', { overlayId });
+}
+
+export async function setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]): Promise<Timeline> {
+	if (!inTauri()) {
+		const o = devTimeline.overlays?.find((ov) => ov.id === overlayId);
+		if (o) o.keyframes = [...keyframes].sort((a, b) => a.time - b.time);
+		recordDev('Set overlay keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_overlay_keyframes', { overlayId, keyframes });
+}
+
+/** Generate caption overlays from an asset's cached transcript. */
+export async function captionsFromTranscript(assetId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const segs = sampleAnalysis[assetId]?.transcript ?? [];
+		const overlays = (devTimeline.overlays ??= []);
+		for (const s of segs) {
+			if (!s.text.trim() || s.end <= s.start) continue;
+			overlays.push({
+				id: uid(),
+				text: s.text.trim(),
+				start: s.start,
+				end: s.end,
+				pos_x: 0.5,
+				pos_y: 0.88,
+				size: 0.05,
+				color: 'white',
+				bg: 'black@0.5',
+				bold: false
+			});
+		}
+		recordDev('Add captions from transcript');
+		return snapshot();
+	}
+	return invoke<Timeline>('captions_from_transcript', { assetId });
+}
+
+/** Write an asset's transcript to a `.srt` file; returns the path. */
+export async function exportSrt(assetId: string, outputPath: string): Promise<string> {
+	if (!inTauri()) return outputPath;
+	return invoke<string>('export_srt', { assetId, outputPath });
 }
 
 export async function removeSilence(assetId: string): Promise<Timeline> {

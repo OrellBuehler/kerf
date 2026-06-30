@@ -92,6 +92,63 @@ export interface Transition {
 	duration: number;
 }
 
+// Discriminated unions mirroring kerf_core::{VideoEffect, AudioEffect}
+// (serde `#[serde(tag = "type")]`).
+export type VideoEffect =
+	| { type: 'blur'; sigma: number }
+	| { type: 'sharpen'; amount: number }
+	| { type: 'grayscale' }
+	| { type: 'invert' }
+	| { type: 'vignette' }
+	| { type: 'chroma_key'; color: string; similarity: number; blend: number };
+
+export type AudioEffect =
+	| { type: 'highpass'; hz: number }
+	| { type: 'lowpass'; hz: number }
+	| { type: 'equalizer'; hz: number; width: number; gain_db: number }
+	| {
+			type: 'compressor';
+			threshold_db: number;
+			ratio: number;
+			attack_ms: number;
+			release_ms: number;
+			makeup_db: number;
+	  }
+	| { type: 'gate'; threshold_db: number };
+
+/** One keyframe of a clip's animated transform. */
+export interface Keyframe {
+	time: number;
+	scale: number;
+	pos_x: number;
+	pos_y: number;
+	rotation: number;
+	opacity: number;
+}
+
+/** One keyframe of an animated text overlay (position + opacity). */
+export interface TextKeyframe {
+	time: number;
+	pos_x: number;
+	pos_y: number;
+	opacity: number;
+}
+
+/** A timed text element (title / lower-third / caption) drawn over the cut. */
+export interface TextOverlay {
+	id: string;
+	text: string;
+	start: number;
+	end: number;
+	pos_x: number;
+	pos_y: number;
+	size: number;
+	color: string;
+	bg?: string | null;
+	bold: boolean;
+	keyframes?: TextKeyframe[];
+}
+
 export interface Clip {
 	id: string;
 	asset_id: string;
@@ -107,6 +164,9 @@ export interface Clip {
 	transform?: Transform;
 	color?: Color;
 	transition_in?: Transition | null;
+	effects?: VideoEffect[];
+	audio?: AudioEffect[];
+	keyframes?: Keyframe[];
 }
 
 export const DEFAULT_TRANSFORM: Transform = {
@@ -132,6 +192,7 @@ export interface Track {
 
 export interface Timeline {
 	tracks: Track[];
+	overlays?: TextOverlay[];
 }
 
 export interface AssetMetadata {
