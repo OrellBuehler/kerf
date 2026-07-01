@@ -25,6 +25,10 @@ class EditorUi {
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
 	 *  Audio is muted in reverse (the playhead falls back to wall-clock). */
 	rate = $state(1);
+	/** In/out marks (seconds) — set with I/O, cleared with Shift+I/O. They
+	 *  bracket the working range; export can render just this span. */
+	markIn = $state<number | null>(null);
+	markOut = $state<number | null>(null);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
@@ -73,11 +77,19 @@ class EditorUi {
 		this.playing ? this.pause() : this.play();
 	}
 
+	/** J/K/L shuttle: a tap in the current play direction doubles the rate
+	 *  (capped at 8×), a tap the other way starts fresh at 1×. */
+	shuttle(dir: 1 | -1) {
+		const sameDir = this.playing && Math.sign(this.rate) === dir;
+		const target = sameDir ? Math.min(8, Math.abs(this.rate) * 2) : 1;
+		this.play(dir * target);
+	}
+
 	play(rate = 1) {
 		if (this.playing && rate === this.rate) return;
+		if (rate < 0 && this.time <= 0) return; // nothing to shuttle back into
 		if (this.#raf) cancelAnimationFrame(this.#raf);
 		if (rate > 0 && this.time >= editor.duration) this.time = 0;
-		if (rate < 0 && this.time <= 0) return;
 		this.playing = true;
 		this.rate = rate;
 		this.#startAudio();

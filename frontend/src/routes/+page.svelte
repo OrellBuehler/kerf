@@ -174,7 +174,18 @@
 		// Tools / transport (bare keys).
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
-		else if (e.key === ' ') {
+		else if (k === 'j') ui.shuttle(-1);
+		else if (k === 'k') ui.pause();
+		else if (k === 'l') ui.shuttle(1);
+		else if (k === 'i') {
+			// I/O mark the working range at the playhead; Shift clears a mark.
+			// The pair stays ordered so a mark can't cross its partner.
+			if (e.shiftKey) ui.markIn = null;
+			else ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
+		} else if (k === 'o') {
+			if (e.shiftKey) ui.markOut = null;
+			else ui.markOut = Math.max(ui.time, ui.markIn ?? 0);
+		} else if (e.key === ' ') {
 			e.preventDefault();
 			ui.togglePlay();
 		} else if (e.key === 'ArrowLeft') {

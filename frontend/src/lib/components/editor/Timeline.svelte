@@ -657,6 +657,32 @@
 							style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 						></span>
 					{/each}
+					{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
+						<div
+							style="position:absolute;left:{ui.markIn * pxPerSec}px;width:{(ui.markOut - ui.markIn) *
+								pxPerSec}px;top:0;bottom:0;background:var(--selection-fill);pointer-events:none"
+						></div>
+					{/if}
+					{#if ui.markIn !== null}
+						<span
+							title="Mark in {fmt(ui.markIn)} — I sets, ⇧I clears"
+							style="position:absolute;left:{ui.markIn * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
+						>
+							<span
+								style="position:absolute;top:0;left:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,0 100%)"
+							></span>
+						</span>
+					{/if}
+					{#if ui.markOut !== null}
+						<span
+							title="Mark out {fmt(ui.markOut)} — O sets, ⇧O clears"
+							style="position:absolute;left:{ui.markOut * pxPerSec - 2}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
+						>
+							<span
+								style="position:absolute;top:0;right:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,100% 100%)"
+							></span>
+						</span>
+					{/if}
 				</div>
 
 				<!-- grid lines -->
