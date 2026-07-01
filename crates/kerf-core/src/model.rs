@@ -81,7 +81,7 @@ impl Asset {
 pub const DEFAULT_IMAGE_DURATION: f64 = 5.0;
 
 /// A half-open time range `[start, end)` in seconds.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TimeRange {
     pub start: f64,
     pub end: f64,
@@ -829,6 +829,91 @@ impl Timeline {
     /// Total timeline duration (seconds).
     pub fn duration(&self) -> f64 {
         self.tracks.iter().map(Track::end).fold(0.0, f64::max)
+    }
+
+    /// A copy containing only `[start, end)`, shifted so `start` lands at 0 —
+    /// the sub-timeline a range export renders. Clips overlapping the window
+    /// edges are cut down (source window and keyframes adjusted, honoring speed
+    /// and reverse); fades and transitions belonging to a removed edge are
+    /// dropped; overlays are clipped and shifted the same way. A clip cut at
+    /// the front keeps its animated pose by sampling a replacement keyframe at
+    /// the new start.
+    pub fn slice(&self, start: f64, end: f64) -> Timeline {
+        let mut out = Timeline {
+            tracks: Vec::with_capacity(self.tracks.len()),
+            overlays: Vec::new(),
+        };
+        for track in &self.tracks {
+            let mut t = Track {
+                id: track.id,
+                kind: track.kind,
+                name: track.name.clone(),
+                clips: Vec::new(),
+            };
+            for clip in &track.clips {
+                let (cs, ce) = (clip.timeline_start, clip.timeline_end());
+                if ce <= start || cs >= end {
+                    continue;
+                }
+                let mut c = clip.clone();
+                let mag = c.speed_mag();
+                let cut_front = (start - cs).max(0.0);
+                let cut_back = (ce - end).max(0.0);
+                if cut_front > 0.0 {
+                    if c.is_reversed() {
+                        c.source_out -= cut_front * mag;
+                    } else {
+                        c.source_in += cut_front * mag;
+                    }
+                    c.fade_in = 0.0;
+                    c.transition_in = None;
+                    if !c.keyframes.is_empty() {
+                        let pose = clip.transform_at(cut_front);
+                        let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
+                        kfs.extend(
+                            c.keyframes
+                                .iter()
+                                .filter(|k| k.time > cut_front)
+                                .map(|k| Keyframe { time: k.time - cut_front, ..*k }),
+                        );
+                        c.keyframes = kfs;
+                    }
+                }
+                if cut_back > 0.0 {
+                    if c.is_reversed() {
+                        c.source_in += cut_back * mag;
+                    } else {
+                        c.source_out -= cut_back * mag;
+                    }
+                    c.fade_out = 0.0;
+                }
+                c.timeline_start = (cs - start).max(0.0);
+                t.clips.push(c);
+            }
+            out.tracks.push(t);
+        }
+        for o in &self.overlays {
+            if o.end <= start || o.start >= end {
+                continue;
+            }
+            let mut ov = o.clone();
+            let cut_front = (start - o.start).max(0.0);
+            if cut_front > 0.0 && !ov.keyframes.is_empty() {
+                let (pos_x, pos_y, opacity) = o.sample(start);
+                let mut kfs = vec![TextKeyframe { time: 0.0, pos_x, pos_y, opacity }];
+                kfs.extend(
+                    ov.keyframes
+                        .iter()
+                        .filter(|k| k.time > cut_front)
+                        .map(|k| TextKeyframe { time: k.time - cut_front, ..*k }),
+                );
+                ov.keyframes = kfs;
+            }
+            ov.start = (o.start - start).max(0.0);
+            ov.end = (o.end.min(end) - start).max(ov.start);
+            out.overlays.push(ov);
+        }
+        out
     }
 }
 

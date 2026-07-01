@@ -255,6 +255,8 @@ export interface ExportOptions {
 	gif_dither?: string | null;
 	gif_loop: boolean;
 	metadata_title?: string | null;
+	/** Render only this timeline span (e.g. the in/out marks); omit for all. */
+	range?: TimeRange | null;
 }
 
 /** Payload of the `export-progress` event streamed during a render. */

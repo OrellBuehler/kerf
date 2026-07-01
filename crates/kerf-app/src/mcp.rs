@@ -351,7 +351,8 @@ struct ExportParams {
                        rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
                        decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
-                       (\"192k\"); include_audio; faststart."
+                       (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
+                       render only that span)."
     )]
     #[serde(default)]
     options: Option<ExportOptions>,

@@ -2,6 +2,7 @@
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { ui } from '$lib/editor-ui.svelte';
 	import { inTauri, pickExportPath, cancelExport, onExportProgress } from '$lib/api';
 	import { toast } from 'svelte-sonner';
 	import type { Container, ExportOptions, ExportProgress, RateControl } from '$lib/types';
@@ -38,6 +39,20 @@
 	let cancelling = $state(false);
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
+	let useRange = $state(false);
+
+	/** The timeline's in/out marks when both are set and ordered, else null. */
+	const marks = $derived(
+		ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn
+			? { start: ui.markIn, end: ui.markOut }
+			: null
+	);
+
+	function fmtTime(s: number): string {
+		const m = Math.floor(s / 60);
+		const sec = (s % 60).toFixed(1).padStart(4, '0');
+		return `${m}:${sec}`;
+	}
 
 	function fmtEta(s: number | null | undefined): string {
 		if (s == null || !isFinite(s)) return '';
@@ -142,7 +157,8 @@
 			progress = p;
 		});
 		try {
-			const out = await editor.export(outputPath, opts);
+			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;
+			const out = await editor.export(outputPath, finalOpts);
 			toast.success(`Exported → ${out}`);
 			onClose();
 		} catch (e) {
@@ -296,6 +312,17 @@
 				/>
 				<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse</Btn>
 			</div>
+			{#if marks}
+				{@render selectRow(
+					'Range',
+					useRange ? 'range' : 'full',
+					[
+						{ value: 'full', label: 'Full timeline' },
+						{ value: 'range', label: `In → out (${fmtTime(marks.start)}–${fmtTime(marks.end)})` }
+					],
+					(v) => (useRange = v === 'range')
+				)}
+			{/if}
 
 			<!-- video -->
 			{#if showVideo}

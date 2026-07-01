@@ -1020,6 +1020,9 @@ pub struct ExportOptions {
     pub gif_loop: bool,
     /// `-metadata title=`.
     pub metadata_title: Option<String>,
+    /// Render only this timeline span (seconds), e.g. the GUI's in/out marks;
+    /// the output starts at `range.start`. `None` renders the whole timeline.
+    pub range: Option<crate::model::TimeRange>,
 }
 
 impl Default for ExportOptions {
@@ -1052,8 +1055,18 @@ impl Default for ExportOptions {
             gif_dither: None,
             gif_loop: true,
             metadata_title: None,
+            range: None,
         }
     }
+}
+
+/// The validated export range from `opts`, clamped to the timeline. `None`
+/// when absent or empty after clamping (which falls back to a full export).
+fn effective_range(timeline: &Timeline, opts: &ExportOptions) -> Option<(f64, f64)> {
+    let r = opts.range?;
+    let start = r.start.max(0.0);
+    let end = r.end.min(timeline.duration());
+    (end - start > 1e-9).then_some((start, end))
 }
 
 /// Whether a bitrate token like "8M" / "2500k" / "800000" is well-formed.
@@ -1383,6 +1396,17 @@ fn build_export_args_phase(
     null_sink: &str,
     passlog: &str,
 ) -> Result<Vec<String>> {
+    // Range export: build the graph against the sliced sub-timeline, so trims,
+    // fades, keyframes and overlays all see the same shifted geometry.
+    let sliced;
+    let timeline = match effective_range(timeline, opts) {
+        Some((s, e)) => {
+            sliced = timeline.slice(s, e);
+            &sliced
+        }
+        None => timeline,
+    };
+
     let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -1798,7 +1822,10 @@ pub fn render_with_progress(
         && !opts.container.is_audio_only()
         && matches!(opts.video_codec.as_deref(), Some(vc) if vc != "prores_ks" && vc != "gif" && enc_family(vc) == EncFamily::Software);
 
-    let total = timeline.duration();
+    let total = match effective_range(timeline, opts) {
+        Some((s, e)) => e - s,
+        None => timeline.duration(),
+    };
     let start = std::time::Instant::now();
 
     if two_pass {
@@ -3674,6 +3701,54 @@ mod tests {
         };
         let g = graph_of(&single(vec![clip]), &[asset]);
         assert!(g.contains("eq=brightness=0.1:contrast=1.2:saturation=1:gamma=1"), "{g}");
+    }
+
+    #[test]
+    fn slice_cuts_clips_and_shifts_to_zero() {
+        let asset_id = Uuid::new_v4();
+        let a = make_clip(asset_id, 0.0, 10.0, 0.0);
+        let b = make_clip(asset_id, 0.0, 10.0, 10.0);
+        let s = single(vec![a, b]).slice(8.0, 12.0);
+        let clips = &s.tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        // A keeps its last 2 source seconds, landing at t=0.
+        assert!((clips[0].source_in - 8.0).abs() < 1e-9, "{}", clips[0].source_in);
+        assert!((clips[0].source_out - 10.0).abs() < 1e-9);
+        assert!(clips[0].timeline_start.abs() < 1e-9);
+        // B keeps its first 2 source seconds, landing right after.
+        assert!(clips[1].source_in.abs() < 1e-9);
+        assert!((clips[1].source_out - 2.0).abs() < 1e-9);
+        assert!((clips[1].timeline_start - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slice_drops_outside_clips_and_honors_speed() {
+        let asset_id = Uuid::new_v4();
+        let mut a = make_clip(asset_id, 0.0, 4.0, 0.0);
+        a.speed = 2.0; // 2 timeline seconds
+        let b = make_clip(asset_id, 0.0, 4.0, 6.0);
+        let s = single(vec![a, b]).slice(1.0, 3.0);
+        let clips = &s.tracks[0].clips;
+        assert_eq!(clips.len(), 1);
+        // One timeline second cut from the front = two source seconds at 2×.
+        assert!((clips[0].source_in - 2.0).abs() < 1e-9, "{}", clips[0].source_in);
+        assert!(clips[0].timeline_start.abs() < 1e-9);
+    }
+
+    #[test]
+    fn range_export_builds_the_graph_from_the_sliced_timeline() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let tl = single(vec![clip]);
+        let opts = ExportOptions {
+            range: Some(crate::model::TimeRange { start: 2.0, end: 6.0 }),
+            ..Default::default()
+        };
+        let args = build_export_args(&tl, &[asset], "out.mp4", &opts).unwrap();
+        let joined = args.join(" ");
+        // The kept span is source 2..6 fast-sought to 2, so the in-graph trim
+        // is seek-relative 0..4 — the graph really was built from the slice.
+        assert!(joined.contains("trim=start=0:end=4"), "{joined}");
     }
 
     #[test]
