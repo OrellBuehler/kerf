@@ -293,8 +293,8 @@ class EditorState {
 	split(clipId: string, at: number) {
 		return this.#apply(splitClip(clipId, at));
 	}
-	trim(clipId: string, sourceIn?: number, sourceOut?: number) {
-		return this.#apply(trimClip(clipId, sourceIn, sourceOut));
+	trim(clipId: string, sourceIn?: number, sourceOut?: number, timelineStart?: number) {
+		return this.#apply(trimClip(clipId, sourceIn, sourceOut, timelineStart));
 	}
 	reorder(trackId: string, clipId: string, newIndex: number) {
 		return this.#apply(reorderClip(trackId, clipId, newIndex));

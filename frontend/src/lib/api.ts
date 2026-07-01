@@ -369,18 +369,27 @@ export async function splitClip(clipId: string, at: number): Promise<Timeline> {
 	return invoke<Timeline>('split_clip', { clipId, at });
 }
 
-export async function trimClip(clipId: string, sourceIn?: number, sourceOut?: number): Promise<Timeline> {
+export async function trimClip(
+	clipId: string,
+	sourceIn?: number,
+	sourceOut?: number,
+	timelineStart?: number
+): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const clip = found[0].clips[found[1]];
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
+			if (timelineStart != null) {
+				clip.timeline_start = Math.max(0, timelineStart);
+				found[0].clips.sort((a, b) => a.timeline_start - b.timeline_start);
+			}
 		}
 		recordDev('Trim clip');
 		return snapshot();
 	}
-	return invoke<Timeline>('trim_clip', { clipId, sourceIn, sourceOut });
+	return invoke<Timeline>('trim_clip', { clipId, sourceIn, sourceOut, timelineStart });
 }
 
 export async function reorderClip(trackId: string, clipId: string, newIndex: number): Promise<Timeline> {

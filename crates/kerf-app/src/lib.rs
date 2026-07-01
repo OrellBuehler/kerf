@@ -274,10 +274,11 @@ fn trim_clip(
     clip_id: String,
     source_in: Option<f64>,
     source_out: Option<f64>,
+    timeline_start: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project()?;
-    project.trim(id, source_in, source_out).map_err(|e| e.to_string())?;
+    project.trim(id, source_in, source_out, timeline_start).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 

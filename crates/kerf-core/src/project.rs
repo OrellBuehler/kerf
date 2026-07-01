@@ -728,8 +728,17 @@ impl Project {
         })
     }
 
-    /// Adjust a clip's source in/out points (timeline position is preserved).
-    pub fn trim(&self, clip_id: Uuid, source_in: Option<f64>, source_out: Option<f64>) -> Result<Clip> {
+    /// Adjust a clip's source in/out points. `timeline_start` moves the clip in
+    /// the same edit — a left-edge trim from the GUI shifts the start so the
+    /// right edge stays put, and doing both here keeps undo a single step.
+    /// Omitted, the timeline position is preserved.
+    pub fn trim(
+        &self,
+        clip_id: Uuid,
+        source_in: Option<f64>,
+        source_out: Option<f64>,
+        timeline_start: Option<f64>,
+    ) -> Result<Clip> {
         self.edit_timeline("Trim clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
@@ -744,7 +753,14 @@ impl Project {
                     "source_out must be greater than source_in".to_string(),
                 ));
             }
-            Ok(clip.clone())
+            if let Some(start) = timeline_start {
+                clip.timeline_start = start.max(0.0);
+            }
+            let out = clip.clone();
+            if timeline_start.is_some() {
+                timeline.tracks[ti].sort_by_start();
+            }
+            Ok(out)
         })
     }
 
@@ -1874,6 +1890,23 @@ mod tests {
         let resolved = Project::preview_source(&asset);
         let _ = std::fs::remove_file(&proxy);
         assert_eq!(resolved, proxy);
+    }
+
+    #[test]
+    fn trim_with_timeline_start_keeps_the_right_edge_put() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+
+        // 4s clip at t=2 (source 3..7); a left-edge trim tightens the source
+        // in-point and moves the start in one edit, so the end stays at t=6.
+        let clip = project.add_clip_to_timeline(asset.id, None, 3.0, 7.0, Some(2.0)).unwrap();
+        let trimmed = project.trim(clip.id, Some(4.0), None, Some(3.0)).unwrap();
+        assert!((trimmed.timeline_start - 3.0).abs() < 1e-9);
+        assert!((trimmed.timeline_end() - 6.0).abs() < 1e-9);
+
+        let history = project.history().unwrap();
+        assert_eq!(history.last().unwrap().label, "Trim clip");
     }
 
     #[test]

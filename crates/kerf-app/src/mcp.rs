@@ -83,6 +83,11 @@ struct TrimParams {
     source_in: Option<f64>,
     #[schemars(description = "New source out-point (seconds)")]
     source_out: Option<f64>,
+    #[schemars(
+        description = "New timeline start (seconds) applied in the same edit — pass alongside source_in \
+                       when trimming the left edge so the clip's right edge stays put"
+    )]
+    timeline_start: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -518,11 +523,11 @@ impl KerfMcp {
         json(&serde_json::json!({ "left": left, "right": right }))
     }
 
-    #[tool(description = "Trim a clip's source in/out points (timeline position is preserved)")]
+    #[tool(description = "Trim a clip's source in/out points (timeline position preserved unless timeline_start is passed)")]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
-        let out = project.trim(clip_id, p.source_in, p.source_out).map_err(core_err)?;
+        let out = project.trim(clip_id, p.source_in, p.source_out, p.timeline_start).map_err(core_err)?;
         self.changed();
         json(&out)
     }
