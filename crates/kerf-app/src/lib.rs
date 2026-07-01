@@ -314,6 +314,14 @@ fn ripple_delete(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timel
 }
 
 #[tauri::command]
+fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f64) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project()?;
+    project.cut_clip_range(id, from, to).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn add_track(state: State<'_, AppState>, kind: String, name: Option<String>) -> CmdResult<Timeline> {
     let kind = self::kind(&kind)?;
     let project = state.project()?;
@@ -904,6 +912,7 @@ pub fn run() {
             reorder_clip,
             move_clip,
             ripple_delete,
+            cut_clip_range,
             add_track,
             remove_track,
             set_track_duck,

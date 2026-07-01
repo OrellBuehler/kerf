@@ -8,6 +8,7 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { inTauri } from '$lib/api';
 	import { toast } from 'svelte-sonner';
+	import type { Clip } from '$lib/types';
 
 	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; image: boolean; tag: string };
 
@@ -37,12 +38,63 @@
 		})
 	);
 
-	const txLines = $derived(
-		(editor.selectedMetadata?.analysis?.transcript ?? []).map((seg) => ({
-			t: fmt(seg.start),
-			s: seg.text
-		}))
-	);
+	type TxLine = { t: string; s: string; start: number; end: number; clip: Clip | null };
+
+	/** Transcript lines of the selected asset, each resolved (by its midpoint)
+	 * to the timeline clip currently carrying it — null once cut out. */
+	const txLines = $derived.by<TxLine[]>(() => {
+		const assetId = editor.selectedAssetId;
+		return (editor.selectedMetadata?.analysis?.transcript ?? []).map((seg) => {
+			const mid = (seg.start + seg.end) / 2;
+			let clip: Clip | null = null;
+			outer: for (const tr of editor.timeline.tracks) {
+				for (const c of tr.clips) {
+					if (c.asset_id === assetId && mid > c.source_in && mid < c.source_out) {
+						clip = c;
+						break outer;
+					}
+				}
+			}
+			return { t: fmt(seg.start), s: seg.text, start: seg.start, end: seg.end, clip };
+		});
+	});
+
+	/** Timeline time of a source point within a clip (mirrors the timeline's
+	 * mapping, honoring speed and reverse). */
+	function srcToTimeline(c: Clip, src: number): number {
+		const sp = c.speed ?? 1;
+		const mag = Math.max(Math.abs(sp), 0.01);
+		const off = sp < 0 ? c.source_out - src : src - c.source_in;
+		return c.timeline_start + Math.max(0, off) / mag;
+	}
+
+	function seekLine(l: TxLine) {
+		if (l.clip) ui.seek(srcToTimeline(l.clip, l.start));
+	}
+
+	async function cutLine(l: TxLine) {
+		if (!l.clip) return;
+		try {
+			await editor.cutRange(l.clip.id, l.start, l.end);
+			toast('Line cut from timeline', {
+				action: { label: 'Undo', onClick: () => void editor.undo() }
+			});
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	/** Index of the transcript line under the playhead, for the highlight. */
+	const activeTx = $derived.by(() => {
+		for (let i = 0; i < txLines.length; i++) {
+			const l = txLines[i];
+			if (!l.clip) continue;
+			const a = srcToTimeline(l.clip, Math.max(l.start, l.clip.source_in));
+			const b = srcToTimeline(l.clip, Math.min(l.end, l.clip.source_out));
+			if (ui.time >= Math.min(a, b) && ui.time < Math.max(a, b)) return i;
+		}
+		return -1;
+	});
 
 	const tabs = $derived([
 		{ id: 'bin' as const, label: 'Media', count: assets.length || undefined },
@@ -253,12 +305,39 @@
 			{:else}
 				<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 					{#each txLines as l, i (i)}
-						<div style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm)">
-							<span
-								style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none;padding-top:1px"
-								>{l.t}</span
+						<div
+							style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);align-items:flex-start;background:{i ===
+							activeTx
+								? 'var(--surface-inset)'
+								: 'transparent'}"
+						>
+							<button
+								onclick={() => seekLine(l)}
+								disabled={!l.clip}
+								title={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
+								style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;cursor:{l.clip
+									? 'pointer'
+									: 'default'}"
 							>
-							<span style="font-size:12px;line-height:1.45;color:var(--text-secondary)">{l.s}</span>
+								<span
+									style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none;padding-top:1px"
+									>{l.t}</span
+								>
+								<span
+									style="font-size:12px;line-height:1.45;color:{l.clip
+										? 'var(--text-secondary)'
+										: 'var(--text-disabled)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
+								>
+							</button>
+							{#if l.clip}
+								<button
+									title="Cut this line out of the timeline"
+									aria-label="Cut line"
+									onclick={() => void cutLine(l)}
+									style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:1px 0 0"
+									><Icon n="x" s={11} /></button
+								>
+							{/if}
 						</div>
 					{/each}
 				</div>

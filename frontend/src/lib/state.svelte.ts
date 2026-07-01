@@ -37,6 +37,7 @@ import {
 	setTrackDuck,
 	reorderClip,
 	rippleDelete,
+	cutClipRange,
 	revertTo as apiRevertTo,
 	saveProjectAs as apiSaveProjectAs,
 	setColor,
@@ -310,6 +311,9 @@ class EditorState {
 	rippleDelete(clipId: string) {
 		if (this.selectedClipId === clipId) this.selectedClipId = null;
 		return this.#apply(rippleDelete(clipId));
+	}
+	cutRange(clipId: string, from: number, to: number) {
+		return this.#apply(cutClipRange(clipId, from, to));
 	}
 	addTrack(kind: StreamKind, name?: string) {
 		return this.#apply(addTrack(kind, name));

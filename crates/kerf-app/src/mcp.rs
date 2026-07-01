@@ -131,6 +131,16 @@ struct TrackIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CutClipRangeParams {
+    #[schemars(description = "UUID of the clip to cut")]
+    clip_id: String,
+    #[schemars(description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's start)")]
+    from: f64,
+    #[schemars(description = "Source-time end of the span to remove (seconds)")]
+    to: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetTrackDuckParams {
     #[schemars(description = "UUID of the track to (un)duck")]
     track_id: String,
@@ -568,6 +578,19 @@ impl KerfMcp {
         project.ripple_delete(clip_id).map_err(core_err)?;
         self.changed();
         Ok("ok".to_string())
+    }
+
+    #[tool(
+        description = "Cut a source-time range out of a clip and close the gap (split + ripple in one edit) — \
+                       the transcript-editing primitive: pass a transcript segment's start/end to delete that \
+                       sentence from the cut"
+    )]
+    fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let pieces = project.cut_clip_range(clip_id, p.from, p.to).map_err(core_err)?;
+        self.changed();
+        json(&pieces)
     }
 
     #[tool(description = "Add a new empty track (\"video\" or \"audio\"), e.g. a B-roll lane above the interview; later video tracks composite on top at export")]

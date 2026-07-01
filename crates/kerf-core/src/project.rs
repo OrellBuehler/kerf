@@ -764,6 +764,72 @@ impl Project {
         })
     }
 
+    /// Cut a **source-time** range out of a clip: the clip is split around the
+    /// intersection of `[from, to]` with its source window, the middle piece
+    /// removed, and later clips on the track ripple left to close the gap.
+    /// This is the transcript-editing primitive — delete a sentence and the
+    /// cut tightens. Returns the kept pieces in play order.
+    pub fn cut_clip_range(&self, clip_id: Uuid, from: f64, to: f64) -> Result<Vec<Clip>> {
+        self.edit_timeline("Cut range", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = timeline.tracks[ti].clips[ci].clone();
+            let a = from.max(clip.source_in);
+            let b = to.min(clip.source_out);
+            if b - a <= 1e-9 {
+                return Err(Error::InvalidArgument(
+                    "range does not overlap the clip's source window".to_string(),
+                ));
+            }
+            let removed = (b - a) / clip.speed_mag();
+
+            // The kept source spans in play order — a reversed clip plays the
+            // upper span first. A piece that is the sole survivor keeps the
+            // original id and both fades (the cut is just a trim); otherwise
+            // the fades facing the removed middle are dropped.
+            let (head, tail) = if clip.is_reversed() {
+                ((b, clip.source_out), (clip.source_in, a))
+            } else {
+                ((clip.source_in, a), (b, clip.source_out))
+            };
+            let head_ok = head.1 - head.0 > 1e-9;
+            let tail_ok = tail.1 - tail.0 > 1e-9;
+            let mut pieces: Vec<Clip> = Vec::new();
+            let mut cursor = clip.timeline_start;
+            if head_ok {
+                let mut p = clip.clone();
+                (p.source_in, p.source_out) = head;
+                p.timeline_start = cursor;
+                if tail_ok {
+                    p.fade_out = 0.0;
+                }
+                cursor = p.timeline_end();
+                pieces.push(p);
+            }
+            if tail_ok {
+                let mut p = clip.clone();
+                (p.source_in, p.source_out) = tail;
+                p.timeline_start = cursor;
+                if head_ok {
+                    p.id = Uuid::new_v4();
+                    p.fade_in = 0.0;
+                    p.transition_in = None;
+                }
+                pieces.push(p);
+            }
+
+            let track = &mut timeline.tracks[ti];
+            track.clips.remove(ci);
+            for c in &mut track.clips {
+                if c.timeline_start > clip.timeline_start + 1e-9 {
+                    c.timeline_start = (c.timeline_start - removed).max(0.0);
+                }
+            }
+            track.clips.extend(pieces.iter().cloned());
+            track.sort_by_start();
+            Ok(pieces)
+        })
+    }
+
     /// Move a clip to a new index within its track and re-flow the track gaplessly.
     pub fn reorder(&self, track_id: Uuid, clip_id: Uuid, new_index: usize) -> Result<()> {
         self.edit_timeline("Reorder clip", |timeline| {
@@ -1919,6 +1985,25 @@ mod tests {
 
         let history = project.history().unwrap();
         assert_eq!(history.last().unwrap().label, "Trim clip");
+    }
+
+    #[test]
+    fn cut_clip_range_splits_and_ripples() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        // Two 10s clips back to back; cut source 4..6 out of the first.
+        let a = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let b = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let pieces = project.cut_clip_range(a.id, 4.0, 6.0).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!((pieces[0].source_out - 4.0).abs() < 1e-9);
+        assert!((pieces[1].source_in - 6.0).abs() < 1e-9);
+        assert!((pieces[1].timeline_start - 4.0).abs() < 1e-9);
+        // The following clip rippled left by the removed 2 seconds.
+        let timeline = project.timeline().unwrap();
+        let moved = timeline.clip(b.id).unwrap();
+        assert!((moved.timeline_start - 8.0).abs() < 1e-9, "{}", moved.timeline_start);
     }
 
     #[test]

@@ -464,6 +464,63 @@ export async function rippleDelete(clipId: string): Promise<Timeline> {
 	return invoke<Timeline>('ripple_delete', { clipId });
 }
 
+/** Cut a source-time range out of a clip (split + ripple in one edit) — the
+ * transcript-editing primitive. */
+export async function cutClipRange(clipId: string, from: number, to: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const [track, ci] = found;
+			const clip = track.clips[ci];
+			const a = Math.max(from, clip.source_in);
+			const b = Math.min(to, clip.source_out);
+			if (b - a > 1e-9) {
+				const sp = clip.speed ?? 1;
+				const mag = Math.max(Math.abs(sp), 0.01);
+				const removed = (b - a) / mag;
+				const [head, tail] =
+					sp < 0
+						? [
+								[b, clip.source_out],
+								[clip.source_in, a]
+							]
+						: [
+								[clip.source_in, a],
+								[b, clip.source_out]
+							];
+				const headOk = head[1] - head[0] > 1e-9;
+				const tailOk = tail[1] - tail[0] > 1e-9;
+				const pieces: Clip[] = [];
+				let cursor = clip.timeline_start;
+				if (headOk) {
+					const p: Clip = { ...clip, source_in: head[0], source_out: head[1], timeline_start: cursor };
+					if (tailOk) p.fade_out = 0;
+					cursor += (head[1] - head[0]) / mag;
+					pieces.push(p);
+				}
+				if (tailOk) {
+					const p: Clip = { ...clip, source_in: tail[0], source_out: tail[1], timeline_start: cursor };
+					if (headOk) {
+						p.id = uid();
+						p.fade_in = 0;
+						p.transition_in = null;
+					}
+					pieces.push(p);
+				}
+				track.clips.splice(ci, 1);
+				for (const c of track.clips)
+					if (c.timeline_start > clip.timeline_start + 1e-9)
+						c.timeline_start = Math.max(0, c.timeline_start - removed);
+				track.clips.push(...pieces);
+				track.clips.sort((x, y) => x.timeline_start - y.timeline_start);
+			}
+		}
+		recordDev('Cut range');
+		return snapshot();
+	}
+	return invoke<Timeline>('cut_clip_range', { clipId, from, to });
+}
+
 /** Append a new empty track (video tracks above audio); auto-named when omitted. */
 export async function addTrack(kind: StreamKind, name?: string): Promise<Timeline> {
 	if (!inTauri()) {
