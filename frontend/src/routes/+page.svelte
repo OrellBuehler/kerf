@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { toast } from 'svelte-sonner';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
@@ -17,6 +17,13 @@
 	import { inTauri } from '$lib/api';
 
 	let exportOpen = $state(false);
+
+	// Any timeline edit mid-playback re-anchors the audio so what's heard
+	// matches the new cut (volume/fade tweaks land live too).
+	$effect(() => {
+		void editor.timeline;
+		untrack(() => ui.resync());
+	});
 
 	onMount(() => {
 		void editor.load();

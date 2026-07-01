@@ -378,6 +378,15 @@ impl Project {
         engine::frame_jpeg(&path, time_secs, max_width, quality, accurate)
     }
 
+    /// Decode a window of an asset's audio as mono s16le PCM at `sample_rate`,
+    /// for the GUI's preview playback. Static like
+    /// [`Project::decode_preview_frame`] so the caller can release the project
+    /// lock before the ffmpeg decode runs. Always reads the original source —
+    /// proxies are video-only.
+    pub fn decode_audio_pcm(asset: &Asset, start: f64, duration: f64, sample_rate: u32) -> Result<Vec<u8>> {
+        engine::audio_pcm(Path::new(&asset.path), start, duration, sample_rate)
+    }
+
     /// The media path a preview should decode for `asset`: its generated proxy
     /// when one is ready on disk, else the original source. Only the preview
     /// paths ([`Project::decode_preview_frame`] and the [`Project::timeline_frame`]

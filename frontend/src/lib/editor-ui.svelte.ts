@@ -5,6 +5,7 @@
 
 import { editor } from './state.svelte';
 import { listFonts } from './api';
+import { audio } from './audio';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -21,6 +22,9 @@ class EditorUi {
 	analyzingId = $state<string | null>(null);
 	/** Playhead position, seconds. */
 	time = $state(0);
+	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
+	 *  Audio is muted in reverse (the playhead falls back to wall-clock). */
+	rate = $state(1);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
@@ -59,27 +63,41 @@ class EditorUi {
 	// ---- playback ----------------------------------------------------------
 
 	/** Move the playhead, clamped to the timeline so it can't park past the end
-	 *  or before zero. */
+	 *  or before zero. Re-anchors audio when it lands mid-playback. */
 	seek(t: number) {
 		this.time = Math.min(Math.max(0, t), Math.max(0, editor.duration));
+		if (this.playing) this.#startAudio();
 	}
 
 	togglePlay() {
 		this.playing ? this.pause() : this.play();
 	}
 
-	play() {
-		if (this.playing) return;
-		if (this.time >= editor.duration) this.time = 0;
+	play(rate = 1) {
+		if (this.playing && rate === this.rate) return;
+		if (this.#raf) cancelAnimationFrame(this.#raf);
+		if (rate > 0 && this.time >= editor.duration) this.time = 0;
+		if (rate < 0 && this.time <= 0) return;
 		this.playing = true;
+		this.rate = rate;
+		this.#startAudio();
 		let last = performance.now();
 		const step = (now: number) => {
 			if (!this.playing) return;
-			this.time += (now - last) / 1000;
+			// Follow the audio clock when it runs, so picture chases sound rather
+			// than the other way around; wall-clock otherwise (reverse shuttle,
+			// browser demo).
+			const ac = audio.clock();
+			this.time = ac !== null ? ac : this.time + ((now - last) / 1000) * this.rate;
 			last = now;
-			if (this.time >= editor.duration) {
+			if (this.rate > 0 && this.time >= editor.duration) {
 				this.time = editor.duration;
-				this.playing = false;
+				this.pause();
+				return;
+			}
+			if (this.rate < 0 && this.time <= 0) {
+				this.time = 0;
+				this.pause();
 				return;
 			}
 			this.#raf = requestAnimationFrame(step);
@@ -89,8 +107,27 @@ class EditorUi {
 
 	pause() {
 		this.playing = false;
+		this.rate = 1;
+		audio.stop();
 		if (this.#raf) cancelAnimationFrame(this.#raf);
 		this.#raf = null;
+	}
+
+	/** Re-anchor audio playback after a timeline edit so what's heard matches
+	 *  the new cut; a no-op when paused. */
+	resync() {
+		if (this.playing) this.#startAudio();
+	}
+
+	#startAudio() {
+		if (this.rate > 0) {
+			const withAudio = new Set(
+				editor.assets.filter((a) => a.streams.some((s) => s.kind === 'audio')).map((a) => a.id)
+			);
+			audio.start(editor.timeline, withAudio, this.time, this.rate);
+		} else {
+			audio.stop();
+		}
 	}
 }
 

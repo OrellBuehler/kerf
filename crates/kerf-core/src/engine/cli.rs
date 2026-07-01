@@ -656,6 +656,43 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
         .collect())
 }
 
+/// Decode a window of the first audio stream to mono s16le PCM at
+/// `sample_rate` — the GUI's Web Audio preview playback. Raw s16le (no
+/// container) so the webview can build an `AudioBuffer` directly without
+/// codec support; the input-side `-ss` fast-seek keeps a window deep in a
+/// long source cheap to extract.
+pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32) -> Result<Vec<u8>> {
+    let bin = ffmpeg_bin();
+    let output = command(&bin)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(["-ss", &start.max(0.0).to_string()])
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-t",
+            &duration.max(0.0).to_string(),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            &sample_rate.to_string(),
+            "-f",
+            "s16le",
+            "pipe:1",
+        ])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| launch_err(&bin, e))?;
+    if !output.status.success() {
+        return Err(Error::Engine(format!(
+            "could not decode audio: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
 // ---- preview proxies -------------------------------------------------------
 
 /// Cap on the proxy's width, in pixels (`scale='min(W,iw)'`). ~720p: small

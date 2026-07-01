@@ -626,6 +626,26 @@ fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) ->
     state.project()?.waveform(id, buckets).map_err(|e| e.to_string())
 }
 
+/// A window of an asset's audio as raw mono s16le PCM for the preview's Web
+/// Audio playback. Returns raw bytes rather than JSON — a minute of 32 kHz
+/// audio is ~3.8 MB, which a JSON number array would balloon ~5×.
+#[tauri::command]
+fn get_audio(
+    state: State<'_, AppState>,
+    asset_id: String,
+    start: f64,
+    duration: f64,
+    sample_rate: Option<u32>,
+) -> CmdResult<tauri::ipc::Response> {
+    let id = id(&asset_id)?;
+    // Resolve the asset under the lock, then drop the guard before the decode —
+    // same reasoning as `get_frame`.
+    let asset = state.project()?.require_asset(id).map_err(|e| e.to_string())?;
+    let rate = sample_rate.unwrap_or(32_000).clamp(8_000, 48_000);
+    let pcm = Project::decode_audio_pcm(&asset, start, duration, rate).map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(pcm))
+}
+
 #[tauri::command]
 fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
@@ -905,6 +925,7 @@ pub fn run() {
             get_frame,
             get_timeline_frame,
             get_waveform,
+            get_audio,
             get_energy,
             list_tasks,
             add_task,

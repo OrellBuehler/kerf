@@ -932,6 +932,21 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 	return invoke<number[]>('get_waveform', { assetId, buckets });
 }
 
+/**
+ * A window of an asset's audio as raw mono s16le PCM at `sampleRate`, for the
+ * preview's Web Audio playback. `null` outside the desktop app (the browser
+ * demo has no real media to decode).
+ */
+export async function getAudio(
+	assetId: string,
+	start: number,
+	duration: number,
+	sampleRate = 32000
+): Promise<ArrayBuffer | null> {
+	if (!inTauri()) return null;
+	return invoke<ArrayBuffer>('get_audio', { assetId, start, duration, sampleRate });
+}
+
 export async function getEnergy(assetId: string, buckets: number): Promise<number[]> {
 	if (!inTauri()) {
 		// Synthetic but deterministic RMS-like curve for the browser demo.
