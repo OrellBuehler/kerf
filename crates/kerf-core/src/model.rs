@@ -697,6 +697,11 @@ impl Clip {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: Uuid,
+    /// When set, this track's audio is ducked under the rest of the mix on
+    /// export: sidechain compression keyed by the non-ducked tracks, so e.g. a
+    /// music bed dips automatically under dialogue.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub duck: bool,
     pub kind: StreamKind,
     pub name: String,
     #[serde(default)]
@@ -783,12 +788,14 @@ impl Timeline {
                     kind: StreamKind::Video,
                     name: "V1".to_string(),
                     clips: Vec::new(),
+                    duck: false,
                 },
                 Track {
                     id: Uuid::new_v4(),
                     kind: StreamKind::Audio,
                     name: "A1".to_string(),
                     clips: Vec::new(),
+                    duck: false,
                 },
             ],
             overlays: Vec::new(),
@@ -849,6 +856,7 @@ impl Timeline {
                 kind: track.kind,
                 name: track.name.clone(),
                 clips: Vec::new(),
+                duck: track.duck,
             };
             for clip in &track.clips {
                 let (cs, ce) = (clip.timeline_start, clip.timeline_end());

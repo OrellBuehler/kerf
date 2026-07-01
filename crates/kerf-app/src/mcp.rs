@@ -131,6 +131,14 @@ struct TrackIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackDuckParams {
+    #[schemars(description = "UUID of the track to (un)duck")]
+    track_id: String,
+    #[schemars(description = "true to duck this track under the others on export, false to restore a flat mix")]
+    duck: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct VolumeParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -578,6 +586,18 @@ impl KerfMcp {
         project.remove_track(track_id).map_err(core_err)?;
         self.changed();
         Ok("ok".to_string())
+    }
+
+    #[tool(
+        description = "Duck (or unduck) a track: on export its audio is sidechain-compressed under the \
+                       other tracks, so e.g. a music bed dips automatically whenever dialogue plays"
+    )]
+    fn set_track_duck(&self, Parameters(p): Parameters<SetTrackDuckParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
+        self.changed();
+        json(&track)
     }
 
     #[tool(description = "Remove a clip from the timeline")]

@@ -330,6 +330,14 @@ fn remove_track(state: State<'_, AppState>, track_id: String) -> CmdResult<Timel
 }
 
 #[tauri::command]
+fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project()?;
+    project.set_track_duck(id, duck).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project()?;
@@ -898,6 +906,7 @@ pub fn run() {
             ripple_delete,
             add_track,
             remove_track,
+            set_track_duck,
             remove_clip,
             set_volume,
             set_fade,

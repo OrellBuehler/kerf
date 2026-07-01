@@ -620,6 +620,21 @@
 						>{t.name}</span
 					>
 					<span style="font-size:11px;color:var(--text-muted);flex:1">{t.kind === 'video' ? 'Video' : 'Audio'}</span>
+					{#if t.kind === 'audio'}
+						<button
+							title={t.duck
+								? 'Ducking on — this track dips under the rest of the mix on export'
+								: 'Duck this track under the rest of the mix on export'}
+							aria-label="Toggle ducking"
+							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
+							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:1px solid {t.duck
+								? 'var(--kerf-500)'
+								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
+								? '#fff'
+								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px"
+							>DUCK</button
+						>
+					{/if}
 					<Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" />
 					<button
 						title="Remove track"

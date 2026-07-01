@@ -472,6 +472,7 @@
 				{@render secHead('Audio')}
 				{@render toggleRow('Strip audio', !opts.include_audio, (v) => patch({ include_audio: !v }))}
 				{#if opts.include_audio}
+					{@render toggleRow('Normalize loudness (−14 LUFS)', !!opts.loudnorm, (v) => patch({ loudnorm: v }))}
 					{@render selectRow(
 						'Codec',
 						opts.audio_codec ?? '',

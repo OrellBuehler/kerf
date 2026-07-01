@@ -860,6 +860,7 @@ impl Project {
                 kind,
                 name,
                 clips: Vec::new(),
+                duck: false,
             };
             // Insert video tracks just after the last video track and audio
             // tracks at the very end, so the lanes stay grouped (V1, V2, …, A1, A2).
@@ -874,6 +875,17 @@ impl Project {
             };
             timeline.tracks.insert(at, track.clone());
             Ok(track)
+        })
+    }
+
+    /// Flag or unflag a track for export-time ducking: a flagged track's audio
+    /// is sidechain-compressed under the non-ducked tracks (music dips under
+    /// dialogue automatically).
+    pub fn set_track_duck(&self, track_id: Uuid, duck: bool) -> Result<Track> {
+        self.edit_timeline(if duck { "Duck track" } else { "Unduck track" }, |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.duck = duck;
+            Ok(track.clone())
         })
     }
 

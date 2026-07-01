@@ -1023,6 +1023,9 @@ pub struct ExportOptions {
     /// Render only this timeline span (seconds), e.g. the GUI's in/out marks;
     /// the output starts at `range.start`. `None` renders the whole timeline.
     pub range: Option<crate::model::TimeRange>,
+    /// Normalize the final mix to -14 LUFS (single-pass `loudnorm`, the
+    /// streaming-platform target) before encoding.
+    pub loudnorm: bool,
 }
 
 impl Default for ExportOptions {
@@ -1056,6 +1059,7 @@ impl Default for ExportOptions {
             gif_loop: true,
             metadata_title: None,
             range: None,
+            loudnorm: false,
         }
     }
 }
@@ -2012,7 +2016,8 @@ fn build_filter_complex(
     // deduplicated ffmpeg input index (may be shared, so the `[input:v]` source is
     // fanned out with `split` below).
     let mut video: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
-    let mut audio: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
+    // Audio entries also carry the owning track's `duck` flag for the bus split.
+    let mut audio: Vec<(usize, usize, &crate::model::Clip, bool)> = Vec::new();
     let mut base = 0;
     for track in &timeline.tracks {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
@@ -2025,7 +2030,7 @@ fn build_filter_complex(
                 video.push((flat, input, clip));
             }
             if has_audio(clip) {
-                audio.push((flat, input, clip));
+                audio.push((flat, input, clip, track.duck));
             }
         }
         base += track.clips.len();
@@ -2049,7 +2054,7 @@ fn build_filter_complex(
     for (_, input, _) in &video {
         vcount[*input] += 1;
     }
-    for (_, input, _) in &audio {
+    for (_, input, _, _) in &audio {
         acount[*input] += 1;
     }
 
@@ -2159,7 +2164,7 @@ fn build_filter_complex(
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
     if has_audio_out {
-        for (flat, input, clip) in &audio {
+        for (flat, input, clip, _) in &audio {
             let src = if acount[*input] > 1 {
                 let k = anext[*input];
                 anext[*input] += 1;
@@ -2169,12 +2174,43 @@ fn build_filter_complex(
             };
             chains.push(format!("[{src}]{chain}[a{flat}]", chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)));
         }
-        let inputs: String = audio.iter().map(|(flat, _, _)| format!("[a{flat}]")).collect();
-        chains.push(format!(
-            "{inputs}amix=inputs={n}:normalize=0:dropout_transition=0[outa]",
-            inputs = inputs,
-            n = audio.len(),
-        ));
+        // Optional single-pass loudness normalization on the final mix; loudnorm
+        // upsamples to 192 kHz internally, so resample back to the output rate.
+        let mix_tail = if opts.loudnorm {
+            format!(",loudnorm=I=-14:TP=-1.5:LRA=11,aresample={sr}", sr = fmt.sample_rate)
+        } else {
+            String::new()
+        };
+        let pads = |flats: &[usize]| flats.iter().map(|f| format!("[a{f}]")).collect::<String>();
+        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, d)| *d).map(|(f, _, _, _)| *f).collect();
+        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, d)| !*d).map(|(f, _, _, _)| *f).collect();
+        if ducked.is_empty() || keyed.is_empty() {
+            // No ducking in play (nothing flagged, or nothing to key from): one
+            // flat sum of every clip, exactly as before.
+            let flats: Vec<usize> = audio.iter().map(|(f, _, _, _)| *f).collect();
+            chains.push(format!(
+                "{ins}amix=inputs={n}:normalize=0:dropout_transition=0{mix_tail}[outa]",
+                ins = pads(&flats),
+                n = flats.len(),
+            ));
+        } else {
+            // Mix each group into a bus, dip the ducked bus under the keyed one
+            // (sidechain compression — music falls when dialogue speaks), then
+            // sum the two buses.
+            chains.push(format!(
+                "{ins}amix=inputs={n}:normalize=0:dropout_transition=0[akey]",
+                ins = pads(&keyed),
+                n = keyed.len(),
+            ));
+            chains.push(format!(
+                "{ins}amix=inputs={n}:normalize=0:dropout_transition=0[aduck]",
+                ins = pads(&ducked),
+                n = ducked.len(),
+            ));
+            chains.push("[akey]asplit=2[akmix][akside]".to_string());
+            chains.push("[aduck][akside]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string());
+            chains.push(format!("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"));
+        }
     }
 
     FilterGraph {
@@ -3156,6 +3192,7 @@ mod tests {
             kind: StreamKind::Video,
             name: "V1".into(),
             clips,
+            duck: false,
         }
     }
 
@@ -3165,6 +3202,7 @@ mod tests {
             kind: StreamKind::Audio,
             name: "A1".into(),
             clips,
+            duck: false,
         }
     }
 
@@ -3749,6 +3787,40 @@ mod tests {
         // The kept span is source 2..6 fast-sought to 2, so the in-graph trim
         // is seek-relative 0..4 — the graph really was built from the slice.
         assert!(joined.contains("trim=start=0:end=4"), "{joined}");
+    }
+
+    #[test]
+    fn ducked_track_sidechains_under_the_rest() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let voice = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let music = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut music_track = audio_track(vec![music]);
+        music_track.duck = true;
+        let tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+        let g = graph_of(&tl, &[asset]);
+        assert!(g.contains("sidechaincompress"), "{g}");
+        assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+    }
+
+    #[test]
+    fn duck_flag_without_other_audio_keeps_the_flat_mix() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let music = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut t = audio_track(vec![music]);
+        t.duck = true;
+        let g = graph_of(&timeline_of(vec![t]), &[asset]);
+        assert!(!g.contains("sidechaincompress"), "{g}");
+        assert!(g.contains("amix=inputs=1"), "{g}");
+    }
+
+    #[test]
+    fn loudnorm_option_appends_to_the_final_mix() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let opts = ExportOptions { loudnorm: true, ..Default::default() };
+        let args = build_export_args(&single(vec![clip]), &[asset], "out.mp4", &opts).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("loudnorm=I=-14:TP=-1.5:LRA=11,aresample="), "{joined}");
     }
 
     #[test]

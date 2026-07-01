@@ -495,6 +495,16 @@ export async function removeTrack(trackId: string): Promise<Timeline> {
 	return invoke<Timeline>('remove_track', { trackId });
 }
 
+export async function setTrackDuck(trackId: string, duck: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.duck = duck;
+		recordDev(duck ? 'Duck track' : 'Unduck track');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_duck', { trackId, duck });
+}
+
 export async function setVolume(clipId: string, volume: number): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);

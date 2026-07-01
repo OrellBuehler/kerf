@@ -34,6 +34,7 @@ import {
 	removeClip,
 	removeSilence,
 	removeTrack,
+	setTrackDuck,
 	reorderClip,
 	rippleDelete,
 	revertTo as apiRevertTo,
@@ -315,6 +316,9 @@ class EditorState {
 	}
 	removeTrack(trackId: string) {
 		return this.#apply(removeTrack(trackId));
+	}
+	setTrackDuck(trackId: string, duck: boolean) {
+		return this.#apply(setTrackDuck(trackId, duck));
 	}
 	setVolume(clipId: string, volume: number) {
 		return this.#apply(setVolume(clipId, volume));
