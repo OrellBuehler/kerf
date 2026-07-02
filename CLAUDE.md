@@ -33,7 +33,13 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render. The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
+  render. Tracks flagged `Track.duck` are mixed into their own bus and
+  `sidechaincompress`'d against the rest before the final sum (music dips under
+  dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
+  on the final mix, and `ExportOptions.range` renders only a span by building the
+  graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
+  clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
+  The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
@@ -54,6 +60,8 @@ so the feature is **only** activated through these forwards — which is what ma
   seeking. `render_with_progress` streams ffmpeg's `-progress` to report
   `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
+  `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
+  the GUI's Web Audio preview playback fetches clip audio through it.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -113,8 +121,10 @@ no editing logic in the adapter.
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
   motion). Text titles / lower-thirds / captions live on the timeline itself as
   `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
-  animation); `transcript_to_srt` serializes a transcript to SubRip. Inherent
-  helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`) back the
+  animation); `transcript_to_srt` serializes a transcript to SubRip. A `Track`
+  carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
+  Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
+  `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
@@ -166,14 +176,19 @@ Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns 
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
-op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip`, `reorder_clip`, `move_clip`,
-`ripple_delete`, `add_track`, `remove_track`, `remove_clip`, `set_volume`, `set_fade`,
+op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
+left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
+`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
+`set_track_duck`, `remove_clip`, `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
 `concatenate` — each returns the
-refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`), the
+refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
+only non-JSON command — the preview's Web Audio playback decodes it), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), and `export_timeline` (emits `export-progress`
 events) / `cancel_export`. Tauri auto-converts JS camelCase args to Rust
@@ -215,12 +230,27 @@ px/sec + playhead), with scene markers / silence regions mapped from `AssetAnaly
 real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0, and **dropping onto another
-same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing). The timeline
+same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
+**edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
+a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the right edge
+stays put; stills extend freely since they loop). The ruler renders **in/out marks**
+(`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
+**J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
+`src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`,
+schedules them with volume / fades / speed / reverse applied (effects chains are not
+auralized), and the playhead follows the audio clock — edits mid-playback re-anchor via
+`ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
-(`add_track` / `remove_track`); the timeline is genuinely **multi-track**. The old
+(`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
+(`set_track_duck`); the timeline is genuinely **multi-track**. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
-(`get_frame`) under the playhead with real playback/scrub. The **agent panel is a real MCP task
+(`get_frame`) under the playhead with real playback/scrub. `ExportDialog` (⌘E) drives
+the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
+loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
+**Transcript tab is an editing surface**: lines resolve to the clip carrying them,
+click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
+(`cut_clip_range`); cut lines render struck through. The **agent panel is a real MCP task
 queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
