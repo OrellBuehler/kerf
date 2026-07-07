@@ -112,6 +112,7 @@
 	--track-text-edge: #8a6aa8;
 	--waveform: #6fcfa8;
 	--scene-marker: var(--kerf-500);
+	--beat-marker: var(--agent-500);
 	--silence-region: rgba(241, 84, 63, 0.12);
 	--timeline-grid: rgba(255, 255, 255, 0.04);
 	--timeline-grid-major: rgba(255, 255, 255, 0.08);

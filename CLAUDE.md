@@ -235,10 +235,12 @@ text / timing / position / size / color / box / bold).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
-px/sec + playhead), with scene markers / silence regions mapped from `AssetAnalysis` and
+px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
+of audio-track clips, confidence-gated, hidden when beats land closer than 4px) mapped
+from `AssetAnalysis` and
 real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
-positioning with gaps, snapping to clip edges / playhead / 0, and **dropping onto another
+positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
 same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
 **edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
 a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the right edge

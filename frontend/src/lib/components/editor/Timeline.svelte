@@ -65,6 +65,34 @@
 		return xs;
 	});
 
+	// ---- beat grid (tempo analysis → ruler ticks + snap targets) --------------
+
+	/** Ignore tempo estimates below this confidence. */
+	const BEAT_MIN_CONF = 0.25;
+	/** Hide (and stop snapping to) the grid when beats land closer than this, px. */
+	const BEAT_MIN_PX = 4;
+
+	const beatTimes = $derived.by(() => {
+		const ts: number[] = [];
+		let period = Infinity; // shortest on-timeline beat interval, seconds
+		for (const t of editor.timeline.tracks) {
+			if (t.kind !== 'audio') continue;
+			for (const c of t.clips) {
+				const tempo = editor.analysisFor(c.asset_id)?.tempo;
+				if (!tempo || tempo.confidence < BEAT_MIN_CONF || tempo.bpm <= 0) continue;
+				const mag = Math.max(Math.abs(c.speed ?? 1), 0.01);
+				period = Math.min(period, 60 / tempo.bpm / mag);
+				for (const b of tempo.beats) {
+					if (b >= c.source_in && b <= c.source_out) ts.push(srcToTimeline(c, b));
+				}
+			}
+		}
+		if (ts.length === 0 || period * pxPerSec < BEAT_MIN_PX) return [];
+		ts.sort((a, b) => a - b);
+		// Overlapping clips of one asset repeat the same beats; drop the copies.
+		return ts.filter((b, i) => i === 0 || b - ts[i - 1] > 0.005);
+	});
+
 	function silenceRegions(c: Clip): { left: number; width: number }[] {
 		const an = editor.analysisFor(c.asset_id);
 		if (!an) return [];
@@ -242,11 +270,11 @@
 		}
 	}
 
-	/** Snap a time point to 0, the playhead, or another clip's edges. */
+	/** Snap a time point to 0, the playhead, a beat, or another clip's edges. */
 	function snapPoint(time: number, trackId: string, clipId: string): number {
 		if (!ui.snap) return time;
 		const threshold = 8 / pxPerSec;
-		const cands: number[] = [0, ui.time];
+		const cands: number[] = [0, ui.time, ...beatTimes];
 		const track = editor.timeline.tracks.find((t) => t.id === trackId);
 		if (track)
 			for (const c of track.clips) {
@@ -303,12 +331,13 @@
 		return null;
 	}
 
-	/** Snap a candidate start to 0, the playhead, or another clip's edges. */
+	/** Snap a candidate start to 0, the playhead, a beat, or another clip's edges. */
 	function snapStart(start: number, trackId: string, clipId: string, dur: number): number {
 		const clamped = Math.max(0, start);
 		if (!ui.snap) return clamped;
 		const threshold = 8 / pxPerSec;
 		const cands: number[] = [0, ui.time];
+		for (const b of beatTimes) cands.push(b, b - dur); // land either edge on a beat
 		const track = editor.timeline.tracks.find((t) => t.id === trackId);
 		if (track)
 			for (const c of track.clips) {
@@ -670,6 +699,12 @@
 						<span
 							title="Detected scene cut"
 							style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
+						></span>
+					{/each}
+					{#each beatTimes as b (b)}
+						<span
+							title="Beat"
+							style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:1px;height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
 						></span>
 					{/each}
 					{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
