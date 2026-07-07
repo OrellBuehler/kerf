@@ -500,14 +500,19 @@ impl KerfMcp {
     }
 
     #[tool(description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and transcription when configured) and cache the result")]
-    fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+    async fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        // Probe under the lock, run the heavy ffmpeg analysis with the lock
-        // released, then re-lock only to cache it — so analysis doesn't freeze
-        // the GUI or stall other tools for its whole (multi-second) duration.
-        let asset = self.lock().require_asset(id).map_err(core_err)?;
-        let analysis = kerf_core::analyze_asset_media(&asset).map_err(core_err)?;
-        self.lock().set_analysis(&analysis).map_err(core_err)?;
+        let project = self.project.clone();
+        let analysis = blocking(move || {
+            // Resolve under the lock, run the heavy ffmpeg analysis with the lock
+            // released, then re-lock only to cache it — so analysis doesn't freeze
+            // the GUI or stall other tools for its whole (multi-second) duration.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            let analysis = kerf_core::analyze_asset_media(&asset).map_err(core_err)?;
+            lock_agent(&project).set_analysis(&analysis).map_err(core_err)?;
+            Ok(analysis)
+        })
+        .await?;
         self.changed();
         json(&analysis)
     }
@@ -892,17 +897,23 @@ impl KerfMcp {
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
                        safe H.264/AAC MP4 default."
     )]
-    fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
+    async fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
         let opts = p.options.unwrap_or_default();
-        // Snapshot the timeline + assets under the lock, then render with the
-        // lock released so a long export doesn't freeze the GUI (or block other
-        // agent tools) for its whole duration.
-        let (timeline, assets) = {
-            let project = self.lock();
-            (project.timeline().map_err(core_err)?, project.list_assets().map_err(core_err)?)
-        };
-        kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts).map_err(core_err)?;
-        json(&serde_json::json!({ "output": p.output_path }))
+        let project = self.project.clone();
+        let output_path = blocking(move || {
+            // Snapshot the timeline + assets under the lock, then render with the
+            // lock released so a long export doesn't freeze the GUI (or block other
+            // agent tools) for its whole duration.
+            let (timeline, assets) = {
+                let project = lock_agent(&project);
+                (project.timeline().map_err(core_err)?, project.list_assets().map_err(core_err)?)
+            };
+            kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts)
+                .map_err(core_err)?;
+            Ok(p.output_path)
+        })
+        .await?;
+        json(&serde_json::json!({ "output": output_path }))
     }
 
     // ---- agent task queue --------------------------------------------------
@@ -966,47 +977,69 @@ impl KerfMcp {
     }
 
     #[tool(description = "Get peak-magnitude waveform data (0.0–1.0) for an asset's first audio stream")]
-    fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+    async fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let buckets = project.waveform(id, p.buckets).map_err(core_err)?;
+        let project = self.project.clone();
+        let buckets = blocking(move || {
+            // Resolve under the lock, decode the whole audio stream with it
+            // released — bucketing a long source takes seconds and must not
+            // stall the GUI's commands on the shared mutex.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            Project::decode_waveform(&asset, p.buckets).map_err(core_err)
+        })
+        .await?;
         json(&buckets)
     }
 
     #[tool(
         description = "Get an RMS energy envelope (0.0–1.0 per bucket) for an asset's first audio stream — a perceptual loudness-over-time curve. Unlike the peak waveform, it tracks how loud each slice feels, so use it to find quiet/loud passages and match cut pacing to musical energy."
     )]
-    fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+    async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let energy = project.energy(id, p.buckets).map_err(core_err)?;
+        let project = self.project.clone();
+        let energy = blocking(move || {
+            // Same lock-free decode shape as `get_waveform`.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            Project::decode_energy(&asset, p.buckets).map_err(core_err)
+        })
+        .await?;
         json(&energy)
     }
 
     #[tool(
         description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
     )]
-    fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
+    async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let jpeg = self
-            .lock()
-            .frame_jpeg(id, p.time_secs, p.max_width.unwrap_or(640), 4)
-            .map_err(core_err)?;
+        let project = self.project.clone();
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let jpeg = blocking(move || {
+            // Resolve under the lock, decode with it released — mirrors the GUI's
+            // `get_frame` so an agent drill-in can't stall the user's edits.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            Project::decode_preview_frame(&asset, time_secs, max_width, 4, true).map_err(core_err)
+        })
+        .await?;
         Ok(image_result(format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0))), jpeg))
     }
 
     #[tool(
         description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then call get_frame to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
     )]
-    fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
+    async fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
         let columns = p.columns.unwrap_or(4).clamp(1, 8);
         let rows = p.rows.unwrap_or(4).clamp(1, 8);
         let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
-        let (jpeg, times) = self
-            .lock()
-            .skim_asset(id, p.start, p.end, columns, rows, cell_width, 5)
-            .map_err(core_err)?;
+        let project = self.project.clone();
+        let (jpeg, times) = blocking(move || {
+            // Resolve under the lock, sample the (columns × rows) frames with it
+            // released — a contact sheet is many seeks and would otherwise freeze
+            // the GUI's commands on the shared mutex for its whole build.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            Project::decode_contact_sheet(&asset, p.start, p.end, columns, rows, cell_width, 5).map_err(core_err)
+        })
+        .await?;
         let index = times
             .iter()
             .enumerate()
@@ -1020,11 +1053,16 @@ impl KerfMcp {
     #[tool(
         description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. Mid-transition blends (crossfade/dip-to-black) are approximated."
     )]
-    fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
-        let jpeg = self
-            .lock()
-            .timeline_frame(p.time_secs, p.max_width.unwrap_or(640), 4)
-            .map_err(core_err)?;
+    async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
+        let project = self.project.clone();
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let jpeg = blocking(move || {
+            // Snapshot the inputs under the lock, composite with it released —
+            // mirrors the GUI's `get_timeline_frame`.
+            let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
+            Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width, 4).map_err(core_err)
+        })
+        .await?;
         Ok(image_result(format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0))), jpeg))
     }
 
@@ -1063,12 +1101,7 @@ impl KerfMcp {
     /// the agent. The GUI sets `User` the same way, and the mutex keeps the two
     /// from interleaving within a single operation.
     fn lock(&self) -> MutexGuard<'_, Project> {
-        // Recover from a poisoned mutex (a panic while another op held the lock)
-        // rather than panicking here too — a single failed op shouldn't brick the
-        // agent endpoint for the rest of the session.
-        let mut guard = self.project.lock().unwrap_or_else(|e| e.into_inner());
-        guard.set_actor(EditSource::Agent);
-        guard
+        lock_agent(&self.project)
     }
 
     /// Tell the webview the project changed so it re-fetches and renders live.
@@ -1077,6 +1110,27 @@ impl KerfMcp {
             tracing::warn!(error = %e, "failed to emit project-changed");
         }
     }
+}
+
+/// Lock the shared project outside `&self` (for closures moved onto the
+/// blocking pool), attributing edits to the agent. Recovers from a poisoned
+/// mutex (a panic while another op held the lock) rather than panicking here
+/// too — a single failed op shouldn't brick the agent endpoint for the session.
+fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
+    let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
+    guard.set_actor(EditSource::Agent);
+    guard
+}
+
+/// Run a blocking (ffmpeg) job on the blocking thread pool and await it, so a
+/// slow decode / analysis / render doesn't pin one of the shared tokio workers
+/// serving the MCP endpoint (and the rest of the app) for its whole duration.
+async fn blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, McpError> + Send + 'static,
+) -> Result<T, McpError> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
 }
 
 #[tool_handler]

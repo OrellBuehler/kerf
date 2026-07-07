@@ -211,7 +211,16 @@ impl Project {
 
     /// Probe a media file and store its asset record.
     pub fn import_asset(&self, media_path: impl AsRef<Path>) -> Result<Asset> {
-        let path = media_path.as_ref();
+        let asset = Self::probe_asset(media_path.as_ref())?;
+        self.insert_asset(&asset)?;
+        Ok(asset)
+    }
+
+    /// Probe a media file into a fresh [`Asset`] record *without* `&self` — the
+    /// ffprobe run doesn't need the project lock, so callers importing several
+    /// files can probe them concurrently and take the lock only for the quick
+    /// [`Project::insert_asset`].
+    pub fn probe_asset(path: &Path) -> Result<Asset> {
         let probe = engine::probe(path)?;
         let name = path
             .file_name()
@@ -225,16 +234,14 @@ impl Project {
         } else {
             probe.duration
         };
-        let asset = Asset {
+        Ok(Asset {
             id: Uuid::new_v4(),
             path: path.to_string_lossy().into_owned(),
             name,
             duration,
             streams: probe.streams,
             imported_at: Utc::now(),
-        };
-        self.insert_asset(&asset)?;
-        Ok(asset)
+        })
     }
 
     /// Insert (or replace) an asset record directly.
@@ -420,6 +427,22 @@ impl Project {
         quality: u8,
     ) -> Result<(Vec<u8>, Vec<f64>)> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_contact_sheet(&asset, start, end, columns, rows, cell_width, quality)
+    }
+
+    /// Build the contact sheet for an already-resolved [`Asset`], *without*
+    /// `&self` — so the caller can release the project lock before the
+    /// (many-seek) ffmpeg sampling runs. See [`Project::skim_asset`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_contact_sheet(
+        asset: &Asset,
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+    ) -> Result<(Vec<u8>, Vec<f64>)> {
         let start = start.unwrap_or(0.0).max(0.0);
         let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
         engine::contact_sheet(Path::new(&asset.path), start, end, columns, rows, cell_width, quality)
@@ -474,6 +497,13 @@ impl Project {
     /// `0.0..=1.0` for waveform rendering.
     pub fn waveform(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_waveform(&asset, buckets)
+    }
+
+    /// Waveform peaks for an already-resolved [`Asset`], *without* `&self` — so
+    /// the caller can release the project lock before the whole-file ffmpeg
+    /// decode. See [`Project::waveform`].
+    pub fn decode_waveform(asset: &Asset, buckets: usize) -> Result<Vec<f32>> {
         engine::waveform(Path::new(&asset.path), buckets, 8_000)
     }
 
@@ -482,6 +512,12 @@ impl Project {
     /// [`Self::waveform`] (which returns peaks); RMS better reflects loudness.
     pub fn energy(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_energy(&asset, buckets)
+    }
+
+    /// Energy envelope for an already-resolved [`Asset`], *without* `&self` —
+    /// lock-free like [`Project::decode_waveform`].
+    pub fn decode_energy(asset: &Asset, buckets: usize) -> Result<Vec<f32>> {
         engine::energy_envelope(Path::new(&asset.path), buckets, 8_000)
     }
 

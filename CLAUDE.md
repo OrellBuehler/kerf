@@ -191,7 +191,16 @@ refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform
 only non-JSON command — the preview's Web Audio playback decodes it), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), and `export_timeline` (emits `export-progress`
-events) / `cancel_export`. Tauri auto-converts JS camelCase args to Rust
+events) / `cancel_export`. **No command runs on the main thread** (a plain sync
+command would freeze the window in Tauri v2): quick ops are
+`#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
+export, disk-bound open/save) is an `async fn` that pushes its work onto the
+blocking pool via the `blocking()` helper — resolving inputs under the shared
+project lock and **releasing it before the slow part** (see `lock_user`; the
+lock-free `Project::decode_*` statics exist for exactly this). The MCP server's
+heavy tools (`analyze_asset`, `get_frame`, `skim_asset`, `preview_timeline`,
+`get_waveform`/`get_energy`, `export`) follow the same shape with `lock_agent`.
+Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
 `beforeDevCommand`/`beforeBuildCommand` hooks, however, run from Tauri's *app dir* —

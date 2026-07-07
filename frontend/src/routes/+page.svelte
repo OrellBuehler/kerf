@@ -33,17 +33,33 @@
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
 		// the timeline, history, and task queue so the GUI reflects agent edits.
+		// Agent edits arrive in bursts (one event per mutation), so coalesce:
+		// at most one refresh in flight plus one queued re-run, instead of piling
+		// up a redundant full re-fetch per event.
 		// It also emits `proxy-ready` once a background preview proxy finishes, so
 		// the preview re-decodes the current frame from the faster proxy.
+		let refreshing = false;
+		let dirty = false;
+		async function onProjectChanged() {
+			if (refreshing) {
+				dirty = true;
+				return;
+			}
+			refreshing = true;
+			try {
+				do {
+					dirty = false;
+					await Promise.all([editor.refreshTimeline(), editor.refreshHistory(), agent.load()]).catch(() => {});
+				} while (dirty);
+			} finally {
+				refreshing = false;
+			}
+		}
 		const unlisteners: Array<() => void> = [];
 		if (inTauri()) {
 			void import('@tauri-apps/api/event').then(async ({ listen }) => {
 				unlisteners.push(
-					await listen('project-changed', () => {
-						void editor.refreshTimeline();
-						void editor.refreshHistory();
-						void agent.load();
-					}),
+					await listen('project-changed', () => void onProjectChanged()),
 					await listen('proxy-ready', () => ui.refreshPreview())
 				);
 			});

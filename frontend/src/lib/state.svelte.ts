@@ -86,7 +86,7 @@ class EditorState {
 	importing = $state(false);
 	error = $state<string | null>(null);
 
-	#waveforms = new Map<string, number[]>();
+	#waveforms = new Map<string, number[] | Promise<number[]>>();
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
@@ -220,30 +220,34 @@ class EditorState {
 		}
 	}
 
-	/** Pick one or more media files and import them. Imports continue past a
-	 *  failed file; resolves to the assets that succeeded plus per-file errors. */
+	/** Pick one or more media files and import them. All files probe
+	 *  concurrently (each lands in the bin as it resolves); imports continue
+	 *  past a failed file and resolve to the successes plus per-file errors. */
 	async importMedia(): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
 		const paths = await pickMediaPaths();
 		if (paths.length === 0) return { imported: [], failed: [] };
 		this.importing = true;
 		this.error = null;
-		const imported: Asset[] = [];
 		const failed: { name: string; message: string }[] = [];
 		try {
-			for (const path of paths) {
-				try {
-					const asset = await importAsset(path);
-					this.assets = [...this.assets, asset];
-					imported.push(asset);
-				} catch (e) {
-					failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
-				}
-			}
+			const results = await Promise.all(
+				paths.map(async (path) => {
+					try {
+						const asset = await importAsset(path);
+						this.assets = [...this.assets, asset];
+						return asset;
+					} catch (e) {
+						failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
+						return null;
+					}
+				})
+			);
+			const imported = results.filter((a): a is Asset => a !== null);
 			if (imported.length > 0) await this.select(imported[imported.length - 1].id);
+			return { imported, failed };
 		} finally {
 			this.importing = false;
 		}
-		return { imported, failed };
 	}
 
 	/** Run analysis on an asset and merge the result into local caches. */
@@ -256,18 +260,26 @@ class EditorState {
 		return analysis;
 	}
 
-	/** Cached waveform peaks for an asset's audio. */
-	async waveform(assetId: string, buckets: number): Promise<number[]> {
+	/** Cached waveform peaks for an asset's audio. Single-flight: concurrent
+	 *  callers for the same asset share one in-flight request instead of each
+	 *  kicking off their own whole-file decode. */
+	waveform(assetId: string, buckets: number): Promise<number[]> {
 		const key = `${assetId}:${buckets}`;
 		const cached = this.#waveforms.get(key);
-		if (cached) return cached;
-		try {
-			const peaks = await getWaveform(assetId, buckets);
-			this.#waveforms.set(key, peaks);
-			return peaks;
-		} catch {
-			return [];
-		}
+		if (cached) return Promise.resolve(cached);
+		const pending = getWaveform(assetId, buckets).then(
+			(peaks) => {
+				this.#waveforms.set(key, peaks);
+				return peaks;
+			},
+			() => {
+				// Transient failure: drop the entry so a later caller retries.
+				this.#waveforms.delete(key);
+				return [];
+			}
+		);
+		this.#waveforms.set(key, pending);
+		return pending;
 	}
 
 	// ---- editing actions (apply backend result to local timeline) -----------
