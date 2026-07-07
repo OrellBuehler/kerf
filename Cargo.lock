@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "kerf-app"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "kerf-core"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "dirs",
