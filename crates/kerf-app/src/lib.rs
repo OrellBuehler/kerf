@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task,
-    TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task, TextKeyframe,
+    Timeline, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -232,8 +232,7 @@ fn proxy_workers() -> usize {
 /// thread-capped in the engine), leaving the machine responsive while proxies
 /// trickle in; previews use the original source until each one lands.
 fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
-    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> =
-        std::sync::OnceLock::new();
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> = std::sync::OnceLock::new();
     QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String)>();
         let rx = Arc::new(Mutex::new(rx));
@@ -323,7 +322,9 @@ fn trim_clip(
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.trim(id, source_in, source_out, timeline_start).map_err(|e| e.to_string())?;
+    project
+        .trim(id, source_in, source_out, timeline_start)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -337,12 +338,7 @@ fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, n
 }
 
 #[tauri::command(async)]
-fn move_clip(
-    state: State<'_, AppState>,
-    clip_id: String,
-    timeline_start: f64,
-    track_id: Option<String>,
-) -> CmdResult<Timeline> {
+fn move_clip(state: State<'_, AppState>, clip_id: String, timeline_start: f64, track_id: Option<String>) -> CmdResult<Timeline> {
     let clip = id(&clip_id)?;
     let track = track_id.as_deref().map(id).transpose()?;
     let project = state.project();
@@ -407,12 +403,7 @@ fn set_volume(state: State<'_, AppState>, clip_id: String, volume: f32) -> CmdRe
 }
 
 #[tauri::command(async)]
-fn set_fade(
-    state: State<'_, AppState>,
-    clip_id: String,
-    fade_in: Option<f64>,
-    fade_out: Option<f64>,
-) -> CmdResult<Timeline> {
+fn set_fade(state: State<'_, AppState>, clip_id: String, fade_in: Option<f64>, fade_out: Option<f64>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
     project.set_fade(id, fade_in, fade_out).map_err(|e| e.to_string())?;
@@ -445,7 +436,18 @@ fn set_transform(
     let id = id(&clip_id)?;
     let project = state.project();
     project
-        .set_transform(id, scale, pos_x, pos_y, rotation, opacity, crop_left, crop_right, crop_top, crop_bottom)
+        .set_transform(
+            id,
+            scale,
+            pos_x,
+            pos_y,
+            rotation,
+            opacity,
+            crop_left,
+            crop_right,
+            crop_top,
+            crop_bottom,
+        )
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
@@ -461,7 +463,9 @@ fn set_color(
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.set_color(id, brightness, contrast, saturation, gamma).map_err(|e| e.to_string())?;
+    project
+        .set_color(id, brightness, contrast, saturation, gamma)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -517,7 +521,9 @@ fn add_keyframe(
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity).map_err(|e| e.to_string())?;
+    project
+        .add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -663,9 +669,8 @@ async fn get_frame(
         // q=4 JPEG is ~5–10× smaller to encode and ship over IPC — which matters now
         // that the preview fetches frames continuously during playback. `accurate`
         // is false for rough scrub frames (keyframe-snap), true for the settled frame.
-        let jpeg =
-            Project::decode_preview_frame(&asset, time_secs, max_width.unwrap_or(960), 4, accurate.unwrap_or(true))
-                .map_err(|e| e.to_string())?;
+        let jpeg = Project::decode_preview_frame(&asset, time_secs, max_width.unwrap_or(960), 4, accurate.unwrap_or(true))
+            .map_err(|e| e.to_string())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
         Ok(format!("data:image/jpeg;base64,{b64}"))
     })
@@ -772,7 +777,12 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
-async fn export_timeline(app: AppHandle, state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
+async fn export_timeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    output_path: String,
+    options: ExportOptions,
+) -> CmdResult<String> {
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
@@ -884,8 +894,8 @@ fn use_bundled_ffmpeg() {
 fn init_logging(app: &AppHandle) {
     use tracing_subscriber::prelude::*;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
 
     let file = app.path().app_log_dir().ok().and_then(|dir| {
@@ -920,7 +930,10 @@ fn init_logging(app: &AppHandle) {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         let message = info
             .payload()
             .downcast_ref::<&str>()

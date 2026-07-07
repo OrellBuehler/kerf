@@ -19,8 +19,10 @@ fn db() -> &'static Database {
 
 /// Distinct family names of every font installed on this machine, sorted.
 pub fn list_system_fonts() -> Vec<String> {
-    let mut names: Vec<String> =
-        db().faces().filter_map(|f| f.families.first().map(|(name, _)| name.clone())).collect();
+    let mut names: Vec<String> = db()
+        .faces()
+        .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+        .collect();
     names.sort();
     names.dedup();
     names
@@ -32,7 +34,11 @@ pub fn list_system_fonts() -> Vec<String> {
 /// still needed. `None` if the family isn't installed.
 pub fn resolve_font_file(family: &str, bold: bool) -> Option<(PathBuf, bool)> {
     let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
-    let query = Query { families: &[Family::Name(family)], weight, ..Query::default() };
+    let query = Query {
+        families: &[Family::Name(family)],
+        weight,
+        ..Query::default()
+    };
     let face = db().face(db().query(&query)?)?;
     let path = match &face.source {
         Source::File(p) | Source::SharedFile(p, _) => p.clone(),

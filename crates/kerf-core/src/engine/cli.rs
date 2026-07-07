@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, TransitionKind, Transform,
+    Asset, AudioEffect, Clip, Color, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, TransitionKind,
     VideoEffect,
 };
 
@@ -159,7 +159,11 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
 }
 
 fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
-    let format_dur = parsed.format.as_ref().and_then(|f| f.duration.as_deref()).and_then(|d| d.parse::<f64>().ok());
+    let format_dur = parsed
+        .format
+        .as_ref()
+        .and_then(|f| f.duration.as_deref())
+        .and_then(|d| d.parse::<f64>().ok());
 
     // A still image probes as a lone video stream in an image codec with no
     // playable duration and no audio. We mark that stream so the engine loops it
@@ -167,7 +171,11 @@ fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
     // A still has no real timeline; we treat a sub-second duration as "none" so the
     // probe is robust whether the demuxer reports N/A (ffprobe) or a single frame's
     // worth (libav). The image-codec guard keeps short *videos* from being misread.
-    let video_count = parsed.streams.iter().filter(|s| s.codec_type.as_deref() == Some("video")).count();
+    let video_count = parsed
+        .streams
+        .iter()
+        .filter(|s| s.codec_type.as_deref() == Some("video"))
+        .count();
     let has_audio = parsed.streams.iter().any(|s| s.codec_type.as_deref() == Some("audio"));
     let still = video_count == 1
         && !has_audio
@@ -217,8 +225,26 @@ pub(crate) fn is_still_codec(codec: Option<&str>) -> bool {
     matches!(
         codec,
         Some(
-            "png" | "mjpeg" | "jpeg" | "jpegls" | "bmp" | "gif" | "webp" | "tiff" | "ppm" | "pgm" | "pgmyuv" | "pam"
-                | "targa" | "tga" | "qoi" | "apng" | "jpeg2000" | "j2k" | "heif" | "heic"
+            "png"
+                | "mjpeg"
+                | "jpeg"
+                | "jpegls"
+                | "bmp"
+                | "gif"
+                | "webp"
+                | "tiff"
+                | "ppm"
+                | "pgm"
+                | "pgmyuv"
+                | "pam"
+                | "targa"
+                | "tga"
+                | "qoi"
+                | "apng"
+                | "jpeg2000"
+                | "j2k"
+                | "heif"
+                | "heic"
         )
     )
 }
@@ -409,7 +435,8 @@ fn run_frame_decode(
     if let Some(q) = quality {
         cmd.args(["-q:v", q.to_string().as_str()]);
     }
-    cmd.args(["-f", "image2pipe", "-vcodec", vcodec, "pipe:1"]).stderr(Stdio::piped());
+    cmd.args(["-f", "image2pipe", "-vcodec", vcodec, "pipe:1"])
+        .stderr(Stdio::piped());
     let output = cmd.output().map_err(|e| launch_err(bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
@@ -434,10 +461,16 @@ pub fn contact_sheet(
     cell_width: u32,
     quality: u8,
 ) -> Result<(Vec<u8>, Vec<f64>)> {
-    let path = path.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
     let (args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
     let bin = ffmpeg_bin();
-    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    let output = command(&bin)
+        .args(&args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not build contact sheet: {}",
@@ -511,7 +544,17 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
-        .args(["-map", "0:a:0", "-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "pipe:1"])
+        .args([
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            &sample_rate.to_string(),
+            "-f",
+            "f32le",
+            "pipe:1",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -531,7 +574,9 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
     let mut block = [0u8; 1 << 16];
     let mut leftover: Vec<u8> = Vec::with_capacity(4);
     loop {
-        let n = stdout.read(&mut block).map_err(|e| Error::Engine(format!("waveform read failed: {e}")))?;
+        let n = stdout
+            .read(&mut block)
+            .map_err(|e| Error::Engine(format!("waveform read failed: {e}")))?;
         if n == 0 {
             break;
         }
@@ -569,7 +614,13 @@ struct PeakDownsampler {
 impl PeakDownsampler {
     fn new(buckets: usize) -> Self {
         let buckets = buckets.max(1);
-        Self { buf: vec![0.0; buckets * 2], buckets, write: 0, samples_per_bucket: 1, in_bucket: 0 }
+        Self {
+            buf: vec![0.0; buckets * 2],
+            buckets,
+            write: 0,
+            samples_per_bucket: 1,
+            in_bucket: 0,
+        }
     }
 
     fn push(&mut self, magnitude: f32) {
@@ -745,10 +796,8 @@ pub fn ready_proxy(src: &Path) -> Option<PathBuf> {
 /// proxy transcodes in the background (an uncapped `libx264` grabs every core).
 /// Override with `KERF_PROXY_THREADS` (clamped to >= 1).
 fn proxy_threads() -> usize {
-    if let Ok(n) = std::env::var("KERF_PROXY_THREADS").map(|v| v.parse::<usize>()) {
-        if let Ok(n) = n {
-            return n.max(1);
-        }
+    if let Some(n) = std::env::var("KERF_PROXY_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n.max(1);
     }
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
@@ -797,20 +846,27 @@ fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
 /// [`ready_proxy`] would mistake for a finished proxy. Blocking; callers run it
 /// off the project lock (e.g. on a background thread).
 pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
-    let dst = proxy_path(src)
-        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    let dst = proxy_path(src).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create proxy cache dir: {e}")))?;
     }
-    let src_str = src.to_str().ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
+    let src_str = src
+        .to_str()
+        .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
     let tmp = dst.with_extension(format!("{}.part", std::process::id()));
-    let tmp_str = tmp.to_str().ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
     let args = build_proxy_args(src_str, tmp_str, proxy_threads());
     let bin = ffmpeg_bin();
-    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    let output = command(&bin)
+        .args(&args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Engine(format!(
@@ -880,16 +936,48 @@ impl Container {
         // variants wherever it accepts the software one.
         match self {
             Self::Mp4 => &[
-                "libx264", "libx265", "libsvtav1", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv", "hevc_qsv",
-                "av1_qsv", "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+                "libx264",
+                "libx265",
+                "libsvtav1",
+                "h264_nvenc",
+                "hevc_nvenc",
+                "av1_nvenc",
+                "h264_qsv",
+                "hevc_qsv",
+                "av1_qsv",
+                "h264_videotoolbox",
+                "hevc_videotoolbox",
+                "h264_amf",
+                "hevc_amf",
             ],
             Self::Mov => &[
-                "prores_ks", "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv",
-                "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+                "prores_ks",
+                "libx264",
+                "libx265",
+                "h264_nvenc",
+                "hevc_nvenc",
+                "h264_qsv",
+                "hevc_qsv",
+                "h264_videotoolbox",
+                "hevc_videotoolbox",
+                "h264_amf",
+                "hevc_amf",
             ],
             Self::Mkv => &[
-                "libx264", "libx265", "libvpx-vp9", "libsvtav1", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv",
-                "hevc_qsv", "av1_qsv", "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf",
+                "libx264",
+                "libx265",
+                "libvpx-vp9",
+                "libsvtav1",
+                "h264_nvenc",
+                "hevc_nvenc",
+                "av1_nvenc",
+                "h264_qsv",
+                "hevc_qsv",
+                "av1_qsv",
+                "h264_videotoolbox",
+                "hevc_videotoolbox",
+                "h264_amf",
+                "hevc_amf",
             ],
             Self::Webm => &["libvpx-vp9", "libsvtav1", "av1_nvenc", "av1_qsv"],
             Self::Gif => &["gif"],
@@ -1093,7 +1181,16 @@ fn valid_bitrate(s: &str) -> bool {
 /// `stillimage`; feeding an unknown tune makes the encoder fail to initialise.
 fn video_tunes(vc: &str) -> &'static [&'static str] {
     match vc {
-        "libx264" => &["film", "animation", "grain", "stillimage", "zerolatency", "fastdecode", "psnr", "ssim"],
+        "libx264" => &[
+            "film",
+            "animation",
+            "grain",
+            "stillimage",
+            "zerolatency",
+            "fastdecode",
+            "psnr",
+            "ssim",
+        ],
         "libx265" => &["psnr", "ssim", "grain", "zerolatency", "fastdecode", "animation"],
         _ => &[],
     }
@@ -1156,7 +1253,10 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
     let want_audio = has_audio && !c.is_video_only() && opts.include_audio;
 
     if c.is_audio_only() && !has_audio {
-        issues.push(format!("{} is audio-only, but the timeline has no audio.", c.ext().to_uppercase()));
+        issues.push(format!(
+            "{} is audio-only, but the timeline has no audio.",
+            c.ext().to_uppercase()
+        ));
     }
     if c.is_video_only() && !has_video {
         issues.push("GIF export needs video, but the timeline has no video.".to_string());
@@ -1176,7 +1276,9 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
         }
         if let Some(vc) = opts.video_codec.as_deref() {
             if matches!(opts.rate_control, RateControl::TwoPass) && enc_family(vc) != EncFamily::Software {
-                issues.push(format!("Two-pass encoding isn't supported for hardware encoder {vc}; use crf or bitrate."));
+                issues.push(format!(
+                    "Two-pass encoding isn't supported for hardware encoder {vc}; use crf or bitrate."
+                ));
             }
         }
         if let (Some(vc), Some(t)) = (opts.video_codec.as_deref(), opts.tune.as_deref()) {
@@ -1383,7 +1485,10 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
         };
         clip_input.push(input);
     }
-    InputPlan { representatives, clip_input }
+    InputPlan {
+        representatives,
+        clip_input,
+    }
 }
 
 /// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
@@ -1414,12 +1519,16 @@ fn build_export_args_phase(
     let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
-    let timeline_has_video = timeline.tracks.iter().any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
-    let timeline_has_audio = timeline
+    let timeline_has_video = timeline
         .tracks
         .iter()
-        .flat_map(|t| t.clips.iter())
-        .any(|c| assets.iter().find(|a| a.id == c.asset_id).is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio)));
+        .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    let timeline_has_audio = timeline.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
+        assets
+            .iter()
+            .find(|a| a.id == c.asset_id)
+            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
+    });
     let c = opts.container;
     let want_video = timeline_has_video && !c.is_audio_only();
     let want_audio = timeline_has_audio && !c.is_video_only() && opts.include_audio && pass != PassPhase::First;
@@ -1464,7 +1573,11 @@ fn build_export_args_phase(
             // per-input and only for real media — a still gains nothing. Frames
             // are downloaded to system memory (no `-hwaccel_output_format`), so the
             // per-input `-ss` fast-seek and the CPU filtergraph still work.
-            if let Some(hw) = opts.hwaccel.as_deref().filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none")) {
+            if let Some(hw) = opts
+                .hwaccel
+                .as_deref()
+                .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"))
+            {
                 args.push("-hwaccel".to_string());
                 args.push(hw.to_string());
             }
@@ -1806,12 +1919,16 @@ pub fn render_with_progress(
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
 
-    let has_video = timeline.tracks.iter().any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
-    let has_audio = timeline
+    let has_video = timeline
         .tracks
         .iter()
-        .flat_map(|t| t.clips.iter())
-        .any(|c| assets.iter().find(|a| a.id == c.asset_id).is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio)));
+        .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    let has_audio = timeline.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
+        assets
+            .iter()
+            .find(|a| a.id == c.asset_id)
+            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
+    });
     let issues = validate_export(opts, has_video, has_audio);
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
@@ -1835,7 +1952,10 @@ pub fn render_with_progress(
     if two_pass {
         let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
         // ffmpeg appends "-N.log" to the passlog prefix; scope it to this process.
-        let passlog = std::env::temp_dir().join(format!("kerf-2pass-{}", std::process::id())).to_string_lossy().into_owned();
+        let passlog = std::env::temp_dir()
+            .join(format!("kerf-2pass-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         let cleanup = || {
             for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
                 let _ = std::fs::remove_file(format!("{passlog}{suffix}"));
@@ -1843,18 +1963,51 @@ pub fn render_with_progress(
         };
         // Analysis pass fills the first half of the bar, the encode the second.
         let a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
-        let s1 = run_ffmpeg_progress(&a1, output, Bar { total, offset: 0.0, width: 0.5, start }, progress, cancel)?;
+        let s1 = run_ffmpeg_progress(
+            &a1,
+            output,
+            Bar {
+                total,
+                offset: 0.0,
+                width: 0.5,
+                start,
+            },
+            progress,
+            cancel,
+        )?;
         if s1 == RenderStatus::Cancelled {
             cleanup();
             return Ok(RenderStatus::Cancelled);
         }
         let a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
-        let res = run_ffmpeg_progress(&a2, output, Bar { total, offset: 0.5, width: 0.5, start }, progress, cancel);
+        let res = run_ffmpeg_progress(
+            &a2,
+            output,
+            Bar {
+                total,
+                offset: 0.5,
+                width: 0.5,
+                start,
+            },
+            progress,
+            cancel,
+        );
         cleanup();
         res
     } else {
         let args = build_export_args(timeline, assets, output_str, opts)?;
-        run_ffmpeg_progress(&args, output, Bar { total, offset: 0.0, width: 1.0, start }, progress, cancel)
+        run_ffmpeg_progress(
+            &args,
+            output,
+            Bar {
+                total,
+                offset: 0.0,
+                width: 1.0,
+                start,
+            },
+            progress,
+            cancel,
+        )
     }
 }
 
@@ -1925,7 +2078,11 @@ fn run_ffmpeg_progress(
             let fraction = (bar.offset + bar.width * pass).clamp(0.0, 1.0);
             let elapsed = bar.start.elapsed().as_secs_f64();
             let eta = (fraction > 1e-3).then(|| elapsed * (1.0 - fraction) / fraction);
-            progress(ExportProgress { fraction, elapsed_secs: elapsed, eta_secs: eta });
+            progress(ExportProgress {
+                fraction,
+                elapsed_secs: elapsed,
+                eta_secs: eta,
+            });
         }
         if cancel() {
             let _ = child.kill();
@@ -2000,9 +2157,7 @@ fn build_filter_complex(
             .find(|a| a.id == clip.asset_id)
             .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
     };
-    let is_image = |clip: &crate::model::Clip| {
-        assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image())
-    };
+    let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
     let layout = fmt.channel_layout();
 
     // Assign each clip its ffmpeg input index (track-then-storage order, matching
@@ -2110,8 +2265,15 @@ fn build_filter_complex(
             } else {
                 format!("{input}:v")
             };
-            chains.push(format!("[{src}]{chain}[v{flat}]", chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip))));
-            let out = if n == last { composite_pad.to_string() } else { format!("vov{n}") };
+            chains.push(format!(
+                "[{src}]{chain}[v{flat}]",
+                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip))
+            ));
+            let out = if n == last {
+                composite_pad.to_string()
+            } else {
+                format!("vov{n}")
+            };
             let end = clip.timeline_end() + fx[*flat].tail;
             let overlay = if clip.is_animated() {
                 // Animated picture position: per-frame overlay x / y expressions.
@@ -2126,7 +2288,10 @@ fn build_filter_complex(
                     start = clip.timeline_start,
                 )
             } else if clip.transform.is_identity() {
-                format!("overlay=eof_action=pass:enable='between(t,{start},{end})'", start = clip.timeline_start)
+                format!(
+                    "overlay=eof_action=pass:enable='between(t,{start},{end})'",
+                    start = clip.timeline_start
+                )
             } else {
                 let t = &clip.transform;
                 format!(
@@ -2147,7 +2312,11 @@ fn build_filter_complex(
             let last_o = timeline.overlays.len() - 1;
             let text_final = if gif { "vcomp" } else { "outv" };
             for (oi, ov) in timeline.overlays.iter().enumerate() {
-                let out = if oi == last_o { text_final.to_string() } else { format!("vtxt{oi}") };
+                let out = if oi == last_o {
+                    text_final.to_string()
+                } else {
+                    format!("vtxt{oi}")
+                };
                 chains.push(format!("[{tcur}]{f}[{out}]", f = drawtext_export(ov, fmt)));
                 tcur = out;
             }
@@ -2172,7 +2341,10 @@ fn build_filter_complex(
             } else {
                 format!("{input}:a")
             };
-            chains.push(format!("[{src}]{chain}[a{flat}]", chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)));
+            chains.push(format!(
+                "[{src}]{chain}[a{flat}]",
+                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)
+            ));
         }
         // Optional single-pass loudness normalization on the final mix; loudnorm
         // upsamples to 192 kHz internally, so resample back to the output rate.
@@ -2209,7 +2381,9 @@ fn build_filter_complex(
             ));
             chains.push("[akey]asplit=2[akmix][akside]".to_string());
             chains.push("[aduck][akside]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string());
-            chains.push(format!("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"));
+            chains.push(format!(
+                "[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"
+            ));
         }
     }
 
@@ -2369,10 +2543,22 @@ fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
                 dt = fnum(t1 - t0),
             )
         };
-        expr = format!("if(lt({lt},{t1}),{seg},{expr})", lt = lt, t1 = fnum(t1), seg = seg, expr = expr);
+        expr = format!(
+            "if(lt({lt},{t1}),{seg},{expr})",
+            lt = lt,
+            t1 = fnum(t1),
+            seg = seg,
+            expr = expr
+        );
     }
     // Hold the first value before the first keyframe.
-    format!("if(lt({lt},{t0}),{v0},{expr})", lt = lt, t0 = fnum(pts[0].0), v0 = fnum(pts[0].1), expr = expr)
+    format!(
+        "if(lt({lt},{t0}),{v0},{expr})",
+        lt = lt,
+        t0 = fnum(pts[0].0),
+        v0 = fnum(pts[0].1),
+        expr = expr
+    )
 }
 
 fn db_to_linear(db: f64) -> f64 {
@@ -2397,9 +2583,11 @@ fn video_effect_filter(e: &VideoEffect) -> Option<String> {
 /// The `chromakey` filter for a chroma-key effect, or `None` for any other.
 fn chroma_filter(e: &VideoEffect) -> Option<String> {
     match e {
-        VideoEffect::ChromaKey { color, similarity, blend } => {
-            Some(format!("chromakey={color}:{}:{}", fnum(*similarity), fnum(*blend)))
-        }
+        VideoEffect::ChromaKey {
+            color,
+            similarity,
+            blend,
+        } => Some(format!("chromakey={color}:{}:{}", fnum(*similarity), fnum(*blend))),
         _ => None,
     }
 }
@@ -2411,9 +2599,20 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
         AudioEffect::Highpass { hz } => format!("highpass=f={}", fnum(*hz)),
         AudioEffect::Lowpass { hz } => format!("lowpass=f={}", fnum(*hz)),
         AudioEffect::Equalizer { hz, width, gain_db } => {
-            format!("equalizer=f={}:width_type=h:width={}:g={}", fnum(*hz), fnum(*width), fnum(*gain_db))
+            format!(
+                "equalizer=f={}:width_type=h:width={}:g={}",
+                fnum(*hz),
+                fnum(*width),
+                fnum(*gain_db)
+            )
         }
-        AudioEffect::Compressor { threshold_db, ratio, attack_ms, release_ms, makeup_db } => format!(
+        AudioEffect::Compressor {
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => format!(
             "acompressor=threshold={}:ratio={}:attack={}:release={}:makeup={}",
             fnum(db_to_linear(*threshold_db)),
             fnum(*ratio),
@@ -2446,12 +2645,14 @@ fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
     ];
     // Resolve a chosen system font to its file on disk; falls through to
     // FFmpeg's drawtext default if unset or no longer installed.
-    let resolved_bold = o.font.as_deref().and_then(|family| crate::fonts::resolve_font_file(family, o.bold)).map(
-        |(path, matched_bold)| {
+    let resolved_bold = o
+        .font
+        .as_deref()
+        .and_then(|family| crate::fonts::resolve_font_file(family, o.bold))
+        .map(|(path, matched_bold)| {
             parts.push(format!("fontfile='{}'", escape_drawtext(&path.to_string_lossy())));
             matched_bold
-        },
-    );
+        });
     if o.bold && resolved_bold != Some(true) {
         // No real bold face available: a same-color border thickens the glyphs.
         parts.push("borderw=2".to_string());
@@ -2516,8 +2717,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     let chroma = clip.effects.iter().any(|e| e.produces_alpha());
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
-    let transform_alpha =
-        (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
+    let transform_alpha = (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
     let needs_alpha = transform_alpha || fx.xfade_in > 0.0;
     let dur = clip.duration() + fx.tail;
     // A crossfade tail borrows unused source: forward clips extend past source_out,
@@ -2537,7 +2737,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if t.has_crop() {
         let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
         let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
-        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = t.crop_left, ct = t.crop_top));
+        p.push(format!(
+            "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
+            cl = t.crop_left,
+            ct = t.crop_top
+        ));
     }
     if (s - 1.0).abs() < 1e-9 {
         p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
@@ -2548,12 +2752,20 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
-    p.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease{sf}", w = fmt.width, h = fmt.height));
+    p.push(format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease{sf}",
+        w = fmt.width,
+        h = fmt.height
+    ));
     if geom_identity {
         p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
     } else if anim {
         // Per-frame zoom: re-evaluate the scale expression every frame.
-        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(), "t", clip.timeline_start);
+        let expr = keyframe_expr(
+            &kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(),
+            "t",
+            clip.timeline_start,
+        );
         p.push(format!("scale=w='iw*({expr})':h='ih*({expr})':eval=frame{sf}"));
     } else if (t.scale - 1.0).abs() > 1e-9 {
         p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
@@ -2591,16 +2803,28 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // Opacity: animated via a per-frame geq alpha (geq's time var is `T`), else a
     // constant alpha mix.
     if anim_opacity {
-        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(), "T", clip.timeline_start);
-        p.push(format!("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"));
+        let expr = keyframe_expr(
+            &kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(),
+            "T",
+            clip.timeline_start,
+        );
+        p.push(format!(
+            "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"
+        ));
     } else if !anim && t.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
     // rotate. Animated rotation uses a fixed bounding box (the frame diagonal).
     if anim_rotation {
-        let expr = keyframe_expr(&kf.iter().map(|k| (k.time, k.rotation)).collect::<Vec<_>>(), "t", clip.timeline_start);
-        p.push(format!("rotate=a='({expr})*PI/180':fillcolor=none:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"));
+        let expr = keyframe_expr(
+            &kf.iter().map(|k| (k.time, k.rotation)).collect::<Vec<_>>(),
+            "t",
+            clip.timeline_start,
+        );
+        p.push(format!(
+            "rotate=a='({expr})*PI/180':fillcolor=none:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
+        ));
     } else if !anim && t.rotation != 0.0 {
         let rad = t.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
@@ -2640,7 +2864,11 @@ pub fn timeline_frame(
 ) -> Result<Vec<u8>> {
     let args = build_timeline_frame_args(timeline, assets, opts, t, max_width, quality)?;
     let bin = ffmpeg_bin();
-    let output = command(&bin).args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))?;
+    let output = command(&bin)
+        .args(&args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| launch_err(&bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not render timeline frame at {t:.3}s: {}",
@@ -2691,7 +2919,11 @@ fn build_timeline_frame_args(
                 continue;
             }
             let off = (t - clip.timeline_start) * clip.speed_mag();
-            let raw = if clip.is_reversed() { clip.source_out - off } else { clip.source_in + off };
+            let raw = if clip.is_reversed() {
+                clip.source_out - off
+            } else {
+                clip.source_in + off
+            };
             let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
             active.push((clip, raw.clamp(0.0, dur.max(0.0))));
         }
@@ -2765,7 +2997,11 @@ fn still_clip_chain(tf: &Transform, color: &Color, effects: &[VideoEffect], ow: 
     if tf.has_crop() {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
-        p.push(format!("crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}", cl = tf.crop_left, ct = tf.crop_top));
+        p.push(format!(
+            "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
+            cl = tf.crop_left,
+            ct = tf.crop_top
+        ));
     }
     p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}"));
     if tf.is_identity() {
@@ -2849,7 +3085,10 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) 
     if fo > 0.0 {
         p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
-    p.push(format!("aformat=sample_rates={sr}:channel_layouts={layout}", sr = fmt.sample_rate));
+    p.push(format!(
+        "aformat=sample_rates={sr}:channel_layouts={layout}",
+        sr = fmt.sample_rate
+    ));
     p.push(format!("adelay={delay_ms}:all=1"));
     p.join(",")
 }
@@ -3068,7 +3307,16 @@ mod tests {
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.sample_rate, 48_000);
 
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &fmt,
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
         assert!(g.has_video && g.has_audio);
         let f = g.filter;
         // A black canvas spanning the whole timeline, then one positioned
@@ -3080,7 +3328,7 @@ mod tests {
         assert!(f.contains("volume=0.5"));
         assert!(f.contains("[0:v]trim=start=0:end=5"));
         assert!(f.contains("setpts=PTS-STARTPTS+5/TB")); // second clip positioned at 5s
-        // Every video segment is scaled/padded to the common resolution.
+                                                         // Every video segment is scaled/padded to the common resolution.
         assert_eq!(f.matches("scale=1920:1080").count(), 2);
         assert!(f.contains("format=yuv420p"));
         // Only the audio-bearing clip contributes audio; it is summed via amix
@@ -3104,7 +3352,16 @@ mod tests {
             video_track(vec![make_clip(broll.id, 0.0, 6.0, 4.0)]), // overlaps 4..10
         ]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &fmt,
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
         let f = g.filter;
         // Two overlays: B-roll (input 1) composites on top of the interview.
         assert_eq!(f.matches("overlay=eof_action=pass").count(), 2);
@@ -3122,7 +3379,16 @@ mod tests {
         let assets = vec![audio_asset.clone()];
         let timeline = timeline_of(vec![audio_track(vec![make_clip(audio_asset.id, 0.0, 10.0, 3.0)])]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let g = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)));
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &fmt,
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
         assert!(!g.has_video);
         assert!(g.has_audio);
         // Positioned at 3s on the timeline via adelay; no picture canvas.
@@ -3140,7 +3406,17 @@ mod tests {
         let timeline = single(vec![clip]);
 
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets))).filter;
+        let f = build_filter_complex(
+            &timeline,
+            &assets,
+            &fmt,
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        )
+        .filter;
         // Picture fades sit just before the pixel-format normalize.
         assert!(f.contains("fade=t=in:st=0:d=0.5,fade=t=out:st=9:d=1,format=yuv420p"));
         // Audio fades sit just before the audio-format normalize. The out fade
@@ -3154,14 +3430,27 @@ mod tests {
         let assets = vec![asset.clone()];
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
         let fmt = export_format(&timeline, &assets, &ExportOptions::default());
-        let f = build_filter_complex(&timeline, &assets, &fmt, timeline.duration(), &ExportOptions::default(), true, true, &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets))).filter;
+        let f = build_filter_complex(
+            &timeline,
+            &assets,
+            &fmt,
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            true,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        )
+        .filter;
         assert!(!f.contains("fade="), "no fade filter when fades are zero");
         assert!(!f.contains("afade="), "no afade filter when fades are zero");
     }
 
     #[test]
     fn export_format_falls_back_to_defaults() {
-        let timeline = Timeline { tracks: Vec::new(), overlays: Vec::new() };
+        let timeline = Timeline {
+            tracks: Vec::new(),
+            overlays: Vec::new(),
+        };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.channel_layout(), "stereo");
@@ -3179,7 +3468,10 @@ mod tests {
         let args = build_export_args(&timeline, &assets, "/out.mp4", &ExportOptions::default()).unwrap();
         let input = args.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(args[input + 1], asset.path);
-        assert!(!args.iter().any(|a| a.contains("proxies")), "export must not reference a proxy");
+        assert!(
+            !args.iter().any(|a| a.contains("proxies")),
+            "export must not reference a proxy"
+        );
     }
 
     fn make_clip(asset_id: uuid::Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
@@ -3207,7 +3499,10 @@ mod tests {
     }
 
     fn timeline_of(tracks: Vec<Track>) -> Timeline {
-        Timeline { tracks, overlays: Vec::new() }
+        Timeline {
+            tracks,
+            overlays: Vec::new(),
+        }
     }
 
     /// A timeline with a single video track holding `clips`.
@@ -3223,7 +3518,11 @@ mod tests {
         let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
         clip.effects = vec![
             VideoEffect::Blur { sigma: 8.0 },
-            VideoEffect::ChromaKey { color: "green".into(), similarity: 0.1, blend: 0.0 },
+            VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.1,
+                blend: 0.0,
+            },
         ];
         let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false);
         // Color-space blur runs before the alpha plane is established, chroma key
@@ -3274,12 +3573,29 @@ mod tests {
         let assets = vec![asset.clone()];
         let mut clip = make_clip(asset.id, 0.0, 10.0, 2.0);
         clip.keyframes = vec![
-            crate::model::Keyframe { time: 0.0, scale: 1.0, pos_x: -0.3, pos_y: 0.0, rotation: 0.0, opacity: 1.0 },
-            crate::model::Keyframe { time: 4.0, scale: 1.5, pos_x: 0.3, pos_y: 0.0, rotation: 0.0, opacity: 1.0 },
+            crate::model::Keyframe {
+                time: 0.0,
+                scale: 1.0,
+                pos_x: -0.3,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+            crate::model::Keyframe {
+                time: 4.0,
+                scale: 1.5,
+                pos_x: 0.3,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
         ];
         // Per-frame zoom is in the clip chain…
         let chain = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false);
-        assert!(chain.contains("scale=w='iw*(") && chain.contains("eval=frame"), "animated zoom: {chain}");
+        assert!(
+            chain.contains("scale=w='iw*(") && chain.contains("eval=frame"),
+            "animated zoom: {chain}"
+        );
         // …and the animated position is an expression on the overlay.
         let timeline = single(vec![clip]);
         let g = build_filter_complex(
@@ -3292,7 +3608,11 @@ mod tests {
             false,
             &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
         );
-        assert!(g.filter.contains("overlay=x=(W-w)/2+(if(lt((t-2)"), "animated overlay x: {}", g.filter);
+        assert!(
+            g.filter.contains("overlay=x=(W-w)/2+(if(lt((t-2)"),
+            "animated overlay x: {}",
+            g.filter
+        );
     }
 
     #[test]
@@ -3338,7 +3658,10 @@ mod tests {
         let mut o = TextOverlay::new("Hi", 0.0, 1.0);
         o.bold = true;
         let f = drawtext_export(&o, &ExportFormat::default());
-        assert!(f.contains("borderw=2"), "bold with no font resolved approximates via border: {f}");
+        assert!(
+            f.contains("borderw=2"),
+            "bold with no font resolved approximates via border: {f}"
+        );
     }
 
     #[test]
@@ -3363,7 +3686,10 @@ mod tests {
         timeline.overlays = vec![TextOverlay::new("Caption", 0.0, 10.0)];
         let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 3.0, 640, 4).unwrap();
         let joined = args.join(" ");
-        assert!(joined.contains("drawtext=") && joined.contains("text='Caption'"), "still draws overlays: {joined}");
+        assert!(
+            joined.contains("drawtext=") && joined.contains("text='Caption'"),
+            "still draws overlays: {joined}"
+        );
         assert!(joined.contains("null[outv]"), "still terminates on [outv]: {joined}");
     }
 
@@ -3371,8 +3697,16 @@ mod tests {
     fn srt_export_formats_timecodes() {
         use crate::model::TranscriptSegment;
         let srt = crate::model::transcript_to_srt(&[
-            TranscriptSegment { start: 1.5, end: 3.0, text: "first".into() },
-            TranscriptSegment { start: 3.0, end: 4.25, text: "second".into() },
+            TranscriptSegment {
+                start: 1.5,
+                end: 3.0,
+                text: "first".into(),
+            },
+            TranscriptSegment {
+                start: 3.0,
+                end: 4.25,
+                text: "second".into(),
+            },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");
         assert!(srt.contains("2\n00:00:03,000 --> 00:00:04,250\nsecond"), "{srt}");
@@ -3483,7 +3817,10 @@ mod tests {
         let args = build_export_args(&timeline, &assets, "/out/result.mp4", &opts).unwrap();
 
         assert_eq!(args[0], "-y");
-        assert!(args.contains(&"-nostats".to_string()), "progress stats suppressed so stderr stays bounded");
+        assert!(
+            args.contains(&"-nostats".to_string()),
+            "progress stats suppressed so stderr stays bounded"
+        );
         let i_pos = args.iter().position(|a| a == "-i").expect("an input flag");
         assert_eq!(args[i_pos + 1], "/media/clip.mp4");
         assert!(args.contains(&"-filter_complex".to_string()));
@@ -3817,7 +4154,10 @@ mod tests {
     fn loudnorm_option_appends_to_the_final_mix() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let clip = make_clip(asset.id, 0.0, 10.0, 0.0);
-        let opts = ExportOptions { loudnorm: true, ..Default::default() };
+        let opts = ExportOptions {
+            loudnorm: true,
+            ..Default::default()
+        };
         let args = build_export_args(&single(vec![clip]), &[asset], "out.mp4", &opts).unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("loudnorm=I=-14:TP=-1.5:LRA=11,aresample="), "{joined}");
@@ -3843,8 +4183,14 @@ mod tests {
     fn color_eq_runs_before_alpha_is_established() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
-        clip.transform = crate::model::Transform { opacity: 0.5, ..Default::default() };
-        clip.color = crate::model::Color { brightness: 0.1, ..Default::default() };
+        clip.transform = crate::model::Transform {
+            opacity: 0.5,
+            ..Default::default()
+        };
+        clip.color = crate::model::Color {
+            brightness: 0.1,
+            ..Default::default()
+        };
         let g = graph_of(&single(vec![clip]), &[asset]);
         let eq = g.find("eq=").expect("eq present");
         let alpha = g.find("format=yuva420p").expect("alpha present");
@@ -3878,7 +4224,10 @@ mod tests {
             duration: 1.0,
         });
         let g = graph_of(&single(vec![a, b]), &[asset]);
-        assert!(g.contains("trim=start=0:end=10"), "outgoing clip must not bleed across the gap: {g}");
+        assert!(
+            g.contains("trim=start=0:end=10"),
+            "outgoing clip must not bleed across the gap: {g}"
+        );
         assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "incoming dissolves from black: {g}");
     }
 
@@ -3895,7 +4244,10 @@ mod tests {
         let g = graph_of(&single(vec![a, b]), &[asset]);
         // Window [4,15] is fast-seeked: the input gets `-ss 4` and the trim is
         // expressed relative to it (start 0, 11s long).
-        assert!(g.contains("trim=start=0:end=11"), "reversed tail extends below source_in: {g}");
+        assert!(
+            g.contains("trim=start=0:end=11"),
+            "reversed tail extends below source_in: {g}"
+        );
         assert!(g.contains(",reverse,"), "{g}");
     }
 
@@ -3912,7 +4264,10 @@ mod tests {
         // The graph trim/atrim are relative to the seek: a 3s window from 0.
         let filter = flag_val(&args, "-filter_complex").unwrap();
         assert!(filter.contains("trim=start=0:end=3"), "video trim is seek-relative: {filter}");
-        assert!(filter.contains("atrim=start=0:end=3"), "audio trim is seek-relative: {filter}");
+        assert!(
+            filter.contains("atrim=start=0:end=3"),
+            "audio trim is seek-relative: {filter}"
+        );
     }
 
     #[test]
@@ -3935,10 +4290,16 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 0.0, crate::model::DEFAULT_IMAGE_DURATION, 12.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
 
-        assert!(!args.contains(&"-ss".to_string()), "a still is looped, never seeked: {args:?}");
+        assert!(
+            !args.contains(&"-ss".to_string()),
+            "a still is looped, never seeked: {args:?}"
+        );
         let loop_pos = args.iter().position(|a| a == "-loop").expect("a -loop flag");
         assert_eq!(args[loop_pos + 1], "1");
-        assert!(args.contains(&"-framerate".to_string()), "the looped still gets an input framerate");
+        assert!(
+            args.contains(&"-framerate".to_string()),
+            "the looped still gets an input framerate"
+        );
         // `-t` bounds how long the looped still is read — its source window end.
         assert_eq!(flag_val(&args, "-t"), Some("5"));
         let i_pos = args.iter().position(|a| a == "-i").unwrap();
@@ -3968,7 +4329,10 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 0.0, crate::model::DEFAULT_IMAGE_DURATION, 0.0)]);
         // Composite at t=2: a still has one frame, so it must be read without `-ss`.
         let args = build_timeline_frame_args(&timeline, &[asset], &ExportOptions::default(), 2.0, 640, 4).unwrap();
-        assert!(!args.contains(&"-ss".to_string()), "a still has one frame; don't seek it: {args:?}");
+        assert!(
+            !args.contains(&"-ss".to_string()),
+            "a still has one frame; don't seek it: {args:?}"
+        );
         let i_pos = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[i_pos + 1], "/media/title.png");
     }
@@ -4015,7 +4379,10 @@ mod tests {
 
     /// The token following `flag` in `args`, if present.
     fn flag_val<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
     }
 
     /// Build the argv for `opts` against a single 1080p video+audio clip.
@@ -4142,7 +4509,10 @@ mod tests {
         let plain = args_of(&ExportOptions::default());
         assert!(!plain.contains(&"-hwaccel".to_string()));
 
-        let opts = ExportOptions { hwaccel: Some("cuda".into()), ..Default::default() };
+        let opts = ExportOptions {
+            hwaccel: Some("cuda".into()),
+            ..Default::default()
+        };
         let args = args_of(&opts);
         assert_eq!(flag_val(&args, "-hwaccel"), Some("cuda"));
         // It's an input option: must precede the `-i` it accelerates.
@@ -4151,7 +4521,10 @@ mod tests {
         assert!(hw < input);
 
         // "none" is treated as software (no flag emitted).
-        let none = args_of(&ExportOptions { hwaccel: Some("none".into()), ..Default::default() });
+        let none = args_of(&ExportOptions {
+            hwaccel: Some("none".into()),
+            ..Default::default()
+        });
         assert!(!none.contains(&"-hwaccel".to_string()));
     }
 
@@ -4165,7 +4538,11 @@ mod tests {
             video_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]),
         ]);
         let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
-        assert_eq!(args.iter().filter(|a| a.as_str() == "-i").count(), 1, "the shared source must be one input");
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "-i").count(),
+            1,
+            "the shared source must be one input"
+        );
         let f = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert!(f.contains("[0:v]split=2[vsp0_0][vsp0_1]"), "{f}");
         assert!(f.contains("[0:a]asplit=2[asp0_0][asp0_1]"), "{f}");
@@ -4202,9 +4579,17 @@ mod tests {
 
     #[test]
     fn build_export_args_x265_mp4_tags_hvc1_but_mkv_does_not() {
-        let mp4 = ExportOptions { video_codec: Some("libx265".into()), container: Container::Mp4, ..Default::default() };
+        let mp4 = ExportOptions {
+            video_codec: Some("libx265".into()),
+            container: Container::Mp4,
+            ..Default::default()
+        };
         assert_eq!(flag_val(&args_of(&mp4), "-tag:v"), Some("hvc1"));
-        let mkv = ExportOptions { video_codec: Some("libx265".into()), container: Container::Mkv, ..Default::default() };
+        let mkv = ExportOptions {
+            video_codec: Some("libx265".into()),
+            container: Container::Mkv,
+            ..Default::default()
+        };
         assert!(!args_of(&mkv).contains(&"-tag:v".to_string()));
     }
 
@@ -4227,9 +4612,18 @@ mod tests {
 
     #[test]
     fn build_export_args_faststart_only_for_mp4_mov() {
-        let mp4 = ExportOptions { video_codec: Some("libx264".into()), faststart: true, ..Default::default() };
+        let mp4 = ExportOptions {
+            video_codec: Some("libx264".into()),
+            faststart: true,
+            ..Default::default()
+        };
         assert_eq!(flag_val(&args_of(&mp4), "-movflags"), Some("+faststart"));
-        let mkv = ExportOptions { container: Container::Mkv, video_codec: Some("libx264".into()), faststart: true, ..Default::default() };
+        let mkv = ExportOptions {
+            container: Container::Mkv,
+            video_codec: Some("libx264".into()),
+            faststart: true,
+            ..Default::default()
+        };
         assert!(!args_of(&mkv).contains(&"-movflags".to_string()));
     }
 
@@ -4242,7 +4636,10 @@ mod tests {
             ..Default::default()
         };
         let args = args_of(&opts);
-        assert!(!args.contains(&"[outv]".to_string()), "no video map for an audio-only container");
+        assert!(
+            !args.contains(&"[outv]".to_string()),
+            "no video map for an audio-only container"
+        );
         assert!(!args.contains(&"-c:v".to_string()));
         assert!(!args.contains(&"-pix_fmt".to_string()));
         assert!(args.contains(&"[outa]".to_string()));
@@ -4252,7 +4649,11 @@ mod tests {
 
     #[test]
     fn build_export_args_include_audio_false_emits_an() {
-        let opts = ExportOptions { video_codec: Some("libx264".into()), include_audio: false, ..Default::default() };
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
         let args = args_of(&opts);
         assert!(!args.contains(&"[outa]".to_string()));
         assert!(args.contains(&"-an".to_string()));
@@ -4261,7 +4662,11 @@ mod tests {
 
     #[test]
     fn build_export_args_lossless_per_codec() {
-        let x264 = ExportOptions { video_codec: Some("libx264".into()), rate_control: RateControl::Lossless, ..Default::default() };
+        let x264 = ExportOptions {
+            video_codec: Some("libx264".into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        };
         assert_eq!(flag_val(&args_of(&x264), "-crf"), Some("0"));
         let vp9 = ExportOptions {
             container: Container::Webm,
@@ -4287,7 +4692,16 @@ mod tests {
         let asset = av_asset(Uuid::new_v4(), 30.0);
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = [asset];
-        let p1 = build_export_args_phase(&timeline, &assets, "/out/x.mp4", &opts, PassPhase::First, "/dev/null", "/tmp/pl").unwrap();
+        let p1 = build_export_args_phase(
+            &timeline,
+            &assets,
+            "/out/x.mp4",
+            &opts,
+            PassPhase::First,
+            "/dev/null",
+            "/tmp/pl",
+        )
+        .unwrap();
         assert_eq!(flag_val(&p1, "-b:v"), Some("8M"));
         assert_eq!(flag_val(&p1, "-pass"), Some("1"));
         assert_eq!(flag_val(&p1, "-passlogfile"), Some("/tmp/pl"));
@@ -4296,7 +4710,16 @@ mod tests {
         assert_eq!(p1.last().unwrap(), "/dev/null");
         // The null muxer rejects mov/metadata options — they belong to pass 2 only.
         assert!(!p1.contains(&"-movflags".to_string()) && !p1.contains(&"-metadata".to_string()));
-        let p2 = build_export_args_phase(&timeline, &assets, "/out/x.mp4", &opts, PassPhase::Second, "/dev/null", "/tmp/pl").unwrap();
+        let p2 = build_export_args_phase(
+            &timeline,
+            &assets,
+            "/out/x.mp4",
+            &opts,
+            PassPhase::Second,
+            "/dev/null",
+            "/tmp/pl",
+        )
+        .unwrap();
         assert_eq!(flag_val(&p2, "-pass"), Some("2"));
         assert!(p2.contains(&"[outa]".to_string()));
         assert_eq!(flag_val(&p2, "-movflags"), Some("+faststart"));
@@ -4305,7 +4728,11 @@ mod tests {
 
     #[test]
     fn filter_pix_fmt_is_threaded_through_the_graph() {
-        let opts = ExportOptions { video_codec: Some("libx265".into()), pix_fmt: Some("yuv420p10le".into()), ..Default::default() };
+        let opts = ExportOptions {
+            video_codec: Some("libx265".into()),
+            pix_fmt: Some("yuv420p10le".into()),
+            ..Default::default()
+        };
         let asset = av_asset(Uuid::new_v4(), 30.0);
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x", &opts).unwrap();
@@ -4320,7 +4747,11 @@ mod tests {
     fn export_format_even_clamps_and_forces_opus_48k() {
         let asset = test_asset(vec![video_stream(1921, 1081, 30.0), audio_stream(44_100, 2)]);
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
-        let opts = ExportOptions { resolution: Some((1921, 1081)), audio_codec: Some("libopus".into()), ..Default::default() };
+        let opts = ExportOptions {
+            resolution: Some((1921, 1081)),
+            audio_codec: Some("libopus".into()),
+            ..Default::default()
+        };
         let fmt = export_format(&timeline, &[asset], &opts);
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
         assert_eq!(fmt.sample_rate, 48_000);
@@ -4328,7 +4759,12 @@ mod tests {
 
     #[test]
     fn gif_uses_a_palette_and_drops_audio() {
-        let opts = ExportOptions { container: Container::Gif, video_codec: Some("gif".into()), include_audio: false, ..Default::default() };
+        let opts = ExportOptions {
+            container: Container::Gif,
+            video_codec: Some("gif".into()),
+            include_audio: false,
+            ..Default::default()
+        };
         let asset = av_asset(Uuid::new_v4(), 30.0);
         let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x.gif", &opts).unwrap();
@@ -4362,7 +4798,11 @@ mod tests {
 
     #[test]
     fn metadata_title_is_a_single_token() {
-        let opts = ExportOptions { video_codec: Some("libx264".into()), metadata_title: Some("My Cut = v2".into()), ..Default::default() };
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            metadata_title: Some("My Cut = v2".into()),
+            ..Default::default()
+        };
         let args = args_of(&opts);
         let i = args.iter().position(|a| a == "-metadata").unwrap();
         assert_eq!(args[i + 1], "title=My Cut = v2");
@@ -4370,7 +4810,11 @@ mod tests {
 
     #[test]
     fn fps_never_emits_dash_r() {
-        let opts = ExportOptions { video_codec: Some("libx264".into()), fps: Some(24.0), ..Default::default() };
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            fps: Some(24.0),
+            ..Default::default()
+        };
         let args = args_of(&opts);
         assert!(!args.contains(&"-r".to_string()), "fps lives only in the filtergraph");
         assert!(flag_val(&args, "-filter_complex").unwrap().contains("fps=24"));
@@ -4378,7 +4822,11 @@ mod tests {
 
     #[test]
     fn validate_export_flags_bad_combinations() {
-        let webm_x264 = ExportOptions { container: Container::Webm, video_codec: Some("libx264".into()), ..Default::default() };
+        let webm_x264 = ExportOptions {
+            container: Container::Webm,
+            video_codec: Some("libx264".into()),
+            ..Default::default()
+        };
         assert!(!validate_export(&webm_x264, true, true).is_empty());
         let mp4_opus = ExportOptions {
             container: Container::Mp4,
@@ -4387,9 +4835,17 @@ mod tests {
             ..Default::default()
         };
         assert!(!validate_export(&mp4_opus, true, true).is_empty());
-        let two_pass_no_bitrate = ExportOptions { video_codec: Some("libx264".into()), rate_control: RateControl::TwoPass, ..Default::default() };
+        let two_pass_no_bitrate = ExportOptions {
+            video_codec: Some("libx264".into()),
+            rate_control: RateControl::TwoPass,
+            ..Default::default()
+        };
         assert!(!validate_export(&two_pass_no_bitrate, true, true).is_empty());
-        let mp3_no_audio = ExportOptions { container: Container::Mp3, audio_codec: Some("libmp3lame".into()), ..Default::default() };
+        let mp3_no_audio = ExportOptions {
+            container: Container::Mp3,
+            audio_codec: Some("libmp3lame".into()),
+            ..Default::default()
+        };
         assert!(!validate_export(&mp3_no_audio, true, false).is_empty());
         let ok = ExportOptions {
             video_codec: Some("libx264".into()),
@@ -4402,7 +4858,12 @@ mod tests {
 
     #[test]
     fn prores_without_pix_fmt_defaults_to_10bit_422() {
-        let opts = ExportOptions { container: Container::Mov, video_codec: Some("prores_ks".into()), prores_profile: Some(3), ..Default::default() };
+        let opts = ExportOptions {
+            container: Container::Mov,
+            video_codec: Some("prores_ks".into()),
+            prores_profile: Some(3),
+            ..Default::default()
+        };
         let asset = av_asset(Uuid::new_v4(), 30.0);
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x.mov", &opts).unwrap();
@@ -4411,7 +4872,12 @@ mod tests {
         assert!(flag_val(&args, "-filter_complex").unwrap().contains("yuv422p10le"));
         assert!(!args.contains(&"yuv420p".to_string()));
         // The 4444 profiles upgrade to 4:4:4 with alpha.
-        let xq = ExportOptions { container: Container::Mov, video_codec: Some("prores_ks".into()), prores_profile: Some(5), ..Default::default() };
+        let xq = ExportOptions {
+            container: Container::Mov,
+            video_codec: Some("prores_ks".into()),
+            prores_profile: Some(5),
+            ..Default::default()
+        };
         assert_eq!(flag_val(&args_of_for(&timeline_mov(), &xq), "-pix_fmt"), Some("yuva444p10le"));
     }
 
@@ -4426,11 +4892,22 @@ mod tests {
     #[test]
     fn x265_invalid_tune_is_dropped_and_flagged() {
         // `film` is an x264-only tune; x265 would fail to open the encoder.
-        let opts = ExportOptions { video_codec: Some("libx265".into()), tune: Some("film".into()), ..Default::default() };
-        assert!(!args_of(&opts).contains(&"-tune".to_string()), "an invalid tune must not reach ffmpeg");
+        let opts = ExportOptions {
+            video_codec: Some("libx265".into()),
+            tune: Some("film".into()),
+            ..Default::default()
+        };
+        assert!(
+            !args_of(&opts).contains(&"-tune".to_string()),
+            "an invalid tune must not reach ffmpeg"
+        );
         assert!(!validate_export(&opts, true, true).is_empty(), "validation must flag it");
         // A valid x265 tune is kept.
-        let ok = ExportOptions { video_codec: Some("libx265".into()), tune: Some("grain".into()), ..Default::default() };
+        let ok = ExportOptions {
+            video_codec: Some("libx265".into()),
+            tune: Some("grain".into()),
+            ..Default::default()
+        };
         assert_eq!(flag_val(&args_of(&ok), "-tune"), Some("grain"));
         assert!(validate_export(&ok, true, true).is_empty());
     }

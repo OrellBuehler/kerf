@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, EditSource, ExportOptions, Keyframe, Project, StreamKind, TextKeyframe, Transition, TransitionKind,
-    VideoEffect,
+    AudioEffect, EditSource, ExportOptions, Keyframe, Project, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -178,7 +177,9 @@ struct SpeedParams {
 struct TransformParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
-    #[schemars(description = "Uniform scale after fitting to the frame (1.0 = fit, < 1.0 = picture-in-picture); omit to leave unchanged")]
+    #[schemars(
+        description = "Uniform scale after fitting to the frame (1.0 = fit, < 1.0 = picture-in-picture); omit to leave unchanged"
+    )]
     scale: Option<f64>,
     #[schemars(description = "Horizontal offset as a fraction of frame width (0.0 = centered); omit to leave unchanged")]
     pos_x: Option<f64>,
@@ -328,10 +329,8 @@ struct OverlayIdParams {
 struct OverlayKeyframesParams {
     #[schemars(description = "UUID of the overlay")]
     overlay_id: String,
-    #[schemars(
-        description = "Position/opacity keyframes (replaces the overlay's animation). Each: \
-                       {\"time\":seconds_from_overlay_start,\"pos_x\":0.5,\"pos_y\":0.85,\"opacity\":1.0}. Pass [] to clear."
-    )]
+    #[schemars(description = "Position/opacity keyframes (replaces the overlay's animation). Each: \
+                       {\"time\":seconds_from_overlay_start,\"pos_x\":0.5,\"pos_y\":0.85,\"opacity\":1.0}. Pass [] to clear.")]
     keyframes: Vec<TextKeyframe>,
 }
 
@@ -359,8 +358,7 @@ struct RevertParams {
 struct ExportParams {
     #[schemars(description = "Output file path for the rendered result. Its extension should match the chosen container.")]
     output_path: String,
-    #[schemars(
-        description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
+    #[schemars(description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
                        Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
                        (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif, plus GPU encoders \
                        h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/h264_videotoolbox/\
@@ -370,8 +368,7 @@ struct ExportParams {
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
                        decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
                        (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
-                       render only that span)."
-    )]
+                       render only that span).")]
     #[serde(default)]
     options: Option<ExportOptions>,
 }
@@ -473,7 +470,9 @@ struct TimelineSummary {
 
 #[tool_router]
 impl KerfMcp {
-    #[tool(description = "List the system font family names available for text overlays (pass one as `font` to add_overlay / update_overlay)")]
+    #[tool(
+        description = "List the system font family names available for text overlays (pass one as `font` to add_overlay / update_overlay)"
+    )]
     fn list_fonts(&self) -> Result<String, McpError> {
         json(&kerf_core::list_system_fonts())
     }
@@ -484,7 +483,9 @@ impl KerfMcp {
         json(&project.list_assets().map_err(core_err)?)
     }
 
-    #[tool(description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class)")]
+    #[tool(
+        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class)"
+    )]
     fn get_asset_metadata(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.lock();
@@ -499,7 +500,9 @@ impl KerfMcp {
         json(&project.timeline().map_err(core_err)?)
     }
 
-    #[tool(description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and transcription when configured) and cache the result")]
+    #[tool(
+        description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and transcription when configured) and cache the result"
+    )]
     async fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.project.clone();
@@ -551,7 +554,9 @@ impl KerfMcp {
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
-        let out = project.trim(clip_id, p.source_in, p.source_out, p.timeline_start).map_err(core_err)?;
+        let out = project
+            .trim(clip_id, p.source_in, p.source_out, p.timeline_start)
+            .map_err(core_err)?;
         self.changed();
         json(&out)
     }
@@ -566,7 +571,9 @@ impl KerfMcp {
         Ok("ok".to_string())
     }
 
-    #[tool(description = "Move a clip to a new timeline position (free positioning, gaps allowed), optionally onto another same-kind track; rejects overlaps")]
+    #[tool(
+        description = "Move a clip to a new timeline position (free positioning, gaps allowed), optionally onto another same-kind track; rejects overlaps"
+    )]
     fn move_clip(&self, Parameters(p): Parameters<MoveClipParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
@@ -576,7 +583,9 @@ impl KerfMcp {
         json(&out)
     }
 
-    #[tool(description = "Remove a clip and close the gap: later clips on the same track shift left by its duration (ripple delete)")]
+    #[tool(
+        description = "Remove a clip and close the gap: later clips on the same track shift left by its duration (ripple delete)"
+    )]
     fn ripple_delete(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
@@ -598,7 +607,9 @@ impl KerfMcp {
         json(&pieces)
     }
 
-    #[tool(description = "Add a new empty track (\"video\" or \"audio\"), e.g. a B-roll lane above the interview; later video tracks composite on top at export")]
+    #[tool(
+        description = "Add a new empty track (\"video\" or \"audio\"), e.g. a B-roll lane above the interview; later video tracks composite on top at export"
+    )]
     fn add_track(&self, Parameters(p): Parameters<AddTrackParams>) -> Result<String, McpError> {
         let kind = parse_kind(&p.kind)?;
         let project = self.lock();
@@ -804,7 +815,9 @@ impl KerfMcp {
         Ok("ok".to_string())
     }
 
-    #[tool(description = "Set or clear (empty list) a text overlay's position/opacity keyframes, to animate it over its lifetime (e.g. a title that slides in and fades out)")]
+    #[tool(
+        description = "Set or clear (empty list) a text overlay's position/opacity keyframes, to animate it over its lifetime (e.g. a title that slides in and fades out)"
+    )]
     fn set_overlay_keyframes(&self, Parameters(p): Parameters<OverlayKeyframesParams>) -> Result<String, McpError> {
         let overlay_id = parse_id(&p.overlay_id)?;
         let project = self.lock();
@@ -906,10 +919,12 @@ impl KerfMcp {
             // agent tools) for its whole duration.
             let (timeline, assets) = {
                 let project = lock_agent(&project);
-                (project.timeline().map_err(core_err)?, project.list_assets().map_err(core_err)?)
+                (
+                    project.timeline().map_err(core_err)?,
+                    project.list_assets().map_err(core_err)?,
+                )
             };
-            kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts)
-                .map_err(core_err)?;
+            kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts).map_err(core_err)?;
             Ok(p.output_path)
         })
         .await?;
@@ -1020,7 +1035,10 @@ impl KerfMcp {
             Project::decode_preview_frame(&asset, time_secs, max_width, 4, true).map_err(core_err)
         })
         .await?;
-        Ok(image_result(format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0))), jpeg))
+        Ok(image_result(
+            format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0))),
+            jpeg,
+        ))
     }
 
     #[tool(
@@ -1063,7 +1081,10 @@ impl KerfMcp {
             Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width, 4).map_err(core_err)
         })
         .await?;
-        Ok(image_result(format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0))), jpeg))
+        Ok(image_result(
+            format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0))),
+            jpeg,
+        ))
     }
 
     #[tool(description = "Summarise the timeline: total duration, track count, clips per track, and any per-track gaps")]
@@ -1125,9 +1146,7 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
 /// Run a blocking (ffmpeg) job on the blocking thread pool and await it, so a
 /// slow decode / analysis / render doesn't pin one of the shared tokio workers
 /// serving the MCP endpoint (and the rest of the app) for its whole duration.
-async fn blocking<T: Send + 'static>(
-    job: impl FnOnce() -> Result<T, McpError> + Send + 'static,
-) -> Result<T, McpError> {
+async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> + Send + 'static) -> Result<T, McpError> {
     tauri::async_runtime::spawn_blocking(job)
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -1238,8 +1257,8 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Optio
                     None,
                 )
             })?;
-            let duration = duration
-                .ok_or_else(|| McpError::invalid_params("transition duration is required".to_string(), None))?;
+            let duration =
+                duration.ok_or_else(|| McpError::invalid_params("transition duration is required".to_string(), None))?;
             Ok(Some(Transition { kind, duration }))
         }
     }

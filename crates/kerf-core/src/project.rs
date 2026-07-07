@@ -476,7 +476,14 @@ impl Project {
         max_width: u32,
         quality: u8,
     ) -> Result<Vec<u8>> {
-        engine::timeline_frame(timeline, assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
+        engine::timeline_frame(
+            timeline,
+            assets,
+            &engine::ExportOptions::default(),
+            time_secs,
+            max_width,
+            quality,
+        )
     }
 
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
@@ -538,10 +545,8 @@ impl Project {
     /// JSON (an edit + its history snapshot) don't serialize the same timeline
     /// twice.
     fn save_timeline_str(&self, json: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)",
-            params![json],
-        )?;
+        self.conn
+            .execute("INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)", params![json])?;
         Ok(())
     }
 
@@ -1811,7 +1816,9 @@ fn validate_video_effect(e: &VideoEffect) -> Result<()> {
         }
         VideoEffect::ChromaKey { similarity, blend, .. } => {
             if !(0.0..=1.0).contains(similarity) || !(0.0..=1.0).contains(blend) {
-                return Err(Error::InvalidArgument("chroma key similarity / blend must be within 0.0..=1.0".to_string()));
+                return Err(Error::InvalidArgument(
+                    "chroma key similarity / blend must be within 0.0..=1.0".to_string(),
+                ));
             }
         }
         VideoEffect::Grayscale | VideoEffect::Invert | VideoEffect::Vignette => {}
@@ -1836,7 +1843,13 @@ fn validate_audio_effect(e: &AudioEffect) -> Result<()> {
                 return Err(Error::InvalidArgument("gain_db must be finite".to_string()));
             }
         }
-        AudioEffect::Compressor { threshold_db, ratio, attack_ms, release_ms, makeup_db } => {
+        AudioEffect::Compressor {
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => {
             if !threshold_db.is_finite() || !makeup_db.is_finite() {
                 return Err(Error::InvalidArgument("compressor dB values must be finite".to_string()));
             }
@@ -1860,10 +1873,14 @@ fn validate_keyframe(k: &Keyframe) -> Result<()> {
         return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
     }
     if !k.scale.is_finite() || k.scale <= 0.0 {
-        return Err(Error::InvalidArgument("keyframe scale must be a finite value > 0".to_string()));
+        return Err(Error::InvalidArgument(
+            "keyframe scale must be a finite value > 0".to_string(),
+        ));
     }
     if !(0.0..=1.0).contains(&k.opacity) {
-        return Err(Error::InvalidArgument("keyframe opacity must be within 0.0..=1.0".to_string()));
+        return Err(Error::InvalidArgument(
+            "keyframe opacity must be within 0.0..=1.0".to_string(),
+        ));
     }
     if ![k.pos_x, k.pos_y, k.rotation].iter().all(|v| v.is_finite()) {
         return Err(Error::InvalidArgument("keyframe values must be finite".to_string()));
@@ -2129,7 +2146,9 @@ mod tests {
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
         // Pin the current (static) scale at t=0, then animate to 1.5 at t=4.
-        project.set_transform(clip.id, Some(1.2), None, None, None, None, None, None, None, None).unwrap();
+        project
+            .set_transform(clip.id, Some(1.2), None, None, None, None, None, None, None, None)
+            .unwrap();
         let pinned = project.add_keyframe(clip.id, 0.0, None, None, None, None, None).unwrap();
         assert_eq!(pinned.keyframes.len(), 1);
         assert!((pinned.keyframes[0].scale - 1.2).abs() < 1e-9); // captured the static pose
@@ -2154,11 +2173,22 @@ mod tests {
         assert_eq!(updated.effects.len(), 2);
         // An out-of-range chroma key is rejected.
         assert!(project
-            .set_video_effects(clip.id, vec![VideoEffect::ChromaKey { color: "green".into(), similarity: 2.0, blend: 0.0 }])
+            .set_video_effects(
+                clip.id,
+                vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 2.0,
+                    blend: 0.0
+                }]
+            )
             .is_err());
-        let a = project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: 80.0 }]).unwrap();
+        let a = project
+            .set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: 80.0 }])
+            .unwrap();
         assert_eq!(a.audio.len(), 1);
-        assert!(project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: -1.0 }]).is_err());
+        assert!(project
+            .set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: -1.0 }])
+            .is_err());
     }
 
     #[test]
@@ -2186,7 +2216,7 @@ mod tests {
 
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
         project.set_speed(clip.id, 2.0).unwrap(); // 10s of source over 5s of timeline
-        // Split at timeline t=2.0 → 4.0s into the source (2.0 * 2x).
+                                                  // Split at timeline t=2.0 → 4.0s into the source (2.0 * 2x).
         let (left, right) = project.split_at(clip.id, 2.0).unwrap();
         assert!((left.source_out - 4.0).abs() < 1e-9, "left out: {}", left.source_out);
         assert!((right.source_in - 4.0).abs() < 1e-9, "right in: {}", right.source_in);

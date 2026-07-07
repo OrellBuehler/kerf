@@ -16,18 +16,17 @@ mod engine;
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analyze, analyze_asset_media, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
-    SceneDetector, SilenceDetector, Transcriber,
+    analyze, analyze_asset_media, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, SceneDetector,
+    SilenceDetector, Transcriber,
 };
 pub use engine::{
-    generate_proxy, proxy_path, render_with, render_with_progress, validate_export, Container, ExportOptions,
-    ExportProgress, RateControl, RenderStatus,
+    generate_proxy, proxy_path, render_with, render_with_progress, validate_export, Container, ExportOptions, ExportProgress,
+    RateControl, RenderStatus,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, Color, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task,
-    TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, TranscriptSegment, Transform, Transition,
-    TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, Clip, Color, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task, TaskStatus,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
 };
 pub use project::Project;

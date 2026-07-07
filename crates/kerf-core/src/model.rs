@@ -498,7 +498,11 @@ impl TextOverlay {
         let chan = |get: fn(&TextKeyframe) -> f64, fallback: f64| {
             interpolate(&self.keyframes.iter().map(|k| (k.time, get(k))).collect::<Vec<_>>(), local).unwrap_or(fallback)
         };
-        (chan(|k| k.pos_x, self.pos_x), chan(|k| k.pos_y, self.pos_y), chan(|k| k.opacity, 1.0))
+        (
+            chan(|k| k.pos_x, self.pos_x),
+            chan(|k| k.pos_y, self.pos_y),
+            chan(|k| k.opacity, 1.0),
+        )
     }
 }
 
@@ -647,9 +651,7 @@ impl Clip {
             return t;
         }
         let k = self.sorted_keyframes();
-        let chan = |get: fn(&Keyframe) -> f64| {
-            interpolate(&k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>(), local)
-        };
+        let chan = |get: fn(&Keyframe) -> f64| interpolate(&k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>(), local);
         if let Some(v) = chan(|kf| kf.scale) {
             t.scale = v;
         }
@@ -878,12 +880,10 @@ impl Timeline {
                     if !c.keyframes.is_empty() {
                         let pose = clip.transform_at(cut_front);
                         let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
-                        kfs.extend(
-                            c.keyframes
-                                .iter()
-                                .filter(|k| k.time > cut_front)
-                                .map(|k| Keyframe { time: k.time - cut_front, ..*k }),
-                        );
+                        kfs.extend(c.keyframes.iter().filter(|k| k.time > cut_front).map(|k| Keyframe {
+                            time: k.time - cut_front,
+                            ..*k
+                        }));
                         c.keyframes = kfs;
                     }
                 }
@@ -908,13 +908,16 @@ impl Timeline {
             let cut_front = (start - o.start).max(0.0);
             if cut_front > 0.0 && !ov.keyframes.is_empty() {
                 let (pos_x, pos_y, opacity) = o.sample(start);
-                let mut kfs = vec![TextKeyframe { time: 0.0, pos_x, pos_y, opacity }];
-                kfs.extend(
-                    ov.keyframes
-                        .iter()
-                        .filter(|k| k.time > cut_front)
-                        .map(|k| TextKeyframe { time: k.time - cut_front, ..*k }),
-                );
+                let mut kfs = vec![TextKeyframe {
+                    time: 0.0,
+                    pos_x,
+                    pos_y,
+                    opacity,
+                }];
+                kfs.extend(ov.keyframes.iter().filter(|k| k.time > cut_front).map(|k| TextKeyframe {
+                    time: k.time - cut_front,
+                    ..*k
+                }));
                 ov.keyframes = kfs;
             }
             ov.start = (o.start - start).max(0.0);

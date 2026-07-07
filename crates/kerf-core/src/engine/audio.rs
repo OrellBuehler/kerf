@@ -135,10 +135,8 @@ fn pick_onsets(env: &[f32], frame_rate: f64, sensitivity: f64) -> Vec<f64> {
         let mean = slice.iter().copied().sum::<f32>() / slice.len() as f32;
         let var = slice.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / slice.len() as f32;
         let threshold = mean + sensitivity as f32 * var.sqrt();
-        let is_peak = env[i] > threshold
-            && (i == 0 || env[i] >= env[i - 1])
-            && (i + 1 >= env.len() || env[i] >= env[i + 1]);
-        if is_peak && last.map_or(true, |p| i - p >= min_gap) {
+        let is_peak = env[i] > threshold && (i == 0 || env[i] >= env[i - 1]) && (i + 1 >= env.len() || env[i] >= env[i + 1]);
+        if is_peak && last.is_none_or(|p| i - p >= min_gap) {
             onsets.push(i as f64 / frame_rate);
             last = Some(i);
         }
@@ -251,7 +249,10 @@ fn classify_frames(energies: &[f64], zcrs: &[f64]) -> Option<AudioClassification
     let zcr_cv = var_z.sqrt() / (mean_z + 1e-6);
 
     let (class, confidence) = if low_energy_ratio > 0.22 && zcr_cv > 0.45 {
-        (AudioClass::Speech, ((low_energy_ratio - 0.22) * 2.0 + (zcr_cv - 0.45)).clamp(0.3, 1.0))
+        (
+            AudioClass::Speech,
+            ((low_energy_ratio - 0.22) * 2.0 + (zcr_cv - 0.45)).clamp(0.3, 1.0),
+        )
     } else if low_energy_ratio < 0.12 {
         (AudioClass::Music, ((0.12 - low_energy_ratio) * 4.0 + 0.4).clamp(0.3, 1.0))
     } else {
