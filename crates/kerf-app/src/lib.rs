@@ -4,6 +4,14 @@
 //! bridge the SvelteKit frontend to `kerf-core`. Read commands return domain
 //! types; editing commands perform the mutation and return the refreshed
 //! [`Timeline`] so the frontend can re-render in a single round-trip.
+//!
+//! **No command runs on the main thread.** A plain `#[tauri::command]` executes
+//! on the main thread in Tauri v2 and would freeze the window for its duration,
+//! so every quick command here is `#[tauri::command(async)]` (runs on the async
+//! runtime) and every heavy one (ffmpeg decode / analysis / export, disk-bound
+//! project open/save) is an `async fn` that pushes its work onto the blocking
+//! thread pool via [`blocking`], resolving inputs under the shared project lock
+//! and releasing it before the slow part.
 
 mod mcp;
 
@@ -12,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task,
-    TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task, TextKeyframe,
+    Timeline, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -35,13 +43,28 @@ struct AssetMetadata {
 type CmdResult<T> = Result<T, String>;
 
 impl AppState {
-    fn project(&self) -> CmdResult<std::sync::MutexGuard<'_, Project>> {
-        let mut guard = self.project.lock().map_err(|_| "project mutex poisoned".to_string())?;
-        // The GUI is the user; the MCP server attributes its own edits to the
-        // agent under the same shared lock (see `mcp::KerfMcp::lock`).
-        guard.set_actor(EditSource::User);
-        Ok(guard)
+    fn project(&self) -> std::sync::MutexGuard<'_, Project> {
+        lock_user(&self.project)
     }
+}
+
+/// Lock the shared project for a GUI command, attributing edits to the user;
+/// the MCP server attributes its own edits to the agent under the same lock
+/// (see `mcp::KerfMcp::lock`). Recovers from a poisoned mutex (a panic while
+/// another op held it) rather than failing every command for the rest of the
+/// session.
+fn lock_user(project: &Mutex<Project>) -> std::sync::MutexGuard<'_, Project> {
+    let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
+    guard.set_actor(EditSource::User);
+    guard
+}
+
+/// Run a blocking (ffmpeg / disk) job on the blocking thread pool and await it.
+/// Commands doing heavy work must go through this: a plain command body runs on
+/// the main thread (freezing the window) and an `async` one on the shared tokio
+/// workers (starving the MCP server), while the blocking pool grows on demand.
+async fn blocking<T: Send + 'static>(job: impl FnOnce() -> CmdResult<T> + Send + 'static) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(job).await.map_err(|e| e.to_string())?
 }
 
 fn id(s: &str) -> CmdResult<Uuid> {
@@ -71,27 +94,27 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
 
 // ---- read ------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_assets(state: State<'_, AppState>) -> CmdResult<Vec<Asset>> {
-    state.project()?.list_assets().map_err(|e| e.to_string())
+    state.project().list_assets().map_err(|e| e.to_string())
 }
 
 /// Distinct family names of every font installed on this machine, for the
 /// text overlay font picker.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_fonts() -> CmdResult<Vec<String>> {
     Ok(kerf_core::list_system_fonts())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_timeline(state: State<'_, AppState>) -> CmdResult<Timeline> {
-    state.project()?.timeline().map_err(|e| e.to_string())
+    state.project().timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_asset_metadata(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetMetadata> {
     let id = id(&asset_id)?;
-    let project = state.project()?;
+    let project = state.project();
     let asset = project.require_asset(id).map_err(|e| e.to_string())?;
     let analysis = project.get_analysis(id).map_err(|e| e.to_string())?;
     Ok(AssetMetadata { asset, analysis })
@@ -101,17 +124,17 @@ fn get_asset_metadata(state: State<'_, AppState>, asset_id: String) -> CmdResult
 
 /// Path of the `.kerf` file backing the open project, or `null` if it lives
 /// only in memory (the seeded sample) and isn't persisted yet.
-#[tauri::command]
+#[tauri::command(async)]
 fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
-    Ok(state.project()?.path().map(|p| p.display().to_string()))
+    Ok(state.project().path().map(|p| p.display().to_string()))
 }
 
 /// Replace the open project with a fresh, empty in-memory one (no sample data).
 /// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
 /// the embedded MCP server share this `Project`, so both switch to it.
-#[tauri::command]
+#[tauri::command(async)]
 fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
-    let mut project = state.project()?;
+    let mut project = state.project();
     *project = Project::open_in_memory().map_err(|e| e.to_string())?;
     Ok(project.path().map(|p| p.display().to_string()))
 }
@@ -120,40 +143,58 @@ fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 /// and the embedded MCP server share this `Project`, so both now operate on —
 /// and persist to — the opened file. Returns its path.
 #[tauri::command]
-fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
-    let mut project = state.project()?;
-    *project = Project::open(&path).map_err(|e| e.to_string())?;
-    let result = project.path().map(|p| p.display().to_string());
-    let assets = project.list_assets().unwrap_or_default();
-    drop(project);
-    // Make sure every video asset in the reopened project has a preview proxy
-    // (a cached one is a cheap no-op; a missing one regenerates in the background).
-    for asset in &assets {
-        spawn_proxy(&app, asset);
-    }
-    Ok(result)
+async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    blocking(move || {
+        // Open the file first, then swap it in — the (disk-bound) open doesn't
+        // hold the shared lock, and a failed open leaves the current project intact.
+        let opened = Project::open(&path).map_err(|e| e.to_string())?;
+        let mut project = lock_user(&shared);
+        *project = opened;
+        let result = project.path().map(|p| p.display().to_string());
+        let assets = project.list_assets().unwrap_or_default();
+        drop(project);
+        // Make sure every video asset in the reopened project has a preview proxy
+        // (a cached one is a cheap no-op; a missing one regenerates in the background).
+        for asset in &assets {
+            spawn_proxy(&app, asset);
+        }
+        Ok(result)
+    })
+    .await
 }
 
 /// Snapshot the current project to a new `.kerf` file and switch to it, so
 /// subsequent edits (from the GUI and the agent alike) write through to disk.
 /// Returns the saved path.
 #[tauri::command]
-fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
-    let mut project = state.project()?;
-    project.save_as(&path).map_err(|e| e.to_string())?;
-    *project = Project::open(&path).map_err(|e| e.to_string())?;
-    Ok(project.path().map(|p| p.display().to_string()))
+async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let mut project = lock_user(&shared);
+        project.save_as(&path).map_err(|e| e.to_string())?;
+        *project = Project::open(&path).map_err(|e| e.to_string())?;
+        Ok(project.path().map(|p| p.display().to_string()))
+    })
+    .await
 }
 
 // ---- import / analysis -----------------------------------------------------
 
 #[tauri::command]
-fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
-    let asset = state.project()?.import_asset(path).map_err(|e| e.to_string())?;
-    // Kick off the preview proxy in the background; preview uses the original
-    // until it lands (see `spawn_proxy`).
-    spawn_proxy(&app, &asset);
-    Ok(asset)
+async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
+    let shared = state.project.clone();
+    blocking(move || {
+        // Probe without the lock (so parallel imports really probe in parallel),
+        // then take it only for the quick insert.
+        let asset = Project::probe_asset(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+        lock_user(&shared).insert_asset(&asset).map_err(|e| e.to_string())?;
+        // Kick off the preview proxy in the background; preview uses the original
+        // until it lands (see `spawn_proxy`).
+        spawn_proxy(&app, &asset);
+        Ok(asset)
+    })
+    .await
 }
 
 /// Queue an asset's preview proxy (all-intra, ~720p) for background generation so
@@ -191,8 +232,7 @@ fn proxy_workers() -> usize {
 /// thread-capped in the engine), leaving the machine responsive while proxies
 /// trickle in; previews use the original source until each one lands.
 fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
-    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> =
-        std::sync::OnceLock::new();
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> = std::sync::OnceLock::new();
     QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String)>();
         let rx = Arc::new(Mutex::new(rx));
@@ -221,28 +261,32 @@ fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
 }
 
 #[tauri::command]
-fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+async fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
-    // Probe the asset under the lock, run the multi-second ffmpeg analysis with
-    // the lock released, then re-acquire it only to cache the result — so the
-    // GUI and the MCP agent stay responsive while analysis runs.
-    let asset = state.project()?.require_asset(id).map_err(|e| e.to_string())?;
-    let analysis = kerf_core::analyze_asset_media(&asset).map_err(|e| e.to_string())?;
-    state.project()?.set_analysis(&analysis).map_err(|e| e.to_string())?;
-    Ok(analysis)
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve the asset under the lock, run the multi-second ffmpeg analysis
+        // with the lock released, then re-acquire it only to cache the result —
+        // so the GUI and the MCP agent stay responsive while analysis runs.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        let analysis = kerf_core::analyze_asset_media(&asset).map_err(|e| e.to_string())?;
+        lock_user(&shared).set_analysis(&analysis).map_err(|e| e.to_string())?;
+        Ok(analysis)
+    })
+    .await
 }
 
 // ---- timeline editing (each returns the refreshed timeline) ----------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cut_clip(state: State<'_, AppState>, asset_id: String, start: f64, end: f64) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.cut_clip(id, start, end).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_clip(
     state: State<'_, AppState>,
     asset_id: String,
@@ -253,119 +297,128 @@ fn add_clip(
 ) -> CmdResult<Timeline> {
     let asset = id(&asset_id)?;
     let track = track_id.as_deref().map(id).transpose()?;
-    let project = state.project()?;
+    let project = state.project();
     project
         .add_clip_to_timeline(asset, track, source_in, source_out, timeline_start)
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn split_clip(state: State<'_, AppState>, clip_id: String, at: f64) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.split_at(id, at).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trim_clip(
     state: State<'_, AppState>,
     clip_id: String,
     source_in: Option<f64>,
     source_out: Option<f64>,
+    timeline_start: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
-    project.trim(id, source_in, source_out).map_err(|e| e.to_string())?;
+    let project = state.project();
+    project
+        .trim(id, source_in, source_out, timeline_start)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, new_index: usize) -> CmdResult<Timeline> {
     let track = id(&track_id)?;
     let clip = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.reorder(track, clip, new_index).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn move_clip(
-    state: State<'_, AppState>,
-    clip_id: String,
-    timeline_start: f64,
-    track_id: Option<String>,
-) -> CmdResult<Timeline> {
+#[tauri::command(async)]
+fn move_clip(state: State<'_, AppState>, clip_id: String, timeline_start: f64, track_id: Option<String>) -> CmdResult<Timeline> {
     let clip = id(&clip_id)?;
     let track = track_id.as_deref().map(id).transpose()?;
-    let project = state.project()?;
+    let project = state.project();
     project.move_clip(clip, timeline_start, track).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ripple_delete(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.ripple_delete(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f64) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.cut_clip_range(id, from, to).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn add_track(state: State<'_, AppState>, kind: String, name: Option<String>) -> CmdResult<Timeline> {
     let kind = self::kind(&kind)?;
-    let project = state.project()?;
+    let project = state.project();
     project.add_track(kind, name).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_track(state: State<'_, AppState>, track_id: String) -> CmdResult<Timeline> {
     let id = id(&track_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.remove_track(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_duck(id, duck).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.remove(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_volume(state: State<'_, AppState>, clip_id: String, volume: f32) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_volume(id, volume).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn set_fade(
-    state: State<'_, AppState>,
-    clip_id: String,
-    fade_in: Option<f64>,
-    fade_out: Option<f64>,
-) -> CmdResult<Timeline> {
+#[tauri::command(async)]
+fn set_fade(state: State<'_, AppState>, clip_id: String, fade_in: Option<f64>, fade_out: Option<f64>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_fade(id, fade_in, fade_out).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_speed(id, speed).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn set_transform(
     state: State<'_, AppState>,
@@ -381,14 +434,25 @@ fn set_transform(
     crop_bottom: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project
-        .set_transform(id, scale, pos_x, pos_y, rotation, opacity, crop_left, crop_right, crop_top, crop_bottom)
+        .set_transform(
+            id,
+            scale,
+            pos_x,
+            pos_y,
+            rotation,
+            opacity,
+            crop_left,
+            crop_right,
+            crop_top,
+            crop_bottom,
+        )
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_color(
     state: State<'_, AppState>,
     clip_id: String,
@@ -398,12 +462,14 @@ fn set_color(
     gamma: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
-    project.set_color(id, brightness, contrast, saturation, gamma).map_err(|e| e.to_string())?;
+    let project = state.project();
+    project
+        .set_color(id, brightness, contrast, saturation, gamma)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_transition(
     state: State<'_, AppState>,
     clip_id: String,
@@ -412,36 +478,36 @@ fn set_transition(
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let transition = parse_transition(kind, duration)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_transition(id, transition).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_video_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<VideoEffect>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_video_effects(id, effects).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_audio_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<AudioEffect>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_audio_effects(id, effects).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_keyframes(state: State<'_, AppState>, clip_id: String, keyframes: Vec<Keyframe>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_keyframes(id, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn add_keyframe(
     state: State<'_, AppState>,
@@ -454,27 +520,29 @@ fn add_keyframe(
     opacity: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
-    project.add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity).map_err(|e| e.to_string())?;
+    let project = state.project();
+    project
+        .add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity)
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.clear_keyframes(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_overlay(state: State<'_, AppState>, text: String, start: f64, end: f64) -> CmdResult<Timeline> {
-    let project = state.project()?;
+    let project = state.project();
     project.add_overlay(text, start, end).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn update_overlay(
     state: State<'_, AppState>,
@@ -491,98 +559,99 @@ fn update_overlay(
     bold: Option<bool>,
 ) -> CmdResult<Timeline> {
     let oid = id(&overlay_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project
         .update_overlay(oid, text, start, end, pos_x, pos_y, size, color, bg, font, bold)
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
     let oid = id(&overlay_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.remove_overlay(oid).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyframes: Vec<TextKeyframe>) -> CmdResult<Timeline> {
     let oid = id(&overlay_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.set_overlay_keyframes(oid, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn captions_from_transcript(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.captions_from_transcript(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: String) -> CmdResult<String> {
+async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: String) -> CmdResult<String> {
     let id = id(&asset_id)?;
-    let srt = {
-        let project = state.project()?;
-        project.transcript_srt(id).map_err(|e| e.to_string())?
-    };
-    std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
-    Ok(output_path)
+    let shared = state.project.clone();
+    blocking(move || {
+        let srt = lock_user(&shared).transcript_srt(id).map_err(|e| e.to_string())?;
+        std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
+        Ok(output_path)
+    })
+    .await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.remove_silence(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.extract_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn concatenate(state: State<'_, AppState>, asset_ids: Vec<String>) -> CmdResult<Timeline> {
     let ids = asset_ids.iter().map(|s| id(s)).collect::<CmdResult<Vec<_>>>()?;
-    let project = state.project()?;
+    let project = state.project();
     project.concatenate(&ids).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 // ---- history (undo / redo / revert) ----------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_history(state: State<'_, AppState>) -> CmdResult<Vec<Revision>> {
-    state.project()?.history().map_err(|e| e.to_string())
+    state.project().history().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undo(state: State<'_, AppState>) -> CmdResult<Timeline> {
-    state.project()?.undo().map_err(|e| e.to_string())
+    state.project().undo().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn redo(state: State<'_, AppState>) -> CmdResult<Timeline> {
-    state.project()?.redo().map_err(|e| e.to_string())
+    state.project().redo().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
-    state.project()?.revert_to(seq).map_err(|e| e.to_string())
+    state.project().revert_to(seq).map_err(|e| e.to_string())
 }
 
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
-fn get_frame(
+async fn get_frame(
     state: State<'_, AppState>,
     asset_id: String,
     time_secs: f64,
@@ -590,72 +659,117 @@ fn get_frame(
     accurate: Option<bool>,
 ) -> CmdResult<String> {
     let id = id(&asset_id)?;
-    // Resolve the asset under the lock, then *drop the guard* before decoding: the
-    // ffmpeg run must not hold the shared Project mutex for its whole duration, or
-    // it freezes every other op (timeline edits, MCP, the next scrub frame).
-    let asset = state.project()?.require_asset(id).map_err(|e| e.to_string())?;
-    // JPEG rather than PNG: the preview pane never needs lossless frames, and a
-    // q=4 JPEG is ~5–10× smaller to encode and ship over IPC — which matters now
-    // that the preview fetches frames continuously during playback. `accurate`
-    // is false for rough scrub frames (keyframe-snap), true for the settled frame.
-    let jpeg = Project::decode_preview_frame(&asset, time_secs, max_width.unwrap_or(960), 4, accurate.unwrap_or(true))
-        .map_err(|e| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
-    Ok(format!("data:image/jpeg;base64,{b64}"))
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve the asset under the lock, then *drop the guard* before decoding: the
+        // ffmpeg run must not hold the shared Project mutex for its whole duration, or
+        // it freezes every other op (timeline edits, MCP, the next scrub frame).
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        // JPEG rather than PNG: the preview pane never needs lossless frames, and a
+        // q=4 JPEG is ~5–10× smaller to encode and ship over IPC — which matters now
+        // that the preview fetches frames continuously during playback. `accurate`
+        // is false for rough scrub frames (keyframe-snap), true for the settled frame.
+        let jpeg = Project::decode_preview_frame(&asset, time_secs, max_width.unwrap_or(960), 4, accurate.unwrap_or(true))
+            .map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        Ok(format!("data:image/jpeg;base64,{b64}"))
+    })
+    .await
 }
 
 /// The composited timeline still at `time_secs` — every visible clip put through
 /// the same color / effect / transform / overlay chain the export uses, so the
 /// preview reflects Inspector edits live (unlike `get_frame`, a raw source decode).
 #[tauri::command]
-fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
-    // Resolve the inputs under the lock, then *drop the guard* before the ffmpeg
-    // composite — the preview fetches frames continuously during playback, and
-    // holding the shared Project mutex for the whole decode would freeze every
-    // other op (timeline edits, MCP, the next scrub frame). Mirrors `get_frame`.
-    let (timeline, assets) = state.project()?.timeline_frame_inputs().map_err(|e| e.to_string())?;
-    let jpeg = Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width.unwrap_or(960), 4)
-        .map_err(|e| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
-    Ok(format!("data:image/jpeg;base64,{b64}"))
+async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve the inputs under the lock, then *drop the guard* before the ffmpeg
+        // composite — the preview fetches frames continuously during playback, and
+        // holding the shared Project mutex for the whole decode would freeze every
+        // other op (timeline edits, MCP, the next scrub frame). Mirrors `get_frame`.
+        let (timeline, assets) = lock_user(&shared).timeline_frame_inputs().map_err(|e| e.to_string())?;
+        let jpeg = Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width.unwrap_or(960), 4)
+            .map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        Ok(format!("data:image/jpeg;base64,{b64}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
+async fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
-    state.project()?.waveform(id, buckets).map_err(|e| e.to_string())
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve under the lock, decode the whole audio stream with it released —
+        // a long source takes seconds to bucket and must not stall other ops.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        Project::decode_waveform(&asset, buckets).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// A window of an asset's audio as raw mono s16le PCM for the preview's Web
+/// Audio playback. Returns raw bytes rather than JSON — a minute of 32 kHz
+/// audio is ~3.8 MB, which a JSON number array would balloon ~5×.
+#[tauri::command]
+async fn get_audio(
+    state: State<'_, AppState>,
+    asset_id: String,
+    start: f64,
+    duration: f64,
+    sample_rate: Option<u32>,
+) -> CmdResult<tauri::ipc::Response> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    let pcm = blocking(move || {
+        // Resolve the asset under the lock, then drop the guard before the decode —
+        // same reasoning as `get_frame`.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        let rate = sample_rate.unwrap_or(32_000).clamp(8_000, 48_000);
+        Project::decode_audio_pcm(&asset, start, duration, rate).map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(tauri::ipc::Response::new(pcm))
 }
 
 #[tauri::command]
-fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
+async fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
-    state.project()?.energy(id, buckets).map_err(|e| e.to_string())
+    let shared = state.project.clone();
+    blocking(move || {
+        // Same lock-free decode shape as `get_waveform`.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        Project::decode_energy(&asset, buckets).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ---- agent task queue (mutations return the refreshed queue) ---------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_tasks(state: State<'_, AppState>) -> CmdResult<Vec<Task>> {
-    state.project()?.list_tasks().map_err(|e| e.to_string())
+    state.project().list_tasks().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_task(state: State<'_, AppState>, prompt: String) -> CmdResult<Task> {
-    state.project()?.add_task(&prompt).map_err(|e| e.to_string())
+    state.project().add_task(&prompt).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
     let id = id(&task_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.resolve_task(id).map_err(|e| e.to_string())?;
     project.list_tasks().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
     let id = id(&task_id)?;
-    let project = state.project()?;
+    let project = state.project();
     project.remove_task(id).map_err(|e| e.to_string())?;
     project.list_tasks().map_err(|e| e.to_string())
 }
@@ -663,13 +777,18 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 // ---- export ----------------------------------------------------------------
 
 #[tauri::command]
-fn export_timeline(app: AppHandle, state: State<'_, AppState>, output_path: String, options: ExportOptions) -> CmdResult<String> {
+async fn export_timeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    output_path: String,
+    options: ExportOptions,
+) -> CmdResult<String> {
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
     // command and the MCP agent until it finished.
     let (timeline, assets) = {
-        let project = state.project()?;
+        let project = state.project();
         (
             project.timeline().map_err(|e| e.to_string())?,
             project.list_assets().map_err(|e| e.to_string())?,
@@ -680,35 +799,38 @@ fn export_timeline(app: AppHandle, state: State<'_, AppState>, output_path: Stri
     let cancel = state.export_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
 
-    // Stream `export-progress` events ({ fraction, elapsed_secs, eta_secs }) so
-    // the UI can show a bar + ETA. ffmpeg emits ~2/sec, no extra throttle needed.
-    let mut on_progress = |p: kerf_core::ExportProgress| {
-        let _ = app.emit("export-progress", p);
-    };
-    let status = kerf_core::render_with_progress(
-        &timeline,
-        &assets,
-        std::path::Path::new(&output_path),
-        &options,
-        &mut on_progress,
-        &|| cancel.load(Ordering::SeqCst),
-    )
-    .map_err(|e| e.to_string())?;
+    blocking(move || {
+        // Stream `export-progress` events ({ fraction, elapsed_secs, eta_secs }) so
+        // the UI can show a bar + ETA. ffmpeg emits ~2/sec, no extra throttle needed.
+        let mut on_progress = |p: kerf_core::ExportProgress| {
+            let _ = app.emit("export-progress", p);
+        };
+        let status = kerf_core::render_with_progress(
+            &timeline,
+            &assets,
+            std::path::Path::new(&output_path),
+            &options,
+            &mut on_progress,
+            &|| cancel.load(Ordering::SeqCst),
+        )
+        .map_err(|e| e.to_string())?;
 
-    match status {
-        kerf_core::RenderStatus::Completed => Ok(output_path),
-        kerf_core::RenderStatus::Cancelled => {
-            // Drop the half-written file so a cancelled export leaves no debris.
-            let _ = std::fs::remove_file(&output_path);
-            Err("export cancelled".to_string())
+        match status {
+            kerf_core::RenderStatus::Completed => Ok(output_path),
+            kerf_core::RenderStatus::Cancelled => {
+                // Drop the half-written file so a cancelled export leaves no debris.
+                let _ = std::fs::remove_file(&output_path);
+                Err("export cancelled".to_string())
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Request cancellation of the in-flight export (if any). The running
 /// [`export_timeline`] observes the flag on its next progress poll, stops
 /// ffmpeg, and returns the `"export cancelled"` error.
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_export(state: State<'_, AppState>) {
     state.export_cancel.store(true, Ordering::SeqCst);
 }
@@ -718,14 +840,14 @@ fn cancel_export(state: State<'_, AppState>) {
 /// The local MCP endpoint URL a connected LLM points at (e.g.
 /// `http://127.0.0.1:7777/mcp`), honoring the `KERF_MCP_ADDR` override. The
 /// agent panel surfaces this so the user knows how to connect their agent.
-#[tauri::command]
+#[tauri::command(async)]
 fn mcp_endpoint() -> String {
     mcp::endpoint_url()
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn log_dir(app: AppHandle) -> CmdResult<String> {
     app.path()
         .app_log_dir()
@@ -734,7 +856,7 @@ fn log_dir(app: AppHandle) -> CmdResult<String> {
 }
 
 /// Open the log directory in the OS file manager so users can attach the file.
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_logs(app: AppHandle) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
     let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
@@ -772,8 +894,8 @@ fn use_bundled_ffmpeg() {
 fn init_logging(app: &AppHandle) {
     use tracing_subscriber::prelude::*;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
 
     let file = app.path().app_log_dir().ok().and_then(|dir| {
@@ -808,7 +930,10 @@ fn init_logging(app: &AppHandle) {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         let message = info
             .payload()
             .downcast_ref::<&str>()
@@ -875,8 +1000,10 @@ pub fn run() {
             reorder_clip,
             move_clip,
             ripple_delete,
+            cut_clip_range,
             add_track,
             remove_track,
+            set_track_duck,
             remove_clip,
             set_volume,
             set_fade,
@@ -905,6 +1032,7 @@ pub fn run() {
             get_frame,
             get_timeline_frame,
             get_waveform,
+            get_audio,
             get_energy,
             list_tasks,
             add_task,

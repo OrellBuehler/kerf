@@ -85,7 +85,9 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     if video_count == 1
         && !has_audio
         && duration < super::cli::STILL_MAX_DURATION
-        && streams.iter().any(|s| s.kind == StreamKind::Video && super::cli::is_still_codec(Some(&s.codec)))
+        && streams
+            .iter()
+            .any(|s| s.kind == StreamKind::Video && super::cli::is_still_codec(Some(&s.codec)))
     {
         for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
             s.image = true;

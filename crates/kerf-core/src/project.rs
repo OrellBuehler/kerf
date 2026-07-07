@@ -211,7 +211,16 @@ impl Project {
 
     /// Probe a media file and store its asset record.
     pub fn import_asset(&self, media_path: impl AsRef<Path>) -> Result<Asset> {
-        let path = media_path.as_ref();
+        let asset = Self::probe_asset(media_path.as_ref())?;
+        self.insert_asset(&asset)?;
+        Ok(asset)
+    }
+
+    /// Probe a media file into a fresh [`Asset`] record *without* `&self` — the
+    /// ffprobe run doesn't need the project lock, so callers importing several
+    /// files can probe them concurrently and take the lock only for the quick
+    /// [`Project::insert_asset`].
+    pub fn probe_asset(path: &Path) -> Result<Asset> {
         let probe = engine::probe(path)?;
         let name = path
             .file_name()
@@ -225,16 +234,14 @@ impl Project {
         } else {
             probe.duration
         };
-        let asset = Asset {
+        Ok(Asset {
             id: Uuid::new_v4(),
             path: path.to_string_lossy().into_owned(),
             name,
             duration,
             streams: probe.streams,
             imported_at: Utc::now(),
-        };
-        self.insert_asset(&asset)?;
-        Ok(asset)
+        })
     }
 
     /// Insert (or replace) an asset record directly.
@@ -378,6 +385,15 @@ impl Project {
         engine::frame_jpeg(&path, time_secs, max_width, quality, accurate)
     }
 
+    /// Decode a window of an asset's audio as mono s16le PCM at `sample_rate`,
+    /// for the GUI's preview playback. Static like
+    /// [`Project::decode_preview_frame`] so the caller can release the project
+    /// lock before the ffmpeg decode runs. Always reads the original source —
+    /// proxies are video-only.
+    pub fn decode_audio_pcm(asset: &Asset, start: f64, duration: f64, sample_rate: u32) -> Result<Vec<u8>> {
+        engine::audio_pcm(Path::new(&asset.path), start, duration, sample_rate)
+    }
+
     /// The media path a preview should decode for `asset`: its generated proxy
     /// when one is ready on disk, else the original source. Only the preview
     /// paths ([`Project::decode_preview_frame`] and the [`Project::timeline_frame`]
@@ -411,6 +427,22 @@ impl Project {
         quality: u8,
     ) -> Result<(Vec<u8>, Vec<f64>)> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_contact_sheet(&asset, start, end, columns, rows, cell_width, quality)
+    }
+
+    /// Build the contact sheet for an already-resolved [`Asset`], *without*
+    /// `&self` — so the caller can release the project lock before the
+    /// (many-seek) ffmpeg sampling runs. See [`Project::skim_asset`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_contact_sheet(
+        asset: &Asset,
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+    ) -> Result<(Vec<u8>, Vec<f64>)> {
         let start = start.unwrap_or(0.0).max(0.0);
         let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
         engine::contact_sheet(Path::new(&asset.path), start, end, columns, rows, cell_width, quality)
@@ -444,7 +476,14 @@ impl Project {
         max_width: u32,
         quality: u8,
     ) -> Result<Vec<u8>> {
-        engine::timeline_frame(timeline, assets, &engine::ExportOptions::default(), time_secs, max_width, quality)
+        engine::timeline_frame(
+            timeline,
+            assets,
+            &engine::ExportOptions::default(),
+            time_secs,
+            max_width,
+            quality,
+        )
     }
 
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
@@ -465,6 +504,13 @@ impl Project {
     /// `0.0..=1.0` for waveform rendering.
     pub fn waveform(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_waveform(&asset, buckets)
+    }
+
+    /// Waveform peaks for an already-resolved [`Asset`], *without* `&self` — so
+    /// the caller can release the project lock before the whole-file ffmpeg
+    /// decode. See [`Project::waveform`].
+    pub fn decode_waveform(asset: &Asset, buckets: usize) -> Result<Vec<f32>> {
         engine::waveform(Path::new(&asset.path), buckets, 8_000)
     }
 
@@ -473,6 +519,12 @@ impl Project {
     /// [`Self::waveform`] (which returns peaks); RMS better reflects loudness.
     pub fn energy(&self, asset_id: Uuid, buckets: usize) -> Result<Vec<f32>> {
         let asset = self.require_asset(asset_id)?;
+        Self::decode_energy(&asset, buckets)
+    }
+
+    /// Energy envelope for an already-resolved [`Asset`], *without* `&self` —
+    /// lock-free like [`Project::decode_waveform`].
+    pub fn decode_energy(asset: &Asset, buckets: usize) -> Result<Vec<f32>> {
         engine::energy_envelope(Path::new(&asset.path), buckets, 8_000)
     }
 
@@ -493,10 +545,8 @@ impl Project {
     /// JSON (an edit + its history snapshot) don't serialize the same timeline
     /// twice.
     fn save_timeline_str(&self, json: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)",
-            params![json],
-        )?;
+        self.conn
+            .execute("INSERT OR REPLACE INTO timeline (id, data) VALUES (1, ?1)", params![json])?;
         Ok(())
     }
 
@@ -719,8 +769,17 @@ impl Project {
         })
     }
 
-    /// Adjust a clip's source in/out points (timeline position is preserved).
-    pub fn trim(&self, clip_id: Uuid, source_in: Option<f64>, source_out: Option<f64>) -> Result<Clip> {
+    /// Adjust a clip's source in/out points. `timeline_start` moves the clip in
+    /// the same edit — a left-edge trim from the GUI shifts the start so the
+    /// right edge stays put, and doing both here keeps undo a single step.
+    /// Omitted, the timeline position is preserved.
+    pub fn trim(
+        &self,
+        clip_id: Uuid,
+        source_in: Option<f64>,
+        source_out: Option<f64>,
+        timeline_start: Option<f64>,
+    ) -> Result<Clip> {
         self.edit_timeline("Trim clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
@@ -735,7 +794,80 @@ impl Project {
                     "source_out must be greater than source_in".to_string(),
                 ));
             }
-            Ok(clip.clone())
+            if let Some(start) = timeline_start {
+                clip.timeline_start = start.max(0.0);
+            }
+            let out = clip.clone();
+            if timeline_start.is_some() {
+                timeline.tracks[ti].sort_by_start();
+            }
+            Ok(out)
+        })
+    }
+
+    /// Cut a **source-time** range out of a clip: the clip is split around the
+    /// intersection of `[from, to]` with its source window, the middle piece
+    /// removed, and later clips on the track ripple left to close the gap.
+    /// This is the transcript-editing primitive — delete a sentence and the
+    /// cut tightens. Returns the kept pieces in play order.
+    pub fn cut_clip_range(&self, clip_id: Uuid, from: f64, to: f64) -> Result<Vec<Clip>> {
+        self.edit_timeline("Cut range", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = timeline.tracks[ti].clips[ci].clone();
+            let a = from.max(clip.source_in);
+            let b = to.min(clip.source_out);
+            if b - a <= 1e-9 {
+                return Err(Error::InvalidArgument(
+                    "range does not overlap the clip's source window".to_string(),
+                ));
+            }
+            let removed = (b - a) / clip.speed_mag();
+
+            // The kept source spans in play order — a reversed clip plays the
+            // upper span first. A piece that is the sole survivor keeps the
+            // original id and both fades (the cut is just a trim); otherwise
+            // the fades facing the removed middle are dropped.
+            let (head, tail) = if clip.is_reversed() {
+                ((b, clip.source_out), (clip.source_in, a))
+            } else {
+                ((clip.source_in, a), (b, clip.source_out))
+            };
+            let head_ok = head.1 - head.0 > 1e-9;
+            let tail_ok = tail.1 - tail.0 > 1e-9;
+            let mut pieces: Vec<Clip> = Vec::new();
+            let mut cursor = clip.timeline_start;
+            if head_ok {
+                let mut p = clip.clone();
+                (p.source_in, p.source_out) = head;
+                p.timeline_start = cursor;
+                if tail_ok {
+                    p.fade_out = 0.0;
+                }
+                cursor = p.timeline_end();
+                pieces.push(p);
+            }
+            if tail_ok {
+                let mut p = clip.clone();
+                (p.source_in, p.source_out) = tail;
+                p.timeline_start = cursor;
+                if head_ok {
+                    p.id = Uuid::new_v4();
+                    p.fade_in = 0.0;
+                    p.transition_in = None;
+                }
+                pieces.push(p);
+            }
+
+            let track = &mut timeline.tracks[ti];
+            track.clips.remove(ci);
+            for c in &mut track.clips {
+                if c.timeline_start > clip.timeline_start + 1e-9 {
+                    c.timeline_start = (c.timeline_start - removed).max(0.0);
+                }
+            }
+            track.clips.extend(pieces.iter().cloned());
+            track.sort_by_start();
+            Ok(pieces)
         })
     }
 
@@ -835,6 +967,7 @@ impl Project {
                 kind,
                 name,
                 clips: Vec::new(),
+                duck: false,
             };
             // Insert video tracks just after the last video track and audio
             // tracks at the very end, so the lanes stay grouped (V1, V2, …, A1, A2).
@@ -849,6 +982,17 @@ impl Project {
             };
             timeline.tracks.insert(at, track.clone());
             Ok(track)
+        })
+    }
+
+    /// Flag or unflag a track for export-time ducking: a flagged track's audio
+    /// is sidechain-compressed under the non-ducked tracks (music dips under
+    /// dialogue automatically).
+    pub fn set_track_duck(&self, track_id: Uuid, duck: bool) -> Result<Track> {
+        self.edit_timeline(if duck { "Duck track" } else { "Unduck track" }, |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.duck = duck;
+            Ok(track.clone())
         })
     }
 
@@ -1672,7 +1816,9 @@ fn validate_video_effect(e: &VideoEffect) -> Result<()> {
         }
         VideoEffect::ChromaKey { similarity, blend, .. } => {
             if !(0.0..=1.0).contains(similarity) || !(0.0..=1.0).contains(blend) {
-                return Err(Error::InvalidArgument("chroma key similarity / blend must be within 0.0..=1.0".to_string()));
+                return Err(Error::InvalidArgument(
+                    "chroma key similarity / blend must be within 0.0..=1.0".to_string(),
+                ));
             }
         }
         VideoEffect::Grayscale | VideoEffect::Invert | VideoEffect::Vignette => {}
@@ -1697,7 +1843,13 @@ fn validate_audio_effect(e: &AudioEffect) -> Result<()> {
                 return Err(Error::InvalidArgument("gain_db must be finite".to_string()));
             }
         }
-        AudioEffect::Compressor { threshold_db, ratio, attack_ms, release_ms, makeup_db } => {
+        AudioEffect::Compressor {
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => {
             if !threshold_db.is_finite() || !makeup_db.is_finite() {
                 return Err(Error::InvalidArgument("compressor dB values must be finite".to_string()));
             }
@@ -1721,10 +1873,14 @@ fn validate_keyframe(k: &Keyframe) -> Result<()> {
         return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
     }
     if !k.scale.is_finite() || k.scale <= 0.0 {
-        return Err(Error::InvalidArgument("keyframe scale must be a finite value > 0".to_string()));
+        return Err(Error::InvalidArgument(
+            "keyframe scale must be a finite value > 0".to_string(),
+        ));
     }
     if !(0.0..=1.0).contains(&k.opacity) {
-        return Err(Error::InvalidArgument("keyframe opacity must be within 0.0..=1.0".to_string()));
+        return Err(Error::InvalidArgument(
+            "keyframe opacity must be within 0.0..=1.0".to_string(),
+        ));
     }
     if ![k.pos_x, k.pos_y, k.rotation].iter().all(|v| v.is_finite()) {
         return Err(Error::InvalidArgument("keyframe values must be finite".to_string()));
@@ -1868,6 +2024,42 @@ mod tests {
     }
 
     #[test]
+    fn trim_with_timeline_start_keeps_the_right_edge_put() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+
+        // 4s clip at t=2 (source 3..7); a left-edge trim tightens the source
+        // in-point and moves the start in one edit, so the end stays at t=6.
+        let clip = project.add_clip_to_timeline(asset.id, None, 3.0, 7.0, Some(2.0)).unwrap();
+        let trimmed = project.trim(clip.id, Some(4.0), None, Some(3.0)).unwrap();
+        assert!((trimmed.timeline_start - 3.0).abs() < 1e-9);
+        assert!((trimmed.timeline_end() - 6.0).abs() < 1e-9);
+
+        let history = project.history().unwrap();
+        assert_eq!(history.last().unwrap().label, "Trim clip");
+    }
+
+    #[test]
+    fn cut_clip_range_splits_and_ripples() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        // Two 10s clips back to back; cut source 4..6 out of the first.
+        let a = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let b = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let pieces = project.cut_clip_range(a.id, 4.0, 6.0).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!((pieces[0].source_out - 4.0).abs() < 1e-9);
+        assert!((pieces[1].source_in - 6.0).abs() < 1e-9);
+        assert!((pieces[1].timeline_start - 4.0).abs() < 1e-9);
+        // The following clip rippled left by the removed 2 seconds.
+        let timeline = project.timeline().unwrap();
+        let moved = timeline.clip(b.id).unwrap();
+        assert!((moved.timeline_start - 8.0).abs() < 1e-9, "{}", moved.timeline_start);
+    }
+
+    #[test]
     fn split_and_remove_roundtrip() {
         let project = Project::open_in_memory().unwrap();
         let asset = Asset {
@@ -1954,7 +2146,9 @@ mod tests {
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
         // Pin the current (static) scale at t=0, then animate to 1.5 at t=4.
-        project.set_transform(clip.id, Some(1.2), None, None, None, None, None, None, None, None).unwrap();
+        project
+            .set_transform(clip.id, Some(1.2), None, None, None, None, None, None, None, None)
+            .unwrap();
         let pinned = project.add_keyframe(clip.id, 0.0, None, None, None, None, None).unwrap();
         assert_eq!(pinned.keyframes.len(), 1);
         assert!((pinned.keyframes[0].scale - 1.2).abs() < 1e-9); // captured the static pose
@@ -1979,11 +2173,22 @@ mod tests {
         assert_eq!(updated.effects.len(), 2);
         // An out-of-range chroma key is rejected.
         assert!(project
-            .set_video_effects(clip.id, vec![VideoEffect::ChromaKey { color: "green".into(), similarity: 2.0, blend: 0.0 }])
+            .set_video_effects(
+                clip.id,
+                vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 2.0,
+                    blend: 0.0
+                }]
+            )
             .is_err());
-        let a = project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: 80.0 }]).unwrap();
+        let a = project
+            .set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: 80.0 }])
+            .unwrap();
         assert_eq!(a.audio.len(), 1);
-        assert!(project.set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: -1.0 }]).is_err());
+        assert!(project
+            .set_audio_effects(clip.id, vec![AudioEffect::Highpass { hz: -1.0 }])
+            .is_err());
     }
 
     #[test]
@@ -2011,7 +2216,7 @@ mod tests {
 
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
         project.set_speed(clip.id, 2.0).unwrap(); // 10s of source over 5s of timeline
-        // Split at timeline t=2.0 → 4.0s into the source (2.0 * 2x).
+                                                  // Split at timeline t=2.0 → 4.0s into the source (2.0 * 2x).
         let (left, right) = project.split_at(clip.id, 2.0).unwrap();
         assert!((left.source_out - 4.0).abs() < 1e-9, "left out: {}", left.source_out);
         assert!((right.source_in - 4.0).abs() < 1e-9, "right in: {}", right.source_in);

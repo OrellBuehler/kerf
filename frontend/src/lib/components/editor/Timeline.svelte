@@ -147,6 +147,124 @@
 	};
 	let drag = $state<Drag | null>(null);
 
+	// ---- edge-dragging trim ---------------------------------------------------
+
+	type TrimDrag = {
+		clipId: string;
+		trackId: string;
+		edge: 'l' | 'r';
+		min: number; // dragged-edge bounds, timeline seconds
+		max: number;
+		origStart: number;
+		origEnd: number;
+		pos: number; // current ghost position of the dragged edge
+		moved: boolean;
+	};
+	let trimDrag = $state<TrimDrag | null>(null);
+
+	/** Shortest a clip may get when edge-trimming, seconds. */
+	const MIN_CLIP = 0.05;
+
+	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
+		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
+		e.stopPropagation();
+		editor.selectedClipId = c.id;
+		void editor.select(c.asset_id);
+		const asset = editor.assets.find((a) => a.id === c.asset_id);
+		// A still image loops, so its source window can grow without limit.
+		const still = asset?.streams.some((s) => s.image) ?? false;
+		const sp = c.speed ?? 1;
+		const mag = Math.max(Math.abs(sp), 0.01);
+		const start = c.timeline_start;
+		const end = start + clipDuration(c);
+		const clips = [...(editor.timeline.tracks.find((tr) => tr.id === t.id)?.clips ?? [])].sort(
+			(a, b) => a.timeline_start - b.timeline_start
+		);
+		const i = clips.findIndex((x) => x.id === c.id);
+		// Unused source on the side being extended: a forward clip's left edge
+		// draws on the handle below source_in, its right edge on the handle past
+		// source_out; a reversed clip plays backwards, so the sides swap.
+		const headHandle = sp < 0 ? Math.max(0, (asset?.duration ?? c.source_out) - c.source_out) : c.source_in;
+		const tailHandle = sp < 0 ? c.source_in : Math.max(0, (asset?.duration ?? c.source_out) - c.source_out);
+		let min: number;
+		let max: number;
+		if (edge === 'l') {
+			const prev = i > 0 ? clips[i - 1] : null;
+			const prevEnd = prev ? prev.timeline_start + clipDuration(prev) : 0;
+			min = Math.max(0, prevEnd, still ? 0 : start - headHandle / mag);
+			max = end - MIN_CLIP;
+		} else {
+			const nextStart = i >= 0 && i < clips.length - 1 ? clips[i + 1].timeline_start : Infinity;
+			min = start + MIN_CLIP;
+			max = Math.min(nextStart, still ? Infinity : end + tailHandle / mag);
+		}
+		trimDrag = {
+			clipId: c.id,
+			trackId: t.id,
+			edge,
+			min,
+			max,
+			origStart: start,
+			origEnd: end,
+			pos: edge === 'l' ? start : end,
+			moved: false
+		};
+	}
+
+	function onTrimMove(e: PointerEvent) {
+		if (!trimDrag) return;
+		const lane = document.querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
+		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
+		const pos = Math.min(trimDrag.max, Math.max(trimDrag.min, snapPoint(laneTime(e.clientX, laneLeft), trimDrag.trackId, trimDrag.clipId)));
+		const orig = trimDrag.edge === 'l' ? trimDrag.origStart : trimDrag.origEnd;
+		const moved = trimDrag.moved || Math.abs(pos - orig) >= 2 / pxPerSec;
+		trimDrag = { ...trimDrag, pos, moved };
+	}
+
+	function onTrimUp() {
+		if (!trimDrag) return;
+		const d = trimDrag;
+		trimDrag = null;
+		if (!d.moved) return;
+		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
+		if (!clip) return;
+		const sp = clip.speed ?? 1;
+		const mag = Math.max(Math.abs(sp), 0.01);
+		if (d.edge === 'r') {
+			const newDur = d.pos - clip.timeline_start;
+			// The end of playback maps to source_out forward, source_in reversed.
+			if (sp < 0) void editor.trim(d.clipId, clip.source_out - newDur * mag, undefined).catch(err);
+			else void editor.trim(d.clipId, undefined, clip.source_in + newDur * mag).catch(err);
+		} else {
+			const delta = (d.pos - d.origStart) * mag; // > 0 shortens from the left
+			if (sp < 0) void editor.trim(d.clipId, undefined, clip.source_out - delta, d.pos).catch(err);
+			else void editor.trim(d.clipId, clip.source_in + delta, undefined, d.pos).catch(err);
+		}
+	}
+
+	/** Snap a time point to 0, the playhead, or another clip's edges. */
+	function snapPoint(time: number, trackId: string, clipId: string): number {
+		if (!ui.snap) return time;
+		const threshold = 8 / pxPerSec;
+		const cands: number[] = [0, ui.time];
+		const track = editor.timeline.tracks.find((t) => t.id === trackId);
+		if (track)
+			for (const c of track.clips) {
+				if (c.id === clipId) continue;
+				cands.push(c.timeline_start, c.timeline_start + clipDuration(c));
+			}
+		let best = time;
+		let bestD = threshold;
+		for (const cand of cands) {
+			const d = Math.abs(cand - time);
+			if (d < bestD) {
+				bestD = d;
+				best = cand;
+			}
+		}
+		return best;
+	}
+
 	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
 
 	function err(e: unknown) {
@@ -212,6 +330,10 @@
 	}
 
 	function onPointerMove(e: PointerEvent) {
+		if (trimDrag) {
+			onTrimMove(e);
+			return;
+		}
 		if (!drag) return;
 		const lane = laneUnder(e.clientX, e.clientY);
 		let trackId = drag.trackId;
@@ -230,6 +352,10 @@
 	}
 
 	function onPointerUp() {
+		if (trimDrag) {
+			onTrimUp();
+			return;
+		}
 		if (!drag) return;
 		const d = drag;
 		drag = null;
@@ -494,6 +620,21 @@
 						>{t.name}</span
 					>
 					<span style="font-size:11px;color:var(--text-muted);flex:1">{t.kind === 'video' ? 'Video' : 'Audio'}</span>
+					{#if t.kind === 'audio'}
+						<button
+							title={t.duck
+								? 'Ducking on — this track dips under the rest of the mix on export'
+								: 'Duck this track under the rest of the mix on export'}
+							aria-label="Toggle ducking"
+							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
+							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:1px solid {t.duck
+								? 'var(--kerf-500)'
+								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
+								? '#fff'
+								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px"
+							>DUCK</button
+						>
+					{/if}
 					<Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" />
 					<button
 						title="Remove track"
@@ -531,6 +672,32 @@
 							style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 						></span>
 					{/each}
+					{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
+						<div
+							style="position:absolute;left:{ui.markIn * pxPerSec}px;width:{(ui.markOut - ui.markIn) *
+								pxPerSec}px;top:0;bottom:0;background:var(--selection-fill);pointer-events:none"
+						></div>
+					{/if}
+					{#if ui.markIn !== null}
+						<span
+							title="Mark in {fmt(ui.markIn)} — I sets, ⇧I clears"
+							style="position:absolute;left:{ui.markIn * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
+						>
+							<span
+								style="position:absolute;top:0;left:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,0 100%)"
+							></span>
+						</span>
+					{/if}
+					{#if ui.markOut !== null}
+						<span
+							title="Mark out {fmt(ui.markOut)} — O sets, ⇧O clears"
+							style="position:absolute;left:{ui.markOut * pxPerSec - 2}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
+						>
+							<span
+								style="position:absolute;top:0;right:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,100% 100%)"
+							></span>
+						</span>
+					{/if}
 				</div>
 
 				<!-- grid lines -->
@@ -630,6 +797,18 @@
 										>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 									>
 								{/if}
+								{#if ui.tool === 'pointer' && width > 24}
+									<span
+										role="presentation"
+										onpointerdown={(e) => onEdgePointerDown(e, c, t, 'l')}
+										style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+									></span>
+									<span
+										role="presentation"
+										onpointerdown={(e) => onEdgePointerDown(e, c, t, 'r')}
+										style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+									></span>
+								{/if}
 							</button>
 						{/each}
 						{#if drag?.moved && drag.trackId === t.id}
@@ -637,6 +816,16 @@
 								style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 									6,
 									drag.dur * pxPerSec
+								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+							></div>
+						{/if}
+						{#if trimDrag?.moved && trimDrag.trackId === t.id}
+							{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
+							{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
+							<div
+								style="position:absolute;left:{gl * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									2,
+									(gr - gl) * pxPerSec
 								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
 							></div>
 						{/if}

@@ -189,6 +189,8 @@ export interface Track {
 	kind: StreamKind;
 	name: string;
 	clips: Clip[];
+	/** Ducked under the rest of the mix on export (sidechain compression). */
+	duck?: boolean;
 }
 
 export interface Timeline {
@@ -255,6 +257,10 @@ export interface ExportOptions {
 	gif_dither?: string | null;
 	gif_loop: boolean;
 	metadata_title?: string | null;
+	/** Render only this timeline span (e.g. the in/out marks); omit for all. */
+	range?: TimeRange | null;
+	/** Normalize the final mix to -14 LUFS before encoding. */
+	loudnorm?: boolean;
 }
 
 /** Payload of the `export-progress` event streamed during a render. */

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { toast } from 'svelte-sonner';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
@@ -18,6 +18,13 @@
 
 	let exportOpen = $state(false);
 
+	// Any timeline edit mid-playback re-anchors the audio so what's heard
+	// matches the new cut (volume/fade tweaks land live too).
+	$effect(() => {
+		void editor.timeline;
+		untrack(() => ui.resync());
+	});
+
 	onMount(() => {
 		void editor.load();
 		void agent.load();
@@ -26,17 +33,33 @@
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
 		// the timeline, history, and task queue so the GUI reflects agent edits.
+		// Agent edits arrive in bursts (one event per mutation), so coalesce:
+		// at most one refresh in flight plus one queued re-run, instead of piling
+		// up a redundant full re-fetch per event.
 		// It also emits `proxy-ready` once a background preview proxy finishes, so
 		// the preview re-decodes the current frame from the faster proxy.
+		let refreshing = false;
+		let dirty = false;
+		async function onProjectChanged() {
+			if (refreshing) {
+				dirty = true;
+				return;
+			}
+			refreshing = true;
+			try {
+				do {
+					dirty = false;
+					await Promise.all([editor.refreshTimeline(), editor.refreshHistory(), agent.load()]).catch(() => {});
+				} while (dirty);
+			} finally {
+				refreshing = false;
+			}
+		}
 		const unlisteners: Array<() => void> = [];
 		if (inTauri()) {
 			void import('@tauri-apps/api/event').then(async ({ listen }) => {
 				unlisteners.push(
-					await listen('project-changed', () => {
-						void editor.refreshTimeline();
-						void editor.refreshHistory();
-						void agent.load();
-					}),
+					await listen('project-changed', () => void onProjectChanged()),
 					await listen('proxy-ready', () => ui.refreshPreview())
 				);
 			});
@@ -167,7 +190,18 @@
 		// Tools / transport (bare keys).
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
-		else if (e.key === ' ') {
+		else if (k === 'j') ui.shuttle(-1);
+		else if (k === 'k') ui.pause();
+		else if (k === 'l') ui.shuttle(1);
+		else if (k === 'i') {
+			// I/O mark the working range at the playhead; Shift clears a mark.
+			// The pair stays ordered so a mark can't cross its partner.
+			if (e.shiftKey) ui.markIn = null;
+			else ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
+		} else if (k === 'o') {
+			if (e.shiftKey) ui.markOut = null;
+			else ui.markOut = Math.max(ui.time, ui.markIn ?? 0);
+		} else if (e.key === ' ') {
 			e.preventDefault();
 			ui.togglePlay();
 		} else if (e.key === 'ArrowLeft') {
