@@ -39,9 +39,9 @@
           <a class="btn btn-agent" href="#agent">How the agent edits →</a>
         </div>
       </div>
-      <figure class="shot hero-shot">
-        <img src="{{ "img/screenshot-editor.png" | relURL }}" alt="The Kerf editor: media bin, preview, and a multi-track timeline" loading="eager" width="1200" height="750" />
-        <figcaption>The full editor — multi-track timeline, live preview, and the agent panel.</figcaption>
+      <figure class="hero-viz">
+        {{ partial "mock-editor.html" . }}
+        <figcaption>Illustrated: bin, preview, agent queue and a multi-track timeline — the agent is trimming a clip on V1.</figcaption>
       </figure>
     </div>
   </section>
@@ -49,7 +49,7 @@
   <!-- ============ THE AGENT ============ -->
   <section id="agent" class="band">
     <div class="wrap">
-      <div class="section-head">
+      <div class="section-head reveal">
         <span class="kicker agent">The agent</span>
         <h2>Most tools bolt a chatbot onto an editor.<br />Kerf makes the editor an&nbsp;API.</h2>
         <p class="sub">
@@ -59,7 +59,11 @@
           and every edit shows up live for you to review.
         </p>
       </div>
-      <div class="trio">
+      <figure class="viz reveal">
+        <div class="viz-scroll">{{ partial "flow-diagram.html" . }}</div>
+        <figcaption>Two hands, one cut — you click the GUI, the agent calls tools, and both land in the same live project.</figcaption>
+      </figure>
+      <div class="trio reveal stagger">
         <article class="card">
           <div class="ic">👁</div>
           <h3>The agent has eyes</h3>
@@ -83,9 +87,9 @@
           own, and every change is revertible.</p>
         </article>
       </div>
-      <figure class="shot pair">
-        <img src="{{ "img/screenshot-agent.png" | relURL }}" alt="The agent panel: task queue and revertible edit history" loading="lazy" />
-        <img src="{{ "img/screenshot-inspector.png" | relURL }}" alt="The inspector: effect chains, keyframes and overlays" loading="lazy" />
+      <figure class="viz session-viz">
+        {{ partial "mock-session.html" . }}
+        <figcaption>One loop of a real session: skim → cut → preview → hand back. You apply — or dismiss.</figcaption>
       </figure>
     </div>
   </section>
@@ -93,14 +97,19 @@
   <!-- ============ FEATURES ============ -->
   <section id="features" class="band alt">
     <div class="wrap">
-      <div class="section-head">
+      <div class="section-head reveal">
         <span class="kicker">Under the hood</span>
         <h2>A real NLE — not a scaffold.</h2>
         <p class="sub">Everything below is wired to real backend state and renders from a pure,
         unit-tested export graph. Clip positions, gaps, track layering, effects, keyframes,
         overlays, ducking and loudnorm all come out of one <code>filter_complex</code>.</p>
       </div>
-      <div class="feature-grid">
+      <figure class="viz reveal">
+        <div class="viz-scroll">{{ partial "edl-diagram.html" . }}</div>
+        <figcaption>Non-destructive, literally: a clip is a source range at a timeline position. Cuts, effects and
+        keyframes edit that data — sources are read once, at export.</figcaption>
+      </figure>
+      <div class="feature-grid reveal stagger">
         {{ partial "feature.html" (dict "t" "Multi-track NLE" "d" "Bespoke timeline: video / audio / text tracks, free positioning with gaps, drag across tracks, edge-drag trim, razor split, ripple delete, snapping to edges, the playhead and beats.") }}
         {{ partial "feature.html" (dict "t" "Audible playback" "d" "Real Web-Audio playback with J/K/L shuttle and scrub; volume, fades, speed and reverse are auralized and the playhead follows the audio clock.") }}
         {{ partial "feature.html" (dict "t" "Analysis" "d" "FFmpeg silence detection, scene detection, an audio energy / beat grid and waveforms — all CLI-driven. Optional local Whisper transcription.") }}
@@ -116,13 +125,13 @@
   <!-- ============ MCP ============ -->
   <section id="mcp" class="band">
     <div class="wrap mcp-wrap">
-      <div class="section-head left">
+      <div class="section-head left reveal">
         <span class="kicker agent">55 tools, one live project</span>
         <h2>Connect any MCP client<br />and start editing.</h2>
         <p class="sub">The desktop app hosts the server over streamable HTTP. Point a client at
         it and ask in plain language — <i>“skim the interview, cut the dead air, drop in
         captions.”</i> It claims a task, works, and hands back a reviewable result.</p>
-        <div class="chips">
+        <div class="chips reveal stagger">
           <span class="chip see">get_frame</span>
           <span class="chip see">skim_asset</span>
           <span class="chip see">preview_timeline</span>
@@ -138,7 +147,7 @@
           <span class="chip more">+43 more</span>
         </div>
       </div>
-      <div class="code-card">
+      <div class="code-card reveal">
         <div class="code-head"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="code-title">connect with Claude Code</span></div>
         <pre><code>claude mcp add --transport http \
   kerf {{ $mcp }}</code></pre>
@@ -158,11 +167,11 @@
   <!-- ============ GET IT ============ -->
   <section id="get" class="band alt">
     <div class="wrap">
-      <div class="section-head">
+      <div class="section-head reveal">
         <span class="kicker">Get it</span>
         <h2>Download a build, or run from source.</h2>
       </div>
-      <div class="get-grid">
+      <div class="get-grid reveal stagger">
         <article class="get-card">
           <h3>Download</h3>
           <p>Installers for macOS, Linux and Windows are published on every release.</p>

@@ -1,0 +1,44 @@
+<svg class="flow-svg" viewBox="0 0 920 252" role="img"
+  aria-label="Architecture: you drive the Kerf GUI over Tauri IPC, the agent drives MCP tools over HTTP, and both land in the same live project, rendered by the FFmpeg engine.">
+  <line class="fl-wire" x1="252" y1="104" x2="348" y2="104" />
+  <line class="fl-wire" x1="572" y1="104" x2="668" y2="104" />
+  <line class="fl-wire" x1="460" y1="150" x2="460" y2="188" />
+
+  <rect class="fl-halo" x="348" y="58" width="224" height="92" rx="14" />
+  <rect class="fl-node you" x="32" y="66" width="220" height="76" rx="12" />
+  <rect class="fl-node core" x="348" y="58" width="224" height="92" rx="14" />
+  <rect class="fl-node agent" x="668" y="66" width="220" height="76" rx="12" />
+  <rect class="fl-node eng" x="368" y="188" width="184" height="50" rx="10" />
+
+  <text class="fl-title amber" x="142" y="99" text-anchor="middle">You</text>
+  <text class="fl-sub" x="142" y="121" text-anchor="middle">the Kerf GUI</text>
+
+  <text class="fl-title" x="460" y="93" text-anchor="middle">One live project</text>
+  <text class="fl-sub" x="460" y="113" text-anchor="middle">assets · timeline · tasks</text>
+  <text class="fl-sub dim" x="460" y="131" text-anchor="middle">nothing re-encoded</text>
+
+  <text class="fl-title cyan" x="778" y="99" text-anchor="middle">The agent</text>
+  <text class="fl-sub" x="778" y="121" text-anchor="middle">Claude — any MCP client</text>
+
+  <text class="fl-sub" x="460" y="210" text-anchor="middle">FFmpeg engine</text>
+  <text class="fl-sub dim" x="460" y="227" text-anchor="middle">probe · frames · export</text>
+
+  <text class="fl-link" x="300" y="90" text-anchor="middle">Tauri IPC</text>
+  <text class="fl-link" x="620" y="90" text-anchor="middle">MCP · HTTP</text>
+
+  <circle class="pulse amberp" r="3.5">
+    <animateMotion dur="2.6s" repeatCount="indefinite" path="M252 104 L348 104" />
+  </circle>
+  <circle class="pulse grayp" r="3">
+    <animateMotion dur="3.4s" begin="1.2s" repeatCount="indefinite" path="M348 104 L252 104" />
+  </circle>
+  <circle class="pulse cyanp" r="3.5">
+    <animateMotion dur="2.6s" begin="0.7s" repeatCount="indefinite" path="M668 104 L572 104" />
+  </circle>
+  <circle class="pulse grayp" r="3">
+    <animateMotion dur="3.4s" begin="2.1s" repeatCount="indefinite" path="M572 104 L668 104" />
+  </circle>
+  <circle class="pulse amberp" r="3">
+    <animateMotion dur="2.4s" begin="0.4s" repeatCount="indefinite" path="M460 150 L460 188" />
+  </circle>
+</svg>

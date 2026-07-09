@@ -1,0 +1,53 @@
+<div class="mock-editor reveal" role="img"
+  aria-label="Illustration of the Kerf editor: media bin, preview, agent task queue, and a multi-track timeline. The playhead sweeps while the agent trims a clip.">
+  <div class="me-titlebar" aria-hidden="true">
+    <span class="me-dots"><i></i><i></i><i></i></span>
+    <span class="me-title">Kerf — interview.kerf</span>
+    <span class="me-conn"><span class="conn-dot"></span>agent connected</span>
+  </div>
+  <div class="me-main" aria-hidden="true">
+    <div class="me-bin">
+      <div class="me-panel-label">Media</div>
+      <div class="me-thumb t1"><span class="dur">04:12</span><span class="name">interview.mp4</span></div>
+      <div class="me-thumb t2"><span class="dur">01:47</span><span class="name">b-roll.mp4</span></div>
+      <div class="me-thumb t3"><span class="dur">02:30</span><span class="name">music.wav</span></div>
+    </div>
+    <div class="me-preview">
+      <div class="me-frame">
+        <div class="me-scene"></div>
+        <div class="me-transport"><span class="tc">00:00:12:10</span><span class="keys">J&thinsp;K&thinsp;L</span></div>
+      </div>
+    </div>
+    <div class="me-agent">
+      <div class="me-panel-label cyan">Agent · 2 tasks</div>
+      <div class="me-task working">
+        <span class="tdot"></span>
+        <span class="tbody"><b>Assemble rough cut</b><small>working · skim_asset</small></span>
+      </div>
+      <div class="me-task ready">
+        <span class="tdot"></span>
+        <span class="tbody"><b>Remove silences</b><small>ready for review</small></span>
+        <span class="tapply">Apply</span>
+      </div>
+    </div>
+  </div>
+  <div class="me-timeline" aria-hidden="true">
+    <div class="me-ruler"><span>0s</span><span>10s</span><span>20s</span><span>30s</span><span>40s</span></div>
+    <div class="me-track">
+      <span class="me-th">V2</span>
+      <div class="me-lane"><span class="me-clip v c-broll">b-roll</span></div>
+    </div>
+    <div class="me-track">
+      <span class="me-th">V1</span>
+      <div class="me-lane">
+        <span class="me-clip v c-int1">interview</span>
+        <span class="me-clip v c-int2">interview<i class="me-handle"></i></span>
+      </div>
+    </div>
+    <div class="me-track">
+      <span class="me-th">A1<em>DUCK</em></span>
+      <div class="me-lane"><span class="me-clip a c-mus wav"><i class="clip-tag">music</i></span></div>
+    </div>
+    <div class="me-ph-area"><span class="me-playhead"></span></div>
+  </div>
+</div>

@@ -27,5 +27,24 @@
   </head>
   <body>
     {{ block "main" . }}{{ end }}
+    <script>
+      // Reveal-on-scroll: `.in` starts both the entrance transition and, on
+      // the mock panels, their looping keyframes — so every loop is seen
+      // from its first frame. Without JS, everything stays visible/static.
+      document.documentElement.classList.add("js");
+      var io = new IntersectionObserver(
+        function (entries) {
+          entries.forEach(function (e) {
+            if (!e.isIntersecting) return;
+            e.target.classList.add("in");
+            io.unobserve(e.target);
+          });
+        },
+        { threshold: 0.2 }
+      );
+      document.querySelectorAll(".reveal").forEach(function (el) {
+        io.observe(el);
+      });
+    </script>
   </body>
 </html>

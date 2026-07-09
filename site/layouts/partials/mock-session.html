@@ -1,0 +1,57 @@
+<div class="mock-session reveal" role="img"
+  aria-label="Illustration of an agent session: the agent claims a task, skims frames, removes silences, previews the composited cut, and hands the edit back ready for review — while the timeline updates live in the GUI.">
+  <div class="ms-rail" aria-hidden="true">
+    <div class="ms-steps"><span>queued</span><span>working</span><span>ready</span><span>applied</span></div>
+    <div class="ms-line"><span class="ms-dot"></span></div>
+  </div>
+  <div class="ms-panes" aria-hidden="true">
+    <div class="ms-card ms-log">
+      <div class="ms-head"><span class="conn-dot"></span><span>MCP session — Claude ↔ Kerf</span></div>
+      <div class="ms-body">
+        <div class="ll call l1"><span class="op">→</span><span class="fn">skim_asset</span>(<span class="arg">"interview.mp4"</span>)</div>
+        <div class="ll res r1"><span class="sheet"><i></i><i></i><i></i><i></i><i></i><i></i></span><span>contact sheet · 12 frames</span></div>
+        <div class="ll call l2"><span class="op">→</span><span class="fn">remove_silence</span>(track: <span class="arg">"A1"</span>)</div>
+        <div class="ll res r2"><span class="op">✂</span><span>2 silences cut · −1.8&thinsp;s rippled closed</span></div>
+        <div class="ll call l3"><span class="op">→</span><span class="fn">preview_timeline</span>(t: <span class="arg">12.4</span>)</div>
+        <div class="ll res r3"><span class="pframe"></span><span>sees the composited cut — looks right</span></div>
+        <div class="ll call l4"><span class="op">→</span><span class="fn">complete_task</span>(<span class="arg">"ready for review"</span>)</div>
+      </div>
+    </div>
+    <div class="ms-card ms-tl">
+      <div class="ms-head">
+        <span>Timeline — live in your GUI</span>
+        <span class="msc-stack">
+          <span class="msc q">queued</span>
+          <span class="msc w"><i class="spin"></i>working</span>
+          <span class="msc r">ready · <b class="apply">Apply</b></span>
+        </span>
+      </div>
+      <div class="ms-lanes">
+        <div class="ms-lane">
+          <span class="lh">V1</span>
+          <div class="lane-clips">
+            <span class="seg v sA">intro</span>
+            <span class="seg v sB1">interview</span>
+            <span class="seg gap"><span class="gap-label">silence</span></span>
+            <span class="seg v sB2">interview</span>
+          </div>
+        </div>
+        <div class="ms-lane">
+          <span class="lh">A1</span>
+          <div class="lane-clips">
+            <span class="seg a sA wav"></span>
+            <span class="seg a sB1 wav"></span>
+            <span class="seg gap"></span>
+            <span class="seg a sB2 wav"></span>
+          </div>
+        </div>
+        <div class="ms-lane">
+          <span class="lh">A2</span>
+          <div class="lane-clips"><span class="seg m wav"><span class="clip-tag">music · ducked</span></span></div>
+        </div>
+        <span class="ms-playhead"></span>
+      </div>
+      <div class="ms-foot">every agent edit lands in the same project — revert any step from History</div>
+    </div>
+  </div>
+</div>
