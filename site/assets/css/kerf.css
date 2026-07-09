@@ -680,6 +680,14 @@ code {
   font-size: 13px;
   color: var(--text-muted);
 }
+.foot-fine a {
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-strong);
+}
+.foot-fine a:hover {
+  color: var(--kerf-400);
+  border-bottom-color: rgba(226, 157, 46, 0.4);
+}
 
 /* Wider hero on large screens: copy + shot side by side */
 @media (min-width: 1000px) {
