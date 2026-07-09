@@ -1,0 +1,201 @@
+{{ define "main" }}
+{{ $gh := .Site.Params.github }}
+{{ $rel := .Site.Params.releases }}
+{{ $mcp := .Site.Params.mcpUrl }}
+
+<a class="skip" href="#features">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="{{ "" | relURL }}" aria-label="Kerf home">
+      {{ partial "mark.html" (dict "h" 22) }}
+      <span class="brand-word">Kerf</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#agent">The&nbsp;agent</a>
+      <a href="#get">Get&nbsp;it</a>
+      <a class="ghost-link" href="{{ $gh }}" target="_blank" rel="noopener">GitHub&nbsp;↗</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <!-- ============ HERO ============ -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-copy">
+        <span class="eyebrow"><span class="dot"></span> Non-destructive · MCP-native · FFmpeg-backed</span>
+        <h1>The video editor<br />your <span class="amber">AI can drive</span>.</h1>
+        <p class="lede">
+          Kerf is a cross-platform desktop editor with an <b>embedded MCP server</b>, so an
+          LLM can analyze your footage and assemble the cut through the <b>same engine the
+          GUI uses, on the same live project</b> — and it can actually <i>see</i> the frames
+          it edits. Nothing is re-encoded until you export.
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="{{ $rel }}" target="_blank" rel="noopener">Download</a>
+          <a class="btn btn-ghost" href="{{ $gh }}" target="_blank" rel="noopener">View source</a>
+          <a class="btn btn-agent" href="#agent">How the agent edits →</a>
+        </div>
+      </div>
+      <figure class="shot hero-shot">
+        <img src="{{ "img/screenshot-editor.png" | relURL }}" alt="The Kerf editor: media bin, preview, and a multi-track timeline" loading="eager" width="1200" height="750" />
+        <figcaption>The full editor — multi-track timeline, live preview, and the agent panel.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ============ THE AGENT ============ -->
+  <section id="agent" class="band">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker agent">The agent</span>
+        <h2>Most tools bolt a chatbot onto an editor.<br />Kerf makes the editor an&nbsp;API.</h2>
+        <p class="sub">
+          The same <code>Project</code> is exposed twice — as the GUI you click and as
+          <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol</a>
+          tools an agent calls. It doesn't script a black box; it drives the identical engine,
+          and every edit shows up live for you to review.
+        </p>
+      </div>
+      <div class="trio">
+        <article class="card">
+          <div class="ic">👁</div>
+          <h3>The agent has eyes</h3>
+          <p><code>get_frame</code>, <code>skim_asset</code> (a contact-sheet montage) and
+          <code>preview_timeline</code> (the composited cut) return real images the model
+          <i>sees</i> — so it finds the right moment and confirms the cut, not guesses from
+          metadata.</p>
+        </article>
+        <article class="card">
+          <div class="ic">🔗</div>
+          <h3>Same engine, same project</h3>
+          <p>The MCP server and the webview hold the <i>same</i> project behind one lock. When
+          the agent trims a clip, your GUI re-renders it instantly — no import/export
+          round-trip, no second copy of the truth.</p>
+        </article>
+        <article class="card">
+          <div class="ic">🤝</div>
+          <h3>You stay in control</h3>
+          <p>Work is handed back through a <b>task queue</b>: you enqueue plain-language tasks,
+          the agent marks one <i>ready</i>, and you apply or dismiss. Kerf never edits on its
+          own, and every change is revertible.</p>
+        </article>
+      </div>
+      <figure class="shot pair">
+        <img src="{{ "img/screenshot-agent.png" | relURL }}" alt="The agent panel: task queue and revertible edit history" loading="lazy" />
+        <img src="{{ "img/screenshot-inspector.png" | relURL }}" alt="The inspector: effect chains, keyframes and overlays" loading="lazy" />
+      </figure>
+    </div>
+  </section>
+
+  <!-- ============ FEATURES ============ -->
+  <section id="features" class="band alt">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker">Under the hood</span>
+        <h2>A real NLE — not a scaffold.</h2>
+        <p class="sub">Everything below is wired to real backend state and renders from a pure,
+        unit-tested export graph. Clip positions, gaps, track layering, effects, keyframes,
+        overlays, ducking and loudnorm all come out of one <code>filter_complex</code>.</p>
+      </div>
+      <div class="feature-grid">
+        {{ partial "feature.html" (dict "t" "Multi-track NLE" "d" "Bespoke timeline: video / audio / text tracks, free positioning with gaps, drag across tracks, edge-drag trim, razor split, ripple delete, snapping to edges, the playhead and beats.") }}
+        {{ partial "feature.html" (dict "t" "Audible playback" "d" "Real Web-Audio playback with J/K/L shuttle and scrub; volume, fades, speed and reverse are auralized and the playhead follows the audio clock.") }}
+        {{ partial "feature.html" (dict "t" "Analysis" "d" "FFmpeg silence detection, scene detection, an audio energy / beat grid and waveforms — all CLI-driven. Optional local Whisper transcription.") }}
+        {{ partial "feature.html" (dict "t" "Effects & color" "d" "Per-clip video (blur / sharpen / hue / negate / vignette / chroma-key) and audio (highpass / lowpass / EQ / compressor / gate) chains, plus transform and color grade.") }}
+        {{ partial "feature.html" (dict "t" "Keyframe animation" "d" "Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead.") }}
+        {{ partial "feature.html" (dict "t" "Titles & captions" "d" "Text overlays and lower-thirds with their own keyframes, plus one-click captions from a transcript and SRT export.") }}
+        {{ partial "feature.html" (dict "t" "Smart mixing" "d" "Per-track ducking dips music under dialogue via sidechain, and a single-pass loudnorm brings the final mix to −14 LUFS on export.") }}
+        {{ partial "feature.html" (dict "t" "Export" "d" "Positional, multi-track filter_complex with progress and cancel; range export renders just the region between your in / out marks.") }}
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MCP ============ -->
+  <section id="mcp" class="band">
+    <div class="wrap mcp-wrap">
+      <div class="section-head left">
+        <span class="kicker agent">55 tools, one live project</span>
+        <h2>Connect any MCP client<br />and start editing.</h2>
+        <p class="sub">The desktop app hosts the server over streamable HTTP. Point a client at
+        it and ask in plain language — <i>“skim the interview, cut the dead air, drop in
+        captions.”</i> It claims a task, works, and hands back a reviewable result.</p>
+        <div class="chips">
+          <span class="chip see">get_frame</span>
+          <span class="chip see">skim_asset</span>
+          <span class="chip see">preview_timeline</span>
+          <span class="chip">cut_clip</span>
+          <span class="chip">split_at</span>
+          <span class="chip">ripple_delete</span>
+          <span class="chip">remove_silence</span>
+          <span class="chip">set_video_effects</span>
+          <span class="chip">add_keyframe</span>
+          <span class="chip">captions_from_transcript</span>
+          <span class="chip">set_track_duck</span>
+          <span class="chip">export</span>
+          <span class="chip more">+43 more</span>
+        </div>
+      </div>
+      <div class="code-card">
+        <div class="code-head"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="code-title">connect with Claude Code</span></div>
+        <pre><code>claude mcp add --transport http \
+  kerf {{ $mcp }}</code></pre>
+        <div class="code-head"><span class="code-title">…or any HTTP-capable client</span></div>
+        <pre><code>{
+  "mcpServers": {
+    "kerf": {
+      "type": "http",
+      "url": "{{ $mcp }}"
+    }
+  }
+}</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ GET IT ============ -->
+  <section id="get" class="band alt">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker">Get it</span>
+        <h2>Download a build, or run from source.</h2>
+      </div>
+      <div class="get-grid">
+        <article class="get-card">
+          <h3>Download</h3>
+          <p>Installers for macOS, Linux and Windows are published on every release.</p>
+          <p class="fine">macOS / Linux expect a system FFmpeg on <code>PATH</code>; the Windows build bundles it.</p>
+          <a class="btn btn-primary" href="{{ $rel }}" target="_blank" rel="noopener">Latest release ↗</a>
+        </article>
+        <article class="get-card">
+          <h3>Build from source</h3>
+          <pre><code>git clone {{ $gh }}
+cd kerf/frontend && bun install && cd ..
+cargo run -p kerf-app</code></pre>
+          <p class="fine">Needs Rust ≥ 1.82, Bun ≥ 1.2, and (for media) the FFmpeg dev libraries.
+          Builds without them via <code>--no-default-features</code>.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div class="foot-brand">
+      {{ partial "mark.html" (dict "h" 18) }}
+      <span>Kerf</span>
+      <span class="foot-tag">non-destructive video editing, driven by AI</span>
+    </div>
+    <nav class="foot-links">
+      <a href="{{ $gh }}" target="_blank" rel="noopener">GitHub</a>
+      <a href="{{ $rel }}" target="_blank" rel="noopener">Releases</a>
+      <a href="{{ $gh }}/blob/main/LICENSE.md" target="_blank" rel="noopener">License</a>
+      <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">MCP</a>
+    </nav>
+  </div>
+  <div class="wrap foot-fine">PolyForm Noncommercial 1.0.0 · A <i>kerf</i> is the slit a saw leaves behind — the cut itself.</div>
+</footer>
+{{ end }}

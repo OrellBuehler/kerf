@@ -1,0 +1,37 @@
+baseURL = "https://orellbuehler.github.io/kerf/"
+languageCode = "en-us"
+title = "Kerf — the video editor your AI can drive"
+enableRobotsTXT = true
+
+# Single landing page; no taxonomies/RSS clutter.
+disableKinds = ["taxonomy", "term", "RSS", "sitemap"]
+
+[params]
+  description = "Kerf is a non-destructive, FFmpeg-backed desktop video editor with an embedded MCP server, so an LLM can analyze your footage and assemble the cut through the same engine the GUI uses — and can see the frames it edits."
+  tagline = "The non-destructive video editor your AI can drive."
+  github = "https://github.com/OrellBuehler/kerf"
+  releases = "https://github.com/OrellBuehler/kerf/releases/latest"
+  mcpUrl = "http://127.0.0.1:7777/mcp"
+
+[minify]
+  minifyOutput = true
+
+# Redeclaring mounts replaces the defaults, so list them all. The last mount
+# serves the canonical screenshots in ../docs/img at /img/ — one source of truth
+# shared with the repository README.
+[module]
+  [[module.mounts]]
+    source = "assets"
+    target = "assets"
+  [[module.mounts]]
+    source = "content"
+    target = "content"
+  [[module.mounts]]
+    source = "layouts"
+    target = "layouts"
+  [[module.mounts]]
+    source = "static"
+    target = "static"
+  [[module.mounts]]
+    source = "../docs/img"
+    target = "static/img"

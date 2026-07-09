@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" class="dark" style="background:#0f1318;color-scheme:dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ .Title }}</title>
+    <meta name="description" content="{{ .Site.Params.description }}" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="{{ .Title }}" />
+    <meta property="og:description" content="{{ .Site.Params.description }}" />
+    <meta property="og:image" content="{{ "img/screenshot-editor.png" | absURL }}" />
+    <meta property="og:url" content="{{ .Permalink }}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#0f1318" />
+
+    <link rel="icon" href="{{ "favicon.svg" | relURL }}" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    {{ $css := resources.Get "css/kerf.css" | minify | fingerprint }}
+    <link rel="stylesheet" href="{{ $css.RelPermalink }}" integrity="{{ $css.Data.Integrity }}" />
+  </head>
+  <body>
+    {{ block "main" . }}{{ end }}
+  </body>
+</html>

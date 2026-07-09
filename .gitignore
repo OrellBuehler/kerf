@@ -19,6 +19,11 @@ bun.lockb.orig
 /crates/kerf-app/binaries
 /crates/kerf-app/licenses/FFmpeg-LICENSE.txt
 
+# Hugo landing site build output
+/site/public
+/site/resources
+/site/.hugo_build.lock
+
 # Kerf projects & media scratch
 *.kerf
 *.kerf-wal
@@ -26,6 +31,9 @@ bun.lockb.orig
 /samples/*.mp4
 /samples/*.mov
 /samples/*.wav
+# Demo / source footage kept in the repo root (large, never committed)
+/*.mov
+/*.mp4
 
 # Editor / OS
 .DS_Store
