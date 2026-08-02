@@ -16,6 +16,8 @@ import type {
 	ExportOptions,
 	ExportProgress,
 	Keyframe,
+	Reframe,
+	ReframeKeyframe,
 	Revision,
 	StreamKind,
 	Task,
@@ -27,7 +29,7 @@ import type {
 	Transition,
 	VideoEffect
 } from './types';
-import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
+import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -245,7 +247,9 @@ export async function pickMediaPaths(): Promise<string[]> {
 				name: 'Media',
 				extensions: [
 					'mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac',
-					'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif'
+					'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif',
+					// Insta360 captures (360 video / photo) — MP4 under a custom extension.
+					'insv', 'insp'
 				]
 			}
 		]
@@ -748,6 +752,77 @@ export async function clearKeyframes(clipId: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('clear_keyframes', { clipId });
+}
+
+/** Aim a 360 clip's virtual camera. Unspecified fields are left unchanged. */
+export async function setReframe(clipId: string, patch: Partial<Reframe>): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			clip.reframe = { ...DEFAULT_REFRAME, ...(clip.reframe ?? {}), ...patch };
+		}
+		recordDev('Set reframe');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_reframe', {
+		clipId,
+		yaw: patch.yaw,
+		pitch: patch.pitch,
+		roll: patch.roll,
+		fov: patch.fov,
+		lensFov: patch.lens_fov,
+		input: patch.input,
+		output: patch.output
+	});
+}
+
+/** Stop reprojecting a 360 clip, leaving its raw spherical picture. */
+export async function clearReframe(clipId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].reframe = null;
+		recordDev('Clear reframe');
+		return snapshot();
+	}
+	return invoke<Timeline>('clear_reframe', { clipId });
+}
+
+/** Replace a 360 clip's camera animation. An empty list holds the static pose. */
+export async function setReframeKeyframes(
+	clipId: string,
+	keyframes: ReframeKeyframe[]
+): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		const rf = found?.[0].clips[found[1]].reframe;
+		if (rf) rf.keyframes = [...keyframes].sort((a, b) => a.time - b.time);
+		recordDev('Set reframe keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_reframe_keyframes', { clipId, keyframes });
+}
+
+/** Add (or replace) a camera keyframe at `time`; unspecified channels capture
+ *  the camera's current pose there. */
+export async function addReframeKeyframe(
+	clipId: string,
+	time: number,
+	patch: Partial<Omit<ReframeKeyframe, 'time'>> = {}
+): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		const rf = found?.[0].clips[found[1]].reframe;
+		if (rf) {
+			const kfs = (rf.keyframes ?? []).filter((k) => Math.abs(k.time - time) > 1e-6);
+			kfs.push({ time, yaw: rf.yaw, pitch: rf.pitch, roll: rf.roll, fov: rf.fov, ...patch });
+			kfs.sort((a, b) => a.time - b.time);
+			rf.keyframes = kfs;
+		}
+		recordDev('Add reframe keyframe');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_reframe_keyframe', { clipId, time, ...patch });
 }
 
 /** Add a text overlay (title / lower-third / caption). */

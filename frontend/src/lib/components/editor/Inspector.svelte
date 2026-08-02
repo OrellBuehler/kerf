@@ -6,8 +6,14 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { clipDuration, DEFAULT_COLOR, DEFAULT_TRANSFORM } from '$lib/types';
-	import type { AudioEffect, Transform, TransitionKind, VideoEffect } from '$lib/types';
+	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
+	import type {
+		AudioEffect,
+		Reframe,
+		Transform,
+		TransitionKind,
+		VideoEffect
+	} from '$lib/types';
 	import { toast } from 'svelte-sonner';
 
 	const clip = $derived(editor.selectedClip);
@@ -58,6 +64,56 @@
 			void run(() => editor.setTransform(c.id, patch));
 		}
 	}
+	// ---- 360 reframe --------------------------------------------------------
+	const reframe = $derived(clip?.reframe ?? null);
+	const reframeKeys = $derived(reframe?.keyframes ?? []);
+	const sourceProjection = $derived(asset?.streams.find((s) => s.projection)?.projection ?? null);
+	/** Angular lerp along the shortest arc, matching the engine so the sliders
+	 *  agree with what renders. The plain `lerp` above would read a 170° → -170°
+	 *  pan as a 340° swing backwards. */
+	function lerpAngle(points: [number, number][], at: number): number | undefined {
+		if (points.length === 0) return undefined;
+		const wrap = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
+		let prev = wrap(points[0][1]);
+		const unwrapped: [number, number][] = [[points[0][0], prev]];
+		for (const [t, v] of points.slice(1)) {
+			prev += wrap(v - prev);
+			unwrapped.push([t, prev]);
+		}
+		const v = lerp(unwrapped, at);
+		return v === undefined ? undefined : wrap(v);
+	}
+	// Like the Transform panel: while animated the sliders show the camera
+	// sampled at the playhead, and editing a channel keyframes it there.
+	const cam = $derived.by(() => {
+		const base = { ...DEFAULT_REFRAME, ...(reframe ?? {}) };
+		if (clip && reframeKeys.length) {
+			const lt = Math.max(0, ui.time - clip.timeline_start);
+			const ks = [...reframeKeys].sort((a, b) => a.time - b.time);
+			base.yaw = lerpAngle(ks.map((k) => [k.time, k.yaw]), lt) ?? base.yaw;
+			base.pitch = lerp(ks.map((k) => [k.time, k.pitch]), lt) ?? base.pitch;
+			base.roll = lerpAngle(ks.map((k) => [k.time, k.roll]), lt) ?? base.roll;
+			base.fov = lerp(ks.map((k) => [k.time, k.fov]), lt) ?? base.fov;
+		}
+		return base;
+	});
+	/** Route a camera edit: a keyframe at the playhead when animated, else the
+	 *  static pose. `lens_fov` / `input` / `output` are not animatable. */
+	function setCam(patch: Partial<Reframe>) {
+		const c = clip;
+		if (!c) return;
+		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
+		if (reframeKeys.length && animatable) {
+			const time = Math.max(0, ui.time - c.timeline_start);
+			void run(() =>
+				editor.addReframeKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>)
+			);
+		} else {
+			void run(() => editor.setReframe(c.id, patch));
+		}
+	}
+	const CAM_KEYS = new Set(['yaw', 'pitch', 'roll', 'fov']);
+
 	const col = $derived(clip?.color ?? DEFAULT_COLOR);
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
@@ -541,6 +597,69 @@
 					style="accent-color:var(--kerf-500);width:15px;height:15px"
 				/>
 			</label>
+
+			{#if kind === 'video' && (reframe || sourceProjection)}
+				{@render secHead(reframeKeys.length ? '360 reframe · keyframing @ playhead' : '360 reframe')}
+				{#if reframe}
+					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
+						setCam({ yaw: v })
+					)}
+					{@render rangeRow('Pitch', cam.pitch, -90, 90, 1, (v) => `${Math.round(v)}°`, (v) =>
+						setCam({ pitch: v })
+					)}
+					{@render rangeRow('Roll', cam.roll, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
+						setCam({ roll: v })
+					)}
+					{@render rangeRow('FOV', cam.fov, 20, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
+						setCam({ fov: v })
+					)}
+					{#if reframe.input === 'dual_fisheye'}
+						{@render rangeRow('Lens FOV', cam.lens_fov, 170, 220, 1, (v) => `${Math.round(v)}°`, (v) =>
+							run(() => editor.setReframe(clip.id, { lens_fov: v }))
+						)}
+						<p style="font-size:11px;color:var(--text-muted);margin:4px 0 0;line-height:1.4">
+							Approximate stitch — the seam is a hard blend, not Insta360's optical-flow
+							one. Tune Lens FOV to move it, or use a Studio equirect export for a clean
+							join.
+						</p>
+					{/if}
+					<div style="display:flex;gap:6px;padding:6px 0 0">
+						<Btn
+							size="sm"
+							disabled={editor.busy}
+							onclick={() =>
+								run(() =>
+									editor.addReframeKeyframe(
+										clip.id,
+										Math.round(Math.max(0, ui.time - clip.timeline_start) * 1000) / 1000
+									)
+								)}>+ Camera key</Btn
+						>
+						{#if reframeKeys.length}
+							<Btn
+								size="sm"
+								disabled={editor.busy}
+								onclick={() => run(() => editor.setReframeKeyframes(clip.id, []))}
+								>Clear {reframeKeys.length} key{reframeKeys.length === 1 ? '' : 's'}</Btn
+							>
+						{/if}
+						<button style={xBtn} title="Stop reframing" disabled={editor.busy}
+							onclick={() => run(() => editor.clearReframe(clip.id))}>×</button
+						>
+					</div>
+				{:else}
+					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
+						360 source ({sourceProjection === 'dual_fisheye' ? 'dual fisheye' : sourceProjection}),
+						shown raw.
+					</p>
+					<Btn
+						size="sm"
+						disabled={editor.busy}
+						onclick={() => run(() => editor.setReframe(clip.id, { input: sourceProjection! }))}
+						>Reframe to flat</Btn
+					>
+				{/if}
+			{/if}
 
 			{#if kind === 'video'}
 				{@render secHead(keyframes.length ? 'Transform · keyframing @ playhead' : 'Transform')}

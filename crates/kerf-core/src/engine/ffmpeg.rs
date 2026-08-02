@@ -16,7 +16,7 @@ use ffmpeg_next as ff;
 
 use super::ProbeResult;
 use crate::error::Result;
-use crate::model::{StreamInfo, StreamKind};
+use crate::model::{Projection, StreamInfo, StreamKind};
 
 static INIT: Once = Once::new();
 
@@ -53,6 +53,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             sample_rate: None,
             channels: None,
             image: false,
+            projection: None,
         };
 
         match medium {
@@ -61,6 +62,11 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                     info.width = Some(video.width());
                     info.height = Some(video.height());
                 }
+                // Mirror the ffprobe path's two projection signals (see
+                // `super::cli::detect_projection`): the container's declared
+                // spherical mapping first, then the Insta360 dual-fisheye shape.
+                info.projection = spherical_projection(&stream)
+                    .or_else(|| super::cli::projection_from_shape(Some(path), info.width, info.height));
                 let rate = stream.rate();
                 if rate.denominator() != 0 {
                     info.fps = Some(rate.numerator() as f64 / rate.denominator() as f64);
@@ -95,6 +101,23 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     }
 
     Ok(ProbeResult { duration, streams })
+}
+
+/// The stream's declared spherical mapping, if it has one — the libav twin of the
+/// ffprobe path's `Spherical Mapping` side-data check.
+///
+/// `ffmpeg-sys-next` does not bind `libavutil/spherical.h`, so the payload is
+/// decoded by hand. `AVSphericalMapping` leads with its `projection` enum (a C
+/// `int`), which is all we need: 0 is equirectangular, 1 cubemap, 2 an
+/// equirectangular tile. Only a full equirect is reframed — a cubemap or a
+/// cropped tile would need geometry we do not carry, so those stay flat rather
+/// than being reprojected wrongly.
+fn spherical_projection(stream: &ff::format::stream::Stream) -> Option<Projection> {
+    let sd = stream
+        .side_data()
+        .find(|d| d.kind() == ff::codec::packet::side_data::Type::DataSpherical)?;
+    let projection = i32::from_ne_bytes(sd.data().get(..4)?.try_into().ok()?);
+    (projection == 0).then_some(Projection::Equirect)
 }
 
 // ---- in-process render (experimental, `libav-render` feature) --------------

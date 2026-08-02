@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, TransitionKind,
-    VideoEffect,
+    Asset, AudioEffect, Clip, Color, Projection, Reframe, ReframeKeyframe, ResolvedReframe, StreamInfo, StreamKind, TextOverlay,
+    TimeRange, Timeline, Transform, TransitionKind, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -135,6 +135,19 @@ struct ProbeStream {
     sample_rate: Option<String>,
     channels: Option<u16>,
     duration: Option<String>,
+    /// Stream-level side data, which is where a spherical mapping surfaces. The
+    /// mov demuxer fills this from the `sv3d` box (and the legacy Google
+    /// spatial-media `uuid` blob), and `-show_streams` already prints it — no
+    /// extra ffprobe flag is needed. (`-export_side_data` is a *decoder* option
+    /// for film grain / motion vectors and is unrelated.)
+    #[serde(default)]
+    side_data_list: Option<Vec<ProbeSideData>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeSideData {
+    side_data_type: Option<String>,
+    projection: Option<String>,
 }
 
 /// Probe a media file via `ffprobe -of json`.
@@ -155,10 +168,10 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     }
     let parsed: ProbeJson =
         serde_json::from_slice(&output.stdout).map_err(|e| Error::Engine(format!("could not parse ffprobe output: {e}")))?;
-    Ok(probe_from_json(parsed))
+    Ok(probe_from_json(parsed, Some(path)))
 }
 
-fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
+fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
     let format_dur = parsed
         .format
         .as_ref()
@@ -207,6 +220,11 @@ fn probe_from_json(parsed: ProbeJson) -> ProbeResult {
             sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse().ok()),
             channels: s.channels,
             image: still && kind == StreamKind::Video,
+            projection: if kind == StreamKind::Video {
+                detect_projection(path, s)
+            } else {
+                None
+            },
         });
     }
     let duration = format_dur.unwrap_or(max_stream_dur).max(0.0);
@@ -247,6 +265,62 @@ pub(crate) fn is_still_codec(codec: Option<&str>) -> bool {
                 | "heic"
         )
     )
+}
+
+/// Decide whether a probed video stream is 360 footage, and in which projection.
+///
+/// Two signals, strongest first:
+///
+/// 1. A `Spherical Mapping` side-data entry declaring an equirectangular
+///    projection. This is authoritative — it is what a stitched export (Insta360
+///    Studio, the Google spatial-media injector, YouTube-ready files) writes.
+/// 2. An Insta360 `.insv` whose frame is two squares side by side — the raw
+///    dual-fisheye shape (a 5.7K capture probes as 5760x2880, i.e. two 2880x2880
+///    circular hemispheres).
+///
+/// Deliberately **no** bare aspect-ratio guess. A 2:1 frame is a real and common
+/// shape for anamorphic masters, ultrawide edits and ordinary stitched panoramas,
+/// and the costs are lopsided: a missed detection costs one click in the
+/// Inspector, whereas a false positive silently reprojects ordinary footage and
+/// changes the export resolution out from under the user. Everything past these
+/// two signals is a manual override.
+fn detect_projection(path: Option<&Path>, s: &ProbeStream) -> Option<Projection> {
+    if let Some(list) = &s.side_data_list {
+        for sd in list {
+            if sd.side_data_type.as_deref() == Some("Spherical Mapping") {
+                return spherical_side_data_projection(sd.projection.as_deref());
+            }
+        }
+    }
+    projection_from_shape(path, s.width, s.height)
+}
+
+/// Signal 1: map the `projection` field of a `Spherical Mapping` side-data entry.
+/// `None` for the field covers older ffmpeg builds that name the side data but not
+/// its projection — equirect is the only mono-360 projection Insta360 and the
+/// spatial-media spec actually emit. Cubemap / mesh projections exist but are not
+/// something we can reframe faithfully, so they stay flat rather than being
+/// reprojected wrongly.
+pub(crate) fn spherical_side_data_projection(projection: Option<&str>) -> Option<Projection> {
+    match projection {
+        Some("equirectangular") | Some("half equirectangular") | None => Some(Projection::Equirect),
+        _ => None,
+    }
+}
+
+/// Signal 2: an Insta360 capture (`.insv` / `.insp`) whose frame is exactly two
+/// squares side by side — the raw dual-fisheye packing (a 5.7K capture probes as
+/// 5760x2880, i.e. two 2880x2880 circular hemispheres). Shared with the libav
+/// probe backend so both agree on the geometry rule.
+pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, height: Option<u32>) -> Option<Projection> {
+    let insta360 = path
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
+    match (insta360, width, height) {
+        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        _ => None,
+    }
 }
 
 /// Parse an FFmpeg rational like `"30000/1001"` into an `f64`.
@@ -1376,8 +1450,17 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
     let clips = || timeline.tracks.iter().flat_map(|t| t.clips.iter());
 
     let mut fmt = ExportFormat::default();
-    if let Some(v) = clips().find_map(|c| stream_of(c, StreamKind::Video)) {
-        if let (Some(w), Some(h)) = (v.width, v.height) {
+    if let Some((clip, v)) = clips().find_map(|c| stream_of(c, StreamKind::Video).map(|s| (c, s))) {
+        // A reframed clip's source dimensions describe the *sphere*, not the
+        // deliverable — inheriting them would export a 16:9 reframe of a 5.7K
+        // Insta360 capture at 5760x2880. Keep the 1080p default instead and let
+        // `opts.resolution` override as usual. Keyed off the reframe rather than
+        // the projection, so an un-reframed 360 clip still behaves as before.
+        let reframes_to_flat = clip
+            .reframe
+            .as_ref()
+            .is_some_and(|r| r.output == crate::model::Projection::Flat);
+        if let (false, Some(w), Some(h)) = (reframes_to_flat, v.width, v.height) {
             fmt.width = w;
             fmt.height = h;
         }
@@ -1962,7 +2045,8 @@ pub fn render_with_progress(
             }
         };
         // Analysis pass fills the first half of the bar, the encode the second.
-        let a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
+        let mut a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
+        let _g1 = externalize_filter_complex(&mut a1, "p1")?;
         let s1 = run_ffmpeg_progress(
             &a1,
             output,
@@ -1979,7 +2063,8 @@ pub fn render_with_progress(
             cleanup();
             return Ok(RenderStatus::Cancelled);
         }
-        let a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
+        let mut a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
+        let _g2 = externalize_filter_complex(&mut a2, "p2")?;
         let res = run_ffmpeg_progress(
             &a2,
             output,
@@ -1995,7 +2080,8 @@ pub fn render_with_progress(
         cleanup();
         res
     } else {
-        let args = build_export_args(timeline, assets, output_str, opts)?;
+        let mut args = build_export_args(timeline, assets, output_str, opts)?;
+        let _g = externalize_filter_complex(&mut args, "s")?;
         run_ffmpeg_progress(
             &args,
             output,
@@ -2009,6 +2095,54 @@ pub fn render_with_progress(
             cancel,
         )
     }
+}
+
+/// Longest `-filter_complex` we are willing to hand over as an argv string.
+///
+/// An animated reframe's `sendcmd` list dwarfs an ordinary graph — a single
+/// channel at 30 fps runs to roughly 50 KB a minute — and it is *argv*, not
+/// ffmpeg, that gives out first: Linux caps one argument at 128 KiB
+/// (`MAX_ARG_STRLEN`) and Windows caps the whole command line at 32767
+/// characters, which is about ten seconds of animation. The threshold sits well
+/// below both, since spilling to a file costs nothing.
+const GRAPH_ARG_MAX: usize = 8192;
+
+/// Index of the `-filter_complex` *value* when it is too long to pass in argv.
+fn oversized_graph_index(args: &[String]) -> Option<usize> {
+    args.iter()
+        .position(|a| a == "-filter_complex")
+        .map(|i| i + 1)
+        .filter(|&i| args.get(i).is_some_and(|g| g.len() > GRAPH_ARG_MAX))
+}
+
+/// A filtergraph spilled to a script file, removed when the render is done.
+struct GraphScript(Option<PathBuf>);
+
+impl Drop for GraphScript {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Move an oversized filtergraph out of argv into a script file, pointing ffmpeg
+/// at it with `-filter_complex_script`. Leaves ordinary exports untouched, so
+/// their argv stays byte-identical (and every pure arg-builder test with it).
+///
+/// `-filter_complex_script` takes the path as its own argv token, which is why
+/// it beats the obvious alternative of `sendcmd=f=`: that would bury the path
+/// *inside* a filtergraph value, where `\` escapes and `:` separates options, so
+/// a Windows path would have to be mangled first.
+fn externalize_filter_complex(args: &mut [String], tag: &str) -> Result<GraphScript> {
+    let Some(i) = oversized_graph_index(args) else {
+        return Ok(GraphScript(None));
+    };
+    let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}.txt", std::process::id()));
+    std::fs::write(&path, &args[i]).map_err(|e| Error::Engine(format!("could not write the filtergraph script: {e}")))?;
+    args[i] = path.to_string_lossy().into_owned();
+    args[i - 1] = "-filter_complex_script".to_string();
+    Ok(GraphScript(Some(path)))
 }
 
 /// Where one ffmpeg invocation's reported `out_time` maps onto the overall
@@ -2267,7 +2401,7 @@ fn build_filter_complex(
             };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
-                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip))
+                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("c{flat}"))
             ));
             let out = if n == last {
                 composite_pad.to_string()
@@ -2698,12 +2832,129 @@ fn drawtext_still(o: &TextOverlay, frame_h: u32, t: f64) -> String {
     format!("drawtext={}", parts.join(":"))
 }
 
+/// `v360` resampling used for export (quality) and for stills / previews (speed).
+/// The measured difference in reprojection cost between these is small; the
+/// export one buys sharper edges on a wide reframe.
+const EXPORT_INTERP: &str = "cubic";
+const PREVIEW_INTERP: &str = "line";
+
+/// How far a reframe channel must drift from its last emitted value before it is
+/// worth another `sendcmd`, in degrees. Every command makes `v360` rebuild its
+/// remap LUT, so this gate is what keeps a held camera from paying per frame.
+const REFRAME_CMD_TOLERANCE: f64 = 0.05;
+
+/// The `v360` filter realizing one sampled reframe at output size `w`x`h`.
+///
+/// `instance` names the filter (`v360@c3`) so a `sendcmd` can target this clip's
+/// instance and no other — several reframed clips coexist in one graph. The
+/// still path passes `None`: it has no commands to send, so it needs no name.
+fn reframe_filter(r: &ResolvedReframe, w: u32, h: u32, interp: &str, instance: Option<&str>) -> String {
+    let name = match instance {
+        Some(id) => format!("v360@{id}"),
+        None => "v360".to_string(),
+    };
+    // An equirect output must stay 2:1 or the sphere is squashed; size it to the
+    // frame width and let the caller's fit/pad letterbox it. A flat output is
+    // rendered straight at the frame size, which both skips an oversized
+    // intermediate (an 8K source never materializes at 8K) and makes the fit
+    // `scale` that follows a no-op.
+    let (ow, oh) = match r.output {
+        Projection::Equirect => (w, ((w / 2).max(2)) & !1),
+        _ => (w, h),
+    };
+    let mut opts = vec![
+        format!("input={}", r.input.v360_name()),
+        format!("output={}", r.output.v360_name()),
+    ];
+    // The lens field of view only describes a physical fisheye; it means nothing
+    // for an equirect source, which is already unwrapped.
+    if r.input.is_fisheye() {
+        opts.push(format!("ih_fov={}", fnum(r.lens_fov)));
+        opts.push(format!("iv_fov={}", fnum(r.lens_fov)));
+    }
+    opts.push(format!("w={ow}"));
+    opts.push(format!("h={oh}"));
+    opts.push(format!("interp={interp}"));
+    opts.push(format!("yaw={}", fnum(r.yaw)));
+    opts.push(format!("pitch={}", fnum(r.pitch)));
+    opts.push(format!("roll={}", fnum(r.roll)));
+    // `d_fov` derives an aspect-correct horizontal/vertical pair on its own,
+    // unlike `h_fov`, which needs `v_fov` set in lockstep or the picture
+    // stretches. It is meaningless for an equirect output, which always covers
+    // the whole sphere.
+    if r.output == Projection::Flat {
+        opts.push(format!("d_fov={}", fnum(r.fov)));
+    }
+    format!("{name}={}", opts.join(":"))
+}
+
+/// The `sendcmd` command list that drives `target`'s `v360` across an animated
+/// clip, or `None` when the camera holds still — a static reframe bakes its pose
+/// into the filter's own arguments and costs nothing extra.
+///
+/// This is deliberately stingy, because each command makes `v360` re-run
+/// `config_output` and rebuild its remap LUT (~32 ms per command at 1080p, linear
+/// in both command count and output pixels). Two economies do the work: channels
+/// that never move are left as static arguments and never appear here at all, and
+/// a channel re-emits only once it has drifted past [`REFRAME_CMD_TOLERANCE`],
+/// which collapses a long hold to a single command.
+fn reframe_commands(clip: &Clip, rf: &Reframe, target: &str, fps: f64, dur: f64) -> Option<String> {
+    if !rf.is_animated() || !fps.is_finite() || fps <= 0.0 || !dur.is_finite() || dur <= 0.0 {
+        return None;
+    }
+    let k = rf.sorted_keyframes();
+    let moves = |get: fn(&ReframeKeyframe) -> f64| {
+        let first = get(&k[0]);
+        k.iter().any(|kf| get(kf) != first)
+    };
+    // (v360 option name, how to read it off a sampled pose, whether it moves)
+    type Channel = (&'static str, fn(&ResolvedReframe) -> f64, bool);
+    let channels: [Channel; 4] = [
+        ("yaw", |r| r.yaw, moves(|kf| kf.yaw)),
+        ("pitch", |r| r.pitch, moves(|kf| kf.pitch)),
+        ("roll", |r| r.roll, moves(|kf| kf.roll)),
+        ("d_fov", |r| r.fov, moves(|kf| kf.fov)),
+    ];
+    if !channels.iter().any(|(_, _, moving)| *moving) {
+        return None;
+    }
+
+    let frames = (dur * fps).ceil().max(0.0) as u64;
+    let mut cmds: Vec<String> = Vec::new();
+    let mut last: [Option<f64>; 4] = [None; 4];
+    for i in 0..=frames {
+        let local = i as f64 / fps;
+        let pose = rf.sample(local);
+        // Fire half a frame early so the command is already pending when frame
+        // `i` reaches `v360` and cannot be consumed by frame `i-1`. Without the
+        // lead, float drift at rates like 29.97 lands commands a frame late.
+        let at = (clip.timeline_start + local - 0.5 / fps).max(0.0);
+        for (n, (name, get, moving)) in channels.iter().enumerate() {
+            if !*moving {
+                continue;
+            }
+            let v = get(&pose);
+            if last[n].is_some_and(|prev| (v - prev).abs() < REFRAME_CMD_TOLERANCE) {
+                continue;
+            }
+            last[n] = Some(v);
+            // `{:.4}` rather than `fnum`, whose `{}` formatting can spell a
+            // rounded value `0.30000000000000004` and triple the graph's size.
+            cmds.push(format!("{at:.5} {target} {name} {v:.4}"));
+        }
+    }
+    (!cmds.is_empty()).then(|| cmds.join(";"))
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
-/// and its `[v{i}]` output): trim, optional reverse / crop / retime, fit or
-/// transform geometry, color correction, per-clip video effects, keyframe
-/// animation, fades and transition alpha. With all properties at their defaults
-/// this reduces to the original fit-and-letterbox chain.
-fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool) -> String {
+/// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
+/// reprojection, fit or transform geometry, color correction, per-clip video
+/// effects, keyframe animation, fades and transition alpha. With all properties
+/// at their defaults this reduces to the original fit-and-letterbox chain.
+///
+/// `instance` is the clip's unique flat index, used to name its `v360` so
+/// `sendcmd` can address it; it is unused for clips that do not reframe.
+fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
     let anim = clip.is_animated();
@@ -2729,24 +2980,56 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // image is never seeked (it is `-loop`ed from t=0), so its trim stays absolute.
     let seek = if is_image { 0.0 } else { clip_seek(trim_start) };
 
+    let reframe = clip.reframe.as_ref();
+    let crop = t.has_crop().then(|| {
+        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
+        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
+        format!(
+            "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
+            cl = t.crop_left,
+            ct = t.crop_top
+        )
+    });
+
     let mut p: Vec<String> = Vec::new();
     p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
     if clip.is_reversed() {
         p.push("reverse".to_string());
     }
-    if t.has_crop() {
-        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
-        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
-        p.push(format!(
-            "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
-            cl = t.crop_left,
-            ct = t.crop_top
-        ));
+    // A reframed clip crops *after* reprojection instead: edge fractions of a raw
+    // dual-fisheye frame mean nothing, and the user set them against the flat
+    // picture they were looking at. `crop` reads no timestamps (its `iw`/`ih`
+    // fractions are constants), so moving it past `setpts` is safe.
+    if reframe.is_none() {
+        p.extend(crop.clone());
     }
     if (s - 1.0).abs() < 1e-9 {
         p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
     } else {
         p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
+    }
+    if let Some(rf) = reframe {
+        // Hoisted above `v360` so a 50 fps source exporting at 30 reprojects 30
+        // frames a second rather than reprojecting 50 and discarding 20 — each
+        // of which would have rebuilt the remap LUT.
+        p.push(format!("fps={}", fmt.fps));
+        // `sendcmd` sits upstream of `v360`: a command takes effect as a frame
+        // passes through, so downstream it would land one frame late. Both sit
+        // after `setpts`, which puts the timestamps `sendcmd` matches on the
+        // timeline clock — so a keyframe at clip-local `t` is a command at
+        // `timeline_start + t`, and `speed` and `reverse` are already folded in.
+        let target = format!("v360@{instance}");
+        if let Some(cmds) = reframe_commands(clip, rf, &target, fmt.fps, dur) {
+            p.push(format!("sendcmd=c='{cmds}'"));
+        }
+        p.push(reframe_filter(
+            &rf.pose(),
+            fmt.width,
+            fmt.height,
+            EXPORT_INTERP,
+            Some(instance),
+        ));
+        p.extend(crop);
     }
     let sf = fmt.scale_flags();
     // A keyframed clip is treated as non-identity so its picture is centered by
@@ -2771,7 +3054,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
     }
     p.push("setsar=1".to_string());
-    p.push(format!("fps={}", fmt.fps));
+    if reframe.is_none() {
+        p.push(format!("fps={}", fmt.fps));
+    }
     // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`
     // has no alpha-capable input format, so the graph would otherwise auto-insert a
     // conversion that drops the alpha (silently disabling opacity / rotation).
@@ -2951,10 +3236,12 @@ fn build_timeline_frame_args(
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
     for (n, (clip, _)) in active.iter().enumerate() {
-        let tf = clip.transform_at((t - clip.timeline_start).max(0.0));
+        let local = (t - clip.timeline_start).max(0.0);
+        let tf = clip.transform_at(local);
+        let rf = clip.reframe_at(local);
         chains.push(format!(
             "[{n}:v]{chain}[v{n}]",
-            chain = still_clip_chain(&tf, &clip.color, &clip.effects, ow, oh, &sf)
+            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), ow, oh, &sf)
         ));
         let out = format!("ov{n}");
         chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
@@ -2987,22 +3274,42 @@ fn build_timeline_frame_args(
 }
 
 /// The still video chain for one clip in a [`timeline_frame`] composite: take a
-/// single decoded frame, then apply the same crop / fit-or-transform / color /
-/// opacity / rotation geometry as [`video_clip_chain`], minus every time-domain
-/// step (trim/setpts/fps/fades) since the `-ss` input seek already positioned it.
-fn still_clip_chain(tf: &Transform, color: &Color, effects: &[VideoEffect], ow: u32, oh: u32, sf: &str) -> String {
+/// single decoded frame, then apply the same 360 reprojection / crop /
+/// fit-or-transform / color / opacity / rotation geometry as
+/// [`video_clip_chain`], minus every time-domain step (trim/setpts/fps/fades)
+/// since the `-ss` input seek already positioned it.
+///
+/// `reframe` is the clip's camera already **sampled** at the requested instant.
+/// The still pipeline has no timeline clock to run `sendcmd` against, so an
+/// animated reframe resolves to a constant here — which is exactly what the
+/// export chain's commands will have set `v360` to at the same timestamp.
+fn still_clip_chain(
+    tf: &Transform,
+    color: &Color,
+    effects: &[VideoEffect],
+    reframe: Option<&ResolvedReframe>,
+    ow: u32,
+    oh: u32,
+    sf: &str,
+) -> String {
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma;
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
-    if tf.has_crop() {
+    let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
-        p.push(format!(
+        format!(
             "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
             cl = tf.crop_left,
             ct = tf.crop_top
-        ));
+        )
+    });
+    // Mirrors `video_clip_chain`: crop follows reprojection. There is no `setpts`
+    // to step around here, so one order serves both cases.
+    if let Some(r) = reframe {
+        p.push(reframe_filter(r, ow, oh, PREVIEW_INTERP, None));
     }
+    p.extend(crop);
     p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}"));
     if tf.is_identity() {
         p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
@@ -3259,6 +3566,7 @@ mod tests {
             sample_rate: None,
             channels: None,
             image: false,
+            projection: None,
         }
     }
 
@@ -3273,6 +3581,7 @@ mod tests {
             sample_rate: Some(rate),
             channels: Some(channels),
             image: false,
+            projection: None,
         }
     }
 
@@ -3287,6 +3596,7 @@ mod tests {
             sample_rate: None,
             channels: None,
             image: true,
+            projection: None,
         }
     }
 
@@ -3524,7 +3834,7 @@ mod tests {
                 blend: 0.0,
             },
         ];
-        let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false);
+        let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false, "c0");
         // Color-space blur runs before the alpha plane is established, chroma key
         // after it; the terminal yuv420p flatten is suppressed so alpha survives.
         let gi = chain.find("gblur=sigma=8").expect("blur");
@@ -3591,7 +3901,7 @@ mod tests {
             },
         ];
         // Per-frame zoom is in the clip chain…
-        let chain = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false);
+        let chain = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false, "c0");
         assert!(
             chain.contains("scale=w='iw*(") && chain.contains("eval=frame"),
             "animated zoom: {chain}"
@@ -3986,6 +4296,40 @@ mod tests {
         }
     }
 
+    /// A raw Insta360 5.7K capture: one dual-fisheye video stream plus audio.
+    fn insv_asset(id: Uuid, duration: f64) -> Asset {
+        let mut v = video_stream(5760, 2880, 30.0);
+        v.codec = "hevc".into();
+        v.projection = Some(Projection::DualFisheye);
+        Asset {
+            id,
+            path: "/media/VID_20260801_120000_10_001.insv".into(),
+            name: "VID_20260801_120000_10_001.insv".into(),
+            duration,
+            streams: vec![v, audio_stream(48_000, 2)],
+            imported_at: Utc::now(),
+        }
+    }
+
+    /// A clip of `asset` that reframes to flat, optionally animated.
+    fn reframed_clip(asset: &Asset, keyframes: Vec<crate::model::ReframeKeyframe>) -> Clip {
+        let mut clip = Clip::for_asset(asset, 0.0, 8.0, 2.0);
+        let rf = clip.reframe.as_mut().expect("a 360 asset reframes by default");
+        rf.pitch = -8.0;
+        rf.keyframes = keyframes;
+        clip
+    }
+
+    fn rkf(time: f64, yaw: f64) -> crate::model::ReframeKeyframe {
+        crate::model::ReframeKeyframe {
+            time,
+            yaw,
+            pitch: -8.0,
+            roll: 0.0,
+            fov: 100.0,
+        }
+    }
+
     fn fmt_1080p() -> ExportFormat {
         ExportFormat {
             width: 1920,
@@ -4010,6 +4354,273 @@ mod tests {
             &plan_inputs(timeline, assets, &transition_fx(timeline, assets)),
         )
         .filter
+    }
+
+    // ---- 360 / reframe -----------------------------------------------------
+
+    #[test]
+    fn reframe_chain_inserts_v360_after_setpts_before_the_fit() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![]);
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c3");
+
+        let setpts = chain.find("setpts=").expect("setpts");
+        let v360 = chain.find("v360@c3=").expect("v360");
+        let fit = chain.find("scale=1920:1080:force_original_aspect_ratio").expect("fit");
+        assert!(setpts < v360 && v360 < fit, "order: setpts < v360 < fit in {chain}");
+        // Reprojected straight to the export frame, so the fit that follows is a
+        // no-op and an 8K sphere never materializes at 8K.
+        assert!(chain.contains("w=1920:h=1080"), "v360 renders at frame size: {chain}");
+        assert!(chain.contains("input=dfisheye"), "dual-fisheye source: {chain}");
+        assert!(chain.contains("output=flat"), "flat deliverable: {chain}");
+        assert!(chain.contains("d_fov=100"), "aspect-correct fov knob: {chain}");
+        // `:h_fov=`, not `h_fov=` — `ih_fov` (the input lens) contains it.
+        assert!(!chain.contains(":h_fov="), "h_fov would stretch the picture: {chain}");
+        assert!(chain.contains("ih_fov=190"), "lens fov for a fisheye source: {chain}");
+    }
+
+    #[test]
+    fn reframe_hoists_fps_above_v360_and_does_not_repeat_it() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![]);
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert_eq!(chain.matches("fps=30").count(), 1, "exactly one fps: {chain}");
+        assert!(
+            chain.find("fps=30").unwrap() < chain.find("v360@c0=").unwrap(),
+            "reproject at the output rate, not the source rate: {chain}"
+        );
+    }
+
+    #[test]
+    fn reframe_crops_after_reprojection() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let mut clip = reframed_clip(&asset, vec![]);
+        clip.transform.crop_left = 0.1;
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert!(
+            chain.find("v360@c0=").unwrap() < chain.find("crop=").unwrap(),
+            "edge crops mean nothing on a raw fisheye frame: {chain}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_clip_keeps_its_original_chain() {
+        // The reframe branch reorders crop and fps; a non-360 clip must not move.
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let mut clip = make_clip(asset.id, 0.0, 8.0, 2.0);
+        clip.transform.crop_left = 0.1;
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert!(!chain.contains("v360"), "no reprojection: {chain}");
+        assert!(
+            chain.find("crop=").unwrap() < chain.find("setpts=").unwrap(),
+            "crop stays ahead of setpts: {chain}"
+        );
+        assert!(
+            chain.find("setsar=1").unwrap() < chain.find("fps=30").unwrap(),
+            "fps stays after setsar: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_static_reframe_emits_no_sendcmd() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![]);
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert!(
+            !chain.contains("sendcmd"),
+            "a held camera must not pay a LUT rebuild per frame: {chain}"
+        );
+        assert!(chain.contains("yaw=0"), "the pose is baked into the args: {chain}");
+    }
+
+    #[test]
+    fn an_animated_reframe_sends_commands_upstream_of_v360() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![rkf(0.0, 0.0), rkf(4.0, 60.0)]);
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c3");
+
+        let send = chain.find("sendcmd").expect("sendcmd");
+        let v360 = chain.find("v360@c3=").expect("v360");
+        assert!(send < v360, "a command must reach v360 with its own frame: {chain}");
+        assert!(chain.contains("v360@c3 yaw"), "commands target this clip's instance");
+
+        // Timestamps are on the timeline clock (the clip starts at 2.0) and lead
+        // by half a frame so frame `i` cannot be served by frame `i-1`'s value.
+        let first = chain.split("sendcmd=c='").nth(1).unwrap().split(' ').next().unwrap();
+        let expected = 2.0 - 0.5 / 30.0;
+        assert!(
+            (first.parse::<f64>().unwrap() - expected).abs() < 1e-4,
+            "first command at {first}, want {expected}"
+        );
+    }
+
+    #[test]
+    fn reframe_commands_skip_channels_that_never_move() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![rkf(0.0, 0.0), rkf(4.0, 60.0)]);
+        let rf = clip.reframe.as_ref().unwrap();
+        let cmds = reframe_commands(&clip, rf, "v360@c0", 30.0, clip.duration()).expect("commands");
+        assert!(cmds.contains("yaw"), "yaw moves: {cmds}");
+        for still in ["pitch", "roll", "d_fov"] {
+            assert!(!cmds.contains(still), "{still} is static and must stay an arg: {cmds}");
+        }
+        // …and the static pitch is still applied, via the filter's own arguments.
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert!(chain.contains("pitch=-8"), "static pitch survives: {chain}");
+    }
+
+    #[test]
+    fn reframe_commands_wrap_yaw_into_range() {
+        // A pan across the ±180 seam. `v360` *silently discards* an out-of-range
+        // command — the frames render as if uncommanded — so every emitted value
+        // has to land inside [-180, 180].
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![rkf(0.0, 170.0), rkf(4.0, -170.0)]);
+        let rf = clip.reframe.as_ref().unwrap();
+        let cmds = reframe_commands(&clip, rf, "v360@c0", 30.0, clip.duration()).expect("commands");
+
+        let mut seen = 0;
+        for c in cmds.split(';') {
+            let v: f64 = c.rsplit(' ').next().unwrap().parse().unwrap();
+            assert!((-180.0..=180.0).contains(&v), "{v} is out of v360's range: {c}");
+            seen += 1;
+        }
+        assert!(seen > 1, "the pan should emit more than one command");
+        // Shortest arc: 170 -> -170 travels 20° forward through 180, never back
+        // through 0. Halfway is therefore 180/-180, not 0.
+        let mid = rf.sample(2.0).yaw;
+        assert!(mid.abs() > 179.0, "midpoint {mid} should be at the seam, not near 0");
+    }
+
+    #[test]
+    fn reframe_commands_collapse_a_held_camera() {
+        // Keyframes that pin the same pose twice: nothing moves after the first
+        // sample, so the tolerance gate should leave a single command at most.
+        let asset = insv_asset(Uuid::new_v4(), 60.0);
+        let mut clip = reframed_clip(&asset, vec![rkf(0.0, 30.0), rkf(50.0, 30.0)]);
+        clip.source_out = 50.0;
+        let rf = clip.reframe.as_ref().unwrap();
+        let cmds = reframe_commands(&clip, rf, "v360@c0", 30.0, clip.duration());
+        assert!(cmds.is_none(), "a motionless camera needs no commands at all: {cmds:?}");
+    }
+
+    #[test]
+    fn export_format_ignores_a_reframed_clips_source_size() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![]);
+        let tl = single(vec![clip]);
+        let fmt = export_format(&tl, std::slice::from_ref(&asset), &ExportOptions::default());
+        assert_eq!(
+            (fmt.width, fmt.height),
+            (1920, 1080),
+            "a 16:9 reframe must not inherit the sphere's 5760x2880"
+        );
+        assert_eq!(fmt.fps, 30.0, "frame rate still comes from the source");
+
+        // An explicit override still wins.
+        let opts = ExportOptions {
+            resolution: Some((3840, 2160)),
+            ..Default::default()
+        };
+        assert_eq!(export_format(&tl, &[asset], &opts).width, 3840);
+    }
+
+    #[test]
+    fn the_still_path_samples_the_reframe_statically() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        let clip = reframed_clip(&asset, vec![rkf(0.0, 0.0), rkf(4.0, 60.0)]);
+        let tl = single(vec![clip]);
+        // t = 4.0 is 2.0s into a clip starting at 2.0, i.e. halfway through the pan.
+        let args = build_timeline_frame_args(&tl, &[asset], &ExportOptions::default(), 4.0, 960, 4).expect("args");
+        let graph = args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
+        assert!(!graph.contains("sendcmd"), "a still has no clock to command against: {graph}");
+        assert!(graph.contains("v360=input=dfisheye"), "unnamed instance: {graph}");
+        assert!(graph.contains("yaw=30"), "the pose is sampled to a constant: {graph}");
+        assert!(graph.contains("w=960"), "reproject at the preview size: {graph}");
+    }
+
+    #[test]
+    fn slice_resamples_reframe_keyframes() {
+        let asset = insv_asset(Uuid::new_v4(), 30.0);
+        // Clip spans timeline 2..10, panning 0 -> 60 over its 8 seconds.
+        let clip = reframed_clip(&asset, vec![rkf(0.0, 0.0), rkf(8.0, 60.0)]);
+        let pose_at_cut = clip.reframe_at(2.0).unwrap();
+        let sliced = single(vec![clip]).slice(4.0, 10.0);
+
+        let c = &sliced.tracks[0].clips[0];
+        assert_eq!(c.timeline_start, 0.0);
+        let kfs = &c.reframe.as_ref().unwrap().keyframes;
+        assert_eq!(kfs[0].time, 0.0, "a pinned keyframe opens the sliced clip");
+        assert!(
+            (kfs[0].yaw - pose_at_cut.yaw).abs() < 1e-9,
+            "the pin carries the pose the cut landed on: {} vs {}",
+            kfs[0].yaw,
+            pose_at_cut.yaw
+        );
+    }
+
+    #[test]
+    fn an_ordinary_graph_stays_in_argv_but_a_long_pan_spills_to_a_script() {
+        let asset = insv_asset(Uuid::new_v4(), 300.0);
+
+        // A static reframe: no commands, so the graph stays small.
+        let still = single(vec![reframed_clip(&asset, vec![])]);
+        let args = build_export_args(&still, std::slice::from_ref(&asset), "/out.mp4", &ExportOptions::default()).unwrap();
+        assert_eq!(oversized_graph_index(&args), None, "a normal graph rides in argv");
+
+        // A four-minute pan: the sendcmd list alone outgrows what a single argv
+        // string may hold on Windows, and eventually on Linux too.
+        let mut clip = reframed_clip(&asset, vec![rkf(0.0, 0.0), rkf(240.0, 170.0)]);
+        clip.source_out = 240.0;
+        let long = single(vec![clip]);
+        let args = build_export_args(&long, &[asset], "/out.mp4", &ExportOptions::default()).unwrap();
+        let i = oversized_graph_index(&args).expect("a long pan must spill out of argv");
+        assert!(args[i].len() > GRAPH_ARG_MAX);
+
+        let mut spilled = args.clone();
+        let guard = externalize_filter_complex(&mut spilled, "test").unwrap();
+        assert_eq!(spilled[i - 1], "-filter_complex_script");
+        let path = std::path::PathBuf::from(&spilled[i]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), args[i], "the graph is written verbatim");
+        drop(guard);
+        assert!(!path.exists(), "the script is cleaned up after the render");
+    }
+
+    #[test]
+    fn probe_reads_a_spherical_mapping() {
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":3840,"height":1920,"r_frame_rate":"30/1","side_data_list":[{"side_data_type":"Spherical Mapping","projection":"equirectangular"}]}],"format":{"duration":"20.0"}}"#;
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
+        assert_eq!(r.streams[0].projection, Some(Projection::Equirect));
+    }
+
+    #[test]
+    fn probe_reads_insta360_dual_fisheye_geometry() {
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":5760,"height":2880,"r_frame_rate":"30/1"}],"format":{"duration":"20.0"}}"#;
+        let r = probe_from_json(
+            serde_json::from_str(json).unwrap(),
+            Some(Path::new("/media/VID_20260801_120000_10_001.insv")),
+        );
+        assert_eq!(r.streams[0].projection, Some(Projection::DualFisheye));
+    }
+
+    #[test]
+    fn probe_does_not_guess_360_from_aspect_alone() {
+        // 2:1 at 4K is an ordinary shape (anamorphic, ultrawide, panoramas). A
+        // false positive would silently reproject real footage, so only an
+        // Insta360 extension unlocks the geometry signal.
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":5760,"height":2880,"r_frame_rate":"30/1"}],"format":{"duration":"20.0"}}"#;
+        let r = probe_from_json(
+            serde_json::from_str(json).unwrap(),
+            Some(Path::new("/media/ultrawide.mp4")),
+        );
+        assert_eq!(r.streams[0].projection, None);
+    }
+
+    #[test]
+    fn probe_leaves_ordinary_video_flat() {
+        let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"r_frame_rate":"30/1"}],"format":{"duration":"12.0"}}"#;
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), Some(Path::new("/media/a.mp4")));
+        assert_eq!(r.streams[0].projection, None);
     }
 
     #[test]
@@ -4340,7 +4951,7 @@ mod tests {
     #[test]
     fn probe_flags_a_lone_still_image() {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":1920,"height":1080,"r_frame_rate":"25/1"}],"format":{}}"#;
-        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert_eq!(r.duration, 0.0, "a still probes with no duration");
         assert!(r.streams[0].image, "a lone, audio-less png is a still");
     }
@@ -4348,7 +4959,7 @@ mod tests {
     #[test]
     fn probe_does_not_flag_ordinary_video() {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"r_frame_rate":"30/1","duration":"12.0"}],"format":{"duration":"12.0"}}"#;
-        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert!(!r.streams[0].image);
     }
 
@@ -4356,7 +4967,7 @@ mod tests {
     fn probe_does_not_flag_an_animated_gif() {
         // A multi-frame gif probes with a real duration, so it is treated as video.
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"gif","width":480,"height":270,"r_frame_rate":"10/1"}],"format":{"duration":"3.0"}}"#;
-        let r = probe_from_json(serde_json::from_str(json).unwrap());
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert!(!r.streams[0].image);
     }
 

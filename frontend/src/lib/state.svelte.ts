@@ -3,10 +3,12 @@
 import {
 	addClip,
 	addKeyframe,
+	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
 	captionsFromTranscript,
 	clearKeyframes,
+	clearReframe,
 	concatenate,
 	cutClip,
 	exportSrt,
@@ -23,6 +25,8 @@ import {
 	removeOverlay,
 	setAudioEffects,
 	setKeyframes,
+	setReframe,
+	setReframeKeyframes,
 	setOverlayKeyframes,
 	setVideoEffects,
 	updateOverlay,
@@ -59,6 +63,8 @@ import type {
 	Color,
 	ExportOptions,
 	Keyframe,
+	Reframe,
+	ReframeKeyframe,
 	Revision,
 	StreamKind,
 	TextKeyframe,
@@ -368,6 +374,22 @@ class EditorState {
 	}
 	clearKeyframes(clipId: string) {
 		return this.#apply(clearKeyframes(clipId));
+	}
+	setReframe(clipId: string, patch: Partial<Reframe>) {
+		return this.#apply(setReframe(clipId, patch));
+	}
+	clearReframe(clipId: string) {
+		return this.#apply(clearReframe(clipId));
+	}
+	setReframeKeyframes(clipId: string, keyframes: ReframeKeyframe[]) {
+		return this.#apply(setReframeKeyframes(clipId, keyframes));
+	}
+	addReframeKeyframe(
+		clipId: string,
+		time: number,
+		patch: Partial<Omit<ReframeKeyframe, 'time'>> = {}
+	) {
+		return this.#apply(addReframeKeyframe(clipId, time, patch));
 	}
 	addOverlay(text: string, start: number, end: number) {
 		return this.#apply(addOverlay(text, start, end));

@@ -13,7 +13,16 @@ export interface StreamInfo {
 	channels?: number;
 	/** True for a single-frame still image (looped, not seeked, on export). */
 	image?: boolean;
+	/** Set when the stream is 360 footage, detected at probe time. */
+	projection?: Projection | null;
 }
+
+/**
+ * How a video stream maps the world onto its frame. `flat` is ordinary video;
+ * the rest are 360 sources (a raw Insta360 `.insv` is `dual_fisheye`, a stitched
+ * Studio export is `equirect`).
+ */
+export type Projection = 'equirect' | 'dual_fisheye' | 'fisheye' | 'flat';
 
 export interface Asset {
 	id: string;
@@ -126,6 +135,33 @@ export interface Keyframe {
 	opacity: number;
 }
 
+/** One keyframe of a 360 clip's animated virtual camera. */
+export interface ReframeKeyframe {
+	time: number;
+	yaw: number;
+	pitch: number;
+	roll: number;
+	fov: number;
+}
+
+/**
+ * Per-clip reprojection of 360 footage: aim a virtual camera into the sphere and
+ * render what it sees. `output` is `flat` for a normal deliverable, or `equirect`
+ * to stitch a dual-fisheye source without choosing a direction.
+ */
+export interface Reframe {
+	input: Projection;
+	output: Projection;
+	/** Field of view of each physical lens (dual-fisheye sources only). */
+	lens_fov: number;
+	yaw: number;
+	pitch: number;
+	roll: number;
+	/** Diagonal field of view of the virtual camera, in degrees. */
+	fov: number;
+	keyframes?: ReframeKeyframe[];
+}
+
 /** One keyframe of an animated text overlay (position + opacity). */
 export interface TextKeyframe {
 	time: number;
@@ -168,6 +204,8 @@ export interface Clip {
 	effects?: VideoEffect[];
 	audio?: AudioEffect[];
 	keyframes?: Keyframe[];
+	/** 360 reprojection; absent for ordinary flat footage. */
+	reframe?: Reframe | null;
 }
 
 export const DEFAULT_TRANSFORM: Transform = {
@@ -183,6 +221,17 @@ export const DEFAULT_TRANSFORM: Transform = {
 };
 
 export const DEFAULT_COLOR: Color = { brightness: 0, contrast: 1, saturation: 1, gamma: 1 };
+
+/** A level, forward-facing 100° view — what a 360 clip gets on arrival. */
+export const DEFAULT_REFRAME: Reframe = {
+	input: 'equirect',
+	output: 'flat',
+	lens_fov: 190,
+	yaw: 0,
+	pitch: 0,
+	roll: 0,
+	fov: 100
+};
 
 export interface Track {
 	id: string;

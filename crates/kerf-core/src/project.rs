@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Revision, StreamInfo, StreamKind, Task, TaskStatus,
-    TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Projection, Reframe, ReframeKeyframe, Revision, StreamInfo,
+    StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect, MAX_FOV,
+    MIN_FOV,
 };
 
 const SCHEMA: &str = r#"
@@ -724,7 +725,7 @@ impl Project {
                     .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?,
             };
             let start = timeline_start.unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
-            let clip = Clip::new(asset_id, source_in, source_out, start);
+            let clip = Clip::for_asset(&asset, source_in, source_out, start);
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
         })
@@ -1216,7 +1217,7 @@ impl Project {
             let mut start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
             let mut clips = Vec::new();
             for (src_in, src_out) in keep {
-                let clip = Clip::new(asset_id, src_in, src_out, start);
+                let clip = Clip::for_asset(&asset, src_in, src_out, start);
                 start += clip.duration();
                 timeline.track_mut(tid).unwrap().clips.push(clip.clone());
                 clips.push(clip);
@@ -1236,7 +1237,7 @@ impl Project {
                 .first_track_of(StreamKind::Audio)
                 .ok_or_else(|| Error::Other("no audio track".to_string()))?;
             let start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
-            let clip = Clip::new(asset_id, 0.0, asset.duration, start);
+            let clip = Clip::for_asset(&asset, 0.0, asset.duration, start);
             timeline.track_mut(tid).unwrap().clips.push(clip.clone());
             Ok(clip)
         })
@@ -1251,16 +1252,16 @@ impl Project {
         let mut plan = Vec::with_capacity(asset_ids.len());
         for &asset_id in asset_ids {
             let asset = self.require_asset(asset_id)?;
-            plan.push((asset_id, asset.primary_kind(), asset.duration));
+            plan.push((asset.primary_kind(), asset));
         }
         self.edit_timeline("Concatenate", |timeline| {
             let mut clips = Vec::with_capacity(plan.len());
-            for (asset_id, primary, duration) in &plan {
+            for (primary, asset) in &plan {
                 let tid = timeline
                     .first_track_of(*primary)
                     .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?;
                 let start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
-                let clip = Clip::new(*asset_id, 0.0, *duration, start);
+                let clip = Clip::for_asset(asset, 0.0, asset.duration, start);
                 timeline.track_mut(tid).unwrap().clips.push(clip.clone());
                 clips.push(clip);
             }
@@ -1453,6 +1454,7 @@ impl Project {
                     sample_rate: None,
                     channels: None,
                     image: false,
+                    projection: None,
                 },
                 StreamInfo {
                     index: 1,
@@ -1464,6 +1466,7 @@ impl Project {
                     sample_rate: Some(48_000),
                     channels: Some(2),
                     image: false,
+                    projection: None,
                 },
             ],
             imported_at: Utc::now(),
@@ -1484,6 +1487,7 @@ impl Project {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -1645,6 +1649,164 @@ impl Project {
             timeline.tracks[ti].clips[ci].keyframes.clear();
             Ok(timeline.tracks[ti].clips[ci].clone())
         })
+    }
+
+    // ---- 360 reframe ------------------------------------------------------
+
+    /// Point a clip's virtual 360 camera. Each `None` channel is left as it is,
+    /// so a caller can nudge yaw alone. A clip that is not yet reframed picks up
+    /// a default reframe for its asset's projection first — and an asset that is
+    /// not 360 at all is rejected, since reprojecting flat footage is never what
+    /// was meant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_reframe(
+        &self,
+        clip_id: Uuid,
+        yaw: Option<f64>,
+        pitch: Option<f64>,
+        roll: Option<f64>,
+        fov: Option<f64>,
+        lens_fov: Option<f64>,
+        input: Option<Projection>,
+        output: Option<Projection>,
+    ) -> Result<Clip> {
+        validate_angle("yaw", yaw)?;
+        validate_angle("pitch", pitch)?;
+        validate_angle("roll", roll)?;
+        validate_fov(fov)?;
+        validate_lens_fov(lens_fov)?;
+        if input.is_some_and(|p| !p.is_spherical()) {
+            return Err(Error::InvalidArgument(
+                "reframe input must be a spherical projection (equirect, dual_fisheye, fisheye)".to_string(),
+            ));
+        }
+        if output.is_some_and(|p| !matches!(p, Projection::Flat | Projection::Equirect)) {
+            return Err(Error::InvalidArgument(
+                "reframe output must be flat or equirect".to_string(),
+            ));
+        }
+        let fallback = self.clip_asset_projection(clip_id)?;
+        self.edit_timeline("Set reframe", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let rf = match clip.reframe.as_mut() {
+                Some(rf) => rf,
+                None => {
+                    let seed = input.or(fallback).ok_or_else(|| {
+                        Error::InvalidArgument(
+                            "this clip's asset is not 360 footage; pass an explicit input projection to reframe it anyway"
+                                .to_string(),
+                        )
+                    })?;
+                    clip.reframe.insert(Reframe::new(seed))
+                }
+            };
+            if let Some(v) = yaw {
+                rf.yaw = v;
+            }
+            if let Some(v) = pitch {
+                rf.pitch = v;
+            }
+            if let Some(v) = roll {
+                rf.roll = v;
+            }
+            if let Some(v) = fov {
+                rf.fov = v;
+            }
+            if let Some(v) = lens_fov {
+                rf.lens_fov = v;
+            }
+            if let Some(v) = input {
+                rf.input = v;
+            }
+            if let Some(v) = output {
+                rf.output = v;
+            }
+            Ok(clip.clone())
+        })
+    }
+
+    /// Stop reprojecting a clip, leaving its source projection untouched (a raw
+    /// equirect or dual-fisheye picture on the timeline).
+    pub fn clear_reframe(&self, clip_id: Uuid) -> Result<Clip> {
+        self.edit_timeline("Clear reframe", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].reframe = None;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Replace a clip's camera animation (re-sorted by time). An empty list
+    /// clears it, so the static pose is used again.
+    pub fn set_reframe_keyframes(&self, clip_id: Uuid, mut keyframes: Vec<ReframeKeyframe>) -> Result<Clip> {
+        for k in &keyframes {
+            validate_reframe_keyframe(k)?;
+        }
+        keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+        self.edit_timeline("Set reframe keyframes", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let rf = clip
+                .reframe
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("this clip is not reframed".to_string()))?;
+            rf.keyframes = keyframes;
+            Ok(clip.clone())
+        })
+    }
+
+    /// Add a camera keyframe at `time` seconds from the clip's start (replacing
+    /// any keyframe already there). Each `None` channel captures the camera's
+    /// current sampled pose, so a lone keyframe pins where it is now.
+    pub fn add_reframe_keyframe(
+        &self,
+        clip_id: Uuid,
+        time: f64,
+        yaw: Option<f64>,
+        pitch: Option<f64>,
+        roll: Option<f64>,
+        fov: Option<f64>,
+    ) -> Result<Clip> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+        }
+        validate_angle("yaw", yaw)?;
+        validate_angle("pitch", pitch)?;
+        validate_angle("roll", roll)?;
+        validate_fov(fov)?;
+        self.edit_timeline("Add reframe keyframe", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let pose = clip
+                .reframe_at(time)
+                .ok_or_else(|| Error::InvalidArgument("this clip is not reframed".to_string()))?;
+            let rf = clip.reframe.as_mut().expect("checked above");
+            let mut kf = ReframeKeyframe::from_pose(time, &pose);
+            if let Some(v) = yaw {
+                kf.yaw = v;
+            }
+            if let Some(v) = pitch {
+                kf.pitch = v;
+            }
+            if let Some(v) = roll {
+                kf.roll = v;
+            }
+            if let Some(v) = fov {
+                kf.fov = v;
+            }
+            rf.keyframes.retain(|k| (k.time - time).abs() > 1e-6);
+            rf.keyframes.push(kf);
+            rf.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+            Ok(clip.clone())
+        })
+    }
+
+    /// The projection of the asset a clip references, if it is 360 footage.
+    fn clip_asset_projection(&self, clip_id: Uuid) -> Result<Option<Projection>> {
+        let timeline = self.timeline()?;
+        let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        let asset_id = timeline.tracks[ti].clips[ci].asset_id;
+        Ok(self.get_asset(asset_id)?.and_then(|a| a.projection()))
     }
 
     // ---- text overlays (titles / lower-thirds / captions) -----------------
@@ -1868,6 +2030,43 @@ fn validate_audio_effect(e: &AudioEffect) -> Result<()> {
     Ok(())
 }
 
+/// Angles are wrapped or clamped downstream (see [`Reframe::sample`]), so only
+/// non-finite values are rejected here — a caller may legitimately pass 540°.
+fn validate_angle(name: &str, v: Option<f64>) -> Result<()> {
+    match v {
+        Some(v) if !v.is_finite() => Err(Error::InvalidArgument(format!("{name} must be a finite number of degrees"))),
+        _ => Ok(()),
+    }
+}
+
+fn validate_fov(v: Option<f64>) -> Result<()> {
+    match v {
+        Some(v) if !v.is_finite() || !(MIN_FOV..=MAX_FOV).contains(&v) => Err(Error::InvalidArgument(format!(
+            "field of view must be within {MIN_FOV}..={MAX_FOV} degrees"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn validate_lens_fov(v: Option<f64>) -> Result<()> {
+    match v {
+        Some(v) if !v.is_finite() || !(1.0..=360.0).contains(&v) => Err(Error::InvalidArgument(
+            "lens field of view must be within 1..=360 degrees".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_reframe_keyframe(k: &ReframeKeyframe) -> Result<()> {
+    if !k.time.is_finite() || k.time < 0.0 {
+        return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+    }
+    validate_angle("yaw", Some(k.yaw))?;
+    validate_angle("pitch", Some(k.pitch))?;
+    validate_angle("roll", Some(k.roll))?;
+    validate_fov(Some(k.fov))
+}
+
 fn validate_keyframe(k: &Keyframe) -> Result<()> {
     if !k.time.is_finite() || k.time < 0.0 {
         return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
@@ -1972,6 +2171,7 @@ mod tests {
             sample_rate: None,
             channels: None,
             image,
+            projection: None,
         }
     }
 
@@ -1986,6 +2186,7 @@ mod tests {
             sample_rate: Some(48_000),
             channels: Some(2),
             image: false,
+            projection: None,
         }
     }
 
@@ -2077,6 +2278,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -2162,6 +2364,89 @@ mod tests {
     }
 
     #[test]
+    fn a_360_clip_reframes_by_default_and_a_flat_one_never_does() {
+        let project = Project::open_in_memory().unwrap();
+        let mut v = vid_stream(false);
+        v.width = Some(5760);
+        v.height = Some(2880);
+        v.projection = Some(Projection::DualFisheye);
+        let sphere = asset_with("/VID_001.insv", vec![v]);
+        let flat = asset_with("/plain.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&sphere).unwrap();
+        project.insert_asset(&flat).unwrap();
+
+        // Landing a 360 clip on the timeline points a camera at it, so it
+        // previews as ordinary footage rather than two fisheye circles.
+        let clip = project.cut_clip(sphere.id, 0.0, 10.0).unwrap();
+        let rf = clip.reframe.expect("a 360 clip reframes on arrival");
+        assert_eq!(rf.input, Projection::DualFisheye);
+        assert_eq!(rf.output, Projection::Flat);
+
+        assert!(
+            project.cut_clip(flat.id, 0.0, 10.0).unwrap().reframe.is_none(),
+            "ordinary footage is never reprojected"
+        );
+    }
+
+    #[test]
+    fn reframe_ops_aim_the_camera_and_pin_its_pose() {
+        let project = Project::open_in_memory().unwrap();
+        let mut v = vid_stream(false);
+        v.projection = Some(Projection::Equirect);
+        let asset = asset_with("/360.mp4", vec![v]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+
+        // `None` leaves a channel alone, so yaw can be nudged on its own.
+        let aimed = project
+            .set_reframe(clip.id, Some(85.0), Some(-10.0), None, None, None, None, None)
+            .unwrap();
+        let rf = aimed.reframe.as_ref().unwrap();
+        assert_eq!((rf.yaw, rf.pitch, rf.fov), (85.0, -10.0, 100.0));
+
+        // A fresh keyframe captures the pose that is already there.
+        let pinned = project.add_reframe_keyframe(clip.id, 0.0, None, None, None, None).unwrap();
+        let kfs = &pinned.reframe.as_ref().unwrap().keyframes;
+        assert_eq!(kfs.len(), 1);
+        assert_eq!((kfs[0].yaw, kfs[0].pitch), (85.0, -10.0));
+
+        let panned = project
+            .add_reframe_keyframe(clip.id, 4.0, Some(-85.0), None, None, None)
+            .unwrap();
+        assert!(panned.reframe.as_ref().unwrap().is_animated());
+        // Re-adding at the same time replaces rather than duplicates.
+        let replaced = project.add_reframe_keyframe(clip.id, 0.0, Some(0.0), None, None, None).unwrap();
+        assert_eq!(replaced.reframe.as_ref().unwrap().keyframes.len(), 2);
+
+        // Out-of-range field of view is refused up front, since v360 would
+        // reject it at render time.
+        assert!(project
+            .set_reframe(clip.id, None, None, None, Some(0.0), None, None, None)
+            .is_err());
+        assert!(project.clear_reframe(clip.id).unwrap().reframe.is_none());
+    }
+
+    #[test]
+    fn reframing_flat_footage_needs_an_explicit_projection() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/plain.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+
+        assert!(
+            project
+                .set_reframe(clip.id, Some(30.0), None, None, None, None, None, None)
+                .is_err(),
+            "detection can miss, but silently reprojecting flat video is worse"
+        );
+        // …and the escape hatch when detection did miss.
+        let forced = project
+            .set_reframe(clip.id, Some(30.0), None, None, None, None, Some(Projection::Equirect), None)
+            .unwrap();
+        assert_eq!(forced.reframe.unwrap().input, Projection::Equirect);
+    }
+
+    #[test]
     fn video_and_audio_effects_persist_and_validate() {
         let project = Project::open_in_memory().unwrap();
         let asset = asset_with("/x.mp4", vec![vid_stream(false), aud_stream()]);
@@ -2209,6 +2494,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -2247,6 +2533,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -2292,6 +2579,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -2392,6 +2680,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };
@@ -2447,6 +2736,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 image: false,
+                projection: None,
             }],
             imported_at: Utc::now(),
         };

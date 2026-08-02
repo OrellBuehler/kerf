@@ -15,6 +15,62 @@ pub enum StreamKind {
     Data,
 }
 
+/// How a video stream maps the world onto its frame. `Flat` is ordinary
+/// rectilinear video; the rest describe 360 sources — a raw Insta360 `.insv` is
+/// `DualFisheye` (two circular hemispheres side by side), a stitched Insta360
+/// Studio export is `Equirect`. Drives the `v360` reprojection at export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Projection {
+    Equirect,
+    DualFisheye,
+    Fisheye,
+    Flat,
+}
+
+impl Projection {
+    /// The `v360` `input=` / `output=` token naming this projection.
+    pub fn v360_name(self) -> &'static str {
+        match self {
+            Projection::Equirect => "e",
+            Projection::DualFisheye => "dfisheye",
+            Projection::Fisheye => "fisheye",
+            Projection::Flat => "flat",
+        }
+    }
+
+    /// True when this projection covers the sphere, i.e. is worth reframing.
+    pub fn is_spherical(self) -> bool {
+        !matches!(self, Projection::Flat)
+    }
+
+    /// True when the source is lens-shaped, so the lens field of view
+    /// (`ih_fov`/`iv_fov`) is meaningful on input.
+    pub fn is_fisheye(self) -> bool {
+        matches!(self, Projection::DualFisheye | Projection::Fisheye)
+    }
+
+    /// Parse the wire name (`equirect`, `dual_fisheye`, `fisheye`, `flat`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "equirect" => Some(Projection::Equirect),
+            "dual_fisheye" => Some(Projection::DualFisheye),
+            "fisheye" => Some(Projection::Fisheye),
+            "flat" => Some(Projection::Flat),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Projection::Equirect => "equirect",
+            Projection::DualFisheye => "dual_fisheye",
+            Projection::Fisheye => "fisheye",
+            Projection::Flat => "flat",
+        }
+    }
+}
+
 /// Structured description of a single stream inside an imported asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamInfo {
@@ -37,6 +93,14 @@ pub struct StreamInfo {
     /// which predates the flag — still deserializes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub image: bool,
+    /// Spherical projection of a video stream, when the source is 360 footage.
+    /// Detected at probe time from the file's spherical metadata or its geometry
+    /// (see `engine::cli::detect_projection`); `None` for ordinary flat video.
+    /// Defaulted (and omitted when unset) so older `.kerf` JSON still
+    /// deserializes — this rides along in the `streams` JSON column, which is
+    /// why 360 support needs no schema migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Projection>,
 }
 
 /// An imported media file plus the structured metadata probed from it.
@@ -73,6 +137,12 @@ impl Asset {
     /// default length and looped — not seeked — on export.
     pub fn is_image(&self) -> bool {
         self.streams.iter().any(|s| s.image)
+    }
+
+    /// The spherical projection of this asset's video, if it is 360 footage.
+    /// Clips cut from such an asset are reframed to flat by default.
+    pub fn projection(&self) -> Option<Projection> {
+        self.streams.iter().find_map(|s| s.projection).filter(|p| p.is_spherical())
     }
 }
 
@@ -417,6 +487,185 @@ impl Keyframe {
     }
 }
 
+fn default_fov() -> f64 {
+    100.0
+}
+
+fn default_lens_fov() -> f64 {
+    190.0
+}
+
+fn flat() -> Projection {
+    Projection::Flat
+}
+
+/// Narrowest / widest virtual field of view, in degrees. `v360` reads `d_fov=0`
+/// as "unset" (derive from `h_fov`/`v_fov`), so the floor must stay above zero,
+/// and a command carrying an out-of-range value is *silently discarded* — hence
+/// every path that produces a fov clamps into this band first.
+pub const MIN_FOV: f64 = 1.0;
+pub const MAX_FOV: f64 = 359.0;
+
+/// One keyframe of an animated [`Reframe`]: where the virtual camera points and
+/// how wide it sees at `time` (seconds from the clip's start).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReframeKeyframe {
+    /// Offset from the clip's `timeline_start`, in seconds.
+    pub time: f64,
+    #[serde(default)]
+    pub yaw: f64,
+    #[serde(default)]
+    pub pitch: f64,
+    #[serde(default)]
+    pub roll: f64,
+    #[serde(default = "default_fov")]
+    pub fov: f64,
+}
+
+/// Per-clip reprojection of 360 footage: aim a virtual camera into the sphere
+/// and render what it sees. This is the reframing workflow — a 360 source in, an
+/// ordinary rectilinear shot out — and with keyframes the camera moves over the
+/// clip (a pan across a scene, a whip to a subject) without the source ever being
+/// re-encoded.
+///
+/// `input` is the source's own projection, seeded from the asset's probed
+/// [`Projection`] but overridable, since detection is a heuristic. `output` is
+/// `Flat` for a normal deliverable, or `Equirect` to stitch a dual-fisheye source
+/// without picking a viewing direction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Reframe {
+    /// Projection of the source footage being read.
+    pub input: Projection,
+    /// Projection to render into: `Flat` (reframe) or `Equirect` (stitch only).
+    #[serde(default = "flat")]
+    pub output: Projection,
+    /// Field of view of each physical lens, in degrees — only meaningful for a
+    /// fisheye `input`. Insta360's lenses run a little past 180°; 190 is a
+    /// reasonable starting point, and tuning it moves the stitch seam.
+    #[serde(default = "default_lens_fov")]
+    pub lens_fov: f64,
+    /// Virtual camera heading, in degrees. Wraps at ±180.
+    #[serde(default)]
+    pub yaw: f64,
+    /// Virtual camera elevation, in degrees, clamped to ±90 (straight down to
+    /// straight up). Unlike yaw this does *not* wrap — see [`Reframe::sample`].
+    #[serde(default)]
+    pub pitch: f64,
+    /// Virtual camera roll (horizon tilt), in degrees. Wraps at ±180.
+    #[serde(default)]
+    pub roll: f64,
+    /// Diagonal field of view of the virtual camera, in degrees. Maps to `v360`'s
+    /// `d_fov`, which derives an aspect-correct horizontal/vertical pair — unlike
+    /// `h_fov`, which would need `v_fov` set in lockstep or the picture stretches.
+    #[serde(default = "default_fov")]
+    pub fov: f64,
+    /// Camera animation. Empty = the static pose above; otherwise the engine
+    /// interpolates these and drives `v360` over the clip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<ReframeKeyframe>,
+}
+
+/// A [`Reframe`] sampled at one instant: the static projection settings plus the
+/// virtual camera's pose there, already wrapped and clamped into the ranges
+/// `v360` accepts. This is what the engine turns into a `v360` filter, for both
+/// the export chain and the still / preview path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedReframe {
+    pub input: Projection,
+    pub output: Projection,
+    pub lens_fov: f64,
+    pub yaw: f64,
+    pub pitch: f64,
+    pub roll: f64,
+    pub fov: f64,
+}
+
+impl Reframe {
+    /// A level, forward-facing 100° view of a source in `input`. This is what a
+    /// 360 clip gets when it lands on the timeline, so it previews as ordinary
+    /// footage instead of a raw equirect smear or a pair of fisheye circles.
+    pub fn new(input: Projection) -> Self {
+        Self {
+            input,
+            output: Projection::Flat,
+            lens_fov: default_lens_fov(),
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            fov: default_fov(),
+            keyframes: Vec::new(),
+        }
+    }
+
+    /// True when the clip's camera moves (i.e. carries keyframes).
+    pub fn is_animated(&self) -> bool {
+        !self.keyframes.is_empty()
+    }
+
+    /// The keyframes sorted by time (the stored order is kept sorted by the
+    /// editing op, but render code must not assume it).
+    pub fn sorted_keyframes(&self) -> Vec<ReframeKeyframe> {
+        let mut k = self.keyframes.clone();
+        k.sort_by(|a, b| a.time.total_cmp(&b.time));
+        k
+    }
+
+    /// The static pose, ignoring any animation.
+    pub fn pose(&self) -> ResolvedReframe {
+        ResolvedReframe {
+            input: self.input,
+            output: self.output,
+            lens_fov: self.lens_fov,
+            yaw: wrap180(self.yaw),
+            pitch: self.pitch.clamp(-90.0, 90.0),
+            roll: wrap180(self.roll),
+            fov: self.fov.clamp(MIN_FOV, MAX_FOV),
+        }
+    }
+
+    /// Sample the virtual camera at `local` seconds from the clip's start.
+    ///
+    /// Yaw and roll interpolate along the shortest arc, so a pan from 170° to
+    /// -170° travels 20° rather than sweeping 340° the long way round. Pitch
+    /// deliberately does **not**: panning up and over the pole is never what was
+    /// meant, and `v360`'s `|pitch| > 90` region renders an upside-down view.
+    pub fn sample(&self, local: f64) -> ResolvedReframe {
+        let mut r = self.pose();
+        if self.keyframes.is_empty() {
+            return r;
+        }
+        let k = self.sorted_keyframes();
+        let pts = |get: fn(&ReframeKeyframe) -> f64| k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>();
+        if let Some(v) = interpolate_angle(&pts(|kf| kf.yaw), local) {
+            r.yaw = v;
+        }
+        if let Some(v) = interpolate(&pts(|kf| kf.pitch), local) {
+            r.pitch = v.clamp(-90.0, 90.0);
+        }
+        if let Some(v) = interpolate_angle(&pts(|kf| kf.roll), local) {
+            r.roll = v;
+        }
+        if let Some(v) = interpolate(&pts(|kf| kf.fov), local) {
+            r.fov = v.clamp(MIN_FOV, MAX_FOV);
+        }
+        r
+    }
+}
+
+impl ReframeKeyframe {
+    /// A keyframe at `time` carrying `pose`'s animatable channels (the values a
+    /// fresh keyframe pins).
+    pub fn from_pose(time: f64, p: &ResolvedReframe) -> Self {
+        Self {
+            time,
+            yaw: p.yaw,
+            pitch: p.pitch,
+            roll: p.roll,
+            fov: p.fov,
+        }
+    }
+}
+
 /// One keyframe of an animated [`TextOverlay`]: position and opacity at `time`
 /// (seconds from the overlay's `start`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -531,6 +780,41 @@ pub fn interpolate(points: &[(f64, f64)], at: f64) -> Option<f64> {
     }
 }
 
+/// Wrap an angle in degrees into `[-180, 180)`.
+pub fn wrap180(deg: f64) -> f64 {
+    if !deg.is_finite() {
+        return 0.0;
+    }
+    let mut d = (deg + 180.0) % 360.0;
+    if d < 0.0 {
+        d += 360.0;
+    }
+    d - 180.0
+}
+
+/// Linearly interpolate an *angular* channel (degrees) at `at`, taking the
+/// shortest arc across the ±180 seam: a 170° → -170° pair travels +20°, not
+/// -340°.
+///
+/// The whole sequence is unwrapped once onto a continuous path before
+/// interpolating, rather than resolving each segment on its own. That matters
+/// because two different callers walk this data — the still / preview path
+/// samples it point by point, while the export emitter marches across it — and
+/// per-segment unwrapping would let them disagree about which way the camera
+/// turned right at the seam. The result is wrapped back into `[-180, 180)`,
+/// since `v360` silently discards a command outside that range.
+pub fn interpolate_angle(points: &[(f64, f64)], at: f64) -> Option<f64> {
+    let (first, rest) = points.split_first()?;
+    let mut unwrapped = Vec::with_capacity(points.len());
+    let mut prev = wrap180(first.1);
+    unwrapped.push((first.0, prev));
+    for &(t, v) in rest {
+        prev += wrap180(v - prev);
+        unwrapped.push((t, prev));
+    }
+    interpolate(&unwrapped, at).map(wrap180)
+}
+
 /// Render a transcript as a SubRip (`.srt`) subtitle document.
 pub fn transcript_to_srt(segments: &[TranscriptSegment]) -> String {
     fn ts(seconds: f64) -> String {
@@ -599,6 +883,11 @@ pub struct Clip {
     /// / opacity over the clip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keyframes: Vec<Keyframe>,
+    /// Reprojection of 360 source footage, when this clip references a spherical
+    /// asset. `None` for ordinary flat video (and for a 360 clip the user has
+    /// explicitly un-reframed, to work in the raw projection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reframe: Option<Reframe>,
 }
 
 /// Smallest speed magnitude allowed, to keep clip durations finite.
@@ -624,7 +913,17 @@ impl Clip {
             effects: Vec::new(),
             audio: Vec::new(),
             keyframes: Vec::new(),
+            reframe: None,
         }
+    }
+
+    /// A new clip that also reframes, when `asset` is 360 footage — the shape
+    /// every clip-creating op should use so a spherical source lands on the
+    /// timeline already looking like ordinary video.
+    pub fn for_asset(asset: &Asset, source_in: f64, source_out: f64, timeline_start: f64) -> Self {
+        let mut clip = Self::new(asset.id, source_in, source_out, timeline_start);
+        clip.reframe = asset.projection().map(Reframe::new);
+        clip
     }
 
     /// True when the clip carries transform keyframes (i.e. is animated).
@@ -668,6 +967,13 @@ impl Clip {
             t.opacity = v;
         }
         t
+    }
+
+    /// Sample the (possibly animated) reframe at `local` seconds from the clip's
+    /// start. `None` when the clip is not reframed. Used by the still / preview
+    /// path, which cannot drive `v360` with runtime commands the way export does.
+    pub fn reframe_at(&self, local: f64) -> Option<ResolvedReframe> {
+        self.reframe.as_ref().map(|r| r.sample(local))
     }
 
     /// Length of the referenced source span (seconds), ignoring speed.
@@ -885,6 +1191,19 @@ impl Timeline {
                             ..*k
                         }));
                         c.keyframes = kfs;
+                    }
+                    // Same resampling for the reframe camera: pin the pose the
+                    // cut lands on, then shift the surviving keyframes back.
+                    // Sampled off `clip`, not `c` — `c`'s source points have
+                    // already moved above.
+                    if let Some(rf) = c.reframe.as_mut().filter(|r| r.is_animated()) {
+                        let pose = clip.reframe_at(cut_front).expect("clip reframes");
+                        let mut kfs = vec![ReframeKeyframe::from_pose(0.0, &pose)];
+                        kfs.extend(rf.keyframes.iter().filter(|k| k.time > cut_front).map(|k| ReframeKeyframe {
+                            time: k.time - cut_front,
+                            ..*k
+                        }));
+                        rf.keyframes = kfs;
                     }
                 }
                 if cut_back > 0.0 {

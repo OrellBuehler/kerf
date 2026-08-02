@@ -154,8 +154,10 @@ the last three return images the model can see.
 
 `set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
 `set_transition` · `set_video_effects` · `set_audio_effects` · `set_keyframes` ·
-`add_keyframe` · `clear_keyframes` · `add_overlay` · `update_overlay` · `remove_overlay` ·
-`set_overlay_keyframes` · `captions_from_transcript` · `export_srt` · `list_fonts`
+`add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
+`set_reframe_keyframes` · `add_reframe_keyframe` · `add_overlay` · `update_overlay` ·
+`remove_overlay` · `set_overlay_keyframes` · `captions_from_transcript` · `export_srt` ·
+`list_fonts`
 </details>
 
 <details>

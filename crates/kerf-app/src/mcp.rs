@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, EditSource, ExportOptions, Keyframe, Project, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, EditSource, ExportOptions, Keyframe, Project, Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition,
+    TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -261,6 +262,69 @@ struct KeyframesParams {
                        the clip; pass [] to clear and use the static transform."
     )]
     keyframes: Vec<Keyframe>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReframeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Camera heading in degrees, wrapping at ±180 (0 = the source's forward direction, 90 = to the \
+                       right); omit to leave unchanged"
+    )]
+    yaw: Option<f64>,
+    #[schemars(description = "Camera elevation in degrees, -90 (straight down) to 90 (straight up); omit to leave unchanged")]
+    pitch: Option<f64>,
+    #[schemars(description = "Horizon tilt in degrees; omit to leave unchanged")]
+    roll: Option<f64>,
+    #[schemars(
+        description = "Diagonal field of view in degrees, 1–359. ~100 is a natural-looking shot, lower zooms in, \
+                       above ~150 goes fisheye-wide; omit to leave unchanged"
+    )]
+    fov: Option<f64>,
+    #[schemars(
+        description = "Field of view of each physical lens in degrees, for a dual_fisheye source only (default 190). \
+                       Tuning this moves the stitch seam; omit to leave unchanged"
+    )]
+    lens_fov: Option<f64>,
+    #[schemars(
+        description = "Override the source's projection when detection got it wrong: \"equirect\", \"dual_fisheye\" or \
+                       \"fisheye\". Required to reframe an asset Kerf did not detect as 360"
+    )]
+    input: Option<Projection>,
+    #[schemars(
+        description = "What to render: \"flat\" (default — an ordinary rectilinear shot) or \"equirect\" (stitch a \
+                       dual-fisheye source without choosing a direction)"
+    )]
+    output: Option<Projection>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReframeKeyframesParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Camera keyframes (replaces the clip's animation). Each: {\"time\":seconds_from_clip_start, \
+                       \"yaw\":0.0,\"pitch\":0.0,\"roll\":0.0,\"fov\":100.0}. Two or more pan the virtual camera over \
+                       the clip; pass [] to clear and hold the static pose."
+    )]
+    keyframes: Vec<ReframeKeyframe>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddReframeKeyframeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Keyframe time in seconds from the clip's start")]
+    time: f64,
+    #[schemars(description = "Camera heading in degrees at this time; omit to capture the current value")]
+    yaw: Option<f64>,
+    #[schemars(description = "Camera elevation in degrees (-90..90) at this time; omit to capture current")]
+    pitch: Option<f64>,
+    #[schemars(description = "Horizon tilt in degrees at this time; omit to capture current")]
+    roll: Option<f64>,
+    #[schemars(description = "Diagonal field of view in degrees at this time; omit to capture current")]
+    fov: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -782,6 +846,61 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Aim a 360 clip's virtual camera — yaw / pitch / roll / field of view — to render an ordinary \
+                       rectilinear shot out of spherical footage. Clips cut from 360 assets are reframed by default, \
+                       so this adjusts where the camera points. Call preview_timeline first to see the whole sphere \
+                       and decide where the subject is. Omit a field to leave it unchanged."
+    )]
+    fn set_reframe(&self, Parameters(p): Parameters<ReframeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project
+            .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Stop reprojecting a 360 clip, leaving its raw spherical picture (equirect or dual-fisheye) on \
+                       the timeline."
+    )]
+    fn clear_reframe(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.clear_reframe(clip_id).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Replace a 360 clip's camera keyframes to pan the virtual camera over the clip — following a \
+                       subject, whipping between two points of interest, or pushing in by narrowing the field of \
+                       view. Pass an empty list to hold a static pose."
+    )]
+    fn set_reframe_keyframes(&self, Parameters(p): Parameters<ReframeKeyframesParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
+        description = "Add (or replace) one 360 camera keyframe at a time offset from the clip's start; unspecified \
+                       channels capture the camera's current pose there. Two calls pan between two directions."
+    )]
+    fn add_reframe_keyframe(&self, Parameters(p): Parameters<AddReframeKeyframeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let out = project
+            .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
+            .map_err(core_err)?;
+        self.changed();
+        json(&out)
+    }
+
+    #[tool(
         description = "Add a text overlay (title / lower-third / caption / watermark) drawn over the composited picture between start and end (timeline seconds). Returns the overlay; style or animate it with update_overlay / set_overlay_keyframes."
     )]
     fn add_overlay(&self, Parameters(p): Parameters<AddOverlayParams>) -> Result<String, McpError> {
@@ -1183,7 +1302,15 @@ impl ServerHandler for KerfMcp {
              track shows through), set_audio_effects (highpass / lowpass / EQ / \
              compressor / gate), and animate a clip with set_keyframes / \
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
-             Burns zoom, a moving picture-in-picture). Add titles, lower-thirds \
+             Burns zoom, a moving picture-in-picture). 360 footage (Insta360 \
+             .insv, equirect exports) is detected on import and clips cut from it \
+             are reframed to an ordinary rectilinear shot automatically: aim the \
+             virtual camera with set_reframe (yaw / pitch / roll / field of view) \
+             and pan it with add_reframe_keyframe / set_reframe_keyframes, or drop \
+             back to the raw sphere with clear_reframe. You can see the whole \
+             sphere with skim_asset / get_frame and the framed result with \
+             preview_timeline, so look first, then point the camera at whatever \
+             the shot is actually about. Add titles, lower-thirds \
              and captions with add_overlay / update_overlay / set_overlay_keyframes \
              (drawn over the cut; list_fonts lists installed system fonts to pass \
              as update_overlay's font), or captions_from_transcript to caption an \

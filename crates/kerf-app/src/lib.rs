@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Revision, StreamKind, Task, TextKeyframe,
-    Timeline, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Projection, ReframeKeyframe, Revision,
+    StreamKind, Task, TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -536,6 +536,61 @@ fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Tim
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn set_reframe(
+    state: State<'_, AppState>,
+    clip_id: String,
+    yaw: Option<f64>,
+    pitch: Option<f64>,
+    roll: Option<f64>,
+    fov: Option<f64>,
+    lens_fov: Option<f64>,
+    input: Option<Projection>,
+    output: Option<Projection>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project
+        .set_reframe(id, yaw, pitch, roll, fov, lens_fov, input, output)
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn clear_reframe(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.clear_reframe(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn set_reframe_keyframes(state: State<'_, AppState>, clip_id: String, keyframes: Vec<ReframeKeyframe>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_reframe_keyframes(id, keyframes).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn add_reframe_keyframe(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    yaw: Option<f64>,
+    pitch: Option<f64>,
+    roll: Option<f64>,
+    fov: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project
+        .add_reframe_keyframe(id, time, yaw, pitch, roll, fov)
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn add_overlay(state: State<'_, AppState>, text: String, start: f64, end: f64) -> CmdResult<Timeline> {
     let project = state.project();
     project.add_overlay(text, start, end).map_err(|e| e.to_string())?;
@@ -1016,6 +1071,10 @@ pub fn run() {
             set_keyframes,
             add_keyframe,
             clear_keyframes,
+            set_reframe,
+            clear_reframe,
+            set_reframe_keyframes,
+            add_reframe_keyframe,
             add_overlay,
             update_overlay,
             remove_overlay,
