@@ -68,10 +68,11 @@ makes shows up **live** in your timeline for you to review.
 | **Analysis** | FFmpeg `silencedetect`, scene detection, audio energy/**beat** grid, and waveforms — all CLI-driven. Optional local **Whisper** transcription. |
 | **Effects & color** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, plus transform + color grade. |
 | **Keyframe animation** | Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead. |
+| **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. Spherical sources are detected on import; anything unflagged can be reframed manually. |
 | **Titles & captions** | Text overlays / lower-thirds with their own keyframes, and one-click **captions from a transcript** (SRT export too). |
 | **Smart mixing** | Per-track **ducking** (music dips under dialogue via sidechain) and single-pass **loudnorm** to −14 LUFS on export. |
 | **Export** | Positional, multi-track `filter_complex` with progress + cancel; **range export** renders just the region between your in/out marks. |
-| **Agent workflow** | 55 MCP tools, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **Agent workflow** | 59 MCP tools, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
 
 <div align="center">
 
@@ -130,7 +131,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (55)
+### The tools (59)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -164,7 +165,7 @@ the last three return images the model can see.
 <summary><b>Render & hand-off</b></summary>
 
 `export` · `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
-`history` · `undo` · `redo` · `revert_to`
+`resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to`
 </details>
 
 Every mutating tool emits a `project-changed` event, so edits appear in the GUI as the
