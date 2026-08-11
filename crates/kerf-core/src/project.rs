@@ -1681,9 +1681,7 @@ impl Project {
             ));
         }
         if output.is_some_and(|p| !matches!(p, Projection::Flat | Projection::Equirect)) {
-            return Err(Error::InvalidArgument(
-                "reframe output must be flat or equirect".to_string(),
-            ));
+            return Err(Error::InvalidArgument("reframe output must be flat or equirect".to_string()));
         }
         let fallback = self.clip_asset_projection(clip_id)?;
         self.edit_timeline("Set reframe", move |timeline| {
@@ -2415,7 +2413,9 @@ mod tests {
             .unwrap();
         assert!(panned.reframe.as_ref().unwrap().is_animated());
         // Re-adding at the same time replaces rather than duplicates.
-        let replaced = project.add_reframe_keyframe(clip.id, 0.0, Some(0.0), None, None, None).unwrap();
+        let replaced = project
+            .add_reframe_keyframe(clip.id, 0.0, Some(0.0), None, None, None)
+            .unwrap();
         assert_eq!(replaced.reframe.as_ref().unwrap().keyframes.len(), 2);
 
         // Out-of-range field of view is refused up front, since v360 would

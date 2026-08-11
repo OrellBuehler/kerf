@@ -4581,7 +4581,11 @@ mod tests {
         let guard = externalize_filter_complex(&mut spilled, "test").unwrap();
         assert_eq!(spilled[i - 1], "-filter_complex_script");
         let path = std::path::PathBuf::from(&spilled[i]);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), args[i], "the graph is written verbatim");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            args[i],
+            "the graph is written verbatim"
+        );
         drop(guard);
         assert!(!path.exists(), "the script is cleaned up after the render");
     }
@@ -4609,10 +4613,7 @@ mod tests {
         // false positive would silently reproject real footage, so only an
         // Insta360 extension unlocks the geometry signal.
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":5760,"height":2880,"r_frame_rate":"30/1"}],"format":{"duration":"20.0"}}"#;
-        let r = probe_from_json(
-            serde_json::from_str(json).unwrap(),
-            Some(Path::new("/media/ultrawide.mp4")),
-        );
+        let r = probe_from_json(serde_json::from_str(json).unwrap(), Some(Path::new("/media/ultrawide.mp4")));
         assert_eq!(r.streams[0].projection, None);
     }
 
