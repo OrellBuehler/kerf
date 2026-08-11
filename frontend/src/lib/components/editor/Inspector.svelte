@@ -9,6 +9,7 @@
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import type {
 		AudioEffect,
+		Projection,
 		Reframe,
 		Transform,
 		TransitionKind,
@@ -68,6 +69,12 @@
 	const reframe = $derived(clip?.reframe ?? null);
 	const reframeKeys = $derived(reframe?.keyframes ?? []);
 	const sourceProjection = $derived(asset?.streams.find((s) => s.projection)?.projection ?? null);
+	// Detection is deliberately conservative — a `Spherical Mapping` tag or an
+	// Insta360 file packed as two squares, never a bare 2:1 guess. Footage that
+	// carries neither signal (a stripped remux, a per-lens .insv, an unflagged
+	// equirect export) would otherwise be unreachable from the GUI, so the panel
+	// always offers the same `input` override the MCP `set_reframe` tool has.
+	let manualProjection = $state<Projection>('equirect');
 	/** Angular lerp along the shortest arc, matching the engine so the sliders
 	 *  agree with what renders. The plain `lerp` above would read a 170° → -170°
 	 *  pan as a 340° swing backwards. */
@@ -598,7 +605,7 @@
 				/>
 			</label>
 
-			{#if kind === 'video' && (reframe || sourceProjection)}
+			{#if kind === 'video'}
 				{@render secHead(reframeKeys.length ? '360 reframe · keyframing @ playhead' : '360 reframe')}
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
@@ -647,7 +654,7 @@
 							onclick={() => run(() => editor.clearReframe(clip.id))}>×</button
 						>
 					</div>
-				{:else}
+				{:else if sourceProjection}
 					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
 						360 source ({sourceProjection === 'dual_fisheye' ? 'dual fisheye' : sourceProjection}),
 						shown raw.
@@ -656,6 +663,30 @@
 						size="sm"
 						disabled={editor.busy}
 						onclick={() => run(() => editor.setReframe(clip.id, { input: sourceProjection! }))}
+						>Reframe to flat</Btn
+					>
+				{:else}
+					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
+						Not detected as 360. If this really is spherical footage, pick how the source is
+						packed and reframe it anyway.
+					</p>
+					<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+						<span style="font-size:12px;color:var(--text-muted)">Source is</span>
+						<select
+							value={manualProjection}
+							disabled={editor.busy}
+							onchange={(e) => (manualProjection = e.currentTarget.value as Projection)}
+							style={selectCss}
+						>
+							<option value="equirect">Equirectangular</option>
+							<option value="dual_fisheye">Dual fisheye</option>
+							<option value="fisheye">Fisheye</option>
+						</select>
+					</label>
+					<Btn
+						size="sm"
+						disabled={editor.busy}
+						onclick={() => run(() => editor.setReframe(clip.id, { input: manualProjection }))}
 						>Reframe to flat</Btn
 					>
 				{/if}
