@@ -40,6 +40,10 @@ import {
 	removeSilence,
 	removeTrack,
 	setTrackDuck,
+	setTrackMuted,
+	setTrackSolo,
+	setTrackLocked,
+	setClipEnabled,
 	reorderClip,
 	rippleDelete,
 	cutClipRange,
@@ -353,6 +357,18 @@ class EditorState {
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
 		return this.#apply(setTrackDuck(trackId, duck));
+	}
+	setTrackMuted(trackId: string, muted: boolean) {
+		return this.#apply(setTrackMuted(trackId, muted));
+	}
+	setTrackSolo(trackId: string, solo: boolean) {
+		return this.#apply(setTrackSolo(trackId, solo));
+	}
+	setTrackLocked(trackId: string, locked: boolean) {
+		return this.#apply(setTrackLocked(trackId, locked));
+	}
+	setClipEnabled(clipId: string, enabled: boolean) {
+		return this.#apply(setClipEnabled(clipId, enabled));
 	}
 	setVolume(clipId: string, volume: number) {
 		return this.#apply(setVolume(clipId, volume));

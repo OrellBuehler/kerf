@@ -37,6 +37,21 @@
 		return t.kind === 'video' ? 'var(--track-h-video)' : 'var(--track-h-audio)';
 	}
 
+	/** Shared look for the one-letter S / L track flags. */
+	const flagBtn = (on: boolean, accent: string) =>
+		`flex:none;font-family:var(--font-mono);font-size:9px;font-weight:700;line-height:1;padding:2px 3px;border-radius:3px;cursor:pointer;` +
+		`border:1px solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? '#0b0b0c' : 'var(--text-disabled)'}`;
+
+	/** A locked track refuses drag, trim and razor — the point of locking it. */
+	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
+
+	/** Mirrors `Timeline::track_renders` in kerf-core: muted tracks never render,
+	 *  and while any track of a kind is soloed only the soloed ones of that kind do. */
+	const soloed = $derived(
+		new Set(editor.timeline.tracks.filter((t) => t.solo).map((t) => t.kind as string))
+	);
+	const renders = (t: Track) => !t.muted && (!soloed.has(t.kind) || !!t.solo);
+
 	// ---- analysis overlays mapped from source-time to timeline-time ----------
 
 	/** Timeline-seconds position of a source-time point inside a clip, honoring
@@ -195,6 +210,7 @@
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
+		if (t.locked) return;
 		e.stopPropagation();
 		editor.selectedClipId = c.id;
 		void editor.select(c.asset_id);
@@ -303,6 +319,14 @@
 		if (e.button !== 0) return;
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
+		if (t.locked) {
+			// Still selectable and seekable — locking guards the edit, not the view.
+			e.stopPropagation();
+			editor.selectedClipId = c.id;
+			void editor.select(c.asset_id);
+			ui.seek(laneTime(e.clientX, laneLeft));
+			return;
+		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
 			const at = Math.max(c.timeline_start + 0.05, laneTime(e.clientX, laneLeft));
@@ -383,7 +407,7 @@
 		const lane = laneUnder(e.clientX, e.clientY);
 		let trackId = drag.trackId;
 		let laneLeft: number;
-		if (lane && lane.dataset.kind === drag.kind) {
+		if (lane && lane.dataset.kind === drag.kind && !isLocked(lane.dataset.trackId!)) {
 			trackId = lane.dataset.trackId!;
 			laneLeft = lane.getBoundingClientRect().left;
 		} else {
@@ -455,7 +479,7 @@
 
 	function onLaneDragOver(e: DragEvent, t: Track) {
 		const a = ui.dndAsset;
-		if (!a || a.kind !== t.kind) {
+		if (!a || a.kind !== t.kind || t.locked) {
 			dropGhost = null; // wrong-kind track: not a drop target
 			return;
 		}
@@ -480,6 +504,10 @@
 		dropGhost = null;
 		ui.dndAsset = null;
 		if (!a || a.kind !== t.kind) return;
+		if (t.locked) {
+			toast.error(`Track ${t.name} is locked`);
+			return;
+		}
 		e.preventDefault();
 		const start = dropStart(e, t, a.duration);
 		if (wouldOverlap(t.id, start, a.duration)) {
@@ -527,6 +555,21 @@
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
 			{ type: 'separator' },
+			{
+				label: t.muted ? (t.kind === 'video' ? 'Show track' : 'Unmute track') : t.kind === 'video' ? 'Hide track' : 'Mute track',
+				icon: t.muted ? 'eye' : 'eye-off',
+				action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
+			},
+			{
+				label: t.solo ? 'Clear solo' : 'Solo track',
+				action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
+			},
+			{
+				label: t.locked ? 'Unlock track' : 'Lock track',
+				icon: 'lock',
+				action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
+			},
+			{ type: 'separator' },
 			{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }
 		];
 	}
@@ -535,13 +578,20 @@
 		editor.selectedClipId = c.id;
 		void editor.select(c.asset_id);
 		const within = ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c);
+		const enabled = c.enabled !== false;
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
 				icon: 'Scissors',
 				shortcut: 'C',
-				disabled: !within,
+				disabled: !within || !!t.locked,
 				action: () => void editor.split(c.id, ui.time).catch(err)
+			},
+			{
+				label: enabled ? 'Disable clip' : 'Enable clip',
+				icon: enabled ? 'eye-off' : 'eye',
+				disabled: !!t.locked,
+				action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
 			},
 			{ type: 'separator' },
 			{
@@ -817,12 +867,10 @@
 						style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text-secondary);flex:none"
 						>{t.name}</span
 					>
-					<!-- min-width:0 so the label yields first; an audio row's DUCK + icons
-					     otherwise overflow the fixed-width column and spill over the lanes. -->
-					<span
-						style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-						>{t.kind === 'video' ? 'Video' : 'Audio'}</span
-					>
+					<!-- No "Video"/"Audio" caption: the name (V1 / A1) and the eye vs
+					     speaker icon both already say the kind, and the row now carries
+					     mute / solo / lock / remove in a fixed-width column. -->
+					<span style="flex:1;min-width:0"></span>
 					{#if t.kind === 'audio'}
 						<button
 							title={t.duck
@@ -838,8 +886,35 @@
 							>DUCK</button
 						>
 					{/if}
-					<span style="flex:none;display:grid;place-items:center"
-						><Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" /></span
+					<button
+						title={t.muted
+							? t.kind === 'video'
+								? 'Hidden — click to show'
+								: 'Muted — click to unmute'
+							: t.kind === 'video'
+								? 'Hide this track'
+								: 'Mute this track'}
+						aria-label="Toggle mute"
+						aria-pressed={!!t.muted}
+						onclick={() => void editor.setTrackMuted(t.id, !t.muted).catch(err)}
+						style="background:none;border:none;cursor:pointer;padding:0;flex:none;display:grid;place-items:center;color:{t.muted
+							? 'var(--red-500)'
+							: 'var(--text-disabled)'}"
+						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
+					>
+					<button
+						title={t.solo ? 'Soloed — click to clear' : 'Solo this track'}
+						aria-label="Toggle solo"
+						aria-pressed={!!t.solo}
+						onclick={() => void editor.setTrackSolo(t.id, !t.solo).catch(err)}
+						style={flagBtn(!!t.solo, 'var(--kerf-400)')}>S</button
+					>
+					<button
+						title={t.locked ? 'Locked — click to unlock' : 'Lock this track against edits'}
+						aria-label="Toggle lock"
+						aria-pressed={!!t.locked}
+						onclick={() => void editor.setTrackLocked(t.id, !t.locked).catch(err)}
+						style={flagBtn(!!t.locked, 'var(--kerf-300)')}>L</button
 					>
 					<button
 						title="Remove track"
@@ -955,13 +1030,20 @@
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.selectedClipId === c.id}
 						{@const dragging = drag?.moved && drag.clipId === c.id}
+						{@const off = c.enabled === false || !renders(t)}
 						<button
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 							onclick={(e) => e.stopPropagation()}
-							style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{dragging
-								? 0.4
-								: 1};cursor:{ui.tool === 'razor' ? 'crosshair' : drag ? 'grabbing' : 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+							style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
+								? 'grayscale(1)'
+								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{t.locked
+								? 'not-allowed'
+								: ui.tool === 'razor'
+									? 'crosshair'
+									: drag
+										? 'grabbing'
+										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 						>
 							{#if t.kind === 'audio'}
 								{@const peaks = clipPeaks(c, width)}

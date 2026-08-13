@@ -1839,6 +1839,11 @@ fn build_export_args_phase(
     null_sink: &str,
     passlog: &str,
 ) -> Result<Vec<String>> {
+    // Drop muted / solo-shadowed tracks and disabled clips up front, so the rest
+    // of the builder never has to reason about them.
+    let rendered = timeline.for_render();
+    let timeline = &rendered;
+
     // Range export: build the graph against the sliced sub-timeline, so trims,
     // fades, keyframes and overlays all see the same shifted geometry.
     let sliced;
@@ -3433,6 +3438,10 @@ fn build_timeline_frame_args(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<String>> {
+    // Same gate as the export, so the still shows the cut that would render.
+    let rendered = timeline.for_render();
+    let timeline = &rendered;
+
     let fmt = export_format(timeline, assets, opts);
     // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
     let ow = (max_width.min(fmt.width).max(2)) & !1;
@@ -4153,21 +4162,15 @@ mod tests {
 
     fn video_track(clips: Vec<Clip>) -> Track {
         Track {
-            id: Uuid::new_v4(),
-            kind: StreamKind::Video,
-            name: "V1".into(),
             clips,
-            duck: false,
+            ..Track::new(StreamKind::Video, "V1")
         }
     }
 
     fn audio_track(clips: Vec<Clip>) -> Track {
         Track {
-            id: Uuid::new_v4(),
-            kind: StreamKind::Audio,
-            name: "A1".into(),
             clips,
-            duck: false,
+            ..Track::new(StreamKind::Audio, "A1")
         }
     }
 
@@ -4181,6 +4184,63 @@ mod tests {
     /// A timeline with a single video track holding `clips`.
     fn single(clips: Vec<Clip>) -> Timeline {
         timeline_of(vec![video_track(clips)])
+    }
+
+    // ---- mute / solo / clip-enable gating ----------------------------------
+
+    /// The graph builders take the timeline through `Timeline::for_render`, so a
+    /// muted track or a disabled clip must never reach argv. Tested here rather
+    /// than only on the model, because the failure mode is a *missing call*.
+    #[test]
+    fn muted_tracks_and_disabled_clips_never_reach_the_export_args() {
+        let keep = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        // Distinct paths: `test_asset` reuses one, which would make the assertion vacuous.
+        let drop = Asset {
+            path: "/gated.mp4".into(),
+            ..test_asset(vec![video_stream(1920, 1080, 30.0)])
+        };
+        let assets = vec![keep.clone(), drop.clone()];
+
+        let mut disabled = make_clip(drop.id, 0.0, 4.0, 10.0);
+        disabled.enabled = false;
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(keep.id, 0.0, 5.0, 0.0), disabled]),
+            Track {
+                muted: true,
+                ..video_track(vec![make_clip(drop.id, 0.0, 6.0, 0.0)])
+            },
+        ]);
+
+        let args = build_export_args(&timeline, &assets, "/out.mp4", &ExportOptions::default()).unwrap();
+        let argv = args.join(" ");
+        assert!(argv.contains(&keep.path), "the kept clip's input is missing");
+        assert!(
+            !argv.contains(&drop.path),
+            "a muted track and a disabled clip both still reached argv: {argv}"
+        );
+    }
+
+    /// Soloing gates by kind, and the still path must agree with the export.
+    #[test]
+    fn solo_gates_the_timeline_still_by_kind() {
+        let a = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let b = Asset {
+            path: "/soloed.mp4".into(),
+            ..test_asset(vec![video_stream(1920, 1080, 30.0)])
+        };
+        let assets = vec![a.clone(), b.clone()];
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 5.0, 0.0)]),
+            Track {
+                solo: true,
+                ..video_track(vec![make_clip(b.id, 0.0, 5.0, 0.0)])
+            },
+        ]);
+
+        let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 2.0, 960, 4).unwrap();
+        let argv = args.join(" ");
+        assert!(argv.contains(&b.path), "the soloed track should be the one shown");
+        assert!(!argv.contains(&a.path), "an unsoloed track leaked into the still: {argv}");
     }
 
     // ---- per-clip video / audio effects, keyframes, text overlays -----------

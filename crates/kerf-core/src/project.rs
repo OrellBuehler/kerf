@@ -1062,13 +1062,7 @@ impl Project {
                 let prefix = if kind == StreamKind::Audio { "A" } else { "V" };
                 format!("{prefix}{}", count + 1)
             });
-            let track = Track {
-                id: Uuid::new_v4(),
-                kind,
-                name,
-                clips: Vec::new(),
-                duck: false,
-            };
+            let track = Track::new(kind, name);
             // Insert video tracks just after the last video track and audio
             // tracks at the very end, so the lanes stay grouped (V1, V2, …, A1, A2).
             let at = match kind {
@@ -1093,6 +1087,46 @@ impl Project {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
             track.duck = duck;
             Ok(track.clone())
+        })
+    }
+
+    /// Mute or unmute a track: its clips stop rendering (silent for audio,
+    /// hidden for video) while keeping their place on the timeline.
+    pub fn set_track_muted(&self, track_id: Uuid, muted: bool) -> Result<Track> {
+        self.edit_timeline(if muted { "Mute track" } else { "Unmute track" }, |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.muted = muted;
+            Ok(track.clone())
+        })
+    }
+
+    /// Solo or unsolo a track. While any track of a kind is soloed, the other
+    /// tracks of that kind stop rendering; several may be soloed at once.
+    pub fn set_track_solo(&self, track_id: Uuid, solo: bool) -> Result<Track> {
+        self.edit_timeline(if solo { "Solo track" } else { "Unsolo track" }, |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.solo = solo;
+            Ok(track.clone())
+        })
+    }
+
+    /// Lock or unlock a track against editing. A locked track still renders;
+    /// this only guards its clips from being moved, trimmed or split.
+    pub fn set_track_locked(&self, track_id: Uuid, locked: bool) -> Result<Track> {
+        self.edit_timeline(if locked { "Lock track" } else { "Unlock track" }, |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.locked = locked;
+            Ok(track.clone())
+        })
+    }
+
+    /// Enable or disable a single clip. A disabled clip keeps its position,
+    /// trims, effects and keyframes but drops out of the render.
+    pub fn set_clip_enabled(&self, clip_id: Uuid, enabled: bool) -> Result<Clip> {
+        self.edit_timeline(if enabled { "Enable clip" } else { "Disable clip" }, |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].enabled = enabled;
+            Ok(timeline.tracks[ti].clips[ci].clone())
         })
     }
 
@@ -2429,6 +2463,44 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let moved = timeline.clip(b.id).unwrap();
         assert!((moved.timeline_start - 8.0).abs() < 1e-9, "{}", moved.timeline_start);
+    }
+
+    #[test]
+    fn mute_solo_lock_and_clip_enable_persist_and_gate_the_render() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 5.0).unwrap();
+        let tl = project.timeline().unwrap();
+        let vid = tl.tracks.iter().find(|t| t.kind == StreamKind::Video).unwrap().id;
+
+        // Each flag round-trips through the JSON blob independently.
+        assert!(project.set_track_muted(vid, true).unwrap().muted);
+        assert!(project.set_track_solo(vid, true).unwrap().solo);
+        assert!(project.set_track_locked(vid, true).unwrap().locked);
+        let saved = project.timeline().unwrap();
+        let t = saved.track(vid).unwrap();
+        assert!(t.muted && t.solo && t.locked);
+
+        // Muted wins over soloed, so nothing reaches the graph.
+        assert!(saved.for_render().track(vid).unwrap().clips.is_empty());
+
+        // Unmuting brings it back; locking is an editing guard, not a render gate.
+        project.set_track_muted(vid, false).unwrap();
+        let saved = project.timeline().unwrap();
+        assert_eq!(saved.for_render().track(vid).unwrap().clips.len(), 1);
+
+        // Disabling the clip drops it while leaving it on the timeline.
+        assert!(!project.set_clip_enabled(clip.id, false).unwrap().enabled);
+        let saved = project.timeline().unwrap();
+        assert_eq!(saved.track(vid).unwrap().clips.len(), 1, "still on the timeline");
+        assert!(saved.for_render().track(vid).unwrap().clips.is_empty(), "but not rendered");
+
+        // Every one of those was a labelled, revertible edit.
+        let labels: Vec<_> = project.history().unwrap().iter().map(|r| r.label.clone()).collect();
+        for want in ["Mute track", "Solo track", "Lock track", "Unmute track", "Disable clip"] {
+            assert!(labels.contains(&want.to_string()), "missing {want} in {labels:?}");
+        }
     }
 
     #[test]

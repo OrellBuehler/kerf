@@ -894,6 +894,19 @@ pub struct Clip {
     /// explicitly un-reframed, to work in the raw projection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reframe: Option<Reframe>,
+    /// Whether this clip renders. A disabled clip keeps its place on the
+    /// timeline (and its trims, effects and keyframes) but is dropped before the
+    /// render graph is built — the per-clip counterpart of muting a track.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 /// Smallest speed magnitude allowed, to keep clip durations finite.
@@ -920,6 +933,7 @@ impl Clip {
             audio: Vec::new(),
             keyframes: Vec::new(),
             reframe: None,
+            enabled: true,
         }
     }
 
@@ -1016,6 +1030,19 @@ pub struct Track {
     /// music bed dips automatically under dialogue.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub duck: bool,
+    /// Silenced (audio) or hidden (video) — the track's clips are dropped before
+    /// the render graph is built, so it neither exports nor previews.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+    /// Soloed. While any track of a kind is soloed, the others of that kind are
+    /// treated as muted. Kinds solo independently, so soloing a music bed does
+    /// not blank the picture.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub solo: bool,
+    /// Locked against editing. Purely an editing guard — a locked track still
+    /// renders; the GUI refuses to drag, trim or razor its clips.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     pub kind: StreamKind,
     pub name: String,
     #[serde(default)]
@@ -1023,6 +1050,20 @@ pub struct Track {
 }
 
 impl Track {
+    /// An empty track: not ducked, muted, soloed or locked.
+    pub fn new(kind: StreamKind, name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            duck: false,
+            muted: false,
+            solo: false,
+            locked: false,
+            kind,
+            name: name.into(),
+            clips: Vec::new(),
+        }
+    }
+
     /// End time of the last clip on this track (seconds).
     pub fn end(&self) -> f64 {
         self.clips.iter().map(Clip::timeline_end).fold(0.0, f64::max)
@@ -1096,22 +1137,7 @@ impl Timeline {
     /// A fresh timeline with one video and one audio track.
     pub fn new() -> Self {
         Self {
-            tracks: vec![
-                Track {
-                    id: Uuid::new_v4(),
-                    kind: StreamKind::Video,
-                    name: "V1".to_string(),
-                    clips: Vec::new(),
-                    duck: false,
-                },
-                Track {
-                    id: Uuid::new_v4(),
-                    kind: StreamKind::Audio,
-                    name: "A1".to_string(),
-                    clips: Vec::new(),
-                    duck: false,
-                },
-            ],
+            tracks: vec![Track::new(StreamKind::Video, "V1"), Track::new(StreamKind::Audio, "A1")],
             overlays: Vec::new(),
         }
     }
@@ -1152,6 +1178,49 @@ impl Timeline {
         self.tracks.iter().map(Track::end).fold(0.0, f64::max)
     }
 
+    /// Whether any track of `kind` is soloed. While one is, the rest of that
+    /// kind are silent/hidden — and the kinds solo independently, so soloing a
+    /// music bed does not blank the picture.
+    pub fn has_solo(&self, kind: StreamKind) -> bool {
+        self.tracks.iter().any(|t| t.kind == kind && t.solo)
+    }
+
+    /// Whether this track's clips reach the render at all: muted tracks never
+    /// do, and while any track of its kind is soloed, only the soloed ones do.
+    pub fn track_renders(&self, track: &Track) -> bool {
+        !track.muted && (!self.has_solo(track.kind) || track.solo)
+    }
+
+    /// The timeline as it should actually be rendered: muted (and solo-shadowed)
+    /// tracks and disabled clips removed.
+    ///
+    /// Filtering here rather than inside the graph builders is deliberate. The
+    /// export and still paths index clips by a flat position that `plan_inputs`,
+    /// the `ClipFx` table and every `[v{n}]` label agree on, so dropping clips
+    /// mid-graph would mean renumbering all of it. Handing those builders a
+    /// timeline that simply does not contain the silenced clips keeps them — and
+    /// their tests — untouched.
+    ///
+    /// Empty tracks are kept: a track carries `duck`, which the audio mix reads
+    /// even when the track contributes nothing.
+    pub fn for_render(&self) -> Timeline {
+        Timeline {
+            tracks: self
+                .tracks
+                .iter()
+                .map(|track| Track {
+                    clips: if self.track_renders(track) {
+                        track.clips.iter().filter(|c| c.enabled).cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    ..track.clone()
+                })
+                .collect(),
+            overlays: self.overlays.clone(),
+        }
+    }
+
     /// A copy containing only `[start, end)`, shifted so `start` lands at 0 —
     /// the sub-timeline a range export renders. Clips overlapping the window
     /// edges are cut down (source window and keyframes adjusted, honoring speed
@@ -1166,11 +1235,8 @@ impl Timeline {
         };
         for track in &self.tracks {
             let mut t = Track {
-                id: track.id,
-                kind: track.kind,
-                name: track.name.clone(),
                 clips: Vec::new(),
-                duck: track.duck,
+                ..track.clone()
             };
             for clip in &track.clips {
                 let (cs, ce) = (clip.timeline_start, clip.timeline_end());
@@ -1306,4 +1372,125 @@ pub struct Task {
     pub result: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip_at(start: f64, dur: f64) -> Clip {
+        Clip::new(Uuid::new_v4(), 0.0, dur, start)
+    }
+
+    fn track(kind: StreamKind, name: &str, clips: Vec<Clip>) -> Track {
+        Track {
+            clips,
+            ..Track::new(kind, name)
+        }
+    }
+
+    #[test]
+    fn for_render_drops_muted_tracks_and_disabled_clips() {
+        let mut disabled = clip_at(0.0, 2.0);
+        disabled.enabled = false;
+        let tl = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0), disabled]),
+                Track {
+                    muted: true,
+                    ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)])
+                },
+            ],
+            overlays: Vec::new(),
+        };
+        let r = tl.for_render();
+        // The disabled clip is gone but the enabled one stays.
+        assert_eq!(r.tracks[0].clips.len(), 1);
+        // A muted track keeps its row (it still carries `duck`) but loses its clips.
+        assert_eq!(r.tracks.len(), 2);
+        assert!(r.tracks[1].clips.is_empty());
+        // Filtering never touches the original.
+        assert_eq!(tl.tracks[0].clips.len(), 2);
+    }
+
+    #[test]
+    fn solo_shadows_other_tracks_of_the_same_kind_only() {
+        let tl = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)]),
+                Track {
+                    solo: true,
+                    ..track(StreamKind::Video, "V2", vec![clip_at(0.0, 2.0)])
+                },
+                track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)]),
+            ],
+            overlays: Vec::new(),
+        };
+        let r = tl.for_render();
+        assert!(r.tracks[0].clips.is_empty(), "unsoloed video track is shadowed");
+        assert_eq!(r.tracks[1].clips.len(), 1, "soloed video track renders");
+        // Soloing a video track must not blank unrelated audio.
+        assert_eq!(r.tracks[2].clips.len(), 1, "audio is unaffected by a video solo");
+    }
+
+    #[test]
+    fn a_muted_track_stays_muted_even_when_soloed() {
+        let tl = Timeline {
+            tracks: vec![Track {
+                muted: true,
+                solo: true,
+                ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)])
+            }],
+            overlays: Vec::new(),
+        };
+        assert!(tl.for_render().tracks[0].clips.is_empty());
+    }
+
+    #[test]
+    fn for_render_is_a_no_op_on_an_untouched_timeline() {
+        let tl = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0), clip_at(2.0, 1.0)]),
+                track(StreamKind::Audio, "A1", vec![clip_at(0.0, 3.0)]),
+            ],
+            overlays: Vec::new(),
+        };
+        let r = tl.for_render();
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            serde_json::to_string(&tl).unwrap(),
+            "an ordinary timeline must reach the graph builders unchanged"
+        );
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_for_clips_saved_before_the_field_existed() {
+        // Old projects have no `enabled` key; they must not silently stop rendering.
+        let clip: Clip = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001",
+                "asset_id":"00000000-0000-0000-0000-000000000002",
+                "source_in":0.0,"source_out":1.0,"timeline_start":0.0,"volume":1.0}"#,
+        )
+        .unwrap();
+        assert!(clip.enabled);
+        let t: Track =
+            serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000003","kind":"video","name":"V1","clips":[]}"#)
+                .unwrap();
+        assert!(!t.muted && !t.solo && !t.locked);
+    }
+
+    #[test]
+    fn slice_carries_track_flags_through() {
+        let tl = Timeline {
+            tracks: vec![Track {
+                muted: true,
+                locked: true,
+                duck: true,
+                ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 10.0)])
+            }],
+            overlays: Vec::new(),
+        };
+        let s = tl.slice(2.0, 6.0);
+        assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);
+    }
 }

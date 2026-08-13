@@ -568,6 +568,46 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 	return invoke<Timeline>('set_track_duck', { trackId, duck });
 }
 
+export async function setTrackMuted(trackId: string, muted: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.muted = muted;
+		recordDev(muted ? 'Mute track' : 'Unmute track');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_muted', { trackId, muted });
+}
+
+export async function setTrackSolo(trackId: string, solo: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.solo = solo;
+		recordDev(solo ? 'Solo track' : 'Unsolo track');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_solo', { trackId, solo });
+}
+
+export async function setTrackLocked(trackId: string, locked: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.locked = locked;
+		recordDev(locked ? 'Lock track' : 'Unlock track');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_locked', { trackId, locked });
+}
+
+export async function setClipEnabled(clipId: string, enabled: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].enabled = enabled;
+		recordDev(enabled ? 'Enable clip' : 'Disable clip');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_clip_enabled', { clipId, enabled });
+}
+
 export async function setVolume(clipId: string, volume: number): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);

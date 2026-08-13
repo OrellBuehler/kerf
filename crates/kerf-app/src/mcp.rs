@@ -149,6 +149,38 @@ struct SetTrackDuckParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackMutedParams {
+    #[schemars(description = "UUID of the track to mute or unmute")]
+    track_id: String,
+    #[schemars(description = "true to silence (audio) or hide (video) this track, false to restore it")]
+    muted: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackSoloParams {
+    #[schemars(description = "UUID of the track to solo or unsolo")]
+    track_id: String,
+    #[schemars(description = "true to solo this track, false to clear its solo")]
+    solo: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackLockedParams {
+    #[schemars(description = "UUID of the track to lock or unlock")]
+    track_id: String,
+    #[schemars(description = "true to guard this track's clips against edits, false to unlock")]
+    locked: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetClipEnabledParams {
+    #[schemars(description = "UUID of the clip to enable or disable")]
+    clip_id: String,
+    #[schemars(description = "false to drop this clip from the render while leaving it on the timeline")]
+    enabled: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct VolumeParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -712,6 +744,56 @@ impl KerfMcp {
         let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
         self.changed();
         json(&track)
+    }
+
+    #[tool(
+        description = "Mute (or unmute) a track: its clips stop rendering — silent for audio, hidden for \
+                       video — while keeping their place on the timeline. Use this to audition a cut \
+                       without a music bed, or to park B-roll without deleting it."
+    )]
+    fn set_track_muted(&self, Parameters(p): Parameters<SetTrackMutedParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Solo (or unsolo) a track. While any track of a kind is soloed, the other tracks of \
+                       that kind stop rendering; video and audio solo independently, so soloing a music \
+                       bed does not blank the picture. Several tracks may be soloed at once."
+    )]
+    fn set_track_solo(&self, Parameters(p): Parameters<SetTrackSoloParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Lock (or unlock) a track against editing. A locked track still renders; the GUI \
+                       refuses to drag, trim or split its clips."
+    )]
+    fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Enable or disable one clip. A disabled clip keeps its position, trims, effects and \
+                       keyframes but drops out of the render — the reversible way to try a cut without it."
+    )]
+    fn set_clip_enabled(&self, Parameters(p): Parameters<SetClipEnabledParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
+        self.changed();
+        json(&clip)
     }
 
     #[tool(description = "Remove a clip from the timeline")]

@@ -208,6 +208,8 @@ export interface Clip {
 	keyframes?: Keyframe[];
 	/** 360 reprojection; absent for ordinary flat footage. */
 	reframe?: Reframe | null;
+	/** Whether the clip renders. Absent means enabled (the backend omits it when true). */
+	enabled?: boolean;
 }
 
 export const DEFAULT_TRANSFORM: Transform = {
@@ -242,6 +244,12 @@ export interface Track {
 	clips: Clip[];
 	/** Ducked under the rest of the mix on export (sidechain compression). */
 	duck?: boolean;
+	/** Silenced (audio) or hidden (video) — the track's clips do not render. */
+	muted?: boolean;
+	/** Soloed. While any track of a kind is soloed, the rest of that kind are shadowed. */
+	solo?: boolean;
+	/** Guarded against editing. A locked track still renders. */
+	locked?: boolean;
 }
 
 export interface Timeline {

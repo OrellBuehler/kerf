@@ -413,6 +413,38 @@ fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> C
 }
 
 #[tauri::command(async)]
+fn set_track_muted(state: State<'_, AppState>, track_id: String, muted: bool) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_muted(id, muted).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn set_track_solo(state: State<'_, AppState>, track_id: String, solo: bool) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_solo(id, solo).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn set_track_locked(state: State<'_, AppState>, track_id: String, locked: bool) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_locked(id, locked).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enabled: bool) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_clip_enabled(id, enabled).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
@@ -1105,6 +1137,10 @@ pub fn run() {
             add_track,
             remove_track,
             set_track_duck,
+            set_track_muted,
+            set_track_solo,
+            set_track_locked,
+            set_clip_enabled,
             remove_clip,
             set_volume,
             set_fade,

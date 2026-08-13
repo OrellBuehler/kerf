@@ -48,8 +48,14 @@ class AudioEngine {
 		if (ctx.state === 'suspended') void ctx.resume();
 		const session: Session = { anchorTime: t, anchorCtx: ctx.currentTime, rate, nodes: [] };
 		this.#session = session;
+		// Mirrors `Timeline::track_renders` in kerf-core, so what is heard matches
+		// what would export: a muted track is silent, and while any audio track is
+		// soloed only the soloed ones play.
+		const anySolo = timeline.tracks.some((t) => t.kind === 'audio' && t.solo);
 		for (const track of timeline.tracks) {
+			if (track.muted || (anySolo && track.kind === 'audio' && !track.solo)) continue;
 			for (const clip of track.clips) {
+				if (clip.enabled === false) continue;
 				if (!audioAssets.has(clip.asset_id)) continue;
 				const dur = (clip.source_out - clip.source_in) / speedMag(clip);
 				if (clip.timeline_start + dur <= t) continue;
