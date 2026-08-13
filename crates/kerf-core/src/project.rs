@@ -335,9 +335,9 @@ impl Project {
 
     /// The asset backed by `path`, if the project already has one.
     pub fn asset_by_path(&self, path: &str) -> Result<Option<Asset>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE path = ?1 LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE path = ?1 LIMIT 1")?;
         let mut rows = stmt.query(params![path])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_asset(
@@ -1760,6 +1760,34 @@ impl Project {
     /// not 360 at all is rejected, since reprojecting flat footage is never what
     /// was meant.
     #[allow(clippy::too_many_arguments)]
+    /// Record (or clear, with `None`) the spherical projection of an asset's
+    /// video, overriding what probing decided.
+    ///
+    /// Detection is deliberately conservative — a 360 file carrying no spherical
+    /// metadata and no recognizable geometry probes as flat — so this is the
+    /// escape hatch for footage Kerf could not identify. It is a property of the
+    /// *asset*, not of one clip: every clip cut from it afterwards is reframed by
+    /// default ([`Clip::for_asset`]), and it survives save/reopen. Clips already
+    /// on the timeline keep whatever reframe they have.
+    pub fn set_asset_projection(&self, asset_id: Uuid, projection: Option<Projection>) -> Result<Asset> {
+        if projection.is_some_and(|p| !p.is_spherical()) {
+            return Err(Error::InvalidArgument(
+                "asset projection must be a spherical projection (equirect, dual_fisheye, fisheye)".to_string(),
+            ));
+        }
+        let mut asset = self.require_asset(asset_id)?;
+        if !asset.streams.iter().any(|s| s.kind == StreamKind::Video) {
+            return Err(Error::InvalidArgument(
+                "cannot set a projection on an asset with no video stream".to_string(),
+            ));
+        }
+        for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            stream.projection = projection;
+        }
+        self.insert_asset(&asset)?;
+        Ok(asset)
+    }
+
     pub fn set_reframe(
         &self,
         clip_id: Uuid,
@@ -2265,7 +2293,9 @@ mod tests {
         // Both halves of an Insta360 pair stitch to one cached file and arrive
         // with the same path — that must be one asset, not two.
         let project = Project::open_in_memory().unwrap();
-        let first = project.insert_or_get_asset(&asset_with("/cache/stitched.mp4", vec![vid_stream(false)])).unwrap();
+        let first = project
+            .insert_or_get_asset(&asset_with("/cache/stitched.mp4", vec![vid_stream(false)]))
+            .unwrap();
         let second = project
             .insert_or_get_asset(&asset_with("/cache/stitched.mp4", vec![vid_stream(false)]))
             .unwrap();
@@ -2527,6 +2557,42 @@ mod tests {
             project.cut_clip(flat.id, 0.0, 10.0).unwrap().reframe.is_none(),
             "ordinary footage is never reprojected"
         );
+    }
+
+    #[test]
+    fn marking_an_asset_360_makes_later_clips_reframe() {
+        // Footage kerf can't identify (no spherical metadata, no telltale
+        // geometry) probes flat; marking the asset is the escape hatch, and it
+        // has to stick to the asset so every later cut picks it up.
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/mystery.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        assert!(project.cut_clip(asset.id, 0.0, 5.0).unwrap().reframe.is_none());
+
+        let updated = project.set_asset_projection(asset.id, Some(Projection::Equirect)).unwrap();
+        assert_eq!(updated.projection(), Some(Projection::Equirect));
+        let clip = project.cut_clip(asset.id, 0.0, 5.0).unwrap();
+        assert_eq!(clip.reframe.expect("marked asset reframes").input, Projection::Equirect);
+        // Persisted on the asset, not just on the returned copy.
+        assert_eq!(
+            project.require_asset(asset.id).unwrap().projection(),
+            Some(Projection::Equirect)
+        );
+
+        // And it can be taken back off again.
+        project.set_asset_projection(asset.id, None).unwrap();
+        assert_eq!(project.require_asset(asset.id).unwrap().projection(), None);
+    }
+
+    #[test]
+    fn asset_projection_rejects_flat_and_audio_only() {
+        let project = Project::open_in_memory().unwrap();
+        let video = asset_with("/v.mp4", vec![vid_stream(false)]);
+        let audio = asset_with("/a.wav", vec![aud_stream()]);
+        project.insert_asset(&video).unwrap();
+        project.insert_asset(&audio).unwrap();
+        assert!(project.set_asset_projection(video.id, Some(Projection::Flat)).is_err());
+        assert!(project.set_asset_projection(audio.id, Some(Projection::Equirect)).is_err());
     }
 
     #[test]

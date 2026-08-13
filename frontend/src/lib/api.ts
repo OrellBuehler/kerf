@@ -17,6 +17,7 @@ import type {
 	ExportProgress,
 	ImportProgress,
 	Keyframe,
+	Projection,
 	Reframe,
 	ReframeKeyframe,
 	Revision,
@@ -753,6 +754,25 @@ export async function clearKeyframes(clipId: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('clear_keyframes', { clipId });
+}
+
+/**
+ * Mark an asset as 360 footage the probe couldn't identify (or pass `null` to
+ * unmark it). Sticks to the asset, so every clip cut from it afterwards is
+ * reframed — unlike `setReframe`, which only touches one clip.
+ */
+export async function setAssetProjection(
+	assetId: string,
+	projection: Projection | null
+): Promise<Asset> {
+	if (!inTauri()) {
+		const asset = assetById(assetId) ?? sampleAssets[0];
+		for (const s of asset.streams) {
+			if (s.kind === 'video') s.projection = projection ?? undefined;
+		}
+		return { ...asset, streams: [...asset.streams] };
+	}
+	return invoke<Asset>('set_asset_projection', { assetId, projection });
 }
 
 /** Aim a 360 clip's virtual camera. Unspecified fields are left unchanged. */

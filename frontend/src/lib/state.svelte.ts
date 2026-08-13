@@ -25,6 +25,7 @@ import {
 	removeOverlay,
 	setAudioEffects,
 	setKeyframes,
+	setAssetProjection,
 	setReframe,
 	setReframeKeyframes,
 	setOverlayKeyframes,
@@ -63,6 +64,7 @@ import type {
 	Color,
 	ExportOptions,
 	Keyframe,
+	Projection,
 	Reframe,
 	ReframeKeyframe,
 	Revision,
@@ -387,6 +389,15 @@ class EditorState {
 	}
 	setReframe(clipId: string, patch: Partial<Reframe>) {
 		return this.#apply(setReframe(clipId, patch));
+	}
+	/** Mark (or unmark) an asset as 360 footage; later cuts from it reframe. */
+	async setAssetProjection(assetId: string, projection: Projection | null) {
+		const asset = await setAssetProjection(assetId, projection);
+		this.assets = this.assets.map((a) => (a.id === asset.id ? asset : a));
+		if (this.selectedMetadata?.asset.id === asset.id) {
+			this.selectedMetadata = { ...this.selectedMetadata, asset };
+		}
+		return asset;
 	}
 	clearReframe(clipId: string) {
 		return this.#apply(clearReframe(clipId));

@@ -668,7 +668,7 @@
 				{:else}
 					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
 						Not detected as 360. If this really is spherical footage, pick how the source is
-						packed and reframe it anyway.
+						packed — the whole asset is marked, so every clip cut from it reframes.
 					</p>
 					<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 						<span style="font-size:12px;color:var(--text-muted)">Source is</span>
@@ -686,8 +686,11 @@
 					<Btn
 						size="sm"
 						disabled={editor.busy}
-						onclick={() => run(() => editor.setReframe(clip.id, { input: manualProjection }))}
-						>Reframe to flat</Btn
+						onclick={() =>
+							run(async () => {
+								await editor.setAssetProjection(clip.asset_id, manualProjection);
+								await editor.setReframe(clip.id, { input: manualProjection });
+							})}>Mark as 360 &amp; reframe</Btn
 					>
 				{/if}
 			{/if}

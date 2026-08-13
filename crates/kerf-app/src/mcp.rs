@@ -300,6 +300,17 @@ struct ReframeParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AssetProjectionParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(
+        description = "The source's spherical projection: \"equirect\", \"dual_fisheye\" or \"fisheye\"; null clears \
+                       the mark and treats the asset as ordinary flat footage"
+    )]
+    projection: Option<Projection>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ReframeKeyframesParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -859,6 +870,20 @@ impl KerfMcp {
             .map_err(core_err)?;
         self.changed();
         json(&out)
+    }
+
+    #[tool(
+        description = "Mark an asset as 360 footage Kerf did not detect as such (or pass null to unmark it). \
+                       Detection only trusts spherical metadata or a telltale capture layout, so a stitched \
+                       equirect export that lost its metadata imports as flat video. Unlike set_reframe this is \
+                       remembered on the asset, so every clip cut from it afterwards is reframed automatically."
+    )]
+    fn set_asset_projection(&self, Parameters(p): Parameters<AssetProjectionParams>) -> Result<String, McpError> {
+        let asset_id = parse_id(&p.asset_id)?;
+        let asset = self.lock().set_asset_projection(asset_id, p.projection).map_err(core_err)?;
+        crate::spawn_proxy(&self.app, &asset);
+        self.changed();
+        json(&asset)
     }
 
     #[tool(

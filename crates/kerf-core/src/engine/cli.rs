@@ -1129,14 +1129,16 @@ pub fn stitch_insta360(
     duration_hint: f64,
     progress: &mut dyn FnMut(ExportProgress),
 ) -> Result<PathBuf> {
-    let dst =
-        stitched_path(front, rear).ok_or_else(|| Error::Engine("no cache directory available for stitched 360 media".to_string()))?;
+    let dst = stitched_path(front, rear)
+        .ok_or_else(|| Error::Engine("no cache directory available for stitched 360 media".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
 
     let gate = {
-        let mut locks = stitch_locks().lock().map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
+        let mut locks = stitch_locks()
+            .lock()
+            .map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
         std::sync::Arc::clone(locks.entry(dst.clone()).or_default())
     };
     let _held = gate.lock().map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
@@ -3748,7 +3750,10 @@ mod tests {
         assert!(args.contains(&"libx264".to_string()));
         // The output is a `.part` temp file the muxer can't be inferred from, so
         // the format must be stated or ffmpeg refuses to start.
-        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "mp4"), "muxer must be explicit");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-f" && w[1] == "mp4"),
+            "muxer must be explicit"
+        );
         // The source is the input; the proxy is the (final) output.
         let input = args.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(args[input + 1], "/in.mov");

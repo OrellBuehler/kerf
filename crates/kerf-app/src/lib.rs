@@ -226,7 +226,7 @@ async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) 
 /// best-effort: previews fall back to the original source until the proxy lands,
 /// at which point we emit `proxy-ready` so the webview re-fetches the current
 /// frame. Stills and audio-only assets are skipped (they get no proxy).
-fn spawn_proxy(app: &AppHandle, asset: &Asset) {
+pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
     let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
     if !has_video || asset.is_image() {
         return;
@@ -578,6 +578,26 @@ fn set_reframe(
         .set_reframe(id, yaw, pitch, roll, fov, lens_fov, input, output)
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Mark an asset as 360 footage (or clear the mark) for footage the probe could
+/// not identify. Unlike `set_reframe` this sticks to the asset, so every clip cut
+/// from it afterwards is reframed.
+#[tauri::command(async)]
+fn set_asset_projection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+    projection: Option<Projection>,
+) -> CmdResult<Asset> {
+    let id = id(&asset_id)?;
+    let asset = state
+        .project()
+        .set_asset_projection(id, projection)
+        .map_err(|e| e.to_string())?;
+    // 360 assets proxy at a different size, so the cached proxy no longer matches.
+    spawn_proxy(&app, &asset);
+    Ok(asset)
 }
 
 #[tauri::command(async)]
@@ -1096,6 +1116,7 @@ pub fn run() {
             add_keyframe,
             clear_keyframes,
             set_reframe,
+            set_asset_projection,
             clear_reframe,
             set_reframe_keyframes,
             add_reframe_keyframe,
