@@ -28,7 +28,13 @@ so the feature is **only** activated through these forwards — which is what ma
   every clip visible at a timeline time onto a black canvas, mirroring the export
   geometry, so an agent can *see the cut*), waveforms, and export all live here, so
   they work in the `--no-default-features` build — only the binaries are needed,
-  never the dev libraries. Export is a **positional, multi-track** `filter_complex`
+  never the dev libraries. Preview decodes go through a **cached all-intra proxy**
+  (`generate_proxy` in the background, `ready_proxy` never blocks, resolved by
+  `Project::preview_source`; export always reads the original): `proxy_width`
+  gives 1280 normally but 3072 for a spherical asset, because reframing crops
+  ~100° out of the sphere and would otherwise leave ~355 real pixels. That width
+  is part of the cache key, so marking an asset 360 rebuilds its proxy.
+  Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
@@ -51,7 +57,10 @@ so the feature is **only** activated through these forwards — which is what ma
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
   probe time (`detect_projection` — a `Spherical Mapping` side-data entry, or an
   Insta360 `.insv` whose frame is two squares side by side; deliberately *no*
-  bare-aspect guess), and clips cut from such an asset get a default
+  bare-aspect guess) or set by hand with `set_asset_projection` (a persisted
+  per-**asset** override for footage neither signal catches — a stitched equirect
+  that lost its metadata; it sticks so every later cut reframes), and clips cut
+  from such an asset get a default
   `Clip.reframe` (`Clip::for_asset`) aiming a virtual camera at the sphere. In
   `video_clip_chain` a reframed clip runs `setpts → fps → [sendcmd] → v360@c{n} →
   [crop]` *before* the fit `scale`: `fps` is hoisted so an 8K source reprojects at
@@ -69,6 +78,18 @@ so the feature is **only** activated through these forwards — which is what ma
   still path samples `Clip::reframe_at` to a constant `v360` instead, and
   `export_format` ignores a reframed clip's source dimensions so a 5760x2880
   capture does not become the deliverable size.
+  A real **Insta360 capture is a *pair* of files** (`VID_…_00_….mp4` /
+  `…_10_….mp4`), one circular fisheye per lens — neither is 360 on its own, so
+  `Project::probe_import` stitches them at import: `insta360_pair` recognizes a
+  square frame whose positional `_00_`/`_10_` lens token has a sibling on disk,
+  `stitch_insta360` runs `hstack → v360=dfisheye:e:…:roll=180` (the lenses record
+  upside down) into a 5760x2880 h264 file cached at
+  `<cache>/kerf/stitched/<hash>.mp4` keyed by *both* lens files, and the asset
+  that lands describes **that** file (projection forced to `Equirect` — the CLI
+  can't write an `sv3d` box) with the originals kept in `Asset.source_paths`.
+  It is a full re-encode (~2x realtime), so it streams progress (`import-progress`
+  in the app), is serialized per pair, and dedupes via `insert_or_get_asset` —
+  importing the other lens afterwards is a cache hit resolving to the same asset.
   Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
   start (shared `clip_source_window`/`clip_seek`, frame-accurate against the
   seek-relative `trim`), so a cut from deep in a long source decodes only the kept
@@ -205,6 +226,7 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
+`set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
 `concatenate` — each returns the
@@ -252,9 +274,11 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 trim, volume, fades, speed, transform, color, transition, plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
 auto-keyframes at the playhead and shows the sampled pose), a **360 reframe**
-section shown only for spherical sources (yaw / pitch / roll / FOV, auto-keyframing
+section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
-plain `lerp` would read as a 340° swing across the seam), and an always-visible
+plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
+detect as 360 it instead offers a projection picker that marks the whole asset via
+`set_asset_projection`), and an always-visible
 **Text overlays** section (add titles / lower-thirds, generate captions, edit
 text / timing / position / size / color / box / bold).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
