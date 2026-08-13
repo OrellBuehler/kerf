@@ -20,8 +20,8 @@ pub use analysis::{
     SilenceDetector, Transcriber,
 };
 pub use engine::{
-    generate_proxy, proxy_path, render_with, render_with_progress, validate_export, Container, ExportOptions, ExportProgress,
-    RateControl, RenderStatus,
+    generate_proxy, insta360_pair, proxy_path, render_with, render_with_progress, stitch_insta360, stitched_path, validate_export,
+    Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

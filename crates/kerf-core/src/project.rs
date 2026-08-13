@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::engine;
+use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Projection, Reframe, ReframeKeyframe, Revision, StreamInfo,
@@ -25,12 +25,16 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS assets (
-    id          TEXT PRIMARY KEY,
-    path        TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    duration    REAL NOT NULL,
-    streams     TEXT NOT NULL,
-    imported_at TEXT NOT NULL
+    id           TEXT PRIMARY KEY,
+    path         TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    duration     REAL NOT NULL,
+    streams      TEXT NOT NULL,
+    imported_at  TEXT NOT NULL,
+    -- JSON array of the capture files a derived asset was built from (an
+    -- Insta360 lens pair); NULL/absent for an ordinary asset. Older files get
+    -- this column added by the migration in `init`.
+    source_paths TEXT
 );
 
 CREATE TABLE IF NOT EXISTS analysis (
@@ -158,6 +162,16 @@ impl Project {
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
 
+        // `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone,
+        // so a column added after a `.kerf` file was written has to be migrated
+        // onto it explicitly. Adding one is cheap and lossless; the guard is a
+        // probe for the column rather than a schema version because that is the
+        // whole of the migration story so far.
+        let has_source_paths = self.conn.prepare("SELECT source_paths FROM assets LIMIT 1").is_ok();
+        if !has_source_paths {
+            self.conn.execute("ALTER TABLE assets ADD COLUMN source_paths TEXT", [])?;
+        }
+
         let has_timeline: bool = self
             .conn
             .query_row("SELECT EXISTS(SELECT 1 FROM timeline WHERE id = 1)", [], |r| r.get(0))?;
@@ -210,11 +224,47 @@ impl Project {
 
     // ---- assets -----------------------------------------------------------
 
-    /// Probe a media file and store its asset record.
+    /// Probe a media file and store its asset record, stitching an Insta360 lens
+    /// pair into one 360 asset on the way (see [`Project::probe_import`]).
     pub fn import_asset(&self, media_path: impl AsRef<Path>) -> Result<Asset> {
-        let asset = Self::probe_asset(media_path.as_ref())?;
-        self.insert_asset(&asset)?;
-        Ok(asset)
+        let asset = Self::probe_import(media_path.as_ref(), &mut |_| {})?;
+        self.insert_or_get_asset(&asset)
+    }
+
+    /// Probe `path` into an importable [`Asset`], *without* `&self` like
+    /// [`Project::probe_asset`] — and, when `path` turns out to be one lens of an
+    /// Insta360 capture, stitch its pair into a single equirectangular video and
+    /// describe that instead.
+    ///
+    /// An Insta360 capture is written as two files, one circular fisheye per
+    /// lens, neither of which is 360 footage on its own: reframing one would show
+    /// half the sphere. Stitching at import means the rest of Kerf — reframing,
+    /// proxies, thumbnails, export — only ever sees ordinary equirect media, and
+    /// the (slow, cached) re-encode happens once per capture instead of on every
+    /// preview. `progress` reports that encode; it is never called for an
+    /// ordinary file, which is probe-only and instant.
+    pub fn probe_import(path: &Path, progress: &mut dyn FnMut(ExportProgress)) -> Result<Asset> {
+        let asset = Self::probe_asset(path)?;
+        let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video);
+        let Some((front, rear)) = video.and_then(|v| engine::insta360_pair(path, v.width, v.height)) else {
+            return Ok(asset);
+        };
+
+        let stitched = engine::stitch_insta360(&front, &rear, asset.duration, progress)?;
+        let mut stitched_asset = Self::probe_asset(&stitched)?;
+        // The stitch is plain h264 with no spherical metadata of its own (the
+        // ffmpeg CLI cannot write the `sv3d` box), so the projection we just
+        // rendered it into is recorded here rather than re-detected.
+        for stream in stitched_asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            stream.projection = Some(Projection::Equirect);
+        }
+        stitched_asset.name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(engine::insta360_pair_name)
+            .unwrap_or(asset.name);
+        stitched_asset.source_paths = vec![front.to_string_lossy().into_owned(), rear.to_string_lossy().into_owned()];
+        Ok(stitched_asset)
     }
 
     /// Probe a media file into a fresh [`Asset`] record *without* `&self` — the
@@ -242,14 +292,15 @@ impl Project {
             duration,
             streams: probe.streams,
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         })
     }
 
     /// Insert (or replace) an asset record directly.
     pub fn insert_asset(&self, asset: &Asset) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO assets (id, path, name, duration, streams, imported_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO assets (id, path, name, duration, streams, imported_at, source_paths)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 asset.id.to_string(),
                 asset.path,
@@ -257,15 +308,55 @@ impl Project {
                 asset.duration,
                 serde_json::to_string(&asset.streams)?,
                 asset.imported_at.to_rfc3339(),
+                if asset.source_paths.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&asset.source_paths)?)
+                },
             ],
         )?;
         Ok(())
     }
 
+    /// Insert `asset`, unless one for the same file is already in the project —
+    /// in which case that existing asset is returned untouched.
+    ///
+    /// Importing both halves of an Insta360 pair (or the same file twice) would
+    /// otherwise land two asset rows for one piece of media: both imports stitch
+    /// to the same cached file, so they arrive here with the same `path` and
+    /// different fresh ids.
+    pub fn insert_or_get_asset(&self, asset: &Asset) -> Result<Asset> {
+        if let Some(existing) = self.asset_by_path(&asset.path)? {
+            return Ok(existing);
+        }
+        self.insert_asset(asset)?;
+        Ok(asset.clone())
+    }
+
+    /// The asset backed by `path`, if the project already has one.
+    pub fn asset_by_path(&self, path: &str) -> Result<Option<Asset>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE path = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_asset(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_assets(&self) -> Result<Vec<Asset>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, name, duration, streams, imported_at FROM assets ORDER BY imported_at")?;
+            .prepare("SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets ORDER BY imported_at")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -274,12 +365,13 @@ impl Project {
                 row.get::<_, f64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut assets = Vec::new();
         for row in rows {
-            let (id, path, name, duration, streams, imported_at) = row?;
-            assets.push(row_to_asset(id, path, name, duration, streams, imported_at)?);
+            let (id, path, name, duration, streams, imported_at, source_paths) = row?;
+            assets.push(row_to_asset(id, path, name, duration, streams, imported_at, source_paths)?);
         }
         Ok(assets)
     }
@@ -288,7 +380,7 @@ impl Project {
         let row = self
             .conn
             .query_row(
-                "SELECT id, path, name, duration, streams, imported_at FROM assets WHERE id = ?1",
+                "SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
                     Ok((
@@ -298,14 +390,21 @@ impl Project {
                         row.get::<_, f64>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
         match row {
-            Some((id, path, name, duration, streams, imported_at)) => {
-                Ok(Some(row_to_asset(id, path, name, duration, streams, imported_at)?))
-            }
+            Some((id, path, name, duration, streams, imported_at, source_paths)) => Ok(Some(row_to_asset(
+                id,
+                path,
+                name,
+                duration,
+                streams,
+                imported_at,
+                source_paths,
+            )?)),
             None => Ok(None),
         }
     }
@@ -1470,6 +1569,7 @@ impl Project {
                 },
             ],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
 
         let broll = Asset {
@@ -1490,6 +1590,7 @@ impl Project {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
 
         self.insert_asset(&interview)?;
@@ -2103,7 +2204,15 @@ fn row_to_task(
     })
 }
 
-fn row_to_asset(id: String, path: String, name: String, duration: f64, streams: String, imported_at: String) -> Result<Asset> {
+fn row_to_asset(
+    id: String,
+    path: String,
+    name: String,
+    duration: f64,
+    streams: String,
+    imported_at: String,
+    source_paths: Option<String>,
+) -> Result<Asset> {
     Ok(Asset {
         id: parse_uuid(&id)?,
         path,
@@ -2111,6 +2220,10 @@ fn row_to_asset(id: String, path: String, name: String, duration: f64, streams: 
         duration,
         streams: serde_json::from_str(&streams)?,
         imported_at: parse_dt(&imported_at)?,
+        source_paths: match source_paths {
+            Some(json) => serde_json::from_str(&json)?,
+            None => Vec::new(),
+        },
     })
 }
 
@@ -2147,6 +2260,34 @@ mod tests {
         assert!(total_clips >= 3);
     }
 
+    #[test]
+    fn importing_the_same_media_twice_reuses_the_asset() {
+        // Both halves of an Insta360 pair stitch to one cached file and arrive
+        // with the same path — that must be one asset, not two.
+        let project = Project::open_in_memory().unwrap();
+        let first = project.insert_or_get_asset(&asset_with("/cache/stitched.mp4", vec![vid_stream(false)])).unwrap();
+        let second = project
+            .insert_or_get_asset(&asset_with("/cache/stitched.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        assert_eq!(first.id, second.id, "the second import resolves to the first asset");
+        assert_eq!(project.list_assets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stitched_asset_provenance_survives_a_save_and_reopen() {
+        let project = Project::open_in_memory().unwrap();
+        let mut asset = asset_with("/cache/stitched.mp4", vec![vid_stream(false)]);
+        asset.source_paths = vec!["/dcim/VID_1_2_00_3.mp4".into(), "/dcim/VID_1_2_10_3.mp4".into()];
+        project.insert_asset(&asset).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("kerf-stitch-provenance-{}.kerf", Uuid::new_v4()));
+        project.save_as(&dir).unwrap();
+        let reopened = Project::open(&dir).unwrap();
+        let loaded = reopened.require_asset(asset.id).unwrap();
+        assert_eq!(loaded.source_paths, asset.source_paths);
+        let _ = std::fs::remove_file(&dir);
+    }
+
     fn asset_with(path: &str, streams: Vec<StreamInfo>) -> Asset {
         Asset {
             id: Uuid::new_v4(),
@@ -2155,6 +2296,7 @@ mod tests {
             duration: 10.0,
             streams,
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         }
     }
 
@@ -2279,6 +2421,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -2497,6 +2640,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -2536,6 +2680,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
@@ -2582,6 +2727,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let id = asset.id;
         project.insert_asset(&asset).unwrap();
@@ -2683,6 +2829,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -2739,6 +2886,7 @@ mod tests {
                 projection: None,
             }],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 

@@ -15,6 +15,7 @@ import type {
 	EditSource,
 	ExportOptions,
 	ExportProgress,
+	ImportProgress,
 	Keyframe,
 	Reframe,
 	ReframeKeyframe,
@@ -1127,6 +1128,16 @@ export async function onExportProgress(cb: (p: ExportProgress) => void): Promise
 	if (!inTauri()) return () => {};
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<ExportProgress>('export-progress', (e) => cb(e.payload));
+}
+
+/**
+ * Progress of a slow import — an Insta360 lens pair being stitched into one 360
+ * asset. Ordinary imports are instant and never report.
+ */
+export async function onImportProgress(cb: (p: ImportProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<ImportProgress>('import-progress', (e) => cb(e.payload));
 }
 
 /** Open a save dialog defaulted to the given container extension. */

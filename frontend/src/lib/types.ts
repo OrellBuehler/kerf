@@ -31,6 +31,8 @@ export interface Asset {
 	duration: number;
 	streams: StreamInfo[];
 	imported_at: string;
+	/** Original capture files a derived asset was built from (an Insta360 lens pair). */
+	source_paths?: string[];
 }
 
 export interface TimeRange {
@@ -317,6 +319,12 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
+}
+
+/** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
+export interface ImportProgress extends ExportProgress {
+	/** The file the user picked, so a batch import can label which one is working. */
+	path: string;
 }
 
 /** The bare Rust `Default` — the dialog opens by applying a preset over this. */

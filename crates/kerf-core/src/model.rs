@@ -114,6 +114,12 @@ pub struct Asset {
     pub duration: f64,
     pub streams: Vec<StreamInfo>,
     pub imported_at: DateTime<Utc>,
+    /// The original capture files this asset was derived from, when `path` is
+    /// something Kerf produced at import rather than a file the user picked —
+    /// today only an Insta360 lens pair stitched into one equirect video. Empty
+    /// for an ordinary asset, whose `path` *is* its source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_paths: Vec<String>,
 }
 
 impl Asset {

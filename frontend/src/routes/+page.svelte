@@ -60,7 +60,13 @@
 			void import('@tauri-apps/api/event').then(async ({ listen }) => {
 				unlisteners.push(
 					await listen('project-changed', () => void onProjectChanged()),
-					await listen('proxy-ready', () => ui.refreshPreview())
+					await listen('proxy-ready', () => ui.refreshPreview()),
+					// Only a 360 lens pair reports here — its stitch is a full
+					// re-encode, so the import overlay shows how far along it is.
+					await listen<{ fraction: number }>(
+						'import-progress',
+						(e) => (editor.importProgress = e.payload.fraction)
+					)
 				);
 			});
 		}

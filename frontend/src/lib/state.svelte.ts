@@ -90,6 +90,11 @@ class EditorState {
 	busy = $state(false);
 	/** Whether media is currently being imported (drives the bin spinner). */
 	importing = $state(false);
+	/**
+	 * Fraction done of a slow import (a 360 lens pair being stitched), or `null`
+	 * when the import is an ordinary instant probe.
+	 */
+	importProgress = $state<number | null>(null);
 	error = $state<string | null>(null);
 
 	#waveforms = new Map<string, number[] | Promise<number[]>>();
@@ -240,7 +245,11 @@ class EditorState {
 				paths.map(async (path) => {
 					try {
 						const asset = await importAsset(path);
-						this.assets = [...this.assets, asset];
+						// Both lens files of a 360 capture resolve to one stitched
+						// asset, so importing the pair must not list it twice.
+						if (!this.assets.some((a) => a.id === asset.id)) {
+							this.assets = [...this.assets, asset];
+						}
 						return asset;
 					} catch (e) {
 						failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
@@ -253,6 +262,7 @@ class EditorState {
 			return { imported, failed };
 		} finally {
 			this.importing = false;
+			this.importProgress = null;
 		}
 	}
 

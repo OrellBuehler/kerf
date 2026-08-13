@@ -181,14 +181,38 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
 
 // ---- import / analysis -----------------------------------------------------
 
+/// Progress of a slow import (an Insta360 lens pair being stitched), tagged with
+/// the file the user picked so the UI can label it while several import at once.
+#[derive(Clone, serde::Serialize)]
+struct ImportProgress {
+    path: String,
+    fraction: f64,
+    elapsed_secs: f64,
+    eta_secs: Option<f64>,
+}
+
 #[tauri::command]
 async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
     let shared = state.project.clone();
     blocking(move || {
-        // Probe without the lock (so parallel imports really probe in parallel),
-        // then take it only for the quick insert.
-        let asset = Project::probe_asset(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
-        lock_user(&shared).insert_asset(&asset).map_err(|e| e.to_string())?;
+        // Probe (and, for an Insta360 lens pair, stitch) without the lock — so
+        // parallel imports really run in parallel and a multi-minute stitch never
+        // freezes the GUI or the agent — then take it only for the quick insert.
+        let mut on_progress = |p: kerf_core::ExportProgress| {
+            let _ = app.emit(
+                "import-progress",
+                ImportProgress {
+                    path: path.clone(),
+                    fraction: p.fraction,
+                    elapsed_secs: p.elapsed_secs,
+                    eta_secs: p.eta_secs,
+                },
+            );
+        };
+        let asset = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(|e| e.to_string())?;
+        // Importing the pair's other lens (or the same file twice) resolves to
+        // the asset already in the project instead of duplicating it.
+        let asset = lock_user(&shared).insert_or_get_asset(&asset).map_err(|e| e.to_string())?;
         // Kick off the preview proxy in the background; preview uses the original
         // until it lands (see `spawn_proxy`).
         spawn_proxy(&app, &asset);

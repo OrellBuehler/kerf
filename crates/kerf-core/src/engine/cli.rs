@@ -837,9 +837,10 @@ fn fnv1a(s: &str) -> u64 {
 }
 
 /// A content key for `src` that changes whenever the file is replaced: its path
-/// plus size and modified time. Hashed into the proxy filename so re-imports of
-/// the same file reuse the proxy, while a swapped-out source regenerates one.
-fn proxy_key(src: &Path) -> String {
+/// plus size and modified time. Hashed into a cache file name so re-imports of
+/// the same source reuse the cached artifact, while a swapped-out source
+/// regenerates one. Shared by the proxy cache and the Insta360 stitch cache.
+fn source_key(src: &Path) -> String {
     let meta = std::fs::metadata(src).ok();
     let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = meta
@@ -855,7 +856,7 @@ fn proxy_key(src: &Path) -> String {
 /// resolvable (a proxy simply can't be cached — preview falls back to original).
 pub fn proxy_path(src: &Path) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    Some(dir.join(format!("{:016x}.mp4", fnv1a(&proxy_key(src)))))
+    Some(dir.join(format!("{:016x}.mp4", fnv1a(&source_key(src)))))
 }
 
 /// The proxy for `src` **if it has already been generated** (the file exists),
@@ -955,6 +956,225 @@ pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
         return Ok(dst);
     }
     std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
+    Ok(dst)
+}
+
+// ---- insta360 dual-lens stitching ------------------------------------------
+
+/// The equirect frame a lens pair is stitched into. Each lens is a square
+/// fisheye covering [`STITCH_FOV`] degrees, so a 3072x3072 lens carries about
+/// 16 px per degree — roughly 5800 px around the full circle. 5760x2880 is
+/// therefore the size that keeps the capture's detail without inventing any
+/// (and is what Insta360 Studio itself exports a 5.7K capture at).
+const STITCH_WIDTH: u32 = 5760;
+const STITCH_HEIGHT: u32 = 2880;
+
+/// Per-lens field of view, in degrees. Insta360's lenses overshoot the
+/// hemisphere so the two circles overlap at the seam; `v360` needs the real
+/// figure or the halves meet with a gap.
+const STITCH_FOV: u32 = 190;
+
+/// The lens token of an Insta360 capture file name and the name of its other
+/// lens: a capture is written as a *pair* of files whose second-to-last
+/// underscore-separated token is `00` (front) or `10` (rear) —
+/// `VID_20220625_140410_00_008.mp4` / `..._10_008.mp4`.
+///
+/// Matched token-wise rather than by searching for `_00_`, so a capture whose
+/// date or time happens to contain those digits can't be misread.
+pub(crate) fn insta360_lens(file_name: &str) -> Option<(&'static str, String)> {
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if !ext.eq_ignore_ascii_case("mp4") || !stem.starts_with("VID_") {
+        return None;
+    }
+    // `VID_<date>_<time>_<lens>_<sequence>` — anything shorter, or with an empty
+    // trailing sequence, is not a capture file whatever its middle tokens say.
+    let mut tokens: Vec<&str> = stem.split('_').collect();
+    if tokens.len() < 4 || tokens.last().is_none_or(|t| t.is_empty()) {
+        return None;
+    }
+    let lens_at = tokens.len() - 2;
+    let (lens, other) = match tokens[lens_at] {
+        "00" => ("00", "10"),
+        "10" => ("10", "00"),
+        _ => return None,
+    };
+    tokens[lens_at] = other;
+    Some((lens, format!("{}.{ext}", tokens.join("_"))))
+}
+
+/// The display name for a stitched pair: the capture name with the lens token
+/// dropped, so the bin shows one `VID_20220625_140410_008.mp4` rather than
+/// whichever lens file happened to be imported.
+pub(crate) fn insta360_pair_name(file_name: &str) -> Option<String> {
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    insta360_lens(file_name)?;
+    let mut tokens: Vec<&str> = stem.split('_').collect();
+    tokens.remove(tokens.len() - 2);
+    Some(format!("{}.{ext}", tokens.join("_")))
+}
+
+/// The `(front, rear)` lens files of the Insta360 capture `path` belongs to, if
+/// it is one: a square video frame (one fisheye circle per file) whose sibling
+/// lens is on disk next to it. Either half resolves to the same canonical pair,
+/// so importing either file stitches — and caches — the same sphere.
+pub fn insta360_pair(path: &Path, width: Option<u32>, height: Option<u32>) -> Option<(PathBuf, PathBuf)> {
+    let (w, h) = (width?, height?);
+    if w == 0 || w != h {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let (lens, sibling_name) = insta360_lens(name)?;
+    let sibling = path.with_file_name(sibling_name);
+    if !sibling.is_file() {
+        return None;
+    }
+    let this = path.to_path_buf();
+    Some(if lens == "00" { (this, sibling) } else { (sibling, this) })
+}
+
+/// Cache key for a stitched pair: both lens files' identity plus a version salt,
+/// so changing the stitch recipe below invalidates everything stitched by an
+/// older build instead of silently reusing it.
+fn stitch_key(front: &Path, rear: &Path) -> String {
+    format!("{}||{}||v1", source_key(front), source_key(rear))
+}
+
+/// Where the stitched equirect for a lens pair lives (whether or not it exists
+/// yet): `<cache>/kerf/stitched/<hash>.mp4`. Alongside the proxy cache rather
+/// than next to the originals — capture media is routinely on a read-only or
+/// ejected SD card, and a deterministic key lets a re-import reuse the stitch
+/// instead of spending minutes re-encoding it.
+pub fn stitched_path(front: &Path, rear: &Path) -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("kerf").join("stitched");
+    Some(dir.join(format!("{:016x}.mp4", fnv1a(&stitch_key(front, rear)))))
+}
+
+/// Build the ffmpeg argument list (pure, unit-tested) that stitches the two
+/// fisheye lens files into one equirectangular video at `dst`.
+///
+/// `hstack` packs the pair into the dual-fisheye layout `v360` expects (front
+/// left), `roll=180` corrects the sensor orientation — Insta360 records both
+/// lenses upside down — and `shortest` resolves the few-frames-different
+/// durations the two files are written with. The front file's audio is copied
+/// through untouched; its telemetry/subtitle stream is dropped.
+///
+/// CRF 15 rather than a lossless or visually-lossy setting: this file becomes
+/// the effective source for every later reframe and export, so it must not be
+/// the quality floor, while `veryfast` keeps a capture's import to minutes.
+pub(crate) fn build_stitch_args(front: &str, rear: &str, dst: &str) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        front,
+        "-i",
+        rear,
+        "-filter_complex",
+        &format!(
+            "[0:v][1:v]hstack=shortest=1,v360=dfisheye:e:ih_fov={STITCH_FOV}:iv_fov={STITCH_FOV}:roll=180:w={STITCH_WIDTH}:h={STITCH_HEIGHT}[v]"
+        ),
+        "-map",
+        "[v]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "15",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-shortest",
+        // The encode writes a `.part` temp file, whose extension tells ffmpeg
+        // nothing — name the muxer instead of letting it guess.
+        "-f",
+        "mp4",
+        dst,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Serializes stitches of the same pair. Importing both lens files at once (the
+/// obvious thing to do in a file dialog) would otherwise run the same
+/// multi-minute encode twice and throw one away; the loser of the race waits
+/// here and then finds the finished file in the cache.
+fn stitch_locks() -> &'static Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stitch an Insta360 lens pair into a single equirectangular file, returning
+/// its cached path; a pair already stitched returns immediately. `duration_hint`
+/// (the capture's length in seconds) scales the `progress` bar. Blocking and
+/// slow — a full re-encode — so callers run it off the project lock.
+///
+/// Like the proxy cache, the encode writes a per-process temp file and renames
+/// it into place, so an interrupted or concurrent stitch never leaves a
+/// half-written file behind for the next import to mistake for a finished one.
+pub fn stitch_insta360(
+    front: &Path,
+    rear: &Path,
+    duration_hint: f64,
+    progress: &mut dyn FnMut(ExportProgress),
+) -> Result<PathBuf> {
+    let dst =
+        stitched_path(front, rear).ok_or_else(|| Error::Engine("no cache directory available for stitched 360 media".to_string()))?;
+    if dst.is_file() {
+        return Ok(dst);
+    }
+
+    let gate = {
+        let mut locks = stitch_locks().lock().map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
+        std::sync::Arc::clone(locks.entry(dst.clone()).or_default())
+    };
+    let _held = gate.lock().map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
+    // Another stitch of this pair may have finished while we waited for the gate.
+    if dst.is_file() {
+        return Ok(dst);
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create stitch cache dir: {e}")))?;
+    }
+    let (front_str, rear_str) = match (front.to_str(), rear.to_str()) {
+        (Some(f), Some(r)) => (f, r),
+        _ => return Err(Error::Engine("lens file path is not valid UTF-8".to_string())),
+    };
+    let tmp = dst.with_extension(format!("{}.part", std::process::id()));
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| Error::Engine("stitch temp path is not valid UTF-8".to_string()))?;
+
+    tracing::info!(front = %front.display(), rear = %rear.display(), "stitching insta360 lens pair");
+    let args = build_stitch_args(front_str, rear_str, tmp_str);
+    let result = run_ffmpeg_progress(
+        &args,
+        &dst,
+        Bar {
+            total: duration_hint.max(1e-9),
+            offset: 0.0,
+            width: 1.0,
+            start: std::time::Instant::now(),
+        },
+        progress,
+        &|| false,
+    );
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    if dst.is_file() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(dst);
+    }
+    std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize stitched 360 media: {e}")))?;
     Ok(dst)
 }
 
@@ -3528,6 +3748,91 @@ mod tests {
     }
 
     #[test]
+    fn insta360_lens_pairs_the_two_capture_files() {
+        // Either lens resolves to the other, and to one shared display name.
+        let front = "VID_20220625_140410_00_008.mp4";
+        let rear = "VID_20220625_140410_10_008.mp4";
+        assert_eq!(insta360_lens(front), Some(("00", rear.to_string())));
+        assert_eq!(insta360_lens(rear), Some(("10", front.to_string())));
+        assert_eq!(insta360_pair_name(front).as_deref(), Some("VID_20220625_140410_008.mp4"));
+        assert_eq!(insta360_pair_name(rear).as_deref(), Some("VID_20220625_140410_008.mp4"));
+    }
+
+    #[test]
+    fn insta360_lens_ignores_everything_else() {
+        // The lens token is matched positionally, so digits elsewhere in the
+        // name — a time ending in 10, a clip numbered 00 — are not lens tokens.
+        for name in [
+            "VID_20220625_141000_008.mp4",
+            "VID_20220625_140410_20_008.mp4",
+            "VID_20220625_140410_00_008.mov",
+            "MVI_20220625_140410_00_008.mp4",
+            "holiday.mp4",
+            "VID_00_.mp4",
+        ] {
+            assert_eq!(insta360_lens(name), None, "{name} must not read as a lens file");
+        }
+    }
+
+    #[test]
+    fn stitch_args_reproject_the_lens_pair_to_equirect() {
+        let args = build_stitch_args("/dcim/front_00_.mp4", "/dcim/rear_10_.mp4", "/cache/out.mp4");
+        // Front lens is input 0 — hstack packs it into the left half, which is
+        // the front hemisphere `v360=dfisheye` expects.
+        let inputs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && args[i - 1] == "-i")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(inputs, vec!["/dcim/front_00_.mp4", "/dcim/rear_10_.mp4"]);
+        let graph = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .map(|i| args[i + 1].clone())
+            .expect("-filter_complex present");
+        assert!(graph.contains("hstack=shortest=1"));
+        assert!(graph.contains("v360=dfisheye:e"));
+        assert!(graph.contains("ih_fov=190"), "the lenses overshoot the hemisphere");
+        assert!(graph.contains("roll=180"), "both lenses record upside down");
+        assert!(graph.contains("w=5760:h=2880"));
+        // The capture's audio rides along untouched; the output is the stitch.
+        assert!(args.windows(2).any(|w| w[0] == "-map" && w[1] == "0:a?"));
+        assert!(args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "copy"));
+        assert_eq!(args.last().unwrap(), "/cache/out.mp4");
+    }
+
+    #[test]
+    fn stitched_path_is_shared_by_both_lens_orders() {
+        // The pair is keyed by both files, so whichever lens was imported the
+        // cached stitch is the same file (the second import is a cache hit).
+        if let (Some(a), Some(b), Some(other)) = (
+            stitched_path(Path::new("/dcim/a_00_.mp4"), Path::new("/dcim/a_10_.mp4")),
+            stitched_path(Path::new("/dcim/a_00_.mp4"), Path::new("/dcim/a_10_.mp4")),
+            stitched_path(Path::new("/dcim/b_00_.mp4"), Path::new("/dcim/b_10_.mp4")),
+        ) {
+            assert_eq!(a, b);
+            assert_ne!(a, other);
+            assert!(a.to_string_lossy().contains("stitched"));
+        }
+    }
+
+    #[test]
+    fn insta360_pair_needs_square_frames_and_a_sibling_on_disk() {
+        // Non-square (already stitched, or ordinary video) is never a lens file,
+        // and a lone lens file with no sibling next to it can't be stitched.
+        assert_eq!(
+            insta360_pair(Path::new("/dcim/VID_1_2_00_3.mp4"), Some(5760), Some(2880)),
+            None
+        );
+        assert_eq!(
+            insta360_pair(Path::new("/dcim/VID_1_2_00_3.mp4"), Some(3072), Some(3072)),
+            None,
+            "no sibling on disk"
+        );
+    }
+
+    #[test]
     fn proxy_path_is_deterministic_and_distinct_per_source() {
         // Same source → same proxy path on every call (so a re-import / new
         // session reuses the cached proxy); different sources → different files.
@@ -3552,6 +3857,7 @@ mod tests {
             duration: 100.0,
             streams,
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         }
     }
 
@@ -4119,6 +4425,7 @@ mod tests {
             duration: 10.0,
             streams: vec![video_stream(1280, 720, 25.0), audio_stream(44_100, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -4159,6 +4466,7 @@ mod tests {
             duration: 20.0,
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let a2 = Asset {
             id: Uuid::new_v4(),
@@ -4167,6 +4475,7 @@ mod tests {
             duration: 10.0,
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
         let assets = vec![a1, a2.clone()];
@@ -4194,6 +4503,7 @@ mod tests {
             duration: 5.0,
             streams: vec![video_stream(1920, 1080, 30.0)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
         let assets = vec![video_only];
@@ -4220,6 +4530,7 @@ mod tests {
             duration: 10.0,
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -4249,6 +4560,7 @@ mod tests {
             duration: 10.0,
             streams: vec![video_stream(3840, 2160, 60.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -4282,6 +4594,7 @@ mod tests {
             duration,
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         }
     }
 
@@ -4293,6 +4606,7 @@ mod tests {
             duration: crate::model::DEFAULT_IMAGE_DURATION,
             streams: vec![image_stream(1920, 1080)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         }
     }
 
@@ -4308,6 +4622,7 @@ mod tests {
             duration,
             streams: vec![v, audio_stream(48_000, 2)],
             imported_at: Utc::now(),
+            source_paths: Vec::new(),
         }
     }
 

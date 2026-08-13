@@ -213,7 +213,11 @@
 						<div>
 							<div style="font:var(--type-ui);color:var(--text-primary)">Importing media…</div>
 							<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-								Probing streams locally
+								{#if editor.importProgress !== null}
+									Stitching 360 lens pair · {Math.round(editor.importProgress * 100)}%
+								{:else}
+									Probing streams locally
+								{/if}
 							</div>
 						</div>
 					</div>
@@ -249,7 +253,16 @@
 							>{assets.length} assets</span
 						>
 						{#if editor.importing}
-							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+							<span style="display:inline-flex;align-items:center;gap:5px">
+								{#if editor.importProgress !== null}
+									<span
+										style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+										title="Stitching a 360 lens pair"
+										>{Math.round(editor.importProgress * 100)}%</span
+									>
+								{/if}
+								<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+							</span>
 						{:else}
 							<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
 						{/if}
