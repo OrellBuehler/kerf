@@ -1118,13 +1118,30 @@ pub struct Revision {
     pub current: bool,
 }
 
-/// The non-destructive timeline (EDL): a set of multi-kind tracks plus the text
-/// overlays (titles / lower-thirds / captions) drawn over the composited picture.
+/// A named point on the timeline. Purely an annotation — it renders nothing —
+/// but it gives the user and the agent a shared vocabulary for places in the
+/// cut ("the laugh at 01:12"), which timestamps alone do not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Marker {
+    pub id: Uuid,
+    /// Position on the timeline, seconds.
+    pub time: f64,
+    pub name: String,
+    /// Optional CSS color for the ruler chip; the UI picks a default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// The non-destructive timeline (EDL): a set of multi-kind tracks, the text
+/// overlays (titles / lower-thirds / captions) drawn over the composited
+/// picture, and the user's markers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlays: Vec<TextOverlay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
 }
 
 impl Default for Timeline {
@@ -1139,6 +1156,7 @@ impl Timeline {
         Self {
             tracks: vec![Track::new(StreamKind::Video, "V1"), Track::new(StreamKind::Audio, "A1")],
             overlays: Vec::new(),
+            markers: Vec::new(),
         }
     }
 
@@ -1218,6 +1236,7 @@ impl Timeline {
                 })
                 .collect(),
             overlays: self.overlays.clone(),
+            markers: self.markers.clone(),
         }
     }
 
@@ -1232,6 +1251,17 @@ impl Timeline {
         let mut out = Timeline {
             tracks: Vec::with_capacity(self.tracks.len()),
             overlays: Vec::new(),
+            // Markers inside the window come along, shifted like everything else;
+            // without this a range export would desync every one of them.
+            markers: self
+                .markers
+                .iter()
+                .filter(|m| m.time >= start && m.time < end)
+                .map(|m| Marker {
+                    time: m.time - start,
+                    ..m.clone()
+                })
+                .collect(),
         };
         for track in &self.tracks {
             let mut t = Track {
@@ -1402,6 +1432,7 @@ mod tests {
                 },
             ],
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         let r = tl.for_render();
         // The disabled clip is gone but the enabled one stays.
@@ -1425,6 +1456,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)]),
             ],
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         let r = tl.for_render();
         assert!(r.tracks[0].clips.is_empty(), "unsoloed video track is shadowed");
@@ -1442,6 +1474,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)])
             }],
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         assert!(tl.for_render().tracks[0].clips.is_empty());
     }
@@ -1454,6 +1487,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 3.0)]),
             ],
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         let r = tl.for_render();
         assert_eq!(
@@ -1480,6 +1514,26 @@ mod tests {
     }
 
     #[test]
+    fn slice_shifts_markers_into_the_window_and_drops_the_rest() {
+        let mk = |t: f64, n: &str| Marker {
+            id: Uuid::new_v4(),
+            time: t,
+            name: n.into(),
+            color: None,
+        };
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 20.0)])],
+            overlays: Vec::new(),
+            markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
+        };
+        let s = tl.slice(3.0, 7.0);
+        let names: Vec<_> = s.markers.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["inside"], "only markers within the window survive");
+        // Shifted with everything else — otherwise a range export desyncs them.
+        assert!((s.markers[0].time - 1.0).abs() < 1e-9, "{}", s.markers[0].time);
+    }
+
+    #[test]
     fn slice_carries_track_flags_through() {
         let tl = Timeline {
             tracks: vec![Track {
@@ -1489,6 +1543,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 10.0)])
             }],
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);

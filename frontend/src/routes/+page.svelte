@@ -196,6 +196,13 @@
 		// Tools / transport (bare keys).
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
+		else if (k === 'm') {
+			void editor
+				.addMarkerAtPlayhead(ui.time)
+				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
+		} else if (e.key === ',') ui.gotoMarker(-1);
+		else if (e.key === '.') ui.gotoMarker(1);
 		else if (k === 'j') ui.shuttle(-1);
 		else if (k === 'k') ui.pause();
 		else if (k === 'l') ui.shuttle(1);

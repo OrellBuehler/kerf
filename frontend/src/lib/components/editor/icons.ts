@@ -53,7 +53,7 @@ import {
 export const icons: Record<string, typeof LucideIcon> = {
 	'MousePointer2': MousePointer2,
 	'Scissors': Scissors,
-	'Bookmark': Bookmark,
+	'bookmark': Bookmark,
 	'magnet': Magnet,
 	'skip-back': SkipBack,
 	'skip-forward': SkipForward,

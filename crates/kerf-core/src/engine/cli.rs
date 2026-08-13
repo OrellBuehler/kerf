@@ -4132,6 +4132,7 @@ mod tests {
         let timeline = Timeline {
             tracks: Vec::new(),
             overlays: Vec::new(),
+            markers: Vec::new(),
         };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
@@ -4178,6 +4179,7 @@ mod tests {
         Timeline {
             tracks,
             overlays: Vec::new(),
+            markers: Vec::new(),
         }
     }
 

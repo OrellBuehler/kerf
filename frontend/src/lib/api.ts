@@ -887,6 +887,45 @@ export async function addReframeKeyframe(
 }
 
 /** Add a text overlay (title / lower-third / caption). */
+export async function addMarker(time: number, name: string, color?: string): Promise<Timeline> {
+	if (!inTauri()) {
+		devTimeline.markers = [
+			...(devTimeline.markers ?? []),
+			{ id: crypto.randomUUID(), time, name, color: color ?? null }
+		].sort((a, b) => a.time - b.time);
+		recordDev('Add marker');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_marker', { time, name, color });
+}
+
+export async function updateMarker(
+	markerId: string,
+	patch: { time?: number; name?: string; color?: string }
+): Promise<Timeline> {
+	if (!inTauri()) {
+		const m = devTimeline.markers?.find((x) => x.id === markerId);
+		if (m) {
+			if (patch.time !== undefined) m.time = patch.time;
+			if (patch.name !== undefined) m.name = patch.name;
+			if (patch.color !== undefined) m.color = patch.color || null;
+			devTimeline.markers = [...(devTimeline.markers ?? [])].sort((a, b) => a.time - b.time);
+		}
+		recordDev('Update marker');
+		return snapshot();
+	}
+	return invoke<Timeline>('update_marker', { markerId, ...patch });
+}
+
+export async function removeMarker(markerId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		devTimeline.markers = (devTimeline.markers ?? []).filter((m) => m.id !== markerId);
+		recordDev('Remove marker');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_marker', { markerId });
+}
+
 export async function addOverlay(text: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
 		(devTimeline.overlays ??= []).push({

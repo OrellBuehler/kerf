@@ -44,6 +44,9 @@ import {
 	setTrackSolo,
 	setTrackLocked,
 	setClipEnabled,
+	addMarker,
+	updateMarker,
+	removeMarker,
 	reorderClip,
 	rippleDelete,
 	cutClipRange,
@@ -74,6 +77,7 @@ import type {
 	Revision,
 	StreamKind,
 	TextKeyframe,
+	Marker,
 	TextOverlay,
 	Timeline,
 	Transform,
@@ -119,6 +123,11 @@ class EditorState {
 
 	get overlays(): TextOverlay[] {
 		return this.timeline.overlays ?? [];
+	}
+
+	/** Markers, kept sorted by time by the backend. */
+	get markers(): Marker[] {
+		return this.timeline.markers ?? [];
 	}
 
 	get selectedOverlay(): TextOverlay | undefined {
@@ -357,6 +366,19 @@ class EditorState {
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
 		return this.#apply(setTrackDuck(trackId, duck));
+	}
+	/** Add an auto-named marker at `time` — the M shortcut and the timeline menu. */
+	addMarkerAtPlayhead(time: number) {
+		return this.addMarker(time, `Marker ${this.markers.length + 1}`);
+	}
+	addMarker(time: number, name: string, color?: string) {
+		return this.#apply(addMarker(time, name, color));
+	}
+	updateMarker(markerId: string, patch: { time?: number; name?: string; color?: string }) {
+		return this.#apply(updateMarker(markerId, patch));
+	}
+	removeMarker(markerId: string) {
+		return this.#apply(removeMarker(markerId));
 	}
 	setTrackMuted(trackId: string, muted: boolean) {
 		return this.#apply(setTrackMuted(trackId, muted));

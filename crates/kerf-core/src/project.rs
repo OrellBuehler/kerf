@@ -11,9 +11,9 @@ use uuid::Uuid;
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Projection, Reframe, ReframeKeyframe, Revision, StreamInfo,
-    StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect, MAX_FOV,
-    MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe, Revision,
+    StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect,
+    MAX_FOV, MIN_FOV,
 };
 
 const SCHEMA: &str = r#"
@@ -1973,6 +1973,70 @@ impl Project {
     // ---- text overlays (titles / lower-thirds / captions) -----------------
 
     /// Add a text overlay drawn over the composited picture, returning it.
+    /// Drop a named marker at `time`. Markers are kept sorted by time, so the
+    /// UI and `next`/`previous` navigation never have to re-sort.
+    pub fn add_marker(&self, time: f64, name: String, color: Option<String>) -> Result<Marker> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(Error::InvalidArgument("marker time must be >= 0".to_string()));
+        }
+        let marker = Marker {
+            id: Uuid::new_v4(),
+            time,
+            name,
+            color,
+        };
+        self.edit_timeline("Add marker", move |timeline| {
+            timeline.markers.push(marker.clone());
+            timeline.markers.sort_by(|a, b| a.time.total_cmp(&b.time));
+            Ok(marker)
+        })
+    }
+
+    /// Rename, recolor or move a marker; each `None` leaves that field alone.
+    /// Pass an empty `color` to clear it back to the UI default.
+    pub fn update_marker(
+        &self,
+        marker_id: Uuid,
+        time: Option<f64>,
+        name: Option<String>,
+        color: Option<String>,
+    ) -> Result<Marker> {
+        if time.is_some_and(|t| !t.is_finite() || t < 0.0) {
+            return Err(Error::InvalidArgument("marker time must be >= 0".to_string()));
+        }
+        self.edit_timeline("Update marker", |timeline| {
+            let marker = timeline
+                .markers
+                .iter_mut()
+                .find(|m| m.id == marker_id)
+                .ok_or_else(|| Error::InvalidArgument(format!("no marker {marker_id}")))?;
+            if let Some(t) = time {
+                marker.time = t;
+            }
+            if let Some(n) = name {
+                marker.name = n;
+            }
+            if let Some(c) = color {
+                marker.color = if c.is_empty() { None } else { Some(c) };
+            }
+            let out = marker.clone();
+            timeline.markers.sort_by(|a, b| a.time.total_cmp(&b.time));
+            Ok(out)
+        })
+    }
+
+    /// Remove a marker.
+    pub fn remove_marker(&self, marker_id: Uuid) -> Result<()> {
+        self.edit_timeline("Remove marker", |timeline| {
+            let before = timeline.markers.len();
+            timeline.markers.retain(|m| m.id != marker_id);
+            if timeline.markers.len() == before {
+                return Err(Error::InvalidArgument(format!("no marker {marker_id}")));
+            }
+            Ok(())
+        })
+    }
+
     pub fn add_overlay(&self, text: String, start: f64, end: f64) -> Result<TextOverlay> {
         if !start.is_finite() || !end.is_finite() || end <= start {
             return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
@@ -2501,6 +2565,30 @@ mod tests {
         for want in ["Mute track", "Solo track", "Lock track", "Unmute track", "Disable clip"] {
             assert!(labels.contains(&want.to_string()), "missing {want} in {labels:?}");
         }
+    }
+
+    #[test]
+    fn markers_stay_sorted_and_round_trip() {
+        let project = Project::open_in_memory().unwrap();
+        // Added out of order; the store keeps them sorted so the UI never re-sorts.
+        project.add_marker(9.0, "late".into(), None).unwrap();
+        let mid = project.add_marker(4.0, "middle".into(), Some("#f00".into())).unwrap();
+        project.add_marker(1.0, "early".into(), None).unwrap();
+        let names: Vec<_> = project.timeline().unwrap().markers.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, ["early", "middle", "late"]);
+
+        // Moving one re-sorts, renaming sticks, and an empty color clears it.
+        let moved = project
+            .update_marker(mid.id, Some(12.0), Some("moved".into()), Some(String::new()))
+            .unwrap();
+        assert!(moved.color.is_none());
+        let names: Vec<_> = project.timeline().unwrap().markers.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, ["early", "late", "moved"]);
+
+        project.remove_marker(mid.id).unwrap();
+        assert_eq!(project.timeline().unwrap().markers.len(), 2);
+        assert!(project.remove_marker(mid.id).is_err(), "removing twice must fail");
+        assert!(project.add_marker(-1.0, "bad".into(), None).is_err());
     }
 
     #[test]

@@ -75,6 +75,16 @@ class EditorUi {
 		if (this.playing) this.#startAudio();
 	}
 
+	/** Jump to the nearest marker before (-1) or after (+1) the playhead. */
+	gotoMarker(dir: 1 | -1) {
+		const eps = 1e-4;
+		const times = editor.markers
+			.map((m) => m.time)
+			.filter((t) => (dir > 0 ? t > this.time + eps : t < this.time - eps));
+		if (times.length === 0) return;
+		this.seek(dir > 0 ? Math.min(...times) : Math.max(...times));
+	}
+
 	togglePlay() {
 		this.playing ? this.pause() : this.play();
 	}

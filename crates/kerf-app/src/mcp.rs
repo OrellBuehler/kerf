@@ -149,6 +149,38 @@ struct SetTrackDuckParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddMarkerParams {
+    #[schemars(description = "Timeline time in seconds to mark")]
+    time: f64,
+    #[schemars(description = "Short label for the marker, e.g. 'best laugh' or 'chapter 2'")]
+    name: String,
+    #[schemars(description = "Optional CSS color for the ruler chip")]
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdateMarkerParams {
+    #[schemars(description = "UUID of the marker to update")]
+    marker_id: String,
+    #[schemars(description = "New timeline time in seconds; omit to leave it put")]
+    #[serde(default)]
+    time: Option<f64>,
+    #[schemars(description = "New label; omit to leave it alone")]
+    #[serde(default)]
+    name: Option<String>,
+    #[schemars(description = "New CSS color, or an empty string to clear it")]
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct MarkerIdParams {
+    #[schemars(description = "UUID of the marker to remove")]
+    marker_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetTrackMutedParams {
     #[schemars(description = "UUID of the track to mute or unmute")]
     track_id: String,
@@ -744,6 +776,36 @@ impl KerfMcp {
         let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
         self.changed();
         json(&track)
+    }
+
+    #[tool(
+        description = "Drop a named marker on the timeline. Markers render nothing — they are shared \
+                       vocabulary for places in the cut, so 'the laugh at 01:12' survives as something \
+                       the user can see and jump to. Good for reporting findings from skim_asset."
+    )]
+    fn add_marker(&self, Parameters(p): Parameters<AddMarkerParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        let marker = project.add_marker(p.time, p.name, p.color).map_err(core_err)?;
+        self.changed();
+        json(&marker)
+    }
+
+    #[tool(description = "Move, rename or recolor a marker; omitted fields are left alone")]
+    fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
+        let marker_id = parse_id(&p.marker_id)?;
+        let project = self.lock();
+        let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
+        self.changed();
+        json(&marker)
+    }
+
+    #[tool(description = "Remove a marker from the timeline")]
+    fn remove_marker(&self, Parameters(p): Parameters<MarkerIdParams>) -> Result<String, McpError> {
+        let marker_id = parse_id(&p.marker_id)?;
+        let project = self.lock();
+        project.remove_marker(marker_id).map_err(core_err)?;
+        self.changed();
+        Ok("ok".to_string())
     }
 
     #[tool(

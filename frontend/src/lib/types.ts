@@ -252,9 +252,19 @@ export interface Track {
 	locked?: boolean;
 }
 
+/** A named point on the timeline. Renders nothing — it is shared vocabulary
+ *  for places in the cut, for the user and the agent alike. */
+export interface Marker {
+	id: string;
+	time: number;
+	name: string;
+	color?: string | null;
+}
+
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
+	markers?: Marker[];
 }
 
 export interface AssetMetadata {

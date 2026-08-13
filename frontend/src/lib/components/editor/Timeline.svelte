@@ -6,7 +6,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import type { Clip, StreamKind, Track } from '$lib/types';
+	import type { Clip, Marker, StreamKind, Track } from '$lib/types';
 	import { clipDuration } from '$lib/types';
 
 	const pxPerSec = $derived(ui.zoom);
@@ -392,6 +392,10 @@
 			ui.seek(rulerTime(e.clientX));
 			return;
 		}
+		if (markerDrag) {
+			markerDrag = { ...markerDrag, time: rulerTime(e.clientX) };
+			return;
+		}
 		if (markDrag) {
 			const t = rulerTime(e.clientX);
 			// The pair stays ordered, matching how I/O set them from the keyboard.
@@ -427,6 +431,13 @@
 		}
 		if (scrubbing) {
 			scrubbing = false;
+			return;
+		}
+		if (markerDrag) {
+			const d = markerDrag;
+			markerDrag = null;
+			const m = editor.markers.find((x) => x.id === d.id);
+			if (m && Math.abs(m.time - d.time) > 1e-6) void editor.updateMarker(d.id, { time: d.time }).catch(err);
 			return;
 		}
 		if (markDrag) {
@@ -725,12 +736,50 @@
 		markDrag = which;
 	}
 
+	// ---- markers --------------------------------------------------------------
+
+	/** Marker being dragged along the ruler, and the id being renamed inline. */
+	let markerDrag: { id: string; time: number } | null = $state(null);
+	let renaming = $state<string | null>(null);
+
+	const addMarkerHere = () => void editor.addMarkerAtPlayhead(ui.time).catch(err);
+
+	function onMarkerPointerDown(e: PointerEvent, m: Marker) {
+		if (e.button !== 0 || renaming === m.id) return;
+		e.stopPropagation();
+		markerDrag = { id: m.id, time: m.time };
+	}
+
+	function commitRename(m: Marker, value: string) {
+		renaming = null;
+		const name = value.trim();
+		if (name && name !== m.name) void editor.updateMarker(m.id, { name }).catch(err);
+	}
+
+	function onMarkerContextMenu(e: MouseEvent, m: Marker) {
+		e.stopPropagation();
+		contextMenu.show(e, [
+			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
+			{ label: 'Rename', action: () => (renaming = m.id) },
+			{ type: 'separator' },
+			{
+				label: 'Remove marker',
+				icon: 'trash',
+				danger: true,
+				action: () => void editor.removeMarker(m.id).catch(err)
+			}
+		]);
+	}
+
 	// Right-click on empty timeline canvas (ruler / grid / below the tracks). Clip
 	// and lane menus stopPropagation, so only the bare background reaches this.
 	function onTimelineContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+			{ type: 'separator' },
+			{ type: 'separator' },
+			{ label: 'Add marker at playhead', icon: 'bookmark', shortcut: 'M', action: addMarkerHere },
 			{ type: 'separator' },
 			{
 				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
@@ -957,6 +1006,41 @@
 						title="Beat"
 						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:1px;height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
 					></span>
+				{/each}
+				<!-- user markers: click seeks, drag moves, double-click renames -->
+				{#each editor.markers as m (m.id)}
+					{@const mt = markerDrag?.id === m.id ? markerDrag.time : m.time}
+					{@const accent = m.color || 'var(--agent-400)'}
+					<span
+						role="presentation"
+						title="{m.name} — {fmt(mt)}"
+						onpointerdown={(e) => onMarkerPointerDown(e, m)}
+						ondblclick={() => (renaming = m.id)}
+						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
+						style="position:absolute;left:{mt *
+							pxPerSec}px;top:0;bottom:0;width:8px;z-index:29;cursor:ew-resize;touch-action:none;display:flex;align-items:center"
+					>
+						<span style="position:absolute;left:-1px;top:0;bottom:0;width:2px;background:{accent}"></span>
+						{#if renaming === m.id}
+							<!-- svelte-ignore a11y_autofocus -->
+							<input
+								autofocus
+								value={m.name}
+								onblur={(e) => commitRename(m, e.currentTarget.value)}
+								onkeydown={(e) => {
+									if (e.key === 'Enter') e.currentTarget.blur();
+									else if (e.key === 'Escape') renaming = null;
+									e.stopPropagation();
+								}}
+								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:9px;padding:1px 3px;border-radius:3px;border:1px solid {accent};background:var(--surface-inset);color:var(--text-primary)"
+							/>
+						{:else}
+							<span
+								style="position:relative;flex:none;margin-left:3px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;font-weight:600;line-height:1;padding:2px 4px;border-radius:3px;background:{accent};color:#04181c;pointer-events:none"
+								>{m.name}</span
+							>
+						{/if}
+					</span>
 				{/each}
 				{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
 					<div

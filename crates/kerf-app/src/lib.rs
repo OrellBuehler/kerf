@@ -669,6 +669,35 @@ fn add_reframe_keyframe(
 }
 
 #[tauri::command(async)]
+fn add_marker(state: State<'_, AppState>, time: f64, name: String, color: Option<String>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.add_marker(time, name, color).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn update_marker(
+    state: State<'_, AppState>,
+    marker_id: String,
+    time: Option<f64>,
+    name: Option<String>,
+    color: Option<String>,
+) -> CmdResult<Timeline> {
+    let id = id(&marker_id)?;
+    let project = state.project();
+    project.update_marker(id, time, name, color).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn remove_marker(state: State<'_, AppState>, marker_id: String) -> CmdResult<Timeline> {
+    let id = id(&marker_id)?;
+    let project = state.project();
+    project.remove_marker(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn add_overlay(state: State<'_, AppState>, text: String, start: f64, end: f64) -> CmdResult<Timeline> {
     let project = state.project();
     project.add_overlay(text, start, end).map_err(|e| e.to_string())?;
@@ -1158,6 +1187,9 @@ pub fn run() {
             clear_reframe,
             set_reframe_keyframes,
             add_reframe_keyframe,
+            add_marker,
+            update_marker,
+            remove_marker,
             add_overlay,
             update_overlay,
             remove_overlay,
