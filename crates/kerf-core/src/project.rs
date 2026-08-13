@@ -504,7 +504,7 @@ impl Project {
     fn preview_source(asset: &Asset) -> PathBuf {
         let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
         if has_video && !asset.is_image() {
-            if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path)) {
+            if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())) {
                 return proxy;
             }
         }
@@ -2382,7 +2382,8 @@ mod tests {
         // distinct across concurrent test runs (no shared-file race).
         let path = format!("/kerf-test-proxy-source-{}.mp4", std::process::id());
         let asset = asset_with(&path, vec![vid_stream(false)]);
-        let Some(proxy) = crate::engine::proxy_path(Path::new(&asset.path)) else {
+        let width = crate::engine::proxy_width(asset.projection());
+        let Some(proxy) = crate::engine::proxy_path(Path::new(&asset.path), width) else {
             return; // no cache dir on this platform — nothing to resolve to
         };
         if let Some(dir) = proxy.parent() {

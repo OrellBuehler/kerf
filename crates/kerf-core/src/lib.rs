@@ -20,7 +20,7 @@ pub use analysis::{
     SilenceDetector, Transcriber,
 };
 pub use engine::{
-    generate_proxy, insta360_pair, proxy_path, render_with, render_with_progress, stitch_insta360, stitched_path,
+    generate_proxy, insta360_pair, proxy_path, proxy_width, render_with, render_with_progress, stitch_insta360, stitched_path,
     validate_export, Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
 };
 pub use error::{Error, Result};

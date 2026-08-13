@@ -221,8 +221,8 @@ async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) 
     .await
 }
 
-/// Queue an asset's preview proxy (all-intra, ~720p) for background generation so
-/// scrubbing decodes one keyframe instead of seeking a long GOP. Non-blocking and
+/// Queue an asset's preview proxy (all-intra, downscaled) for background
+/// generation so scrubbing decodes one keyframe instead of seeking a long GOP. Non-blocking and
 /// best-effort: previews fall back to the original source until the proxy lands,
 /// at which point we emit `proxy-ready` so the webview re-fetches the current
 /// frame. Stills and audio-only assets are skipped (they get no proxy).
@@ -231,7 +231,9 @@ pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
     if !has_video || asset.is_image() {
         return;
     }
-    if let Err(e) = proxy_jobs().send((app.clone(), asset.path.clone())) {
+    // 360 assets proxy larger — reframing crops most of the frame away.
+    let width = kerf_core::proxy_width(asset.projection());
+    if let Err(e) = proxy_jobs().send((app.clone(), asset.path.clone(), width)) {
         tracing::warn!(error = %e, "preview proxy queue is closed");
     }
 }
@@ -255,10 +257,10 @@ fn proxy_workers() -> usize {
 /// job is funnelled through `proxy_workers()` workers (each encode also
 /// thread-capped in the engine), leaving the machine responsive while proxies
 /// trickle in; previews use the original source until each one lands.
-fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
-    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String)>> = std::sync::OnceLock::new();
+fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String, u32)> {
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<(AppHandle, String, u32)>> = std::sync::OnceLock::new();
     QUEUE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(AppHandle, String, u32)>();
         let rx = Arc::new(Mutex::new(rx));
         for _ in 0..proxy_workers() {
             let rx = Arc::clone(&rx);
@@ -269,8 +271,8 @@ fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String)> {
                     Ok(guard) => guard.recv(),
                     Err(_) => break,
                 };
-                let Ok((app, path)) = job else { break };
-                match kerf_core::generate_proxy(std::path::Path::new(&path)) {
+                let Ok((app, path, width)) = job else { break };
+                match kerf_core::generate_proxy(std::path::Path::new(&path), width) {
                     Ok(_) => {
                         if let Err(e) = app.emit("proxy-ready", ()) {
                             tracing::warn!(error = %e, "failed to emit proxy-ready");

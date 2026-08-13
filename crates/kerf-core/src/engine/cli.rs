@@ -824,6 +824,23 @@ pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32) -> Re
 /// enough that one frame decodes in a few ms, large enough to preview framing.
 const PROXY_MAX_WIDTH: u32 = 1280;
 
+/// Cap on the proxy's width for spherical sources. A reframed preview crops
+/// roughly a 100° window out of a 360° picture, so only about a quarter of the
+/// proxy's width ever reaches the screen: at 1280 that leaves ~355 px of real
+/// detail — visible mush. 3072 puts ~850 px across the shot while an all-intra
+/// frame still decodes fast enough to scrub.
+const PROXY_MAX_WIDTH_SPHERICAL: u32 = 3072;
+
+/// The proxy width to render (and look up) an asset at. 360 footage is preserved
+/// at a larger size because reframing throws most of the frame away.
+pub fn proxy_width(projection: Option<Projection>) -> u32 {
+    if projection.is_some_and(|p| p.is_spherical()) {
+        PROXY_MAX_WIDTH_SPHERICAL
+    } else {
+        PROXY_MAX_WIDTH
+    }
+}
+
 /// FNV-1a over `s`. A small, dependency-free, deterministic hash for naming a
 /// source's proxy file — stability across sessions is what lets a re-import
 /// reuse the cached proxy (a non-deterministic hasher would orphan it).
@@ -851,19 +868,25 @@ fn source_key(src: &Path) -> String {
     format!("{}|{len}|{mtime}", src.display())
 }
 
-/// The on-disk path of `src`'s preview proxy (whether or not it exists yet):
-/// `<cache>/kerf/proxies/<hash>.mp4`. `None` when no OS cache directory is
-/// resolvable (a proxy simply can't be cached — preview falls back to original).
-pub fn proxy_path(src: &Path) -> Option<PathBuf> {
+/// The on-disk path of `src`'s preview proxy at `width` (whether or not it
+/// exists yet): `<cache>/kerf/proxies/<hash>.mp4`. `None` when no OS cache
+/// directory is resolvable (a proxy simply can't be cached — preview falls back
+/// to the original).
+///
+/// The width is part of the key, so an asset that is later marked as 360 (or
+/// stops being one) looks up a different file and regenerates instead of
+/// silently reusing a proxy rendered at the wrong size.
+pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    Some(dir.join(format!("{:016x}.mp4", fnv1a(&source_key(src)))))
+    Some(dir.join(format!("{:016x}.mp4", fnv1a(&format!("{}|{width}", source_key(src))))))
 }
 
-/// The proxy for `src` **if it has already been generated** (the file exists),
-/// for a preview path to decode from instead of the original; `None` otherwise.
-/// Preview must never block on generation, so this is a pure existence check.
-pub fn ready_proxy(src: &Path) -> Option<PathBuf> {
-    proxy_path(src).filter(|p| p.is_file())
+/// The proxy for `src` at `width` **if it has already been generated** (the file
+/// exists), for a preview path to decode from instead of the original; `None`
+/// otherwise. Preview must never block on generation, so this is a pure
+/// existence check.
+pub fn ready_proxy(src: &Path, width: u32) -> Option<PathBuf> {
+    proxy_path(src, width).filter(|p| p.is_file())
 }
 
 /// How many CPU threads a single preview-proxy encode may use. Capped to leave
@@ -880,13 +903,13 @@ fn proxy_threads() -> usize {
 }
 
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
-/// an all-intra, audio-less, ~720p preview proxy at `dst`, using at most
-/// `threads` CPU threads. `-g 1` makes every frame a keyframe, so a seek decodes
+/// an all-intra, audio-less preview proxy at `dst`, capped to `width` pixels
+/// across (see [`proxy_width`]) and using at most `threads` CPU threads. `-g 1` makes every frame a keyframe, so a seek decodes
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
 /// always reads the original) would.
-fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
+fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32) -> Vec<String> {
     vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -896,7 +919,7 @@ fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
         src.to_string(),
         "-an".to_string(),
         "-vf".to_string(),
-        format!("scale='min({PROXY_MAX_WIDTH},iw)':-2:flags=bilinear"),
+        format!("scale='min({width},iw)':-2:flags=bilinear"),
         "-c:v".to_string(),
         "libx264".to_string(),
         "-preset".to_string(),
@@ -925,8 +948,9 @@ fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
 /// interrupted / concurrent encode never leaves a half-written file that
 /// [`ready_proxy`] would mistake for a finished proxy. Blocking; callers run it
 /// off the project lock (e.g. on a background thread).
-pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
-    let dst = proxy_path(src).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
+    let dst =
+        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
@@ -940,7 +964,7 @@ pub fn generate_proxy(src: &Path) -> Result<PathBuf> {
     let tmp_str = tmp
         .to_str()
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
-    let args = build_proxy_args(src_str, tmp_str, proxy_threads());
+    let args = build_proxy_args(src_str, tmp_str, proxy_threads(), width);
     let bin = ffmpeg_bin();
     let output = command(&bin)
         .args(&args)
@@ -3731,7 +3755,7 @@ mod tests {
 
     #[test]
     fn proxy_args_are_all_intra_audioless_and_keep_timing() {
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3);
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH);
         // All-intra: every frame a keyframe, so a preview seek decodes one frame.
         let gop = args.iter().position(|a| a == "-g").expect("-g present");
         assert_eq!(args[gop + 1], "1");
@@ -3851,14 +3875,34 @@ mod tests {
         // session reuses the cached proxy); different sources → different files.
         // Skipped when the platform exposes no cache directory.
         if let (Some(a1), Some(a2), Some(b)) = (
-            proxy_path(Path::new("/media/a.mov")),
-            proxy_path(Path::new("/media/a.mov")),
-            proxy_path(Path::new("/media/b.mov")),
+            proxy_path(Path::new("/media/a.mov"), PROXY_MAX_WIDTH),
+            proxy_path(Path::new("/media/a.mov"), PROXY_MAX_WIDTH),
+            proxy_path(Path::new("/media/b.mov"), PROXY_MAX_WIDTH),
         ) {
             assert_eq!(a1, a2);
             assert_ne!(a1, b);
             assert!(a1.to_string_lossy().contains("proxies"));
             assert_eq!(a1.extension().and_then(|e| e.to_str()), Some("mp4"));
+        }
+    }
+
+    #[test]
+    fn spherical_sources_proxy_larger_and_under_their_own_key() {
+        // Reframing crops ~100° out of 360, so a 360 proxy keeps more pixels.
+        assert_eq!(proxy_width(None), PROXY_MAX_WIDTH);
+        assert_eq!(proxy_width(Some(Projection::Flat)), PROXY_MAX_WIDTH);
+        assert_eq!(proxy_width(Some(Projection::Equirect)), PROXY_MAX_WIDTH_SPHERICAL);
+        assert_eq!(proxy_width(Some(Projection::DualFisheye)), PROXY_MAX_WIDTH_SPHERICAL);
+        assert!(build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL)
+            .iter()
+            .any(|a| a.contains("scale='min(3072,iw)':-2")));
+        // Marking an asset as 360 must not silently reuse the small proxy that
+        // was rendered while it looked flat, so the width is part of the key.
+        if let (Some(flat), Some(sphere)) = (
+            proxy_path(Path::new("/media/a.mov"), PROXY_MAX_WIDTH),
+            proxy_path(Path::new("/media/a.mov"), PROXY_MAX_WIDTH_SPHERICAL),
+        ) {
+            assert_ne!(flat, sphere);
         }
     }
 
