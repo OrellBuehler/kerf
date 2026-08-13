@@ -909,6 +909,11 @@ fn build_proxy_args(src: &str, dst: &str, threads: usize) -> Vec<String> {
         threads.max(1).to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
+        // The encode writes a `.part` temp file, whose extension tells ffmpeg
+        // nothing — name the muxer instead of letting it guess, or it exits
+        // with "unable to find a suitable output format" before decoding a frame.
+        "-f".to_string(),
+        "mp4".to_string(),
         dst.to_string(),
     ]
 }
@@ -3741,6 +3746,9 @@ mod tests {
         assert!(!args.contains(&"-ss".to_string()), "proxy must not seek");
         assert!(args.iter().any(|a| a.contains("scale='min(1280,iw)':-2")));
         assert!(args.contains(&"libx264".to_string()));
+        // The output is a `.part` temp file the muxer can't be inferred from, so
+        // the format must be stated or ffmpeg refuses to start.
+        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "mp4"), "muxer must be explicit");
         // The source is the input; the proxy is the (final) output.
         let input = args.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(args[input + 1], "/in.mov");
