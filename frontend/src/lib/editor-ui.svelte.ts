@@ -31,6 +31,8 @@ class EditorUi {
 	markOut = $state<number | null>(null);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
+	/** Height of the timeline panel in px, dragged from its top edge. */
+	timelineH = $state(296);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);

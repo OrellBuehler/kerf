@@ -359,6 +359,22 @@
 	}
 
 	function onPointerMove(e: PointerEvent) {
+		if (resizeFrom) {
+			const max = Math.max(180, window.innerHeight - 180);
+			ui.timelineH = Math.min(Math.max(140, resizeFrom.h + (resizeFrom.y - e.clientY)), max);
+			return;
+		}
+		if (scrubbing) {
+			ui.seek(rulerTime(e.clientX));
+			return;
+		}
+		if (markDrag) {
+			const t = rulerTime(e.clientX);
+			// The pair stays ordered, matching how I/O set them from the keyboard.
+			if (markDrag === 'in') ui.markIn = Math.min(t, ui.markOut ?? Infinity);
+			else ui.markOut = Math.max(t, ui.markIn ?? 0);
+			return;
+		}
 		if (trimDrag) {
 			onTrimMove(e);
 			return;
@@ -381,6 +397,18 @@
 	}
 
 	function onPointerUp() {
+		if (resizeFrom) {
+			resizeFrom = null;
+			return;
+		}
+		if (scrubbing) {
+			scrubbing = false;
+			return;
+		}
+		if (markDrag) {
+			markDrag = null;
+			return;
+		}
 		if (trimDrag) {
 			onTrimUp();
 			return;
@@ -539,6 +567,114 @@
 	const onLaneContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
 	const onTrackHeaderContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));
 
+	// ---- viewport: scrolling, zoom anchoring, panel resize --------------------
+
+	let scroller = $state<HTMLElement | null>(null);
+	let headersEl = $state<HTMLElement | null>(null);
+	let rulerEl = $state<HTMLElement | null>(null);
+
+	const ZOOM_MIN = 8;
+	const ZOOM_MAX = 96;
+
+	/** The visible lane window. The header column is sticky, so it covers the
+	 *  first `headerW` px of the scroller — which makes `scrollLeft` index the
+	 *  lane-x sitting at the left edge of the *uncovered* area exactly. */
+	function viewport() {
+		const el = scroller;
+		if (!el) return null;
+		const headerW = headersEl?.offsetWidth ?? 0;
+		return { el, headerW, viewW: Math.max(1, el.clientWidth - headerW) };
+	}
+
+	// Keep the playhead on screen while it moves — during playback it would
+	// otherwise walk straight off the right edge. Only runs when the playhead
+	// moves, so scrolling away by hand while parked isn't fought.
+	$effect(() => {
+		const laneX = ui.time * pxPerSec;
+		const v = viewport();
+		if (!v) return;
+		const margin = Math.min(80, v.viewW * 0.15);
+		if (laneX < v.el.scrollLeft + margin || laneX > v.el.scrollLeft + v.viewW - margin) {
+			v.el.scrollLeft = Math.max(0, laneX - v.viewW * 0.25);
+		}
+	});
+
+	// Hold one point in time still across a zoom change, so zooming in on a
+	// distant clip doesn't sweep it off screen. The anchor is the playhead unless
+	// the wheel handler overrode it with the time under the cursor. `$effect.pre`
+	// samples the scroll position *before* the DOM is patched (i.e. at the old
+	// zoom); the paired `$effect` applies it after the content has been rewidened.
+	let lastZoom = ui.zoom;
+	let preScroll = 0;
+	let zoomAnchor: { time: number; offset: number } | null = null;
+
+	$effect.pre(() => {
+		void ui.zoom;
+		preScroll = scroller?.scrollLeft ?? 0;
+	});
+
+	$effect(() => {
+		const z = ui.zoom;
+		const v = viewport();
+		if (!v) {
+			lastZoom = z;
+			return;
+		}
+		if (z === lastZoom) return;
+		const prev = lastZoom;
+		lastZoom = z;
+		const a = zoomAnchor;
+		zoomAnchor = null;
+		const time = a ? a.time : ui.time;
+		// A playhead anchor that was off screen would otherwise be preserved off
+		// screen; clamp it into the window first.
+		const offset = a ? a.offset : Math.min(Math.max(time * prev - preScroll, 0), v.viewW);
+		v.el.scrollLeft = Math.max(0, time * z - offset);
+	});
+
+	/** ⌘/Ctrl + wheel zooms around the cursor. Plain and shift wheel are left to
+	 *  the browser's native vertical / horizontal scrolling, which now matters. */
+	function onWheel(e: WheelEvent) {
+		if (!e.ctrlKey && !e.metaKey) return;
+		e.preventDefault();
+		const v = viewport();
+		if (!v) return;
+		const offset = e.clientX - v.el.getBoundingClientRect().left - v.headerW;
+		const time = (v.el.scrollLeft + offset) / pxPerSec;
+		const next = Math.round(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, ui.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15))));
+		if (next === ui.zoom) return;
+		zoomAnchor = { time, offset };
+		ui.zoom = next;
+	}
+
+	let resizeFrom: { y: number; h: number } | null = null;
+
+	function onResizePointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		e.preventDefault();
+		resizeFrom = { y: e.clientY, h: ui.timelineH };
+	}
+
+	// ---- ruler scrub + draggable in/out marks ---------------------------------
+
+	let scrubbing = false;
+	let markDrag: 'in' | 'out' | null = null;
+
+	const rulerTime = (clientX: number) =>
+		Math.max(0, (clientX - (rulerEl?.getBoundingClientRect().left ?? 0)) / pxPerSec);
+
+	function onRulerPointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		scrubbing = true;
+		ui.seek(rulerTime(e.clientX));
+	}
+
+	function onMarkPointerDown(e: PointerEvent, which: 'in' | 'out') {
+		if (e.button !== 0) return;
+		e.stopPropagation();
+		markDrag = which;
+	}
+
 	// Right-click on empty timeline canvas (ruler / grid / below the tracks). Clip
 	// and lane menus stopPropagation, so only the bare background reaches this.
 	function onTimelineContextMenu(e: MouseEvent) {
@@ -558,8 +694,16 @@
 <svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
 
 <div
-	style="height:296px;flex:none;border-top:1px solid var(--border-default);background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
+	style="height:{ui.timelineH}px;flex:none;border-top:1px solid var(--border-default);background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
+	<!-- drag the top edge to resize the panel -->
+	<div
+		role="presentation"
+		title="Drag to resize the timeline"
+		onpointerdown={onResizePointerDown}
+		style="position:absolute;top:-2px;left:0;right:0;height:6px;cursor:row-resize;z-index:60;touch-action:none"
+	></div>
+
 	<!-- timeline toolbar -->
 	<div
 		style="height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-subtle);flex:none"
@@ -598,24 +742,35 @@
 		<button
 			title="Zoom out"
 			aria-label="Zoom out"
-			onclick={() => (ui.zoom = Math.max(8, ui.zoom - 8))}
+			onclick={() => (ui.zoom = Math.max(ZOOM_MIN, ui.zoom - 8))}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-out" s={14} /></button
 		>
-		<div style="width:90px;height:4px;border-radius:999px;background:var(--surface-inset);position:relative">
-			<div
-				style="position:absolute;inset:0 auto 0 0;width:{Math.round((ui.zoom / 96) * 100)}%;background:var(--neutral-600);border-radius:999px"
-			></div>
-		</div>
+		<input
+			type="range"
+			min={ZOOM_MIN}
+			max={ZOOM_MAX}
+			step="1"
+			bind:value={ui.zoom}
+			title="Zoom — {ui.zoom} px/s (⌘/Ctrl + wheel zooms at the cursor)"
+			aria-label="Timeline zoom"
+			style="width:90px;height:4px;accent-color:var(--kerf-500);cursor:pointer"
+		/>
 		<button
 			title="Zoom in"
 			aria-label="Zoom in"
-			onclick={() => (ui.zoom = Math.min(96, ui.zoom + 8))}
+			onclick={() => (ui.zoom = Math.min(ZOOM_MAX, ui.zoom + 8))}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-in" s={14} /></button
 		>
-		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
-			>{ui.snap ? 'snap on' : 'snap off'}</span
+		<button
+			title={ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable'}
+			aria-pressed={ui.snap}
+			onclick={() => (ui.snap = !ui.snap)}
+			style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{ui.snap
+				? 'var(--surface-hover)'
+				: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+			>{ui.snap ? 'snap on' : 'snap off'}</button
 		>
 		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 		<button
@@ -632,23 +787,42 @@
 		>
 	</div>
 
-	<div style="flex:1;display:flex;min-height:0">
+	<!-- One scroller for both columns, so headers and lanes cannot desync. The
+	     headers stick to the left, the ruler to the top, and their corner to
+	     both. Vertical overflow scrolls, so a 5th track is reachable.
+	     `align-items:flex-start` + `min-height:100%` rather than the default
+	     stretch: stretch would size each column to the scroller's *client*
+	     height, cutting the playhead and grid lines off at the fold while the
+	     tracks kept going. -->
+	<div
+		bind:this={scroller}
+		onwheel={onWheel}
+		style="flex:1;min-height:0;overflow:auto;position:relative;display:flex;align-items:flex-start"
+	>
 		<!-- track headers -->
 		<div
-			style="width:var(--track-header-w);flex:none;border-right:1px solid var(--border-default);background:var(--surface-app)"
+			bind:this={headersEl}
+			style="width:var(--track-header-w);flex:none;min-height:100%;position:sticky;left:0;z-index:40;border-right:1px solid var(--border-default);background:var(--surface-app)"
 		>
-			<div style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle)"></div>
+			<div
+				style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:sticky;top:0;z-index:50;background:var(--surface-app)"
+			></div>
 			{#each editor.timeline.tracks as t (t.id)}
 				<div
 					role="presentation"
 					oncontextmenu={(e) => onTrackHeaderContextMenu(e, t)}
-					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:8px;padding:0 10px"
+					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
 				>
 					<span
-						style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text-secondary);width:20px"
+						style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text-secondary);flex:none"
 						>{t.name}</span
 					>
-					<span style="font-size:11px;color:var(--text-muted);flex:1">{t.kind === 'video' ? 'Video' : 'Audio'}</span>
+					<!-- min-width:0 so the label yields first; an audio row's DUCK + icons
+					     otherwise overflow the fixed-width column and spill over the lanes. -->
+					<span
+						style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+						>{t.kind === 'video' ? 'Video' : 'Audio'}</span
+					>
 					{#if t.kind === 'audio'}
 						<button
 							title={t.duck
@@ -660,233 +834,242 @@
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
 								? '#fff'
-								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px"
+								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px;flex:none"
 							>DUCK</button
 						>
 					{/if}
-					<Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" />
+					<span style="flex:none;display:grid;place-items:center"
+						><Icon n={t.kind === 'video' ? 'eye' : 'volume-2'} s={12} color="var(--text-disabled)" /></span
+					>
 					<button
 						title="Remove track"
 						aria-label="Remove track"
 						onclick={() => onRemoveTrack(t)}
-						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0"
+						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0;flex:none"
 						><Icon n="x" s={12} /></button
 					>
 				</div>
 			{/each}
 		</div>
 
-		<!-- scrollable track area -->
-		<div style="flex:1;overflow-x:auto;overflow-y:hidden;position:relative">
+		<!-- lanes -->
+		<div
+			role="presentation"
+			oncontextmenu={onTimelineContextMenu}
+			style="width:{contentW}px;flex:none;min-height:100%;position:relative"
+		>
+			<!-- ruler — sticky under the playhead (z 30) but over the drag ghosts (z 25) -->
 			<div
+				bind:this={rulerEl}
 				role="presentation"
-				oncontextmenu={onTimelineContextMenu}
-				style="width:{contentW}px;position:relative"
+				onpointerdown={onRulerPointerDown}
+				style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
 			>
-				<!-- ruler -->
+				{#each ticks as t (t)}
+					<span
+						style="position:absolute;left:{t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
+						>{fmt(t)}</span
+					>
+				{/each}
+				{#each sceneXs as x (x)}
+					<span
+						title="Detected scene cut"
+						style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
+					></span>
+				{/each}
+				{#each beatTimes as b (b)}
+					<span
+						title="Beat"
+						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:1px;height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
+					></span>
+				{/each}
+				{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
+					<div
+						style="position:absolute;left:{ui.markIn * pxPerSec}px;width:{(ui.markOut - ui.markIn) *
+							pxPerSec}px;top:0;bottom:0;background:var(--selection-fill);pointer-events:none"
+					></div>
+				{/if}
+				{#if ui.markIn !== null}
+					<span
+						role="presentation"
+						title="Mark in {fmt(ui.markIn)} — drag to move, ⇧I clears"
+						onpointerdown={(e) => onMarkPointerDown(e, 'in')}
+						style="position:absolute;left:{ui.markIn * pxPerSec -
+							3}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
+					>
+						<span style="position:absolute;left:3px;top:0;bottom:0;width:2px;background:var(--kerf-400)"></span>
+						<span
+							style="position:absolute;top:0;left:5px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,0 100%)"
+						></span>
+					</span>
+				{/if}
+				{#if ui.markOut !== null}
+					<span
+						role="presentation"
+						title="Mark out {fmt(ui.markOut)} — drag to move, ⇧O clears"
+						onpointerdown={(e) => onMarkPointerDown(e, 'out')}
+						style="position:absolute;left:{ui.markOut * pxPerSec -
+							9}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
+					>
+						<span style="position:absolute;right:1px;top:0;bottom:0;width:2px;background:var(--kerf-400)"></span>
+						<span
+							style="position:absolute;top:0;right:3px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,100% 100%)"
+						></span>
+					</span>
+				{/if}
+			</div>
+
+			<!-- grid lines -->
+			{#if hasClips}
+				{#each ticks as t, i (t)}
+					<span
+						style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:1px;background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
+					></span>
+				{/each}
+			{/if}
+
+			{#if !hasClips}
+				<div
+					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-disabled);font-size:12px"
+				>
+					Timeline empty — import media and queue a cut
+				</div>
+			{/if}
+
+			<!-- tracks -->
+			{#each editor.timeline.tracks as t (t.id)}
 				<div
 					role="presentation"
+					data-lane
+					data-track-id={t.id}
+					data-kind={t.kind}
 					onclick={onLaneSeek}
-					style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:relative;background:var(--surface-app);cursor:pointer"
+					oncontextmenu={(e) => onLaneContextMenu(e, t)}
+					ondragover={(e) => onLaneDragOver(e, t)}
+					ondragleave={(e) => onLaneDragLeave(e, t)}
+					ondrop={(e) => onLaneDrop(e, t)}
+					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);position:relative"
 				>
-					{#each ticks as t (t)}
-						<span
-							style="position:absolute;left:{t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
-							>{fmt(t)}</span
+					{#each t.clips as c (c.id)}
+						{@const left = c.timeline_start * pxPerSec}
+						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
+						{@const selected = editor.selectedClipId === c.id}
+						{@const dragging = drag?.moved && drag.clipId === c.id}
+						<button
+							onpointerdown={(e) => onClipPointerDown(e, c, t)}
+							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
+							onclick={(e) => e.stopPropagation()}
+							style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{dragging
+								? 0.4
+								: 1};cursor:{ui.tool === 'razor' ? 'crosshair' : drag ? 'grabbing' : 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 						>
+							{#if t.kind === 'audio'}
+								{@const peaks = clipPeaks(c, width)}
+								{#if peaks.length}
+									<div style="position:absolute;inset:0;display:flex;align-items:center;gap:1px;padding:0 2px;opacity:.5">
+										{#each peaks as p, i (i)}
+											<span style="flex:1;height:{Math.max(6, p * 100)}%;background:var(--waveform);border-radius:1px"></span>
+										{/each}
+									</div>
+								{:else}
+									<div
+										style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, var(--waveform) 0 1px, transparent 1px 3px);opacity:.35;mask-image:linear-gradient(transparent 28%, #000 28%, #000 72%, transparent 72%)"
+									></div>
+								{/if}
+								{#each silenceRegions(c) as r (r.left)}
+									<span
+										title="Detected silence"
+										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid rgba(229,84,75,.3);border-radius:2px"
+									></span>
+								{/each}
+							{/if}
+							{#if c.fade_in > 0}
+								<span
+									title="Fade in {c.fade_in.toFixed(2)}s"
+									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, rgba(0,0,0,.7), transparent);pointer-events:none"
+								></span>
+							{/if}
+							{#if c.fade_out > 0}
+								<span
+									title="Fade out {c.fade_out.toFixed(2)}s"
+									style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, rgba(0,0,0,.7), transparent);pointer-events:none"
+								></span>
+							{/if}
+							{#if c.transition_in}
+								<span
+									title="{c.transition_in.kind === 'crossfade' ? 'Crossfade' : 'Dip to black'} {c.transition_in.duration.toFixed(2)}s"
+									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
+										c.transition_in.duration * pxPerSec,
+										width
+									)}px;background:linear-gradient(to right, rgba(120,140,255,.55), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
+								></span>
+							{/if}
+							<span
+								style="position:relative;font-size:10px;font-weight:600;color:rgba(255,255,255,.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								>{editor.assetName(c.asset_id)}</span
+							>
+							{#if (c.speed ?? 1) !== 1}
+								{@const sp = c.speed ?? 1}
+								<span
+									title="Speed {sp}×"
+									style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:1px 4px;pointer-events:none"
+									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
+								>
+							{/if}
+							{#if ui.tool === 'pointer' && width > 24}
+								<span
+									role="presentation"
+									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'l')}
+									style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+								></span>
+								<span
+									role="presentation"
+									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'r')}
+									style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+								></span>
+							{/if}
+						</button>
 					{/each}
-					{#each sceneXs as x (x)}
-						<span
-							title="Detected scene cut"
-							style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
-						></span>
-					{/each}
-					{#each beatTimes as b (b)}
-						<span
-							title="Beat"
-							style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:1px;height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
-						></span>
-					{/each}
-					{#if ui.markIn !== null && ui.markOut !== null && ui.markOut > ui.markIn}
+					{#if drag?.moved && drag.trackId === t.id}
 						<div
-							style="position:absolute;left:{ui.markIn * pxPerSec}px;width:{(ui.markOut - ui.markIn) *
-								pxPerSec}px;top:0;bottom:0;background:var(--selection-fill);pointer-events:none"
+							style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+								6,
+								drag.dur * pxPerSec
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
 						></div>
 					{/if}
-					{#if ui.markIn !== null}
-						<span
-							title="Mark in {fmt(ui.markIn)} — I sets, ⇧I clears"
-							style="position:absolute;left:{ui.markIn * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
-						>
-							<span
-								style="position:absolute;top:0;left:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,0 100%)"
-							></span>
-						</span>
+					{#if trimDrag?.moved && trimDrag.trackId === t.id}
+						{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
+						{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
+						<div
+							style="position:absolute;left:{gl * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+								2,
+								(gr - gl) * pxPerSec
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+						></div>
 					{/if}
-					{#if ui.markOut !== null}
-						<span
-							title="Mark out {fmt(ui.markOut)} — O sets, ⇧O clears"
-							style="position:absolute;left:{ui.markOut * pxPerSec - 2}px;top:0;bottom:0;width:2px;background:var(--kerf-400);pointer-events:none"
-						>
-							<span
-								style="position:absolute;top:0;right:2px;width:7px;height:7px;background:var(--kerf-400);clip-path:polygon(0 0,100% 0,100% 100%)"
-							></span>
-						</span>
+					{#if dropGhost && dropGhost.trackId === t.id}
+						<div
+							style="position:absolute;left:{dropGhost.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+								6,
+								dropGhost.dur * pxPerSec
+							)}px;border:1.5px dashed {dropGhost.ok
+								? 'var(--kerf-400)'
+								: 'var(--red-500)'};border-radius:2px;background:{dropGhost.ok
+								? 'var(--selection-fill)'
+								: 'var(--danger-surface)'};pointer-events:none;z-index:25"
+						></div>
 					{/if}
 				</div>
+			{/each}
 
-				<!-- grid lines -->
-				{#if hasClips}
-					{#each ticks as t, i (t)}
-						<span
-							style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:1px;background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
-						></span>
-					{/each}
-				{/if}
-
-				{#if !hasClips}
-					<div
-						style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-disabled);font-size:12px"
-					>
-						Timeline empty — import media and queue a cut
-					</div>
-				{/if}
-
-				<!-- tracks -->
-				{#each editor.timeline.tracks as t (t.id)}
-					<div
-						role="presentation"
-						data-lane
-						data-track-id={t.id}
-						data-kind={t.kind}
-						onclick={onLaneSeek}
-						oncontextmenu={(e) => onLaneContextMenu(e, t)}
-						ondragover={(e) => onLaneDragOver(e, t)}
-						ondragleave={(e) => onLaneDragLeave(e, t)}
-						ondrop={(e) => onLaneDrop(e, t)}
-						style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);position:relative"
-					>
-						{#each t.clips as c (c.id)}
-							{@const left = c.timeline_start * pxPerSec}
-							{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
-							{@const selected = editor.selectedClipId === c.id}
-							{@const dragging = drag?.moved && drag.clipId === c.id}
-							<button
-								onpointerdown={(e) => onClipPointerDown(e, c, t)}
-								oncontextmenu={(e) => onClipContextMenu(e, c, t)}
-								onclick={(e) => e.stopPropagation()}
-								style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{dragging
-									? 0.4
-									: 1};cursor:{ui.tool === 'razor' ? 'crosshair' : drag ? 'grabbing' : 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
-							>
-								{#if t.kind === 'audio'}
-									{@const peaks = clipPeaks(c, width)}
-									{#if peaks.length}
-										<div style="position:absolute;inset:0;display:flex;align-items:center;gap:1px;padding:0 2px;opacity:.5">
-											{#each peaks as p, i (i)}
-												<span style="flex:1;height:{Math.max(6, p * 100)}%;background:var(--waveform);border-radius:1px"></span>
-											{/each}
-										</div>
-									{:else}
-										<div
-											style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, var(--waveform) 0 1px, transparent 1px 3px);opacity:.35;mask-image:linear-gradient(transparent 28%, #000 28%, #000 72%, transparent 72%)"
-										></div>
-									{/if}
-									{#each silenceRegions(c) as r (r.left)}
-										<span
-											title="Detected silence"
-											style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid rgba(229,84,75,.3);border-radius:2px"
-										></span>
-									{/each}
-								{/if}
-								{#if c.fade_in > 0}
-									<span
-										title="Fade in {c.fade_in.toFixed(2)}s"
-										style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, rgba(0,0,0,.7), transparent);pointer-events:none"
-									></span>
-								{/if}
-								{#if c.fade_out > 0}
-									<span
-										title="Fade out {c.fade_out.toFixed(2)}s"
-										style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, rgba(0,0,0,.7), transparent);pointer-events:none"
-									></span>
-								{/if}
-								{#if c.transition_in}
-									<span
-										title="{c.transition_in.kind === 'crossfade' ? 'Crossfade' : 'Dip to black'} {c.transition_in.duration.toFixed(2)}s"
-										style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
-											c.transition_in.duration * pxPerSec,
-											width
-										)}px;background:linear-gradient(to right, rgba(120,140,255,.55), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
-									></span>
-								{/if}
-								<span
-									style="position:relative;font-size:10px;font-weight:600;color:rgba(255,255,255,.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-									>{editor.assetName(c.asset_id)}</span
-								>
-								{#if (c.speed ?? 1) !== 1}
-									{@const sp = c.speed ?? 1}
-									<span
-										title="Speed {sp}×"
-										style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:1px 4px;pointer-events:none"
-										>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
-									>
-								{/if}
-								{#if ui.tool === 'pointer' && width > 24}
-									<span
-										role="presentation"
-										onpointerdown={(e) => onEdgePointerDown(e, c, t, 'l')}
-										style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-									></span>
-									<span
-										role="presentation"
-										onpointerdown={(e) => onEdgePointerDown(e, c, t, 'r')}
-										style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-									></span>
-								{/if}
-							</button>
-						{/each}
-						{#if drag?.moved && drag.trackId === t.id}
-							<div
-								style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-									6,
-									drag.dur * pxPerSec
-								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
-							></div>
-						{/if}
-						{#if trimDrag?.moved && trimDrag.trackId === t.id}
-							{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
-							{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
-							<div
-								style="position:absolute;left:{gl * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-									2,
-									(gr - gl) * pxPerSec
-								)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
-							></div>
-						{/if}
-						{#if dropGhost && dropGhost.trackId === t.id}
-							<div
-								style="position:absolute;left:{dropGhost.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
-									6,
-									dropGhost.dur * pxPerSec
-								)}px;border:1.5px dashed {dropGhost.ok
-									? 'var(--kerf-400)'
-									: 'var(--red-500)'};border-radius:2px;background:{dropGhost.ok
-									? 'var(--selection-fill)'
-									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
-							></div>
-						{/if}
-					</div>
-				{/each}
-
-				<!-- playhead -->
-				<div
-					style="position:absolute;left:{ui.time * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--playhead);box-shadow:0 0 10px 1px var(--playhead-glow);z-index:30;pointer-events:none"
-				>
-					<span
-						style="position:absolute;top:-1px;left:-5px;width:12px;height:9px;background:var(--playhead);clip-path:polygon(0 0,100% 0,50% 100%)"
-					></span>
-				</div>
+			<!-- playhead -->
+			<div
+				style="position:absolute;left:{ui.time * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--playhead);box-shadow:0 0 10px 1px var(--playhead-glow);z-index:30;pointer-events:none"
+			>
+				<span
+					style="position:absolute;top:-1px;left:-5px;width:12px;height:9px;background:var(--playhead);clip-path:polygon(0 0,100% 0,50% 100%)"
+				></span>
 			</div>
 		</div>
 	</div>
