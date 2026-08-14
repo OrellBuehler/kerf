@@ -212,7 +212,7 @@
 		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
 		if (t.locked) return;
 		e.stopPropagation();
-		editor.selectedClipId = c.id;
+		editor.selectClip(c.id);
 		void editor.select(c.asset_id);
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		// A still image loops, so its source window can grow without limit.
@@ -319,10 +319,11 @@
 		if (e.button !== 0) return;
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
+		const mode = e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace';
 		if (t.locked) {
 			// Still selectable and seekable — locking guards the edit, not the view.
 			e.stopPropagation();
-			editor.selectedClipId = c.id;
+			editor.selectClip(c.id, mode);
 			void editor.select(c.asset_id);
 			ui.seek(laneTime(e.clientX, laneLeft));
 			return;
@@ -333,8 +334,13 @@
 			void editor.split(c.id, at).catch(err);
 			return;
 		}
-		editor.selectedClipId = c.id;
+		editor.selectClip(c.id, mode);
 		void editor.select(c.asset_id);
+		// A modifier click is a selection gesture, not the start of a drag.
+		if (mode !== 'replace') {
+			e.stopPropagation();
+			return;
+		}
 		drag = {
 			clipId: c.id,
 			kind: t.kind,
@@ -463,6 +469,8 @@
 	function onLaneSeek(e: MouseEvent) {
 		const x = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
 		ui.seek(x / pxPerSec);
+		// Empty lane space is the only way to deselect; clips stopPropagation.
+		if (!e.shiftKey && !e.ctrlKey && !e.metaKey) editor.clearSelection();
 	}
 
 	// ---- drop a bin asset onto a track (HTML5 drag-and-drop) ------------------
@@ -555,9 +563,18 @@
 
 	// ---- context menus -------------------------------------------------------
 
+	/** Delete the whole selection when the clicked clip is part of it. */
 	function removeClip(id: string, ripple: boolean) {
-		void (ripple ? editor.rippleDelete(id) : editor.remove(id))
-			.then(() => toast('Clip removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+		const many = editor.isSelected(id) && editor.selectedClipIds.length > 1;
+		const done = many
+			? editor.removeSelected(ripple)
+			: (ripple ? editor.rippleDelete(id) : editor.remove(id)).then(() => 1);
+		void done
+			.then((n) =>
+				toast(n === 1 ? 'Clip removed' : `${n} clips removed`, {
+					action: { label: 'Undo', onClick: () => void editor.undo() }
+				})
+			)
 			.catch(err);
 	}
 
@@ -586,10 +603,12 @@
 	}
 
 	function onClipContextMenu(e: MouseEvent, c: Clip, t: Track) {
-		editor.selectedClipId = c.id;
+		// Right-clicking inside a multi-selection keeps it, so the menu can act on all.
+		if (!editor.isSelected(c.id)) editor.selectClip(c.id);
 		void editor.select(c.asset_id);
 		const within = ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c);
 		const enabled = c.enabled !== false;
+		const n = editor.isSelected(c.id) ? editor.selectedClipIds.length : 1;
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
@@ -614,9 +633,15 @@
 				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
 			},
 			{ type: 'separator' },
-			{ label: 'Remove', icon: 'trash', shortcut: 'Del', danger: true, action: () => removeClip(c.id, false) },
 			{
-				label: 'Ripple delete',
+				label: n > 1 ? `Remove ${n} clips` : 'Remove',
+				icon: 'trash',
+				shortcut: 'Del',
+				danger: true,
+				action: () => removeClip(c.id, false)
+			},
+			{
+				label: n > 1 ? `Ripple delete ${n} clips` : 'Ripple delete',
 				icon: 'trash',
 				shortcut: '⇧Del',
 				danger: true,
@@ -1112,7 +1137,8 @@
 					{#each t.clips as c (c.id)}
 						{@const left = c.timeline_start * pxPerSec}
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
-						{@const selected = editor.selectedClipId === c.id}
+						{@const selected = editor.isSelected(c.id)}
+						{@const primary = editor.selectedClipId === c.id}
 						{@const dragging = drag?.moved && drag.clipId === c.id}
 						{@const off = c.enabled === false || !renders(t)}
 						<button
@@ -1127,7 +1153,11 @@
 									? 'crosshair'
 									: drag
 										? 'grabbing'
-										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
+								? '0 0 0 1px var(--kerf-500)'
+								: selected
+									? '0 0 0 1px var(--kerf-600)'
+									: 'none'}"
 						>
 							{#if t.kind === 'audio'}
 								{@const peaks = clipPeaks(c, width)}

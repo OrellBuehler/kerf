@@ -90,7 +90,11 @@ class EditorState {
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
 	selectedAssetId = $state<string | null>(null);
+	/** The clip the Inspector edits — the primary of the selection. */
 	selectedClipId = $state<string | null>(null);
+	/** The whole selection. Always contains `selectedClipId` when that is set;
+	 *  most edits act on the primary, but delete acts on all of these. */
+	selectedClipIds = $state<string[]>([]);
 	selectedOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
@@ -119,6 +123,71 @@ class EditorState {
 			if (c) return c;
 		}
 		return undefined;
+	}
+
+	/** Every selected clip that still exists, in timeline order. */
+	get selectedClips(): Clip[] {
+		const want = new Set(this.selectedClipIds);
+		const out: Clip[] = [];
+		for (const t of this.timeline.tracks) for (const c of t.clips) if (want.has(c.id)) out.push(c);
+		return out.sort((a, b) => a.timeline_start - b.timeline_start);
+	}
+
+	isSelected(clipId: string): boolean {
+		return this.selectedClipIds.includes(clipId);
+	}
+
+	/**
+	 * Select a clip. `replace` (a plain click) drops the rest, `toggle`
+	 * (ctrl/cmd-click) adds or removes it, and `range` (shift-click) takes
+	 * everything between the primary and this clip on the same track.
+	 */
+	selectClip(clipId: string, mode: 'replace' | 'toggle' | 'range' = 'replace') {
+		if (mode === 'toggle') {
+			const has = this.selectedClipIds.includes(clipId);
+			this.selectedClipIds = has
+				? this.selectedClipIds.filter((id) => id !== clipId)
+				: [...this.selectedClipIds, clipId];
+			// Dropping the primary hands the Inspector whatever is left.
+			if (has && this.selectedClipId === clipId) this.selectedClipId = this.selectedClipIds.at(-1) ?? null;
+			else if (!has) this.selectedClipId = clipId;
+			return;
+		}
+		if (mode === 'range' && this.selectedClipId) {
+			const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
+			const anchor = track?.clips.findIndex((c) => c.id === this.selectedClipId) ?? -1;
+			const to = track?.clips.findIndex((c) => c.id === clipId) ?? -1;
+			if (track && anchor >= 0 && to >= 0) {
+				const [lo, hi] = anchor <= to ? [anchor, to] : [to, anchor];
+				this.selectedClipIds = track.clips.slice(lo, hi + 1).map((c) => c.id);
+				this.selectedClipId = clipId;
+				return;
+			}
+		}
+		this.selectedClipId = clipId;
+		this.selectedClipIds = [clipId];
+	}
+
+	/** Select every clip on every unlocked track. */
+	selectAll() {
+		const ids = this.timeline.tracks.filter((t) => !t.locked).flatMap((t) => t.clips.map((c) => c.id));
+		this.selectedClipIds = ids;
+		this.selectedClipId = ids.at(-1) ?? null;
+	}
+
+	clearSelection() {
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+	}
+
+	/** Delete every selected clip as one user gesture. Ripple deletes run
+	 *  right-to-left so each removal cannot shift the ones still to come. */
+	async removeSelected(ripple: boolean): Promise<number> {
+		const ids = ripple ? this.selectedClips.map((c) => c.id).reverse() : this.selectedClips.map((c) => c.id);
+		if (ids.length === 0) return 0;
+		this.clearSelection();
+		for (const id of ids) await (ripple ? this.rippleDelete(id) : this.remove(id));
+		return ids.length;
 	}
 
 	get overlays(): TextOverlay[] {
@@ -202,6 +271,7 @@ class EditorState {
 		if (!(await apiNewProject())) return false; // running in the browser
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
+		this.selectedClipIds = [];
 		await this.load();
 		return true;
 	}
@@ -212,6 +282,7 @@ class EditorState {
 		if (path === null) return false; // cancelled, or running in the browser
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
+		this.selectedClipIds = [];
 		await this.load();
 		return true;
 	}
@@ -348,12 +419,17 @@ class EditorState {
 		return this.#apply(moveClip(clipId, timelineStart, trackId));
 	}
 	remove(clipId: string) {
-		if (this.selectedClipId === clipId) this.selectedClipId = null;
+		this.#forget(clipId);
 		return this.#apply(removeClip(clipId));
 	}
 	rippleDelete(clipId: string) {
-		if (this.selectedClipId === clipId) this.selectedClipId = null;
+		this.#forget(clipId);
 		return this.#apply(rippleDelete(clipId));
+	}
+
+	#forget(clipId: string) {
+		if (this.selectedClipId === clipId) this.selectedClipId = null;
+		this.selectedClipIds = this.selectedClipIds.filter((id) => id !== clipId);
 	}
 	cutRange(clipId: string, from: number, to: number) {
 		return this.#apply(cutClipRange(clipId, from, to));
@@ -483,15 +559,15 @@ class EditorState {
 	// ---- history (undo / redo / revert) -------------------------------------
 
 	undo() {
-		this.selectedClipId = null;
+		this.clearSelection();
 		return this.#apply(apiUndo());
 	}
 	redo() {
-		this.selectedClipId = null;
+		this.clearSelection();
 		return this.#apply(apiRedo());
 	}
 	revertTo(seq: number) {
-		this.selectedClipId = null;
+		this.clearSelection();
 		return this.#apply(apiRevertTo(seq));
 	}
 

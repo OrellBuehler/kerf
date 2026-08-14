@@ -189,6 +189,9 @@
 			} else if (k === 'i') {
 				e.preventDefault();
 				void onImport();
+			} else if (k === 'a') {
+				e.preventDefault();
+				editor.selectAll();
 			}
 			return;
 		}
@@ -235,12 +238,16 @@
 		} else if (e.key === '-') {
 			e.preventDefault();
 			ui.zoom = Math.max(8, ui.zoom - 8);
-		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipId) {
+		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipIds.length > 0) {
 			e.preventDefault();
 			// Shift+Delete ripples (closes the gap); plain Delete leaves a gap.
-			const id = editor.selectedClipId;
-			void (e.shiftKey ? editor.rippleDelete(id) : editor.remove(id))
-				.then(() => toast('Clip removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+			void editor
+				.removeSelected(e.shiftKey)
+				.then((n) =>
+					toast(n === 1 ? 'Clip removed' : `${n} clips removed`, {
+						action: { label: 'Undo', onClick: () => void editor.undo() }
+					})
+				)
 				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
 		}
 	}
