@@ -18,8 +18,11 @@ ffmpeg = ["dep:ffmpeg-next"]
 # Experimental in-process libav export pipeline (otherwise export drives the
 # `ffmpeg` binary). Implies `ffmpeg`; needs the FFmpeg dev libraries.
 libav-render = ["ffmpeg"]
-# Local speech-to-text transcription via whisper-rs. Needs a ggml model file
-# (KERF_WHISPER_MODEL) at runtime and the whisper.cpp build toolchain.
+# In-process speech-to-text via whisper-rs. Needs the whisper.cpp build
+# toolchain (cmake + a C++ compiler); the ggml model itself is downloaded at
+# runtime, so no manual setup is required either way. Without this feature
+# transcription still works when the `ffmpeg` binary has the (FFmpeg 8.0)
+# `whisper` filter — see `engine::whisper`.
 whisper = ["dep:whisper-rs"]
 
 [dependencies]
@@ -33,5 +36,8 @@ rusqlite.workspace = true
 tracing.workspace = true
 dirs = "6"
 fontdb.workspace = true
+# Speech model downloads (see engine::whisper). Blocking + rustls, so it needs
+# no async runtime and no system OpenSSL.
+ureq = "3.4"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }

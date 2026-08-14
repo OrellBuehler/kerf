@@ -21,6 +21,12 @@ path = "src/main.rs"
 default = ["ffmpeg"]
 # Forward in-process FFmpeg support to kerf-core (probe / export).
 ffmpeg = ["kerf-core/ffmpeg"]
+# Forward in-process speech-to-text (whisper.cpp) to kerf-core. Off by default:
+# it needs cmake, a C++ compiler and libclang at build time, whereas the
+# always-compiled fallback (FFmpeg's own `whisper` filter) needs nothing —
+# see `kerf_core::engine::whisper`. Turn it on for release builds to guarantee
+# transcription regardless of how the user's ffmpeg was configured.
+whisper = ["kerf-core/whisper"]
 
 [build-dependencies]
 tauri-build.workspace = true

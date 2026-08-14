@@ -28,6 +28,11 @@ mod cli;
 mod audio;
 pub use audio::{classify_audio, detect_onsets, detect_tempo, energy_envelope, measure_loudness};
 
+// Speech model provisioning + transcription through the `ffmpeg` binary's
+// `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
+// transcript surface works in the `--no-default-features` build too.
+pub mod whisper;
+
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
@@ -40,6 +45,19 @@ pub use cli::{
 };
 
 pub(crate) use cli::insta360_pair_name;
+
+// Speech models: the download itself, plus what can be downloaded. Re-exported
+// under speech-prefixed names so the crate root reads unambiguously next to the
+// `whisper` build feature (which is only one of the two backends).
+pub use whisper::{
+    download_model as download_speech_model, set_model as set_speech_model, DownloadProgress, ModelInfo as SpeechModelInfo,
+    DEFAULT_MODEL as DEFAULT_SPEECH_MODEL,
+};
+
+/// The names of every speech model Kerf can download, smallest first.
+pub fn speech_model_names() -> Vec<&'static str> {
+    whisper::MODELS.iter().map(|m| m.name).collect()
+}
 
 #[cfg(feature = "whisper")]
 pub use cli::decode_audio_16k_mono;

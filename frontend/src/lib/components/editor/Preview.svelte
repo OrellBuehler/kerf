@@ -148,7 +148,7 @@
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
-					{#if ui.analyzing}<Badge tone="agent" dot>analyzing</Badge>{/if}
+					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
 				</div>
 				<div
 					style="position:absolute;right:14px;top:12px;font-family:var(--font-mono);font-size:11px;color:rgba(255,255,255,.55)"

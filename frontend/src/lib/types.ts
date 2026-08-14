@@ -327,6 +327,48 @@ export interface ImportProgress extends ExportProgress {
 	path: string;
 }
 
+/**
+ * Payload of the `analysis-progress` event: one step of an analysis pass.
+ * Transcription can download a model and then run for minutes, so analysis
+ * reports where it is rather than showing an indeterminate spinner.
+ */
+export interface AnalysisProgress {
+	asset_id: string;
+	/** `silence` · `scenes` · `loudness` · `rhythm` · `download_model` · `transcribe` · `done` */
+	stage: string;
+	fraction?: number | null;
+	/** A short note, e.g. `84 MB / 142 MB`. */
+	detail?: string | null;
+}
+
+/** Payload of the `model-progress` event, emitted while a speech model downloads. */
+export interface ModelProgress {
+	model: string;
+	downloaded_bytes: number;
+	total_bytes?: number | null;
+	fraction?: number | null;
+}
+
+/** A downloadable whisper.cpp speech model. */
+export interface SpeechModelInfo {
+	name: string;
+	approx_bytes: number;
+	multilingual: boolean;
+}
+
+/** Which speech-to-text backend this build uses, and whether it is ready. */
+export interface TranscriptionStatus {
+	/** `libwhisper` (in-process) · `ffmpeg_filter` · `none` */
+	backend: string;
+	available: boolean;
+	model?: string | null;
+	model_path?: string | null;
+	model_ready: boolean;
+	approx_download_bytes?: number | null;
+	models: SpeechModelInfo[];
+	reason?: string | null;
+}
+
 /** The bare Rust `Default` — the dialog opens by applying a preset over this. */
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
 	container: 'mp4',

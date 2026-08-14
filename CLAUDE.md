@@ -109,9 +109,34 @@ so the feature is **only** activated through these forwards — which is what ma
   export pipeline. It can only compile with the dev libraries present (written against
   the ffmpeg-next 8.1 API). The default export path is the CLI one even in full builds.
 
-Two more optional features: `libav-render` (above) and `whisper` (local `whisper-rs`
-transcription; needs a ggml model via `KERF_WHISPER_MODEL` and the whisper.cpp build
-toolchain). Both are off by default and **not** exercised by `--no-default-features` CI.
+**Transcription works in every build** (`engine/whisper.rs`, always compiled). Two
+backends, picked by `analysis::default_transcriber`: the `whisper` feature's
+in-process `whisper-rs` when it is compiled in, otherwise **FFmpeg 8.0's native
+`whisper` audio filter** driven through the binary — `filter_available()` probes
+`ffmpeg -h filter=whisper` once per process, `transcribe` runs
+`aresample=16000,aformat=…,whisper=model=…:destination=…:format=srt` and parses the
+SRT back (its `format=json` writes unescaped text, so SRT is the safe wire format).
+`queue=30` overrides the filter's 3 s default, which would otherwise transcribe
+three-second windows with no context. The model path is **never** put in the filter
+graph (`:` and `\` are graph syntax, and a Windows path is both): ffmpeg runs with its
+working directory set to the model's folder and both `model=` and `destination=` are
+bare file names. Either backend gets its ggml model from `ensure_model`, which
+**downloads it on first use** into `<cache>/kerf/models/ggml-<name>.bin` (streamed with
+progress, `.part` + atomic rename, resumed via a range request, magic-byte checked so an
+error page is never mistaken for a model). Which model: `set_speech_model` (the GUI
+picker, persisted in project meta under `speech_model`) → `KERF_WHISPER_MODEL` (still
+accepts a *path*, for existing setups) → `base`. `KERF_WHISPER_LANGUAGE` sets the
+language hint, `KERF_WHISPER_MODEL_URL` an offline model mirror. `transcription_status()`
+reports which backend is live, the model, and whether it still has to be fetched — the
+transcript tab and an agent both read it to explain an empty transcript.
+`analyze_asset_media_with_progress` streams a per-step `AnalysisProgress`
+(`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
+transcription runs **last** so the markers land before minutes of inference.
+
+Two more optional features: `libav-render` (above) and `whisper` (in-process
+`whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time — turn it on
+for release builds so transcription doesn't depend on how the user's ffmpeg was
+configured). Both are off by default and **not** exercised by `--no-default-features` CI.
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the
@@ -183,8 +208,11 @@ no editing logic in the adapter.
   ready → done` (or `failed`) lifecycle in `model.rs`.
 - `analysis.rs` — transcription / scene / silence are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`). Real impls now exist:
-  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available) and
-  `WhisperTranscriber` (`whisper` feature); `NullAnalyzer` is still the fallback.
+  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available),
+  `WhisperFilterTranscriber` (the ffmpeg `whisper` filter, always compiled) and
+  `WhisperTranscriber` (in-process, `whisper` feature); `NullAnalyzer` is still the
+  fallback. `Transcriber::transcribe` takes a `ProgressFn` — alone among the
+  providers, because it can download a model and then run for minutes.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
@@ -217,7 +245,9 @@ live in the GUI.
 Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
-`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
+`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
+`analysis-progress` per step), speech-to-text (`transcription_status`,
+`set_speech_model`, `download_speech_model` → emits `model-progress`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
@@ -310,7 +340,10 @@ the full `ExportOptions` surface — presets, containers/codecs, rate control, r
 loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. The **agent panel is a real MCP task
+(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+of the five reasons applies (nothing selected / no backend / model not downloaded /
+not analyzed / no speech) and offers the matching action — a model picker + download,
+or Analyze — instead of a dead end. The **agent panel is a real MCP task
 queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips

@@ -16,12 +16,14 @@ mod engine;
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analyze, analyze_asset_media, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, SceneDetector,
-    SilenceDetector, Transcriber,
+    analyze, analyze_asset_media, analyze_asset_media_with_progress, analyze_with_progress, transcription_status,
+    AnalysisProgress, AnalysisProviders, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, SceneDetector,
+    SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
 pub use engine::{
-    generate_proxy, insta360_pair, proxy_path, proxy_width, render_with, render_with_progress, stitch_insta360, stitched_path,
-    validate_export, Container, ExportOptions, ExportProgress, RateControl, RenderStatus,
+    download_speech_model, generate_proxy, insta360_pair, proxy_path, proxy_width, render_with, render_with_progress,
+    set_speech_model, speech_model_names, stitch_insta360, stitched_path, validate_export, Container, DownloadProgress,
+    ExportOptions, ExportProgress, RateControl, RenderStatus, SpeechModelInfo, DEFAULT_SPEECH_MODEL,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

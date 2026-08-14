@@ -29,6 +29,7 @@ import type {
 	Track,
 	Transform,
 	Transition,
+	TranscriptionStatus,
 	VideoEffect
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
@@ -316,6 +317,39 @@ export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 		);
 	}
 	return invoke<AssetAnalysis>('analyze_asset', { assetId });
+}
+
+// ---- speech-to-text --------------------------------------------------------
+
+/** Which transcription backend is available, and whether its model is cached. */
+export async function transcriptionStatus(): Promise<TranscriptionStatus> {
+	if (!inTauri()) {
+		// The browser harness has no backend at all; say so plainly rather than
+		// implying a download would help.
+		return {
+			backend: 'none',
+			available: false,
+			model: null,
+			model_path: null,
+			model_ready: false,
+			approx_download_bytes: null,
+			models: [],
+			reason: 'transcription runs in the desktop app'
+		};
+	}
+	return invoke<TranscriptionStatus>('transcription_status');
+}
+
+/** Choose which speech model transcription uses; remembered in the project. */
+export async function setSpeechModel(name: string | null): Promise<TranscriptionStatus> {
+	if (!inTauri()) return transcriptionStatus();
+	return invoke<TranscriptionStatus>('set_speech_model', { name });
+}
+
+/** Fetch a speech model into Kerf's cache, streaming `model-progress`. */
+export async function downloadSpeechModel(name: string): Promise<string> {
+	if (!inTauri()) throw new Error('speech models are only available in the desktop app');
+	return invoke<string>('download_speech_model', { name });
 }
 
 // ---- timeline editing (each resolves to the refreshed timeline) ------------

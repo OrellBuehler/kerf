@@ -154,6 +154,9 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         let result = project.path().map(|p| p.display().to_string());
         let assets = project.list_assets().unwrap_or_default();
         drop(project);
+        // The speech model is remembered per project, so transcribing in the
+        // reopened one uses the model it was cut with.
+        restore_speech_model(&shared);
         // Make sure every video asset in the reopened project has a preview proxy
         // (a cached one is a cheap no-op; a missing one regenerates in the background).
         for asset in &assets {
@@ -286,8 +289,18 @@ fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String, u32)> {
     })
 }
 
+/// One step of an analysis pass, tagged with the asset it belongs to so the bin
+/// can badge the right row when several assets are analyzed at once.
+#[derive(Serialize, Clone)]
+struct AnalysisProgressEvent {
+    asset_id: String,
+    stage: String,
+    fraction: Option<f64>,
+    detail: Option<String>,
+}
+
 #[tauri::command]
-async fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
     blocking(move || {
@@ -295,9 +308,92 @@ async fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResul
         // with the lock released, then re-acquire it only to cache the result —
         // so the GUI and the MCP agent stay responsive while analysis runs.
         let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
-        let analysis = kerf_core::analyze_asset_media(&asset).map_err(|e| e.to_string())?;
+        // Analysis is no longer a short opaque wait: the first transcription
+        // downloads a speech model and then runs inference for minutes, so each
+        // step is streamed to the webview rather than hidden behind a spinner.
+        let mut on_progress = |p: kerf_core::AnalysisProgress| {
+            let _ = app.emit(
+                "analysis-progress",
+                AnalysisProgressEvent {
+                    asset_id: asset_id.clone(),
+                    stage: p.stage,
+                    fraction: p.fraction,
+                    detail: p.detail,
+                },
+            );
+        };
+        let analysis = kerf_core::analyze_asset_media_with_progress(&asset, &mut on_progress).map_err(|e| e.to_string())?;
         lock_user(&shared).set_analysis(&analysis).map_err(|e| e.to_string())?;
         Ok(analysis)
+    })
+    .await
+}
+
+// ---- speech-to-text -------------------------------------------------------
+
+/// The project-meta key holding the user's speech-model choice.
+const SPEECH_MODEL_KEY: &str = "speech_model";
+
+/// Which transcription backend this build will use, and whether its model is
+/// already downloaded. The transcript tab reads this to explain an empty
+/// transcript instead of just showing nothing.
+#[tauri::command(async)]
+fn transcription_status() -> CmdResult<kerf_core::TranscriptionStatus> {
+    Ok(kerf_core::transcription_status())
+}
+
+/// Pick which speech model transcription uses, remembering it in the project.
+///
+/// `None` clears the choice back to the environment / built-in default. The
+/// model is not downloaded here — that happens on the next transcription, or
+/// via `download_speech_model`.
+#[tauri::command(async)]
+fn set_speech_model(state: State<'_, AppState>, name: Option<String>) -> CmdResult<kerf_core::TranscriptionStatus> {
+    kerf_core::set_speech_model(name.as_deref());
+    state
+        .project()
+        .set_meta(SPEECH_MODEL_KEY, name.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    Ok(kerf_core::transcription_status())
+}
+
+/// Apply the speech-model choice stored in `project` (a no-op when unset), so a
+/// reopened project transcribes with the model the user picked for it.
+fn restore_speech_model(project: &Mutex<Project>) {
+    let stored = lock_user(project).meta(SPEECH_MODEL_KEY).ok().flatten();
+    kerf_core::set_speech_model(stored.as_deref().filter(|s| !s.is_empty()));
+}
+
+/// A speech model download in flight.
+#[derive(Serialize, Clone)]
+struct ModelProgressEvent {
+    model: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    fraction: Option<f64>,
+}
+
+/// Download a speech model ahead of time, streaming `model-progress`.
+///
+/// Transcription downloads on demand anyway; this exists so the user can start
+/// the (few hundred megabyte) fetch deliberately, and pick a model other than
+/// the default, instead of discovering it mid-analysis.
+#[tauri::command]
+async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String> {
+    blocking(move || {
+        let mut on_progress = |p: kerf_core::DownloadProgress| {
+            let _ = app.emit(
+                "model-progress",
+                ModelProgressEvent {
+                    model: name.clone(),
+                    downloaded_bytes: p.downloaded,
+                    total_bytes: p.total,
+                    fraction: p.fraction(),
+                },
+            );
+        };
+        let path = kerf_core::download_speech_model(&name, &mut on_progress).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
     })
     .await
 }
@@ -1094,6 +1190,9 @@ pub fn run() {
             save_project_as,
             import_asset,
             analyze_asset,
+            transcription_status,
+            set_speech_model,
+            download_speech_model,
             cut_clip,
             add_clip,
             split_clip,
