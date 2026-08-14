@@ -554,6 +554,278 @@ pub fn contact_sheet(
     Ok((output.stdout, times))
 }
 
+/// Emit the `-i` inputs for every deduplicated input in `plan`, in `-i` order,
+/// with each one's fast-seek / still-loop / hwaccel options. Shared by the
+/// export and the preview stream so both index their inputs identically —
+/// `build_filter_complex` addresses them positionally.
+///
+/// `realtime` adds `-re` to each real input, which makes ffmpeg read at native
+/// frame rate instead of as fast as it can. That is what paces the preview
+/// stream: the pipe fills, ffmpeg blocks on write, and nothing has to buffer an
+/// unbounded run of frames.
+#[allow(clippy::too_many_arguments)]
+fn push_inputs(
+    args: &mut Vec<String>,
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    fmt: &ExportFormat,
+    fx: &[ClipFx],
+    plan: &InputPlan,
+    realtime: bool,
+) -> Result<()> {
+    let path_of = |id| assets.iter().find(|a: &&Asset| a.id == id).map(|a| a.path.as_str());
+    let image_of = |id| assets.iter().find(|a: &&Asset| a.id == id).is_some_and(|a| a.is_image());
+    let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
+    for &rep in &plan.representatives {
+        let clip = clips[rep];
+        let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
+        let (start, end) = clip_source_window(clip, &fx[rep]);
+        if image_of(clip.asset_id) {
+            // A still has no timeline of its own: loop the single frame and read it
+            // for the clip's whole source window. The in-graph trim (with the seek
+            // forced to 0 for images) then carves the clip's duration out of it.
+            // No `-ss` — seeking into a one-frame input decodes nothing.
+            args.push("-loop".to_string());
+            args.push("1".to_string());
+            args.push("-framerate".to_string());
+            args.push(format!("{}", fmt.fps));
+            args.push("-t".to_string());
+            args.push(format!("{}", end.max(1.0 / fmt.fps)));
+        } else {
+            // Hardware-accelerated decode for this input when requested. `-hwaccel`
+            // is an input option (applies to the next `-i`), so it's emitted
+            // per-input and only for real media — a still gains nothing. Frames
+            // are downloaded to system memory (no `-hwaccel_output_format`), so the
+            // per-input `-ss` fast-seek and the CPU filtergraph still work.
+            if let Some(hw) = opts
+                .hwaccel
+                .as_deref()
+                .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"))
+            {
+                args.push("-hwaccel".to_string());
+                args.push(hw.to_string());
+            }
+            let seek = clip_seek(start);
+            if seek > 0.0 {
+                args.push("-ss".to_string());
+                args.push(format!("{seek}"));
+            }
+        }
+        // Read at native rate so ffmpeg emits frames no faster than they can be
+        // watched; the pipe then supplies the backpressure and nothing has to
+        // buffer an unbounded run of them. `-re` is an input option, so it has
+        // to sit with this input's other pre-`-i` flags.
+        if realtime {
+            args.push("-re".to_string());
+        }
+        args.push("-i".to_string());
+        args.push(path.to_string());
+    }
+    Ok(())
+}
+
+/// Longest a preview stream will render before ffmpeg exits on its own. The
+/// frontend restarts the stream on every seek and edit anyway; this only bounds
+/// a stream nobody stopped.
+const PREVIEW_STREAM_MAX_SECS: f64 = 3600.0;
+
+/// Pure arg builder for [`preview_stream`] (no I/O, unit-tested).
+///
+/// Renders the *same* `filter_complex` the export does — so effects, color,
+/// transforms, keyframes, overlays, track layering and 360 reframing all look
+/// the way they will in the deliverable — but starting at `start`, capped to
+/// `max_width`, video only, into an MJPEG pipe on stdout.
+///
+/// MJPEG rather than rawvideo on purpose: 960x540 RGBA is ~2 MB a frame, which
+/// is ~62 MB/s at 30fps across the IPC boundary. A JPEG is ~50–100 KB and the
+/// webview decodes it natively off the main thread.
+///
+/// Audio is deliberately absent (`-an`): preview sound already comes from the
+/// Web Audio path, which owns the clock this picture is slaved to.
+fn build_preview_stream_args(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    start: f64,
+    max_width: u32,
+    quality: u8,
+) -> Result<Vec<String>> {
+    // Same gate as the export: muted / solo-shadowed tracks and disabled clips
+    // never reach the graph.
+    let rendered = timeline.for_render();
+    let start = start.max(0.0);
+    let end = rendered.duration();
+    if end <= start {
+        return Err(Error::InvalidArgument("nothing to preview after the playhead".to_string()));
+    }
+    // Start at the playhead by rendering a shifted sub-timeline, exactly as a
+    // range export does — so trims, fades, keyframes and overlays all agree.
+    let sub = rendered.slice(start, (start + PREVIEW_STREAM_MAX_SECS).min(end));
+
+    let full = export_format(&sub, assets, opts);
+    // Render straight to the preview size: the whole graph then composites at
+    // that size instead of at the deliverable's, which is most of the speedup.
+    let width = (max_width.min(full.width).max(2)) & !1;
+    let height = ((((width as u64) * (full.height as u64)) / (full.width.max(1) as u64)) as u32).max(2) & !1;
+    let fmt = ExportFormat { width, height, ..full };
+
+    let fx = transition_fx(&sub, assets);
+    let plan = plan_inputs(&sub, assets, &fx);
+
+    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-nostats".to_string()];
+    push_inputs(&mut args, &sub, assets, opts, &fmt, &fx, &plan, true)?;
+
+    let total = sub.duration();
+    let graph = build_filter_complex(&sub, assets, &fmt, total, opts, true, false, &plan);
+    if !graph.has_video {
+        return Err(Error::InvalidArgument("no video to preview".to_string()));
+    }
+    args.push("-filter_complex".to_string());
+    args.push(graph.filter);
+    args.push("-map".to_string());
+    args.push("[outv]".to_string());
+    args.push("-an".to_string());
+    args.push("-c:v".to_string());
+    args.push("mjpeg".to_string());
+    args.push("-q:v".to_string());
+    args.push(quality.clamp(2, 31).to_string());
+    // MJPEG wants a full-range YUV pixel format; without this ffmpeg warns and
+    // picks one itself, which differs across builds.
+    args.push("-pix_fmt".to_string());
+    args.push("yuvj420p".to_string());
+    args.push("-f".to_string());
+    args.push("image2pipe".to_string());
+    args.push("pipe:1".to_string());
+    Ok(args)
+}
+
+/// A running preview stream: one long-lived ffmpeg rendering the timeline to an
+/// MJPEG pipe. Killed when dropped, so a dropped handle always reaps the child.
+pub struct PreviewStream {
+    child: std::process::Child,
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+impl Drop for PreviewStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl PreviewStream {
+    /// ffmpeg's stderr, once the process has ended. Only useful after the frame
+    /// callback has returned.
+    pub fn stderr(&mut self) -> String {
+        self.stderr.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default()
+    }
+}
+
+/// Start rendering `timeline` from `start` as a stream of JPEG frames, calling
+/// `on_frame` with each complete frame as it arrives. Blocks until the stream
+/// ends, ffmpeg exits, or `on_frame` returns `false` to stop early.
+///
+/// Frames are split out of the pipe by scanning for the JPEG start/end markers
+/// `FFD8` / `FFD9`. That is safe rather than merely convenient: inside
+/// entropy-coded JPEG data every literal `0xFF` byte is stuffed as `0xFF 0x00`,
+/// so a bare `FFD9` in the byte stream is always a real end-of-image and never
+/// image data that happens to look like one.
+pub fn preview_stream(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    start: f64,
+    max_width: u32,
+    quality: u8,
+    on_frame: &mut dyn FnMut(Vec<u8>) -> bool,
+) -> Result<()> {
+    use std::io::{BufReader, Read};
+
+    let mut args = build_preview_stream_args(timeline, assets, opts, start, max_width, quality)?;
+    // An animated reframe's sendcmd list outgrows argv just as it does on export.
+    let _graph = externalize_filter_complex(&mut args, "prev")?;
+
+    let bin = ffmpeg_bin();
+    tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg preview stream command");
+    let mut child = command(&bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| launch_err(&bin, e))?;
+
+    let err = child.stderr.take().expect("stderr piped");
+    let stderr = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = BufReader::new(err).read_to_string(&mut buf);
+        buf
+    });
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut stream = PreviewStream {
+        child,
+        stderr: Some(stderr),
+    };
+
+    let mut reader = BufReader::with_capacity(1 << 16, stdout);
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 18);
+    let mut chunk = [0u8; 1 << 15];
+    // Where the SOI..EOI scan has already looked, so each byte is examined once
+    // instead of the buffer being rescanned from the front for every read.
+    let mut scanned = 0usize;
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        loop {
+            let Some(soi) = find2(&buf, 0xFF, 0xD8, 0) else {
+                // No frame started yet; drop all but a trailing byte, which could
+                // be the first half of an SOI split across two reads.
+                if buf.len() > 1 {
+                    buf.drain(..buf.len() - 1);
+                }
+                scanned = 0;
+                break;
+            };
+            let from = scanned.max(soi + 2);
+            let Some(eoi) = find2(&buf, 0xFF, 0xD9, from) else {
+                scanned = buf.len().saturating_sub(1);
+                break;
+            };
+            let frame = buf[soi..eoi + 2].to_vec();
+            buf.drain(..eoi + 2);
+            scanned = 0;
+            if !on_frame(frame) {
+                return Ok(());
+            }
+        }
+    }
+
+    let status = stream
+        .child
+        .wait()
+        .map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    if !status.success() {
+        let text = stream.stderr();
+        let mut tail: Vec<&str> = text.lines().rev().take(12).collect();
+        tail.reverse();
+        return Err(Error::Engine(format!("preview stream failed: {}", tail.join("\n").trim())));
+    }
+    Ok(())
+}
+
+/// Index of the first `[a, b]` pair in `hay` at or after `from`.
+fn find2(hay: &[u8], a: u8, b: u8, from: usize) -> Option<usize> {
+    if hay.len() < 2 || from + 1 >= hay.len() {
+        return None;
+    }
+    hay[from..].windows(2).position(|w| w[0] == a && w[1] == b).map(|i| i + from)
+}
+
 /// Pure arg builder for [`contact_sheet`] (no I/O, unit-tested): the ffmpeg
 /// argument list and the row-major per-cell timestamps. Frames are sampled at
 /// the start of each of `columns*rows` equal slices of the window via the `fps`
@@ -1855,8 +2127,6 @@ fn build_export_args_phase(
         None => timeline,
     };
 
-    let path_of = |id| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
-
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
     let timeline_has_video = timeline
         .tracks
@@ -1885,50 +2155,11 @@ fn build_export_args_phase(
     // stay frame-accurate. Inputs are added in storage order, matching how
     // `build_filter_complex` indexes them and how `fx` is indexed.
     let fmt = export_format(timeline, assets, opts);
-    let image_of = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
     let fx = transition_fx(timeline, assets);
     // Deduplicate inputs: clips whose `-i` args are identical (same asset, same
     // fast-seek) share one decoded input, fanned out in the graph with `split`.
     let plan = plan_inputs(timeline, assets, &fx);
-    let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
-    for &rep in &plan.representatives {
-        let clip = clips[rep];
-        let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        let (start, end) = clip_source_window(clip, &fx[rep]);
-        if image_of(clip.asset_id) {
-            // A still has no timeline of its own: loop the single frame and read it
-            // for the clip's whole source window. The in-graph trim (with the seek
-            // forced to 0 for images) then carves the clip's duration out of it.
-            // No `-ss` — seeking into a one-frame input decodes nothing.
-            args.push("-loop".to_string());
-            args.push("1".to_string());
-            args.push("-framerate".to_string());
-            args.push(format!("{}", fmt.fps));
-            args.push("-t".to_string());
-            args.push(format!("{}", end.max(1.0 / fmt.fps)));
-        } else {
-            // Hardware-accelerated decode for this input when requested. `-hwaccel`
-            // is an input option (applies to the next `-i`), so it's emitted
-            // per-input and only for real media — a still gains nothing. Frames
-            // are downloaded to system memory (no `-hwaccel_output_format`), so the
-            // per-input `-ss` fast-seek and the CPU filtergraph still work.
-            if let Some(hw) = opts
-                .hwaccel
-                .as_deref()
-                .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"))
-            {
-                args.push("-hwaccel".to_string());
-                args.push(hw.to_string());
-            }
-            let seek = clip_seek(start);
-            if seek > 0.0 {
-                args.push("-ss".to_string());
-                args.push(format!("{seek}"));
-            }
-        }
-        args.push("-i".to_string());
-        args.push(path.to_string());
-    }
+    push_inputs(&mut args, timeline, assets, opts, &fmt, &fx, &plan, false)?;
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4186,6 +4417,132 @@ mod tests {
     /// A timeline with a single video track holding `clips`.
     fn single(clips: Vec<Clip>) -> Timeline {
         timeline_of(vec![video_track(clips)])
+    }
+
+    // ---- preview stream ----------------------------------------------------
+
+    #[test]
+    fn preview_stream_args_render_the_export_graph_to_an_mjpeg_pipe() {
+        let a = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let assets = vec![a.clone()];
+        let timeline = single(vec![make_clip(a.id, 0.0, 10.0, 0.0)]);
+
+        let args = build_preview_stream_args(&timeline, &assets, &ExportOptions::default(), 0.0, 960, 6).unwrap();
+        let argv = args.join(" ");
+        // Video only: preview sound comes from the Web Audio path instead.
+        assert!(argv.contains("-an"), "{argv}");
+        assert!(!argv.contains("[outa]"), "{argv}");
+        // MJPEG on stdout, so the webview can decode frames natively.
+        assert!(argv.contains("-c:v mjpeg"), "{argv}");
+        assert!(argv.contains("-f image2pipe"), "{argv}");
+        assert!(argv.ends_with("pipe:1"), "{argv}");
+        // `-re` paces ffmpeg to realtime — that is what stops it racing ahead.
+        assert!(argv.contains("-re"), "{argv}");
+        // Rendered straight at preview size, not at the deliverable's.
+        assert!(argv.contains("960x540"), "canvas should be the capped size: {argv}");
+        assert!(!argv.contains("1920x1080"), "{argv}");
+    }
+
+    #[test]
+    fn preview_stream_starts_at_the_playhead() {
+        let a = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![a.clone()];
+        // One clip covering 0..10 on the timeline; previewing from t=4 must seek
+        // 4s into the source rather than replaying from the top.
+        let timeline = single(vec![make_clip(a.id, 0.0, 10.0, 0.0)]);
+        let args = build_preview_stream_args(&timeline, &assets, &ExportOptions::default(), 4.0, 640, 6).unwrap();
+        let i = args.iter().position(|x| x == "-ss").expect("input seek");
+        assert!((args[i + 1].parse::<f64>().unwrap() - 4.0).abs() < 1e-6, "{:?}", args);
+    }
+
+    #[test]
+    fn preview_stream_honors_mute_and_refuses_an_empty_tail() {
+        let a = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![a.clone()];
+        let timeline = timeline_of(vec![Track {
+            muted: true,
+            ..video_track(vec![make_clip(a.id, 0.0, 10.0, 0.0)])
+        }]);
+        // Everything is muted, so there is no picture to stream.
+        assert!(build_preview_stream_args(&timeline, &assets, &ExportOptions::default(), 0.0, 960, 6).is_err());
+
+        // Past the end of the timeline there is nothing to render either.
+        let live = single(vec![make_clip(a.id, 0.0, 10.0, 0.0)]);
+        assert!(build_preview_stream_args(&live, &assets, &ExportOptions::default(), 20.0, 960, 6).is_err());
+    }
+
+    #[test]
+    fn find2_locates_jpeg_markers_and_respects_the_offset() {
+        let buf = [0x00, 0xFF, 0xD8, 0x11, 0xFF, 0x00, 0xFF, 0xD9];
+        assert_eq!(find2(&buf, 0xFF, 0xD8, 0), Some(1));
+        // The stuffed `FF 00` in entropy-coded data is not a marker; the real
+        // EOI after it is.
+        assert_eq!(find2(&buf, 0xFF, 0xD9, 3), Some(6));
+        assert_eq!(find2(&buf, 0xFF, 0xD9, 7), None);
+        assert_eq!(find2(&[], 0xFF, 0xD8, 0), None);
+    }
+
+    /// Runs the real ffmpeg binary, so it is `#[ignore]`d and stays out of the
+    /// no-default-features CI. Run it with:
+    ///   cargo test -p kerf-core --no-default-features preview_stream_really -- --ignored --nocapture
+    ///
+    /// Worth having despite that: the proxy encoder had a passing arg-builder
+    /// test and still never once produced a file, because nothing ever ran the
+    /// binary. This asserts frames actually arrive and are well-formed JPEGs.
+    #[test]
+    #[ignore = "spawns ffmpeg"]
+    fn preview_stream_really_emits_jpeg_frames() {
+        let dir = std::env::temp_dir().join(format!("kerf-preview-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        let ok = std::process::Command::new(ffmpeg_bin())
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x360:rate=25",
+                "-t",
+                "6",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&src)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(ok.success(), "could not build the test source");
+
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: src.to_string_lossy().into_owned(),
+            name: "src.mp4".into(),
+            duration: 6.0,
+            streams: vec![video_stream(640, 360, 25.0)],
+            imported_at: Utc::now(),
+            source_paths: Vec::new(),
+        };
+        let timeline = single(vec![make_clip(asset.id, 0.0, 6.0, 0.0)]);
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        preview_stream(&timeline, &[asset], &ExportOptions::default(), 1.0, 320, 8, &mut |f| {
+            frames.push(f);
+            frames.len() < 12 // stop early, as the frontend does on pause
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(frames.len(), 12, "the stream stopped short");
+        for (i, f) in frames.iter().enumerate() {
+            assert!(f.len() > 512, "frame {i} is implausibly small: {} bytes", f.len());
+            assert_eq!(&f[..2], &[0xFF, 0xD8], "frame {i} does not start with SOI");
+            assert_eq!(&f[f.len() - 2..], &[0xFF, 0xD9], "frame {i} does not end with EOI");
+        }
     }
 
     // ---- mute / solo / clip-enable gating ----------------------------------

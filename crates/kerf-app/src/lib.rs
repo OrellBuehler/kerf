@@ -15,7 +15,7 @@
 
 mod mcp;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -32,6 +32,11 @@ struct AppState {
     /// Set by `cancel_export` and polled by the in-flight export; lives outside
     /// the project lock so a cancel lands even while a render holds it.
     export_cancel: Arc<AtomicBool>,
+    /// Bumped by every `start_preview_stream` / `stop_preview_stream`. Only one
+    /// preview stream runs at a time: each spawned stream captures the
+    /// generation it started at and stops as soon as the counter moves on, so a
+    /// rapid seek-restart cannot leave two ffmpegs racing into one channel.
+    preview_gen: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -462,6 +467,58 @@ fn insert_clips(state: State<'_, AppState>, placements: Vec<Placement>, at: f64)
     let project = state.project();
     project.insert_clips(&items, at).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Start streaming the composited timeline from `start` as JPEG frames.
+///
+/// Returns as soon as ffmpeg is spawned; frames arrive on `channel` until the
+/// timeline ends, ffmpeg fails, or another start/stop bumps the generation.
+/// This is the same `filter_complex` the export uses, so what plays is what
+/// renders — effects, color, transforms, keyframes, overlays, track layering
+/// and 360 reframing included.
+#[tauri::command(async)]
+async fn start_preview_stream(
+    state: State<'_, AppState>,
+    start: f64,
+    width: u32,
+    quality: u8,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> CmdResult<()> {
+    // Resolve inputs under the lock (proxy-swapped, so playback decodes the
+    // light all-intra copies), then release it before the long-lived ffmpeg.
+    let (timeline, assets) = {
+        let project = state.project();
+        project.timeline_frame_inputs().map_err(|e| e.to_string())?
+    };
+
+    let generation = state.preview_gen.clone();
+    let mine = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sent = 0usize;
+        let result = Project::stream_timeline(&timeline, &assets, start, width, quality, &mut |frame| {
+            if generation.load(Ordering::SeqCst) != mine {
+                return false; // superseded by a newer stream, or stopped
+            }
+            sent += 1;
+            channel.send(tauri::ipc::InvokeResponseBody::Raw(frame)).is_ok()
+        });
+        // A stream that was superseded reports whatever ffmpeg said as it was
+        // killed; only complain when the stream was still the current one.
+        if let Err(e) = result {
+            if generation.load(Ordering::SeqCst) == mine {
+                tracing::warn!(error = %e, "preview stream ended early");
+            }
+        }
+        tracing::debug!(sent, "preview stream finished");
+    });
+    Ok(())
+}
+
+/// Stop the running preview stream, if any. Bumping the generation is enough:
+/// the stream's frame callback sees it and returns `false`, which kills ffmpeg.
+#[tauri::command(async)]
+fn stop_preview_stream(state: State<'_, AppState>) {
+    state.preview_gen.fetch_add(1, Ordering::SeqCst);
 }
 
 #[tauri::command(async)]
@@ -1147,6 +1204,7 @@ pub fn run() {
         .manage(AppState {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
+            preview_gen: Arc::new(AtomicU64::new(0)),
         })
         .setup(move |app| {
             // Logging needs the resolved platform log directory, so set it up here
@@ -1198,6 +1256,8 @@ pub fn run() {
             set_track_solo,
             set_track_locked,
             set_clip_enabled,
+            start_preview_stream,
+            stop_preview_stream,
             duplicate_clips,
             insert_clips,
             remove_clip,

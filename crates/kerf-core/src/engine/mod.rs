@@ -34,8 +34,8 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_pcm, contact_sheet, detect_scenes, detect_silence, frame_at, frame_jpeg, generate_proxy, insta360_pair, proxy_path,
-    proxy_width, ready_proxy, stitch_insta360, stitched_path, timeline_frame, validate_export, waveform, Container,
+    audio_pcm, contact_sheet, detect_scenes, detect_silence, frame_at, frame_jpeg, generate_proxy, insta360_pair, preview_stream,
+    proxy_path, proxy_width, ready_proxy, stitch_insta360, stitched_path, timeline_frame, validate_export, waveform, Container,
     ExportOptions, ExportProgress, RateControl, RenderStatus,
 };
 

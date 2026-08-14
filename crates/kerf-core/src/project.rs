@@ -586,6 +586,32 @@ impl Project {
         )
     }
 
+    /// Stream the timeline from `start` as JPEG frames, **without** `&self` —
+    /// the playback counterpart of [`Project::composite_timeline_frame`], so the
+    /// caller resolves inputs under the project lock, drops the guard, and only
+    /// then runs the long-lived ffmpeg. Holding the lock here would freeze every
+    /// other command and the MCP agent for the whole of playback.
+    ///
+    /// `on_frame` returns `false` to stop the stream.
+    pub fn stream_timeline(
+        timeline: &Timeline,
+        assets: &[Asset],
+        start: f64,
+        max_width: u32,
+        quality: u8,
+        on_frame: &mut dyn FnMut(Vec<u8>) -> bool,
+    ) -> Result<()> {
+        engine::preview_stream(
+            timeline,
+            assets,
+            &engine::ExportOptions::default(),
+            start,
+            max_width,
+            quality,
+            on_frame,
+        )
+    }
+
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
     /// its ready proxy — the asset list the timeline-preview compositor decodes
     /// from. Stream metadata (resolution / fps) is kept from the original, so the

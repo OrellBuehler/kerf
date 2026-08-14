@@ -104,6 +104,20 @@ so the feature is **only** activated through these forwards — which is what ma
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
+  **Playback picture** is `preview_stream` (`build_preview_stream_args`, pure +
+  unit-tested): *one* long-lived ffmpeg rendering the same `filter_complex` the
+  export uses — starting at the playhead via `Timeline::slice`, capped to a
+  preview width so the whole graph composites small, `-an`, `-re` on each input
+  so ffmpeg self-paces to realtime and the pipe applies backpressure — into an
+  **MJPEG** `image2pipe` on stdout. Frames are split out by scanning `FFD8`/
+  `FFD9`, which is safe because JPEG byte-stuffs a literal `0xFF` as `0xFF 0x00`,
+  so a bare `FFD9` is always a real EOI. MJPEG, not rawvideo: 960x540 RGBA is
+  ~62 MB/s at 30fps across IPC, a JPEG is ~50–100 KB and the webview decodes it
+  natively. The still path (`timeline_frame`) is *still* what draws while paused
+  and scrubbing — it costs an ffmpeg process per frame, which is exactly what
+  streaming exists to avoid during playback. `push_inputs` is shared by the
+  export and the stream so both index their `-i` inputs identically
+  (`build_filter_complex` addresses them positionally).
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

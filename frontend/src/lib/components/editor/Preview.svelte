@@ -1,10 +1,12 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { getTimelineFrame } from '$lib/api';
+	import { previewStream } from '$lib/preview-stream';
 	import { clipDuration } from '$lib/types';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
@@ -92,9 +94,63 @@
 			queued = null;
 			return;
 		}
+		// While streaming, the canvas has the picture — and a composited still
+		// per frame is the very cost streaming exists to avoid.
+		if (streaming) return;
 		queued = t;
 		pump();
 	});
+
+	// ---- streamed playback ---------------------------------------------------
+
+	let canvas = $state<HTMLCanvasElement | null>(null);
+	let streaming = $state(false);
+	let raf: number | null = null;
+
+	/** Stream at rate 1 only. J/K/L shuttle and reverse keep the still path,
+	 *  which is consistent with reverse already being silent. */
+	const wantStream = $derived(ui.playing && ui.rate === 1 && hasClips);
+
+	// Restart the stream on play, on seek, and on any edit — the same three
+	// things `ui.resync()` re-anchors the audio for, so picture and sound stay
+	// on the same cut. `ui.time` is deliberately untracked: a running stream
+	// must not be restarted by its own playhead advance.
+	$effect(() => {
+		const on = wantStream;
+		void editor.timeline;
+		void ui.seekEpoch;
+		if (!on) {
+			void previewStream.stop();
+			streaming = false;
+			return;
+		}
+		streaming = true;
+		void previewStream.start(untrack(() => ui.time));
+	});
+
+	// Present whatever the newest decoded frame is, once per animation frame.
+	$effect(() => {
+		if (!streaming) return;
+		const draw = () => {
+			const bmp = previewStream.frame;
+			const el = canvas;
+			if (bmp && el) {
+				if (el.width !== bmp.width || el.height !== bmp.height) {
+					el.width = bmp.width;
+					el.height = bmp.height;
+				}
+				el.getContext('2d')?.drawImage(bmp, 0, 0);
+			}
+			raf = requestAnimationFrame(draw);
+		};
+		raf = requestAnimationFrame(draw);
+		return () => {
+			if (raf) cancelAnimationFrame(raf);
+			raf = null;
+		};
+	});
+
+	$effect(() => () => void previewStream.stop());
 
 	function scrub(e: MouseEvent) {
 		const el = e.currentTarget as HTMLElement;
@@ -138,9 +194,17 @@
 			<div
 				style="position:relative;aspect-ratio:16/9;max-height:100%;max-width:100%;width:min(100%, 720px);border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, #2b3a49 0%, #161d24 55%, #0d1116 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
+				<!-- The streamed canvas sits over the still and is revealed during
+				     playback, so switching between them never blanks the frame. -->
+				<canvas
+					bind:this={canvas}
+					style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:1;display:{streaming
+						? 'block'
+						: 'none'}"
+				></canvas>
 				{#if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000" />
-				{:else}
+				{:else if !streaming}
 					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, rgba(226,157,46,.06) 60%)"></div>
 					<div style="position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.22)">
 						<Icon n={ui.playing ? 'pause' : 'play'} s={44} />

@@ -68,10 +68,19 @@ class EditorUi {
 
 	// ---- playback ----------------------------------------------------------
 
+	/**
+	 * Bumped by every explicit seek. Playback's own advance writes `time`
+	 * directly, so this distinguishes "the user jumped" from "the playhead
+	 * moved" — which is what the streamed preview needs in order to re-anchor
+	 * only on the former, exactly as the audio does.
+	 */
+	seekEpoch = $state(0);
+
 	/** Move the playhead, clamped to the timeline so it can't park past the end
 	 *  or before zero. Re-anchors audio when it lands mid-playback. */
 	seek(t: number) {
 		this.time = Math.min(Math.max(0, t), Math.max(0, editor.duration));
+		this.seekEpoch++;
 		if (this.playing) this.#startAudio();
 	}
 
