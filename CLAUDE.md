@@ -104,6 +104,19 @@ so the feature is **only** activated through these forwards — which is what ma
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
+  **Playback is a real video stream**, not a slideshow: `stream_preview` hands a
+  whole span to **one long-lived ffmpeg** (a spawn-seek-decode-exit cycle per frame
+  caps well below frame rate however fast the machine is) and reads composited
+  JPEGs off its stdout, split on the `FFD8`/`FFD9` markers. It composites through
+  **the same graph the export builds** — `push_inputs` + `build_filter_complex`
+  over a `Timeline::slice` from the playhead, both now shared with
+  `build_export_args` — so what plays is what renders: every track, effect,
+  keyframe and overlay. Only the ends differ: proxy paths in (the caller passes
+  `timeline_frame_inputs`' proxy-swapped assets), `-c:v mjpeg -f image2pipe pipe:1`
+  out. Frames are **paced to the requested fps against the wall clock**, which
+  throttles ffmpeg through pipe backpressure instead of letting it race ahead and
+  buffer the whole timeline, and each carries its timeline time so the webview can
+  drop one the audio clock has already passed.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -261,6 +274,10 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 `captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
 `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`start_playback` / `stop_playback` — streamed composited frames over a
+`tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
+counter, because start and stop are separate async calls that can arrive out of
+order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
@@ -334,8 +351,15 @@ toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove on
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
 (`set_track_duck`); the timeline is genuinely **multi-track**. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
-dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
-(`get_frame`) under the playhead with real playback/scrub. `ExportDialog` (⌘E) drives
+dep is still in `package.json`, now unused). `Preview` shows the composited frame under the playhead, and during
+**forward 1× playback it switches to the streamed frame source** (`start_playback`)
+— per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
+settled frame, where you want *one* frame rather than all of them. Its effect keys
+off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; a
+frame the audio clock has already passed is dropped, and a stream running more than
+`RESYNC_AFTER` behind is restarted from the playhead rather than played out in slow
+motion against the sound. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,

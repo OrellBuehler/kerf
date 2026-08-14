@@ -46,6 +46,11 @@ class EditorUi {
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
+	/** Bumped on every *deliberate* move of the playhead — a seek or a fresh
+	 *  play — but never by playback advancing it. Playback's streamed frame
+	 *  source keys off this: it has to restart when the user jumps somewhere,
+	 *  and must not restart 60 times a second just because time is passing. */
+	seekEpoch = $state(0);
 	/** System font family names available for the text overlay font picker. */
 	availableFonts = $state<string[]>([]);
 
@@ -140,6 +145,7 @@ class EditorUi {
 	 *  or before zero. Re-anchors audio when it lands mid-playback. */
 	seek(t: number) {
 		this.time = Math.min(Math.max(0, t), Math.max(0, editor.duration));
+		this.seekEpoch++;
 		if (this.playing) this.#startAudio();
 	}
 
@@ -162,6 +168,7 @@ class EditorUi {
 		if (rate > 0 && this.time >= editor.duration) this.time = 0;
 		this.playing = true;
 		this.rate = rate;
+		this.seekEpoch++;
 		this.#startAudio();
 		let last = performance.now();
 		const step = (now: number) => {

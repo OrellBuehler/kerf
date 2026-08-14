@@ -319,6 +319,55 @@ export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 	return invoke<AssetAnalysis>('analyze_asset', { assetId });
 }
 
+// ---- playback --------------------------------------------------------------
+
+/** A composited frame pushed up during playback. */
+export interface PlaybackFrame {
+	/** Timeline time this frame shows, for dropping ones the clock has passed. */
+	time: number;
+	/** `data:image/jpeg;base64,…` — the same shape `getTimelineFrame` returns. */
+	jpeg: string;
+}
+
+/**
+ * Play the timeline from `start`, invoking `onFrame` with each composited frame
+ * until playback stops. Returns a function that stops it.
+ *
+ * One long-lived ffmpeg renders the whole span, rather than the one process per
+ * frame that scrubbing uses — the difference between a slideshow and video. In
+ * the browser harness there is no backend, so this is a no-op and the preview
+ * keeps its scrub-driven frame.
+ */
+let playbackSeq = 0;
+
+export function startPlayback(
+	start: number,
+	fps: number,
+	onFrame: (f: PlaybackFrame) => void
+): () => void {
+	if (!inTauri()) return () => {};
+	// The backend cancels *by id* rather than by a generation counter: start and
+	// stop are separate async calls that can arrive out of order, and a stop
+	// meant for the previous stream must not kill the one that replaced it.
+	const playbackId = ++playbackSeq;
+	let stopped = false;
+	void (async () => {
+		const { Channel } = await import('@tauri-apps/api/core');
+		if (stopped) return;
+		const channel = new Channel<PlaybackFrame>();
+		channel.onmessage = (f) => {
+			if (!stopped) onFrame(f);
+		};
+		// Resolves only when playback ends; nothing waits on it.
+		void invoke('start_playback', { playbackId, start, fps, onFrame: channel }).catch(() => {});
+	})();
+	return () => {
+		if (stopped) return;
+		stopped = true;
+		void invoke('stop_playback', { playbackId }).catch(() => {});
+	};
+}
+
 // ---- speech-to-text --------------------------------------------------------
 
 /** Which transcription backend is available, and whether its model is cached. */

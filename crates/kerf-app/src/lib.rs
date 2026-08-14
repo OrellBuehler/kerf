@@ -894,6 +894,86 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
     .await
 }
 
+/// One composited frame pushed to the webview during playback.
+#[derive(Serialize, Clone)]
+struct PlaybackFrame {
+    /// The timeline time this frame shows, so the webview can drop a frame that
+    /// arrived after the audio clock has already moved past it.
+    time: f64,
+    /// `data:image/jpeg;base64,…`, the same shape `get_timeline_frame` returns —
+    /// so the preview renders streamed frames through its existing path.
+    jpeg: String,
+}
+
+/// The id of the playback that *should* be running (0 = none). A stream keeps
+/// going only while this still equals the id it was started with, so a seek or a
+/// second Play supersedes the previous ffmpeg rather than racing it for the pane.
+///
+/// The id comes from the caller rather than being minted here, and `stop_playback`
+/// only clears the id it was given, because start and stop are separate async
+/// IPC calls that can arrive out of order: a bare generation counter would let a
+/// stop meant for the previous stream land after the next one started and kill
+/// it, which reads as playback that dies the moment you seek.
+static ACTIVE_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Play the timeline from `start`, streaming composited frames to `on_frame`
+/// until playback is stopped, superseded, or the timeline ends.
+///
+/// Scrubbing and the settled frame still go through `get_timeline_frame` — one
+/// process per frame is right when you want *one* frame. Playback is the case
+/// that can't work that way: a spawn-seek-decode-exit cycle per frame caps well
+/// below frame rate, so this hands the whole span to a single long-lived ffmpeg
+/// and pushes frames up as they render.
+///
+/// Resolves only when playback ends; the caller is not expected to await it.
+#[tauri::command]
+async fn start_playback(
+    state: State<'_, AppState>,
+    playback_id: u64,
+    start: f64,
+    fps: Option<f64>,
+    on_frame: tauri::ipc::Channel<PlaybackFrame>,
+) -> CmdResult<()> {
+    use std::sync::atomic::Ordering;
+
+    let shared = state.project.clone();
+    ACTIVE_PLAYBACK.store(playback_id, Ordering::SeqCst);
+    blocking(move || {
+        // Resolve the inputs under the lock and drop the guard before streaming:
+        // playback runs for as long as the user watches, and holding the shared
+        // mutex for that would freeze every edit and the whole MCP server.
+        let (timeline, assets) = lock_user(&shared).timeline_frame_inputs().map_err(|e| e.to_string())?;
+        let result = kerf_core::stream_preview(&timeline, &assets, start, fps.unwrap_or(24.0), &mut |f| {
+            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id {
+                return false;
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&f.jpeg);
+            on_frame
+                .send(PlaybackFrame {
+                    time: f.time,
+                    jpeg: format!("data:image/jpeg;base64,{b64}"),
+                })
+                .is_ok()
+        });
+        // Running out of timeline, or being superseded, is not an error; only a
+        // genuine ffmpeg failure is worth surfacing.
+        if let Err(e) = result {
+            tracing::debug!(error = %e, "preview stream ended");
+        }
+        let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        Ok(())
+    })
+    .await
+}
+
+/// Stop the playback stream with this id (pause, seek, or a timeline edit).
+/// A stop for a stream that has already been superseded is a no-op.
+#[tauri::command(async)]
+fn stop_playback(playback_id: u64) {
+    use std::sync::atomic::Ordering;
+    let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
 #[tauri::command]
 async fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
@@ -1236,6 +1316,8 @@ pub fn run() {
             revert_to,
             get_frame,
             get_timeline_frame,
+            start_playback,
+            stop_playback,
             get_waveform,
             get_audio,
             get_energy,
