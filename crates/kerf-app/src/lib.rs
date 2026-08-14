@@ -444,6 +444,34 @@ fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enabled: bool) 
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// One clipboard entry: the clip's data plus the track it should land on.
+#[derive(serde::Deserialize)]
+struct Placement {
+    track_id: String,
+    clip: kerf_core::Clip,
+}
+
+/// Paste clipboard clips. Takes clip *values*, not ids, so a cut-then-paste
+/// works after the sources are gone.
+#[tauri::command(async)]
+fn insert_clips(state: State<'_, AppState>, placements: Vec<Placement>, at: f64) -> CmdResult<Timeline> {
+    let items = placements
+        .into_iter()
+        .map(|p| id(&p.track_id).map(|t| (t, p.clip)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.insert_clips(&items, at).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn duplicate_clips(state: State<'_, AppState>, clip_ids: Vec<String>, at: f64) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.duplicate_clips(&ids, at).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 #[tauri::command(async)]
 fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
@@ -1170,6 +1198,8 @@ pub fn run() {
             set_track_solo,
             set_track_locked,
             set_clip_enabled,
+            duplicate_clips,
+            insert_clips,
             remove_clip,
             set_volume,
             set_fade,

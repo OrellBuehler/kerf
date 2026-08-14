@@ -415,6 +415,52 @@ export async function reorderClip(trackId: string, clipId: string, newIndex: num
 	return invoke<Timeline>('reorder_clip', { trackId, clipId, newIndex });
 }
 
+/** One clipboard entry: the clip's data plus the track it should land on. */
+export interface Placement {
+	track_id: string;
+	clip: Clip;
+}
+
+export async function insertClips(placements: Placement[], at: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const base = Math.min(...placements.map((p) => p.clip.timeline_start));
+		for (const p of placements) {
+			const track = devTimeline.tracks.find((t) => t.id === p.track_id);
+			if (!track) throw new Error(`no track ${p.track_id}`);
+			const copy: Clip = JSON.parse(JSON.stringify(p.clip));
+			copy.id = crypto.randomUUID();
+			copy.timeline_start = at + (p.clip.timeline_start - base);
+			track.clips.push(copy);
+			track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
+		}
+		recordDev('Insert clips');
+		return snapshot();
+	}
+	return invoke<Timeline>('insert_clips', { placements, at });
+}
+
+export async function duplicateClips(clipIds: string[], at: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const sources = clipIds.map((id) => {
+			const found = locate(devTimeline, id);
+			if (!found) throw new Error(`no clip ${id}`);
+			return { track: found[0], clip: found[0].clips[found[1]] };
+		});
+		const base = Math.min(...sources.map((s) => s.clip.timeline_start));
+		for (const s of sources) {
+			// Deep-copy so the copy's transform / effects / keyframes are its own.
+			const copy: Clip = JSON.parse(JSON.stringify(s.clip));
+			copy.id = crypto.randomUUID();
+			copy.timeline_start = at + (s.clip.timeline_start - base);
+			s.track.clips.push(copy);
+			s.track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
+		}
+		recordDev('Duplicate clips');
+		return snapshot();
+	}
+	return invoke<Timeline>('duplicate_clips', { clipIds, at });
+}
+
 export async function removeClip(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);

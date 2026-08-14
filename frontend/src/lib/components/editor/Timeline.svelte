@@ -618,6 +618,25 @@
 				action: () => void editor.split(c.id, ui.time).catch(err)
 			},
 			{
+				label: n > 1 ? `Copy ${n} clips` : 'Copy',
+				icon: 'copy',
+				shortcut: '⌘C',
+				action: () => {
+					const k = editor.copySelection();
+					if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
+				}
+			},
+			{
+				label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
+				shortcut: '⌘D',
+				action: () =>
+					void editor
+						.duplicateSelection()
+						.then((k) => k && toast(k === 1 ? 'Clip duplicated' : `${k} clips duplicated`))
+						.catch(err)
+			},
+			{ type: 'separator' },
+			{
 				label: enabled ? 'Disable clip' : 'Enable clip',
 				icon: enabled ? 'eye-off' : 'eye',
 				disabled: !!t.locked,
@@ -803,6 +822,18 @@
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
 			{ type: 'separator' },
+			{ type: 'separator' },
+			{
+				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
+				icon: 'copy',
+				shortcut: '⌘V',
+				disabled: editor.clipboard.length === 0,
+				action: () =>
+					void editor
+						.paste(ui.time)
+						.then((k) => k && toast(k === 1 ? 'Clip pasted' : `${k} clips pasted`))
+						.catch(err)
+			},
 			{ type: 'separator' },
 			{ label: 'Add marker at playhead', icon: 'bookmark', shortcut: 'M', action: addMarkerHere },
 			{ type: 'separator' },

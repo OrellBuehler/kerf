@@ -158,6 +158,8 @@
 		e.preventDefault();
 	}
 
+	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
+
 	function onKey(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 		const k = e.key.toLowerCase();
@@ -192,6 +194,30 @@
 			} else if (k === 'a') {
 				e.preventDefault();
 				editor.selectAll();
+			} else if (k === 'c') {
+				e.preventDefault();
+				const n = editor.copySelection();
+				if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
+			} else if (k === 'x') {
+				e.preventDefault();
+				const n = editor.copySelection();
+				if (n)
+					void editor
+						.removeSelected(false)
+						.then(() => toast(n === 1 ? 'Clip cut' : `${n} clips cut`))
+						.catch(clipErr);
+			} else if (k === 'v') {
+				e.preventDefault();
+				void editor
+					.paste(ui.time)
+					.then((n) => n && toast(n === 1 ? 'Clip pasted' : `${n} clips pasted`))
+					.catch(clipErr);
+			} else if (k === 'd') {
+				e.preventDefault();
+				void editor
+					.duplicateSelection()
+					.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
+					.catch(clipErr);
 			}
 			return;
 		}

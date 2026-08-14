@@ -1,5 +1,6 @@
 // Central editor state (Svelte 5 runes).
 
+import type { Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
@@ -44,6 +45,8 @@ import {
 	setTrackSolo,
 	setTrackLocked,
 	setClipEnabled,
+	duplicateClips,
+	insertClips,
 	addMarker,
 	updateMarker,
 	removeMarker,
@@ -418,6 +421,38 @@ class EditorState {
 	move(clipId: string, timelineStart: number, trackId?: string) {
 		return this.#apply(moveClip(clipId, timelineStart, trackId));
 	}
+	/**
+	 * The clipboard holds clip *snapshots*, not ids, so cut-then-paste still
+	 * works once the sources are gone — and the same clipboard can be pasted
+	 * repeatedly, since the backend re-ids on every insert.
+	 */
+	clipboard = $state<Placement[]>([]);
+
+	copySelection(): number {
+		const want = new Set(this.selectedClipIds);
+		const out: Placement[] = [];
+		for (const t of this.timeline.tracks)
+			for (const c of t.clips) if (want.has(c.id)) out.push({ track_id: t.id, clip: $state.snapshot(c) as Clip });
+		this.clipboard = out.sort((a, b) => a.clip.timeline_start - b.clip.timeline_start);
+		return this.clipboard.length;
+	}
+
+	/** Paste the clipboard so its earliest clip lands at `at`. */
+	async paste(at: number): Promise<number> {
+		if (this.clipboard.length === 0) return 0;
+		await this.#apply(insertClips([...this.clipboard], at));
+		return this.clipboard.length;
+	}
+
+	/** Duplicate the selection immediately after itself. */
+	async duplicateSelection(): Promise<number> {
+		const sel = this.selectedClips;
+		if (sel.length === 0) return 0;
+		const end = Math.max(...sel.map((c) => c.timeline_start + clipDuration(c)));
+		await this.#apply(duplicateClips(sel.map((c) => c.id), end));
+		return sel.length;
+	}
+
 	remove(clipId: string) {
 		this.#forget(clipId);
 		return this.#apply(removeClip(clipId));

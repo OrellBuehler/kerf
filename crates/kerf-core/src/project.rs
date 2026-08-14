@@ -1033,6 +1033,85 @@ impl Project {
         })
     }
 
+    /// Insert `placements` — each a `(track_id, clip)` pair — so the earliest
+    /// lands at `at`, preserving the relative offsets between them. Backs both
+    /// paste (clips carried on a clipboard, whose sources may already be gone)
+    /// and [`Self::duplicate_clips`].
+    ///
+    /// Everything about a clip comes along — trims, speed, transform, color,
+    /// transition, effects, keyframes and reframe — which is exactly what
+    /// `add_clip_to_timeline` cannot do, since that builds a fresh
+    /// [`Clip::for_asset`]. Each clip is given a new id, so a clipboard can be
+    /// pasted repeatedly.
+    ///
+    /// All-or-nothing: if any clip would overlap, the whole insert is rejected,
+    /// so a partial paste can never land. Clips pasted alongside each other are
+    /// checked against one another too, not just against what is already there.
+    pub fn insert_clips(&self, placements: &[(Uuid, Clip)], at: f64) -> Result<Vec<Clip>> {
+        if placements.is_empty() {
+            return Err(Error::InvalidArgument("no clips to insert".to_string()));
+        }
+        let at = at.max(0.0);
+        let base = placements.iter().map(|(_, c)| c.timeline_start).fold(f64::INFINITY, f64::min);
+
+        self.edit_timeline("Insert clips", |timeline| {
+            // Resolve every destination first, so an unknown track fails before
+            // any edit lands.
+            let mut staged: Vec<(usize, Clip)> = Vec::with_capacity(placements.len());
+            for (track_id, clip) in placements {
+                let ti = timeline
+                    .tracks
+                    .iter()
+                    .position(|t| t.id == *track_id)
+                    .ok_or(Error::TrackNotFound(*track_id))?;
+                let mut copy = clip.clone();
+                copy.id = Uuid::new_v4();
+                copy.timeline_start = at + (clip.timeline_start - base);
+                staged.push((ti, copy));
+            }
+
+            for (i, (ti, clip)) in staged.iter().enumerate() {
+                let (start, end) = (clip.timeline_start, clip.timeline_end());
+                let hits_existing = timeline.tracks[*ti]
+                    .clips
+                    .iter()
+                    .any(|c| start < c.timeline_end() && c.timeline_start < end);
+                let hits_sibling = staged
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (oti, o))| j != i && oti == ti && start < o.timeline_end() && o.timeline_start < end);
+                if hits_existing || hits_sibling {
+                    return Err(Error::InvalidArgument(
+                        "pasted clips would overlap existing clips — move the playhead to free space".to_string(),
+                    ));
+                }
+            }
+
+            for (ti, clip) in &staged {
+                timeline.tracks[*ti].clips.push(clip.clone());
+                timeline.tracks[*ti].sort_by_start();
+            }
+            Ok(staged.into_iter().map(|(_, c)| c).collect())
+        })
+    }
+
+    /// Copy the clips named by `clip_ids` and insert the copies so the earliest
+    /// lands at `at`, each staying on its source track. The by-id convenience
+    /// over [`Self::insert_clips`], for duplicate and for agent use.
+    pub fn duplicate_clips(&self, clip_ids: &[Uuid], at: f64) -> Result<Vec<Clip>> {
+        let timeline = self.timeline()?;
+        let placements = clip_ids
+            .iter()
+            .map(|id| {
+                timeline
+                    .locate(*id)
+                    .map(|(ti, ci)| (timeline.tracks[ti].id, timeline.tracks[ti].clips[ci].clone()))
+                    .ok_or(Error::ClipNotFound(*id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.insert_clips(&placements, at)
+    }
+
     /// Remove a clip and close the gap it leaves: every later clip on the **same
     /// track** shifts left by the removed clip's duration. (Plain [`remove`]
     /// leaves a gap.)
@@ -2589,6 +2668,74 @@ mod tests {
         assert_eq!(project.timeline().unwrap().markers.len(), 2);
         assert!(project.remove_marker(mid.id).is_err(), "removing twice must fail");
         assert!(project.add_marker(-1.0, "bad".into(), None).is_err());
+    }
+
+    #[test]
+    fn duplicate_clips_preserves_everything_and_relative_offsets() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        // Two clips, 2s apart, the first carrying non-default properties.
+        let a = project.add_clip_to_timeline(asset.id, None, 0.0, 2.0, Some(0.0)).unwrap();
+        let b = project.add_clip_to_timeline(asset.id, None, 5.0, 6.0, Some(4.0)).unwrap();
+        project.set_volume(a.id, 0.25).unwrap();
+        project.set_speed(a.id, 2.0).unwrap();
+        project
+            .set_video_effects(a.id, vec![VideoEffect::Blur { sigma: 3.0 }])
+            .unwrap();
+
+        let copies = project.duplicate_clips(&[a.id, b.id], 20.0).unwrap();
+        assert_eq!(copies.len(), 2);
+        // The earliest lands on `at`, and the gap between them survives.
+        assert!((copies[0].timeline_start - 20.0).abs() < 1e-9);
+        assert!((copies[1].timeline_start - 24.0).abs() < 1e-9);
+        // Fresh identities, but everything else carried over — which is exactly
+        // what add_clip_to_timeline cannot do.
+        assert_ne!(copies[0].id, a.id);
+        assert!((copies[0].volume - 0.25).abs() < 1e-6);
+        assert!((copies[0].speed - 2.0).abs() < 1e-9);
+        assert_eq!(copies[0].effects.len(), 1);
+        assert_eq!(project.timeline().unwrap().tracks[0].clips.len(), 4);
+
+        // Overlapping an existing clip is rejected outright, leaving nothing behind.
+        let before = project.timeline().unwrap().tracks[0].clips.len();
+        assert!(project.duplicate_clips(&[a.id], 20.5).is_err());
+        assert_eq!(project.timeline().unwrap().tracks[0].clips.len(), before, "no partial paste");
+
+        assert!(project.duplicate_clips(&[], 0.0).is_err());
+        assert!(project.duplicate_clips(&[Uuid::new_v4()], 30.0).is_err());
+    }
+
+    /// The point of `insert_clips` taking values rather than ids: cut-then-paste,
+    /// where the source clip no longer exists by the time the paste happens.
+    #[test]
+    fn insert_clips_pastes_clips_whose_sources_are_already_gone() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.add_clip_to_timeline(asset.id, None, 0.0, 3.0, Some(0.0)).unwrap();
+        project.set_volume(clip.id, 0.5).unwrap();
+
+        // Snapshot it the way a clipboard would, then cut it.
+        let tl = project.timeline().unwrap();
+        let track_id = tl.tracks[0].id;
+        let snapshot = tl.clip(clip.id).unwrap().clone();
+        project.remove(clip.id).unwrap();
+        assert!(project.timeline().unwrap().tracks[0].clips.is_empty());
+
+        // Pasting still works, and the copy is a new identity carrying the edits.
+        let pasted = project.insert_clips(&[(track_id, snapshot)], 10.0).unwrap();
+        assert_eq!(pasted.len(), 1);
+        assert_ne!(pasted[0].id, clip.id);
+        assert!((pasted[0].timeline_start - 10.0).abs() < 1e-9);
+        assert!((pasted[0].volume - 0.5).abs() < 1e-6);
+
+        // Pasting the same clipboard again is fine — each insert re-ids.
+        let again = project.insert_clips(&[(track_id, pasted[0].clone())], 20.0).unwrap();
+        assert_ne!(again[0].id, pasted[0].id);
+        assert_eq!(project.timeline().unwrap().tracks[0].clips.len(), 2);
+
+        assert!(project.insert_clips(&[(Uuid::new_v4(), pasted[0].clone())], 30.0).is_err());
     }
 
     #[test]

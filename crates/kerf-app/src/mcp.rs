@@ -181,6 +181,14 @@ struct MarkerIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DuplicateClipsParams {
+    #[schemars(description = "UUIDs of the clips to copy")]
+    clip_ids: Vec<String>,
+    #[schemars(description = "Timeline time the earliest copy should land at, in seconds")]
+    at: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetTrackMutedParams {
     #[schemars(description = "UUID of the track to mute or unmute")]
     track_id: String,
@@ -856,6 +864,21 @@ impl KerfMcp {
         let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
         self.changed();
         json(&clip)
+    }
+
+    #[tool(
+        description = "Copy clips and insert the copies so the earliest lands at `at`, keeping the \
+                       relative offsets between them and each one's track. Everything comes along — \
+                       trims, speed, transform, color, effects, keyframes, reframe — which \
+                       add_clip_to_timeline cannot do, since that builds a fresh clip. Rejected \
+                       outright if any copy would overlap, so a partial paste never lands."
+    )]
+    fn duplicate_clips(&self, Parameters(p): Parameters<DuplicateClipsParams>) -> Result<String, McpError> {
+        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
+        let project = self.lock();
+        let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
+        self.changed();
+        json(&clips)
     }
 
     #[tool(description = "Remove a clip from the timeline")]
