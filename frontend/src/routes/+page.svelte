@@ -15,6 +15,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { inTauri } from '$lib/api';
+	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	let exportOpen = $state(false);
 
@@ -29,6 +30,7 @@
 		void editor.load();
 		void agent.load();
 		void ui.loadFonts();
+		void ui.loadTranscriptionStatus();
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -66,6 +68,15 @@
 					await listen<{ fraction: number }>(
 						'import-progress',
 						(e) => (editor.importProgress = e.payload.fraction)
+					),
+					// Analysis names its step as it goes — transcription in
+					// particular downloads a model and then runs for minutes.
+					await listen<AnalysisProgress>('analysis-progress', (e) =>
+						ui.noteAnalysisProgress(e.payload)
+					),
+					await listen<ModelProgress>(
+						'model-progress',
+						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
 					)
 				);
 			});

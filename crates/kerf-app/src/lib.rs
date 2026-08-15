@@ -15,7 +15,7 @@
 
 mod mcp;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -32,11 +32,6 @@ struct AppState {
     /// Set by `cancel_export` and polled by the in-flight export; lives outside
     /// the project lock so a cancel lands even while a render holds it.
     export_cancel: Arc<AtomicBool>,
-    /// Bumped by every `start_preview_stream` / `stop_preview_stream`. Only one
-    /// preview stream runs at a time: each spawned stream captures the
-    /// generation it started at and stops as soon as the counter moves on, so a
-    /// rapid seek-restart cannot leave two ffmpegs racing into one channel.
-    preview_gen: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +154,9 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         let result = project.path().map(|p| p.display().to_string());
         let assets = project.list_assets().unwrap_or_default();
         drop(project);
+        // The speech model is remembered per project, so transcribing in the
+        // reopened one uses the model it was cut with.
+        restore_speech_model(&shared);
         // Make sure every video asset in the reopened project has a preview proxy
         // (a cached one is a cheap no-op; a missing one regenerates in the background).
         for asset in &assets {
@@ -291,8 +289,18 @@ fn proxy_jobs() -> &'static std::sync::mpsc::Sender<(AppHandle, String, u32)> {
     })
 }
 
+/// One step of an analysis pass, tagged with the asset it belongs to so the bin
+/// can badge the right row when several assets are analyzed at once.
+#[derive(Serialize, Clone)]
+struct AnalysisProgressEvent {
+    asset_id: String,
+    stage: String,
+    fraction: Option<f64>,
+    detail: Option<String>,
+}
+
 #[tauri::command]
-async fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
     blocking(move || {
@@ -300,9 +308,92 @@ async fn analyze_asset(state: State<'_, AppState>, asset_id: String) -> CmdResul
         // with the lock released, then re-acquire it only to cache the result —
         // so the GUI and the MCP agent stay responsive while analysis runs.
         let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
-        let analysis = kerf_core::analyze_asset_media(&asset).map_err(|e| e.to_string())?;
+        // Analysis is no longer a short opaque wait: the first transcription
+        // downloads a speech model and then runs inference for minutes, so each
+        // step is streamed to the webview rather than hidden behind a spinner.
+        let mut on_progress = |p: kerf_core::AnalysisProgress| {
+            let _ = app.emit(
+                "analysis-progress",
+                AnalysisProgressEvent {
+                    asset_id: asset_id.clone(),
+                    stage: p.stage,
+                    fraction: p.fraction,
+                    detail: p.detail,
+                },
+            );
+        };
+        let analysis = kerf_core::analyze_asset_media_with_progress(&asset, &mut on_progress).map_err(|e| e.to_string())?;
         lock_user(&shared).set_analysis(&analysis).map_err(|e| e.to_string())?;
         Ok(analysis)
+    })
+    .await
+}
+
+// ---- speech-to-text -------------------------------------------------------
+
+/// The project-meta key holding the user's speech-model choice.
+const SPEECH_MODEL_KEY: &str = "speech_model";
+
+/// Which transcription backend this build will use, and whether its model is
+/// already downloaded. The transcript tab reads this to explain an empty
+/// transcript instead of just showing nothing.
+#[tauri::command(async)]
+fn transcription_status() -> CmdResult<kerf_core::TranscriptionStatus> {
+    Ok(kerf_core::transcription_status())
+}
+
+/// Pick which speech model transcription uses, remembering it in the project.
+///
+/// `None` clears the choice back to the environment / built-in default. The
+/// model is not downloaded here — that happens on the next transcription, or
+/// via `download_speech_model`.
+#[tauri::command(async)]
+fn set_speech_model(state: State<'_, AppState>, name: Option<String>) -> CmdResult<kerf_core::TranscriptionStatus> {
+    kerf_core::set_speech_model(name.as_deref());
+    state
+        .project()
+        .set_meta(SPEECH_MODEL_KEY, name.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    Ok(kerf_core::transcription_status())
+}
+
+/// Apply the speech-model choice stored in `project` (a no-op when unset), so a
+/// reopened project transcribes with the model the user picked for it.
+fn restore_speech_model(project: &Mutex<Project>) {
+    let stored = lock_user(project).meta(SPEECH_MODEL_KEY).ok().flatten();
+    kerf_core::set_speech_model(stored.as_deref().filter(|s| !s.is_empty()));
+}
+
+/// A speech model download in flight.
+#[derive(Serialize, Clone)]
+struct ModelProgressEvent {
+    model: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    fraction: Option<f64>,
+}
+
+/// Download a speech model ahead of time, streaming `model-progress`.
+///
+/// Transcription downloads on demand anyway; this exists so the user can start
+/// the (few hundred megabyte) fetch deliberately, and pick a model other than
+/// the default, instead of discovering it mid-analysis.
+#[tauri::command]
+async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String> {
+    blocking(move || {
+        let mut on_progress = |p: kerf_core::DownloadProgress| {
+            let _ = app.emit(
+                "model-progress",
+                ModelProgressEvent {
+                    model: name.clone(),
+                    downloaded_bytes: p.downloaded,
+                    total_bytes: p.total,
+                    fraction: p.fraction(),
+                },
+            );
+        };
+        let path = kerf_core::download_speech_model(&name, &mut on_progress).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
     })
     .await
 }
@@ -467,58 +558,6 @@ fn insert_clips(state: State<'_, AppState>, placements: Vec<Placement>, at: f64)
     let project = state.project();
     project.insert_clips(&items, at).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
-}
-
-/// Start streaming the composited timeline from `start` as JPEG frames.
-///
-/// Returns as soon as ffmpeg is spawned; frames arrive on `channel` until the
-/// timeline ends, ffmpeg fails, or another start/stop bumps the generation.
-/// This is the same `filter_complex` the export uses, so what plays is what
-/// renders — effects, color, transforms, keyframes, overlays, track layering
-/// and 360 reframing included.
-#[tauri::command(async)]
-async fn start_preview_stream(
-    state: State<'_, AppState>,
-    start: f64,
-    width: u32,
-    quality: u8,
-    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
-) -> CmdResult<()> {
-    // Resolve inputs under the lock (proxy-swapped, so playback decodes the
-    // light all-intra copies), then release it before the long-lived ffmpeg.
-    let (timeline, assets) = {
-        let project = state.project();
-        project.timeline_frame_inputs().map_err(|e| e.to_string())?
-    };
-
-    let generation = state.preview_gen.clone();
-    let mine = generation.fetch_add(1, Ordering::SeqCst) + 1;
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut sent = 0usize;
-        let result = Project::stream_timeline(&timeline, &assets, start, width, quality, &mut |frame| {
-            if generation.load(Ordering::SeqCst) != mine {
-                return false; // superseded by a newer stream, or stopped
-            }
-            sent += 1;
-            channel.send(tauri::ipc::InvokeResponseBody::Raw(frame)).is_ok()
-        });
-        // A stream that was superseded reports whatever ffmpeg said as it was
-        // killed; only complain when the stream was still the current one.
-        if let Err(e) = result {
-            if generation.load(Ordering::SeqCst) == mine {
-                tracing::warn!(error = %e, "preview stream ended early");
-            }
-        }
-        tracing::debug!(sent, "preview stream finished");
-    });
-    Ok(())
-}
-
-/// Stop the running preview stream, if any. Bumping the generation is enough:
-/// the stream's frame callback sees it and returns `false`, which kills ffmpeg.
-#[tauri::command(async)]
-fn stop_preview_stream(state: State<'_, AppState>) {
-    state.preview_gen.fetch_add(1, Ordering::SeqCst);
 }
 
 #[tauri::command(async)]
@@ -944,6 +983,99 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
     .await
 }
 
+/// One composited frame pushed to the webview during playback.
+#[derive(Serialize, Clone)]
+struct PlaybackFrame {
+    /// The timeline time this frame shows, so the webview can drop a frame that
+    /// arrived after the audio clock has already moved past it.
+    time: f64,
+    /// `data:image/jpeg;base64,…`, the same shape `get_timeline_frame` returns —
+    /// so the preview renders streamed frames through its existing path.
+    jpeg: String,
+}
+
+/// The id of the playback that *should* be running (0 = none). A stream keeps
+/// going only while this still equals the id it was started with, so a seek or a
+/// second Play supersedes the previous ffmpeg rather than racing it for the pane.
+///
+/// The id comes from the caller rather than being minted here, and `stop_playback`
+/// only clears the id it was given, because start and stop are separate async
+/// IPC calls that can arrive out of order: a bare generation counter would let a
+/// stop meant for the previous stream land after the next one started and kill
+/// it, which reads as playback that dies the moment you seek.
+static ACTIVE_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The last id `stop_playback` was asked to cancel.
+///
+/// `ACTIVE_PLAYBACK` alone is not enough: a stop can reach the backend *before*
+/// the start it was meant to cancel (the webview issues them as two independent
+/// IPC calls, and the start goes through a dynamic import first). Such a stop
+/// finds nothing to clear and the stream then starts with nobody left to end it
+/// — an ffmpeg that plays on forever. Recording the id instead means the stream
+/// notices at its very next frame, whichever order the two calls land in.
+static STOPPED_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Play the timeline from `start`, streaming composited frames to `on_frame`
+/// until playback is stopped, superseded, or the timeline ends.
+///
+/// Scrubbing and the settled frame still go through `get_timeline_frame` — one
+/// process per frame is right when you want *one* frame. Playback is the case
+/// that can't work that way: a spawn-seek-decode-exit cycle per frame caps well
+/// below frame rate, so this hands the whole span to a single long-lived ffmpeg
+/// and pushes frames up as they render.
+///
+/// Resolves only when playback ends; the caller is not expected to await it.
+#[tauri::command]
+async fn start_playback(
+    state: State<'_, AppState>,
+    playback_id: u64,
+    start: f64,
+    fps: Option<f64>,
+    on_frame: tauri::ipc::Channel<PlaybackFrame>,
+) -> CmdResult<()> {
+    use std::sync::atomic::Ordering;
+
+    let shared = state.project.clone();
+    ACTIVE_PLAYBACK.store(playback_id, Ordering::SeqCst);
+    blocking(move || {
+        // Resolve the inputs under the lock and drop the guard before streaming:
+        // playback runs for as long as the user watches, and holding the shared
+        // mutex for that would freeze every edit and the whole MCP server.
+        let (timeline, assets) = lock_user(&shared).timeline_frame_inputs().map_err(|e| e.to_string())?;
+        let result = kerf_core::stream_preview(&timeline, &assets, start, fps.unwrap_or(24.0), &mut |f| {
+            // Superseded by a newer playback, or explicitly stopped — including by
+            // a stop that arrived before this stream even started.
+            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
+                return false;
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&f.jpeg);
+            on_frame
+                .send(PlaybackFrame {
+                    time: f.time,
+                    jpeg: format!("data:image/jpeg;base64,{b64}"),
+                })
+                .is_ok()
+        });
+        // Running out of timeline, or being superseded, is not an error; only a
+        // genuine ffmpeg failure is worth surfacing.
+        if let Err(e) = result {
+            tracing::debug!(error = %e, "preview stream ended");
+        }
+        let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        Ok(())
+    })
+    .await
+}
+
+/// Stop the playback stream with this id (pause, seek, or a timeline edit).
+/// A stop for a stream that has already been superseded is a no-op.
+#[tauri::command(async)]
+fn stop_playback(playback_id: u64) {
+    use std::sync::atomic::Ordering;
+    STOPPED_PLAYBACK.store(playback_id, Ordering::SeqCst);
+    let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
 #[tauri::command]
 async fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
     let id = id(&asset_id)?;
@@ -967,15 +1099,31 @@ async fn get_audio(
     start: f64,
     duration: f64,
     sample_rate: Option<u32>,
+    clip_id: Option<String>,
 ) -> CmdResult<tauri::ipc::Response> {
+    let clip_id = clip_id.as_deref().map(id).transpose()?;
     let id = id(&asset_id)?;
     let shared = state.project.clone();
     let pcm = blocking(move || {
         // Resolve the asset under the lock, then drop the guard before the decode —
-        // same reasoning as `get_frame`.
-        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        // same reasoning as `get_frame`. `clip_id` names the clip this window is
+        // being fetched for, so its effect chain is baked into the decode and the
+        // monitor plays what the export will render, not the dry source.
+        let (asset, effects) = {
+            let project = lock_user(&shared);
+            let asset = project.require_asset(id).map_err(|e| e.to_string())?;
+            let effects = match clip_id {
+                Some(clip_id) => project
+                    .timeline()
+                    .ok()
+                    .and_then(|tl| tl.clip(clip_id).map(|c| c.audio.clone()))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            (asset, effects)
+        };
         let rate = sample_rate.unwrap_or(32_000).clamp(8_000, 48_000);
-        Project::decode_audio_pcm(&asset, start, duration, rate).map_err(|e| e.to_string())
+        Project::decode_audio_pcm(&asset, start, duration, rate, &effects).map_err(|e| e.to_string())
     })
     .await?;
     Ok(tauri::ipc::Response::new(pcm))
@@ -1204,7 +1352,6 @@ pub fn run() {
         .manage(AppState {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
-            preview_gen: Arc::new(AtomicU64::new(0)),
         })
         .setup(move |app| {
             // Logging needs the resolved platform log directory, so set it up here
@@ -1241,6 +1388,9 @@ pub fn run() {
             save_project_as,
             import_asset,
             analyze_asset,
+            transcription_status,
+            set_speech_model,
+            download_speech_model,
             cut_clip,
             add_clip,
             split_clip,
@@ -1256,8 +1406,6 @@ pub fn run() {
             set_track_solo,
             set_track_locked,
             set_clip_enabled,
-            start_preview_stream,
-            stop_preview_stream,
             duplicate_clips,
             insert_clips,
             remove_clip,
@@ -1295,6 +1443,8 @@ pub fn run() {
             revert_to,
             get_frame,
             get_timeline_frame,
+            start_playback,
+            stop_playback,
             get_waveform,
             get_audio,
             get_energy,

@@ -44,6 +44,14 @@ struct AssetIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpeechModelParams {
+    #[schemars(
+        description = "whisper.cpp model name (tiny, base, small, medium, large-v3-turbo, or an `.en` variant); omit for the default"
+    )]
+    name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CutClipParams {
     #[schemars(description = "UUID of the source asset")]
     asset_id: String,
@@ -648,7 +656,25 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and transcription when configured) and cache the result"
+        description = "Which speech-to-text backend this build of Kerf will use for transcription, and whether its model is downloaded yet. Call this when an asset's transcript comes back empty: it says whether transcription is unavailable (and why), or simply that the first run still has to fetch a model."
+    )]
+    fn transcription_status(&self) -> Result<String, McpError> {
+        json(&kerf_core::transcription_status())
+    }
+
+    #[tool(
+        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache so the next analyze_asset transcribes without waiting for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
+    )]
+    async fn download_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
+        let name = p.name.unwrap_or_else(|| kerf_core::DEFAULT_SPEECH_MODEL.to_string());
+        let path =
+            blocking(move || kerf_core::download_speech_model(&name, &mut |_: kerf_core::DownloadProgress| {}).map_err(core_err))
+                .await?;
+        Ok(format!("Speech model ready at {}", path.display()))
+    }
+
+    #[tool(
+        description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and speech-to-text transcription) and cache the result. The first call that transcribes downloads a speech model (~148 MB) and inference then runs for a good fraction of the media's duration, so expect this one to be slow; see transcription_status if the transcript comes back empty."
     )]
     async fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;

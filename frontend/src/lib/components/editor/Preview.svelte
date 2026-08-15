@@ -5,9 +5,20 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { getTimelineFrame } from '$lib/api';
-	import { previewStream } from '$lib/preview-stream';
+	import { getTimelineFrame, startPlayback } from '$lib/api';
 	import { clipDuration } from '$lib/types';
+
+	/** Frames per second to composite during playback. 24 is the lowest rate that
+	 *  still reads as motion, and compositing several tracks with effects is real
+	 *  work — asking for 60 on a busy timeline just produces late frames. */
+	const PLAYBACK_FPS = 24;
+	/** How far behind the audio clock a frame may be and still be worth showing.
+	 *  Roughly two frames: enough to absorb IPC jitter without letting the picture
+	 *  visibly trail the sound. */
+	const STALE_AFTER = 2 / PLAYBACK_FPS;
+	/** Lag at which the stream is abandoned and restarted from the playhead,
+	 *  rather than kept and played out behind the sound. */
+	const RESYNC_AFTER = 1.0;
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -61,9 +72,9 @@
 	let queued: number | null = null; // latest wanted timeline time, or null to clear
 
 	// Single-flight decode: only ever one composite in flight, and `queued` always
-	// holds the *latest* wanted timeline time. Scrubbing/playback collapses to one
-	// render + one pending target instead of a backlog of stale frames that must
-	// all drain before the frame under the cursor appears (the cause of lag).
+	// holds the *latest* wanted timeline time. Scrubbing collapses to one render +
+	// one pending target instead of a backlog of stale frames that must all drain
+	// before the frame under the cursor appears (the cause of lag).
 	async function pump() {
 		if (inFlight || queued === null) return;
 		const t = queued;
@@ -74,7 +85,9 @@
 			// effects, transform and overlays applied, so Inspector edits show up
 			// live. (Desktop only — null in the browser.)
 			const url = await getTimelineFrame(t, 960);
-			if (url) frameUrl = url;
+			// Playback may have taken over while this was decoding; a still landing
+			// on top of live frames would show as a stutter.
+			if (url && !streaming) frameUrl = url;
 		} catch {
 			/* ignore decode errors — keep the last good frame */
 		}
@@ -82,9 +95,73 @@
 		if (queued !== null) pump(); // a newer target arrived mid-decode — go to it
 	}
 
+	// ---- playback: a streamed frame source instead of per-frame decodes -------
+	//
+	// While playing forward at 1×, one long-lived ffmpeg composites the timeline
+	// from the playhead and pushes frames up as they render. Scrubbing, shuttle
+	// and the paused frame keep the per-frame path below: that one is right when
+	// you want *one* frame, and streaming is right when you want all of them.
+	let streaming = $state(false);
+	let stopStream: (() => void) | null = null;
+	/** Bumped when the stream has fallen so far behind the clock that it is worth
+	 *  restarting it from where playback has actually got to. */
+	let resyncs = $state(0);
+
+	function endStream() {
+		stopStream?.();
+		stopStream = null;
+		streaming = false;
+	}
+
+	$effect(() => {
+		// Restart the stream whenever what it is rendering changes: play/pause,
+		// shuttle rate, a deliberate seek, or an edit to the timeline it
+		// composited from. Deliberately *not* `ui.time` — that ticks with every
+		// animation frame during playback, and depending on it would tear down
+		// and respawn ffmpeg 60 times a second.
+		const play = ui.playing && ui.rate === 1;
+		void ui.seekEpoch;
+		void resyncs;
+		void editor.timeline;
+		void ui.previewEpoch;
+		const from = untrack(() => ui.time);
+		if (!play || !hasClips) {
+			endStream();
+			return;
+		}
+		let live = true;
+		streaming = true;
+		const stop = startPlayback(from, PLAYBACK_FPS, (f) => {
+			if (!live) return;
+			// The audio clock owns time; picture chases it.
+			const lag = ui.time - f.time;
+			if (lag > RESYNC_AFTER) {
+				// Compositing can't keep up with real time on this timeline. Playing
+				// the backlog out would run the picture in slow motion against the
+				// sound, and dropping it forever would freeze the pane — so jump the
+				// stream forward to where playback has actually got to.
+				live = false;
+				resyncs++;
+				return;
+			}
+			// Merely late: a frame the clock has already passed would drag the
+			// picture behind the sound, so skip it and wait for one that applies.
+			if (lag > STALE_AFTER) return;
+			frameUrl = f.jpeg;
+		});
+		stopStream = stop;
+		return () => {
+			live = false;
+			stop();
+			if (stopStream === stop) stopStream = null;
+			streaming = false;
+		};
+	});
+
 	// Keep the preview in step with the playhead *and* the edit state: re-render on
 	// every playhead move, on every timeline change (an Inspector edit reassigns
-	// `editor.timeline`), and when a proxy becomes ready.
+	// `editor.timeline`), and when a proxy becomes ready. Suspended while the
+	// stream is feeding frames, so the two don't fight over the pane.
 	$effect(() => {
 		const t = ui.time;
 		void editor.timeline;
@@ -94,63 +171,10 @@
 			queued = null;
 			return;
 		}
-		// While streaming, the canvas has the picture — and a composited still
-		// per frame is the very cost streaming exists to avoid.
 		if (streaming) return;
 		queued = t;
 		pump();
 	});
-
-	// ---- streamed playback ---------------------------------------------------
-
-	let canvas = $state<HTMLCanvasElement | null>(null);
-	let streaming = $state(false);
-	let raf: number | null = null;
-
-	/** Stream at rate 1 only. J/K/L shuttle and reverse keep the still path,
-	 *  which is consistent with reverse already being silent. */
-	const wantStream = $derived(ui.playing && ui.rate === 1 && hasClips);
-
-	// Restart the stream on play, on seek, and on any edit — the same three
-	// things `ui.resync()` re-anchors the audio for, so picture and sound stay
-	// on the same cut. `ui.time` is deliberately untracked: a running stream
-	// must not be restarted by its own playhead advance.
-	$effect(() => {
-		const on = wantStream;
-		void editor.timeline;
-		void ui.seekEpoch;
-		if (!on) {
-			void previewStream.stop();
-			streaming = false;
-			return;
-		}
-		streaming = true;
-		void previewStream.start(untrack(() => ui.time));
-	});
-
-	// Present whatever the newest decoded frame is, once per animation frame.
-	$effect(() => {
-		if (!streaming) return;
-		const draw = () => {
-			const bmp = previewStream.frame;
-			const el = canvas;
-			if (bmp && el) {
-				if (el.width !== bmp.width || el.height !== bmp.height) {
-					el.width = bmp.width;
-					el.height = bmp.height;
-				}
-				el.getContext('2d')?.drawImage(bmp, 0, 0);
-			}
-			raf = requestAnimationFrame(draw);
-		};
-		raf = requestAnimationFrame(draw);
-		return () => {
-			if (raf) cancelAnimationFrame(raf);
-			raf = null;
-		};
-	});
-
-	$effect(() => () => void previewStream.stop());
 
 	function scrub(e: MouseEvent) {
 		const el = e.currentTarget as HTMLElement;
@@ -194,17 +218,9 @@
 			<div
 				style="position:relative;aspect-ratio:16/9;max-height:100%;max-width:100%;width:min(100%, 720px);border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, #2b3a49 0%, #161d24 55%, #0d1116 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
-				<!-- The streamed canvas sits over the still and is revealed during
-				     playback, so switching between them never blanks the frame. -->
-				<canvas
-					bind:this={canvas}
-					style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:1;display:{streaming
-						? 'block'
-						: 'none'}"
-				></canvas>
 				{#if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000" />
-				{:else if !streaming}
+				{:else}
 					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, rgba(226,157,46,.06) 60%)"></div>
 					<div style="position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.22)">
 						<Icon n={ui.playing ? 'pause' : 'play'} s={44} />
@@ -212,7 +228,7 @@
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
-					{#if ui.analyzing}<Badge tone="agent" dot>analyzing</Badge>{/if}
+					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
 				</div>
 				<div
 					style="position:absolute;right:14px;top:12px;font-family:var(--font-mono);font-size:11px;color:rgba(255,255,255,.55)"

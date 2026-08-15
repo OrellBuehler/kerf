@@ -5,7 +5,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { inTauri, pickExportPath, cancelExport, onExportProgress } from '$lib/api';
 	import { toast } from 'svelte-sonner';
-	import type { Container, ExportOptions, ExportProgress, RateControl } from '$lib/types';
+	import type { Container, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
 		CONTAINERS,
@@ -17,6 +17,7 @@
 		SAMPLE_RATES,
 		SCALERS,
 		GIF_DITHERS,
+		FITS,
 		RESOLUTIONS,
 		FRAME_RATES,
 		applyPreset,
@@ -457,6 +458,17 @@
 							onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
 							style="{inputCss};width:90px;text-align:right"
 						/>
+					</div>
+				{/if}
+				{#if opts.resolution}
+					{@render selectRow(
+						'Aspect fit',
+						opts.fit ?? 'contain',
+						FITS.map((f) => ({ value: f.id, label: f.label })),
+						(v) => patch({ fit: v as Fit })
+					)}
+					<div style="font-size:11px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+						{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
 					</div>
 				{/if}
 				{@render selectRow(

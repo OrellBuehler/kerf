@@ -4,8 +4,9 @@
    in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
-import { listFonts } from './api';
+import { downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
 import { audio } from './audio';
+import type { AnalysisProgress, TranscriptionStatus } from './types';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -20,6 +21,17 @@ class EditorUi {
 	analyzing = $state(false);
 	/** The asset currently being analyzed (so the bin badges the right one). */
 	analyzingId = $state<string | null>(null);
+	/** The step analysis is on, streamed from the backend. Analysis is no longer
+	 *  a few seconds of ffmpeg: the first transcription downloads a speech model
+	 *  and then runs inference for minutes, so the UI names the step and shows a
+	 *  real percentage wherever the backend can produce one. */
+	analysisStage = $state<AnalysisProgress | null>(null);
+	/** Which speech-to-text backend is available, once probed. */
+	transcription = $state<TranscriptionStatus | null>(null);
+	/** Set while a speech model is being fetched deliberately (not mid-analysis). */
+	downloadingModel = $state<string | null>(null);
+	/** 0..1 for that download. */
+	modelFraction = $state(0);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
@@ -52,27 +64,86 @@ class EditorUi {
 		this.previewEpoch++;
 	}
 
-	/** Analyze an asset, flagging `analyzing` while kerf-core works. The work has
-	 *  no real progress signal, so the UI shows an indeterminate state rather than
-	 *  a fabricated percentage. */
+	/** Fetch the speech-to-text backend status once at startup, so the transcript
+	 *  tab can explain itself before anything is analyzed. */
+	async loadTranscriptionStatus() {
+		try {
+			this.transcription = await transcriptionStatus();
+		} catch {
+			this.transcription = null;
+		}
+	}
+
+	/** Record a step reported by the running analysis pass (the `analysis-progress`
+	 *  Tauri event). Ignores events for an asset we're no longer waiting on. */
+	noteAnalysisProgress(p: AnalysisProgress) {
+		if (this.analyzingId && p.asset_id !== this.analyzingId) return;
+		this.analysisStage = p;
+	}
+
+	/** A short label for the step analysis is on, or null when idle. */
+	get analysisLabel(): string | null {
+		if (!this.analyzing) return null;
+		const p = this.analysisStage;
+		if (!p) return 'analyzing';
+		const name =
+			{
+				silence: 'detecting silence',
+				scenes: 'detecting scenes',
+				loudness: 'measuring loudness',
+				rhythm: 'finding the beat',
+				download_model: 'downloading speech model',
+				transcribe: 'transcribing',
+				done: 'analyzing'
+			}[p.stage] ?? p.stage;
+		const pct = p.fraction != null ? ` ${Math.round(p.fraction * 100)}%` : '';
+		return `${name}${pct}`;
+	}
+
+	/** Pick which speech model transcription uses (remembered in the project). */
+	async chooseSpeechModel(name: string) {
+		this.transcription = await setSpeechModel(name);
+	}
+
+	/** Download a speech model up front, so the first transcription doesn't
+	 *  stall on a few hundred megabytes. Refreshes the status when it lands. */
+	async fetchSpeechModel(name: string) {
+		this.downloadingModel = name;
+		this.modelFraction = 0;
+		try {
+			await downloadSpeechModel(name);
+			await this.loadTranscriptionStatus();
+		} finally {
+			this.downloadingModel = null;
+			this.modelFraction = 0;
+		}
+	}
+
+	/** Analyze an asset, flagging `analyzing` while kerf-core works and following
+	 *  the streamed step reports. */
 	async runAnalysis(assetId: string) {
 		this.analyzing = true;
 		this.analyzingId = assetId;
+		this.analysisStage = null;
 		try {
 			await editor.analyze(assetId);
+			// Transcription may have downloaded a model on the way.
+			if (this.transcription && !this.transcription.model_ready) await this.loadTranscriptionStatus();
 		} finally {
 			this.analyzing = false;
 			this.analyzingId = null;
+			this.analysisStage = null;
 		}
 	}
 
 	// ---- playback ----------------------------------------------------------
 
 	/**
-	 * Bumped by every explicit seek. Playback's own advance writes `time`
-	 * directly, so this distinguishes "the user jumped" from "the playhead
-	 * moved" — which is what the streamed preview needs in order to re-anchor
-	 * only on the former, exactly as the audio does.
+	 * Bumped on every *deliberate* move of the playhead — a seek or a fresh
+	 * play — but never by playback advancing it, which writes `time` directly.
+	 * Playback's streamed frame source keys off this: it has to restart when the
+	 * user jumps somewhere, and must not restart 60 times a second just because
+	 * time is passing.
 	 */
 	seekEpoch = $state(0);
 
@@ -113,6 +184,7 @@ class EditorUi {
 		if (rate > 0 && this.time >= editor.duration) this.time = 0;
 		this.playing = true;
 		this.rate = rate;
+		this.seekEpoch++;
 		this.#startAudio();
 		let last = performance.now();
 		const step = (now: number) => {

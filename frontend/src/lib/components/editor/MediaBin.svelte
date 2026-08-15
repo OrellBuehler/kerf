@@ -101,6 +101,36 @@
 		{ id: 'tx' as const, label: 'Transcript', count: txLines.length || undefined }
 	]);
 
+	/** What the empty transcript panel should say and offer. An empty transcript
+	 * has several quite different causes — nothing selected, no speech-to-text
+	 * backend, a model still to download, analysis not run, or genuinely no
+	 * speech — and telling them apart is the difference between a dead end and
+	 * one click. */
+	const tx = $derived.by<{ title: string; body?: string; action?: 'download' | 'analyze' }>(() => {
+		const st = ui.transcription;
+		const mb = (b?: number | null) => (b ? `${Math.round(b / 1024 / 1024)} MB` : 'a few hundred MB');
+		if (ui.analyzing) {
+			return { title: ui.analysisLabel ?? 'analyzing', body: ui.analysisStage?.detail ?? undefined };
+		}
+		if (!editor.selectedAssetId) {
+			return { title: 'No media selected', body: 'Pick a clip in the Media tab to see its transcript.' };
+		}
+		if (st && !st.available) {
+			return { title: 'Transcription unavailable', body: st.reason ?? undefined };
+		}
+		if (st && !st.model_ready) {
+			return {
+				title: 'Speech model not downloaded',
+				body: `Transcription needs a speech model (${mb(st.approx_download_bytes)}). It downloads on first use, or fetch it now.`,
+				action: 'download'
+			};
+		}
+		if (!editor.selectedMetadata?.analysis) {
+			return { title: 'Not analyzed yet', body: 'Analyze this clip to transcribe its speech.', action: 'analyze' };
+		}
+		return { title: 'No speech found', body: 'This media was analyzed but no speech was detected in it.' };
+	});
+
 	async function onImport() {
 		if (!inTauri()) {
 			toast.info('Importing media is available in the desktop app.');
@@ -311,9 +341,54 @@
 		{:else if tab === 'tx'}
 			{#if txLines.length === 0}
 				<div
-					style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-disabled);text-align:center"
+					style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-disabled);text-align:center"
 				>
-					<Icon n="captions" s={22} /><span style="font-size:12px">Transcript appears after analysis</span>
+					<Icon n="captions" s={22} />
+					<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
+					{#if tx.body}
+						<span style="font-size:11px;line-height:1.5;max-width:240px">{tx.body}</span>
+					{/if}
+					{#if ui.analyzing}
+						<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
+							<div
+								style="height:100%;width:{Math.round(
+									(ui.analysisStage?.fraction ?? 0) * 100
+								)}%;background:var(--kerf-500);transition:width .2s"
+							></div>
+						</div>
+					{:else if tx.action === 'download'}
+						<div style="display:flex;flex-direction:column;gap:8px;align-items:center">
+							<select
+								value={ui.transcription?.model ?? ''}
+								onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
+								disabled={!!ui.downloadingModel}
+								style="background:var(--surface-inset);color:var(--text-secondary);border:1px solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
+							>
+								{#each ui.transcription?.models ?? [] as m (m.name)}
+									<option value={m.name}
+										>{m.name} · {Math.round(m.approx_bytes / 1024 / 1024)} MB{m.multilingual
+											? ''
+											: ' · English'}</option
+									>
+								{/each}
+							</select>
+							{#if ui.downloadingModel}
+								<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
+									<div
+										style="height:100%;width:{Math.round(
+											ui.modelFraction * 100
+										)}%;background:var(--kerf-500);transition:width .2s"
+									></div>
+								</div>
+							{:else}
+								<Btn size="sm" onclick={() => void ui.fetchSpeechModel(ui.transcription?.model ?? 'base')}
+									>Download model</Btn
+								>
+							{/if}
+						</div>
+					{:else if tx.action === 'analyze' && editor.selectedAssetId}
+						<Btn size="sm" onclick={() => void ui.runAnalysis(editor.selectedAssetId!)}>Analyze &amp; transcribe</Btn>
+					{/if}
 				</div>
 			{:else}
 				<div data-selectable style="display:flex;flex-direction:column;gap:2px">

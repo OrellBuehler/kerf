@@ -39,7 +39,13 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render. Tracks flagged `Track.duck` are mixed into their own bus and
+  render. `ExportOptions.fit` decides what happens when the delivery aspect differs
+  from the footage: `Contain` (the default, and the historical behaviour) scales to
+  fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
+  — which is what makes the vertical / square presets produce a usable shot rather
+  than a strip of picture in a black field. It sets the *base* fit only; a clip with
+  its own transform still composes on top.
+  Tracks flagged `Track.duck` are mixed into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
   on the final mix, and `ExportOptions.range` renders only a span by building the
@@ -104,28 +110,54 @@ so the feature is **only** activated through these forwards — which is what ma
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
-  **Playback picture** is `preview_stream` (`build_preview_stream_args`, pure +
-  unit-tested): *one* long-lived ffmpeg rendering the same `filter_complex` the
-  export uses — starting at the playhead via `Timeline::slice`, capped to a
-  preview width so the whole graph composites small, `-an`, `-re` on each input
-  so ffmpeg self-paces to realtime and the pipe applies backpressure — into an
-  **MJPEG** `image2pipe` on stdout. Frames are split out by scanning `FFD8`/
-  `FFD9`, which is safe because JPEG byte-stuffs a literal `0xFF` as `0xFF 0x00`,
-  so a bare `FFD9` is always a real EOI. MJPEG, not rawvideo: 960x540 RGBA is
-  ~62 MB/s at 30fps across IPC, a JPEG is ~50–100 KB and the webview decodes it
-  natively. The still path (`timeline_frame`) is *still* what draws while paused
-  and scrubbing — it costs an ffmpeg process per frame, which is exactly what
-  streaming exists to avoid during playback. `push_inputs` is shared by the
-  export and the stream so both index their `-i` inputs identically
-  (`build_filter_complex` addresses them positionally).
+  **Playback is a real video stream**, not a slideshow: `stream_preview` hands a
+  whole span to **one long-lived ffmpeg** (a spawn-seek-decode-exit cycle per frame
+  caps well below frame rate however fast the machine is) and reads composited
+  JPEGs off its stdout, split on the `FFD8`/`FFD9` markers. It composites through
+  **the same graph the export builds** — `push_inputs` + `build_filter_complex`
+  over a `Timeline::slice` from the playhead, both now shared with
+  `build_export_args` — so what plays is what renders: every track, effect,
+  keyframe and overlay, and the same `Timeline::for_render` gate, so a muted or
+  solo-shadowed track is as absent from playback as from the file. Only the ends
+  differ: proxy paths in (the caller passes
+  `timeline_frame_inputs`' proxy-swapped assets), `-c:v mjpeg -f image2pipe pipe:1`
+  out. Frames are **paced to the requested fps against the wall clock**, which
+  throttles ffmpeg through pipe backpressure instead of letting it race ahead and
+  buffer the whole timeline, and each carries its timeline time so the webview can
+  drop one the audio clock has already passed.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
   the ffmpeg-next 8.1 API). The default export path is the CLI one even in full builds.
 
-Two more optional features: `libav-render` (above) and `whisper` (local `whisper-rs`
-transcription; needs a ggml model via `KERF_WHISPER_MODEL` and the whisper.cpp build
-toolchain). Both are off by default and **not** exercised by `--no-default-features` CI.
+**Transcription works in every build** (`engine/whisper.rs`, always compiled). Two
+backends, picked by `analysis::default_transcriber`: the `whisper` feature's
+in-process `whisper-rs` when it is compiled in, otherwise **FFmpeg 8.0's native
+`whisper` audio filter** driven through the binary — `filter_available()` probes
+`ffmpeg -h filter=whisper` once per process, `transcribe` runs
+`aresample=16000,aformat=…,whisper=model=…:destination=…:format=srt` and parses the
+SRT back (its `format=json` writes unescaped text, so SRT is the safe wire format).
+`queue=30` overrides the filter's 3 s default, which would otherwise transcribe
+three-second windows with no context. The model path is **never** put in the filter
+graph (`:` and `\` are graph syntax, and a Windows path is both): ffmpeg runs with its
+working directory set to the model's folder and both `model=` and `destination=` are
+bare file names. Either backend gets its ggml model from `ensure_model`, which
+**downloads it on first use** into `<cache>/kerf/models/ggml-<name>.bin` (streamed with
+progress, `.part` + atomic rename, resumed via a range request, magic-byte checked so an
+error page is never mistaken for a model). Which model: `set_speech_model` (the GUI
+picker, persisted in project meta under `speech_model`) → `KERF_WHISPER_MODEL` (still
+accepts a *path*, for existing setups) → `base`. `KERF_WHISPER_LANGUAGE` sets the
+language hint, `KERF_WHISPER_MODEL_URL` an offline model mirror. `transcription_status()`
+reports which backend is live, the model, and whether it still has to be fetched — the
+transcript tab and an agent both read it to explain an empty transcript.
+`analyze_asset_media_with_progress` streams a per-step `AnalysisProgress`
+(`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
+transcription runs **last** so the markers land before minutes of inference.
+
+Two more optional features: `libav-render` (above) and `whisper` (in-process
+`whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time — turn it on
+for release builds so transcription doesn't depend on how the user's ffmpeg was
+configured). Both are off by default and **not** exercised by `--no-default-features` CI.
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the
@@ -138,6 +170,12 @@ toolchain). Both are off by default and **not** exercised by `--no-default-featu
 cargo check --workspace --no-default-features
 cargo test  -p kerf-core --no-default-features
 cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # single test
+
+# The default run is pure (no binaries, no network). Tests that drive the real
+# `ffmpeg` binary — playback streaming, the vertical/cover export — or download a
+# real speech model are `#[ignore]`d, so run them explicitly when touching the
+# engine or the export graph:
+cargo test -p kerf-core --no-default-features -- --ignored
 
 # MCP server — the desktop app hosts it (streamable HTTP on 127.0.0.1:7777/mcp).
 # Run the app (below), then point an MCP client at the URL, e.g.:
@@ -197,8 +235,11 @@ no editing logic in the adapter.
   ready → done` (or `failed`) lifecycle in `model.rs`.
 - `analysis.rs` — transcription / scene / silence are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`). Real impls now exist:
-  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available) and
-  `WhisperTranscriber` (`whisper` feature); `NullAnalyzer` is still the fallback.
+  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available),
+  `WhisperFilterTranscriber` (the ffmpeg `whisper` filter, always compiled) and
+  `WhisperTranscriber` (in-process, `whisper` feature); `NullAnalyzer` is still the
+  fallback. `Transcriber::transcribe` takes a `ProgressFn` — alone among the
+  providers, because it can download a model and then run for minutes.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
@@ -231,7 +272,9 @@ live in the GUI.
 Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
-`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset`, every editing
+`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
+`analysis-progress` per step), speech-to-text (`transcription_status`,
+`set_speech_model`, `download_speech_model` → emits `model-progress`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
@@ -245,6 +288,10 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 `captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
 `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`start_playback` / `stop_playback` — streamed composited frames over a
+`tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
+counter, because start and stop are separate async calls that can arrive out of
+order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
@@ -310,21 +357,37 @@ a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the righ
 stays put; stills extend freely since they loop). The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
 **J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
-`src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`,
-schedules them with volume / fades / speed / reverse applied (effects chains are not
-auralized), and the playhead follows the audio clock — edits mid-playback re-anchor via
+`src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`
+and schedules them with volume / fades / speed / reverse applied. **Per-clip effect
+chains are auralized**: passing `clipId` to `get_audio` decodes the window through that
+clip's own ffmpeg chain (`audio_effects_filter`, the same string the export renders), so
+the chain is part of the buffer cache key and retuning an EQ re-fetches. It runs before
+this engine's gain envelope where the export runs it after the clip gain — audible only
+to a level-dependent effect, and keeping volume in Web Audio is what lets the fader stay
+live instead of re-fetching PCM on every drag. Reverse shuttle is still silent. The
+playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
 (`set_track_duck`); the timeline is genuinely **multi-track**. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
-dep is still in `package.json`, now unused). `Preview` shows the **decoded frame**
-(`get_frame`) under the playhead with real playback/scrub. `ExportDialog` (⌘E) drives
+dep is still in `package.json`, now unused). `Preview` shows the composited frame under the playhead, and during
+**forward 1× playback it switches to the streamed frame source** (`start_playback`)
+— per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
+settled frame, where you want *one* frame rather than all of them. Its effect keys
+off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; a
+frame the audio clock has already passed is dropped, and a stream running more than
+`RESYNC_AFTER` behind is restarted from the playhead rather than played out in slow
+motion against the sound. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. The **agent panel is a real MCP task
+(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+of the five reasons applies (nothing selected / no backend / model not downloaded /
+not analyzed / no speech) and offers the matching action — a model picker + download,
+or Analyze — instead of a dead end. The **agent panel is a real MCP task
 queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
