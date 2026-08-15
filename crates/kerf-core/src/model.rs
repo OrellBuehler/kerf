@@ -221,6 +221,17 @@ pub struct Tempo {
     pub confidence: f64,
 }
 
+/// Everything the rhythm analysis pass derives from one decoded PCM stream:
+/// onsets, tempo and the speech/music class. Bundled because the three share
+/// the decode (and onsets/tempo the onset envelope) — computing them together
+/// costs one full-file ffmpeg decode instead of three.
+#[derive(Debug, Clone, Default)]
+pub struct Rhythm {
+    pub onsets: Vec<f64>,
+    pub tempo: Option<Tempo>,
+    pub audio_class: Option<AudioClassification>,
+}
+
 /// Cached, pluggable analysis results for an asset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetAnalysis {

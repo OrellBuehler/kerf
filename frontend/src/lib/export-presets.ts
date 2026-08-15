@@ -10,23 +10,35 @@ export interface ContainerInfo {
 	label: string;
 	ext: string;
 	video: string[];
+	/** Hardware encoders legal in this container (mirrors the Rust allowlist);
+	 *  the dialog offers only the ones the backend verified usable. */
+	hwVideo: string[];
 	audio: string[];
 	faststart: boolean;
 	audioOnly: boolean;
 	videoOnly: boolean;
 }
 
+const HW_H26X = ['h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_videotoolbox', 'hevc_videotoolbox', 'h264_amf', 'hevc_amf'];
+const HW_AV1 = ['av1_nvenc', 'av1_qsv'];
+
 export const CONTAINERS: ContainerInfo[] = [
-	{ id: 'mp4', label: 'MP4', ext: 'mp4', video: ['libx264', 'libx265', 'libsvtav1'], audio: ['aac', 'alac'], faststart: true, audioOnly: false, videoOnly: false },
-	{ id: 'mov', label: 'QuickTime MOV', ext: 'mov', video: ['prores_ks', 'libx264', 'libx265'], audio: ['aac', 'alac', 'pcm_s16le', 'pcm_s24le'], faststart: true, audioOnly: false, videoOnly: false },
-	{ id: 'mkv', label: 'Matroska MKV', ext: 'mkv', video: ['libx264', 'libx265', 'libvpx-vp9', 'libsvtav1'], audio: ['aac', 'libopus', 'libmp3lame', 'flac', 'pcm_s16le'], faststart: false, audioOnly: false, videoOnly: false },
-	{ id: 'webm', label: 'WebM', ext: 'webm', video: ['libvpx-vp9', 'libsvtav1'], audio: ['libopus'], faststart: false, audioOnly: false, videoOnly: false },
-	{ id: 'gif', label: 'Animated GIF', ext: 'gif', video: ['gif'], audio: [], faststart: false, audioOnly: false, videoOnly: true },
-	{ id: 'mp3', label: 'MP3 audio', ext: 'mp3', video: [], audio: ['libmp3lame'], faststart: false, audioOnly: true, videoOnly: false },
-	{ id: 'm4a', label: 'M4A audio', ext: 'm4a', video: [], audio: ['aac', 'alac'], faststart: true, audioOnly: true, videoOnly: false },
-	{ id: 'wav', label: 'WAV (PCM)', ext: 'wav', video: [], audio: ['pcm_s16le', 'pcm_s24le'], faststart: false, audioOnly: true, videoOnly: false },
-	{ id: 'flac', label: 'FLAC', ext: 'flac', video: [], audio: ['flac'], faststart: false, audioOnly: true, videoOnly: false }
+	{ id: 'mp4', label: 'MP4', ext: 'mp4', video: ['libx264', 'libx265', 'libsvtav1'], hwVideo: [...HW_H26X, ...HW_AV1], audio: ['aac', 'alac'], faststart: true, audioOnly: false, videoOnly: false },
+	{ id: 'mov', label: 'QuickTime MOV', ext: 'mov', video: ['prores_ks', 'libx264', 'libx265'], hwVideo: HW_H26X, audio: ['aac', 'alac', 'pcm_s16le', 'pcm_s24le'], faststart: true, audioOnly: false, videoOnly: false },
+	{ id: 'mkv', label: 'Matroska MKV', ext: 'mkv', video: ['libx264', 'libx265', 'libvpx-vp9', 'libsvtav1'], hwVideo: [...HW_H26X, ...HW_AV1], audio: ['aac', 'libopus', 'libmp3lame', 'flac', 'pcm_s16le'], faststart: false, audioOnly: false, videoOnly: false },
+	{ id: 'webm', label: 'WebM', ext: 'webm', video: ['libvpx-vp9', 'libsvtav1'], hwVideo: HW_AV1, audio: ['libopus'], faststart: false, audioOnly: false, videoOnly: false },
+	{ id: 'gif', label: 'Animated GIF', ext: 'gif', video: ['gif'], hwVideo: [], audio: [], faststart: false, audioOnly: false, videoOnly: true },
+	{ id: 'mp3', label: 'MP3 audio', ext: 'mp3', video: [], hwVideo: [], audio: ['libmp3lame'], faststart: false, audioOnly: true, videoOnly: false },
+	{ id: 'm4a', label: 'M4A audio', ext: 'm4a', video: [], hwVideo: [], audio: ['aac', 'alac'], faststart: true, audioOnly: true, videoOnly: false },
+	{ id: 'wav', label: 'WAV (PCM)', ext: 'wav', video: [], hwVideo: [], audio: ['pcm_s16le', 'pcm_s24le'], faststart: false, audioOnly: true, videoOnly: false },
+	{ id: 'flac', label: 'FLAC', ext: 'flac', video: [], hwVideo: [], audio: ['flac'], faststart: false, audioOnly: true, videoOnly: false }
 ];
+
+/** Whether a `-c:v` value is a hardware encoder (family read from its suffix,
+ *  as in the Rust engine). */
+export function isHwCodec(id?: string | null): boolean {
+	return !!id && /_(nvenc|qsv|videotoolbox|amf)$/.test(id);
+}
 
 export interface VideoCodecInfo {
 	id: string;
@@ -34,10 +46,45 @@ export interface VideoCodecInfo {
 	crf: [number, number, number] | null; // [min, max, default]; null = no CRF (prores/gif)
 	presets: string[] | null; // named presets (x264/x265); null = none / numeric handled separately
 	presetKind: 'named' | 'svtav1' | 'cpuused' | null;
+	/** The preset to select on codec change; falls back to the kind default. */
+	defaultPreset?: string;
 	tunes: string[]; // valid -tune values for this encoder ([] = no tune)
 	profiles: string[]; // -profile:v choices
 	pixFmts: string[];
 }
+
+/** A [`VideoCodecInfo`] for one hardware encoder. The backend maps the shared
+ *  `crf` field onto each family's own quality knob (-cq / -global_quality /
+ *  -q:v / -qp), so the slider means the same thing everywhere. */
+function hwCodec(id: string, label: string, crfDefault: number, presets: string[] | null, defaultPreset?: string, profiles: string[] = []): VideoCodecInfo {
+	return {
+		id,
+		label,
+		crf: [0, 51, crfDefault],
+		presets,
+		presetKind: presets ? 'named' : null,
+		defaultPreset,
+		tunes: [],
+		profiles,
+		pixFmts: ['yuv420p']
+	};
+}
+
+const NVENC_PRESETS = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'];
+const QSV_PRESETS = ['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'];
+
+export const HW_VIDEO_CODECS: Record<string, VideoCodecInfo> = {
+	h264_nvenc: hwCodec('h264_nvenc', 'H.264 · NVIDIA GPU (NVENC)', 23, NVENC_PRESETS, 'p4', ['baseline', 'main', 'high']),
+	hevc_nvenc: hwCodec('hevc_nvenc', 'HEVC · NVIDIA GPU (NVENC)', 25, NVENC_PRESETS, 'p4', ['main']),
+	av1_nvenc: hwCodec('av1_nvenc', 'AV1 · NVIDIA GPU (NVENC)', 30, NVENC_PRESETS, 'p4'),
+	h264_qsv: hwCodec('h264_qsv', 'H.264 · Intel GPU (QuickSync)', 23, QSV_PRESETS, 'medium', ['baseline', 'main', 'high']),
+	hevc_qsv: hwCodec('hevc_qsv', 'HEVC · Intel GPU (QuickSync)', 25, QSV_PRESETS, 'medium', ['main']),
+	av1_qsv: hwCodec('av1_qsv', 'AV1 · Intel GPU (QuickSync)', 30, QSV_PRESETS, 'medium'),
+	h264_videotoolbox: hwCodec('h264_videotoolbox', 'H.264 · Apple GPU (VideoToolbox)', 20, null, undefined, ['baseline', 'main', 'high']),
+	hevc_videotoolbox: hwCodec('hevc_videotoolbox', 'HEVC · Apple GPU (VideoToolbox)', 22, null, undefined, ['main']),
+	h264_amf: hwCodec('h264_amf', 'H.264 · AMD GPU (AMF)', 23, null, undefined, ['baseline', 'main', 'high']),
+	hevc_amf: hwCodec('hevc_amf', 'HEVC · AMD GPU (AMF)', 25, null, undefined, ['main'])
+};
 
 export const VIDEO_CODECS: Record<string, VideoCodecInfo> = {
 	libx264: {
@@ -90,7 +137,8 @@ export const VIDEO_CODECS: Record<string, VideoCodecInfo> = {
 		profiles: [],
 		pixFmts: ['yuv422p10le', 'yuva444p10le']
 	},
-	gif: { id: 'gif', label: 'GIF', crf: null, presets: null, presetKind: null, tunes: [], profiles: [], pixFmts: [] }
+	gif: { id: 'gif', label: 'GIF', crf: null, presets: null, presetKind: null, tunes: [], profiles: [], pixFmts: [] },
+	...HW_VIDEO_CODECS
 };
 
 export const PRORES_PROFILES: { value: number; label: string }[] = [
@@ -253,7 +301,8 @@ export function containerInfo(c: Container): ContainerInfo {
 export function videoCodecDefaults(id: string): Partial<ExportOptions> {
 	const v = VIDEO_CODECS[id];
 	if (!v) return { video_codec: id };
-	const preset = v.presetKind === 'named' ? 'medium' : v.presetKind === 'svtav1' ? '8' : v.presetKind === 'cpuused' ? '4' : null;
+	const preset =
+		v.defaultPreset ?? (v.presetKind === 'named' ? 'medium' : v.presetKind === 'svtav1' ? '8' : v.presetKind === 'cpuused' ? '4' : null);
 	return { video_codec: id, crf: v.crf ? v.crf[2] : null, preset, pix_fmt: v.pixFmts[0] ?? null, tune: null, profile_v: null };
 }
 
@@ -263,7 +312,7 @@ export function reconcileContainer(opts: ExportOptions): ExportOptions {
 	const next = { ...opts };
 	if (info.audioOnly) {
 		next.video_codec = null;
-	} else if (!next.video_codec || !info.video.includes(next.video_codec)) {
+	} else if (!next.video_codec || !(info.video.includes(next.video_codec) || info.hwVideo.includes(next.video_codec))) {
 		next.video_codec = info.video[0] ?? null;
 	}
 	// A forced codec change must re-derive its preset / pix_fmt / crf / tune.
@@ -295,12 +344,15 @@ export function validateExport(opts: ExportOptions, hasVideo: boolean, hasAudio:
 	if (info.audioOnly && !hasAudio) issues.push(`${info.ext.toUpperCase()} is audio-only, but the timeline has no audio.`);
 	if (info.videoOnly && !hasVideo) issues.push('GIF export needs video, but the timeline has no video.');
 	if (!wantVideo && !wantAudio) issues.push('These settings would export nothing.');
-	if (wantVideo && opts.video_codec && !info.video.includes(opts.video_codec)) {
+	if (wantVideo && opts.video_codec && !(info.video.includes(opts.video_codec) || info.hwVideo.includes(opts.video_codec))) {
 		issues.push(`${opts.video_codec} can't go in a .${info.ext} file.`);
 	}
 	const rateMode = opts.video_codec !== 'prores_ks' && opts.video_codec !== 'gif';
 	if (wantVideo && rateMode && (opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass') && !opts.video_bitrate) {
 		issues.push('A target video bitrate is required for bitrate / two-pass.');
+	}
+	if (wantVideo && opts.video_codec && opts.rate_control === 'two_pass' && isHwCodec(opts.video_codec)) {
+		issues.push(`Two-pass encoding isn't supported for hardware encoder ${opts.video_codec}; use crf or bitrate.`);
 	}
 	if (wantVideo && opts.tune && (opts.video_codec === 'libx264' || opts.video_codec === 'libx265') && !VIDEO_CODECS[opts.video_codec].tunes.includes(opts.tune)) {
 		issues.push(`tune "${opts.tune}" is not valid for ${opts.video_codec}.`);
@@ -361,19 +413,31 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 	const info = containerInfo(opts.container);
 	const wantVideo = hasVideo && !info.audioOnly;
 	const wantAudio = hasAudio && !info.videoOnly && opts.include_audio;
-	const a: string[] = ['ffmpeg', '-y', '-i', '…inputs…', '-filter_complex', '…graph…'];
+	const hwaccel = opts.hwaccel && opts.hwaccel !== 'none' ? ['-hwaccel', opts.hwaccel] : [];
+	const a: string[] = ['ffmpeg', '-y', ...hwaccel, '-i', '…inputs…', '-filter_complex', '…graph…'];
 	if (wantVideo) a.push('-map', '[outv]');
 	if (wantAudio) a.push('-map', '[outa]');
 
 	const vc = opts.video_codec;
 	if (wantVideo && vc) {
+		const h264 = vc === 'libx264' || vc.startsWith('h264_');
+		const hevc = vc === 'libx265' || vc.startsWith('hevc_');
 		a.push('-c:v', vc);
 		if (vc === 'prores_ks') {
 			a.push('-profile:v', String(opts.prores_profile ?? 3));
 		} else if (vc !== 'gif') {
 			if (opts.rate_control === 'crf') {
-				if (opts.crf != null) a.push('-crf', String(opts.crf));
-				if (vc === 'libvpx-vp9') a.push('-b:v', '0');
+				// Hardware families spell the constant-quality knob differently.
+				const q = opts.crf != null ? String(opts.crf) : null;
+				if (vc.endsWith('_nvenc')) a.push('-rc', 'vbr', ...(q ? ['-cq', q] : []), '-b:v', '0');
+				else if (vc.endsWith('_qsv')) q && a.push('-global_quality', q);
+				else if (vc.endsWith('_videotoolbox'))
+					opts.crf != null && a.push('-q:v', String(Math.min(100, Math.max(1, Math.round((1 - Math.min(opts.crf, 51) / 51) * 100)))));
+				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', ...(q ? ['-qp_i', q, '-qp_p', q] : []));
+				else {
+					if (q) a.push('-crf', q);
+					if (vc === 'libvpx-vp9') a.push('-b:v', '0');
+				}
 			} else if (opts.rate_control === 'bitrate' && opts.video_bitrate) {
 				a.push('-b:v', opts.video_bitrate);
 				if (opts.max_rate) a.push('-maxrate', opts.max_rate);
@@ -386,8 +450,8 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 			if (vc === 'libvpx-vp9') a.push('-cpu-used', opts.preset ?? '4');
 			else if (opts.preset) a.push('-preset', opts.preset);
 			if ((vc === 'libx264' || vc === 'libx265') && opts.tune) a.push('-tune', opts.tune);
-			if ((vc === 'libx264' || vc === 'libx265') && opts.profile_v) a.push('-profile:v', opts.profile_v);
-			if (vc === 'libx265' && (opts.container === 'mp4' || opts.container === 'mov')) a.push('-tag:v', 'hvc1');
+			if ((h264 || hevc) && opts.profile_v) a.push('-profile:v', opts.profile_v);
+			if (hevc && (opts.container === 'mp4' || opts.container === 'mov')) a.push('-tag:v', 'hvc1');
 			a.push('-pix_fmt', opts.pix_fmt ?? 'yuv420p');
 		}
 	}

@@ -6,7 +6,7 @@
 
 use crate::engine::whisper;
 use crate::error::Result;
-use crate::model::{Asset, AssetAnalysis, AudioClassification, Loudness, Tempo, TimeRange, TranscriptSegment};
+use crate::model::{Asset, AssetAnalysis, Loudness, Rhythm, TimeRange, TranscriptSegment};
 
 /// A step of an analysis pass, reported as it runs.
 ///
@@ -71,21 +71,12 @@ pub trait LoudnessAnalyzer: Send + Sync {
     fn measure(&self, asset: &Asset) -> Result<Option<Loudness>>;
 }
 
-/// Detects onset (transient) timestamps in an asset's audio.
-pub trait OnsetDetector: Send + Sync {
-    fn detect_onsets(&self, asset: &Asset) -> Result<Vec<f64>>;
-}
-
-/// Estimates tempo and a beat grid for an asset's audio (`None` when it has no
-/// usable rhythm).
-pub trait TempoDetector: Send + Sync {
-    fn detect_tempo(&self, asset: &Asset) -> Result<Option<Tempo>>;
-}
-
-/// Classifies an asset's audio as speech / music / mixed (`None` for silent /
-/// video-only assets).
-pub trait AudioClassifier: Send + Sync {
-    fn classify(&self, asset: &Asset) -> Result<Option<AudioClassification>>;
+/// Derives rhythm metadata — onset timestamps, tempo / beat grid, and the
+/// speech/music class — from an asset's audio. One trait for the three results
+/// because they share the decoded PCM: a provider can (and the ffmpeg one does)
+/// produce all of them from a single decode.
+pub trait RhythmAnalyzer: Send + Sync {
+    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -146,51 +137,26 @@ impl LoudnessAnalyzer for FfmpegLoudnessAnalyzer {
     }
 }
 
-/// Onset detection backed by light DSP (energy flux) on PCM decoded with the
-/// `ffmpeg` binary, so no dev libraries are required.
-pub struct FfmpegOnsetDetector {
-    /// Adaptive-threshold std-dev multiplier; higher = fewer, stronger onsets.
+/// Rhythm analysis (onsets, tempo, speech/music class) backed by light DSP on
+/// PCM decoded once with the `ffmpeg` binary, so no dev libraries are required.
+pub struct FfmpegRhythmAnalyzer {
+    /// Onset adaptive-threshold std-dev multiplier; higher = fewer, stronger
+    /// onsets.
     pub sensitivity: f64,
 }
 
-impl Default for FfmpegOnsetDetector {
+impl Default for FfmpegRhythmAnalyzer {
     fn default() -> Self {
         Self { sensitivity: 1.5 }
     }
 }
 
-impl OnsetDetector for FfmpegOnsetDetector {
-    fn detect_onsets(&self, asset: &Asset) -> Result<Vec<f64>> {
+impl RhythmAnalyzer for FfmpegRhythmAnalyzer {
+    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm> {
         if !asset.has_audio() {
-            return Ok(Vec::new());
+            return Ok(Rhythm::default());
         }
-        crate::engine::detect_onsets(std::path::Path::new(&asset.path), self.sensitivity)
-    }
-}
-
-/// Tempo estimation backed by autocorrelation of the onset envelope (PCM decoded
-/// with the `ffmpeg` binary), so no dev libraries are required.
-pub struct FfmpegTempoDetector;
-
-impl TempoDetector for FfmpegTempoDetector {
-    fn detect_tempo(&self, asset: &Asset) -> Result<Option<Tempo>> {
-        if !asset.has_audio() {
-            return Ok(None);
-        }
-        crate::engine::detect_tempo(std::path::Path::new(&asset.path))
-    }
-}
-
-/// Speech/music classification by light DSP on PCM decoded with the `ffmpeg`
-/// binary, so no dev libraries are required.
-pub struct HeuristicAudioClassifier;
-
-impl AudioClassifier for HeuristicAudioClassifier {
-    fn classify(&self, asset: &Asset) -> Result<Option<AudioClassification>> {
-        if !asset.has_audio() {
-            return Ok(None);
-        }
-        crate::engine::classify_audio(std::path::Path::new(&asset.path))
+        crate::engine::analyze_rhythm(std::path::Path::new(&asset.path), self.sensitivity)
     }
 }
 
@@ -418,21 +384,9 @@ impl LoudnessAnalyzer for NullAnalyzer {
     }
 }
 
-impl OnsetDetector for NullAnalyzer {
-    fn detect_onsets(&self, _asset: &Asset) -> Result<Vec<f64>> {
-        Ok(Vec::new())
-    }
-}
-
-impl TempoDetector for NullAnalyzer {
-    fn detect_tempo(&self, _asset: &Asset) -> Result<Option<Tempo>> {
-        Ok(None)
-    }
-}
-
-impl AudioClassifier for NullAnalyzer {
-    fn classify(&self, _asset: &Asset) -> Result<Option<AudioClassification>> {
-        Ok(None)
+impl RhythmAnalyzer for NullAnalyzer {
+    fn analyze_rhythm(&self, _asset: &Asset) -> Result<Rhythm> {
+        Ok(Rhythm::default())
     }
 }
 
@@ -442,9 +396,7 @@ pub struct AnalysisProviders<'a> {
     pub scene: &'a dyn SceneDetector,
     pub transcriber: &'a dyn Transcriber,
     pub loudness: &'a dyn LoudnessAnalyzer,
-    pub onset: &'a dyn OnsetDetector,
-    pub tempo: &'a dyn TempoDetector,
-    pub classifier: &'a dyn AudioClassifier,
+    pub rhythm: &'a dyn RhythmAnalyzer,
 }
 
 impl<'a> AnalysisProviders<'a> {
@@ -455,9 +407,7 @@ impl<'a> AnalysisProviders<'a> {
             scene: null,
             transcriber: null,
             loudness: null,
-            onset: null,
-            tempo: null,
-            classifier: null,
+            rhythm: null,
         }
     }
 }
@@ -512,9 +462,7 @@ pub fn analyze_asset_media_with_progress(asset: &Asset, progress: ProgressFn) ->
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
-    let onset = FfmpegOnsetDetector::default();
-    let tempo = FfmpegTempoDetector;
-    let classifier = HeuristicAudioClassifier;
+    let rhythm = FfmpegRhythmAnalyzer::default();
     let null = NullAnalyzer;
 
     let transcriber = default_transcriber();
@@ -525,9 +473,7 @@ pub fn analyze_asset_media_with_progress(asset: &Asset, progress: ProgressFn) ->
         scene: &scene,
         transcriber,
         loudness: &loudness,
-        onset: &onset,
-        tempo: &tempo,
-        classifier: &classifier,
+        rhythm: &rhythm,
     };
     analyze_with_progress(asset, &providers, progress)
 }
@@ -546,9 +492,8 @@ pub fn analyze_with_progress(asset: &Asset, providers: &AnalysisProviders, progr
     progress(AnalysisProgress::stage("loudness"));
     let loudness = providers.loudness.measure(asset)?;
     progress(AnalysisProgress::stage("rhythm"));
-    let onsets = providers.onset.detect_onsets(asset)?;
-    let tempo = providers.tempo.detect_tempo(asset)?;
-    let audio_class = providers.classifier.classify(asset)?;
+    // One provider call for onsets + tempo + class: they share a single decode.
+    let rhythm = providers.rhythm.analyze_rhythm(asset)?;
     // Transcription runs last: it is by far the slowest step, and the ones above
     // are what the timeline draws — markers and waveform regions appear as soon
     // as the caller caches this, rather than waiting behind minutes of inference.
@@ -560,8 +505,8 @@ pub fn analyze_with_progress(asset: &Asset, providers: &AnalysisProviders, progr
         scene_changes,
         transcript,
         loudness,
-        onsets,
-        tempo,
-        audio_class,
+        onsets: rhythm.onsets,
+        tempo: rhythm.tempo,
+        audio_class: rhythm.audio_class,
     })
 }

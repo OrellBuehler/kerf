@@ -219,6 +219,12 @@ export async function listFonts(): Promise<string[]> {
 	return invoke<string[]>('list_fonts');
 }
 
+/** GPU video encoders the backend verified usable (empty in the browser). */
+export async function hwEncoders(): Promise<string[]> {
+	if (!inTauri()) return [];
+	return invoke<string[]>('hw_encoders');
+}
+
 export async function getTimeline(): Promise<Timeline> {
 	if (!inTauri()) return snapshot();
 	return invoke<Timeline>('get_timeline');

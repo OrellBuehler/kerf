@@ -34,6 +34,20 @@ so the feature is **only** activated through these forwards — which is what ma
   gives 1280 normally but 3072 for a spherical asset, because reframing crops
   ~100° out of the sphere and would otherwise leave ~355 real pixels. That width
   is part of the cache key, so marking an asset 360 rebuilds its proxy.
+  **GPU acceleration**: `hw_encoders()` probes once per process which hardware
+  encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
+  each compiled-in candidate is verified with a one-frame test encode, because
+  `-encoders` listing alone is not proof (`KERF_HW_ENCODE=none` disables). The
+  list is surfaced as the `hw_encoders` Tauri command and the
+  `export_capabilities` MCP tool, and the export dialog merges the verified ones
+  into its codec choices. Proxy generation uses the first verified h264 HW
+  encoder and stitching the first hevc one (both fall back to libx264 on any
+  failure, and one such failure disables HW encode for the process). Background
+  decodes (proxy, stitch, scene detection, the composited still) use the same
+  `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
+  software fallback shared with the preview path; the GUI defaults export
+  `hwaccel` to `auto` too, and `render_with_progress` retries a failed
+  hardware-decode export once in software so the default can never lose a render.
   Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
@@ -89,11 +103,14 @@ so the feature is **only** activated through these forwards — which is what ma
   `Project::probe_import` stitches them at import: `insta360_pair` recognizes a
   square frame whose positional `_00_`/`_10_` lens token has a sibling on disk,
   `stitch_insta360` runs `hstack → v360=dfisheye:e:…:roll=180` (the lenses record
-  upside down) into a 5760x2880 h264 file cached at
-  `<cache>/kerf/stitched/<hash>.mp4` keyed by *both* lens files, and the asset
+  upside down) into a 5760x2880 file cached at
+  `<cache>/kerf/stitched/<hash>.mp4` keyed by *both* lens files (HEVC via a
+  verified GPU encoder when one exists — the frame is too wide for h264 NVENC —
+  else libx264 CRF 15), and the asset
   that lands describes **that** file (projection forced to `Equirect` — the CLI
   can't write an `sv3d` box) with the originals kept in `Asset.source_paths`.
-  It is a full re-encode (~2x realtime), so it streams progress (`import-progress`
+  It is a full re-encode (~2x realtime in software, far faster on a GPU), so it
+  streams progress (`import-progress`
   in the app), is serialized per pair, and dedupes via `insert_or_get_asset` —
   importing the other lens afterwards is a cache hit resolving to the same asset.
   Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
@@ -234,10 +251,15 @@ no editing logic in the adapter.
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
   ready → done` (or `failed`) lifecycle in `model.rs`.
-- `analysis.rs` — transcription / scene / silence are **pluggable traits**
-  (`Transcriber`, `SceneDetector`, `SilenceDetector`). Real impls now exist:
-  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available),
-  `WhisperFilterTranscriber` (the ffmpeg `whisper` filter, always compiled) and
+- `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
+  (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
+  now exist:
+  `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available —
+  scene detection decodes hardware-accelerated and scores at 640px, the metric
+  being resolution-normalized), `FfmpegRhythmAnalyzer` (onsets + tempo +
+  speech/music class from **one** PCM decode — they used to be three traits, each
+  re-decoding the whole file), `WhisperFilterTranscriber` (the ffmpeg `whisper`
+  filter, always compiled) and
   `WhisperTranscriber` (in-process, `whisper` feature); `NullAnalyzer` is still the
   fallback. `Transcriber::transcribe` takes a `ProgressFn` — alone among the
   providers, because it can download a model and then run for minutes.

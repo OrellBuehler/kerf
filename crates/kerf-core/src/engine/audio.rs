@@ -9,7 +9,7 @@ use std::process::Stdio;
 
 use super::cli::{command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use crate::error::{Error, Result};
-use crate::model::{AudioClass, AudioClassification, Loudness, Tempo};
+use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 
 // ---- loudness (EBU R128) ---------------------------------------------------
 
@@ -78,16 +78,24 @@ fn rms_buckets(samples: &[f32], buckets: usize) -> Vec<f32> {
 
 // ---- onset / transient detection -------------------------------------------
 
-/// Detect onset (transient) timestamps in seconds — the moments where new sound
-/// energy arrives (a drum hit, a note attack, a hard edit point). An agent can
-/// snap cut points to these so edits land on the beat rather than mid-phrase.
-/// `sensitivity` is the adaptive-threshold std-dev multiplier; higher = fewer,
-/// stronger onsets.
-pub fn detect_onsets(path: &Path, sensitivity: f64) -> Result<Vec<f64>> {
+/// Onsets, tempo and speech/music classification from **one** decode. The three
+/// analyses all read the same 22.05 kHz mono PCM (and onsets/tempo the same
+/// onset envelope), so deriving them together turns what used to be three
+/// full-file ffmpeg decodes per analysis pass into one. `sensitivity` is the
+/// onset adaptive-threshold std-dev multiplier; higher = fewer, stronger onsets.
+///
+/// Onsets mark the moments new sound energy arrives (a drum hit, a note attack)
+/// so an agent can snap cut points to the beat; tempo is the autocorrelated
+/// beat grid; the class is the speech/music/mixed hint.
+pub fn analyze_rhythm(path: &Path, sensitivity: f64) -> Result<Rhythm> {
     const SR: u32 = 22_050;
     let samples = decode_audio_mono_f32(path, SR)?;
     let (env, frame_rate) = onset_envelope(&samples, SR);
-    Ok(pick_onsets(&env, frame_rate, sensitivity))
+    Ok(Rhythm {
+        onsets: pick_onsets(&env, frame_rate, sensitivity),
+        tempo: estimate_tempo(&env, frame_rate),
+        audio_class: classify_samples(&samples),
+    })
 }
 
 /// Frame hop for the onset / tempo envelopes. At 22.05 kHz this is a ~43 Hz
@@ -146,18 +154,9 @@ fn pick_onsets(env: &[f32], frame_rate: f64, sensitivity: f64) -> Vec<f64> {
 
 // ---- tempo / beat grid -----------------------------------------------------
 
-/// Estimate tempo (BPM) and a beat grid for an asset's audio, or `None` when it
-/// has no usable rhythm. Autocorrelates the onset envelope to find the dominant
-/// period in a 60–180 BPM band, then a phase search places the beats. See
-/// [`crate::model::Tempo`] for the best-effort / octave caveats.
-pub fn detect_tempo(path: &Path) -> Result<Option<Tempo>> {
-    const SR: u32 = 22_050;
-    let samples = decode_audio_mono_f32(path, SR)?;
-    let (env, frame_rate) = onset_envelope(&samples, SR);
-    Ok(estimate_tempo(&env, frame_rate))
-}
-
-/// Autocorrelation tempo + phase estimation on an onset envelope. Pure, tested.
+/// Autocorrelation tempo + phase estimation on an onset envelope: the dominant
+/// period in a 60–180 BPM band, then a phase search to place the beats. See
+/// [`crate::model::Tempo`] for the best-effort / octave caveats. Pure, tested.
 fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
     const MIN_BPM: f64 = 60.0;
     const MAX_BPM: f64 = 180.0;
@@ -207,16 +206,15 @@ fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
 
 // ---- speech vs. music classification ---------------------------------------
 
-/// Classify an asset's audio as speech / music / mixed using two cheap cues:
+/// Classify decoded audio as speech / music / mixed using two cheap cues:
 /// how often the energy drops into a gap (speech is gappy, music continuous) and
 /// how variable the zero-crossing rate is (speech alternates voiced/unvoiced).
-/// A hint, not a trained model — see [`crate::model::AudioClass`].
-pub fn classify_audio(path: &Path) -> Result<Option<AudioClassification>> {
-    const SR: u32 = 22_050;
-    const FRAME: usize = 1024; // ~46 ms
-    let samples = decode_audio_mono_f32(path, SR)?;
+/// A hint, not a trained model — see [`crate::model::AudioClass`]. Takes the
+/// PCM rather than a path so [`analyze_rhythm`] can share one decode.
+fn classify_samples(samples: &[f32]) -> Option<AudioClassification> {
+    const FRAME: usize = 1024; // ~46 ms at 22.05 kHz
     if samples.len() < FRAME * 4 {
-        return Ok(None);
+        return None;
     }
     let n = samples.len() / FRAME;
     let mut energies = Vec::with_capacity(n);
@@ -228,7 +226,7 @@ pub fn classify_audio(path: &Path) -> Result<Option<AudioClassification>> {
         energies.push(energy);
         zcrs.push(crossings as f64 / (FRAME - 1) as f64);
     }
-    Ok(classify_frames(&energies, &zcrs))
+    classify_frames(&energies, &zcrs)
 }
 
 /// Decide a class from per-frame energy and zero-crossing-rate series. Pure, so

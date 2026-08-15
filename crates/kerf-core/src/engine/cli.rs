@@ -28,7 +28,14 @@ struct FrameCache {
     map: HashMap<String, (u64, Vec<u8>)>,
     tick: u64,
     cap: usize,
+    /// Sum of cached frame bytes, kept under [`FRAME_CACHE_MAX_BYTES`]. The
+    /// entry cap alone is no memory bound — 96 full-width PNGs can run to
+    /// hundreds of megabytes.
+    bytes: usize,
 }
+
+/// Byte budget for the frame cache (the entry cap still applies too).
+const FRAME_CACHE_MAX_BYTES: usize = 64 << 20;
 
 impl FrameCache {
     fn get(&mut self, key: &str) -> Option<Vec<u8>> {
@@ -41,12 +48,19 @@ impl FrameCache {
 
     fn put(&mut self, key: String, value: Vec<u8>) {
         self.tick += 1;
-        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
-            // Evict the least-recently-used entry.
+        if let Some((_, old)) = self.map.remove(&key) {
+            self.bytes -= old.len();
+        }
+        // Evict least-recently-used entries until both the entry and byte caps
+        // hold with the new frame counted in.
+        while !self.map.is_empty() && (self.map.len() >= self.cap || self.bytes + value.len() > FRAME_CACHE_MAX_BYTES) {
             if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
-                self.map.remove(&oldest);
+                if let Some((_, evicted)) = self.map.remove(&oldest) {
+                    self.bytes -= evicted.len();
+                }
             }
         }
+        self.bytes += value.len();
         self.map.insert(key, (self.tick, value));
     }
 }
@@ -58,6 +72,7 @@ fn frame_cache() -> &'static Mutex<FrameCache> {
             map: HashMap::new(),
             tick: 0,
             cap: 96,
+            bytes: 0,
         })
     })
 }
@@ -88,6 +103,95 @@ fn hwaccel() -> Option<String> {
 /// cleared, later preview frames skip the accelerated attempt so a broken
 /// `-hwaccel auto` doesn't double every frame's latency.
 static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Cleared the first time a hardware *encode* (proxy / stitch) fails while the
+/// software retry succeeds, so a broken GPU encoder doesn't double every later
+/// background encode.
+static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The `-hwaccel` for the engine's own decodes (preview stills and streaming,
+/// proxy generation, stitching, scene detection): the configured accel unless
+/// an earlier fallback proved it broken on this machine.
+pub fn decode_hwaccel() -> Option<String> {
+    if HWACCEL_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        hwaccel()
+    } else {
+        None
+    }
+}
+
+/// Whether hardware encoding may be used at all. `KERF_HW_ENCODE=none` (or
+/// empty, or `0`) forces every internal encode onto the software encoders.
+fn hw_encode_enabled() -> bool {
+    match std::env::var("KERF_HW_ENCODE") {
+        Ok(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("none")),
+        Err(_) => true,
+    }
+}
+
+/// Every hardware encoder the export surface knows how to drive, in family
+/// preference order (NVENC, QuickSync, VideoToolbox, AMF). VAAPI encoders are
+/// deliberately absent: they only accept frames already uploaded to the GPU,
+/// which the software filtergraph never produces, whereas these all take system
+/// memory frames directly.
+const HW_ENCODER_CANDIDATES: [&str; 10] = [
+    "h264_nvenc",
+    "hevc_nvenc",
+    "av1_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "av1_qsv",
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
+    "h264_amf",
+    "hevc_amf",
+];
+
+/// The hardware video encoders this machine's ffmpeg can actually use, probed
+/// once per process and cached. `-encoders` listing an encoder is not proof —
+/// an nvenc-enabled build without a usable NVIDIA driver still lists it and
+/// then fails at open — so each compiled-in candidate is exercised with a
+/// one-frame test encode and only the ones that succeed are reported. Ordered
+/// by [`HW_ENCODER_CANDIDATES`]. `KERF_HW_ENCODE=none` reports none.
+pub fn hw_encoders() -> &'static [String] {
+    static ENCODERS: OnceLock<Vec<String>> = OnceLock::new();
+    ENCODERS.get_or_init(|| {
+        if !hw_encode_enabled() {
+            return Vec::new();
+        }
+        let bin = ffmpeg_bin();
+        let listed = match command(&bin)
+            .args(["-hide_banner", "-v", "error", "-encoders"])
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return Vec::new(),
+        };
+        // `-encoders` prints ` V....D h264_nvenc  NVIDIA NVENC…` — the name is
+        // the second whitespace-separated token.
+        let compiled: std::collections::HashSet<&str> = listed.lines().filter_map(|l| l.split_whitespace().nth(1)).collect();
+        let found: Vec<String> = HW_ENCODER_CANDIDATES
+            .iter()
+            .filter(|enc| compiled.contains(**enc))
+            .filter(|enc| {
+                // 256x256 clears every family's minimum-dimension floor; nv12 is
+                // the input format they all accept.
+                command(&bin)
+                    .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2"])
+                    .args(["-frames:v", "1", "-pix_fmt", "nv12", "-c:v", enc, "-f", "null", "-"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
+            .map(|s| s.to_string())
+            .collect();
+        tracing::info!(encoders = ?found, "hardware video encoders detected");
+        found
+    })
+}
 
 pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
     Error::Engine(format!("failed to launch `{bin}` ({e}); is FFmpeg installed and on PATH?"))
@@ -373,18 +477,52 @@ fn parse_silence(stderr: &str) -> Vec<TimeRange> {
     ranges
 }
 
+/// Width the scene detector runs at. The scene score is a mean absolute frame
+/// difference normalized by pixel count, so it is stable under downscale — and
+/// computing it on a 640px frame instead of 4K makes the per-frame diff ~20x
+/// cheaper while the decode (hardware-accelerated when available) dominates.
+const SCENE_DETECT_WIDTH: u32 = 640;
+
 /// Detect scene-change timestamps using `select='gt(scene,threshold)'`.
+///
+/// Decodes with `-hwaccel` when configured (the whole file is decoded, which is
+/// the expensive part for 4K sources); a failed accelerated run retries in
+/// software, mirroring [`decode_frame`]'s fallback.
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
+    use std::sync::atomic::Ordering;
+
     let bin = ffmpeg_bin();
-    let filter = format!("select='gt(scene,{threshold})',showinfo");
-    let output = command(&bin)
-        .args(["-hide_banner", "-nostats"])
-        .arg("-i")
-        .arg(path)
-        .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
-        .stdout(Stdio::null())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
+    let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    let run = |hw: Option<&str>| {
+        let mut cmd = command(&bin);
+        cmd.args(["-hide_banner", "-nostats"]);
+        if let Some(hw) = hw {
+            cmd.args(["-hwaccel", hw]);
+        }
+        cmd.arg("-i")
+            .arg(path)
+            .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
+            .stdout(Stdio::null())
+            .output()
+            .map_err(|e| launch_err(&bin, e))
+    };
+    let hw = decode_hwaccel();
+    let output = match hw.as_deref() {
+        Some(h) => {
+            let out = run(Some(h))?;
+            if out.status.success() {
+                out
+            } else {
+                let sw = run(None)?;
+                if sw.status.success() {
+                    HWACCEL_OK.store(false, Ordering::Relaxed);
+                    tracing::warn!("hardware decode failed during scene detection; using software decode");
+                }
+                sw
+            }
+        }
+        None => run(None)?,
+    };
     Ok(parse_scenes(&String::from_utf8_lossy(&output.stderr)))
 }
 
@@ -906,43 +1044,90 @@ fn proxy_threads() -> usize {
         .unwrap_or(1)
 }
 
+/// Constant-quality flags for encoder `vc` at software-CRF-scale `crf` — the
+/// proxy / stitch analogue of the export's `push_video_opts`, spelling the same
+/// intent per hardware family (each names its quality knob differently).
+fn quality_args(vc: &str, crf: u32) -> Vec<String> {
+    let s = |v: &str| v.to_string();
+    match enc_family(vc) {
+        EncFamily::Software => vec![s("-preset"), s("veryfast"), s("-crf"), crf.to_string()],
+        EncFamily::Nvenc => vec![s("-rc"), s("vbr"), s("-cq"), crf.to_string(), s("-b:v"), s("0")],
+        EncFamily::Qsv => vec![s("-global_quality"), crf.to_string()],
+        EncFamily::VideoToolbox => vec![s("-q:v"), crf_to_vt_quality(crf).to_string()],
+        EncFamily::Amf => {
+            let qp = crf.to_string();
+            vec![s("-rc"), s("cqp"), s("-qp_i"), qp.clone(), s("-qp_p"), qp]
+        }
+    }
+}
+
+/// Encoder input pixel format: the hardware encoders all take `nv12` (some take
+/// nothing else), the software path keeps its historical `yuv420p`. Both are
+/// 4:2:0, so the decoded proxy looks the same either way.
+fn encode_pix_fmt(vc: &str) -> &'static str {
+    if enc_family(vc) == EncFamily::Software {
+        "yuv420p"
+    } else {
+        "nv12"
+    }
+}
+
+/// The hardware H.264 encoder to generate proxies with, when one is available
+/// and hardware encoding hasn't been disabled or found broken. H.264 rather
+/// than HEVC because every proxy width (≤3072) sits inside even H.264 NVENC's
+/// 4096-wide ceiling, and H.264 decodes cheapest — which is the whole point of
+/// a scrubbing proxy.
+fn proxy_hw_encoder() -> Option<&'static str> {
+    if !HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    HW_ENCODER_CANDIDATES
+        .iter()
+        .find(|e| e.starts_with("h264_") && hw_encoders().iter().any(|h| h == *e))
+        .copied()
+}
+
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
 /// an all-intra, audio-less preview proxy at `dst`, capped to `width` pixels
-/// across (see [`proxy_width`]) and using at most `threads` CPU threads. `-g 1` makes every frame a keyframe, so a seek decodes
+/// across (see [`proxy_width`]) and using at most `threads` CPU threads.
+/// `encoder` is `libx264` or a detected hardware encoder (which offloads the
+/// whole background transcode to the GPU); `hw_decode` adds an input-side
+/// `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
 /// always reads the original) would.
-fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32) -> Vec<String> {
-    vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-y".to_string(),
+fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32, encoder: &str, hw_decode: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string(), "-y".to_string()];
+    if let Some(hw) = hw_decode {
+        args.push("-hwaccel".to_string());
+        args.push(hw.to_string());
+    }
+    args.extend([
         "-i".to_string(),
         src.to_string(),
         "-an".to_string(),
         "-vf".to_string(),
         format!("scale='min({width},iw)':-2:flags=bilinear"),
         "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        "veryfast".to_string(),
-        "-crf".to_string(),
-        "24".to_string(),
+        encoder.to_string(),
+    ]);
+    args.extend(quality_args(encoder, 24));
+    args.extend([
         "-g".to_string(),
         "1".to_string(),
         "-threads".to_string(),
         threads.max(1).to_string(),
         "-pix_fmt".to_string(),
-        "yuv420p".to_string(),
+        encode_pix_fmt(encoder).to_string(),
         // The encode writes a `.part` temp file, whose extension tells ffmpeg
         // nothing — name the muxer instead of letting it guess, or it exits
         // with "unable to find a suitable output format" before decoding a frame.
         "-f".to_string(),
         "mp4".to_string(),
         dst.to_string(),
-    ]
+    ]);
+    args
 }
 
 /// Generate the preview proxy for `src` if it isn't cached yet, returning its
@@ -968,13 +1153,33 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
     let tmp_str = tmp
         .to_str()
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
-    let args = build_proxy_args(src_str, tmp_str, proxy_threads(), width);
     let bin = ffmpeg_bin();
-    let output = command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
+    let run = |encoder: &str, hw_decode: Option<&str>| -> Result<std::process::Output> {
+        let args = build_proxy_args(src_str, tmp_str, proxy_threads(), width, encoder, hw_decode);
+        command(&bin)
+            .args(&args)
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| launch_err(&bin, e))
+    };
+    // GPU encode (and decode) when available — a background proxy transcode
+    // then costs the CPU almost nothing. A failure falls back to the software
+    // pipeline once, and a hardware-*encoder* failure whose software retry
+    // succeeds disables hardware encodes for the rest of the process.
+    let hw_enc = proxy_hw_encoder();
+    let hw_dec = decode_hwaccel();
+    let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
+    if !output.status.success() && (hw_enc.is_some() || hw_dec.is_some()) {
+        let _ = std::fs::remove_file(&tmp);
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        output = run("libx264", None)?;
+        if output.status.success() {
+            if hw_enc.is_some() {
+                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracing::warn!(error = %err, "hardware-accelerated proxy encode failed; using software");
+        }
+    }
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Engine(format!(
@@ -1094,44 +1299,59 @@ pub fn stitched_path(front: &Path, rear: &Path) -> Option<PathBuf> {
 /// CRF 15 rather than a lossless or visually-lossy setting: this file becomes
 /// the effective source for every later reframe and export, so it must not be
 /// the quality floor, while `veryfast` keeps a capture's import to minutes.
-pub(crate) fn build_stitch_args(front: &str, rear: &str, dst: &str) -> Vec<String> {
-    [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        front,
-        "-i",
-        rear,
-        "-filter_complex",
-        &format!(
+/// With a hardware `encoder` the same quality intent is mapped per family (see
+/// [`quality_args`]) and the multi-minute re-encode moves onto the GPU;
+/// `hw_decode` accelerates the two lens decodes the same way.
+pub(crate) fn build_stitch_args(front: &str, rear: &str, dst: &str, encoder: &str, hw_decode: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string(), "-y".to_string()];
+    // `-hwaccel` is an input option: emit it before each lens file's `-i`.
+    for lens in [front, rear] {
+        if let Some(hw) = hw_decode {
+            args.push("-hwaccel".to_string());
+            args.push(hw.to_string());
+        }
+        args.push("-i".to_string());
+        args.push(lens.to_string());
+    }
+    args.extend([
+        "-filter_complex".to_string(),
+        format!(
             "[0:v][1:v]hstack=shortest=1,v360=dfisheye:e:ih_fov={STITCH_FOV}:iv_fov={STITCH_FOV}:roll=180:w={STITCH_WIDTH}:h={STITCH_HEIGHT}[v]"
         ),
-        "-map",
-        "[v]",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "15",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "copy",
-        "-shortest",
+        "-map".to_string(),
+        "[v]".to_string(),
+        "-map".to_string(),
+        "0:a?".to_string(),
+        "-c:v".to_string(),
+        encoder.to_string(),
+    ]);
+    args.extend(quality_args(encoder, 15));
+    args.extend([
+        "-pix_fmt".to_string(),
+        encode_pix_fmt(encoder).to_string(),
+        "-c:a".to_string(),
+        "copy".to_string(),
+        "-shortest".to_string(),
         // The encode writes a `.part` temp file, whose extension tells ffmpeg
         // nothing — name the muxer instead of letting it guess.
-        "-f",
-        "mp4",
-        dst,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+        "-f".to_string(),
+        "mp4".to_string(),
+        dst.to_string(),
+    ]);
+    args
+}
+
+/// The hardware encoder for stitching, when available: an **HEVC** one, because
+/// the 5760-wide equirect frame exceeds H.264 NVENC's 4096-wide ceiling while
+/// every HEVC hardware encoder handles 8K. `None` falls back to libx264.
+fn stitch_hw_encoder() -> Option<&'static str> {
+    if !HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    HW_ENCODER_CANDIDATES
+        .iter()
+        .find(|e| e.starts_with("hevc_") && hw_encoders().iter().any(|h| h == *e))
+        .copied()
 }
 
 /// Serializes stitches of the same pair. Importing both lens files at once (the
@@ -1188,19 +1408,35 @@ pub fn stitch_insta360(
         .ok_or_else(|| Error::Engine("stitch temp path is not valid UTF-8".to_string()))?;
 
     tracing::info!(front = %front.display(), rear = %rear.display(), "stitching insta360 lens pair");
-    let args = build_stitch_args(front_str, rear_str, tmp_str);
-    let result = run_ffmpeg_progress(
-        &args,
-        &dst,
-        Bar {
-            total: duration_hint.max(1e-9),
-            offset: 0.0,
-            width: 1.0,
-            start: std::time::Instant::now(),
-        },
-        progress,
-        &|| false,
-    );
+    let attempt = |encoder: &str, hw_decode: Option<&str>, progress: &mut dyn FnMut(ExportProgress)| {
+        let args = build_stitch_args(front_str, rear_str, tmp_str, encoder, hw_decode);
+        run_ffmpeg_progress(
+            &args,
+            &dst,
+            Bar {
+                total: duration_hint.max(1e-9),
+                offset: 0.0,
+                width: 1.0,
+                start: std::time::Instant::now(),
+            },
+            progress,
+            &|| false,
+        )
+    };
+    // GPU-encode the stitch when a verified HEVC hardware encoder exists (the
+    // full re-encode drops from minutes towards realtime); one failure falls
+    // back to the software pipeline and disables hardware encodes.
+    let hw_enc = stitch_hw_encoder();
+    let hw_dec = decode_hwaccel();
+    let mut result = attempt(hw_enc.unwrap_or("libx264"), hw_dec.as_deref(), progress);
+    if result.is_err() && (hw_enc.is_some() || hw_dec.is_some()) {
+        tracing::warn!(error = ?result.as_ref().err(), "hardware-accelerated stitch failed; retrying in software");
+        if hw_enc.is_some() {
+            HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        result = attempt("libx264", None, progress);
+    }
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -2331,7 +2567,7 @@ fn build_preview_args(
         // Bilinear over the export's default: at preview size the difference is
         // invisible and the scaler runs on every frame of every clip.
         scaler: Some("bilinear".to_string()),
-        hwaccel: hwaccel(),
+        hwaccel: decode_hwaccel(),
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
@@ -2505,8 +2741,40 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
 /// Like [`render_with`] but streams [`ExportProgress`] to `progress` and polls
 /// `cancel` between updates — returning [`RenderStatus::Cancelled`] (and leaving
 /// the partial output for the caller to remove) when it trips.
+///
+/// When the options request hardware decode (`opts.hwaccel`) and the render
+/// fails, it is retried once fully in software — so defaulting exports to GPU
+/// decode can never lose a render that plain software decoding would have
+/// produced. (`-hwaccel auto` already falls back at init; this covers the rarer
+/// mid-stream decoder failure.)
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with_progress(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
+    let hw_requested = opts
+        .hwaccel
+        .as_deref()
+        .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"));
+    match render_attempt(timeline, assets, output, opts, progress, cancel) {
+        Err(e) if hw_requested => {
+            tracing::warn!(error = %e, "export with hardware decode failed; retrying with software decode");
+            let sw = ExportOptions {
+                hwaccel: None,
+                ..opts.clone()
+            };
+            render_attempt(timeline, assets, output, &sw, progress, cancel)
+        }
+        result => result,
+    }
+}
+
+/// One export run with `opts` exactly as given (no fallback).
+fn render_attempt(
     timeline: &Timeline,
     assets: &[Asset],
     output: &Path,
@@ -3694,20 +3962,42 @@ pub fn timeline_frame(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<u8>> {
-    let args = build_timeline_frame_args(timeline, assets, opts, t, max_width, quality)?;
-    let bin = ffmpeg_bin();
-    let output = command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::Engine(format!(
-            "could not render timeline frame at {t:.3}s: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let run = |o: &ExportOptions| -> Result<Vec<u8>> {
+        let args = build_timeline_frame_args(timeline, assets, o, t, max_width, quality)?;
+        let bin = ffmpeg_bin();
+        let output = command(&bin)
+            .args(&args)
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| launch_err(&bin, e))?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return Err(Error::Engine(format!(
+                "could not render timeline frame at {t:.3}s: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output.stdout)
+    };
+    let hw = opts
+        .hwaccel
+        .as_deref()
+        .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"));
+    match run(opts) {
+        // Mirror `decode_frame`'s fallback: a software retry that succeeds means
+        // `-hwaccel` is the culprit here, so stop asking for it.
+        Err(hw_err) if hw => match run(&ExportOptions {
+            hwaccel: None,
+            ..opts.clone()
+        }) {
+            Ok(bytes) => {
+                HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("hardware decode failed for the timeline still ({hw_err}); using software decode");
+                Ok(bytes)
+            }
+            Err(_) => Err(hw_err),
+        },
+        result => result,
     }
-    Ok(output.stdout)
 }
 
 /// Pure arg builder for [`timeline_frame`] (no I/O, unit-tested).
@@ -3769,8 +4059,17 @@ fn build_timeline_frame_args(
     for (clip, src) in &active {
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
-        // it up); seeking into it decodes nothing, so skip the `-ss` for images.
+        // it up); seeking into it decodes nothing, so skip the `-ss` (and any
+        // decode acceleration) for images.
         if !asset.is_image() {
+            if let Some(hw) = opts
+                .hwaccel
+                .as_deref()
+                .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"))
+            {
+                args.push("-hwaccel".to_string());
+                args.push(hw.to_string());
+            }
             args.push("-ss".to_string());
             args.push(format!("{src:.3}"));
         }
@@ -4055,7 +4354,7 @@ mod tests {
 
     #[test]
     fn proxy_args_are_all_intra_audioless_and_keep_timing() {
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH);
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "libx264", None);
         // All-intra: every frame a keyframe, so a preview seek decodes one frame.
         let gop = args.iter().position(|a| a == "-g").expect("-g present");
         assert_eq!(args[gop + 1], "1");
@@ -4082,6 +4381,72 @@ mod tests {
         let input = args.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(args[input + 1], "/in.mov");
         assert_eq!(args.last().unwrap(), "/out.mp4");
+    }
+
+    #[test]
+    fn proxy_args_with_hw_encoder_spell_quality_per_family_and_stay_all_intra() {
+        // NVENC: CRF intent becomes -rc vbr -cq, input format nv12, and the
+        // all-intra / no-retime invariants hold exactly as in software.
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "h264_nvenc", Some("auto"));
+        assert!(args.windows(2).any(|w| w[0] == "-hwaccel" && w[1] == "auto"));
+        assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "h264_nvenc"));
+        assert!(args.windows(2).any(|w| w[0] == "-cq" && w[1] == "24"));
+        assert!(!args.contains(&"-crf".to_string()), "hw encoders have no -crf");
+        assert!(args.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "nv12"));
+        assert!(args.windows(2).any(|w| w[0] == "-g" && w[1] == "1"));
+        assert!(!args.contains(&"-ss".to_string()) && !args.contains(&"-r".to_string()));
+        // The `-hwaccel` is an input option: it must precede the `-i`.
+        let hw = args.iter().position(|a| a == "-hwaccel").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(hw < input);
+    }
+
+    #[test]
+    fn stitch_args_with_hw_encoder_accelerate_both_lens_decodes() {
+        let args = build_stitch_args("/dcim/f_00_.mp4", "/dcim/r_10_.mp4", "/cache/out.mp4", "hevc_nvenc", Some("auto"));
+        // One `-hwaccel` per lens input, each before its `-i`.
+        assert_eq!(args.iter().filter(|a| *a == "-hwaccel").count(), 2);
+        assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "hevc_nvenc"));
+        assert!(args.windows(2).any(|w| w[0] == "-cq" && w[1] == "15"));
+        assert!(args.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "nv12"));
+        // The stitch geometry is untouched by the encoder choice.
+        let graph = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .map(|i| args[i + 1].clone())
+            .expect("-filter_complex present");
+        assert!(graph.contains("hstack=shortest=1"));
+        assert!(graph.contains("w=5760:h=2880"));
+    }
+
+    #[test]
+    fn quality_args_map_the_same_intent_per_family() {
+        assert_eq!(quality_args("libx264", 24).join(" "), "-preset veryfast -crf 24");
+        assert_eq!(quality_args("h264_qsv", 24).join(" "), "-global_quality 24");
+        assert_eq!(quality_args("h264_amf", 24).join(" "), "-rc cqp -qp_i 24 -qp_p 24");
+        // VideoToolbox flips the scale: lower CRF must become higher quality.
+        let vt15: u32 = quality_args("hevc_videotoolbox", 15)[1].parse().unwrap();
+        let vt28: u32 = quality_args("hevc_videotoolbox", 28)[1].parse().unwrap();
+        assert!(vt15 > vt28);
+    }
+
+    #[test]
+    fn timeline_frame_hwaccel_is_per_input_and_opt_in() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        // Default stays byte-identical: no -hwaccel.
+        let plain = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 1.0, 960, 4).unwrap();
+        assert!(!plain.contains(&"-hwaccel".to_string()));
+        // Requested: emitted as an input option (before the -i it applies to).
+        let hw = ExportOptions {
+            hwaccel: Some("auto".to_string()),
+            ..ExportOptions::default()
+        };
+        let args = build_timeline_frame_args(&timeline, &assets, &hw, 1.0, 960, 4).unwrap();
+        let at = args.iter().position(|a| a == "-hwaccel").expect("-hwaccel present");
+        assert_eq!(args[at + 1], "auto");
+        assert!(at < args.iter().position(|a| a == "-i").unwrap());
     }
 
     #[test]
@@ -4113,7 +4478,7 @@ mod tests {
 
     #[test]
     fn stitch_args_reproject_the_lens_pair_to_equirect() {
-        let args = build_stitch_args("/dcim/front_00_.mp4", "/dcim/rear_10_.mp4", "/cache/out.mp4");
+        let args = build_stitch_args("/dcim/front_00_.mp4", "/dcim/rear_10_.mp4", "/cache/out.mp4", "libx264", None);
         // Front lens is input 0 — hstack packs it into the left half, which is
         // the front hemisphere `v360=dfisheye` expects.
         let inputs: Vec<&String> = args
@@ -4193,7 +4558,7 @@ mod tests {
         assert_eq!(proxy_width(Some(Projection::Flat)), PROXY_MAX_WIDTH);
         assert_eq!(proxy_width(Some(Projection::Equirect)), PROXY_MAX_WIDTH_SPHERICAL);
         assert_eq!(proxy_width(Some(Projection::DualFisheye)), PROXY_MAX_WIDTH_SPHERICAL);
-        assert!(build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL)
+        assert!(build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None)
             .iter()
             .any(|a| a.contains("scale='min(3072,iw)':-2")));
         // Marking an asset as 360 must not silently reuse the small proxy that

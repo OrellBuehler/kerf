@@ -1190,6 +1190,15 @@ fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Tas
 
 // ---- export ----------------------------------------------------------------
 
+/// The hardware (GPU) video encoders this machine's ffmpeg can actually use —
+/// verified once per process with a tiny test encode. The export dialog merges
+/// them into its codec choices; empty means software encoders only.
+#[tauri::command]
+async fn hw_encoders() -> CmdResult<Vec<String>> {
+    // First call probes by spawning ffmpeg, so keep it off the async workers.
+    blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await
+}
+
 #[tauri::command]
 async fn export_timeline(
     app: AppHandle,
@@ -1471,6 +1480,7 @@ pub fn run() {
             add_task,
             resolve_task,
             remove_task,
+            hw_encoders,
             export_timeline,
             cancel_export,
             mcp_endpoint,

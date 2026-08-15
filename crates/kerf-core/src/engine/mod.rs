@@ -26,7 +26,7 @@ mod cli;
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
-pub use audio::{classify_audio, detect_onsets, detect_tempo, energy_envelope, measure_loudness};
+pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
@@ -39,9 +39,10 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, contact_sheet, detect_scenes, detect_silence, frame_at, frame_jpeg, generate_proxy,
-    insta360_pair, proxy_path, proxy_width, ready_proxy, stitch_insta360, stitched_path, stream_preview, timeline_frame,
-    validate_export, waveform, Container, ExportOptions, ExportProgress, Fit, PreviewFrame, RateControl, RenderStatus,
+    audio_effects_filter, audio_pcm, contact_sheet, decode_hwaccel, detect_scenes, detect_silence, frame_at, frame_jpeg,
+    generate_proxy, hw_encoders, insta360_pair, proxy_path, proxy_width, ready_proxy, stitch_insta360, stitched_path,
+    stream_preview, timeline_frame, validate_export, waveform, Container, ExportOptions, ExportProgress, Fit, PreviewFrame,
+    RateControl, RenderStatus,
 };
 
 pub(crate) use cli::insta360_pair_name;

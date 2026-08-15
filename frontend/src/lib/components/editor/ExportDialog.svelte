@@ -3,7 +3,7 @@
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, cancelExport, onExportProgress } from '$lib/api';
+	import { inTauri, pickExportPath, cancelExport, onExportProgress, hwEncoders } from '$lib/api';
 	import { toast } from 'svelte-sonner';
 	import type { Container, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
 	import {
@@ -22,6 +22,7 @@
 		FRAME_RATES,
 		applyPreset,
 		containerInfo,
+		isHwCodec,
 		reconcileContainer,
 		videoCodecDefaults,
 		validateExport,
@@ -41,6 +42,15 @@
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
 	let useRange = $state(false);
+
+	// GPU encoders the backend verified usable on this machine; merged into the
+	// codec choices once known (empty in the browser harness).
+	let hwCodecs = $state<string[]>([]);
+	$effect(() => {
+		hwEncoders()
+			.then((list) => (hwCodecs = list))
+			.catch(() => {});
+	});
 
 	/** The timeline's in/out marks when both are set and ordered, else null. */
 	const marks = $derived(
@@ -112,7 +122,10 @@
 		if (outputPath) outputPath = swapExt(outputPath, containerInfo(c).ext);
 	}
 	function setVideoCodec(id: string) {
-		patch(videoCodecDefaults(id));
+		const p = videoCodecDefaults(id);
+		// Hardware encoders have no two-pass mode; land on CRF instead.
+		if (isHwCodec(id) && opts.rate_control === 'two_pass') p.rate_control = 'crf';
+		patch(p);
 	}
 	function setRate(r: RateControl) {
 		const p: Partial<ExportOptions> = { rate_control: r };
@@ -331,7 +344,10 @@
 				{@render selectRow(
 					'Codec',
 					opts.video_codec ?? '',
-					info.video.map((id) => ({ value: id, label: VIDEO_CODECS[id]?.label ?? id })),
+					[...info.video, ...info.hwVideo.filter((id) => hwCodecs.includes(id))].map((id) => ({
+						value: id,
+						label: VIDEO_CODECS[id]?.label ?? id
+					})),
 					setVideoCodec
 				)}
 
@@ -349,7 +365,7 @@
 					<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
 						<span style="font-size:12px;color:var(--text-muted);width:90px;flex:none">Rate control</span>
 						<div style="display:flex;gap:4px;flex:1">
-							{#each RATE_CONTROLS as rc (rc.id)}
+							{#each RATE_CONTROLS.filter((rc) => rc.id !== 'two_pass' || !isHwCodec(opts.video_codec)) as rc (rc.id)}
 								<button
 									onclick={() => setRate(rc.id)}
 									style="flex:1;padding:5px 4px;font-size:11px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid {opts.rate_control ===
@@ -426,6 +442,9 @@
 						opts.scaler ?? '',
 						[{ value: '', label: 'Default (bicubic)' }, ...SCALERS.map((s) => ({ value: s, label: s }))],
 						(v) => patch({ scaler: v || null })
+					)}
+					{@render toggleRow('GPU decode (hwaccel)', !!opts.hwaccel && opts.hwaccel !== 'none', (v) =>
+						patch({ hwaccel: v ? 'auto' : null })
 					)}
 				{/if}
 

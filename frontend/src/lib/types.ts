@@ -394,14 +394,18 @@ export interface TranscriptionStatus {
 	reason?: string | null;
 }
 
-/** The bare Rust `Default` — the dialog opens by applying a preset over this. */
+/** The dialog's baseline options (a preset is applied over this). One deliberate
+ *  departure from the bare Rust `Default`: source decode is `hwaccel: 'auto'`,
+ *  so exports GPU-decode where the machine can (ffmpeg falls back to software
+ *  at init, and the engine retries a failed hardware render in software). */
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
 	container: 'mp4',
 	rate_control: 'crf',
 	fit: 'contain',
 	include_audio: true,
 	faststart: false,
-	gif_loop: true
+	gif_loop: true,
+	hwaccel: 'auto'
 };
 
 export const clipDuration = (clip: Clip): number => {

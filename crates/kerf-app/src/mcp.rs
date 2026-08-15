@@ -1243,6 +1243,16 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "List the hardware (GPU) video encoders this machine's ffmpeg can actually use (verified by a \
+                       test encode) — pass one as export's video_codec for a much faster render. Empty means software \
+                       encoders only."
+    )]
+    async fn export_capabilities(&self) -> Result<String, McpError> {
+        let encoders = blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await?;
+        json(&serde_json::json!({ "hw_encoders": encoders }))
+    }
+
+    #[tool(
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
                        safe H.264/AAC MP4 default."

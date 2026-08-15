@@ -589,14 +589,14 @@ impl Project {
         max_width: u32,
         quality: u8,
     ) -> Result<Vec<u8>> {
-        engine::timeline_frame(
-            timeline,
-            assets,
-            &engine::ExportOptions::default(),
-            time_secs,
-            max_width,
-            quality,
-        )
+        // Hardware-accelerated decode like the single-frame path (with the same
+        // learned software fallback inside the engine) — this runs continuously
+        // while the user scrubs.
+        let opts = engine::ExportOptions {
+            hwaccel: engine::decode_hwaccel(),
+            ..engine::ExportOptions::default()
+        };
+        engine::timeline_frame(timeline, assets, &opts, time_secs, max_width, quality)
     }
 
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
