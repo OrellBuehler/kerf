@@ -39,7 +39,13 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render. Tracks flagged `Track.duck` are mixed into their own bus and
+  render. `ExportOptions.fit` decides what happens when the delivery aspect differs
+  from the footage: `Contain` (the default, and the historical behaviour) scales to
+  fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
+  — which is what makes the vertical / square presets produce a usable shot rather
+  than a strip of picture in a black field. It sets the *base* fit only; a clip with
+  its own transform still composes on top.
+  Tracks flagged `Track.duck` are mixed into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
   on the final mix, and `ExportOptions.range` renders only a span by building the
@@ -343,9 +349,15 @@ a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the righ
 stays put; stills extend freely since they loop). The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
 **J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
-`src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`,
-schedules them with volume / fades / speed / reverse applied (effects chains are not
-auralized), and the playhead follows the audio clock — edits mid-playback re-anchor via
+`src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`
+and schedules them with volume / fades / speed / reverse applied. **Per-clip effect
+chains are auralized**: passing `clipId` to `get_audio` decodes the window through that
+clip's own ffmpeg chain (`audio_effects_filter`, the same string the export renders), so
+the chain is part of the buffer cache key and retuning an EQ re-fetches. It runs before
+this engine's gain envelope where the export runs it after the clip gain — audible only
+to a level-dependent effect, and keeping volume in Web Audio is what lets the fader stay
+live instead of re-fetching PCM on every drag. Reverse shuttle is still silent. The
+playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**

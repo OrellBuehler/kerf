@@ -23,7 +23,7 @@ pub use analysis::{
 pub use engine::{
     download_speech_model, generate_proxy, insta360_pair, proxy_path, proxy_width, render_with, render_with_progress,
     set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export, Container,
-    DownloadProgress, ExportOptions, ExportProgress, PreviewFrame, RateControl, RenderStatus, SpeechModelInfo,
+    DownloadProgress, ExportOptions, ExportProgress, Fit, PreviewFrame, RateControl, RenderStatus, SpeechModelInfo,
     DEFAULT_SPEECH_MODEL,
 };
 pub use error::{Error, Result};

@@ -786,10 +786,10 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
 /// container) so the webview can build an `AudioBuffer` directly without
 /// codec support; the input-side `-ss` fast-seek keeps a window deep in a
 /// long source cheap to extract.
-pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32) -> Result<Vec<u8>> {
+pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filters: Option<&str>) -> Result<Vec<u8>> {
     let bin = ffmpeg_bin();
-    let output = command(&bin)
-        .args(["-hide_banner", "-loglevel", "error"])
+    let mut cmd = command(&bin);
+    cmd.args(["-hide_banner", "-loglevel", "error"])
         .args(["-ss", &start.max(0.0).to_string()])
         .arg("-i")
         .arg(path)
@@ -802,10 +802,14 @@ pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32) -> Re
             "1",
             "-ar",
             &sample_rate.to_string(),
-            "-f",
-            "s16le",
-            "pipe:1",
-        ])
+        ]);
+    // The clip's own effect chain, so the monitor hears the EQ / compressor /
+    // gate the export will render rather than the dry source.
+    if let Some(filters) = filters.filter(|f| !f.is_empty()) {
+        cmd.args(["-af", filters]);
+    }
+    let output = cmd
+        .args(["-f", "s16le", "pipe:1"])
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| launch_err(&bin, e))?;
@@ -1346,6 +1350,24 @@ pub enum RateControl {
     Lossless,
 }
 
+/// How a clip's picture is fitted to an output frame of a different shape.
+///
+/// This is what makes a vertical or square export usable. `Contain` letterboxes,
+/// which is right when the delivery matches the footage and wrong the moment it
+/// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
+/// mostly-black frame — technically the whole picture, and not something anyone
+/// would post. `Cover` fills the frame and throws away the overflow instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Fit {
+    /// Scale to fit inside the frame and pad the remainder with black. The
+    /// default, and the historical behaviour.
+    #[default]
+    Contain,
+    /// Scale to cover the frame and crop what hangs over the edges.
+    Cover,
+}
+
 /// Which ffmpeg invocation [`build_export_args`] is emitting for. Injected so
 /// the builder stays pure (no knowledge of the platform null device or the temp
 /// passlog file — [`render_with`] supplies those).
@@ -1409,6 +1431,9 @@ pub struct ExportOptions {
 
     /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
+    /// How footage of a different shape is fitted to that frame — letterboxed
+    /// (the default) or filled and cropped. Only matters when the two differ.
+    pub fit: Fit,
     /// Output fps, baked into the filtergraph; never emits `-r`.
     pub fps: Option<f64>,
     /// `scale=…:flags=` scaler (bicubic / bilinear / lanczos / neighbor / spline).
@@ -1460,6 +1485,7 @@ impl Default for ExportOptions {
             pix_fmt: None,
             hwaccel: None,
             resolution: None,
+            fit: Fit::Contain,
             fps: None,
             scaler: None,
             audio_sample_rate: None,
@@ -1655,6 +1681,8 @@ struct ExportFormat {
     pix_fmt: String,
     /// Optional `scale=…:flags=` scaler.
     scaler: Option<String>,
+    /// Letterbox or fill-and-crop when the footage and the frame differ in shape.
+    fit: Fit,
 }
 
 impl Default for ExportFormat {
@@ -1667,6 +1695,7 @@ impl Default for ExportFormat {
             channels: 2,
             pix_fmt: "yuv420p".to_string(),
             scaler: None,
+            fit: Fit::Contain,
         }
     }
 }
@@ -1761,6 +1790,7 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
         };
     }
     fmt.scaler = opts.scaler.clone();
+    fmt.fit = opts.fit;
     fmt
 }
 
@@ -3204,6 +3234,16 @@ fn chroma_filter(e: &VideoEffect) -> Option<String> {
     }
 }
 
+/// A clip's whole audio effect chain as one comma-joined filter string, or `None`
+/// when it has no effects.
+///
+/// Public because the GUI's preview monitor decodes clip audio through the same
+/// chain the export renders — the chain is only *described* once, here, so the
+/// two can't drift.
+pub fn audio_effects_filter(effects: &[AudioEffect]) -> Option<String> {
+    (!effects.is_empty()).then(|| effects.iter().map(audio_effect_filter).collect::<Vec<_>>().join(","))
+}
+
 /// The filter for one audio effect. dB thresholds / make-up gain are converted to
 /// the linear units ffmpeg's dynamics filters expect.
 fn audio_effect_filter(e: &AudioEffect) -> String {
@@ -3513,23 +3553,44 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
-    p.push(format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease{sf}",
-        w = fmt.width,
-        h = fmt.height
-    ));
-    if geom_identity {
-        p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
-    } else if anim {
-        // Per-frame zoom: re-evaluate the scale expression every frame.
-        let expr = keyframe_expr(
-            &kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(),
-            "t",
-            clip.timeline_start,
-        );
-        p.push(format!("scale=w='iw*({expr})':h='ih*({expr})':eval=frame{sf}"));
-    } else if (t.scale - 1.0).abs() > 1e-9 {
-        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
+    match fmt.fit {
+        // Fit inside the frame; the identity case then pads out to full size so
+        // the overlay lands on a complete canvas.
+        Fit::Contain => {
+            p.push(format!(
+                "scale={w}:{h}:force_original_aspect_ratio=decrease{sf}",
+                w = fmt.width,
+                h = fmt.height
+            ));
+            if geom_identity {
+                p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
+            }
+        }
+        // Fill the frame and cut the overflow, so 16:9 footage delivered at 9:16
+        // is a usable vertical shot rather than a strip of picture in a black
+        // field. `increase` overshoots on one axis; the crop takes the centre.
+        Fit::Cover => {
+            p.push(format!(
+                "scale={w}:{h}:force_original_aspect_ratio=increase{sf}",
+                w = fmt.width,
+                h = fmt.height
+            ));
+            p.push(format!("crop={w}:{h}", w = fmt.width, h = fmt.height));
+        }
+    }
+    // A transformed clip's own zoom rides on top of that base fit.
+    if !geom_identity {
+        if anim {
+            // Per-frame zoom: re-evaluate the scale expression every frame.
+            let expr = keyframe_expr(
+                &kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(),
+                "t",
+                clip.timeline_start,
+            );
+            p.push(format!("scale=w='iw*({expr})':h='ih*({expr})':eval=frame{sf}"));
+        } else if (t.scale - 1.0).abs() > 1e-9 {
+            p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
+        }
     }
     p.push("setsar=1".to_string());
     if reframe.is_none() {
@@ -4938,6 +4999,7 @@ mod tests {
             channels: 2,
             pix_fmt: "yuv420p".to_string(),
             scaler: None,
+            fit: Fit::Contain,
         }
     }
 
@@ -6121,6 +6183,67 @@ mod tests {
         };
         assert_eq!(flag_val(&args_of(&ok), "-tune"), Some("grain"));
         assert!(validate_export(&ok, true, true).is_empty());
+    }
+
+    #[test]
+    fn cover_fills_the_frame_where_contain_letterboxes_it() {
+        let clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
+        // A vertical delivery of landscape footage: the whole point of `cover`.
+        let vertical = ExportFormat {
+            width: 1080,
+            height: 1920,
+            ..ExportFormat::default()
+        };
+
+        let contained = video_clip_chain(&clip, &vertical, &ClipFx::default(), false, "c0");
+        assert!(contained.contains("force_original_aspect_ratio=decrease"));
+        assert!(contained.contains("pad=1080:1920"), "contain must letterbox: {contained}");
+        assert!(!contained.contains("crop=1080:1920"));
+
+        let covered = video_clip_chain(
+            &clip,
+            &ExportFormat {
+                fit: Fit::Cover,
+                ..vertical
+            },
+            &ClipFx::default(),
+            false,
+            "c0",
+        );
+        assert!(covered.contains("force_original_aspect_ratio=increase"));
+        assert!(covered.contains("crop=1080:1920"), "cover must crop: {covered}");
+        assert!(!covered.contains("pad="), "cover must not letterbox: {covered}");
+    }
+
+    #[test]
+    fn fit_defaults_to_the_historical_letterbox() {
+        assert_eq!(ExportOptions::default().fit, Fit::Contain);
+        let fmt = export_format(&Timeline::default(), &[], &ExportOptions::default());
+        assert_eq!(fmt.fit, Fit::Contain);
+        // And an explicit choice reaches the format the graph is built from.
+        let fmt = export_format(
+            &Timeline::default(),
+            &[],
+            &ExportOptions {
+                fit: Fit::Cover,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fmt.fit, Fit::Cover);
+    }
+
+    #[test]
+    fn the_monitors_effect_chain_is_the_export_chain() {
+        assert_eq!(audio_effects_filter(&[]), None);
+        let effects = vec![AudioEffect::Highpass { hz: 80.0 }, AudioEffect::Gate { threshold_db: -40.0 }];
+        let chain = audio_effects_filter(&effects).expect("a chain");
+        assert_eq!(chain, "highpass=f=80,agate=threshold=0.01");
+        // The preview decodes through exactly what the export renders, so a clip
+        // whose chain is auralized cannot drift from the mix it will become.
+        let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
+        clip.audio = effects;
+        let exported = audio_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), "stereo");
+        assert!(exported.contains(&chain), "export chain {exported} must contain {chain}");
     }
 
     // ---- live preview streaming --------------------------------------------

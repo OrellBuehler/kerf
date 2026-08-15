@@ -997,15 +997,31 @@ async fn get_audio(
     start: f64,
     duration: f64,
     sample_rate: Option<u32>,
+    clip_id: Option<String>,
 ) -> CmdResult<tauri::ipc::Response> {
     let id = id(&asset_id)?;
+    let clip_id = clip_id.as_deref().map(id).transpose()?;
     let shared = state.project.clone();
     let pcm = blocking(move || {
         // Resolve the asset under the lock, then drop the guard before the decode —
-        // same reasoning as `get_frame`.
-        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        // same reasoning as `get_frame`. `clip_id` names the clip this window is
+        // being fetched for, so its effect chain is baked into the decode and the
+        // monitor plays what the export will render, not the dry source.
+        let (asset, effects) = {
+            let project = lock_user(&shared);
+            let asset = project.require_asset(id).map_err(|e| e.to_string())?;
+            let effects = match clip_id {
+                Some(clip_id) => project
+                    .timeline()
+                    .ok()
+                    .and_then(|tl| tl.clip(clip_id).map(|c| c.audio.clone()))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            (asset, effects)
+        };
         let rate = sample_rate.unwrap_or(32_000).clamp(8_000, 48_000);
-        Project::decode_audio_pcm(&asset, start, duration, rate).map_err(|e| e.to_string())
+        Project::decode_audio_pcm(&asset, start, duration, rate, &effects).map_err(|e| e.to_string())
     })
     .await?;
     Ok(tauri::ipc::Response::new(pcm))

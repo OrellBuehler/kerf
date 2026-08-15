@@ -297,6 +297,10 @@ export interface ExportOptions {
 	pix_fmt?: string | null;
 	hwaccel?: string | null;
 	resolution?: [number, number] | null;
+	/** How footage of a different shape is fitted to `resolution`: letterboxed
+	 *  (`contain`, the default) or filled and cropped (`cover`). Only matters
+	 *  when the delivery aspect differs from the footage. */
+	fit?: Fit;
 	fps?: number | null;
 	scaler?: string | null;
 	audio_sample_rate?: number | null;
@@ -313,6 +317,9 @@ export interface ExportOptions {
 	/** Normalize the final mix to -14 LUFS before encoding. */
 	loudnorm?: boolean;
 }
+
+/** How a clip's picture is fitted to an output frame of a different shape. */
+export type Fit = 'contain' | 'cover';
 
 /** Payload of the `export-progress` event streamed during a render. */
 export interface ExportProgress {
@@ -373,6 +380,7 @@ export interface TranscriptionStatus {
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
 	container: 'mp4',
 	rate_control: 'crf',
+	fit: 'contain',
 	include_audio: true,
 	faststart: false,
 	gif_loop: true

@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import type { Container, ExportOptions, RateControl } from './types';
+import type { Container, ExportOptions, Fit, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
 export interface ContainerInfo {
@@ -127,6 +127,11 @@ export const RATE_CONTROLS: { id: RateControl; label: string }[] = [
 
 export const AUDIO_BITRATES = ['96k', '128k', '160k', '192k', '256k', '320k', '384k'];
 export const SAMPLE_RATES = [44100, 48000];
+export const FITS: { id: Fit; label: string; hint: string }[] = [
+	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
+	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' }
+];
+
 export const SCALERS = ['bicubic', 'bilinear', 'lanczos', 'neighbor', 'spline'];
 export const GIF_DITHERS = ['bayer', 'sierra2', 'none'];
 
@@ -198,14 +203,14 @@ export const PRESETS: Preset[] = [
 	{
 		id: 'vertical_reel',
 		label: 'Reels / Shorts (9:16)',
-		description: '1080×1920 vertical H.264.',
-		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1920], fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
+		description: '1080×1920 vertical H.264, filled and cropped.',
+		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1920], fit: 'cover', fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
 	},
 	{
 		id: 'square_social',
 		label: 'Square (1:1)',
-		description: '1080×1080 for the feed.',
-		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1080], fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
+		description: '1080×1080 for the feed, filled and cropped.',
+		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1080], fit: 'cover', fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
 	},
 	{
 		id: 'target_size_2pass',
@@ -332,6 +337,9 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 			parts.push(`${opts.video_bitrate}${opts.rate_control === 'two_pass' ? ' 2-pass' : ''}`);
 		}
 		parts.push(opts.resolution ? `${opts.resolution[0]}×${opts.resolution[1]}` : 'source');
+		// Worth surfacing: at a delivery aspect that differs from the footage it
+		// decides between a cropped shot and a letterboxed one.
+		if (opts.resolution && opts.fit === 'cover') parts.push('filled');
 		if (opts.fps) parts.push(`${opts.fps}fps`);
 	}
 	if (wantAudio && opts.audio_codec) {

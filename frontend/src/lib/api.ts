@@ -1192,14 +1192,18 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
  * preview's Web Audio playback. `null` outside the desktop app (the browser
  * demo has no real media to decode).
  */
+/** Decode a clip's source window to raw mono PCM. Naming `clipId` decodes it
+ *  through that clip's audio effect chain, so the monitor hears the EQ /
+ *  compressor / gate the export will render. */
 export async function getAudio(
 	assetId: string,
 	start: number,
 	duration: number,
-	sampleRate = 32000
+	sampleRate = 32000,
+	clipId?: string
 ): Promise<ArrayBuffer | null> {
 	if (!inTauri()) return null;
-	return invoke<ArrayBuffer>('get_audio', { assetId, start, duration, sampleRate });
+	return invoke<ArrayBuffer>('get_audio', { assetId, start, duration, sampleRate, clipId });
 }
 
 export async function getEnergy(assetId: string, buckets: number): Promise<number[]> {

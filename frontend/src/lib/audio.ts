@@ -1,8 +1,15 @@
 /* Web Audio preview playback. Decodes clip audio windows to raw PCM via the
    backend, schedules every audio-bearing clip against the timeline with its
    volume / fades / speed applied, and exposes the audio clock so the playhead
-   can follow it sample-accurately. Per-clip effect chains and reverse shuttle
-   are not auralized — this is a preview monitor, not the export mix. */
+   can follow it sample-accurately.
+
+   Per-clip effect chains *are* auralized: the backend decodes each window
+   through the clip's own ffmpeg chain, so an EQ or compressor is heard rather
+   than guessed at. They run before this file's gain envelope where the export
+   runs them after the clip gain — audible only to a level-dependent effect, and
+   keeping volume here is what lets the fader stay live instead of re-fetching
+   PCM on every drag. Reverse shuttle is still silent: this is a preview monitor,
+   not the export mix. */
 
 import { getAudio } from './api';
 import type { Clip, Timeline } from './types';
@@ -129,12 +136,16 @@ class AudioEngine {
 		const sin = rev ? Math.max(clip.source_in, clip.source_out - MAX_WINDOW) : clip.source_in;
 		const sout = rev ? clip.source_out : Math.min(clip.source_out, clip.source_in + MAX_WINDOW);
 		if (sout - sin <= 0) return null;
-		const key = `${clip.asset_id}:${sin.toFixed(3)}:${sout.toFixed(3)}:${rev ? 'r' : 'f'}`;
+		// The effect chain is baked into the decode, so it is part of the identity
+		// of the cached buffer: retuning an EQ has to re-fetch rather than keep
+		// playing the previous sound.
+		const fx = clip.audio?.length ? JSON.stringify(clip.audio) : '';
+		const key = `${clip.asset_id}:${sin.toFixed(3)}:${sout.toFixed(3)}:${rev ? 'r' : 'f'}:${fx}`;
 		const hit = this.#cache.get(key);
 		if (hit) return hit instanceof Promise ? hit : hit;
 
 		const pending = (async (): Promise<AudioBuffer | null> => {
-			const bytes = await getAudio(clip.asset_id, sin, sout - sin, RATE);
+			const bytes = await getAudio(clip.asset_id, sin, sout - sin, RATE, clip.id);
 			if (!bytes || bytes.byteLength < 2) return null;
 			const ctx = this.#ctx;
 			if (!ctx) return null;

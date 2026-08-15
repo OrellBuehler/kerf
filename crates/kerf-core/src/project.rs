@@ -490,8 +490,21 @@ impl Project {
     /// [`Project::decode_preview_frame`] so the caller can release the project
     /// lock before the ffmpeg decode runs. Always reads the original source —
     /// proxies are video-only.
-    pub fn decode_audio_pcm(asset: &Asset, start: f64, duration: f64, sample_rate: u32) -> Result<Vec<u8>> {
-        engine::audio_pcm(Path::new(&asset.path), start, duration, sample_rate)
+    /// `effects` is the owning clip's audio chain, applied during the decode so
+    /// the monitor hears its EQ / compressor / gate instead of the dry source.
+    /// The chain runs *before* the Web Audio engine's volume and fade envelope,
+    /// where the export runs it after the clip gain — a difference only a
+    /// level-dependent effect (compressor, gate) can hear, and this is a preview
+    /// monitor, not the export mix.
+    pub fn decode_audio_pcm(
+        asset: &Asset,
+        start: f64,
+        duration: f64,
+        sample_rate: u32,
+        effects: &[crate::model::AudioEffect],
+    ) -> Result<Vec<u8>> {
+        let filters = engine::audio_effects_filter(effects);
+        engine::audio_pcm(Path::new(&asset.path), start, duration, sample_rate, filters.as_deref())
     }
 
     /// The media path a preview should decode for `asset`: its generated proxy
