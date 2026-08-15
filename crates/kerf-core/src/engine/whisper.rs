@@ -273,7 +273,14 @@ pub fn download_model(name: &str, progress: &mut dyn FnMut(DownloadProgress)) ->
 /// Stream `url` into `tmp`, resuming a partial file when one is there.
 fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress)) -> Result<()> {
     let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-    let mut request = ureq::get(url);
+    // A connect timeout but no global one: reaching the host should fail fast
+    // (a firewalled or DNS-blackholed mirror otherwise stalls for minutes before
+    // admitting it), while the transfer itself is legitimately allowed to run for
+    // as long as a gigabyte takes.
+    let mut request = ureq::get(url)
+        .config()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .build();
     if have > 0 {
         request = request.header("Range", &format!("bytes={have}-"));
     }

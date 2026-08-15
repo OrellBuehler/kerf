@@ -6374,4 +6374,162 @@ mod tests {
         // of frames takes about a second (with slack for the graph starting up).
         assert!(elapsed.as_secs_f64() > 0.8, "playback ran ahead of real time: {elapsed:?}");
     }
+
+    /// The graph features most likely to break only at runtime — a looped still
+    /// input, a crossfade, a colour grade, a video effect and a `drawtext`
+    /// overlay — all in one playable timeline. Unit tests can only check the
+    /// argv; this checks ffmpeg actually accepts it.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored plays_a_timeline_with_everything`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn plays_a_timeline_with_everything_on_it() {
+        let dir = std::env::temp_dir().join(format!("kerf-preview-rich-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let still = dir.join("card.png");
+        let run = |args: Vec<String>| {
+            let ok = command(&ffmpeg_bin()).args(&args).status().expect("run ffmpeg");
+            assert!(ok.success(), "ffmpeg failed for {args:?}");
+        };
+        let s = |v: &str| v.to_string();
+        run(vec![
+            s("-hide_banner"),
+            s("-loglevel"),
+            s("error"),
+            s("-y"),
+            s("-f"),
+            s("lavfi"),
+            s("-i"),
+            s("testsrc=size=640x360:rate=30:duration=6"),
+            s("-f"),
+            s("lavfi"),
+            s("-i"),
+            s("sine=frequency=440:duration=6"),
+            s("-c:v"),
+            s("libx264"),
+            s("-pix_fmt"),
+            s("yuv420p"),
+            s("-c:a"),
+            s("aac"),
+            s("-shortest"),
+            media.to_string_lossy().into_owned(),
+        ]);
+        run(vec![
+            s("-hide_banner"),
+            s("-loglevel"),
+            s("error"),
+            s("-y"),
+            s("-f"),
+            s("lavfi"),
+            s("-i"),
+            s("color=c=red:size=640x360"),
+            s("-frames:v"),
+            s("1"),
+            still.to_string_lossy().into_owned(),
+        ]);
+
+        let mut video = av_asset(Uuid::new_v4(), 6.0);
+        video.path = media.to_string_lossy().into_owned();
+        video.streams = vec![video_stream(640, 360, 30.0), audio_stream(48_000, 2)];
+        let mut card = av_asset(Uuid::new_v4(), 5.0);
+        card.path = still.to_string_lossy().into_owned();
+        card.streams = vec![image_stream(640, 360)];
+
+        // A graded, blurred clip; a still crossfading in over it; a title on top.
+        let mut base = make_clip(video.id, 0.0, 6.0, 0.0);
+        base.color = Color {
+            brightness: 0.05,
+            contrast: 1.2,
+            saturation: 0.8,
+            gamma: 1.0,
+        };
+        base.effects = vec![VideoEffect::Blur { sigma: 2.0 }];
+        let mut over = make_clip(card.id, 0.0, 3.0, 1.5);
+        over.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        over.transform.scale = 0.6;
+        let mut timeline = timeline_of(vec![video_track(vec![base]), video_track(vec![over])]);
+        timeline.overlays = vec![TextOverlay::new("Rough cut", 0.0, 6.0)];
+
+        let mut frames = 0usize;
+        let result = stream_preview(&timeline, &[video, card], 1.0, 24.0, &mut |f| {
+            assert_eq!(&f.jpeg[..2], &[0xFF, 0xD8]);
+            frames += 1;
+            frames < 12
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("stream");
+        assert_eq!(frames, 12);
+    }
+
+    /// A real vertical export of landscape footage, both ways. `Cover` is only
+    /// worth anything if the delivered frame actually has picture at the top and
+    /// bottom instead of black, which no argv assertion can tell you.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored cover_really_fills`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn cover_really_fills_a_vertical_frame() {
+        let dir = std::env::temp_dir().join(format!("kerf-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(1920, 1080, 30.0)];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 2.0, 0.0)]);
+
+        // Mean luma of the top 100 rows of the first frame: black bars sit near
+        // 16 (limited-range black), real picture well above it.
+        let top_luma = |file: &Path| -> f64 {
+            let raw = dir.join("top.raw");
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .arg("-i")
+                .arg(file)
+                .args([
+                    "-vf",
+                    "crop=1080:100:0:0",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                ])
+                .arg(&raw)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+
+        let opts = |fit| ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            resolution: Some((1080, 1920)),
+            fit,
+            include_audio: false,
+            ..Default::default()
+        };
+        let contained = dir.join("contain.mp4");
+        let covered = dir.join("cover.mp4");
+        render_with(&timeline, &[asset.clone()], &contained, &opts(Fit::Contain)).expect("contain export");
+        render_with(&timeline, &[asset], &covered, &opts(Fit::Cover)).expect("cover export");
+
+        let (dark, bright) = (top_luma(&contained), top_luma(&covered));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dark < 30.0, "contain should letterbox the top, got luma {dark}");
+        assert!(bright > 60.0, "cover should fill the top with picture, got luma {bright}");
+    }
 }

@@ -169,6 +169,12 @@ cargo check --workspace --no-default-features
 cargo test  -p kerf-core --no-default-features
 cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # single test
 
+# The default run is pure (no binaries, no network). Tests that drive the real
+# `ffmpeg` binary — playback streaming, the vertical/cover export — or download a
+# real speech model are `#[ignore]`d, so run them explicitly when touching the
+# engine or the export graph:
+cargo test -p kerf-core --no-default-features -- --ignored
+
 # MCP server — the desktop app hosts it (streamable HTTP on 127.0.0.1:7777/mcp).
 # Run the app (below), then point an MCP client at the URL, e.g.:
 #   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
