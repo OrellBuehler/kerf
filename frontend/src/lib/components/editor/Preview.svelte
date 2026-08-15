@@ -12,11 +12,13 @@
 	 *  still reads as motion, and compositing several tracks with effects is real
 	 *  work — asking for 60 on a busy timeline just produces late frames. */
 	const PLAYBACK_FPS = 24;
-	/** How far behind the audio clock a frame may be and still be worth showing.
-	 *  Roughly two frames: enough to absorb IPC jitter without letting the picture
-	 *  visibly trail the sound. */
+	/** How much further behind the audio clock a frame may *drift* than the first
+	 *  frame of its stream did, and still be worth showing. Roughly two frames:
+	 *  enough to absorb IPC jitter without letting the picture visibly trail the
+	 *  sound. Measured against the stream's own baseline, never against zero —
+	 *  see the `baseline` note below. */
 	const STALE_AFTER = 2 / PLAYBACK_FPS;
-	/** Lag at which the stream is abandoned and restarted from the playhead,
+	/** Drift at which the stream is abandoned and restarted from the playhead,
 	 *  rather than kept and played out behind the sound. */
 	const RESYNC_AFTER = 1.0;
 
@@ -130,12 +132,22 @@
 			return;
 		}
 		let live = true;
+		// Lag of this stream's *first* frame — ffmpeg's startup plus the IPC,
+		// base64 and JSON cost of shipping one frame up. That is a fixed transport
+		// delay, not the picture falling behind, and the backend paces every later
+		// frame from the same anchor, so it stays roughly constant for the whole
+		// stream. Judging staleness against zero instead would compare that
+		// constant to a two-frame budget and drop *every* frame forever, leaving
+		// the pane on whatever still it had — which is exactly what it did.
+		let baseline: number | null = null;
 		streaming = true;
 		const stop = startPlayback(from, PLAYBACK_FPS, (f) => {
 			if (!live) return;
 			// The audio clock owns time; picture chases it.
 			const lag = ui.time - f.time;
-			if (lag > RESYNC_AFTER) {
+			baseline ??= lag;
+			const drift = lag - baseline;
+			if (drift > RESYNC_AFTER) {
 				// Compositing can't keep up with real time on this timeline. Playing
 				// the backlog out would run the picture in slow motion against the
 				// sound, and dropping it forever would freeze the pane — so jump the
@@ -144,9 +156,10 @@
 				resyncs++;
 				return;
 			}
-			// Merely late: a frame the clock has already passed would drag the
-			// picture behind the sound, so skip it and wait for one that applies.
-			if (lag > STALE_AFTER) return;
+			// Drifting further behind than it started: a frame the clock has moved
+			// past would drag the picture behind the sound, so skip it and wait for
+			// one that applies.
+			if (drift > STALE_AFTER) return;
 			frameUrl = f.jpeg;
 		});
 		stopStream = stop;
