@@ -916,6 +916,16 @@ struct PlaybackFrame {
 /// it, which reads as playback that dies the moment you seek.
 static ACTIVE_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The last id `stop_playback` was asked to cancel.
+///
+/// `ACTIVE_PLAYBACK` alone is not enough: a stop can reach the backend *before*
+/// the start it was meant to cancel (the webview issues them as two independent
+/// IPC calls, and the start goes through a dynamic import first). Such a stop
+/// finds nothing to clear and the stream then starts with nobody left to end it
+/// — an ffmpeg that plays on forever. Recording the id instead means the stream
+/// notices at its very next frame, whichever order the two calls land in.
+static STOPPED_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Play the timeline from `start`, streaming composited frames to `on_frame`
 /// until playback is stopped, superseded, or the timeline ends.
 ///
@@ -944,7 +954,9 @@ async fn start_playback(
         // mutex for that would freeze every edit and the whole MCP server.
         let (timeline, assets) = lock_user(&shared).timeline_frame_inputs().map_err(|e| e.to_string())?;
         let result = kerf_core::stream_preview(&timeline, &assets, start, fps.unwrap_or(24.0), &mut |f| {
-            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id {
+            // Superseded by a newer playback, or explicitly stopped — including by
+            // a stop that arrived before this stream even started.
+            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
                 return false;
             }
             let b64 = base64::engine::general_purpose::STANDARD.encode(&f.jpeg);
@@ -971,6 +983,7 @@ async fn start_playback(
 #[tauri::command(async)]
 fn stop_playback(playback_id: u64) {
     use std::sync::atomic::Ordering;
+    STOPPED_PLAYBACK.store(playback_id, Ordering::SeqCst);
     let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
