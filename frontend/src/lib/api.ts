@@ -335,8 +335,8 @@ export interface PlaybackFrame {
  *
  * One long-lived ffmpeg renders the whole span, rather than the one process per
  * frame that scrubbing uses — the difference between a slideshow and video. In
- * the browser harness there is no backend, so this is a no-op and the preview
- * keeps its scrub-driven frame.
+ * the browser harness there is no backend, so frames are synthesized instead
+ * (see `samplePlayback`).
  */
 let playbackSeq = 0;
 
@@ -345,7 +345,7 @@ export function startPlayback(
 	fps: number,
 	onFrame: (f: PlaybackFrame) => void
 ): () => void {
-	if (!inTauri()) return () => {};
+	if (!inTauri()) return samplePlayback(start, fps, onFrame);
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -366,6 +366,45 @@ export function startPlayback(
 		stopped = true;
 		void invoke('stop_playback', { playbackId }).catch(() => {});
 	};
+}
+
+/** What the desktop app really pays to put one frame on screen: ffmpeg's startup
+ *  plus base64, JSON and IPC. Deliberately larger than the preview's two-frame
+ *  staleness budget — a harness whose frames arrive instantly cannot reproduce
+ *  the class of bug where that constant is mistaken for the picture drifting. */
+const SAMPLE_FRAME_LAG_MS = 90;
+
+/**
+ * The browser harness's stand-in for the streamed composite: a generated frame
+ * per tick, paced at `fps` and delayed by a realistic transport cost, so
+ * playback moves in `bun run dev` and the preview's frame pacing is exercised
+ * end to end without a backend.
+ */
+function samplePlayback(start: number, fps: number, onFrame: (f: PlaybackFrame) => void): () => void {
+	let index = 0;
+	let timer: ReturnType<typeof setInterval> | null = null;
+	const spawn = setTimeout(() => {
+		timer = setInterval(() => {
+			const time = start + index++ / fps;
+			onFrame({ time, jpeg: sampleFrameUrl(time) });
+		}, 1000 / fps);
+	}, SAMPLE_FRAME_LAG_MS);
+	return () => {
+		clearTimeout(spawn);
+		if (timer) clearInterval(timer);
+	};
+}
+
+/** A frame that visibly moves, so a frozen preview looks frozen. */
+function sampleFrameUrl(time: number): string {
+	const x = (((time * 90) % 700) - 60).toFixed(1);
+	const svg =
+		`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360">` +
+		`<rect width="640" height="360" fill="#0d1116"/>` +
+		`<rect x="${x}" y="150" width="60" height="60" fill="#e29d2e"/>` +
+		`<text x="20" y="336" fill="#8fa3b8" font-family="monospace" font-size="22">${time.toFixed(2)}s</text>` +
+		`</svg>`;
+	return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
 // ---- speech-to-text --------------------------------------------------------

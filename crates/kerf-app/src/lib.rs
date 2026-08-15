@@ -1042,6 +1042,13 @@ async fn start_playback(
         // playback runs for as long as the user watches, and holding the shared
         // mutex for that would freeze every edit and the whole MCP server.
         let (timeline, assets) = lock_user(&shared).timeline_frame_inputs().map_err(|e| e.to_string())?;
+        // Counted and logged below: whether frames reached the webview at all, and
+        // how long the first one took, are the two facts that tell a stream that
+        // never started from one whose frames the preview received and discarded.
+        // Without them a black pane looks identical either way.
+        let began = std::time::Instant::now();
+        let mut frames: u64 = 0;
+        let mut first_frame: Option<std::time::Duration> = None;
         let result = kerf_core::stream_preview(&timeline, &assets, start, fps.unwrap_or(24.0), &mut |f| {
             // Superseded by a newer playback, or explicitly stopped — including by
             // a stop that arrived before this stream even started.
@@ -1049,13 +1056,25 @@ async fn start_playback(
                 return false;
             }
             let b64 = base64::engine::general_purpose::STANDARD.encode(&f.jpeg);
-            on_frame
+            let sent = on_frame
                 .send(PlaybackFrame {
                     time: f.time,
                     jpeg: format!("data:image/jpeg;base64,{b64}"),
                 })
-                .is_ok()
+                .is_ok();
+            if sent {
+                frames += 1;
+                first_frame.get_or_insert_with(|| began.elapsed());
+            }
+            sent
         });
+        tracing::info!(
+            playback_id,
+            frames,
+            first_frame_ms = first_frame.map(|d| d.as_millis() as u64),
+            elapsed_ms = began.elapsed().as_millis() as u64,
+            "playback stream ended"
+        );
         // Running out of timeline, or being superseded, is not an error; only a
         // genuine ffmpeg failure is worth surfacing.
         if let Err(e) = result {

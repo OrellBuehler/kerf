@@ -187,6 +187,7 @@ bun install
 bun run dev      # http://localhost:1420, fixed port; uses sample data outside Tauri
 bun run build    # static SPA -> frontend/build (consumed by Tauri)
 bun run check    # svelte-check (type check)
+bun run test     # bun's built-in runner over src/**/*.test.ts
 
 # Desktop app — Tauri config is NOT at the default path, pass --config
 bunx @tauri-apps/cli@2 dev   --config crates/kerf-app/tauri.conf.json
@@ -376,10 +377,20 @@ dep is still in `package.json`, now unused). `Preview` shows the composited fram
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
 settled frame, where you want *one* frame rather than all of them. Its effect keys
 off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
-`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; a
-frame the audio clock has already passed is dropped, and a stream running more than
-`RESYNC_AFTER` behind is restarted from the playhead rather than played out in slow
-motion against the sound. `ExportDialog` (⌘E) drives
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec.
+Which frames survive is `playback-sync.ts`'s `createFrameGate` (`show`/`skip`/
+`resync`, unit-tested — the one piece of frontend logic with tests): every frame
+arrives late by a *constant* transport cost (ffmpeg's spawn, then base64 + JSON +
+IPC) that on its own exceeds the two-frame `STALE_AFTER` budget, so lag is judged
+against the smallest this stream has managed rather than against zero — measuring
+from zero dropped every frame forever and froze the pane. Only growth past that
+floor is drift: `STALE_AFTER` skips the frame, `RESYNC_AFTER` restarts the stream
+from the playhead rather than playing it out in slow motion against the sound.
+`start_playback` logs `frames` / `first_frame_ms` per run, which is what separates
+"never started" from "sent but dropped"; in the browser harness `startPlayback`
+**synthesizes** frames at the requested fps behind a deliberate 90 ms lag, so
+playback moves under `bun run dev` and that failure mode is reproducible without a
+desktop build. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
