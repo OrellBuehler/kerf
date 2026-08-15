@@ -365,6 +365,17 @@ detect as 360 it instead offers a projection picker that marks the whole asset v
 `set_asset_projection`), and an always-visible
 **Text overlays** section (add titles / lower-thirds, generate captions, edit
 text / timing / position / size / color / box / bold).
+**Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
+surfaces): the Color section leads with one-click **looks** —
+Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the sliders
+show exactly what a chip applied) built on `Color.temperature`, a warm-cool
+channel in -1..1 rendered as opposing `eq` per-channel gammas (`eq_filter` —
+omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
+tint) — and the Text overlays section leads with **Title / Lower third /
+Caption** style chips that create a styled overlay at the playhead with
+fade-in/out opacity keyframes; the caption style matches what
+`captions_from_transcript` generates, so manual and generated captions look
+alike.
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`

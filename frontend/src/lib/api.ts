@@ -868,7 +868,8 @@ export async function setColor(clipId: string, patch: Partial<Color>): Promise<T
 		brightness: patch.brightness,
 		contrast: patch.contrast,
 		saturation: patch.saturation,
-		gamma: patch.gamma
+		gamma: patch.gamma,
+		temperature: patch.temperature
 	});
 }
 

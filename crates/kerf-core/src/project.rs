@@ -1367,6 +1367,7 @@ impl Project {
         contrast: Option<f64>,
         saturation: Option<f64>,
         gamma: Option<f64>,
+        temperature: Option<f64>,
     ) -> Result<Clip> {
         if brightness.is_some_and(|v| !(-1.0..=1.0).contains(&v)) {
             return Err(Error::InvalidArgument("brightness must be within -1.0..=1.0".to_string()));
@@ -1379,6 +1380,9 @@ impl Project {
         }
         if gamma.is_some_and(|v| !(0.1..=10.0).contains(&v)) {
             return Err(Error::InvalidArgument("gamma must be within 0.1..=10.0".to_string()));
+        }
+        if temperature.is_some_and(|v| !(-1.0..=1.0).contains(&v)) {
+            return Err(Error::InvalidArgument("temperature must be within -1.0..=1.0".to_string()));
         }
         self.edit_timeline("Set color", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
@@ -1394,6 +1398,9 @@ impl Project {
             }
             if let Some(v) = gamma {
                 c.gamma = v;
+            }
+            if let Some(v) = temperature {
+                c.temperature = v;
             }
             Ok(timeline.tracks[ti].clips[ci].clone())
         })

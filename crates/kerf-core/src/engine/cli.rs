@@ -3483,6 +3483,28 @@ fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
 
+/// The `eq` filter for a clip's color correction, shared by the export and
+/// still chains. `temperature` becomes opposing red/blue per-channel gammas —
+/// `eq` has no white-balance knob, but shifting midtone gamma per channel
+/// warms/cools convincingly; ±1.0 maps to a ±30% gamma split. The channel
+/// gammas are omitted at 0 so a temperature-free clip's graph stays
+/// byte-identical to before the field existed.
+fn eq_filter(c: &Color) -> String {
+    let mut f = format!(
+        "eq=brightness={}:contrast={}:saturation={}:gamma={}",
+        c.brightness, c.contrast, c.saturation, c.gamma
+    );
+    if c.temperature != 0.0 {
+        let t = c.temperature.clamp(-1.0, 1.0);
+        f.push_str(&format!(
+            ":gamma_r={}:gamma_b={}",
+            fnum(1.0 + 0.3 * t),
+            fnum(1.0 - 0.3 * t)
+        ));
+    }
+    f
+}
+
 /// The filter for a non-alpha video effect, or `None` for chroma key (which
 /// establishes alpha and is emitted separately, after the alpha plane exists).
 fn video_effect_filter(e: &VideoEffect) -> Option<String> {
@@ -3876,11 +3898,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // has no alpha-capable input format, so the graph would otherwise auto-insert a
     // conversion that drops the alpha (silently disabling opacity / rotation).
     if !clip.color.is_identity() {
-        let c = &clip.color;
-        p.push(format!(
-            "eq=brightness={}:contrast={}:saturation={}:gamma={}",
-            c.brightness, c.contrast, c.saturation, c.gamma
-        ));
+        p.push(eq_filter(&clip.color));
     }
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
@@ -4168,10 +4186,7 @@ fn still_clip_chain(
     }
     p.push("setsar=1".to_string());
     if !color.is_identity() {
-        p.push(format!(
-            "eq=brightness={}:contrast={}:saturation={}:gamma={}",
-            color.brightness, color.contrast, color.saturation, color.gamma
-        ));
+        p.push(eq_filter(color));
     }
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
@@ -5779,6 +5794,22 @@ mod tests {
         };
         let g = graph_of(&single(vec![clip]), &[asset]);
         assert!(g.contains("eq=brightness=0.1:contrast=1.2:saturation=1:gamma=1"), "{g}");
+        // No temperature → no channel gammas, so pre-temperature graphs are
+        // reproduced byte-for-byte.
+        assert!(!g.contains("gamma_r"), "{g}");
+    }
+
+    #[test]
+    fn color_temperature_warms_via_opposing_channel_gammas() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.color = crate::model::Color {
+            temperature: 0.5,
+            ..Default::default()
+        };
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert!(g.contains("gamma_r=1.15"), "{g}");
+        assert!(g.contains("gamma_b=0.85"), "{g}");
     }
 
     #[test]
@@ -6884,6 +6915,7 @@ mod tests {
             contrast: 1.2,
             saturation: 0.8,
             gamma: 1.0,
+            temperature: 0.3,
         };
         base.effects = vec![VideoEffect::Blur { sigma: 2.0 }];
         let mut over = make_clip(card.id, 0.0, 3.0, 1.5);

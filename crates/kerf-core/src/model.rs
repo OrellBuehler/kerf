@@ -345,6 +345,12 @@ pub struct Color {
     /// Gamma (1.0 = unchanged).
     #[serde(default = "one")]
     pub gamma: f64,
+    /// Warm/cool shift in -1.0–1.0 (0.0 = unchanged): positive warms the
+    /// picture (lifts red, lowers blue), negative cools it. Rendered as
+    /// opposing per-channel gammas — what makes one-click warm / cool looks
+    /// possible, since plain saturation/gamma can't tint.
+    #[serde(default)]
+    pub temperature: f64,
 }
 
 impl Default for Color {
@@ -354,6 +360,7 @@ impl Default for Color {
             contrast: 1.0,
             saturation: 1.0,
             gamma: 1.0,
+            temperature: 0.0,
         }
     }
 }

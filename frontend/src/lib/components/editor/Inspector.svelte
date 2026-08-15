@@ -7,6 +7,8 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
+	import { COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
+	import type { TextStyle } from '$lib/style-presets';
 	import type {
 		AudioEffect,
 		Projection,
@@ -194,6 +196,28 @@
 			if (created) editor.selectedOverlayId = created.id;
 		});
 	}
+	/** Add a preset-styled overlay at the playhead: create, style, then (for
+	 *  faded styles) keyframe the opacity in and out. */
+	function addStyledOverlay(s: TextStyle) {
+		const at = Math.max(0, ui.time);
+		void run(async () => {
+			await editor.addOverlay(s.text, at, at + s.duration);
+			const created = editor.overlays[editor.overlays.length - 1];
+			if (!created) return;
+			const { bg, ...rest } = s.style;
+			await editor.updateOverlay(created.id, bg == null ? rest : { ...rest, bg });
+			if (s.fade > 0) {
+				const kf = (time: number, opacity: number) => ({ time, pos_x: s.style.pos_x, pos_y: s.style.pos_y, opacity });
+				await editor.setOverlayKeyframes(created.id, [
+					kf(0, 0),
+					kf(s.fade, 1),
+					kf(s.duration - s.fade, 1),
+					kf(s.duration, 0)
+				]);
+			}
+			editor.selectedOverlayId = created.id;
+		});
+	}
 	function makeCaptions() {
 		const id = clip?.asset_id ?? editor.selectedAssetId;
 		if (!id) {
@@ -277,6 +301,12 @@
 		'width:70px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:11px;padding:4px 5px';
 	const xBtn =
 		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;padding:0 2px';
+	const chip = (active: boolean) =>
+		`padding:4px 9px;font-size:11px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid ${
+			active ? 'var(--kerf-500)' : 'var(--border-strong)'
+		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
+			active ? 'var(--text-primary)' : 'var(--text-secondary)'
+		}`;
 </script>
 
 {#snippet secHead(label: string)}
@@ -411,6 +441,11 @@
 
 {#snippet overlaysSection()}
 	{@render secHead('Text overlays')}
+	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+		{#each TEXT_STYLES as s (s.id)}
+			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
+		{/each}
+	</div>
 	<div style="display:flex;gap:7px;margin-bottom:6px">
 		<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addOverlayHere}>+ Text</Btn>
 		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={makeCaptions}>Captions</Btn>
@@ -726,6 +761,21 @@
 				)}
 
 				{@render secHead('Color')}
+				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+					{#each COLOR_LOOKS as look (look.id)}
+						<button
+							style={chip(activeLook(col)?.id === look.id)}
+							disabled={editor.busy}
+							onclick={() => run(() => editor.setColor(clip.id, look.color))}>{look.label}</button
+						>
+					{/each}
+					<button
+						style={chip(false)}
+						disabled={editor.busy}
+						title="Reset color"
+						onclick={() => run(() => editor.setColor(clip.id, DEFAULT_COLOR))}>Reset</button
+					>
+				</div>
 				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { brightness: v }))
 				)}
@@ -734,6 +784,9 @@
 				)}
 				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { saturation: v }))
+				)}
+				{@render rangeRow('Warmth', col.temperature ?? 0, -1, 1, 0.05, (v) => v.toFixed(2), (v) =>
+					run(() => editor.setColor(clip.id, { temperature: v }))
 				)}
 				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { gamma: v }))

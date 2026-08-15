@@ -642,11 +642,12 @@ fn set_color(
     contrast: Option<f64>,
     saturation: Option<f64>,
     gamma: Option<f64>,
+    temperature: Option<f64>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
     project
-        .set_color(id, brightness, contrast, saturation, gamma)
+        .set_color(id, brightness, contrast, saturation, gamma, temperature)
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }

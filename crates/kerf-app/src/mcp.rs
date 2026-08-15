@@ -292,6 +292,8 @@ struct ColorParams {
     saturation: Option<f64>,
     #[schemars(description = "Gamma 0.1–10.0 (1.0 = unchanged); omit to leave unchanged")]
     gamma: Option<f64>,
+    #[schemars(description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -970,13 +972,13 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's color correction — brightness / contrast / saturation / gamma. Omit a field to leave it unchanged."
+        description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let project = self.lock();
         let out = project
-            .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma)
+            .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
             .map_err(core_err)?;
         self.changed();
         json(&out)

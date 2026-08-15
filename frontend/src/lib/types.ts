@@ -94,6 +94,8 @@ export interface Color {
 	contrast: number;
 	saturation: number;
 	gamma: number;
+	/** Warm/cool shift −1..1 (0 = neutral; positive warms, negative cools). */
+	temperature: number;
 }
 
 export type TransitionKind = 'crossfade' | 'dip_to_black';
@@ -224,7 +226,7 @@ export const DEFAULT_TRANSFORM: Transform = {
 	crop_bottom: 0
 };
 
-export const DEFAULT_COLOR: Color = { brightness: 0, contrast: 1, saturation: 1, gamma: 1 };
+export const DEFAULT_COLOR: Color = { brightness: 0, contrast: 1, saturation: 1, gamma: 1, temperature: 0 };
 
 /** A level, forward-facing 100° view — what a 360 clip gets on arrival. */
 export const DEFAULT_REFRAME: Reframe = {
