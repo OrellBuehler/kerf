@@ -40,7 +40,7 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": ["https://github.com/orellbuehler/kerf/releases/latest/download/latest.json"],
+      "endpoints": ["https://github.com/OrellBuehler/kerf/releases/latest/download/latest.json"],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2MzU3MkY3NDI5M0YzQUQKUldTdDg1TkM5M0kxbHIvdWZacUpLb0Z3RDZXUE9FQjNWWUJtZGplSUdEVkFNZkpFVUR0RDFzakkK",
       "windows": {
         "installMode": "passive"

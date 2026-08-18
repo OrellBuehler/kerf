@@ -1463,7 +1463,7 @@ export async function revealLogs(): Promise<void> {
 // `checkUpdate` keeps the plugin's `Update` handle module-local and hands the
 // UI plain data; `installUpdate` then downloads + installs that same handle.
 
-export const RELEASES_URL = 'https://github.com/orellbuehler/kerf/releases/latest';
+export const RELEASES_URL = 'https://github.com/OrellBuehler/kerf/releases/latest';
 
 let pendingUpdate: { downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void> } | null = null;
 

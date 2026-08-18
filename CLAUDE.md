@@ -341,7 +341,7 @@ instead of a fragile relative path.
 **Auto-update.** The app updates itself from its own GitHub releases via
 `tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both
 registered in `run()`. `plugins.updater` in `tauri.conf.json` points at
-`https://github.com/orellbuehler/kerf/releases/latest/download/latest.json`
+`https://github.com/OrellBuehler/kerf/releases/latest/download/latest.json`
 and embeds the **minisign public key**: a bundle only installs if its signature
 verifies against that key, so the update path is not just "trust whatever the
 URL serves". `bundle.createUpdaterArtifacts` makes `tauri build` emit the
