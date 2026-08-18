@@ -35,6 +35,8 @@ tauri-build.workspace = true
 tauri = { workspace = true, features = [] }
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
+tauri-plugin-updater.workspace = true
+tauri-plugin-process.workspace = true
 kerf-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

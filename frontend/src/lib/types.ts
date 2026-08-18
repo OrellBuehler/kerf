@@ -396,6 +396,18 @@ export interface TranscriptionStatus {
 	reason?: string | null;
 }
 
+/** A newer signed release found on GitHub by the updater. */
+export interface UpdateInfo {
+	/** The available version, e.g. `0.18.0`. */
+	version: string;
+	/** The version this build is running. */
+	current_version: string;
+	/** Release date as published in `latest.json`, when present. */
+	date?: string | null;
+	/** Release notes (the GitHub release body), when present. */
+	notes?: string | null;
+}
+
 /** The dialog's baseline options (a preset is applied over this). One deliberate
  *  departure from the bare Rust `Default`: source decode is `hwaccel: 'auto'`,
  *  so exports GPU-decode where the machine can (ffmpeg falls back to software

@@ -1,7 +1,13 @@
 <script lang="ts">
 	import KerfMark from './KerfMark.svelte';
 	import Badge from './Badge.svelte';
+	import Icon from './Icon.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { updater } from '$lib/updater.svelte';
+
+	// An available update stays offered here after the dialog is dismissed;
+	// otherwise the version label doubles as a manual "check for updates".
+	const available = $derived(updater.update !== null);
 </script>
 
 <div
@@ -16,6 +22,26 @@
 			<Badge tone="warning" dot>Unsaved</Badge>
 		{/if}
 	</div>
+	<button
+		onclick={() => updater.open()}
+		title={available
+			? `Kerf ${updater.update?.version} is available — click to install`
+			: `Kerf ${updater.version} — click to check for updates`}
+		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;cursor:pointer;font-family:var(--font-mono);font-size:11px;border:1px solid {available
+			? 'var(--kerf-500)'
+			: 'transparent'};background:{available
+			? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
+			: 'transparent'};color:{available ? 'var(--text-primary)' : 'var(--text-disabled)'}"
+	>
+		{#if available}
+			<Icon n="download" s={12} />
+			{updater.update?.version}
+		{:else if updater.phase === 'checking'}
+			checking…
+		{:else}
+			{updater.version && updater.version !== 'dev' ? `v${updater.version}` : updater.version}
+		{/if}
+	</button>
 	<span
 		title={editor.currentPath ?? 'In-memory project — not yet saved'}
 		style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled);max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"

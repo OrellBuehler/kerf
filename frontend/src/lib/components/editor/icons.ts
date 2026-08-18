@@ -46,7 +46,10 @@ import {
 	Copy,
 	ChevronDown,
 	Image,
-	X
+	X,
+	Download,
+	RefreshCw,
+	ExternalLink
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -97,7 +100,10 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'copy': Copy,
 	'chevron-down': ChevronDown,
 	'image': Image,
-	'x': X
+	'x': X,
+	'download': Download,
+	'refresh-cw': RefreshCw,
+	'external-link': ExternalLink
 };
 
 export type IconName = keyof typeof icons;

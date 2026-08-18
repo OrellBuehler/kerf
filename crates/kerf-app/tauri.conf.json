@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "category": "Video",
     "shortDescription": "AI-assisted video/audio editor",
     "icon": [
@@ -36,5 +37,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/orellbuehler/kerf/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2MzU3MkY3NDI5M0YzQUQKUldTdDg1TkM5M0kxbHIvdWZacUpLb0Z3RDZXUE9FQjNWWUJtZGplSUdEVkFNZkpFVUR0RDFzakkK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

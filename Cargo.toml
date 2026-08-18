@@ -56,6 +56,10 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# Auto-update: checks the GitHub release feed and installs a signed bundle;
+# `process` supplies the relaunch after the install.
+tauri-plugin-updater = "2.10"
+tauri-plugin-process = "2.3"
 
 [profile.release]
 opt-level = 3

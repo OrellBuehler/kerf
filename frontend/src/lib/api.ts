@@ -30,6 +30,7 @@ import type {
 	Transform,
 	Transition,
 	TranscriptionStatus,
+	UpdateInfo,
 	VideoEffect
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
@@ -1449,4 +1450,116 @@ export async function logDir(): Promise<string | null> {
 export async function revealLogs(): Promise<void> {
 	if (!inTauri()) return;
 	await invoke('reveal_logs');
+}
+
+// ---- auto-update (GitHub releases) -----------------------------------------
+//
+// The desktop app checks the `latest.json` published on the repo's GitHub
+// releases (see `plugins.updater.endpoints` in tauri.conf.json). Bundles are
+// signed with the project's minisign key and verified against the embedded
+// public key before anything is installed, so an update can only come from a
+// release signed with that key.
+//
+// `checkUpdate` keeps the plugin's `Update` handle module-local and hands the
+// UI plain data; `installUpdate` then downloads + installs that same handle.
+
+export const RELEASES_URL = 'https://github.com/orellbuehler/kerf/releases/latest';
+
+let pendingUpdate: { downloadAndInstall: (cb: (e: DownloadEvent) => void) => Promise<void> } | null = null;
+
+type DownloadEvent =
+	| { event: 'Started'; data: { contentLength?: number } }
+	| { event: 'Progress'; data: { chunkLength: number } }
+	| { event: 'Finished' };
+
+/** Bytes fetched so far of an update download; `total` is null if the server sent no length. */
+export type UpdateProgress = { downloaded: number; total: number | null };
+
+/** The `true` in the browser harness: `?update=1` makes a fake update available. */
+function fakeUpdateRequested(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('update');
+}
+
+/** This build's version — `dev` in the browser harness, which has no bundle. */
+export async function appVersion(): Promise<string> {
+	if (!inTauri()) return 'dev';
+	const { getVersion } = await import('@tauri-apps/api/app');
+	return getVersion();
+}
+
+/**
+ * Ask GitHub whether a newer signed release exists. Returns `null` when this
+ * build is current (or when there is nothing to update, as in the browser).
+ * Throws if the endpoint is unreachable — callers doing a silent startup check
+ * should swallow that; a user-initiated check should show it.
+ */
+export async function checkUpdate(): Promise<UpdateInfo | null> {
+	if (!inTauri()) {
+		if (!fakeUpdateRequested()) return null;
+		pendingUpdate = {
+			async downloadAndInstall(cb) {
+				cb({ event: 'Started', data: { contentLength: 40_000_000 } });
+				for (let i = 0; i < 20; i++) {
+					await new Promise((r) => setTimeout(r, 100));
+					cb({ event: 'Progress', data: { chunkLength: 2_000_000 } });
+				}
+				cb({ event: 'Finished' });
+			}
+		};
+		return {
+			version: '0.99.0',
+			current_version: 'dev',
+			date: null,
+			notes: 'Synthetic update from the browser dev harness (`?update=1`).'
+		};
+	}
+	const { check } = await import('@tauri-apps/plugin-updater');
+	const update = await check();
+	if (!update) {
+		pendingUpdate = null;
+		return null;
+	}
+	pendingUpdate = update;
+	return {
+		version: update.version,
+		current_version: update.currentVersion,
+		date: update.date ?? null,
+		notes: update.body ?? null
+	};
+}
+
+/**
+ * Download and install the update the last `checkUpdate` found, reporting
+ * progress. Resolves once the new version is staged; the app must then
+ * [`relaunchApp`] to run it. On Linux this only works for the AppImage build —
+ * a `.deb` / `.rpm` install rejects, and the caller should fall back to the
+ * release page.
+ */
+export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
+	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
+	let downloaded = 0;
+	let total: number | null = null;
+	await pendingUpdate.downloadAndInstall((e) => {
+		if (e.event === 'Started') total = e.data.contentLength ?? null;
+		else if (e.event === 'Progress') downloaded += e.data.chunkLength;
+		else downloaded = total ?? downloaded;
+		onProgress?.({ downloaded, total });
+	});
+}
+
+/** Restart into the freshly installed version. No-op outside Tauri. */
+export async function relaunchApp(): Promise<void> {
+	if (!inTauri()) return;
+	const { relaunch } = await import('@tauri-apps/plugin-process');
+	await relaunch();
+}
+
+/** Open the GitHub releases page — the manual fallback when an install can't run. */
+export async function openReleases(): Promise<void> {
+	if (!inTauri()) {
+		window.open(RELEASES_URL, '_blank');
+		return;
+	}
+	const { openUrl } = await import('@tauri-apps/plugin-opener');
+	await openUrl(RELEASES_URL);
 }

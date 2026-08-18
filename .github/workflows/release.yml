@@ -71,12 +71,89 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater artifacts (`bundle.createUpdaterArtifacts`) with the
+          # project's minisign key; the app only installs an update whose
+          # signature verifies against the `pubkey` in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/kerf-app
           tauriScript: bunx @tauri-apps/cli@2
           releaseId: ${{ github.event.release.id }}
+          # `latest.json` is assembled once by the `updater-manifest` job below:
+          # the per-platform jobs run concurrently and would each overwrite the
+          # others' entries in it.
+          includeUpdaterJson: false
           # `--config` (per matrix row) zeroes out beforeBuildCommand (frontend is
           # already built) and, on Windows, adds the FFmpeg externalBin sidecars.
           # Everything after `--` is forwarded to cargo, where --no-default-features
           # disables the FFmpeg dev-library dependency.
           args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features"
+
+  # The update feed the app polls (`plugins.updater.endpoints` in tauri.conf.json
+  # points at this release asset). Built after every bundle is uploaded, from the
+  # `.sig` files tauri-action attached, so all platforms land in one manifest —
+  # letting each build write it would leave whichever finished last.
+  updater-manifest:
+    name: latest.json
+    needs: app-bundles
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assemble and upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --pattern '*.sig' --dir sigs --clobber
+          gh release view "$TAG" --json body,publishedAt > release.json
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+
+          tag = os.environ["TAG"]
+          repo = os.environ["GH_REPO"]
+          meta = json.load(open("release.json"))
+
+          def platform_of(name: str):
+              """Map an updater bundle file name to a Tauri `platforms` key."""
+              if name.endswith(".app.tar.gz"):
+                  return "darwin-aarch64" if "aarch64" in name else "darwin-x86_64"
+              if name.endswith(".AppImage"):
+                  return "linux-aarch64" if "aarch64" in name else "linux-x86_64"
+              if name.endswith("-setup.exe") or name.endswith(".msi"):
+                  return "windows-aarch64" if "arm64" in name else "windows-x86_64"
+              return None
+
+          platforms = {}
+          for sig in sorted(pathlib.Path("sigs").iterdir()):
+              bundle = sig.name[:-4]  # strip .sig
+              key = platform_of(bundle)
+              if not key:
+                  continue
+              # A release carrying both NSIS and MSI keeps the NSIS installer:
+              # it is the one the updater can run unattended.
+              if key in platforms and bundle.endswith(".msi"):
+                  continue
+              platforms[key] = {
+                  "signature": sig.read_text().strip(),
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{bundle.replace(' ', '%20')}",
+              }
+
+          if not platforms:
+              sys.exit("no signed updater artifacts found — is TAURI_SIGNING_PRIVATE_KEY set?")
+
+          json.dump(
+              {
+                  "version": tag.lstrip("v"),
+                  "notes": meta.get("body") or "",
+                  "pub_date": meta.get("publishedAt"),
+                  "platforms": platforms,
+              },
+              open("latest.json", "w"),
+              indent=2,
+          )
+          print(json.dumps(sorted(platforms), indent=2))
+          PY
+          gh release upload "$TAG" latest.json --clobber

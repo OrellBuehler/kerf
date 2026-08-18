@@ -10,10 +10,12 @@
 	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
+	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { updater } from '$lib/updater.svelte';
 	import { inTauri } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -31,6 +33,9 @@
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
+		// Ask GitHub whether a newer signed release exists (silently — offline is
+		// not worth an interruption) and offer it in the title bar / dialog.
+		const stopUpdater = updater.init();
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -83,6 +88,7 @@
 		}
 		return () => {
 			for (const un of unlisteners) un();
+			stopUpdater();
 		};
 	});
 
@@ -313,6 +319,10 @@
 
 {#if exportOpen}
 	<ExportDialog onClose={() => (exportOpen = false)} />
+{/if}
+
+{#if updater.dialogOpen}
+	<UpdateDialog />
 {/if}
 
 <ContextMenu />

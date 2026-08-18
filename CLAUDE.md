@@ -335,7 +335,29 @@ snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 which for this `crates/kerf-app` layout resolves to `crates/`, not the config dir or repo
 root — so they anchor to the repo via `cd "$(git rev-parse --show-toplevel)/frontend" && bun run dev`
 instead of a fragile relative path.
-`capabilities/default.json` grants `core:default` + `dialog:default`.
+`capabilities/default.json` grants `core:default` + `dialog:default` +
+`updater:default` + `process:allow-restart` + `opener:allow-open-url`.
+
+**Auto-update.** The app updates itself from its own GitHub releases via
+`tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both
+registered in `run()`. `plugins.updater` in `tauri.conf.json` points at
+`https://github.com/orellbuehler/kerf/releases/latest/download/latest.json`
+and embeds the **minisign public key**: a bundle only installs if its signature
+verifies against that key, so the update path is not just "trust whatever the
+URL serves". `bundle.createUpdaterArtifacts` makes `tauri build` emit the
+updatable bundles (`.app.tar.gz` / `.AppImage` / NSIS `-setup.exe`) plus a
+`.sig` per bundle — which means **a bundle build now needs the private key**
+(`TAURI_SIGNING_PRIVATE_KEY`, or `TAURI_SIGNING_PRIVATE_KEY_PATH`, plus
+`…_PASSWORD`) in the environment; plain `cargo build` / CI is unaffected.
+`release.yml` passes those from repo secrets, and a **separate
+`updater-manifest` job** assembles `latest.json` from the uploaded `.sig` files
+*after* all bundles land (`includeUpdaterJson: false` on the build step): the
+per-platform jobs run concurrently and each writing the manifest would leave
+only whichever finished last. Prereleases are skipped, so they never become the
+update everyone is offered. In-place update is per-platform: macOS and Windows
+(NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
+`.deb`/`.rpm` install fails the install step, which the dialog reports with a
+link to the release page.
 
 ### frontend (`frontend/`)
 
@@ -440,7 +462,22 @@ Two preset chips (`Remove silences` / `Assemble rough cut`) also run the matchin
 resolve their task; the rest just enqueue for the agent. In the browser there is no agent, so
 queued tasks correctly just wait. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
-`editor.revertTo(seq)`. `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
+`editor.revertTo(seq)`.
+
+The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
+alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
+6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp`, and drives
+`idle → checking → { current | available → downloading → ready } | error`. The
+title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
+available and opens `UpdateDialog` (release notes, download progress, then
+**Restart now** — which warns first when the project has unsaved changes); the
+dialog auto-opens the first time a given version is seen (remembered under
+`kerf.update.seen` in localStorage) so declining doesn't nag every launch. The
+`Update` handle the plugin returns stays module-local in `api.ts`, which hands the
+UI plain data — so the browser harness can fake the whole flow: `bun run dev`
+with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, making
+the dialog explorable without a signed desktop build.
+`data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
 all project data renders from the real backend.
 
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
