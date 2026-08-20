@@ -2,6 +2,7 @@
 //! analysis metadata, and the non-destructive timeline (EDL). All timeline
 //! operations mutate the stored EDL; nothing is re-encoded until [`Project::export`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -12,9 +13,10 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe, Revision,
-    StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition, VideoEffect,
-    MAX_FOV, MIN_FOV,
+    StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition,
+    VideoEffect, MAX_FOV, MIN_FOV,
 };
+use crate::model::default_beat_tolerance;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -1458,6 +1460,59 @@ impl Project {
         })
     }
 
+    /// Ripple the cuts of a track onto the beat grid of the music on the audio
+    /// tracks — "cut to the beat". Each clip is retrimmed so its outgoing cut
+    /// lands on the nearest beat within `tolerance` seconds (default: half a
+    /// beat, so every cut moves to the beat it is already closest to) and the
+    /// rest of the track follows, preserving gaps. `track_id` picks one track;
+    /// `None` aligns every unlocked video track. Returns how many cuts moved.
+    ///
+    /// Needs the music asset analyzed — the grid comes from the cached
+    /// [`Tempo`], the same one the timeline ruler draws its beat ticks from.
+    pub fn snap_to_beats(&self, track_id: Option<Uuid>, tolerance: Option<f64>) -> Result<usize> {
+        let mut limits = HashMap::new();
+        let mut tempos: HashMap<Uuid, Tempo> = HashMap::new();
+        for asset in self.list_assets()? {
+            // A still loops, so it stretches to whatever the beat asks for.
+            let limit = if asset.is_image() { f64::INFINITY } else { asset.duration };
+            limits.insert(asset.id, limit);
+            if let Some(tempo) = self.get_analysis(asset.id)?.and_then(|a| a.tempo) {
+                tempos.insert(asset.id, tempo);
+            }
+        }
+        self.edit_timeline("Cut to the beat", |timeline| {
+            let beats = timeline.beat_grid(&tempos);
+            if beats.len() < 2 {
+                return Err(Error::InvalidArgument(
+                    "no beat grid — put rhythmic audio on an audio track and analyze it first".to_string(),
+                ));
+            }
+            let tolerance = match tolerance {
+                Some(value) if value > 0.0 => value,
+                Some(_) => return Err(Error::InvalidArgument("tolerance must be positive".to_string())),
+                None => default_beat_tolerance(&beats),
+            };
+            let targets: Vec<Uuid> = match track_id {
+                Some(id) => {
+                    timeline.track(id).ok_or(Error::TrackNotFound(id))?;
+                    vec![id]
+                }
+                None => timeline
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == StreamKind::Video && !t.locked)
+                    .map(|t| t.id)
+                    .collect(),
+            };
+            let mut aligned = 0;
+            for id in targets {
+                let track = timeline.track_mut(id).ok_or(Error::TrackNotFound(id))?;
+                aligned += track.align_cuts_to_beats(&beats, tolerance, &limits);
+            }
+            Ok(aligned)
+        })
+    }
+
     /// Append the full audio of an asset to the first audio track.
     pub fn extract_audio(&self, asset_id: Uuid) -> Result<Clip> {
         let asset = self.require_asset(asset_id)?;
@@ -2555,6 +2610,58 @@ mod tests {
             image: false,
             projection: None,
         }
+    }
+
+    #[test]
+    fn snap_to_beats_lands_the_video_cuts_on_the_music_grid() {
+        let project = Project::open_in_memory().unwrap();
+        let video = project
+            .insert_or_get_asset(&asset_with("/beat-video.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/beat-music.wav", vec![aud_stream()]))
+            .unwrap();
+        project
+            .set_analysis(&AssetAnalysis {
+                asset_id: music.id,
+                tempo: Some(crate::model::Tempo {
+                    bpm: 120.0,
+                    beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
+                    confidence: 0.8,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        project.extract_audio(music.id).unwrap();
+        project.cut_clip(video.id, 0.0, 1.1).unwrap();
+        project.cut_clip(video.id, 2.0, 3.4).unwrap();
+
+        let moved = project.snap_to_beats(None, None).unwrap();
+        assert!(moved > 0, "cuts off the grid should have moved");
+
+        let timeline = project.timeline().unwrap();
+        let cuts: Vec<f64> = timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| t.clips.iter().map(Clip::timeline_end))
+            .collect();
+        assert_eq!(cuts, vec![1.0, 2.5]);
+
+        // The music track is the grid, not a target — it keeps its full length.
+        let audio = timeline.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap();
+        assert_eq!(audio.clips[0].duration(), 10.0);
+    }
+
+    #[test]
+    fn snap_to_beats_without_a_grid_says_what_is_missing() {
+        let project = Project::open_in_memory().unwrap();
+        let video = project
+            .insert_or_get_asset(&asset_with("/no-music.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        project.cut_clip(video.id, 0.0, 1.1).unwrap();
+        let err = project.snap_to_beats(None, None).unwrap_err().to_string();
+        assert!(err.contains("no beat grid"), "got: {err}");
     }
 
     #[test]

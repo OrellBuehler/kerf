@@ -237,7 +237,14 @@ no editing logic in the adapter.
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
-  operations.
+  operations. **Beat alignment** lives here too and is pure + unit-tested:
+  `Timeline::beat_grid` maps the audio tracks' cached `Tempo` onto timeline time
+  (confidence-gated by `BEAT_MIN_CONFIDENCE`, mirroring the ruler's ticks) and
+  `Track::align_cuts_to_beats` ripples a track's cuts onto that grid — each clip
+  retrimmed at its **outgoing** edge (`source_in` for a reversed clip, whose tail
+  is the source's head), gaps preserved and their incoming cuts snapped too,
+  stretching only as far as the asset has footage (a still loops, so it is
+  unbounded).
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -247,7 +254,11 @@ no editing logic in the adapter.
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
   opens a `.kerf` file to populate it.
   `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
-  unchanged. The **agent task queue** is a real `tasks` table (one row per `Task`,
+  unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects
+  every asset's cached `Tempo`, builds the grid and aligns one track (or every
+  unlocked video track) to it, defaulting the tolerance to half a beat so each cut
+  moves to the beat it is already nearest; it errors when nothing rhythmic has been
+  analyzed rather than silently doing nothing. The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
   ready → done` (or `failed`) lifecycle in `model.rs`.
@@ -308,8 +319,8 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
-`captions_from_transcript`, `export_srt`, `remove_silence`, `extract_audio`,
-`concatenate` — each returns the
+`captions_from_transcript`, `export_srt`, `remove_silence`, `snap_to_beats`,
+`extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
@@ -402,8 +413,10 @@ Everything is styled with the CSS-variable tokens directly (inline `style`), not
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
-of audio-track clips, confidence-gated, hidden when beats land closer than 4px) mapped
-from `AssetAnalysis` and
+of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from
+`src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
+snapping and the browser harness's alignment all share, unit-tested with `bun test`)
+mapped from `AssetAnalysis` and
 real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
@@ -458,7 +471,10 @@ queue** (status · queue · history · add-task) — Kerf has no in-app chat; a 
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
-Two preset chips (`Remove silences` / `Assemble rough cut`) also run the matching local op and
+Three preset chips (`Remove silences` / `Assemble rough cut` / `Cut to the beat` — which
+analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
+"No cuts were near a beat" instead of claiming an alignment when the grid never reached
+them) also run the matching local op and
 resolve their task; the rest just enqueue for the agent. In the browser there is no agent, so
 queued tasks correctly just wait. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click

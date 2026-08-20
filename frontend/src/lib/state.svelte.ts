@@ -39,6 +39,7 @@ import {
 	redo as apiRedo,
 	removeClip,
 	removeSilence,
+	snapToBeats,
 	removeTrack,
 	setTrackDuck,
 	setTrackMuted,
@@ -583,6 +584,10 @@ class EditorState {
 	}
 	removeSilence(assetId: string) {
 		return this.#apply(removeSilence(assetId));
+	}
+	/** Ripple a track's cuts onto the music's beat grid; all video tracks by default. */
+	snapToBeats(trackId?: string, tolerance?: number) {
+		return this.#apply(snapToBeats(trackId, tolerance));
 	}
 	extractAudio(assetId: string) {
 		return this.#apply(extractAudio(assetId));

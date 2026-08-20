@@ -898,6 +898,14 @@ fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Tim
 }
 
 #[tauri::command(async)]
+fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance: Option<f64>) -> CmdResult<Timeline> {
+    let track = track_id.as_deref().map(id).transpose()?;
+    let project = state.project();
+    project.snap_to_beats(track, tolerance).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
     let project = state.project();
@@ -1466,6 +1474,7 @@ pub fn run() {
             captions_from_transcript,
             export_srt,
             remove_silence,
+            snap_to_beats,
             extract_audio,
             concatenate,
             get_history,

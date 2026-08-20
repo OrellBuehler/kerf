@@ -139,6 +139,16 @@ struct TrackIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SnapToBeatsParams {
+    #[schemars(description = "UUID of the track to align; every unlocked video track when omitted")]
+    track_id: Option<String>,
+    #[schemars(
+        description = "How far a cut may move to reach a beat (seconds). Defaults to half a beat, which lands every cut on the beat it is nearest"
+    )]
+    tolerance: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CutClipRangeParams {
     #[schemars(description = "UUID of the clip to cut")]
     clip_id: String,
@@ -1194,6 +1204,19 @@ impl KerfMcp {
         let out = project.remove_silence(id).map_err(core_err)?;
         self.changed();
         json(&out)
+    }
+
+    #[tool(
+        description = "Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed music on the audio tracks, retrimming each clip so its outgoing cut lands on a beat. Analyze the music asset first"
+    )]
+    fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
+        let track = p.track_id.as_deref().map(parse_id).transpose()?;
+        let project = self.lock();
+        let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
+        let timeline = project.timeline().map_err(core_err)?;
+        drop(project);
+        self.changed();
+        json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": timeline }))
     }
 
     #[tool(description = "Append the full audio of an asset to the first audio track")]

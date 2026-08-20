@@ -8,6 +8,7 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import type { Clip, Marker, StreamKind, Track } from '$lib/types';
 	import { clipDuration } from '$lib/types';
+	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
 
 	const pxPerSec = $derived(ui.zoom);
 	const duration = $derived(Math.max(editor.duration, 8));
@@ -56,12 +57,7 @@
 
 	/** Timeline-seconds position of a source-time point inside a clip, honoring
 	 * the clip's speed (and reverse direction). */
-	function srcToTimeline(c: Clip, src: number): number {
-		const sp = c.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
-		const off = sp < 0 ? c.source_out - src : src - c.source_in;
-		return c.timeline_start + off / mag;
-	}
+	const srcToTimeline = sourceToTimeline;
 
 	const sceneXs = $derived.by(() => {
 		const xs: number[] = [];
@@ -82,30 +78,12 @@
 
 	// ---- beat grid (tempo analysis → ruler ticks + snap targets) --------------
 
-	/** Ignore tempo estimates below this confidence. */
-	const BEAT_MIN_CONF = 0.25;
 	/** Hide (and stop snapping to) the grid when beats land closer than this, px. */
 	const BEAT_MIN_PX = 4;
 
 	const beatTimes = $derived.by(() => {
-		const ts: number[] = [];
-		let period = Infinity; // shortest on-timeline beat interval, seconds
-		for (const t of editor.timeline.tracks) {
-			if (t.kind !== 'audio') continue;
-			for (const c of t.clips) {
-				const tempo = editor.analysisFor(c.asset_id)?.tempo;
-				if (!tempo || tempo.confidence < BEAT_MIN_CONF || tempo.bpm <= 0) continue;
-				const mag = Math.max(Math.abs(c.speed ?? 1), 0.01);
-				period = Math.min(period, 60 / tempo.bpm / mag);
-				for (const b of tempo.beats) {
-					if (b >= c.source_in && b <= c.source_out) ts.push(srcToTimeline(c, b));
-				}
-			}
-		}
-		if (ts.length === 0 || period * pxPerSec < BEAT_MIN_PX) return [];
-		ts.sort((a, b) => a - b);
-		// Overlapping clips of one asset repeat the same beats; drop the copies.
-		return ts.filter((b, i) => i === 0 || b - ts[i - 1] > 0.005);
+		const ts = beatGrid(editor.timeline, (id) => editor.analysisFor(id)?.tempo);
+		return beatPeriod(ts) * pxPerSec < BEAT_MIN_PX ? [] : ts;
 	});
 
 	function silenceRegions(c: Clip): { left: number; width: number }[] {

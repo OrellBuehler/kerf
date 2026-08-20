@@ -90,6 +90,15 @@
 		}
 	}
 
+	/** The video cuts as they stand, to tell a no-op alignment from a real one. */
+	function cutSignature(): string {
+		return JSON.stringify(
+			editor.timeline.tracks
+				.filter((t) => t.kind === 'video')
+				.map((t) => t.clips.map((c) => [c.timeline_start, c.source_in, c.source_out]))
+		);
+	}
+
 	async function runPreset(p: string) {
 		const assetId = editor.selectedAssetId ?? editor.assets[0]?.id;
 		if (!assetId) {
@@ -98,12 +107,28 @@
 		}
 		try {
 			const task = await agent.add(p);
-			// Two presets map to a local op we can run now; the rest wait for the agent.
+			// Three presets map to a local op we can run now; the rest wait for the agent.
 			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
 				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
 				await editor.removeSilence(assetId);
 				await agent.resolve(task.id);
 				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
+			} else if (task && p === 'Cut to the beat') {
+				// The grid comes from the music, so analyze whatever is on the audio tracks.
+				const music = [
+					...new Set(
+						editor.timeline.tracks.filter((t) => t.kind === 'audio').flatMap((t) => t.clips.map((c) => c.asset_id))
+					)
+				];
+				if (music.length === 0) throw new Error('Put music on an audio track first');
+				for (const id of music) if (!editor.analysisFor(id)) await ui.runAnalysis(id);
+				const before = cutSignature();
+				await editor.snapToBeats();
+				await agent.resolve(task.id);
+				// A grid that does not reach the cuts leaves them alone; say so
+				// rather than claiming an alignment that never happened.
+				if (cutSignature() === before) toast.info('No cuts were near a beat');
+				else toast.success('Aligned the cuts to the beat');
 			} else {
 				toast.info(`Queued “${p}” — your connected agent claims tasks over MCP`);
 			}

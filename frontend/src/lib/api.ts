@@ -34,6 +34,7 @@ import type {
 	VideoEffect
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
+import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1223,6 +1224,24 @@ export async function removeSilence(assetId: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_silence', { assetId });
+}
+
+/**
+ * Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed
+ * music. `trackId` omitted aligns every video track.
+ */
+export async function snapToBeats(trackId?: string, tolerance?: number): Promise<Timeline> {
+	if (!inTauri()) {
+		const beats = beatGrid(devTimeline, (id) => sampleAnalysis[id]?.tempo);
+		if (beats.length < 2) throw new Error('no beat grid — put rhythmic audio on an audio track and analyze it first');
+		const tol = tolerance ?? defaultBeatTolerance(beats);
+		const limitFor = (id: string) => assetById(id)?.duration ?? Infinity;
+		const targets = devTimeline.tracks.filter((t) => (trackId ? t.id === trackId : t.kind === 'video'));
+		for (const t of targets) alignCutsToBeats(t.clips, beats, tol, limitFor);
+		recordDev('Cut to the beat');
+		return snapshot();
+	}
+	return invoke<Timeline>('snap_to_beats', { trackId, tolerance });
 }
 
 export async function extractAudio(assetId: string): Promise<Timeline> {

@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Kind of an elementary media stream.
@@ -1037,6 +1038,49 @@ impl Clip {
     pub fn timeline_end(&self) -> f64 {
         self.timeline_start + self.duration()
     }
+
+    /// Where a source timestamp of this clip lands on the timeline (seconds).
+    /// Honors speed and reverse, so an analysis marker maps to the moment it is
+    /// actually heard.
+    pub fn source_to_timeline(&self, source: f64) -> f64 {
+        let offset = if self.is_reversed() {
+            self.source_out - source
+        } else {
+            source - self.source_in
+        };
+        self.timeline_start + offset / self.speed_mag()
+    }
+}
+
+/// Tempo estimates below this confidence are ignored when building a beat grid
+/// — the same gate the timeline ruler uses to decide whether to draw beat ticks.
+pub const BEAT_MIN_CONFIDENCE: f64 = 0.25;
+
+/// Shortest clip a beat alignment may leave behind (seconds).
+pub const MIN_BEAT_CLIP: f64 = 0.05;
+
+/// The beat nearest `time` within `tolerance`, from an ascending beat grid.
+pub fn nearest_beat(beats: &[f64], time: f64, tolerance: f64) -> Option<f64> {
+    if tolerance <= 0.0 {
+        return None;
+    }
+    let after = beats.partition_point(|b| *b < time);
+    beats[after.saturating_sub(1)..beats.len().min(after + 1)]
+        .iter()
+        .copied()
+        .filter(|b| (b - time).abs() <= tolerance)
+        .min_by(|a, b| (a - time).abs().total_cmp(&(b - time).abs()))
+}
+
+/// Half the median beat interval — the widest tolerance that still has a single
+/// answer, so every cut moves to the beat it is already closest to.
+pub fn default_beat_tolerance(beats: &[f64]) -> f64 {
+    let mut gaps: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2] / 2.0
 }
 
 /// A single timeline lane holding clips of one kind.
@@ -1101,6 +1145,60 @@ impl Track {
     /// lane.
     pub fn sort_by_start(&mut self) {
         self.clips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+    }
+
+    /// Ripple every cut on this track onto the nearest beat within `tolerance`.
+    /// Each clip is retrimmed at its outgoing edge (so the cut lands on a beat)
+    /// and the rest of the track follows, keeping the original gaps — a gap's
+    /// own incoming cut snaps too. `source_limit` caps each asset's source time
+    /// (its duration; `INFINITY` for a still, which loops), so a clip is only
+    /// stretched as far as it has footage. Returns how many cuts moved.
+    pub fn align_cuts_to_beats(&mut self, beats: &[f64], tolerance: f64, source_limit: &HashMap<Uuid, f64>) -> usize {
+        self.sort_by_start();
+        let mut moved = 0;
+        let mut cursor = 0.0; // end of the previous clip after alignment
+        let mut previous_end = 0.0; // ...and where it ended before
+        for clip in &mut self.clips {
+            let gap = (clip.timeline_start - previous_end).max(0.0);
+            previous_end = clip.timeline_end();
+
+            let mut start = cursor + gap;
+            if gap > 1e-6 {
+                if let Some(beat) = nearest_beat(beats, start, tolerance) {
+                    let snapped = beat.max(cursor);
+                    if (snapped - start).abs() > 1e-6 {
+                        moved += 1;
+                        start = snapped;
+                    }
+                }
+            }
+
+            let speed = clip.speed_mag();
+            let mut duration = clip.duration();
+            if let Some(beat) = nearest_beat(beats, start + duration, tolerance) {
+                let limit = source_limit.get(&clip.asset_id).copied().unwrap_or(f64::INFINITY);
+                let source_left = if clip.is_reversed() {
+                    clip.source_out
+                } else {
+                    (limit - clip.source_in).max(0.0)
+                };
+                let available = source_left / speed;
+                let wanted = (beat - start).clamp(MIN_BEAT_CLIP, available.max(MIN_BEAT_CLIP));
+                if (wanted - duration).abs() > 1e-6 {
+                    moved += 1;
+                    duration = wanted;
+                }
+            }
+
+            clip.timeline_start = start;
+            if clip.is_reversed() {
+                clip.source_in = (clip.source_out - duration * speed).max(0.0);
+            } else {
+                clip.source_out = clip.source_in + duration * speed;
+            }
+            cursor = clip.timeline_end();
+        }
+        moved
     }
 }
 
@@ -1193,6 +1291,36 @@ impl Timeline {
     /// The id of the first track of a given kind, if any.
     pub fn first_track_of(&self, kind: StreamKind) -> Option<Uuid> {
         self.tracks.iter().find(|t| t.kind == kind).map(|t| t.id)
+    }
+
+    /// Beat timestamps of the audio tracks mapped onto the timeline, ascending
+    /// and de-duplicated. `tempos` supplies each asset's cached tempo; estimates
+    /// below [`BEAT_MIN_CONFIDENCE`] are ignored, so a non-rhythmic source
+    /// contributes nothing rather than a grid of noise.
+    pub fn beat_grid(&self, tempos: &HashMap<Uuid, Tempo>) -> Vec<f64> {
+        let mut times = Vec::new();
+        for track in &self.tracks {
+            if track.kind != StreamKind::Audio {
+                continue;
+            }
+            for clip in &track.clips {
+                let Some(tempo) = tempos.get(&clip.asset_id) else {
+                    continue;
+                };
+                if tempo.confidence < BEAT_MIN_CONFIDENCE || tempo.bpm <= 0.0 {
+                    continue;
+                }
+                for &beat in &tempo.beats {
+                    if beat >= clip.source_in && beat <= clip.source_out {
+                        times.push(clip.source_to_timeline(beat));
+                    }
+                }
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        // Overlapping clips of one asset repeat the same beats; drop the copies.
+        times.dedup_by(|a, b| (*a - *b).abs() <= 0.005);
+        times
     }
 
     /// Find a clip by id, returning `(track_index, clip_index)`.
@@ -1435,6 +1563,112 @@ mod tests {
             clips,
             ..Track::new(kind, name)
         }
+    }
+
+    #[test]
+    fn beat_grid_maps_source_beats_onto_the_timeline() {
+        // A music clip cut from 2s into the source and placed at 10s: a beat at
+        // source 3.0 is heard at 11.0, and beats outside the window never sound.
+        let asset = Uuid::new_v4();
+        let clip = Clip::new(asset, 2.0, 6.0, 10.0);
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Audio, "A1", vec![clip])],
+            ..Timeline::new()
+        };
+        let tempos = HashMap::from([(
+            asset,
+            Tempo {
+                bpm: 120.0,
+                beats: vec![0.0, 1.0, 3.0, 5.0, 8.0],
+                confidence: 0.5,
+            },
+        )]);
+        assert_eq!(tl.beat_grid(&tempos), vec![11.0, 13.0]);
+    }
+
+    #[test]
+    fn beat_grid_ignores_a_low_confidence_tempo() {
+        let asset = Uuid::new_v4();
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Audio, "A1", vec![Clip::new(asset, 0.0, 4.0, 0.0)])],
+            ..Timeline::new()
+        };
+        let tempos = HashMap::from([(
+            asset,
+            Tempo {
+                bpm: 120.0,
+                beats: vec![0.5, 1.0],
+                confidence: BEAT_MIN_CONFIDENCE - 0.01,
+            },
+        )]);
+        assert!(tl.beat_grid(&tempos).is_empty());
+    }
+
+    #[test]
+    fn nearest_beat_takes_the_closest_within_tolerance() {
+        let beats = [0.0, 0.5, 1.0, 1.5];
+        assert_eq!(nearest_beat(&beats, 0.6, 0.25), Some(0.5));
+        assert_eq!(nearest_beat(&beats, 0.9, 0.25), Some(1.0));
+        assert_eq!(nearest_beat(&beats, 0.75, 0.1), None);
+        assert_eq!(nearest_beat(&beats, 9.0, 0.25), None);
+        assert_eq!(default_beat_tolerance(&beats), 0.25);
+    }
+
+    #[test]
+    fn align_cuts_to_beats_ripples_every_cut_onto_the_grid() {
+        let asset = Uuid::new_v4();
+        let beats: Vec<f64> = (0..=20).map(|i| i as f64 * 0.5).collect();
+        let limits = HashMap::from([(asset, 10.0)]);
+        let mut t = track(
+            StreamKind::Video,
+            "V1",
+            vec![Clip::new(asset, 0.0, 1.1, 0.0), Clip::new(asset, 4.0, 4.9, 1.1)],
+        );
+
+        assert_eq!(t.align_cuts_to_beats(&beats, 0.25, &limits), 2);
+        assert_eq!(t.clips[0].timeline_start, 0.0);
+        assert_eq!(t.clips[0].source_out, 1.0, "the first cut moved back onto the beat");
+        assert_eq!(t.clips[1].timeline_start, 1.0, "the next clip rippled with it");
+        assert_eq!(t.clips[1].timeline_end(), 2.0, "and its own cut landed on a beat too");
+        assert_eq!(t.clips[1].source_in, 4.0, "trimming happens at the outgoing edge");
+
+        // Already aligned: nothing moves, so running it twice is a no-op.
+        assert_eq!(t.align_cuts_to_beats(&beats, 0.25, &limits), 0);
+    }
+
+    #[test]
+    fn align_cuts_to_beats_keeps_gaps_and_respects_the_source() {
+        let asset = Uuid::new_v4();
+        let beats: Vec<f64> = (0..=20).map(|i| i as f64 * 0.5).collect();
+        // Only 1.2s of footage left after source_in, so the clip cannot stretch
+        // to the 1.5 beat its end is nearest.
+        let limits = HashMap::from([(asset, 1.2)]);
+        let mut t = track(
+            StreamKind::Video,
+            "V1",
+            vec![Clip::new(asset, 0.0, 0.4, 0.0), Clip::new(asset, 0.0, 1.4, 0.9)],
+        );
+
+        t.align_cuts_to_beats(&beats, 0.25, &limits);
+        assert_eq!(t.clips[0].timeline_end(), 0.5);
+        assert_eq!(t.clips[1].timeline_start, 1.0, "the 0.5s gap survived, snapped to a beat");
+        assert_eq!(t.clips[1].source_out, 1.2, "stretched only as far as there is footage");
+    }
+
+    #[test]
+    fn align_cuts_to_beats_trims_a_reversed_clip_at_its_outgoing_edge() {
+        // Played backwards the timeline tail is the *start* of the source, so
+        // shortening the clip must move source_in, not source_out.
+        let asset = Uuid::new_v4();
+        let beats: Vec<f64> = (0..=20).map(|i| i as f64 * 0.5).collect();
+        let mut clip = Clip::new(asset, 1.0, 2.1, 0.0);
+        clip.speed = -1.0;
+        let mut t = track(StreamKind::Video, "V1", vec![clip]);
+
+        t.align_cuts_to_beats(&beats, 0.25, &HashMap::from([(asset, 10.0)]));
+        assert_eq!(t.clips[0].source_out, 2.1);
+        assert!((t.clips[0].source_in - 1.1).abs() < 1e-9);
+        assert!((t.clips[0].timeline_end() - 1.0).abs() < 1e-9);
     }
 
     #[test]
