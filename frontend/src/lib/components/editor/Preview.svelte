@@ -39,7 +39,11 @@
 		atPlayhead ? editor.assets.find((a) => a.id === atPlayhead.assetId) : undefined
 	);
 
+	// Once the project has a delivery frame, that is the shape on screen — showing
+	// the source's dimensions here would label the picture with a size it isn't.
 	const resolution = $derived.by(() => {
+		const d = editor.timeline.format;
+		if (d) return `${d.width}×${d.height}`;
 		const v = previewAsset?.streams.find((s) => s.kind === 'video');
 		return v?.width && v?.height ? `${v.width}×${v.height}` : '—';
 	});
@@ -174,6 +178,24 @@
 		ui.seek((x / el.clientWidth) * duration);
 	}
 
+	// The preview pane is the delivery frame, not a fixed 16:9 window: cutting a
+	// Reel against a landscape box would hide the very crop that decides the shot.
+	const delivery = $derived(editor.timeline.format ?? null);
+	const aspect = $derived(delivery ? delivery.width / delivery.height : 16 / 9);
+	// Which axis binds depends on the pane's shape as much as the frame's — a 1:1
+	// frame is height-bound in a wide pane, and choosing by `aspect < 1` alone
+	// squashed it to the pane's height at full width. `100cqh` reads the pane's
+	// own height (it declares `container-type:size`), so one rule covers every
+	// orientation: never wider than the pane or 720px, never taller than the pane.
+	const frameBox = $derived(`width:min(100%, 720px, calc(100cqh * ${aspect}))`);
+
+	// Roughly where a phone's UI covers a vertical video: the top status strip,
+	// the caption / button rail along the bottom, and the action column on the
+	// right. Percentages of the frame, deliberately generous — every app differs,
+	// so this is "keep the subject out of here", not a pixel contract.
+	const CHROME = { top: 0.08, bottom: 0.2, right: 0.14 };
+	const showGuides = $derived(ui.safeAreas && !!delivery && aspect < 1.2);
+
 	function onPreviewContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
 			{
@@ -191,6 +213,13 @@
 				shortcut: 'End',
 				disabled: empty,
 				action: () => ui.seek(editor.duration)
+			},
+			{ type: 'separator' },
+			{
+				label: ui.safeAreas ? 'Hide safe areas' : 'Show safe areas',
+				icon: 'crop',
+				disabled: !delivery,
+				action: () => (ui.safeAreas = !ui.safeAreas)
 			}
 		]);
 	}
@@ -200,7 +229,7 @@
 	<div
 		role="presentation"
 		oncontextmenu={onPreviewContextMenu}
-		style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative"
+		style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative;container-type:size"
 	>
 		{#if empty}
 			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-disabled)">
@@ -208,7 +237,7 @@
 			</div>
 		{:else}
 			<div
-				style="position:relative;aspect-ratio:16/9;max-height:100%;max-width:100%;width:min(100%, 720px);border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, #2b3a49 0%, #161d24 55%, #0d1116 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, #2b3a49 0%, #161d24 55%, #0d1116 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000" />
@@ -216,6 +245,21 @@
 					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, rgba(226,157,46,.06) 60%)"></div>
 					<div style="position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.22)">
 						<Icon n={ui.playing ? 'pause' : 'play'} s={44} />
+					</div>
+				{/if}
+				{#if showGuides}
+					<!-- Where the platform's own UI sits over the picture. Shaded, not
+					     cropped: the pixels still render, they are just not yours to
+					     put a face or a caption in. -->
+					<div style="position:absolute;inset:0;pointer-events:none">
+						<div style="position:absolute;left:0;right:0;top:0;height:{CHROME.top * 100}%;background:rgba(0,0,0,.34);border-bottom:1px dashed rgba(255,255,255,.28)"></div>
+						<div style="position:absolute;left:0;right:0;bottom:0;height:{CHROME.bottom * 100}%;background:rgba(0,0,0,.34);border-top:1px dashed rgba(255,255,255,.28)"></div>
+						<div
+							style="position:absolute;right:0;top:{CHROME.top * 100}%;bottom:{CHROME.bottom * 100}%;width:{CHROME.right * 100}%;background:rgba(0,0,0,.24);border-left:1px dashed rgba(255,255,255,.2)"
+						></div>
+						<div
+							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:1px solid rgba(255,255,255,.14);border-radius:2px"
+						></div>
 					</div>
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">

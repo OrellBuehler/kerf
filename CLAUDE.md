@@ -59,6 +59,18 @@ so the feature is **only** activated through these forwards — which is what ma
   — which is what makes the vertical / square presets produce a usable shot rather
   than a strip of picture in a black field. It sets the *base* fit only; a clip with
   its own transform still composes on top.
+  **The shape itself is a property of the project**, not of one render:
+  `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
+  is being made *for*. `export_format` applies it between the footage-derived
+  default and an explicit `opts.resolution` — so the shape follows the footage when
+  unset (every pre-existing timeline, byte-identical graphs), the project frame when
+  set, and a size typed into the export dialog always wins. Because
+  `preview_resolution` and `build_timeline_frame_args` already derive their canvas
+  from `export_format`, the streamed playback, the scrubbed still and the export all
+  render the same frame from that one change — `Timeline::slice`/`for_render` carry
+  `format` through so range export and playback keep it. `still_clip_chain` honors
+  `fit` too (it used to letterbox unconditionally, so the one frame you looked at
+  while cutting was the one shape you were never going to ship).
   Tracks flagged `Track.duck` are mixed into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
@@ -235,6 +247,8 @@ no editing logic in the adapter.
   `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
   animation); `transcript_to_srt` serializes a transcript to SubRip. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
+  `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
+  re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
@@ -313,7 +327,8 @@ op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start`
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
-`set_track_duck`, `remove_clip`, `set_volume`, `set_fade`,
+`set_track_duck`, `set_delivery_format` (the project's delivery frame; omit
+width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
@@ -440,7 +455,15 @@ toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove on
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
 (`set_track_duck`); the timeline is genuinely **multi-track**. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
-dep is still in `package.json`, now unused). `Preview` shows the composited frame under the playhead, and during
+dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
+from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
+preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
+frame is height-bound in a wide pane, not squashed), and for a vertical or square
+delivery it draws **safe-area guides** (the platform's top strip / caption rail /
+action column, plus a title-safe box; `ui.safeAreas`, toggled from the preview
+context menu). The export dialog's "Source" resolution relabels to
+**Project frame (WxH)** so the two surfaces cannot silently disagree.
+`Preview` shows the composited frame under the playhead, and during
 **forward 1× playback it switches to the streamed frame source** (`start_playback`)
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
 settled frame, where you want *one* frame rather than all of them. Its effect keys

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, EditSource, ExportOptions, Keyframe, Project, Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition,
-    TransitionKind, VideoEffect,
+    AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe, StreamKind,
+    TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -164,6 +164,18 @@ struct SetTrackDuckParams {
     track_id: String,
     #[schemars(description = "true to duck this track under the others on export, false to restore a flat mix")]
     duck: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetDeliveryFormatParams {
+    #[schemars(description = "Delivery frame width in pixels, e.g. 1080. Omit (with height) to clear the \
+                              format and go back to following the footage's shape.")]
+    width: Option<u32>,
+    #[schemars(description = "Delivery frame height in pixels, e.g. 1920 for a 9:16 vertical cut")]
+    height: Option<u32>,
+    #[schemars(description = "How footage of a different shape meets the frame: \"cover\" (the default) \
+                              fills and crops, \"contain\" scales the whole picture in and letterboxes")]
+    fit: Option<Fit>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -631,6 +643,11 @@ struct TimelineSummary {
     track_count: usize,
     total_clip_count: usize,
     tracks: Vec<TrackSummary>,
+    /// The frame this cut is being made for, e.g. "1080x1920 (cover)". Absent
+    /// when the project follows its footage's shape. Worth reading before
+    /// framing anything: under a cover delivery the crop decides what survives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_format: Option<String>,
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -822,6 +839,26 @@ impl KerfMcp {
         let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
         self.changed();
         json(&track)
+    }
+
+    #[tool(
+        description = "Set the frame this project is cut for — the shape of the delivered video, e.g. \
+                       1080x1920 for a vertical Reel or 1080x1080 for a square feed post. Everything \
+                       that renders a picture (preview_timeline, get_frame and the export) then uses \
+                       it, so what you look at while cutting is what ships. With \"cover\" (the default) \
+                       a 16:9 shot is filled and cropped to the frame, which means the crop decides what \
+                       survives: check preview_timeline and use set_transform's position to slide the \
+                       important part of a shot back into frame. Omit width and height to clear it."
+    )]
+    fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
+        let format = match (p.width, p.height) {
+            (Some(w), Some(h)) => Some(Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover))),
+            _ => None,
+        };
+        let project = self.lock();
+        let timeline = project.set_delivery_format(format).map_err(core_err)?;
+        self.changed();
+        json(&timeline)
     }
 
     #[tool(
@@ -1480,6 +1517,9 @@ impl KerfMcp {
             track_count: tracks.len(),
             total_clip_count,
             tracks,
+            delivery_format: timeline
+                .format
+                .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
         };
         json(&summary)
     }

@@ -14,6 +14,10 @@ class EditorUi {
 	tool = $state<Tool>('pointer');
 	snap = $state(true);
 	agentOpen = $state(true);
+	/** Draw the delivery safe areas over the preview. Only has an effect while
+	 *  the project is cut for a delivery frame; a 16:9 web export has no chrome
+	 *  to stay clear of. */
+	safeAreas = $state(true);
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);

@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe, Revision,
+    Asset, AssetAnalysis, AudioEffect, Clip, Delivery, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe,
+    Revision,
     StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition,
     VideoEffect, MAX_FOV, MIN_FOV,
 };
@@ -1182,6 +1183,26 @@ impl Project {
             track.duck = duck;
             Ok(track.clone())
         })
+    }
+
+    /// Set (or clear) the frame this project is cut for.
+    ///
+    /// The delivery frame decides the shape of every rendered picture — the
+    /// scrubbed still, the streamed playback and the export — so a vertical cut
+    /// is framed against the vertical frame instead of being cropped sight-unseen
+    /// at render time. `None` restores the default: the shape follows the
+    /// footage. An explicit `ExportOptions::resolution` still overrides it, so
+    /// a one-off render at another size is unaffected.
+    pub fn set_delivery_format(&self, format: Option<Delivery>) -> Result<Timeline> {
+        let label = match format {
+            Some(d) => format!("Deliver {}x{}", d.width, d.height),
+            None => "Deliver at source shape".to_string(),
+        };
+        self.edit_timeline(&label, |timeline| {
+            timeline.format = format.map(|d| Delivery::new(d.width, d.height, d.fit));
+            Ok(())
+        })?;
+        self.timeline()
     }
 
     /// Mute or unmute a track: its clips stop rendering (silent for audio,
@@ -2528,6 +2549,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Fit;
 
     #[test]
     fn sample_project_has_assets_and_timeline() {
@@ -3432,6 +3454,31 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().any(|t| t.status == TaskStatus::Done));
         assert!(tasks.iter().any(|t| t.status == TaskStatus::Queued));
+    }
+
+    #[test]
+    fn the_delivery_format_persists_and_clears() {
+        let project = Project::sample().unwrap();
+        assert!(project.timeline().unwrap().format.is_none(), "projects start at source shape");
+
+        let tl = project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
+        assert_eq!(tl.format, Some(Delivery::new(1080, 1920, Fit::Cover)));
+
+        // The timeline is stored as one JSON blob, so a reload is the real test.
+        let path = std::env::temp_dir().join(format!("kerf-delivery-{}.kerf", Uuid::new_v4()));
+        project.save_as(&path).unwrap();
+        let reopened = Project::open(&path).unwrap();
+        assert_eq!(reopened.timeline().unwrap().format, Some(Delivery::new(1080, 1920, Fit::Cover)));
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+
+        // And clearing it goes back to following the footage.
+        assert!(project.set_delivery_format(None).unwrap().format.is_none());
+        // Both edits are in the log, so the frame change is undoable like any other.
+        let history = project.history().unwrap();
+        assert!(history.iter().any(|r| r.label == "Deliver 1080x1920"), "{history:?}");
     }
 
     #[test]

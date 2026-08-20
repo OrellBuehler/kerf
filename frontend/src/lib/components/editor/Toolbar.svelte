@@ -4,6 +4,9 @@
 	import Btn from './Btn.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
+	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
+	import { toast } from 'svelte-sonner';
 
 	let {
 		onNew,
@@ -17,6 +20,29 @@
 		['pointer', 'MousePointer2', 'Select (V)'],
 		['razor', 'Scissors', 'Razor (C)']
 	];
+
+	// The frame the cut is being made for. Changing it reshapes the preview, the
+	// scrubbed still and the export together, so the vertical crop is something
+	// you compose against rather than discover in the rendered file.
+	const delivery = $derived(presetFor(editor.timeline.format));
+
+	function pickDelivery(e: MouseEvent) {
+		contextMenu.show(
+			e,
+			DELIVERY_PRESETS.map((p) => ({
+				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+				icon: p.id === delivery.id ? 'check' : undefined,
+				action: async () => {
+					try {
+						await editor.setDeliveryFormat(p.format);
+						toast.success(p.format ? `Cutting for ${p.label} (${fitLabel(p.format.fit)})` : 'Following the footage');
+					} catch (err) {
+						toast.error(err instanceof Error ? err.message : String(err));
+					}
+				}
+			}))
+		);
+	}
 
 	function tc(s: number): string {
 		const m = Math.floor(s / 60);
@@ -75,6 +101,19 @@
 	<span style="font-family:var(--font-mono);font-size:13px;color:var(--kerf-300);margin-left:6px;font-weight:500">
 		{tc(ui.time)}
 	</span>
+
+	{@render divider()}
+
+	<Btn
+		variant="ghost"
+		size="sm"
+		icon="crop"
+		onclick={pickDelivery}
+		title={delivery.format
+			? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
+			: 'The frame follows the footage. Click to cut for a delivery shape.'}
+		style={delivery.format ? 'color:var(--kerf-300)' : ''}>{delivery.label}</Btn
+	>
 
 	<div style="flex:1"></div>
 

@@ -1248,6 +1248,56 @@ pub struct Marker {
     pub color: Option<String>,
 }
 
+/// How a clip's picture is fitted to an output frame of a different shape.
+///
+/// This is what makes a vertical or square delivery usable. `Contain` letterboxes,
+/// which is right when the delivery matches the footage and wrong the moment it
+/// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
+/// mostly-black frame — technically the whole picture, and not something anyone
+/// would post. `Cover` fills the frame and throws away the overflow instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Fit {
+    /// Scale to fit inside the frame and pad the remainder with black. The
+    /// default, and the historical behaviour.
+    #[default]
+    Contain,
+    /// Scale to cover the frame and crop what hangs over the edges.
+    Cover,
+}
+
+/// The frame the project is cut *for* — the shape of the thing being delivered.
+///
+/// Without one, a timeline's shape is whatever the first video clip happens to
+/// be, and a vertical delivery exists only as a resolution typed into the export
+/// dialog. That is backwards for short-form work: the 9:16 crop decides which
+/// half of every shot survives, so it has to be visible while the cut is made,
+/// not discovered in the rendered file. Setting this makes the preview, the
+/// scrubbed still, the streamed playback and the export all render the same
+/// frame — an explicit export `resolution` still wins, so nothing about the
+/// existing dialog changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Delivery {
+    pub width: u32,
+    pub height: u32,
+    /// How footage of a different shape meets that frame. `Cover` is the useful
+    /// default for a reframed delivery; `Contain` keeps the whole picture.
+    #[serde(default)]
+    pub fit: Fit,
+}
+
+impl Delivery {
+    /// Even-clamped, and never zero — the dimensions reach a filtergraph.
+    pub fn new(width: u32, height: u32, fit: Fit) -> Self {
+        let even = |v: u32| v.max(2) & !1;
+        Self { width: even(width), height: even(height), fit }
+    }
+
+    pub fn aspect(&self) -> f64 {
+        self.width as f64 / self.height.max(1) as f64
+    }
+}
+
 /// The non-destructive timeline (EDL): a set of multi-kind tracks, the text
 /// overlays (titles / lower-thirds / captions) drawn over the composited
 /// picture, and the user's markers.
@@ -1258,6 +1308,11 @@ pub struct Timeline {
     pub overlays: Vec<TextOverlay>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Marker>,
+    /// The frame this cut is being made for. `None` (the default, and every
+    /// timeline saved before this existed) keeps the historical behaviour:
+    /// the shape follows the first video clip's footage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<Delivery>,
 }
 
 impl Default for Timeline {
@@ -1273,6 +1328,7 @@ impl Timeline {
             tracks: vec![Track::new(StreamKind::Video, "V1"), Track::new(StreamKind::Audio, "A1")],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         }
     }
 
@@ -1383,6 +1439,7 @@ impl Timeline {
                 .collect(),
             overlays: self.overlays.clone(),
             markers: self.markers.clone(),
+            format: self.format,
         }
     }
 
@@ -1408,6 +1465,9 @@ impl Timeline {
                     ..m.clone()
                 })
                 .collect(),
+            // A slice is still the same delivery: range export and playback both
+            // build from one, and either would otherwise fall back to footage shape.
+            format: self.format,
         };
         for track in &self.tracks {
             let mut t = Track {
@@ -1685,6 +1745,7 @@ mod tests {
             ],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         let r = tl.for_render();
         // The disabled clip is gone but the enabled one stays.
@@ -1709,6 +1770,7 @@ mod tests {
             ],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         let r = tl.for_render();
         assert!(r.tracks[0].clips.is_empty(), "unsoloed video track is shadowed");
@@ -1727,6 +1789,7 @@ mod tests {
             }],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         assert!(tl.for_render().tracks[0].clips.is_empty());
     }
@@ -1740,6 +1803,7 @@ mod tests {
             ],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         let r = tl.for_render();
         assert_eq!(
@@ -1777,6 +1841,7 @@ mod tests {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 20.0)])],
             overlays: Vec::new(),
             markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
+            format: None,
         };
         let s = tl.slice(3.0, 7.0);
         let names: Vec<_> = s.markers.iter().map(|m| m.name.as_str()).collect();
@@ -1796,6 +1861,7 @@ mod tests {
             }],
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);

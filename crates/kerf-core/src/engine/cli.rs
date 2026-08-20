@@ -1586,23 +1586,8 @@ pub enum RateControl {
     Lossless,
 }
 
-/// How a clip's picture is fitted to an output frame of a different shape.
-///
-/// This is what makes a vertical or square export usable. `Contain` letterboxes,
-/// which is right when the delivery matches the footage and wrong the moment it
-/// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
-/// mostly-black frame — technically the whole picture, and not something anyone
-/// would post. `Cover` fills the frame and throws away the overflow instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Fit {
-    /// Scale to fit inside the frame and pad the remainder with black. The
-    /// default, and the historical behaviour.
-    #[default]
-    Contain,
-    /// Scale to cover the frame and crop what hangs over the edges.
-    Cover,
-}
+pub use crate::model::Fit;
+
 
 /// Which ffmpeg invocation [`build_export_args`] is emitting for. Injected so
 /// the builder stays pure (no knowledge of the platform null device or the temp
@@ -1992,6 +1977,15 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
             fmt.channels = c;
         }
     }
+    // The project's delivery frame sits between the footage and an explicit
+    // export resolution: it overrides "whatever the first clip is" so the
+    // preview, the still and the export agree on the shape being cut for, and
+    // yields to a resolution typed into the export dialog so a one-off render
+    // at a different size still works.
+    if let Some(d) = timeline.format {
+        fmt.width = d.width;
+        fmt.height = d.height;
+    }
     if let Some((w, h)) = opts.resolution {
         fmt.width = w;
         fmt.height = h;
@@ -2026,7 +2020,12 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
         };
     }
     fmt.scaler = opts.scaler.clone();
-    fmt.fit = opts.fit;
+    // Same precedence for the fit: a Cover delivery crops in the preview exactly
+    // as it will on export, but an explicit non-default `opts.fit` still wins.
+    fmt.fit = match (timeline.format, opts.fit) {
+        (Some(d), Fit::Contain) => d.fit,
+        (_, f) => f,
+    };
     fmt
 }
 
@@ -4100,7 +4099,12 @@ fn build_timeline_frame_args(
     // overlays live at `t`. A trailing `null` makes the final label always
     // `[outv]` (so an empty timeline still maps cleanly).
     let live: Vec<&TextOverlay> = timeline.overlays.iter().filter(|o| t >= o.start && t < o.end).collect();
-    let sf = fmt.scale_flags();
+    let canvas = StillCanvas {
+        w: ow,
+        h: oh,
+        fit: fmt.fit,
+        sf: fmt.scale_flags(),
+    };
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
     for (n, (clip, _)) in active.iter().enumerate() {
@@ -4109,7 +4113,7 @@ fn build_timeline_frame_args(
         let rf = clip.reframe_at(local);
         chains.push(format!(
             "[{n}:v]{chain}[v{n}]",
-            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), ow, oh, &sf)
+            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas)
         ));
         let out = format!("ov{n}");
         chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
@@ -4141,6 +4145,17 @@ fn build_timeline_frame_args(
     Ok(args)
 }
 
+/// The frame a [`timeline_frame`] composite renders into: the delivery aspect
+/// capped to the caller's preview width, how footage of another shape meets it,
+/// and the scaler flags. Bundled because these four always travel together —
+/// every one of them comes from the same `ExportFormat`.
+struct StillCanvas {
+    w: u32,
+    h: u32,
+    fit: Fit,
+    sf: String,
+}
+
 /// The still video chain for one clip in a [`timeline_frame`] composite: take a
 /// single decoded frame, then apply the same 360 reprojection / crop /
 /// fit-or-transform / color / opacity / rotation geometry as
@@ -4156,10 +4171,10 @@ fn still_clip_chain(
     color: &Color,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
-    ow: u32,
-    oh: u32,
-    sf: &str,
+    canvas: &StillCanvas,
 ) -> String {
+    let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
+    let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma;
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
@@ -4178,9 +4193,23 @@ fn still_clip_chain(
         p.push(reframe_filter(r, ow, oh, PREVIEW_INTERP, None));
     }
     p.extend(crop);
-    p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}"));
+    // The same base fit `video_clip_chain` applies, so a Cover delivery crops in
+    // the scrubbed still exactly as it will in the file. Letterboxing here while
+    // the export cropped meant the one frame you look at while cutting was the
+    // one shape you were never going to ship.
+    match fit {
+        Fit::Contain => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+        Fit::Cover => {
+            p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
+            p.push(format!("crop={ow}:{oh}"));
+        }
+    }
     if tf.is_identity() {
-        p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
+        // Cover already fills the frame; padding it would be a no-op that still
+        // costs a filter, so only the letterboxed path needs it.
+        if fit == Fit::Contain {
+            p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
+        }
     } else if (tf.scale - 1.0).abs() > 1e-9 {
         p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = tf.scale));
     }
@@ -4285,7 +4314,7 @@ fn atempo_chain(speed: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, Clip, StreamInfo, StreamKind, Timeline, Track};
+    use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track};
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -4804,6 +4833,7 @@ mod tests {
             tracks: Vec::new(),
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
@@ -4851,6 +4881,7 @@ mod tests {
             tracks,
             overlays: Vec::new(),
             markers: Vec::new(),
+            format: None,
         }
     }
 
@@ -6677,6 +6708,79 @@ mod tests {
     }
 
     #[test]
+    fn the_delivery_format_sets_the_frame_every_render_path_uses() {
+        let mut timeline = Timeline::default();
+        // No delivery frame: the shape still follows the footage / the 1080p default.
+        let fmt = export_format(&timeline, &[], &ExportOptions::default());
+        assert_eq!((fmt.width, fmt.height), (1920, 1080));
+        assert_eq!(fmt.fit, Fit::Contain);
+
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let fmt = export_format(&timeline, &[], &ExportOptions::default());
+        assert_eq!((fmt.width, fmt.height), (1080, 1920), "the project frame wins over the footage");
+        assert_eq!(fmt.fit, Fit::Cover, "and brings its fit, so the preview crops like the export");
+    }
+
+    #[test]
+    fn an_explicit_export_resolution_still_overrides_the_delivery_format() {
+        let timeline = Timeline {
+            format: Some(Delivery::new(1080, 1920, Fit::Cover)),
+            ..Timeline::default()
+        };
+        let opts = ExportOptions {
+            resolution: Some((3840, 2160)),
+            ..Default::default()
+        };
+        let fmt = export_format(&timeline, &[], &opts);
+        assert_eq!((fmt.width, fmt.height), (3840, 2160));
+        // The fit is not overridden by a *default* Contain — only an explicit
+        // Cover would differ, and Contain is what a one-off resize wants anyway.
+        assert_eq!(fmt.fit, Fit::Cover);
+    }
+
+    #[test]
+    fn a_delivery_frame_is_even_clamped_and_never_zero() {
+        let d = Delivery::new(1081, 0, Fit::Cover);
+        assert_eq!((d.width, d.height), (1080, 2));
+    }
+
+    #[test]
+    fn the_preview_canvas_follows_the_delivery_frame() {
+        let timeline = Timeline {
+            format: Some(Delivery::new(1080, 1920, Fit::Cover)),
+            ..Timeline::default()
+        };
+        // Capped to max_width, but at the delivery aspect — not the footage's.
+        assert_eq!(preview_resolution(&timeline, &[], 540), (540, 960));
+        // Already inside the cap: kept as-is.
+        assert_eq!(preview_resolution(&timeline, &[], 2000), (1080, 1920));
+    }
+
+    #[test]
+    fn the_scrubbed_still_crops_like_the_export_when_the_delivery_covers() {
+        let canvas = |fit| StillCanvas {
+            w: 1080,
+            h: 1920,
+            fit,
+            sf: String::new(),
+        };
+        let contained = still_clip_chain(
+            &Transform::default(),
+            &Color::default(),
+            &[],
+            None,
+            &canvas(Fit::Contain),
+        );
+        assert!(contained.contains("force_original_aspect_ratio=decrease"));
+        assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
+
+        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover));
+        assert!(covered.contains("force_original_aspect_ratio=increase"));
+        assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
+        assert!(!covered.contains("pad="), "and never letterboxes: {covered}");
+    }
+
+    #[test]
     fn fit_defaults_to_the_historical_letterbox() {
         assert_eq!(ExportOptions::default().fit, Fit::Contain);
         let fmt = export_format(&Timeline::default(), &[], &ExportOptions::default());
@@ -7005,5 +7109,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(dark < 30.0, "contain should letterbox the top, got luma {dark}");
         assert!(bright > 60.0, "cover should fill the top with picture, got luma {bright}");
+    }
+
+    /// The delivery frame is the point of the whole feature: with it set and
+    /// **no** export resolution at all, a 16:9 source must still render a filled
+    /// 1080x1920 file — the same thing the preview showed while cutting.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored delivery_format_renders`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn delivery_format_renders_the_project_frame_without_an_export_resolution() {
+        let dir = std::env::temp_dir().join(format!("kerf-delivery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(1920, 1080, 30.0)];
+        let timeline = Timeline {
+            format: Some(Delivery::new(1080, 1920, Fit::Cover)),
+            ..single(vec![make_clip(asset.id, 0.0, 2.0, 0.0)])
+        };
+
+        let out = dir.join("vertical.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        render_with(&timeline, &[asset], &out, &opts).expect("delivery export");
+
+        let probed = command(&ffprobe_bin())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .expect("run ffprobe");
+        let dims = String::from_utf8_lossy(&probed.stdout).trim().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dims, "1080,1920", "the project frame decides the file's shape");
     }
 }

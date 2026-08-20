@@ -133,6 +133,13 @@
 		if ((r === 'bitrate' || r === 'two_pass') && !opts.video_bitrate) p.video_bitrate = '8M';
 		patch(p);
 	}
+	// The project's delivery frame, when it has one — what an unset export
+	// resolution now resolves to.
+	const projectFrame = $derived.by(() => {
+		const d = editor.timeline.format;
+		return d ? `${d.width}×${d.height}` : null;
+	});
+
 	function resValue(): string {
 		if (customRes) return 'custom';
 		return opts.resolution ? `${opts.resolution[0]}x${opts.resolution[1]}` : 'source';
@@ -453,11 +460,21 @@
 					'Resolution',
 					resValue(),
 					[
-						...RESOLUTIONS.map((r) => ({ value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source', label: r.label })),
+						...RESOLUTIONS.map((r) => ({
+							value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source',
+							// With a project frame set, "Source" is that frame — the export and
+							// the preview must not be able to disagree about the deliverable.
+							label: r.value ? r.label : projectFrame ? `Project frame (${projectFrame})` : r.label
+						})),
 						{ value: 'custom', label: 'Custom…' }
 					],
 					setRes
 				)}
+				{#if !opts.resolution && projectFrame}
+					<div style="font-size:11px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+						Renders the frame you have been cutting in. Pick a size to override it here only.
+					</div>
+				{/if}
 				{#if customRes}
 					<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
 						<input

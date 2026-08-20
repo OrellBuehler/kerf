@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, EditSource, ExportOptions, Keyframe, Project, Projection, ReframeKeyframe, Revision,
-    StreamKind, Task, TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
+    ReframeKeyframe, Revision, StreamKind, Task, TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -506,6 +506,23 @@ fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> C
     let project = state.project();
     project.set_track_duck(id, duck).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set the frame the project is cut for, or clear it back to the source shape.
+/// The preview, the scrubbed still and the export all read it, so the vertical
+/// crop is visible while cutting instead of only in the rendered file.
+#[tauri::command(async)]
+fn set_delivery_format(
+    state: State<'_, AppState>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fit: Option<Fit>,
+) -> CmdResult<Timeline> {
+    let format = match (width, height) {
+        (Some(w), Some(h)) => Some(Delivery::new(w, h, fit.unwrap_or(Fit::Cover))),
+        _ => None,
+    };
+    state.project().set_delivery_format(format).map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
@@ -1441,6 +1458,7 @@ pub fn run() {
             add_track,
             remove_track,
             set_track_duck,
+            set_delivery_format,
             set_track_muted,
             set_track_solo,
             set_track_locked,

@@ -263,10 +263,21 @@ export interface Marker {
 	color?: string | null;
 }
 
+/** The frame the project is cut *for* — the shape of the delivered video.
+ *  Every rendered picture (preview, scrubbed still, export) uses it, so a
+ *  vertical crop is visible while cutting rather than only in the output. */
+export interface Delivery {
+	width: number;
+	height: number;
+	fit: Fit;
+}
+
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
 	markers?: Marker[];
+	/** Unset = the shape follows the footage (the historical behaviour). */
+	format?: Delivery | null;
 }
 
 export interface AssetMetadata {

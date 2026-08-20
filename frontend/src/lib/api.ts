@@ -12,6 +12,7 @@ import type {
 	AudioEffect,
 	Clip,
 	Color,
+	Delivery,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
@@ -742,6 +743,20 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 		return snapshot();
 	}
 	return invoke<Timeline>('set_track_duck', { trackId, duck });
+}
+
+/** Set the frame the project is cut for, or pass `null` to follow the footage. */
+export async function setDeliveryFormat(format: Delivery | null): Promise<Timeline> {
+	if (!inTauri()) {
+		devTimeline.format = format;
+		recordDev(format ? `Deliver ${format.width}x${format.height}` : 'Deliver at source shape');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_delivery_format', {
+		width: format?.width ?? null,
+		height: format?.height ?? null,
+		fit: format?.fit ?? null
+	});
 }
 
 export async function setTrackMuted(trackId: string, muted: boolean): Promise<Timeline> {

@@ -42,6 +42,7 @@ import {
 	snapToBeats,
 	removeTrack,
 	setTrackDuck,
+	setDeliveryFormat,
 	setTrackMuted,
 	setTrackSolo,
 	setTrackLocked,
@@ -73,6 +74,7 @@ import type {
 	AudioEffect,
 	Clip,
 	Color,
+	Delivery,
 	ExportOptions,
 	Keyframe,
 	Projection,
@@ -478,6 +480,10 @@ class EditorState {
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
 		return this.#apply(setTrackDuck(trackId, duck));
+	}
+	/** The frame this project is cut for; `null` follows the footage's shape. */
+	setDeliveryFormat(format: Delivery | null) {
+		return this.#apply(setDeliveryFormat(format));
 	}
 	/** Add an auto-named marker at `time` — the M shortcut and the timeline menu. */
 	addMarkerAtPlayhead(time: number) {
