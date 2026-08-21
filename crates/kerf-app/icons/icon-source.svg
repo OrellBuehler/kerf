@@ -1,0 +1,14 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Kerf">
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#15264a"/>
+      <stop offset="1" stop-color="#0a1428"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="url(#navy)"/>
+  <g transform="translate(290.5 202) scale(14.762)">
+    <rect x="0" y="4" width="13" height="34" rx="1" fill="#eef1f5"/>
+    <rect x="17" y="8" width="13" height="34" rx="1" fill="#aab3bf"/>
+    <rect x="13.8" y="0" width="2.4" height="42" rx="1" fill="#e29d2e"/>
+  </g>
+</svg>

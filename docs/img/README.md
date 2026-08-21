@@ -5,7 +5,9 @@ This folder is the **single source of truth** for images used by both the reposi
 copies everything here into the site's `static/img/` at build time, so a file dropped
 here appears in both places.
 
-`kerf-mark.svg` is the Kerf logo — two clip bars split by the amber "cut" line.
+`kerf-mark.svg` is the Kerf logo — two clip bars split by the amber "cut" line. The
+app icon is the same mark on navy: `crates/kerf-app/icons/icon-source.svg` is the 1024px
+master every bundled icon is generated from (`bunx @tauri-apps/cli@2 icon <png> -o crates/kerf-app/icons`).
 
 ## Shot list
 
