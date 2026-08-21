@@ -232,7 +232,10 @@ cargo run    -p kerf-app  --no-default-features
 
 Two further optional features need a fuller toolchain and are off by default:
 `libav-render` (experimental in-process libav export) and `whisper` (local `whisper-rs`
-transcription; set `KERF_WHISPER_MODEL`).
+transcription; set `KERF_WHISPER_MODEL`). The **downloadable release bundles are built
+with `whisper`**, so transcription there never depends on the local `ffmpeg` having been
+built `--enable-whisper`; a build from source falls back to that filter unless you pass
+`--features whisper` (cmake + a C++ compiler + libclang).
 
 ---
 

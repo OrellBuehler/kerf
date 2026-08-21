@@ -68,10 +68,12 @@ jobs:
           # Windows has no system FFmpeg, so bundle ffmpeg/ffprobe as externalBin
           # sidecars (fetched below). Injecting externalBin only here keeps it out
           # of the plain `cargo build` CI runs, which don't ship the binaries.
+          # `resources` *replaces* the committed array rather than extending it,
+          # so it repeats the whisper.cpp notice every platform ships.
           - platform: windows-latest
             arch: x86_64
             args: ''
-            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
             bundleFfmpeg: true
     runs-on: ${{ matrix.platform }}
     steps:
@@ -105,6 +107,13 @@ jobs:
       - name: Fetch bundled FFmpeg
         if: matrix.bundleFfmpeg
         run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.arch }}-pc-windows-msvc
+      # Release bundles are built with the `whisper` cargo feature (see the args
+      # below), which compiles whisper.cpp in-process. Without it a release ships
+      # with no speech-to-text at all wherever the local `ffmpeg` lacks the
+      # (8.0+) `whisper` filter — which is every Windows install, since the
+      # sidecar fetched above is a `--disable-whisper` build.
+      - name: Install the whisper.cpp build toolchain
+        uses: ./.github/actions/whisper-toolchain
       - name: Build and upload bundles
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
@@ -125,9 +134,11 @@ jobs:
           # `--config` (per matrix row) zeroes out beforeBuildCommand (frontend is
           # already built) and, on Windows, adds the FFmpeg externalBin sidecars.
           # Everything after `--` is forwarded to cargo, where --no-default-features
-          # disables the FFmpeg dev-library dependency, and --locked builds exactly
-          # the dependency versions in the committed Cargo.lock.
-          args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features --locked"
+          # disables the FFmpeg dev-library dependency, --features whisper compiles
+          # in-process speech-to-text so transcription never depends on how the
+          # user's ffmpeg was configured, and --locked builds exactly the
+          # dependency versions in the committed Cargo.lock.
+          args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features --features whisper --locked"
 
   # The update feed the app polls (`plugins.updater.endpoints` in tauri.conf.json
   # points at this release asset). Built after every bundle is uploaded, from the

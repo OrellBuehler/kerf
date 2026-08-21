@@ -184,9 +184,15 @@ transcript tab and an agent both read it to explain an empty transcript.
 transcription runs **last** so the markers land before minutes of inference.
 
 Two more optional features: `libav-render` (above) and `whisper` (in-process
-`whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time — turn it on
-for release builds so transcription doesn't depend on how the user's ffmpeg was
-configured). Both are off by default and **not** exercised by `--no-default-features` CI.
+`whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time). Both are
+off by default, so `--no-default-features` CI exercises neither — but **release
+bundles are built `--features whisper`** (`release.yml`), because the bundled Windows
+FFmpeg is a `--disable-whisper` build and a release with no in-process backend would
+have no transcription at all there. `.github/actions/whisper-toolchain` installs and
+*verifies* that toolchain (a missing libclang is not an error to whisper-rs-sys — it
+silently falls back to its bundled Linux-generated bindings), and CI's `whisper` job
+compiles the feature on all three runners, plus the x86_64 macOS cross-compile the
+release does, so it can't break for the first time during a release.
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the

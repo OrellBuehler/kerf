@@ -1,0 +1,71 @@
+name: whisper.cpp build toolchain
+description: >-
+  Install what the `whisper` cargo feature needs to build whisper.cpp from
+  source: cmake, a C++ compiler, and libclang for bindgen. Shared by the release
+  bundles and by the CI job that rehearses them, so the two cannot drift.
+
+runs:
+  using: composite
+  steps:
+    - name: Install cmake + libclang (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y cmake libclang-dev
+
+    - name: Install cmake (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v cmake >/dev/null || brew install cmake
+
+    # bindgen loads libclang at *runtime*, and whisper-rs-sys treats not finding
+    # it as a warning, not an error: it falls back to the bindings.rs it ships,
+    # which were generated on Linux/glibc. A signed release must not silently be
+    # built from those, so an image that has lost libclang has to fail here —
+    # before the build — rather than quietly change what gets compiled.
+    - name: Verify libclang (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          dev=$(xcode-select --print-path)
+          candidates="$dev/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib
+        $dev/usr/lib/libclang.dylib
+        /Library/Developer/CommandLineTools/usr/lib/libclang.dylib"
+        else
+          # what `libclang-dev` installs; the libclang-cpp.so next to it is a
+          # different library and not the one bindgen loads.
+          candidates=$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null || true)
+        fi
+        for p in $candidates; do
+          if [ -e "$p" ]; then echo "libclang: $p"; exit 0; fi
+        done
+        echo "::error::libclang not found — whisper-rs-sys would fall back to its bundled Linux bindings"
+        exit 1
+
+    - name: Verify cmake + libclang (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+          Write-Output '::error::cmake not found on the runner image'
+          exit 1
+        }
+        # Standalone LLVM first, then the clang toolset Visual Studio ships.
+        $dlls = @("$env:ProgramFiles\LLVM\bin\libclang.dll") + (
+          Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Tools\Llvm\x64\bin\libclang.dll" `
+            -ErrorAction SilentlyContinue | ForEach-Object FullName
+        )
+        $hit = $dlls | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $hit) {
+          Write-Output '::error::libclang.dll not found — whisper-rs-sys would fall back to its bundled Linux bindings'
+          exit 1
+        }
+        Write-Output "libclang: $hit"
+        "LIBCLANG_PATH=$(Split-Path $hit)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
