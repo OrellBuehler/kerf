@@ -5,7 +5,7 @@ members = ["crates/kerf-core", "crates/kerf-app"]
 [workspace.package]
 version = "0.18.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.95"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["Orell Bühler <me@orellbuehler.ch>"]
 repository = "https://github.com/orellbuehler/kerf"
