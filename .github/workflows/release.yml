@@ -68,7 +68,7 @@ jobs:
         if: matrix.bundleFfmpeg
         run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.arch }}-pc-windows-msvc
       - name: Build and upload bundles
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signs the updater artifacts (`bundle.createUpdaterArtifacts`) with the
