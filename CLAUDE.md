@@ -404,7 +404,11 @@ which for this `crates/kerf-app` layout resolves to `crates/`, not the config di
 root — so they anchor to the repo via `cd "$(git rev-parse --show-toplevel)/frontend" && bun run dev`
 instead of a fragile relative path.
 `capabilities/default.json` grants `core:default` + `dialog:default` +
-`updater:default` + `process:allow-restart` + `opener:allow-open-url`.
+`updater:default` + `process:allow-restart` + `opener:allow-open-url`. That last
+one enables the command **with no scope of its own** (`allow-default-urls` is a
+separate permission), so it is listed in object form with an `allow` entry for
+`https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
+comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
 
 **Auto-update.** The app updates itself from its own GitHub releases via
 `tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both
@@ -421,8 +425,22 @@ updatable bundles (`.app.tar.gz` / `.AppImage` / NSIS `-setup.exe`) plus a
 `updater-manifest` job** assembles `latest.json` from the uploaded `.sig` files
 *after* all bundles land (`includeUpdaterJson: false` on the build step): the
 per-platform jobs run concurrently and each writing the manifest would leave
-only whichever finished last. Prereleases are skipped, so they never become the
-update everyone is offered. In-place update is per-platform: macOS and Windows
+only whichever finished last. It runs under `!cancelled()`, not on plain
+success — the matrix is `fail-fast: false`, and one platform failing must not
+leave the release with no manifest at all, which would 404 the feed for
+*everyone*. Prereleases are skipped, so they never become the update everyone is
+offered.
+
+**Publishing a release opens a gap in the feed**: the new tag becomes
+`releases/latest` the moment it is published, but its `latest.json` is only
+attached ~25 min later when the slowest bundle (Windows) finishes, so
+`releases/latest/download/latest.json` 404s until then and every running install's
+check fails with the plugin's `Could not fetch a valid release JSON`. `api.ts`
+rewrites that one error into an explanation (`describeFeedFailure`); the durable
+fix, if the wait ever becomes a problem, is to publish as a *prerelease* — which
+leaves `releases/latest` on the previous version, so checks say "up to date"
+instead of erroring — and have the manifest job clear the flag once the bundles
+are up. In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a
 link to the release page.
