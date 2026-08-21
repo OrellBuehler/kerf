@@ -258,7 +258,16 @@ no editing logic in the adapter.
   retrimmed at its **outgoing** edge (`source_in` for a reversed clip, whose tail
   is the source's head), gaps preserved and their incoming cuts snapped too,
   stretching only as far as the asset has footage (a still loops, so it is
-  unbounded).
+  unbounded). **What changed between two cuts** is here too and pure +
+  unit-tested: `Timeline::diff` returns a `TimelineDiff` — a `DiffEntry` per
+  change (`DiffKind` distinguishes an add from a cut from a *move* from a
+  *retrim*, because those are different things to review), each already phrased
+  for a human (`Trimmed clip on V1 at 0:04.0 — 4.0s → 2.5s (-1.5s)`) and
+  carrying the clip/track/time so a UI can jump there. Everything is matched by
+  **id**, so a reordered track reads as the handful of moves it is rather than as
+  every clip having been replaced, and a removed track is one entry instead of one
+  per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
+  labels, `stale`, and its diff).
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -276,6 +285,27 @@ no editing logic in the adapter.
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
   ready → done` (or `failed`) lifecycle in `model.rs`.
+  **Agent edits are staged, not applied** — the thing that makes an agent safe to
+  leave running on someone's cut. A one-row `staged` table holds a proposal (the
+  timeline being built, the one it branched from, the edit labels, the task it
+  belongs to); `edit_timeline` routes an edit into it whenever the actor is
+  `Agent` and a session is open, so the timeline the user is looking at never
+  moves under them. `begin_staging` opens one, `staged()` reports it *with its
+  diff* and whether it went `stale` (the user kept cutting, so applying would
+  replace their newer work — refused unless `apply_staged(force)`),
+  `apply_staged` lands it as **one** revision attributed to the agent (an empty
+  proposal just closes, rather than putting a no-op edit in the user's history)
+  and `discard_staged` throws it away. `working_timeline()` is the read side:
+  the proposal while the agent has one, the live timeline otherwise — every read
+  an edit depends on goes through it (including the preview, still and export
+  paths), so the agent can *look at* the cut it is proposing, and the GUI, which
+  never stages, always sees the live one. `restore` (undo/redo/revert) refuses
+  for an agent holding staged edits rather than walking the ground out from under
+  them. The queue ties in at both ends: `claim_next_task` opens a staging session
+  for the task, `resolve_task` applies it (accepting the task *is* accepting its
+  edits) and `remove_task` discards it. `diff_revisions` / `revision_diff` point
+  the same diff at the stored history snapshots, so the edit log can say what an
+  edit did rather than only which operation ran.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:
@@ -313,7 +343,16 @@ actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). The `lock
 helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
 helper sets `User` the same way); every **mutating** tool calls `self.changed()`, which
 emits a `project-changed` Tauri event so the webview re-fetches and the edit shows up
-live in the GUI.
+live in the GUI. Because agent edits **stage**, "live in the GUI" now means the
+proposal appears for review, not that the cut changes: the read tools
+(`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
+`working_timeline`, so the agent sees the cut it is building, and
+`timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
+`stage_edits` / `staged_diff` (the entries plus a rendered text summary) /
+`apply_staged_edits` / `discard_staged_edits` drive it explicitly, and
+`revision_diff` explains a past revision. The server `instructions` spell the flow
+out, since an agent that does not know its edits are held back would report a cut
+the user has not got.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
@@ -344,8 +383,11 @@ order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
-`remove_task` → the refreshed `Task[]`), and `export_timeline` (emits `export-progress`
-events) / `cancel_export`. **No command runs on the main thread** (a plain sync
+`remove_task` → the refreshed `Task[]`), the agent's staged proposal
+(`get_staged_edit` → the `StagedEdit` *with its diff*, so the review card renders
+from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit` /
+`discard_staged_edit`) and `revision_diff`, and `export_timeline` (emits
+`export-progress` events) / `cancel_export`. **No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
@@ -499,9 +541,23 @@ analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and 
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them) also run the matching local op and
 resolve their task; the rest just enqueue for the agent. In the browser there is no agent, so
-queued tasks correctly just wait. Below the queue, the **History** section renders
+queued tasks correctly just wait. Above the queue sits the **review card** — the
+panel's whole point, since an agent's task edits never touch the open cut. It renders
+`editor.staged`: the agent's note, a headline (`4 changes · 2:00.0 → 1:40.0 (-20.0s)`),
+the changes grouped by what they touch and tinted by the design system's own
+`--diff-add`/`--diff-remove`/`--diff-shift`, each row clicking through to the moment
+it describes. **Preview** swaps the editor onto the proposed timeline behind a
+banner (`editor.previewingStaged`; any real edit or a fresh `load()` drops back to
+the live cut, and `refreshTimeline` parks an incoming live update rather than
+yanking the view) — so the proposal can be *watched*, not only read. Apply lands it
+as one revision (confirming first when it went `stale`), Discard drops it. The
+headline arithmetic is `src/lib/diff.ts`, the bun-tested TS mirror of
+`TimelineDiff::headline`; the entries themselves are phrased by kerf-core, which is
+why `revisionDiff` returns `null` in the browser instead of a second, divergent diff
+engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
-`editor.revertTo(seq)`.
+`editor.revertTo(seq)`, and each row expands to *what* that revision changed
+(`revision_diff`).
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
 alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
@@ -516,6 +572,9 @@ dialog auto-opens the first time a given version is seen (remembered under
 UI plain data — so the browser harness can fake the whole flow: `bun run dev`
 with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, making
 the dialog explorable without a signed desktop build.
+`bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
+intro), which is how the whole review flow — card, preview swap, apply, discard — is
+driven end-to-end without a desktop build.
 `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
 all project data renders from the real backend.
 

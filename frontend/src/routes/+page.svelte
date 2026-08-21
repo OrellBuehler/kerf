@@ -301,6 +301,23 @@
 <div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<TitleBar />
 	<Toolbar {onNew} {onExport} {onOpen} {onSave} />
+	<!-- While a proposal is on screen the editor is showing a cut that is not
+	     the project's yet; say so where it cannot be missed. -->
+	{#if editor.previewingStaged}
+		<div
+			style="flex:none;display:flex;align-items:center;gap:9px;height:30px;padding:0 12px;background:var(--agent-surface);border-bottom:1px solid var(--agent-border);color:var(--agent-300);font-size:12px"
+		>
+			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
+			></span>
+			<span>Previewing the agent's proposed cut — your timeline is unchanged.</span>
+			<div style="flex:1"></div>
+			<button
+				onclick={() => editor.exitStagedPreview()}
+				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:1px solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				>Exit preview</button
+			>
+		</div>
+	{/if}
 	<div style="flex:1;display:flex;min-height:0">
 		<MediaBin />
 		<div style="flex:1;display:flex;flex-direction:column;min-width:0">

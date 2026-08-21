@@ -56,6 +56,11 @@ import {
 	rippleDelete,
 	cutClipRange,
 	revertTo as apiRevertTo,
+	revisionDiff as apiRevisionDiff,
+	applyStagedEdit,
+	discardStagedEdit,
+	getStagedEdit,
+	getStagedTimeline,
 	saveProjectAs as apiSaveProjectAs,
 	setColor,
 	setFade,
@@ -81,6 +86,7 @@ import type {
 	Reframe,
 	ReframeKeyframe,
 	Revision,
+	StagedEdit,
 	StreamKind,
 	TextKeyframe,
 	Marker,
@@ -105,6 +111,10 @@ class EditorState {
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
+	/** The proposal a connected agent has staged, or null. */
+	staged = $state<StagedEdit | null>(null);
+	/** While true, `timeline` holds the *proposed* cut, not the live one. */
+	previewingStaged = $state(false);
 	currentPath = $state<string | null>(null);
 	loading = $state(false);
 	busy = $state(false);
@@ -118,6 +128,8 @@ class EditorState {
 	error = $state<string | null>(null);
 
 	#waveforms = new Map<string, number[] | Promise<number[]>>();
+	/** The live cut, parked while `previewingStaged` shows the proposal. */
+	#liveTimeline: Timeline | null = null;
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
@@ -254,12 +266,15 @@ class EditorState {
 		this.loading = true;
 		this.error = null;
 		try {
+			this.previewingStaged = false;
+			this.#liveTimeline = null;
 			[this.assets, this.timeline, this.history, this.currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
 				getHistory(),
 				projectPath()
 			]);
+			await this.refreshStaged();
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
 			}
@@ -312,7 +327,59 @@ class EditorState {
 	}
 
 	async refreshTimeline() {
-		this.timeline = await getTimeline();
+		const live = await getTimeline();
+		// While the proposal is on screen the live cut is parked, not shown —
+		// an agent edit landing mid-review must not yank the view out from
+		// under the person reading it.
+		if (this.previewingStaged) this.#liveTimeline = live;
+		else this.timeline = live;
+		await this.refreshStaged();
+	}
+
+	// ---- staged edits (the agent's pending proposal) ------------------------
+
+	async refreshStaged() {
+		try {
+			this.staged = await getStagedEdit();
+		} catch {
+			this.staged = null;
+		}
+		if (!this.staged && this.previewingStaged) await this.exitStagedPreview();
+		else if (this.staged && this.previewingStaged) {
+			// The agent staged more while we were looking at it.
+			const proposed = await getStagedTimeline();
+			if (proposed) this.timeline = proposed;
+		}
+	}
+
+	/** Show the proposed cut in the editor instead of the live one. */
+	async previewStaged() {
+		const proposed = await getStagedTimeline();
+		if (!proposed) return;
+		if (!this.previewingStaged) this.#liveTimeline = this.timeline;
+		this.timeline = proposed;
+		this.previewingStaged = true;
+		this.clearSelection();
+	}
+
+	async exitStagedPreview() {
+		if (!this.previewingStaged) return;
+		this.previewingStaged = false;
+		this.timeline = this.#liveTimeline ?? (await getTimeline());
+		this.#liveTimeline = null;
+		this.clearSelection();
+	}
+
+	/** Accept the proposal — it lands on the live timeline as one revision. */
+	async applyStaged(force = false) {
+		await this.#apply(applyStagedEdit(force));
+		await this.refreshStaged();
+	}
+
+	/** Throw the proposal away; the live timeline is untouched. */
+	async discardStaged() {
+		await this.#apply(discardStagedEdit());
+		await this.refreshStaged();
 	}
 
 	async refreshHistory() {
@@ -395,6 +462,9 @@ class EditorState {
 	async #apply(op: Promise<Timeline>) {
 		this.busy = true;
 		this.error = null;
+		// Any real edit is an edit to the live cut, so reviewing is over.
+		this.previewingStaged = false;
+		this.#liveTimeline = null;
 		try {
 			this.timeline = await op;
 			await this.refreshHistory();
@@ -615,6 +685,10 @@ class EditorState {
 	revertTo(seq: number) {
 		this.clearSelection();
 		return this.#apply(apiRevertTo(seq));
+	}
+	/** What one revision changed; null where the backend can't say (browser). */
+	revisionDiff(seq: number) {
+		return apiRevisionDiff(seq);
 	}
 
 	async export(outputPath: string, options: ExportOptions): Promise<string> {

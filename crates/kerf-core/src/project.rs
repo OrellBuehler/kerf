@@ -11,13 +11,12 @@ use uuid::Uuid;
 
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
+use crate::model::default_beat_tolerance;
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, Clip, Delivery, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe,
-    Revision,
-    StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, Track, Transition,
-    VideoEffect, MAX_FOV, MIN_FOV,
+    Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    TimelineDiff, Track, Transition, VideoEffect, MAX_FOV, MIN_FOV,
 };
-use crate::model::default_beat_tolerance;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -57,6 +56,20 @@ CREATE TABLE IF NOT EXISTS history (
     source     TEXT NOT NULL,
     snapshot   TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+-- At most one pending proposal (`id = 1`), holding the timeline the agent is
+-- building, the one it branched from, and the labels of the edits it made.
+CREATE TABLE IF NOT EXISTS staged (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    base_seq   INTEGER NOT NULL,
+    base       TEXT NOT NULL,
+    timeline   TEXT NOT NULL,
+    edits      TEXT NOT NULL,
+    task_id    TEXT,
+    note       TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -577,7 +590,7 @@ impl Project {
     /// them out under the project lock and then **drop the guard** before running
     /// the slow ffmpeg composite — see [`Project::composite_timeline_frame`].
     pub fn timeline_frame_inputs(&self) -> Result<(Timeline, Vec<Asset>)> {
-        Ok((self.timeline()?, self.preview_assets()?))
+        Ok((self.working_timeline()?, self.preview_assets()?))
     }
 
     /// Composite a timeline still from already-resolved inputs, **without**
@@ -672,6 +685,15 @@ impl Project {
     /// edit and its history head move atomically — and the timeline is
     /// serialized once and reused for both writes.
     fn edit_timeline<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        // While the agent has a staging session open its edits go to the
+        // proposal instead, leaving the cut the user is looking at alone. The
+        // GUI never stages, so a user edit always lands live — and makes any
+        // open proposal `stale`.
+        if self.actor == EditSource::Agent {
+            if let Some(row) = self.staged_row()? {
+                return self.edit_staged(row, label, f);
+            }
+        }
         let tx = self.conn.unchecked_transaction()?;
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
@@ -680,6 +702,162 @@ impl Project {
         self.record_revision(label, self.actor, &json)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    // ---- staged edits -----------------------------------------------------
+
+    /// The timeline the current actor is working on: the staged proposal while
+    /// the agent has one open, otherwise the live timeline.
+    ///
+    /// Every read that an agent's next edit depends on goes through this, so the
+    /// agent sees its own staged work — including the preview and export paths,
+    /// which is the point: it can look at the cut it is proposing before handing
+    /// it over. The GUI never stages, so it always sees the live timeline.
+    pub fn working_timeline(&self) -> Result<Timeline> {
+        if self.actor == EditSource::Agent {
+            if let Some(timeline) = self.staged_timeline()? {
+                return Ok(timeline);
+            }
+        }
+        self.timeline()
+    }
+
+    fn staged_row(&self) -> Result<Option<StagedRow>> {
+        self.conn
+            .query_row(
+                "SELECT base_seq, base, timeline, edits, task_id, note, created_at, updated_at FROM staged WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(base_seq, base, timeline, edits, task_id, note, created_at, updated_at)| {
+                Ok(StagedRow {
+                    base_seq,
+                    base,
+                    timeline,
+                    edits: serde_json::from_str(&edits)?,
+                    task_id: task_id.as_deref().map(parse_uuid).transpose()?,
+                    note,
+                    created_at: parse_dt(&created_at)?,
+                    updated_at: parse_dt(&updated_at)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Apply an edit to the pending proposal rather than the live timeline,
+    /// appending its label to the running list of what has been staged.
+    fn edit_staged<R>(&self, row: StagedRow, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
+        let result = f(&mut timeline)?;
+        let mut edits = row.edits;
+        edits.push(label.to_string());
+        self.conn.execute(
+            "UPDATE staged SET timeline = ?1, edits = ?2, updated_at = ?3 WHERE id = 1",
+            params![
+                serde_json::to_string(&timeline)?,
+                serde_json::to_string(&edits)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(result)
+    }
+
+    /// Open a staging session branched from the live timeline: from here until
+    /// [`Self::apply_staged`] or [`Self::discard_staged`], agent edits are held
+    /// back for review instead of changing the cut the user sees.
+    pub fn begin_staging(&self, task_id: Option<Uuid>, note: Option<&str>) -> Result<StagedEdit> {
+        if self.staged_row()?.is_some() {
+            return Err(Error::StagedEditPending);
+        }
+        let snapshot = serde_json::to_string(&self.timeline()?)?;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO staged (id, base_seq, base, timeline, edits, task_id, note, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?2, '[]', ?3, ?4, ?5, ?5)",
+            params![self.head()?, snapshot, task_id.map(|id| id.to_string()), note, now],
+        )?;
+        self.staged()?.ok_or(Error::NoStagedEdit)
+    }
+
+    /// The pending proposal — what it would change, and whether the live
+    /// timeline has moved on underneath it — or `None` when nothing is staged.
+    pub fn staged(&self) -> Result<Option<StagedEdit>> {
+        let Some(row) = self.staged_row()? else {
+            return Ok(None);
+        };
+        let base: Timeline = serde_json::from_str(&row.base)?;
+        let proposed: Timeline = serde_json::from_str(&row.timeline)?;
+        Ok(Some(StagedEdit {
+            base_seq: row.base_seq,
+            task_id: row.task_id,
+            note: row.note,
+            edits: row.edits,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            stale: self.head()? != row.base_seq,
+            diff: base.diff(&proposed),
+        }))
+    }
+
+    /// The staged timeline itself, for previewing the proposal.
+    pub fn staged_timeline(&self) -> Result<Option<Timeline>> {
+        match self.staged_row()? {
+            Some(row) => Ok(Some(serde_json::from_str(&row.timeline)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Accept the proposal: it becomes the live timeline as a **single**
+    /// revision, and the staging session closes.
+    ///
+    /// Refuses a `stale` proposal unless `force` — one branched from a cut the
+    /// user has since edited would silently replace that newer work.
+    pub fn apply_staged(&self, force: bool) -> Result<Timeline> {
+        let row = self.staged_row()?.ok_or(Error::NoStagedEdit)?;
+        if self.head()? != row.base_seq && !force {
+            return Err(Error::StagedEditStale);
+        }
+        let base: Timeline = serde_json::from_str(&row.base)?;
+        let proposed: Timeline = serde_json::from_str(&row.timeline)?;
+        let diff = base.diff(&proposed);
+        // A session that staged nothing (or staged and undid it) just closes —
+        // recording a revision here would put an edit that changed nothing into
+        // the user's history.
+        if diff.is_empty() {
+            self.conn.execute("DELETE FROM staged", [])?;
+            return self.timeline();
+        }
+        let label = match (&row.note, row.edits.as_slice()) {
+            (Some(note), _) => note.clone(),
+            (None, [one]) => one.clone(),
+            (None, edits) => format!("Agent edit ({} of {} changes)", diff.entries.len(), edits.len()),
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        self.save_timeline_str(&row.timeline)?;
+        self.record_revision(&label, EditSource::Agent, &row.timeline)?;
+        self.conn.execute("DELETE FROM staged", [])?;
+        tx.commit()?;
+        Ok(proposed)
+    }
+
+    /// Throw the proposal away, leaving the live timeline untouched.
+    pub fn discard_staged(&self) -> Result<Timeline> {
+        if self.conn.execute("DELETE FROM staged", [])? == 0 {
+            return Err(Error::NoStagedEdit);
+        }
+        self.timeline()
     }
 
     // ---- history ----------------------------------------------------------
@@ -721,6 +899,14 @@ impl Project {
     /// Restore the stored snapshot at `seq` as the live timeline and move the
     /// head there. Does not itself record a new revision.
     fn restore(&self, seq: i64) -> Result<Timeline> {
+        // Undo/redo/revert walk the *live* history. An agent holding staged
+        // edits would be moving the ground under its own proposal, so make it
+        // say which it means rather than guessing.
+        if self.actor == EditSource::Agent && self.staged_row()?.is_some() {
+            return Err(Error::InvalidArgument(
+                "the timeline history is not available while edits are staged — apply or discard them first".to_string(),
+            ));
+        }
         let snapshot: Option<String> = self
             .conn
             .query_row("SELECT snapshot FROM history WHERE seq = ?1", params![seq], |r| r.get(0))
@@ -805,6 +991,31 @@ impl Project {
     /// Jump the head to any revision `seq`, returning the restored timeline.
     pub fn revert_to(&self, seq: i64) -> Result<Timeline> {
         self.restore(seq)
+    }
+
+    fn revision_timeline(&self, seq: i64) -> Result<Timeline> {
+        let snapshot: Option<String> = self
+            .conn
+            .query_row("SELECT snapshot FROM history WHERE seq = ?1", params![seq], |r| r.get(0))
+            .optional()?;
+        Ok(serde_json::from_str(&snapshot.ok_or(Error::RevisionNotFound(seq))?)?)
+    }
+
+    /// What changed between two stored revisions. Both snapshots are already
+    /// kept for undo, so the edit log can explain itself rather than just
+    /// listing operation names.
+    pub fn diff_revisions(&self, from: i64, to: i64) -> Result<TimelineDiff> {
+        Ok(self.revision_timeline(from)?.diff(&self.revision_timeline(to)?))
+    }
+
+    /// What one revision changed (`seq - 1` → `seq`). Revision 0 is the baseline
+    /// and changed nothing.
+    pub fn revision_diff(&self, seq: i64) -> Result<TimelineDiff> {
+        let timeline = self.revision_timeline(seq)?;
+        if seq <= 0 {
+            return Ok(timeline.diff(&timeline));
+        }
+        self.diff_revisions(seq - 1, seq)
     }
 
     // ---- timeline operations ---------------------------------------------
@@ -1115,7 +1326,7 @@ impl Project {
     /// lands at `at`, each staying on its source track. The by-id convenience
     /// over [`Self::insert_clips`], for duplicate and for agent use.
     pub fn duplicate_clips(&self, clip_ids: &[Uuid], at: f64) -> Result<Vec<Clip>> {
-        let timeline = self.timeline()?;
+        let timeline = self.working_timeline()?;
         let placements = clip_ids
             .iter()
             .map(|id| {
@@ -1202,7 +1413,7 @@ impl Project {
             timeline.format = format.map(|d| Delivery::new(d.width, d.height, d.fit));
             Ok(())
         })?;
-        self.timeline()
+        self.working_timeline()
     }
 
     /// Mute or unmute a track: its clips stop rendering (silent for audio,
@@ -1579,7 +1790,7 @@ impl Project {
 
     /// Render the timeline to `output_path`. Requires the `ffmpeg` feature.
     pub fn export(&self, output_path: impl AsRef<Path>, format: &str) -> Result<PathBuf> {
-        let timeline = self.timeline()?;
+        let timeline = self.working_timeline()?;
         let assets = self.list_assets()?;
         let output = output_path.as_ref();
         engine::render(&timeline, &assets, output, format)?;
@@ -1588,7 +1799,7 @@ impl Project {
 
     /// Like [`export`] but with explicit [`engine::ExportOptions`].
     pub fn export_with(&self, output_path: impl AsRef<Path>, opts: &engine::ExportOptions) -> Result<PathBuf> {
-        let timeline = self.timeline()?;
+        let timeline = self.working_timeline()?;
         let assets = self.list_assets()?;
         let output = output_path.as_ref();
         engine::render_with(&timeline, &assets, output, opts)?;
@@ -1698,7 +1909,16 @@ impl Project {
             )
             .optional()?;
         match next {
-            Some(id) => Ok(Some(self.set_task_state(parse_uuid(&id)?, TaskStatus::Working, None)?)),
+            Some(id) => {
+                let id = parse_uuid(&id)?;
+                // Claiming a task opens a staging session for it, so the work an
+                // agent does on the user's behalf is a proposal by default and
+                // never rewrites the open cut unasked.
+                if self.staged_row()?.is_none() {
+                    self.begin_staging(Some(id), None)?;
+                }
+                Ok(Some(self.set_task_state(id, TaskStatus::Working, None)?))
+            }
             None => Ok(None),
         }
     }
@@ -1713,17 +1933,26 @@ impl Project {
         self.set_task_state(id, TaskStatus::Failed, Some(Some(error.to_string())))
     }
 
-    /// Mark a task `done` (the user accepted the staged edit).
+    /// Mark a task `done` — the user accepted its work, so a proposal staged
+    /// under it is applied in the same breath.
     pub fn resolve_task(&self, id: Uuid) -> Result<Task> {
+        if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
+            self.apply_staged(false)?;
+        }
         self.set_task_state(id, TaskStatus::Done, None)
     }
 
+    /// Drop a task, and with it any proposal staged under it — dismissing the
+    /// task is how the user says no to the edit.
     pub fn remove_task(&self, id: Uuid) -> Result<()> {
         let affected = self
             .conn
             .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
         if affected == 0 {
             return Err(Error::TaskNotFound(id));
+        }
+        if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
+            self.discard_staged()?;
         }
         Ok(())
     }
@@ -2139,7 +2368,7 @@ impl Project {
 
     /// The projection of the asset a clip references, if it is 360 footage.
     fn clip_asset_projection(&self, clip_id: Uuid) -> Result<Option<Projection>> {
-        let timeline = self.timeline()?;
+        let timeline = self.working_timeline()?;
         let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let asset_id = timeline.tracks[ti].clips[ci].asset_id;
         Ok(self.get_asset(asset_id)?.and_then(|a| a.projection()))
@@ -2528,6 +2757,19 @@ fn row_to_asset(
     })
 }
 
+/// The `staged` row as stored: timelines still serialized, so an edit that only
+/// touches the proposal never pays to deserialize the base.
+struct StagedRow {
+    base_seq: i64,
+    base: String,
+    timeline: String,
+    edits: Vec<String>,
+    task_id: Option<Uuid>,
+    note: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
 fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| Error::Other(format!("invalid uuid {s}: {e}")))
 }
@@ -2549,7 +2791,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Fit;
+    use crate::model::{DiffKind, Fit};
 
     #[test]
     fn sample_project_has_assets_and_timeline() {
@@ -3470,7 +3712,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kerf-delivery-{}.kerf", Uuid::new_v4()));
         project.save_as(&path).unwrap();
         let reopened = Project::open(&path).unwrap();
-        assert_eq!(reopened.timeline().unwrap().format, Some(Delivery::new(1080, 1920, Fit::Cover)));
+        assert_eq!(
+            reopened.timeline().unwrap().format,
+            Some(Delivery::new(1080, 1920, Fit::Cover))
+        );
         drop(reopened);
         let _ = std::fs::remove_file(&path);
 
@@ -3506,5 +3751,182 @@ mod tests {
         Project::sample().unwrap().save_as(&path).unwrap();
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A sample project with the agent driving, which is the only actor whose
+    /// edits stage.
+    fn agent_project() -> Project {
+        let mut project = Project::sample().unwrap();
+        project.set_actor(EditSource::Agent);
+        project
+    }
+
+    fn first_clip(project: &Project) -> Clip {
+        project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.clone())
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn staged_agent_edits_leave_the_live_timeline_alone_until_applied() {
+        let project = agent_project();
+        let clip = first_clip(&project);
+        let before = project.timeline().unwrap();
+        let revisions_before = project.history().unwrap().len();
+
+        project.begin_staging(None, None).unwrap();
+        project.set_volume(clip.id, 0.4).unwrap();
+        project.remove(clip.id).unwrap();
+
+        // The cut the user is looking at has not moved.
+        let live = project.timeline().unwrap();
+        assert_eq!(live.duration(), before.duration());
+        assert!(live.clip(clip.id).is_some());
+        assert_eq!(project.history().unwrap().len(), revisions_before);
+        // …but the agent sees its own work.
+        assert!(project.working_timeline().unwrap().clip(clip.id).is_none());
+
+        let staged = project.staged().unwrap().unwrap();
+        assert!(!staged.stale);
+        assert_eq!(staged.edits, vec!["Set volume".to_string(), "Remove clip".to_string()]);
+        assert!(staged.diff.entries.iter().any(|e| e.kind == DiffKind::ClipRemoved));
+
+        let applied = project.apply_staged(false).unwrap();
+        assert!(applied.clip(clip.id).is_none());
+        assert!(project.timeline().unwrap().clip(clip.id).is_none());
+        assert!(project.staged().unwrap().is_none());
+
+        // Two edits, one revision: the user accepted a proposal, not a replay.
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions_before + 1);
+        let latest = history.last().unwrap();
+        assert_eq!(latest.source, EditSource::Agent);
+        assert!(latest.label.starts_with("Agent edit ("), "{}", latest.label);
+    }
+
+    #[test]
+    fn discarding_a_proposal_leaves_no_trace() {
+        let project = agent_project();
+        let clip = first_clip(&project);
+        let revisions_before = project.history().unwrap().len();
+
+        project.begin_staging(None, Some("tighten the intro")).unwrap();
+        project.remove(clip.id).unwrap();
+        project.discard_staged().unwrap();
+
+        assert!(project.staged().unwrap().is_none());
+        assert!(project.timeline().unwrap().clip(clip.id).is_some());
+        assert_eq!(project.history().unwrap().len(), revisions_before);
+        assert!(matches!(project.discard_staged(), Err(Error::NoStagedEdit)));
+    }
+
+    #[test]
+    fn a_user_edit_underneath_makes_the_proposal_stale() {
+        let mut project = agent_project();
+        let clips: Vec<Clip> = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.clone())
+            .collect();
+
+        project.begin_staging(None, None).unwrap();
+        project.set_volume(clips[0].id, 0.2).unwrap();
+
+        // The user keeps cutting while the agent works.
+        project.set_actor(EditSource::User);
+        project.set_volume(clips[1].id, 0.9).unwrap();
+        project.set_actor(EditSource::Agent);
+
+        let staged = project.staged().unwrap().unwrap();
+        assert!(staged.stale, "the live timeline moved on since the proposal branched");
+        assert!(matches!(project.apply_staged(false), Err(Error::StagedEditStale)));
+
+        // Forcing it is the explicit "replace that newer cut" choice.
+        let applied = project.apply_staged(true).unwrap();
+        assert_eq!(applied.clip(clips[0].id).unwrap().volume, 0.2);
+        assert_eq!(applied.clip(clips[1].id).unwrap().volume, 1.0);
+    }
+
+    #[test]
+    fn staging_refuses_to_nest_and_history_refuses_to_move_under_it() {
+        let project = agent_project();
+        project.begin_staging(None, None).unwrap();
+        assert!(matches!(project.begin_staging(None, None), Err(Error::StagedEditPending)));
+        // Undo would walk the live history out from under the proposal.
+        assert!(project.undo().is_err());
+        project.discard_staged().unwrap();
+        assert!(project.begin_staging(None, None).is_ok());
+    }
+
+    #[test]
+    fn applying_a_proposal_that_changed_nothing_adds_no_revision() {
+        let project = agent_project();
+        let revisions_before = project.history().unwrap().len();
+        project.begin_staging(None, None).unwrap();
+        project.apply_staged(false).unwrap();
+        assert_eq!(project.history().unwrap().len(), revisions_before);
+        assert!(project.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn claiming_a_task_stages_its_work_and_resolving_applies_it() {
+        let mut project = Project::open_in_memory().unwrap();
+        let task = project.add_task("tighten the intro").unwrap();
+
+        project.set_actor(EditSource::Agent);
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.task_id, Some(claimed.id));
+
+        project.add_track(StreamKind::Video, Some("B-roll".to_string())).unwrap();
+        assert_eq!(project.timeline().unwrap().tracks.len(), 2, "live cut untouched");
+        assert_eq!(project.working_timeline().unwrap().tracks.len(), 3);
+
+        project
+            .complete_task(task.id, Some("added a B-roll track".to_string()))
+            .unwrap();
+        // Accepting the task is accepting its edits.
+        project.resolve_task(task.id).unwrap();
+        assert_eq!(project.timeline().unwrap().tracks.len(), 3);
+        assert!(project.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn dismissing_a_task_throws_its_staged_edits_away() {
+        let mut project = Project::open_in_memory().unwrap();
+        let task = project.add_task("tighten the intro").unwrap();
+        project.set_actor(EditSource::Agent);
+        project.claim_next_task().unwrap().unwrap();
+        project.add_track(StreamKind::Video, Some("B-roll".to_string())).unwrap();
+
+        project.remove_task(task.id).unwrap();
+        assert!(project.staged().unwrap().is_none());
+        assert_eq!(project.timeline().unwrap().tracks.len(), 2);
+    }
+
+    #[test]
+    fn a_revision_explains_what_it_changed() {
+        let project = Project::sample().unwrap();
+        let clip = first_clip(&project);
+        project.set_volume(clip.id, 0.25).unwrap();
+
+        let seq = project.history().unwrap().last().unwrap().seq;
+        let diff = project.revision_diff(seq).unwrap();
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, DiffKind::ClipChanged);
+        assert!(
+            diff.entries[0].detail.as_deref().unwrap().contains("volume 100% → 25%"),
+            "{:?}",
+            diff.entries[0].detail
+        );
+        // The baseline revision changed nothing by definition.
+        assert!(project.revision_diff(0).unwrap().is_empty());
     }
 }

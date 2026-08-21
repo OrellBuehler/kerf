@@ -402,7 +402,7 @@ impl TransitionKind {
 
 /// A transition blending the **start** of a clip with the clip that precedes it
 /// on the same track. Realized at export.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transition {
     pub kind: TransitionKind,
     /// Duration of the transition in seconds.
@@ -432,6 +432,18 @@ pub enum VideoEffect {
 }
 
 impl VideoEffect {
+    /// Short name, for listing a chain in a diff or a log line.
+    pub fn name(&self) -> &'static str {
+        match self {
+            VideoEffect::Blur { .. } => "blur",
+            VideoEffect::Sharpen { .. } => "sharpen",
+            VideoEffect::Grayscale => "grayscale",
+            VideoEffect::Invert => "invert",
+            VideoEffect::Vignette => "vignette",
+            VideoEffect::ChromaKey { .. } => "chroma key",
+        }
+    }
+
     /// True when applying this effect leaves the frame with an alpha channel.
     pub fn produces_alpha(&self) -> bool {
         matches!(self, VideoEffect::ChromaKey { .. })
@@ -461,6 +473,19 @@ pub enum AudioEffect {
     },
     /// Noise gate: silence audio below `threshold_db`.
     Gate { threshold_db: f64 },
+}
+
+impl AudioEffect {
+    /// Short name, for listing a chain in a diff or a log line.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AudioEffect::Highpass { .. } => "highpass",
+            AudioEffect::Lowpass { .. } => "lowpass",
+            AudioEffect::Equalizer { .. } => "EQ",
+            AudioEffect::Compressor { .. } => "compressor",
+            AudioEffect::Gate { .. } => "gate",
+        }
+    }
 }
 
 fn half() -> f64 {
@@ -710,7 +735,7 @@ pub struct TextKeyframe {
 /// as a fraction of the frame height. Rendered with `drawtext`. Captions are
 /// just a batch of these generated from a transcript (see
 /// `Project::captions_from_transcript`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextOverlay {
     pub id: Uuid,
     pub text: String,
@@ -1234,10 +1259,39 @@ pub struct Revision {
     pub current: bool,
 }
 
+/// A batch of edits held back from the live timeline for the user to review.
+///
+/// This is what makes an agent safe to leave running on someone's cut: while a
+/// staging session is open, every agent edit lands here instead of on the
+/// timeline the user is looking at, and nothing moves under them until they
+/// accept it. The user's own edits are unaffected and keep going straight to the
+/// live timeline — which is what `stale` reports, since a proposal branched from
+/// a cut that has since moved on would replace that newer work rather than build
+/// on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedEdit {
+    /// History seq the proposal was branched from.
+    pub base_seq: i64,
+    /// The task the agent was working when staging began, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    /// The agent's own description of what it is proposing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Labels of the individual edits, in the order they were staged.
+    pub edits: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// The live timeline has moved on since `base_seq`.
+    pub stale: bool,
+    /// What applying it would do to the cut.
+    pub diff: TimelineDiff,
+}
+
 /// A named point on the timeline. Purely an annotation — it renders nothing —
 /// but it gives the user and the agent a shared vocabulary for places in the
 /// cut ("the laugh at 01:12"), which timestamps alone do not.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Marker {
     pub id: Uuid,
     /// Position on the timeline, seconds.
@@ -1266,6 +1320,15 @@ pub enum Fit {
     Cover,
 }
 
+impl Fit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Fit::Contain => "contain",
+            Fit::Cover => "cover",
+        }
+    }
+}
+
 /// The frame the project is cut *for* — the shape of the thing being delivered.
 ///
 /// Without one, a timeline's shape is whatever the first video clip happens to
@@ -1290,7 +1353,11 @@ impl Delivery {
     /// Even-clamped, and never zero — the dimensions reach a filtergraph.
     pub fn new(width: u32, height: u32, fit: Fit) -> Self {
         let even = |v: u32| v.max(2) & !1;
-        Self { width: even(width), height: even(height), fit }
+        Self {
+            width: even(width),
+            height: even(height),
+            fit,
+        }
     }
 
     pub fn aspect(&self) -> f64 {
@@ -1610,6 +1677,664 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
 }
 
+// ---- diff ------------------------------------------------------------------
+
+/// Below this, two timeline values are the same value — the timeline round-trips
+/// through JSON on every edit, so an exact compare would be honest but noisy.
+const DIFF_EPS: f64 = 1e-6;
+
+fn num_changed(a: f64, b: f64) -> bool {
+    (a - b).abs() > DIFF_EPS
+}
+
+/// `m:ss.d`, the way an editor reads a timeline position.
+fn fmt_time(secs: f64) -> String {
+    let s = secs.max(0.0);
+    let m = (s / 60.0).floor();
+    format!("{}:{:04.1}", m as i64, s - m * 60.0)
+}
+
+fn fmt_delta(secs: f64) -> String {
+    if secs >= 0.0 {
+        format!("+{secs:.1}s")
+    } else {
+        format!("{secs:.1}s")
+    }
+}
+
+/// What one [`DiffEntry`] is about. The UI groups and tints by this; the kinds
+/// are deliberately editorial (a *retrim* is a different thing to review than a
+/// *move*) rather than one generic "clip changed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffKind {
+    TrackAdded,
+    TrackRemoved,
+    TrackChanged,
+    ClipAdded,
+    ClipRemoved,
+    ClipMoved,
+    ClipRetrimmed,
+    ClipChanged,
+    OverlayAdded,
+    OverlayRemoved,
+    OverlayChanged,
+    MarkerAdded,
+    MarkerRemoved,
+    MarkerChanged,
+    FormatChanged,
+}
+
+impl DiffKind {
+    /// Whether this entry adds, removes, or alters something — the three tints a
+    /// diff needs.
+    pub fn polarity(self) -> &'static str {
+        match self {
+            DiffKind::TrackAdded | DiffKind::ClipAdded | DiffKind::OverlayAdded | DiffKind::MarkerAdded => "added",
+            DiffKind::TrackRemoved | DiffKind::ClipRemoved | DiffKind::OverlayRemoved | DiffKind::MarkerRemoved => "removed",
+            _ => "changed",
+        }
+    }
+}
+
+/// One change between two timelines, phrased for a human reviewing a cut.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffEntry {
+    pub kind: DiffKind,
+    /// One line, e.g. `Trimmed clip on V1 at 0:04.0 — 4.0s → 2.5s (-1.5s)`.
+    pub summary: String,
+    /// Field-level specifics behind a `*Changed` entry, e.g. `volume 100% → 40%`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_id: Option<Uuid>,
+    /// Where on the timeline to look, so the reviewer can jump straight to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<f64>,
+}
+
+impl DiffEntry {
+    fn new(kind: DiffKind, summary: String) -> Self {
+        Self {
+            kind,
+            summary,
+            detail: None,
+            track_id: None,
+            clip_id: None,
+            at: None,
+        }
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    fn on_track(mut self, id: Uuid) -> Self {
+        self.track_id = Some(id);
+        self
+    }
+
+    fn on_clip(mut self, id: Uuid) -> Self {
+        self.clip_id = Some(id);
+        self
+    }
+
+    fn at(mut self, time: f64) -> Self {
+        self.at = Some(time);
+        self
+    }
+}
+
+/// What a set of edits did to a cut: the individual changes plus the two numbers
+/// an editor checks first — how long it is now, and how many clips it has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineDiff {
+    pub entries: Vec<DiffEntry>,
+    pub duration_before: f64,
+    pub duration_after: f64,
+    pub clips_before: usize,
+    pub clips_after: usize,
+}
+
+impl TimelineDiff {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// A single line: how many changes and what they did to the runtime.
+    pub fn headline(&self) -> String {
+        if self.entries.is_empty() {
+            return "No changes".to_string();
+        }
+        let n = self.entries.len();
+        let mut s = format!("{n} change{}", if n == 1 { "" } else { "s" });
+        if num_changed(self.duration_before, self.duration_after) {
+            s.push_str(&format!(
+                " · {} → {} ({})",
+                fmt_time(self.duration_before),
+                fmt_time(self.duration_after),
+                fmt_delta(self.duration_after - self.duration_before)
+            ));
+        } else {
+            s.push_str(&format!(" · {}", fmt_time(self.duration_after)));
+        }
+        if self.clips_before != self.clips_after {
+            s.push_str(&format!(" · {} → {} clips", self.clips_before, self.clips_after));
+        }
+        s
+    }
+
+    /// The headline followed by one line per change — what an agent reads back
+    /// and what the review card renders.
+    pub fn summary(&self) -> String {
+        let mut out = self.headline();
+        for e in &self.entries {
+            out.push_str("\n  • ");
+            out.push_str(&e.summary);
+            if let Some(d) = &e.detail {
+                out.push_str(" (");
+                out.push_str(d);
+                out.push(')');
+            }
+        }
+        out
+    }
+}
+
+fn clip_index(timeline: &Timeline) -> HashMap<Uuid, (&Track, &Clip)> {
+    let mut map = HashMap::new();
+    for track in &timeline.tracks {
+        for clip in &track.clips {
+            map.insert(clip.id, (track, clip));
+        }
+    }
+    map
+}
+
+fn kind_name(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Video => "video",
+        StreamKind::Audio => "audio",
+        StreamKind::Subtitle => "subtitle",
+        StreamKind::Data => "data",
+    }
+}
+
+fn joined(parts: Vec<String>) -> Option<String> {
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn track_changes(before: &Track, after: &Track) -> Option<String> {
+    let mut parts = Vec::new();
+    if before.name != after.name {
+        parts.push(format!("renamed {} → {}", before.name, after.name));
+    }
+    for (was, is, on, off) in [
+        (before.muted, after.muted, "muted", "unmuted"),
+        (before.solo, after.solo, "soloed", "unsoloed"),
+        (before.locked, after.locked, "locked", "unlocked"),
+        (before.duck, after.duck, "ducking on", "ducking off"),
+    ] {
+        if was != is {
+            parts.push((if is { on } else { off }).to_string());
+        }
+    }
+    joined(parts)
+}
+
+fn transform_changes(before: &Transform, after: &Transform) -> Vec<String> {
+    let mut parts = Vec::new();
+    for (label, a, b) in [
+        ("scale", before.scale, after.scale),
+        ("x", before.pos_x, after.pos_x),
+        ("y", before.pos_y, after.pos_y),
+        ("rotation", before.rotation, after.rotation),
+        ("opacity", before.opacity, after.opacity),
+    ] {
+        if num_changed(a, b) {
+            parts.push(format!("{label} {a:.2} → {b:.2}"));
+        }
+    }
+    if before.has_crop() != after.has_crop()
+        || num_changed(before.crop_left, after.crop_left)
+        || num_changed(before.crop_right, after.crop_right)
+        || num_changed(before.crop_top, after.crop_top)
+        || num_changed(before.crop_bottom, after.crop_bottom)
+    {
+        parts.push(if after.has_crop() { "cropped" } else { "crop cleared" }.to_string());
+    }
+    parts
+}
+
+fn color_changes(before: &Color, after: &Color) -> Vec<String> {
+    let mut parts = Vec::new();
+    for (label, a, b) in [
+        ("brightness", before.brightness, after.brightness),
+        ("contrast", before.contrast, after.contrast),
+        ("saturation", before.saturation, after.saturation),
+        ("gamma", before.gamma, after.gamma),
+        ("temperature", before.temperature, after.temperature),
+    ] {
+        if num_changed(a, b) {
+            parts.push(format!("{label} {a:.2} → {b:.2}"));
+        }
+    }
+    parts
+}
+
+fn effect_list<T>(effects: &[T], name: impl Fn(&T) -> &'static str) -> String {
+    if effects.is_empty() {
+        "none".to_string()
+    } else {
+        effects.iter().map(name).collect::<Vec<_>>().join("+")
+    }
+}
+
+fn reframe_changes(before: Option<&Reframe>, after: Option<&Reframe>) -> Vec<String> {
+    match (before, after) {
+        (None, None) => Vec::new(),
+        (None, Some(_)) => vec!["reframe added".to_string()],
+        (Some(_), None) => vec!["reframe cleared".to_string()],
+        (Some(a), Some(b)) => {
+            if a == b {
+                return Vec::new();
+            }
+            let mut parts = Vec::new();
+            for (label, x, y) in [
+                ("yaw", a.yaw, b.yaw),
+                ("pitch", a.pitch, b.pitch),
+                ("roll", a.roll, b.roll),
+                ("fov", a.fov, b.fov),
+            ] {
+                if num_changed(x, y) {
+                    parts.push(format!("{label} {x:.0}° → {y:.0}°"));
+                }
+            }
+            if a.keyframes.len() != b.keyframes.len() {
+                parts.push(format!("reframe keyframes {} → {}", a.keyframes.len(), b.keyframes.len()));
+            } else if a.keyframes != b.keyframes {
+                parts.push("reframe keyframes retimed".to_string());
+            }
+            if parts.is_empty() {
+                parts.push("reframe changed".to_string());
+            }
+            parts
+        }
+    }
+}
+
+fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
+    let mut parts = Vec::new();
+    if before.asset_id != after.asset_id {
+        parts.push("different source asset".to_string());
+    }
+    if (before.volume - after.volume).abs() > DIFF_EPS as f32 {
+        parts.push(format!("volume {:.0}% → {:.0}%", before.volume * 100.0, after.volume * 100.0));
+    }
+    for (label, a, b) in [
+        ("fade in", before.fade_in, after.fade_in),
+        ("fade out", before.fade_out, after.fade_out),
+    ] {
+        if num_changed(a, b) {
+            parts.push(format!("{label} {a:.2}s → {b:.2}s"));
+        }
+    }
+    if num_changed(before.speed, after.speed) {
+        parts.push(format!("speed {:.2}× → {:.2}×", before.speed, after.speed));
+    }
+    if before.enabled != after.enabled {
+        parts.push(if after.enabled { "re-enabled" } else { "disabled" }.to_string());
+    }
+    parts.extend(transform_changes(&before.transform, &after.transform));
+    parts.extend(color_changes(&before.color, &after.color));
+    if before.transition_in != after.transition_in {
+        parts.push(match &after.transition_in {
+            None => "transition removed".to_string(),
+            Some(t) => format!("transition {} {:.2}s", t.kind.as_str(), t.duration),
+        });
+    }
+    if before.effects != after.effects {
+        parts.push(format!(
+            "video effects {} → {}",
+            effect_list(&before.effects, VideoEffect::name),
+            effect_list(&after.effects, VideoEffect::name)
+        ));
+    }
+    if before.audio != after.audio {
+        parts.push(format!(
+            "audio effects {} → {}",
+            effect_list(&before.audio, AudioEffect::name),
+            effect_list(&after.audio, AudioEffect::name)
+        ));
+    }
+    if before.keyframes.len() != after.keyframes.len() {
+        parts.push(format!("keyframes {} → {}", before.keyframes.len(), after.keyframes.len()));
+    } else if before.keyframes != after.keyframes {
+        parts.push("keyframes retimed".to_string());
+    }
+    parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
+    joined(parts)
+}
+
+fn overlay_changes(before: &TextOverlay, after: &TextOverlay) -> Option<String> {
+    let mut parts = Vec::new();
+    if before.text != after.text {
+        parts.push(format!("text “{}” → “{}”", before.text, after.text));
+    }
+    if num_changed(before.start, after.start) || num_changed(before.end, after.end) {
+        parts.push(format!(
+            "timing {}–{} → {}–{}",
+            fmt_time(before.start),
+            fmt_time(before.end),
+            fmt_time(after.start),
+            fmt_time(after.end)
+        ));
+    }
+    if num_changed(before.pos_x, after.pos_x) || num_changed(before.pos_y, after.pos_y) {
+        parts.push(format!(
+            "position {:.2},{:.2} → {:.2},{:.2}",
+            before.pos_x, before.pos_y, after.pos_x, after.pos_y
+        ));
+    }
+    if num_changed(before.size, after.size) {
+        parts.push(format!("size {:.3} → {:.3}", before.size, after.size));
+    }
+    if before.color != after.color {
+        parts.push(format!("color {} → {}", before.color, after.color));
+    }
+    if before.bg != after.bg {
+        parts.push("box changed".to_string());
+    }
+    if before.font != after.font {
+        parts.push("font changed".to_string());
+    }
+    if before.bold != after.bold {
+        parts.push(if after.bold { "bold" } else { "not bold" }.to_string());
+    }
+    if before.keyframes != after.keyframes {
+        parts.push(format!("keyframes {} → {}", before.keyframes.len(), after.keyframes.len()));
+    }
+    joined(parts)
+}
+
+fn fmt_delivery(d: &Delivery) -> String {
+    format!("{}x{} ({})", d.width, d.height, d.fit.as_str())
+}
+
+impl Timeline {
+    /// What changed between this timeline and `after`, phrased for a human
+    /// reviewing a cut.
+    ///
+    /// Everything is matched by id — clips keep theirs across a move, a trim and
+    /// a retime — so a reordered track reads as the handful of moves it is
+    /// rather than as every clip having been replaced. Pure, and the single
+    /// source of truth behind both the staged-edit review card and
+    /// [`crate::project::Project::diff_revisions`].
+    pub fn diff(&self, after: &Timeline) -> TimelineDiff {
+        let before_clips = clip_index(self);
+        let after_clips = clip_index(after);
+
+        let mut tracks = Vec::new();
+        let mut clips = Vec::new();
+
+        for track in &after.tracks {
+            match self.track(track.id) {
+                None => tracks.push(
+                    DiffEntry::new(
+                        DiffKind::TrackAdded,
+                        format!("Added {} track {}", kind_name(track.kind), track.name),
+                    )
+                    .on_track(track.id),
+                ),
+                Some(before) => {
+                    if let Some(detail) = track_changes(before, track) {
+                        tracks.push(
+                            DiffEntry::new(DiffKind::TrackChanged, format!("Changed track {}", track.name))
+                                .detail(detail)
+                                .on_track(track.id),
+                        );
+                    }
+                }
+            }
+        }
+        for track in &self.tracks {
+            if after.track(track.id).is_none() {
+                let n = track.clips.len();
+                tracks.push(
+                    DiffEntry::new(
+                        DiffKind::TrackRemoved,
+                        format!(
+                            "Removed {} track {} ({n} clip{})",
+                            kind_name(track.kind),
+                            track.name,
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    )
+                    .on_track(track.id),
+                );
+            }
+        }
+
+        // Clips whose whole track went away are already covered by the track
+        // entry above; listing each of them again would bury the one change the
+        // reviewer actually has to judge.
+        for track in &self.tracks {
+            if after.track(track.id).is_none() {
+                continue;
+            }
+            for clip in &track.clips {
+                if after_clips.contains_key(&clip.id) {
+                    continue;
+                }
+                clips.push(
+                    DiffEntry::new(
+                        DiffKind::ClipRemoved,
+                        format!(
+                            "Removed clip from {} at {} ({:.1}s)",
+                            track.name,
+                            fmt_time(clip.timeline_start),
+                            clip.duration()
+                        ),
+                    )
+                    .on_track(track.id)
+                    .on_clip(clip.id)
+                    .at(clip.timeline_start),
+                );
+            }
+        }
+
+        for track in &after.tracks {
+            for clip in &track.clips {
+                let Some((before_track, before_clip)) = before_clips.get(&clip.id) else {
+                    clips.push(
+                        DiffEntry::new(
+                            DiffKind::ClipAdded,
+                            format!(
+                                "Added clip to {} at {} ({:.1}s)",
+                                track.name,
+                                fmt_time(clip.timeline_start),
+                                clip.duration()
+                            ),
+                        )
+                        .on_track(track.id)
+                        .on_clip(clip.id)
+                        .at(clip.timeline_start),
+                    );
+                    continue;
+                };
+                if before_track.id != track.id {
+                    clips.push(
+                        DiffEntry::new(
+                            DiffKind::ClipMoved,
+                            format!(
+                                "Moved clip from {} to {} at {}",
+                                before_track.name,
+                                track.name,
+                                fmt_time(clip.timeline_start)
+                            ),
+                        )
+                        .on_track(track.id)
+                        .on_clip(clip.id)
+                        .at(clip.timeline_start),
+                    );
+                } else if num_changed(before_clip.timeline_start, clip.timeline_start) {
+                    clips.push(
+                        DiffEntry::new(
+                            DiffKind::ClipMoved,
+                            format!(
+                                "Moved clip on {} — {} → {}",
+                                track.name,
+                                fmt_time(before_clip.timeline_start),
+                                fmt_time(clip.timeline_start)
+                            ),
+                        )
+                        .on_track(track.id)
+                        .on_clip(clip.id)
+                        .at(clip.timeline_start),
+                    );
+                }
+                if num_changed(before_clip.source_in, clip.source_in) || num_changed(before_clip.source_out, clip.source_out) {
+                    let (was, is) = (before_clip.source_duration(), clip.source_duration());
+                    clips.push(
+                        DiffEntry::new(
+                            DiffKind::ClipRetrimmed,
+                            format!(
+                                "Trimmed clip on {} at {} — {was:.1}s → {is:.1}s ({})",
+                                track.name,
+                                fmt_time(clip.timeline_start),
+                                fmt_delta(is - was)
+                            ),
+                        )
+                        .on_track(track.id)
+                        .on_clip(clip.id)
+                        .at(clip.timeline_start),
+                    );
+                }
+                if let Some(detail) = clip_changes(before_clip, clip) {
+                    clips.push(
+                        DiffEntry::new(
+                            DiffKind::ClipChanged,
+                            format!("Adjusted clip on {} at {}", track.name, fmt_time(clip.timeline_start)),
+                        )
+                        .detail(detail)
+                        .on_track(track.id)
+                        .on_clip(clip.id)
+                        .at(clip.timeline_start),
+                    );
+                }
+            }
+        }
+
+        let mut rest = Vec::new();
+        for overlay in &after.overlays {
+            match self.overlay(overlay.id) {
+                None => rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayAdded,
+                        format!(
+                            "Added text “{}” at {}–{}",
+                            overlay.text,
+                            fmt_time(overlay.start),
+                            fmt_time(overlay.end)
+                        ),
+                    )
+                    .at(overlay.start),
+                ),
+                Some(before) => {
+                    if let Some(detail) = overlay_changes(before, overlay) {
+                        rest.push(
+                            DiffEntry::new(DiffKind::OverlayChanged, format!("Changed text “{}”", overlay.text))
+                                .detail(detail)
+                                .at(overlay.start),
+                        );
+                    }
+                }
+            }
+        }
+        for overlay in &self.overlays {
+            if after.overlay(overlay.id).is_none() {
+                rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayRemoved,
+                        format!("Removed text “{}” at {}", overlay.text, fmt_time(overlay.start)),
+                    )
+                    .at(overlay.start),
+                );
+            }
+        }
+
+        let before_markers: HashMap<Uuid, &Marker> = self.markers.iter().map(|m| (m.id, m)).collect();
+        for marker in &after.markers {
+            match before_markers.get(&marker.id) {
+                None => rest.push(
+                    DiffEntry::new(
+                        DiffKind::MarkerAdded,
+                        format!("Added marker “{}” at {}", marker.name, fmt_time(marker.time)),
+                    )
+                    .at(marker.time),
+                ),
+                Some(before) => {
+                    let mut parts = Vec::new();
+                    if before.name != marker.name {
+                        parts.push(format!("renamed “{}” → “{}”", before.name, marker.name));
+                    }
+                    if num_changed(before.time, marker.time) {
+                        parts.push(format!("moved {} → {}", fmt_time(before.time), fmt_time(marker.time)));
+                    }
+                    if before.color != marker.color {
+                        parts.push("recolored".to_string());
+                    }
+                    if let Some(detail) = joined(parts) {
+                        rest.push(
+                            DiffEntry::new(DiffKind::MarkerChanged, format!("Changed marker “{}”", marker.name))
+                                .detail(detail)
+                                .at(marker.time),
+                        );
+                    }
+                }
+            }
+        }
+        for marker in &self.markers {
+            if !after.markers.iter().any(|m| m.id == marker.id) {
+                rest.push(
+                    DiffEntry::new(
+                        DiffKind::MarkerRemoved,
+                        format!("Removed marker “{}” at {}", marker.name, fmt_time(marker.time)),
+                    )
+                    .at(marker.time),
+                );
+            }
+        }
+
+        if self.format != after.format {
+            let summary = match (&self.format, &after.format) {
+                (None, Some(d)) => format!("Set the delivery frame to {}", fmt_delivery(d)),
+                (Some(d), None) => format!("Cleared the delivery frame (was {})", fmt_delivery(d)),
+                (Some(a), Some(b)) => format!("Delivery frame {} → {}", fmt_delivery(a), fmt_delivery(b)),
+                (None, None) => unreachable!(),
+            };
+            rest.push(DiffEntry::new(DiffKind::FormatChanged, summary));
+        }
+
+        tracks.append(&mut clips);
+        tracks.append(&mut rest);
+        TimelineDiff {
+            entries: tracks,
+            duration_before: self.duration(),
+            duration_after: after.duration(),
+            clips_before: before_clips.len(),
+            clips_after: after_clips.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1865,5 +2590,160 @@ mod tests {
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);
+    }
+
+    #[test]
+    fn an_untouched_timeline_diffs_to_nothing() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0), clip_at(4.0, 3.0)])],
+            ..Timeline::new()
+        };
+        let diff = tl.diff(&tl.clone());
+        assert!(diff.is_empty());
+        assert_eq!(diff.headline(), "No changes");
+        assert_eq!(diff.clips_before, 2);
+    }
+
+    #[test]
+    fn diff_names_the_move_the_trim_and_the_removal() {
+        let tl = Timeline {
+            tracks: vec![track(
+                StreamKind::Video,
+                "V1",
+                vec![clip_at(0.0, 4.0), clip_at(4.0, 3.0), clip_at(7.0, 2.0)],
+            )],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        {
+            let clips = &mut after.tracks[0].clips;
+            clips[0].source_out = 2.5; // retrim
+            clips[1].timeline_start = 5.0; // move
+            clips.remove(2); // cut
+        }
+
+        let diff = tl.diff(&after);
+        let kinds: Vec<DiffKind> = diff.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![DiffKind::ClipRemoved, DiffKind::ClipRetrimmed, DiffKind::ClipMoved]
+        );
+        assert_eq!(diff.clips_before, 3);
+        assert_eq!(diff.clips_after, 2);
+        // The retrim reports the source window, and the entry carries the clip
+        // so the reviewer can jump to it.
+        assert!(
+            diff.entries[1].summary.contains("4.0s → 2.5s (-1.5s)"),
+            "{}",
+            diff.entries[1].summary
+        );
+        assert_eq!(diff.entries[1].clip_id, Some(after.tracks[0].clips[0].id));
+        assert!(
+            diff.entries[2].summary.contains("0:04.0 → 0:05.0"),
+            "{}",
+            diff.entries[2].summary
+        );
+        // The headline leads with what the edit did to the runtime.
+        assert_eq!(diff.headline(), "3 changes · 0:09.0 → 0:08.0 (-1.0s) · 3 → 2 clips");
+    }
+
+    #[test]
+    fn a_removed_track_is_one_change_not_one_per_clip() {
+        let tl = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)]),
+                track(StreamKind::Audio, "A1", vec![clip_at(0.0, 4.0), clip_at(4.0, 4.0)]),
+            ],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        after.tracks.remove(1);
+
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, DiffKind::TrackRemoved);
+        assert!(
+            diff.entries[0].summary.contains("A1 (2 clips)"),
+            "{}",
+            diff.entries[0].summary
+        );
+    }
+
+    #[test]
+    fn a_clip_dragged_to_another_track_reads_as_one_move() {
+        let mut tl = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)]),
+                track(StreamKind::Video, "V2", vec![]),
+            ],
+            ..Timeline::new()
+        };
+        tl.tracks[1].kind = StreamKind::Video;
+        let mut after = tl.clone();
+        let clip = after.tracks[0].clips.remove(0);
+        after.tracks[1].clips.push(clip);
+
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, DiffKind::ClipMoved);
+        assert!(
+            diff.entries[0].summary.contains("from V1 to V2"),
+            "{}",
+            diff.entries[0].summary
+        );
+    }
+
+    #[test]
+    fn diff_details_what_changed_on_a_clip() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)])],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        {
+            let c = &mut after.tracks[0].clips[0];
+            c.volume = 0.4;
+            c.speed = 2.0;
+            c.effects.push(VideoEffect::Vignette);
+            c.enabled = false;
+        }
+
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, DiffKind::ClipChanged);
+        let detail = diff.entries[0].detail.clone().unwrap();
+        assert!(detail.contains("volume 100% → 40%"), "{detail}");
+        assert!(detail.contains("speed 1.00× → 2.00×"), "{detail}");
+        assert!(detail.contains("disabled"), "{detail}");
+        assert!(detail.contains("video effects none → vignette"), "{detail}");
+    }
+
+    #[test]
+    fn diff_covers_overlays_markers_and_the_delivery_frame() {
+        let tl = Timeline::new();
+        let mut after = tl.clone();
+        after.overlays.push(TextOverlay::new("Hello", 1.0, 3.0));
+        after.markers.push(Marker {
+            id: Uuid::new_v4(),
+            time: 72.0,
+            name: "the laugh".to_string(),
+            color: None,
+        });
+        after.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+
+        let diff = tl.diff(&after);
+        let kinds: Vec<DiffKind> = diff.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![DiffKind::OverlayAdded, DiffKind::MarkerAdded, DiffKind::FormatChanged]
+        );
+        assert!(diff.entries[1].summary.contains("1:12.0"), "{}", diff.entries[1].summary);
+        assert!(
+            diff.entries[2].summary.contains("1080x1920 (cover)"),
+            "{}",
+            diff.entries[2].summary
+        );
+        // Every entry lands in the rendered summary the agent reads back.
+        assert_eq!(diff.summary().lines().count(), 4);
     }
 }

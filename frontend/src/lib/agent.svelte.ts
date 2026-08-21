@@ -7,6 +7,7 @@
 // renders `agent.tasks` directly.
 
 import { addTask, listTasks, removeTask, resolveTask } from './api';
+import { editor } from './state.svelte';
 import type { Task, TaskStatus } from './types';
 
 class AgentQueue {
@@ -55,12 +56,18 @@ class AgentQueue {
 		return task;
 	}
 
+	/** Accept a task — and with it any edits staged under it, which the backend
+	 *  applies in the same call, so the timeline and history have to re-read. */
 	async resolve(taskId: string): Promise<void> {
 		this.tasks = await resolveTask(taskId);
+		await editor.refreshTimeline();
+		await editor.refreshHistory();
 	}
 
+	/** Dismiss a task, discarding any proposal staged under it. */
 	async remove(taskId: string): Promise<void> {
 		this.tasks = await removeTask(taskId);
+		await editor.refreshTimeline();
 	}
 
 	#msg(e: unknown): string {

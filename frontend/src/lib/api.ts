@@ -22,11 +22,13 @@ import type {
 	Reframe,
 	ReframeKeyframe,
 	Revision,
+	StagedEdit,
 	StreamKind,
 	Task,
 	TextKeyframe,
 	TextOverlay,
 	Timeline,
+	TimelineDiff,
 	Track,
 	Transform,
 	Transition,
@@ -36,6 +38,7 @@ import type {
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
+import { formatTime as fmtTime } from './diff';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1314,6 +1317,156 @@ export async function revertTo(seq: number): Promise<Timeline> {
 	return invoke<Timeline>('revert_to', { seq });
 }
 
+/**
+ * What one revision changed. `null` in the browser harness — the diff engine
+ * lives in kerf-core, and mirroring it here would be a second source of truth
+ * for the one thing the review card must not get wrong.
+ */
+export async function revisionDiff(seq: number): Promise<TimelineDiff | null> {
+	if (!inTauri()) return null;
+	return invoke<TimelineDiff>('revision_diff', { seq });
+}
+
+// ---- staged edits (the agent's pending proposal) ---------------------------
+//
+// A connected agent's task edits never touch the open cut: they accumulate in a
+// proposal that the user applies or discards. In the browser there is no agent,
+// so `?staged=1` seeds a synthetic one — the review flow is the point, and it
+// has to be explorable (and testable) without a desktop build.
+
+function timelineDuration(tl: Timeline): number {
+	return tl.tracks.reduce((m, t) => Math.max(m, trackEnd(t)), 0);
+}
+
+/** The `true` in the browser harness: `?staged=1` seeds a fake agent proposal. */
+function fakeStagedRequested(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('staged');
+}
+
+let devStaged: { edit: StagedEdit; timeline: Timeline } | null = null;
+let devStagedSeeded = false;
+
+/** A plausible proposal over the dev timeline: a tightened intro, ripple closed. */
+function seedDevStaged() {
+	devStagedSeeded = true;
+	const before = snapshot();
+	const proposed = snapshot();
+	const video = proposed.tracks.find((t) => t.kind === 'video');
+	const audio = proposed.tracks.find((t) => t.kind === 'audio');
+	if (!video || video.clips.length < 2 || !audio || audio.clips.length === 0) return;
+
+	const [first, second] = video.clips;
+	const entries: TimelineDiff['entries'] = [];
+	const wasSource = first.source_out - first.source_in;
+	first.source_out = first.source_in + wasSource - 3.5;
+	entries.push({
+		kind: 'clip_retrimmed',
+		summary: `Trimmed clip on ${video.name} at ${fmtTime(first.timeline_start)} — ${wasSource.toFixed(1)}s → ${(wasSource - 3.5).toFixed(1)}s (-3.5s)`,
+		track_id: video.id,
+		clip_id: first.id,
+		at: first.timeline_start
+	});
+	const movedFrom = second.timeline_start;
+	second.timeline_start = trackEnd({ ...video, clips: [first] });
+	entries.push({
+		kind: 'clip_moved',
+		summary: `Moved clip on ${video.name} — ${fmtTime(movedFrom)} → ${fmtTime(second.timeline_start)}`,
+		track_id: video.id,
+		clip_id: second.id,
+		at: second.timeline_start
+	});
+	const bed = audio.clips[0];
+	const bedWas = bed.source_out - bed.source_in;
+	bed.source_out = bed.source_in + bedWas - 20;
+	entries.push({
+		kind: 'clip_retrimmed',
+		summary: `Trimmed clip on ${audio.name} at ${fmtTime(bed.timeline_start)} — ${bedWas.toFixed(1)}s → ${(bedWas - 20).toFixed(1)}s (-20.0s)`,
+		track_id: audio.id,
+		clip_id: bed.id,
+		at: bed.timeline_start
+	});
+	const overlay: TextOverlay = {
+		id: uid(),
+		text: 'How we cut this',
+		start: 1,
+		end: 4,
+		pos_x: 0.5,
+		pos_y: 0.5,
+		size: 0.08,
+		color: 'white',
+		bold: true
+	};
+	proposed.overlays = [...(proposed.overlays ?? []), overlay];
+	entries.push({
+		kind: 'overlay_added',
+		summary: `Added text “${overlay.text}” at ${fmtTime(overlay.start)}–${fmtTime(overlay.end)}`,
+		at: overlay.start
+	});
+
+	const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
+	devStaged = {
+		timeline: proposed,
+		edit: {
+			base_seq: devHead,
+			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
+			note: 'Tighten the intro',
+			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay'],
+			created_at: now(),
+			updated_at: now(),
+			stale: false,
+			diff: {
+				entries,
+				duration_before: timelineDuration(before),
+				duration_after: timelineDuration(proposed),
+				clips_before: countClips(before),
+				clips_after: countClips(proposed)
+			}
+		}
+	};
+}
+
+/** The proposal a connected agent has staged, or `null` when there is none. */
+export async function getStagedEdit(): Promise<StagedEdit | null> {
+	if (!inTauri()) {
+		if (!devStagedSeeded && fakeStagedRequested()) seedDevStaged();
+		return devStaged ? structuredClone(devStaged.edit) : null;
+	}
+	return invoke<StagedEdit | null>('get_staged_edit');
+}
+
+/** The staged timeline itself, for previewing the proposal in the editor. */
+export async function getStagedTimeline(): Promise<Timeline | null> {
+	if (!inTauri()) {
+		if (!devStagedSeeded && fakeStagedRequested()) seedDevStaged();
+		return devStaged ? structuredClone(devStaged.timeline) : null;
+	}
+	return invoke<Timeline | null>('get_staged_timeline');
+}
+
+/** Accept the proposal: it becomes the live timeline as a single revision. */
+export async function applyStagedEdit(force = false): Promise<Timeline> {
+	if (!inTauri()) {
+		if (!devStaged) throw new Error('no staged edit is pending');
+		if (devStaged.edit.stale && !force) throw new Error('the timeline changed since these edits were staged');
+		devTimeline = structuredClone(devStaged.timeline);
+		recordDev(devStaged.edit.note ?? 'Agent edit');
+		devHistory[devHead].source = 'agent';
+		devStaged = null;
+		return snapshot();
+	}
+	return invoke<Timeline>('apply_staged_edit', { force });
+}
+
+/** Throw the proposal away, leaving the live timeline untouched. */
+export async function discardStagedEdit(): Promise<Timeline> {
+	if (!inTauri()) {
+		if (!devStaged) throw new Error('no staged edit is pending');
+		devStaged = null;
+		return snapshot();
+	}
+	return invoke<Timeline>('discard_staged_edit');
+}
+
 // ---- agent task queue ------------------------------------------------------
 //
 // The desktop app persists tasks in kerf-core; a connected LLM claims and works
@@ -1339,6 +1492,8 @@ export async function addTask(prompt: string): Promise<Task> {
 /** Accept a staged edit (status → done); resolves to the refreshed queue. */
 export async function resolveTask(taskId: string): Promise<Task[]> {
 	if (!inTauri()) {
+		// Accepting a task is accepting its edits — same rule as kerf-core.
+		if (devStaged?.edit.task_id === taskId) await applyStagedEdit(true);
 		devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
 		return structuredClone(devTasks);
 	}
@@ -1348,6 +1503,7 @@ export async function resolveTask(taskId: string): Promise<Task[]> {
 /** Remove a task from the queue; resolves to the refreshed queue. */
 export async function removeTask(taskId: string): Promise<Task[]> {
 	if (!inTauri()) {
+		if (devStaged?.edit.task_id === taskId) await discardStagedEdit();
 		devTasks = devTasks.filter((t) => t.id !== taskId);
 		return structuredClone(devTasks);
 	}

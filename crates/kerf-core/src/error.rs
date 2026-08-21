@@ -34,6 +34,15 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("no staged edit is pending")]
+    NoStagedEdit,
+
+    #[error("a staged edit is already pending; apply or discard it first")]
+    StagedEditPending,
+
+    #[error("the timeline changed since these edits were staged — applying would replace that newer cut; apply with force, or discard the staged edit")]
+    StagedEditStale,
+
     #[error("FFmpeg support is not enabled in this build (enable the `ffmpeg` feature)")]
     FfmpegDisabled,
 

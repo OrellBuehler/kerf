@@ -38,6 +38,28 @@ pub struct KerfMcp {
 // ---- tool parameter schemas ------------------------------------------------
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct StageEditsParams {
+    #[schemars(description = "One line describing what you are about to propose; it becomes the label of the applied revision")]
+    note: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ApplyStagedParams {
+    #[schemars(
+        description = "Apply even though the user has edited the timeline since these edits were staged, replacing their newer cut. Default false."
+    )]
+    force: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RevisionDiffParams {
+    #[schemars(description = "Revision seq to explain (see history); the diff is from the revision before it")]
+    seq: i64,
+    #[schemars(description = "Compare against this revision seq instead of `seq - 1`")]
+    from: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AssetIdParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
@@ -314,7 +336,9 @@ struct ColorParams {
     saturation: Option<f64>,
     #[schemars(description = "Gamma 0.1–10.0 (1.0 = unchanged); omit to leave unchanged")]
     gamma: Option<f64>,
-    #[schemars(description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged")]
+    #[schemars(
+        description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged"
+    )]
     temperature: Option<f64>,
 }
 
@@ -648,6 +672,10 @@ struct TimelineSummary {
     /// framing anything: under a cover delivery the crop decides what survives.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery_format: Option<String>,
+    /// Set while edits are staged: this summary describes the **proposal**, not
+    /// the cut the user is looking at. `staged_diff` spells out the difference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staged_changes: Option<usize>,
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -681,7 +709,7 @@ impl KerfMcp {
     #[tool(description = "Get the full non-destructive timeline state (tracks and clips)")]
     fn get_timeline_state(&self) -> Result<String, McpError> {
         let project = self.lock();
-        json(&project.timeline().map_err(core_err)?)
+        json(&project.working_timeline().map_err(core_err)?)
     }
 
     #[tool(
@@ -1274,6 +1302,65 @@ impl KerfMcp {
         json(&out)
     }
 
+    #[tool(
+        description = "Begin a staged edit: from here on your edits are held back as a proposal the user reviews \
+                       instead of changing the cut they are looking at. Your own reads (get_timeline_state, \
+                       preview_timeline, timeline_summary, export) follow the proposal, so you can check your work \
+                       before handing it over. claim_next_task already does this for you."
+    )]
+    fn stage_edits(&self, Parameters(p): Parameters<StageEditsParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        let staged = project.begin_staging(None, p.note.as_deref()).map_err(core_err)?;
+        self.changed();
+        json(&staged)
+    }
+
+    #[tool(
+        description = "What your staged edits would change about the user's cut — every add, cut, move, retrim and \
+                       adjustment, plus the runtime before and after. Returns null when nothing is staged."
+    )]
+    fn staged_diff(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        match project.staged().map_err(core_err)? {
+            None => json(&serde_json::json!(null)),
+            Some(staged) => {
+                let summary = staged.diff.summary();
+                json(&serde_json::json!({ "staged": staged, "summary": summary }))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Apply your staged edits to the live timeline yourself, as one revision. Normally leave this to \
+                       the user — completing the task shows them the proposal to accept. Fails if they have edited \
+                       the timeline since you staged, unless `force`."
+    )]
+    fn apply_staged_edits(&self, Parameters(p): Parameters<ApplyStagedParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        let timeline = project.apply_staged(p.force.unwrap_or(false)).map_err(core_err)?;
+        self.changed();
+        json(&timeline)
+    }
+
+    #[tool(description = "Throw your staged edits away, leaving the user's timeline untouched")]
+    fn discard_staged_edits(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        let timeline = project.discard_staged().map_err(core_err)?;
+        self.changed();
+        json(&timeline)
+    }
+
+    #[tool(description = "Explain what one revision changed (see history), as a list of edits to the cut")]
+    fn revision_diff(&self, Parameters(p): Parameters<RevisionDiffParams>) -> Result<String, McpError> {
+        let project = self.lock();
+        let diff = match p.from {
+            Some(from) => project.diff_revisions(from, p.seq).map_err(core_err)?,
+            None => project.revision_diff(p.seq).map_err(core_err)?,
+        };
+        let summary = diff.summary();
+        json(&serde_json::json!({ "diff": diff, "summary": summary }))
+    }
+
     #[tool(description = "List the timeline edit history (revisions, newest changes have higher seq; the current one is marked)")]
     fn history(&self) -> Result<String, McpError> {
         let project = self.lock();
@@ -1329,7 +1416,7 @@ impl KerfMcp {
             let (timeline, assets) = {
                 let project = lock_agent(&project);
                 (
-                    project.timeline().map_err(core_err)?,
+                    project.working_timeline().map_err(core_err)?,
                     project.list_assets().map_err(core_err)?,
                 )
             };
@@ -1499,7 +1586,7 @@ impl KerfMcp {
     #[tool(description = "Summarise the timeline: total duration, track count, clips per track, and any per-track gaps")]
     fn timeline_summary(&self) -> Result<String, McpError> {
         let project = self.lock();
-        let timeline = project.timeline().map_err(core_err)?;
+        let timeline = project.working_timeline().map_err(core_err)?;
         let tracks: Vec<TrackSummary> = timeline
             .tracks
             .iter()
@@ -1520,6 +1607,7 @@ impl KerfMcp {
             delivery_format: timeline
                 .format
                 .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
+            staged_changes: project.staged().map_err(core_err)?.map(|staged| staged.diff.entries.len()),
         };
         json(&summary)
     }
@@ -1608,11 +1696,20 @@ impl ServerHandler for KerfMcp {
              (drawn over the cut; list_fonts lists installed system fonts to pass \
              as update_overlay's font), or captions_from_transcript to caption an \
              analyzed asset in one call; export_srt writes a subtitle file. \
-             Every edit is tracked: use \
-             history to list revisions and undo / redo / revert_to to roll \
-             changes back. When finished call complete_task with a short summary \
-             (or fail_task on error); the user reviews and applies the staged \
-             edit. Call export to render."
+             Your task edits are STAGED, not applied: claiming a task opens a \
+             proposal, and every edit you make goes into it instead of changing \
+             the cut the user is looking at. Your own reads follow the proposal, \
+             so get_timeline_state / preview_timeline / timeline_summary show \
+             the cut you are building — check staged_diff to see exactly what you \
+             are about to hand over, and discard_staged_edits to abandon it. When \
+             finished call complete_task with a short summary (or fail_task on \
+             error); the user then accepts the proposal, which applies it as one \
+             revision, or dismisses it. Outside a task, stage_edits opens a \
+             proposal the same way and apply_staged_edits commits one yourself. \
+             Every applied edit is tracked: history lists the revisions, \
+             revision_diff explains one of them, and undo / redo / revert_to roll \
+             changes back (they work on the live cut, so apply or discard your \
+             staged edits first). Call export to render."
                 .to_string(),
         );
         info

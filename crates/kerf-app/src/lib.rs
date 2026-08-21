@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
-    ReframeKeyframe, Revision, StreamKind, Task, TextKeyframe, Timeline, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe,
+    Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -960,6 +960,41 @@ fn revert_to(state: State<'_, AppState>, seq: i64) -> CmdResult<Timeline> {
     state.project().revert_to(seq).map_err(|e| e.to_string())
 }
 
+/// What one revision changed, so the edit log can explain itself.
+#[tauri::command(async)]
+fn revision_diff(state: State<'_, AppState>, seq: i64) -> CmdResult<TimelineDiff> {
+    state.project().revision_diff(seq).map_err(|e| e.to_string())
+}
+
+// ---- staged edits (the agent's pending proposal) ---------------------------
+
+/// The proposal a connected agent has staged, or `None`. Carries its own diff,
+/// so the review card renders from one round-trip.
+#[tauri::command(async)]
+fn get_staged_edit(state: State<'_, AppState>) -> CmdResult<Option<StagedEdit>> {
+    state.project().staged().map_err(|e| e.to_string())
+}
+
+/// The staged timeline itself — what the editor shows while previewing a
+/// proposal, so the user can look at the cut rather than only read about it.
+#[tauri::command(async)]
+fn get_staged_timeline(state: State<'_, AppState>) -> CmdResult<Option<Timeline>> {
+    state.project().staged_timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn apply_staged_edit(state: State<'_, AppState>, force: Option<bool>) -> CmdResult<Timeline> {
+    state
+        .project()
+        .apply_staged(force.unwrap_or(false))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn discard_staged_edit(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    state.project().discard_staged().map_err(|e| e.to_string())
+}
+
 // ---- media (preview frames, waveforms) -------------------------------------
 
 #[tauri::command]
@@ -1496,6 +1531,11 @@ pub fn run() {
             extract_audio,
             concatenate,
             get_history,
+            revision_diff,
+            get_staged_edit,
+            get_staged_timeline,
+            apply_staged_edit,
+            discard_staged_edit,
             undo,
             redo,
             revert_to,

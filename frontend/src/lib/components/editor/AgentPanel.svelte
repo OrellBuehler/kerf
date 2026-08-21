@@ -8,8 +8,9 @@
 	import { mcpEndpoint } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
 	import { STATUS_MAP, PRESETS } from './data';
-	import type { EditSource, Task, TaskStatus } from '$lib/types';
+	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
 
 	const working = $derived(agent.working);
 	const disabled = $derived(editor.assets.length === 0);
@@ -63,6 +64,81 @@
 		user: 'You',
 		system: 'Kerf'
 	};
+
+	// ---- the agent's pending proposal ---------------------------------------
+	const staged = $derived(editor.staged);
+	const headline = $derived(staged ? diffHeadline(staged.diff) : '');
+	const groups = $derived(staged ? groupEntries(staged.diff.entries) : []);
+	let applying = $state(false);
+
+	// The design system already names these three; a proposal is a diff.
+	const polarityTint: Record<'added' | 'removed' | 'changed', string> = {
+		added: 'var(--diff-add)',
+		removed: 'var(--diff-remove)',
+		changed: 'var(--diff-shift)'
+	};
+	const polarityMark: Record<'added' | 'removed' | 'changed', string> = {
+		added: '+',
+		removed: '−',
+		changed: '~'
+	};
+
+	/** Jump the playhead to where a change happens, so it can be looked at. */
+	function inspect(e: DiffEntry) {
+		if (e.at == null) return;
+		ui.seek(e.at);
+		if (e.clip_id) editor.selectClip(e.clip_id);
+	}
+
+	async function applyProposal() {
+		if (!staged) return;
+		if (staged.stale && !confirm('You have edited the timeline since these changes were staged. Applying replaces your newer cut. Continue?'))
+			return;
+		applying = true;
+		try {
+			await editor.applyStaged(staged.stale);
+			toast.success('Applied the proposed changes');
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			applying = false;
+		}
+	}
+
+	async function discardProposal() {
+		try {
+			await editor.discardStaged();
+			toast.info('Discarded the proposed changes');
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	// ---- "what did that edit change?" --------------------------------------
+	// Same diff engine, pointed at the edit log: a revision label says which
+	// operation ran, not what it did to the cut.
+	let openRevision = $state<number | null>(null);
+	let revisionDiffs = $state<Record<number, TimelineDiff | null>>({});
+
+	async function toggleRevision(seq: number) {
+		if (openRevision === seq) {
+			openRevision = null;
+			return;
+		}
+		openRevision = seq;
+		if (!(seq in revisionDiffs)) {
+			try {
+				revisionDiffs[seq] = await editor.revisionDiff(seq);
+			} catch {
+				revisionDiffs[seq] = null;
+			}
+		}
+	}
+
+	async function togglePreview() {
+		if (editor.previewingStaged) await editor.exitStagedPreview();
+		else await editor.previewStaged();
+	}
 
 	function metaFor(t: Task): string | null {
 		if (t.result) return t.result;
@@ -237,6 +313,11 @@
 			</div>
 		{/if}
 		{#if t.status === 'ready'}
+			{#if staged?.task_id === t.id}
+				<div style="font-size:11px;color:var(--agent-300);margin-top:8px;padding-left:21px">
+					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} below — applying accepts them
+				</div>
+			{/if}
 			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
 				<button
 					onclick={() => agent.resolve(t.id)}
@@ -273,7 +354,7 @@
 	<div style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:16px">
 		<!-- MCP status -->
 		<div
-			style="display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:var(--radius-md);background:var(--agent-surface);border:1px solid var(--agent-border)"
+			style="flex:none;display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:var(--radius-md);background:var(--agent-surface);border:1px solid var(--agent-border)"
 		>
 			<span
 				style="flex:none;width:28px;height:28px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--agent-border);display:grid;place-items:center;color:var(--agent-300)"
@@ -305,9 +386,102 @@
 			</span>
 		</div>
 
+		<!-- the agent's pending proposal -->
+		{#if staged}
+			<div
+				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--agent-border);border-left:2px solid var(--agent-500);overflow:hidden"
+			>
+				<div style="display:flex;align-items:center;gap:8px;padding:10px 11px 0">
+					<Icon n="git-pull-request-arrow" s={14} color="var(--agent-300)" />
+					<span style="flex:1;font-size:13px;font-weight:600;color:var(--text-primary)">Proposed changes</span>
+					<Badge tone="agent">review</Badge>
+				</div>
+				<div style="padding:7px 11px 0 32px">
+					{#if staged.note}
+						<div style="font-size:12px;color:var(--text-secondary);margin-bottom:3px">{staged.note}</div>
+					{/if}
+					<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{headline}</div>
+					<div style="font-size:10px;color:var(--text-disabled);margin-top:3px">
+						Your timeline is untouched until you apply these.
+					</div>
+				</div>
+
+				{#if staged.stale}
+					<div
+						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:1px solid var(--diff-remove);font-size:11px;color:var(--text-secondary);line-height:1.45"
+					>
+						You have edited the timeline since these were staged — applying replaces your newer cut.
+					</div>
+				{/if}
+
+				<div style="padding:10px 11px 0 32px;display:flex;flex-direction:column;gap:9px">
+					{#each groups as group (group.label)}
+						<div>
+							<div
+								style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-disabled);margin-bottom:4px"
+							>
+								{group.label}
+							</div>
+							<div style="display:flex;flex-direction:column;gap:2px">
+								{#each group.entries as e, i (`${e.kind}-${i}-${e.summary}`)}
+									{@const tone = polarity(e.kind)}
+									<button
+										onclick={() => inspect(e)}
+										disabled={e.at == null}
+										title={e.at == null ? e.summary : `Jump to ${e.summary}`}
+										style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
+										null
+											? 'default'
+											: 'pointer'}"
+									>
+										<span
+											style="flex:none;width:9px;font-family:var(--font-mono);font-size:11px;color:{polarityTint[tone]}"
+											>{polarityMark[tone]}</span
+										>
+										<span style="flex:1;min-width:0;font-size:11px;line-height:1.45;color:var(--text-secondary)">
+											{e.summary}
+											{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}
+										</span>
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/each}
+				</div>
+
+				<div style="display:flex;gap:7px;padding:12px 11px">
+					<button
+						onclick={applyProposal}
+						disabled={applying}
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+						>{applying ? 'Applying…' : 'Apply'}</button
+					>
+					<button
+						onclick={togglePreview}
+						title="Show the proposed cut in the editor"
+						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:1px solid {editor.previewingStaged
+							? 'var(--agent-500)'
+							: 'var(--border-strong)'};background:{editor.previewingStaged
+							? 'var(--agent-surface)'
+							: 'transparent'};color:{editor.previewingStaged
+							? 'var(--agent-300)'
+							: 'var(--text-secondary)'};font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:5px"
+					>
+						<Icon n={editor.previewingStaged ? 'eye-off' : 'eye'} s={13} />
+						{editor.previewingStaged ? 'Exit' : 'Preview'}
+					</button>
+					<button
+						onclick={discardProposal}
+						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+						>Discard</button
+					>
+				</div>
+			</div>
+		{/if}
+
 		<!-- how to connect an agent -->
 		<div
-			style="border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);overflow:hidden"
+			style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);overflow:hidden"
 		>
 			<button
 				onclick={() => (showConnect = !showConnect)}
@@ -345,7 +519,7 @@
 		</div>
 
 		<!-- queue -->
-		<div>
+		<div style="flex:none">
 			{@render secHead('Queue', agent.summary)}
 			<div style="display:flex;flex-direction:column;gap:8px">
 				{#if queue.length === 0}
@@ -367,7 +541,7 @@
 		</div>
 
 		<!-- history -->
-		<div>
+		<div style="flex:none">
 			{@render secHead('History', `${editor.history.length} edit${editor.history.length === 1 ? '' : 's'}`)}
 			<div style="display:flex;flex-direction:column;gap:1px">
 				{#each revisions as rev (rev.seq)}
@@ -377,7 +551,11 @@
 							: ''}"
 					>
 						<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
-						<div style="flex:1;min-width:0">
+						<button
+							onclick={() => toggleRevision(rev.seq)}
+							title="What this edit changed"
+							style="flex:1;min-width:0;text-align:left;background:none;border:none;padding:0;cursor:pointer"
+						>
 							<div
 								style="font-size:12px;line-height:1.35;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 							>
@@ -386,7 +564,7 @@
 							<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
 								{sourceLabel[rev.source]}
 							</div>
-						</div>
+						</button>
 						{#if rev.current}
 							<span
 								style="display:inline-flex;align-items:center;gap:4px;font-family:var(--font-mono);font-size:9px;color:var(--green-400)"
@@ -403,6 +581,36 @@
 							</button>
 						{/if}
 					</div>
+					{#if openRevision === rev.seq}
+						{@const d = revisionDiffs[rev.seq]}
+						<div style="padding:2px 4px 8px 26px;display:flex;flex-direction:column;gap:2px">
+							{#if d === undefined}
+								<span style="font-size:11px;color:var(--text-disabled)">Reading the change…</span>
+							{:else if d === null}
+								<span style="font-size:11px;color:var(--text-disabled)"
+									>Change details are available in the desktop app.</span
+								>
+							{:else if d.entries.length === 0}
+								<span style="font-size:11px;color:var(--text-disabled)">Changed nothing.</span>
+							{:else}
+								<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+									>{diffHeadline(d)}</span
+								>
+								{#each d.entries as e, i (`${rev.seq}-${i}`)}
+									<span style="display:flex;gap:6px;align-items:baseline">
+										<span
+											style="flex:none;width:9px;font-family:var(--font-mono);font-size:11px;color:{polarityTint[
+												polarity(e.kind)
+											]}">{polarityMark[polarity(e.kind)]}</span
+										>
+										<span style="flex:1;min-width:0;font-size:11px;line-height:1.45;color:var(--text-secondary)"
+											>{e.summary}{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}</span
+										>
+									</span>
+								{/each}
+							{/if}
+						</div>
+					{/if}
 				{/each}
 			</div>
 		</div>

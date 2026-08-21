@@ -295,6 +295,53 @@ export interface Revision {
 	current: boolean;
 }
 
+export type DiffKind =
+	| 'track_added'
+	| 'track_removed'
+	| 'track_changed'
+	| 'clip_added'
+	| 'clip_removed'
+	| 'clip_moved'
+	| 'clip_retrimmed'
+	| 'clip_changed'
+	| 'overlay_added'
+	| 'overlay_removed'
+	| 'overlay_changed'
+	| 'marker_added'
+	| 'marker_removed'
+	| 'marker_changed'
+	| 'format_changed';
+
+export interface DiffEntry {
+	kind: DiffKind;
+	summary: string;
+	detail?: string | null;
+	track_id?: string | null;
+	clip_id?: string | null;
+	at?: number | null;
+}
+
+export interface TimelineDiff {
+	entries: DiffEntry[];
+	duration_before: number;
+	duration_after: number;
+	clips_before: number;
+	clips_after: number;
+}
+
+/** A batch of agent edits held back from the live timeline for review. */
+export interface StagedEdit {
+	base_seq: number;
+	task_id?: string | null;
+	note?: string | null;
+	edits: string[];
+	created_at: string;
+	updated_at: string;
+	/** The live timeline moved on since this branched — applying replaces it. */
+	stale: boolean;
+	diff: TimelineDiff;
+}
+
 export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
 
 export interface Task {

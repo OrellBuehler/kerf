@@ -29,9 +29,11 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, Color, Delivery, EditSource, Keyframe, Marker, Projection, Reframe,
+    Asset, AssetAnalysis, AudioEffect, Clip, Color, Delivery, DiffEntry, DiffKind, EditSource, Keyframe, Marker,
+    Projection, Reframe,
     ReframeKeyframe,
-    ResolvedReframe, Revision, Rhythm, StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange,
-    Timeline, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
+    ResolvedReframe, Revision, Rhythm, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay,
+    TimeRange,
+    Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
 };
 pub use project::Project;
