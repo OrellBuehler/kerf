@@ -13,7 +13,15 @@
 // localStorage), so declining an update doesn't nag on every launch — the
 // title-bar badge keeps offering it instead.
 
-import { appVersion, checkUpdate, installUpdate, openReleases, relaunchApp, type UpdateProgress } from './api';
+import {
+	appVersion,
+	checkUpdate,
+	installUpdate,
+	openReleases,
+	relaunchApp,
+	RELEASES_URL,
+	type UpdateProgress
+} from './api';
 import type { UpdateInfo } from './types';
 
 const SEEN_KEY = 'kerf.update.seen';
@@ -107,9 +115,17 @@ class Updater {
 		await relaunchApp();
 	}
 
-	/** Manual fallback when the in-place install can't run (a .deb / .rpm install). */
+	/**
+	 * Manual fallback when the in-place install can't run (a .deb / .rpm install).
+	 * A rejection here (no browser, a URL the opener scope refuses) would be
+	 * invisible otherwise — the button would just look dead — so report it.
+	 */
 	async openReleasePage(): Promise<void> {
-		await openReleases();
+		try {
+			await openReleases();
+		} catch (e) {
+			this.error = `Couldn't open ${RELEASES_URL} — ${msg(e)}`;
+		}
 	}
 
 	open() {

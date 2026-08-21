@@ -1678,6 +1678,21 @@ export async function appVersion(): Promise<string> {
 }
 
 /**
+ * Turn the updater plugin's plumbing errors into something a user can act on.
+ * The common one is not a broken feed but a *race*: publishing a release makes
+ * it `releases/latest` immediately, while `latest.json` is only attached once
+ * every platform's bundle has been built (~25 min), so a check in that window
+ * 404s and the plugin reports "Could not fetch a valid release JSON".
+ */
+function describeFeedFailure(e: unknown): string {
+	const raw = e instanceof Error ? e.message : String(e);
+	if (/valid release JSON/i.test(raw)) {
+		return "The newest release hasn't published its update manifest yet — its installers are probably still building. Try again in a few minutes, or grab it from the release page.";
+	}
+	return raw;
+}
+
+/**
  * Ask GitHub whether a newer signed release exists. Returns `null` when this
  * build is current (or when there is nothing to update, as in the browser).
  * Throws if the endpoint is unreachable — callers doing a silent startup check
@@ -1704,7 +1719,9 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
 		};
 	}
 	const { check } = await import('@tauri-apps/plugin-updater');
-	const update = await check();
+	const update = await check().catch((e) => {
+		throw new Error(describeFeedFailure(e));
+	});
 	if (!update) {
 		pendingUpdate = null;
 		return null;
