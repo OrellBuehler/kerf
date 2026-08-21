@@ -178,7 +178,15 @@ pub fn hw_encoders() -> &'static [String] {
                 // 256x256 clears every family's minimum-dimension floor; nv12 is
                 // the input format they all accept.
                 command(&bin)
-                    .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2"])
+                    .args([
+                        "-hide_banner",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=black:s=256x256:r=30:d=0.2",
+                    ])
                     .args(["-frames:v", "1", "-pix_fmt", "nv12", "-c:v", enc, "-f", "null", "-"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -1098,7 +1106,12 @@ fn proxy_hw_encoder() -> Option<&'static str> {
 /// onto the proxy and a preview seek lands on the same frame the export (which
 /// always reads the original) would.
 fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32, encoder: &str, hw_decode: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string(), "-y".to_string()];
+    let mut args: Vec<String> = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+    ];
     if let Some(hw) = hw_decode {
         args.push("-hwaccel".to_string());
         args.push(hw.to_string());
@@ -1303,7 +1316,12 @@ pub fn stitched_path(front: &Path, rear: &Path) -> Option<PathBuf> {
 /// [`quality_args`]) and the multi-minute re-encode moves onto the GPU;
 /// `hw_decode` accelerates the two lens decodes the same way.
 pub(crate) fn build_stitch_args(front: &str, rear: &str, dst: &str, encoder: &str, hw_decode: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string(), "-y".to_string()];
+    let mut args: Vec<String> = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+    ];
     // `-hwaccel` is an input option: emit it before each lens file's `-i`.
     for lens in [front, rear] {
         if let Some(hw) = hw_decode {
@@ -1587,7 +1605,6 @@ pub enum RateControl {
 }
 
 pub use crate::model::Fit;
-
 
 /// Which ffmpeg invocation [`build_export_args`] is emitting for. Injected so
 /// the builder stays pure (no knowledge of the platform null device or the temp
@@ -3495,11 +3512,7 @@ fn eq_filter(c: &Color) -> String {
     );
     if c.temperature != 0.0 {
         let t = c.temperature.clamp(-1.0, 1.0);
-        f.push_str(&format!(
-            ":gamma_r={}:gamma_b={}",
-            fnum(1.0 + 0.3 * t),
-            fnum(1.0 - 0.3 * t)
-        ));
+        f.push_str(&format!(":gamma_r={}:gamma_b={}", fnum(1.0 + 0.3 * t), fnum(1.0 - 0.3 * t)));
     }
     f
 }
@@ -4447,7 +4460,13 @@ mod tests {
 
     #[test]
     fn stitch_args_with_hw_encoder_accelerate_both_lens_decodes() {
-        let args = build_stitch_args("/dcim/f_00_.mp4", "/dcim/r_10_.mp4", "/cache/out.mp4", "hevc_nvenc", Some("auto"));
+        let args = build_stitch_args(
+            "/dcim/f_00_.mp4",
+            "/dcim/r_10_.mp4",
+            "/cache/out.mp4",
+            "hevc_nvenc",
+            Some("auto"),
+        );
         // One `-hwaccel` per lens input, each before its `-i`.
         assert_eq!(args.iter().filter(|a| *a == "-hwaccel").count(), 2);
         assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "hevc_nvenc"));
@@ -4602,9 +4621,11 @@ mod tests {
         assert_eq!(proxy_width(Some(Projection::Flat)), PROXY_MAX_WIDTH);
         assert_eq!(proxy_width(Some(Projection::Equirect)), PROXY_MAX_WIDTH_SPHERICAL);
         assert_eq!(proxy_width(Some(Projection::DualFisheye)), PROXY_MAX_WIDTH_SPHERICAL);
-        assert!(build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None)
-            .iter()
-            .any(|a| a.contains("scale='min(3072,iw)':-2")));
+        assert!(
+            build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None)
+                .iter()
+                .any(|a| a.contains("scale='min(3072,iw)':-2"))
+        );
         // Marking an asset as 360 must not silently reuse the small proxy that
         // was rendered while it looked flat, so the width is part of the key.
         if let (Some(flat), Some(sphere)) = (
@@ -6717,8 +6738,16 @@ mod tests {
 
         timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
-        assert_eq!((fmt.width, fmt.height), (1080, 1920), "the project frame wins over the footage");
-        assert_eq!(fmt.fit, Fit::Cover, "and brings its fit, so the preview crops like the export");
+        assert_eq!(
+            (fmt.width, fmt.height),
+            (1080, 1920),
+            "the project frame wins over the footage"
+        );
+        assert_eq!(
+            fmt.fit,
+            Fit::Cover,
+            "and brings its fit, so the preview crops like the export"
+        );
     }
 
     #[test]
@@ -6764,13 +6793,7 @@ mod tests {
             fit,
             sf: String::new(),
         };
-        let contained = still_clip_chain(
-            &Transform::default(),
-            &Color::default(),
-            &[],
-            None,
-            &canvas(Fit::Contain),
-        );
+        let contained = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Contain));
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
 

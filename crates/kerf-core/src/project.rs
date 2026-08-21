@@ -2226,6 +2226,9 @@ impl Project {
         Ok(asset)
     }
 
+    /// One `Option` per `v360` parameter: the Tauri command and the MCP tool both
+    /// patch a subset, so the arity follows the filter's, not a struct's.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_reframe(
         &self,
         clip_id: Uuid,
