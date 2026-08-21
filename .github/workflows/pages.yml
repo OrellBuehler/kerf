@@ -27,7 +27,7 @@ jobs:
     env:
       HUGO_VERSION: 0.154.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Hugo
         run: |
           wget -q -O hugo.deb \
