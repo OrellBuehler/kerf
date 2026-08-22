@@ -1,21 +1,60 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
 version: 2
 updates:
-  - package-ecosystem: "cargo" # the Rust workspace
-    directory: "/"
+  # The workflows pin actions by commit SHA, which nothing updates on its own —
+  # Dependabot rewrites the SHA and the trailing `# vN` comment together.
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+    # Don't take a version the day it is published — a compromised release is
+    # usually yanked within days, and nothing here needs same-day upgrades.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
 
-  - package-ecosystem: "bun" # the SvelteKit frontend
-    directory: "/frontend"
+  - package-ecosystem: cargo
+    directory: /
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+    # Don't take a version the day it is published — a compromised release is
+    # usually yanked within days, and nothing here needs same-day upgrades.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Tauri ships its crates in lockstep; splitting them across PRs just
+      # produces ones that don't build.
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+      patch-and-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  - package-ecosystem: "github-actions" # ci.yml / pages.yml / release.yml
-    directory: "/"
+  - package-ecosystem: bun
+    directory: /frontend
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+    # Don't take a version the day it is published — a compromised release is
+    # usually yanked within days, and nothing here needs same-day upgrades.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      svelte:
+        patterns: ["svelte", "svelte-*", "@sveltejs/*"]
+      tauri-js:
+        patterns: ["@tauri-apps/*"]
+      patch-and-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

@@ -5,16 +5,50 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
+# Default to nothing. Only the jobs that attach assets to the release ask for
+# `contents: write` — this workflow also holds the updater's minisign private
+# key, so its blast radius is worth keeping small.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fail before four platform builds burn if the tag and the versions baked into
+  # the artifacts disagree. `latest.json` takes its `version` from the tag while
+  # the installed app compares that against `tauri.conf.json`'s version — if the
+  # two diverge, every user is offered an update that installs the version they
+  # already have, forever.
+  version-check:
+    name: version consistency
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Tag must match Cargo.toml, package.json and tauri.conf.json
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          cargo_v=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          pkg_v=$(python3 -c 'import json;print(json.load(open("frontend/package.json"))["version"])')
+          tauri_v=$(python3 -c 'import json;print(json.load(open("crates/kerf-app/tauri.conf.json"))["version"])')
+          echo "tag=$want cargo=$cargo_v package.json=$pkg_v tauri.conf.json=$tauri_v"
+          for got in "$cargo_v" "$pkg_v" "$tauri_v"; do
+            [ "$got" = "$want" ] || { echo "::error::version mismatch: tag '$want' vs '$got'"; exit 1; }
+          done
+
   # Desktop app installers (.deb/.AppImage/.rpm, .dmg/.app, .msi/.exe) per OS.
   app-bundles:
     name: app (${{ matrix.platform }} / ${{ matrix.arch }})
+    needs: version-check
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -34,26 +68,32 @@ jobs:
           # Windows has no system FFmpeg, so bundle ffmpeg/ffprobe as externalBin
           # sidecars (fetched below). Injecting externalBin only here keeps it out
           # of the plain `cargo build` CI runs, which don't ship the binaries.
+          # `resources` *replaces* the committed array rather than extending it,
+          # so it repeats the whisper.cpp notice every platform ships.
           - platform: windows-latest
             arch: x86_64
             args: ''
-            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
             bundleFfmpeg: true
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install Linux dependencies (Tauri)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Deliberately uncached, here and for cargo below: a release build is
+          # signed and auto-installed by every user, so it is built cold rather
+          # than from a cache a lower-privileged run could have written into.
+          no-cache: true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-app-${{ matrix.platform }}-${{ matrix.arch }}
       # Build the frontend ourselves so the build is deterministic and so we can
       # disable the committed `beforeBuildCommand` (it uses `$(git rev-parse ...)`,
       # which is not valid on the Windows `cmd` runner) via the --config override.
@@ -67,8 +107,15 @@ jobs:
       - name: Fetch bundled FFmpeg
         if: matrix.bundleFfmpeg
         run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.arch }}-pc-windows-msvc
+      # Release bundles are built with the `whisper` cargo feature (see the args
+      # below), which compiles whisper.cpp in-process. Without it a release ships
+      # with no speech-to-text at all wherever the local `ffmpeg` lacks the
+      # (8.0+) `whisper` filter — which is every Windows install, since the
+      # sidecar fetched above is a `--disable-whisper` build.
+      - name: Install the whisper.cpp build toolchain
+        uses: ./.github/actions/whisper-toolchain
       - name: Build and upload bundles
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signs the updater artifacts (`bundle.createUpdaterArtifacts`) with the
@@ -83,28 +130,27 @@ jobs:
           # `latest.json` is assembled once by the `updater-manifest` job below:
           # the per-platform jobs run concurrently and would each overwrite the
           # others' entries in it.
-          includeUpdaterJson: false
+          uploadUpdaterJson: false
           # `--config` (per matrix row) zeroes out beforeBuildCommand (frontend is
           # already built) and, on Windows, adds the FFmpeg externalBin sidecars.
           # Everything after `--` is forwarded to cargo, where --no-default-features
-          # disables the FFmpeg dev-library dependency.
-          args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features"
+          # disables the FFmpeg dev-library dependency, --features whisper compiles
+          # in-process speech-to-text so transcription never depends on how the
+          # user's ffmpeg was configured, and --locked builds exactly the
+          # dependency versions in the committed Cargo.lock.
+          args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features --features whisper --locked"
 
   # The update feed the app polls (`plugins.updater.endpoints` in tauri.conf.json
   # points at this release asset). Built after every bundle is uploaded, from the
   # `.sig` files tauri-action attached, so all platforms land in one manifest —
   # letting each build write it would leave whichever finished last.
-  #
-  # `!cancelled()` rather than plain success: the matrix is `fail-fast: false`, and
-  # one platform failing must not leave the release with *no* manifest at all —
-  # `releases/latest/download/latest.json` would 404 for everyone, breaking the
-  # update check on the platforms that did build. A partial manifest only means the
-  # missing platform sees "up to date" until the release is re-run.
   updater-manifest:
     name: latest.json
     needs: app-bundles
-    if: ${{ !cancelled() && !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Assemble and upload latest.json
         env:

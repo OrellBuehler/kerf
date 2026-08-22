@@ -801,8 +801,8 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
             break;
         }
         leftover.extend_from_slice(&block[..n]);
-        for s in leftover.chunks_exact(4) {
-            down.push(f32::from_le_bytes([s[0], s[1], s[2], s[3]]).abs());
+        for s in leftover.as_chunks::<4>().0 {
+            down.push(f32::from_le_bytes(*s).abs());
         }
         let consumed = (leftover.len() / 4) * 4;
         leftover.copy_within(consumed.., 0);
@@ -922,8 +922,10 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
     }
     Ok(output
         .stdout
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect())
 }
 

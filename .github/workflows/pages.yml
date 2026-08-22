@@ -11,10 +11,9 @@ on:
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Default to nothing; each job asks for exactly what it needs. Only `deploy`
+# gets the Pages write + OIDC token — the build job just produces an artifact.
+permissions: {}
 
 # Allow one concurrent deployment; don't cancel an in-progress publish.
 concurrency:
@@ -24,10 +23,16 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       HUGO_VERSION: 0.154.1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Nothing here pushes; leaving the token in .git/config would let any
+          # later step (or a leaked artifact) reuse it.
+          persist-credentials: false
       - name: Install Hugo
         run: |
           wget -q -O hugo.deb \
@@ -35,22 +40,27 @@ jobs:
           sudo dpkg -i hugo.deb
       - name: Configure Pages
         id: pages
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
       - name: Build
         working-directory: site
-        run: hugo --gc --minify --baseURL "${{ steps.pages.outputs.base_url }}/"
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: hugo --gc --minify --baseURL "$BASE_URL/"
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site/public
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5

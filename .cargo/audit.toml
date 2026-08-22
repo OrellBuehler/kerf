@@ -1,0 +1,20 @@
+# Exceptions for `cargo audit` (see .github/workflows/security.yml).
+#
+# Only add an ID here with the reason it cannot be fixed from this repo, and
+# recheck when the upstream dependency moves.
+
+[advisories]
+ignore = [
+    # quick-xml < 0.41 DoS (quadratic attribute scan / unbounded namespace
+    # allocation), reached only via `plist` <- `tauri-utils`. `plist` requires
+    # `quick-xml ^0.39`, so it cannot be updated from here — it needs a Tauri
+    # release that bumps `plist`. Kerf never parses untrusted XML at runtime:
+    # the path is Tauri's build-time Info.plist handling.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+# `unmaintained` and `unsound` are reported but do not fail the build: the Linux
+# Tauri stack pulls in the archived gtk-rs GTK3 bindings (atk/gdk/gtk/… 0.18),
+# which no change in this repo can resolve.
+informational_warnings = ["unmaintained", "unsound", "notice"]

@@ -14,7 +14,7 @@ frames it's editing. Nothing is re-encoded until you export.
 [![CI](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml/badge.svg)](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/OrellBuehler/kerf?color=e29d2e&label=release)](https://github.com/OrellBuehler/kerf/releases)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-22b4c4.svg)](./LICENSE.md)
-[![Rust](https://img.shields.io/badge/Rust-1.82+-dea584.svg?logo=rust&logoColor=white)](https://rustup.rs)
+[![Rust](https://img.shields.io/badge/Rust-1.95+-dea584.svg?logo=rust&logoColor=white)](https://rustup.rs)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri&logoColor=white)](https://tauri.app)
 [![Stars](https://img.shields.io/github/stars/OrellBuehler/kerf?style=flat&color=e29d2e)](https://github.com/OrellBuehler/kerf/stargazers)
 
@@ -101,7 +101,7 @@ cd kerf/frontend && bun install && cd ..
 cargo run -p kerf-app            # launches the app (runs the frontend dev server first)
 ```
 
-You need **Rust ≥ 1.82**, **Bun ≥ 1.2**, the platform WebView/GTK libraries for Tauri,
+You need **Rust ≥ 1.95**, **Bun ≥ 1.2**, the platform WebView/GTK libraries for Tauri,
 and (for the default `ffmpeg` feature) the FFmpeg development libraries + `clang`. See
 [Building](#building) for per-platform setup and the no-FFmpeg path.
 
@@ -232,7 +232,10 @@ cargo run    -p kerf-app  --no-default-features
 
 Two further optional features need a fuller toolchain and are off by default:
 `libav-render` (experimental in-process libav export) and `whisper` (local `whisper-rs`
-transcription; set `KERF_WHISPER_MODEL`).
+transcription; set `KERF_WHISPER_MODEL`). The **downloadable release bundles are built
+with `whisper`**, so transcription there never depends on the local `ffmpeg` having been
+built `--enable-whisper`; a build from source falls back to that filter unless you pass
+`--features whisper` (cmake + a C++ compiler + libclang).
 
 ---
 

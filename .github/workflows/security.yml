@@ -1,0 +1,99 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Advisories land against code that hasn't changed, so a push-only trigger
+  # would never surface them on a quiet week.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # RustSec advisories against the committed Cargo.lock. Fails on
+  # `vulnerability`; `unmaintained`/`unsound` are reported but do not block —
+  # the Linux Tauri stack pulls in the archived gtk-rs GTK3 bindings, which
+  # nothing in this repo can fix. Exceptions live in `.cargo/audit.toml`.
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+      - name: Audit dependencies
+        run: cargo audit
+
+  # npm advisories for the webview bundle. `--audit-level=moderate` is the gate:
+  # `low` currently only matches an unreachable server-side SvelteKit cookie
+  # parser (this app is a static SPA with `ssr = false`).
+  bun-audit:
+    name: bun audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Install dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+      - name: Audit dependencies
+        working-directory: frontend
+        run: bun audit --audit-level=moderate
+
+  # Blocks a PR that *introduces* a vulnerable or badly-licensed dependency,
+  # rather than waiting for the next scheduled scan. PR-only by design.
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  # Static analysis of the workflows themselves. The release workflow holds the
+  # updater's minisign private key, so a template-injection or an over-broad
+  # `permissions:` block there is a path to signing a malicious update.
+  zizmor:
+    name: workflow audit (zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      # Version-pinned: a new zizmor release adds audits, and an unpinned one
+      # would turn CI red on a day nobody touched a workflow.
+      - name: Run zizmor
+        run: uvx zizmor@1.29.0 --persona=regular --min-severity=medium --format=sarif . > zizmor.sarif
+      # The exit code above is the gate; this only makes the findings readable in
+      # the Security tab, and shouldn't fail the job if code scanning is off.
+      - uses: github/codeql-action/upload-sarif@42947a340483f03ba47bb1a039b2c519aab3df85 # v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor

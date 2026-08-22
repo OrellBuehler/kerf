@@ -5,7 +5,20 @@
 // sidecars so installs ship a known-good FFmpeg without one on the user's PATH.
 //
 // Usage:  bun scripts/fetch-ffmpeg.mjs [<target-triple>]
+//         bun scripts/fetch-ffmpeg.mjs --print-hashes   (after bumping a pin)
 // The triple defaults to the host (parsed from `rustc -vV`).
+//
+// Every archive is PINNED to an immutable upstream release and verified against
+// a SHA-256 recorded here. These binaries are bundled into an installer that is
+// code-signed and auto-installed by every user, so "whatever upstream published
+// most recently" is not good enough: an unverified download would inherit the
+// signature's trust. A mismatch aborts rather than shipping.
+//
+// To bump: change the version constants below, run `--print-hashes`, and paste
+// the new digests in. Verify the run afterwards with the engine tests, which
+// exercise the real filter graphs against the binary:
+//   KERF_FFMPEG=<path> KERF_FFPROBE=<path> \
+//     cargo test -p kerf-core --no-default-features -- --ignored --skip downloads_a_real_model
 //
 // FFmpeg is licensed separately (the Windows/Linux builds below are GPL); shipping
 // them carries that license's obligations — see the FFmpeg project for details.
@@ -30,25 +43,77 @@ function hostTriple() {
   return m[1].trim();
 }
 
+// FFmpeg 9.0 across all three platforms. BtbN's dated `autobuild-*` tags are
+// immutable, unlike the rolling `latest` tag; the `-gpl-9.0` assets track the
+// 9.0 release branch rather than a master snapshot. Note these builds are
+// configured `--disable-whisper`, so the bundled binary has no `whisper` filter
+// — transcription on a bundled platform needs the `whisper` cargo feature.
+const BTBN_TAG = "autobuild-2026-08-21-13-40";
+const BTBN_BUILD = "n9.0.1-6-g9d4ca21220";
+const BTBN_BRANCH = "9.0";
+const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
+// evermeet.cx serves per-version URLs alongside its rolling `getrelease` ones.
+const EVERMEET = "9.0.1";
+
 // One or more archives per target; each contributes some of {ffmpeg, ffprobe}.
-const BTBN = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
 const SOURCES = {
   "x86_64-pc-windows-msvc": {
     ext: ".exe",
-    archives: [{ url: `${BTBN}/ffmpeg-master-latest-win64-gpl.zip`, wants: ["ffmpeg.exe", "ffprobe.exe"] }],
+    archives: [
+      {
+        url: `${BTBN}/ffmpeg-${BTBN_BUILD}-win64-gpl-${BTBN_BRANCH}.zip`,
+        sha256: "6c0a3c1256cba57c62a3bb012c1e8f5e794d38a16c6509d05349237d2b66340f",
+        wants: ["ffmpeg.exe", "ffprobe.exe"],
+      },
+    ],
   },
   "x86_64-unknown-linux-gnu": {
     ext: "",
-    archives: [{ url: `${BTBN}/ffmpeg-master-latest-linux64-gpl.tar.xz`, wants: ["ffmpeg", "ffprobe"] }],
+    archives: [
+      {
+        url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linux64-gpl-${BTBN_BRANCH}.tar.xz`,
+        sha256: "da7c861c44cc6f92fff7f3f6aefb47690e3e88702826d06fbf9ac592a5f24083",
+        wants: ["ffmpeg", "ffprobe"],
+      },
+    ],
   },
   "x86_64-apple-darwin": {
     ext: "",
     archives: [
-      { url: "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip", wants: ["ffmpeg"] },
-      { url: "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip", wants: ["ffprobe"] },
+      {
+        url: `https://evermeet.cx/ffmpeg/ffmpeg-${EVERMEET}.zip`,
+        sha256: "8a8c9e549983409fe6604b9aa665648b7a5def9407fe814c39c8b2ea7f64a48f",
+        wants: ["ffmpeg"],
+      },
+      {
+        url: `https://evermeet.cx/ffmpeg/ffprobe-${EVERMEET}.zip`,
+        sha256: "d13f35db03456b7f65b7edb6437c86e23810fbfe91795e571f5b77211343b4f1",
+        wants: ["ffprobe"],
+      },
     ],
   },
 };
+
+async function download(url) {
+  console.log(`\u2193 ${url}`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download failed (${res.status}) for ${url}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+  return { bytes, digest };
+}
+
+// `--print-hashes` fetches every pinned archive and prints its digest, so
+// bumping a version is paste-in rather than a hash computed by hand (or skipped).
+if (process.argv.includes("--print-hashes")) {
+  for (const [triple, source] of Object.entries(SOURCES)) {
+    for (const { url } of source.archives) {
+      const { digest } = await download(url);
+      console.log(`  ${triple}\n    ${url}\n    sha256: "${digest}",`);
+    }
+  }
+  process.exit(0);
+}
 
 async function findFile(root, base) {
   for (const e of await readdir(root, { withFileTypes: true })) {
@@ -76,12 +141,19 @@ await mkdir(licenseDir, { recursive: true });
 const work = await mkdtemp(join(tmpdir(), "kerf-ffmpeg-"));
 let licenseWritten = false;
 try {
-  for (const { url, wants } of source.archives) {
-    console.log(`↓ ${url}`);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`download failed (${res.status}) for ${url}`);
+  for (const { url, wants, sha256 } of source.archives) {
+    const { bytes, digest } = await download(url);
+    // Verified before anything unpacks it — a tampered archive is never handed
+    // to `tar`, let alone bundled into a signed installer.
+    if (digest !== sha256) {
+      throw new Error(
+        `checksum mismatch for ${url}\n  expected ${sha256}\n  got      ${digest}\n` +
+          "If upstream legitimately republished, re-pin with --print-hashes.",
+      );
+    }
+    console.log(`✓ sha256 ${digest}`);
     const archive = join(work, url.split("/").pop().replace(/[^\w.-]/g, "_") || "archive");
-    await Bun.write(archive, await res.arrayBuffer());
+    await Bun.write(archive, bytes);
     // bsdtar (Windows/macOS) extracts .zip; GNU tar (Linux) handles .tar.xz.
     await $`tar -xf ${archive} -C ${work}`.quiet();
 
