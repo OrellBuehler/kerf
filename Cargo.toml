@@ -45,7 +45,7 @@ fontdb = "0.24"
 ffmpeg-next = "9.0"
 
 # MCP — official Rust SDK (streamable-HTTP server transport, hosted by kerf-app)
-rmcp = { version = "1.7", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = "1.2"
 
 # HTTP server for the embedded MCP endpoint (matches rmcp's tower/axum 0.8)
