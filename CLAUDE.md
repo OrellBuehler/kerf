@@ -192,7 +192,12 @@ have no transcription at all there. `.github/actions/whisper-toolchain` installs
 *verifies* that toolchain (a missing libclang is not an error to whisper-rs-sys — it
 silently falls back to its bundled Linux-generated bindings), and CI's `whisper` job
 compiles the feature on all three runners, plus the x86_64 macOS cross-compile the
-release does, so it can't break for the first time during a release.
+release does, so it can't break for the first time during a release. On macOS it
+also sets `MACOSX_DEPLOYMENT_TARGET` to `bundle.macOS.minimumSystemVersion`
+(**10.15**, raised from Tauri's 10.13 default): ggml reaches for
+`std::filesystem`, which libc++ marks unavailable below 10.15, so the floor is
+what the feature costs — and a job compiling against the runner's own SDK would
+never see it.
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the
