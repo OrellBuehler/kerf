@@ -51,7 +51,11 @@ runs:
     - name: Verify cmake + libclang (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
-      run: |
+      # Exports LIBCLANG_PATH through GITHUB_ENV because bindgen reads it from
+      # the environment of the *cargo* step, not this one. The value is a path
+      # discovered on the runner image itself — nothing from the event payload
+      # reaches it — so the injection route the audit warns about is closed.
+      run: | # zizmor: ignore[github-env]
         $ErrorActionPreference = 'Stop'
         if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
           Write-Output '::error::cmake not found on the runner image'
