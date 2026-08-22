@@ -1,0 +1,42 @@
+{{- /* The Get-it section's three platform cards. Same data attributes as the
+       hero menu, so download.js fills both from one API call. */ -}}
+{{- $rel := .Site.Params.releases -}}
+<div class="dl-cards stagger reveal">
+  <article class="dl-card" data-dl-card="macos">
+    <header>
+      {{ partial "os-icon.html" (dict "os" "macos" "h" 18) }}
+      <h3>macOS</h3>
+      <span class="dl-mine">Your platform</span>
+    </header>
+    {{ partial "dl-row.html" (dict "key" "macos-arm" "name" "Apple silicon" "ext" ".dmg" "rel" $rel) }}
+    {{ partial "dl-row.html" (dict "key" "macos-intel" "name" "Intel" "ext" ".dmg" "rel" $rel) }}
+    <p class="fine">macOS 10.15+. Needs a system <code>ffmpeg</code> on <code>PATH</code> —
+    <code>brew install ffmpeg</code>. The build is unsigned, so open it once with
+    right-click → <b>Open</b>.</p>
+  </article>
+
+  <article class="dl-card" data-dl-card="windows">
+    <header>
+      {{ partial "os-icon.html" (dict "os" "windows" "h" 18) }}
+      <h3>Windows</h3>
+      <span class="dl-mine">Your platform</span>
+    </header>
+    {{ partial "dl-row.html" (dict "key" "windows-exe" "name" "Installer" "ext" ".exe" "rel" $rel) }}
+    {{ partial "dl-row.html" (dict "key" "windows-msi" "name" "MSI package" "ext" ".msi" "rel" $rel) }}
+    <p class="fine">Windows 10/11 x64. <b>FFmpeg is bundled</b> — nothing else to install.
+    Needs the WebView2 runtime, which ships with Windows 11.</p>
+  </article>
+
+  <article class="dl-card" data-dl-card="linux">
+    <header>
+      {{ partial "os-icon.html" (dict "os" "linux" "h" 18) }}
+      <h3>Linux</h3>
+      <span class="dl-mine">Your platform</span>
+    </header>
+    {{ partial "dl-row.html" (dict "key" "linux-appimage" "name" "AppImage" "ext" "" "rel" $rel) }}
+    {{ partial "dl-row.html" (dict "key" "linux-deb" "name" "Debian / Ubuntu" "ext" ".deb" "rel" $rel) }}
+    {{ partial "dl-row.html" (dict "key" "linux-rpm" "name" "Fedora / RHEL" "ext" ".rpm" "rel" $rel) }}
+    <p class="fine">x86_64, WebKitGTK 4.1. Needs a system <code>ffmpeg</code> on <code>PATH</code>.
+    Only the <b>AppImage</b> can update itself in place.</p>
+  </article>
+</div>

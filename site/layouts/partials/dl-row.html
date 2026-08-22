@@ -1,0 +1,9 @@
+{{- /* One downloadable file. Ships pointing at the releases page; download.js
+       swaps in the real asset URL and fills the size in. */ -}}
+<a class="dl-row" data-dl-asset="{{ .key }}" href="{{ .rel }}" target="_blank" rel="noopener">
+  <span class="dl-row-name">{{ .name }}</span>
+  <span class="dl-row-meta">
+    {{- with .ext }}<span class="dl-ext">{{ . }}</span>{{ end -}}
+    <span class="dl-size" data-dl-size></span>
+  </span>
+</a>

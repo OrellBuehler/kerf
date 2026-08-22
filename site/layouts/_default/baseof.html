@@ -6,10 +6,18 @@
     <title>{{ .Title }}</title>
     <meta name="description" content="{{ .Site.Params.description }}" />
 
+    <link rel="canonical" href="{{ .Permalink }}" />
+
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Kerf" />
     <meta property="og:title" content="{{ .Title }}" />
     <meta property="og:description" content="{{ .Site.Params.description }}" />
-    <meta property="og:image" content="{{ "img/screenshot-editor.png" | absURL }}" />
+    {{/* docs/img is mounted at static/img, so this is the same file the repo
+         README can use — see docs/img/README.md for how it is regenerated. */}}
+    <meta property="og:image" content="{{ "img/og.png" | absURL }}" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Kerf — the video editor your AI can drive" />
     <meta property="og:url" content="{{ .Permalink }}" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="theme-color" content="#0f1318" />
@@ -46,5 +54,7 @@
         io.observe(el);
       });
     </script>
+    {{ $dl := resources.Get "js/download.js" | minify | fingerprint }}
+    <script src="{{ $dl.RelPermalink }}" integrity="{{ $dl.Data.Integrity }}" defer></script>
   </body>
 </html>

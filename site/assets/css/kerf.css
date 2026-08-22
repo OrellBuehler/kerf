@@ -187,7 +187,9 @@ pre {
   background: var(--surface-hover);
 }
 @media (max-width: 640px) {
-  .nav-links a:not(.ghost-link) {
+  /* Only the download chip survives — it is the primary action, and the
+     section links are all reachable by scrolling anyway. */
+  .nav-links a:not(.nav-dl) {
     display: none;
   }
 }
@@ -221,8 +223,8 @@ pre {
 h1 {
   font-family: var(--font-display);
   font-weight: 700;
-  font-size: clamp(38px, 6.4vw, 68px);
-  line-height: 1.02;
+  font-size: clamp(36px, 5.4vw, 60px);
+  line-height: 1.04;
   letter-spacing: -0.025em;
   margin: 18px 0 0;
 }
@@ -687,6 +689,12 @@ code {
 .foot-fine a:hover {
   color: var(--kerf-400);
   border-bottom-color: rgba(226, 157, 46, 0.4);
+}
+
+/* The open download menu has to clear the band below it: every `.wrap` sits at
+   z-index 1, so DOM order alone would paint the stat strip over the hero. */
+.hero .wrap {
+  z-index: 20;
 }
 
 /* Wider hero on large screens: copy + shot side by side */
@@ -1461,6 +1469,41 @@ html.js .stagger.in > *:nth-child(n + 9) { transition-delay: 540ms; }
   89% { box-shadow: 0 0 0 1px rgba(234, 177, 78, 0.55), 0 0 34px rgba(226, 157, 46, 0.25); }
   94%, 100% { box-shadow: var(--shadow-lg); }
 }
+.ms-diff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 10px;
+}
+.ms-diff .lead {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.ms-diff i {
+  font-style: normal;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+}
+.ms-diff .add {
+  color: #6fd39b;
+  background: rgba(40, 197, 133, 0.1);
+  border-color: rgba(40, 197, 133, 0.28);
+}
+.ms-diff .cut {
+  color: #f08a78;
+  background: rgba(241, 84, 63, 0.1);
+  border-color: rgba(241, 84, 63, 0.28);
+}
+.ms-diff .shift {
+  color: var(--kerf-300);
+  background: rgba(226, 157, 46, 0.1);
+  border-color: rgba(226, 157, 46, 0.3);
+}
+
 .ms-foot {
   padding: 9px 14px;
   border-top: 1px solid var(--border-subtle);
@@ -1610,6 +1653,402 @@ html.js .stagger.in > *:nth-child(n + 9) { transition-delay: 540ms; }
   border-color: var(--border-strong);
 }
 
+/* =============================================================
+   Downloads.
+   The links ship pointing at the releases page and are rewritten
+   in place by assets/js/download.js once it has resolved the real
+   asset URLs — so every state below has to read correctly with
+   the script blocked, too.
+   ============================================================= */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- The split button ---- */
+.dl {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+}
+.dl-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  padding-right: 18px;
+}
+.dl-ic {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  opacity: 0.9;
+}
+.dl-toggle {
+  position: relative;
+  padding: 0 12px;
+  margin-left: 1px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  box-shadow: 0 8px 26px rgba(226, 157, 46, 0.28);
+  cursor: pointer;
+  font: inherit;
+}
+/* One seam between the two halves, drawn on the dark button face. */
+.dl-toggle::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 9px;
+  bottom: 9px;
+  width: 1px;
+  background: rgba(26, 18, 5, 0.25);
+}
+.dl-chev {
+  width: 14px;
+  height: 14px;
+  transition: transform 160ms var(--ease-out);
+}
+.dl-toggle[aria-expanded="true"] .dl-chev {
+  transform: rotate(180deg);
+}
+
+/* ---- The platform menu ---- */
+.dl-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 10px);
+  left: 0;
+  min-width: 290px;
+  padding: 8px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-pop);
+}
+.dl-menu[hidden] {
+  display: none;
+}
+html.js .dl-menu:not([hidden]) {
+  animation: dl-pop 150ms var(--ease-out);
+}
+@keyframes dl-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+.dl-menu-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 10px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.dl-ver {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--kerf-400);
+}
+.dl-group + .dl-group {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+.dl-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.os-ic {
+  flex: none;
+  opacity: 0.75;
+}
+.dl-menu-foot {
+  display: block;
+  margin-top: 6px;
+  padding: 9px 10px 5px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.dl-menu-foot:hover {
+  color: var(--kerf-400);
+}
+
+/* ---- One downloadable file ---- */
+.dl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 10px;
+  border-radius: var(--radius-lg);
+  font-size: 14px;
+  color: var(--text-primary);
+  transition:
+    background 120ms,
+    color 120ms;
+}
+.dl-row[hidden] {
+  display: none;
+}
+.dl-row:hover {
+  background: var(--surface-hover);
+}
+.dl-row-name {
+  font-weight: 500;
+}
+.dl-row-meta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.dl-ext {
+  color: var(--text-secondary);
+}
+.dl-size:empty {
+  display: none;
+}
+/* The row the hero button points at. */
+.dl-row.is-pick .dl-row-name::after {
+  content: "Detected";
+  margin-left: 9px;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: rgba(226, 157, 46, 0.13);
+  border: 1px solid rgba(226, 157, 46, 0.3);
+  color: var(--kerf-300);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  vertical-align: 1px;
+}
+
+/* ---- Hero meta lines ---- */
+.dl-meta {
+  margin: 14px 0 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--kerf-300);
+}
+.dl-meta[hidden] {
+  display: none;
+}
+.dl-note {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.dl-note a {
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-strong);
+}
+.dl-note a:hover {
+  color: var(--kerf-400);
+}
+.get-cta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 26px;
+}
+.get-cta .dl-meta {
+  margin: 0;
+}
+
+/* ---- The Get-it platform cards ---- */
+.dl-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+  margin-bottom: 22px;
+}
+@media (max-width: 860px) {
+  .dl-cards {
+    grid-template-columns: 1fr;
+  }
+}
+.dl-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 20px 18px 18px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-2xl);
+  transition:
+    border-color 200ms,
+    transform 200ms var(--ease-out);
+}
+.dl-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+}
+.dl-card.is-mine {
+  border-color: rgba(226, 157, 46, 0.4);
+  box-shadow: 0 0 0 1px rgba(226, 157, 46, 0.12);
+}
+.dl-card header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dl-card h3 {
+  flex: 1;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 17px;
+}
+.dl-card .os-ic {
+  opacity: 0.85;
+}
+.dl-mine {
+  display: none;
+  padding: 2px 9px;
+  border-radius: var(--radius-full);
+  background: rgba(226, 157, 46, 0.13);
+  border: 1px solid rgba(226, 157, 46, 0.3);
+  color: var(--kerf-300);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.dl-card.is-mine .dl-mine {
+  display: inline-block;
+}
+.dl-card .dl-row {
+  margin: 0 -8px;
+  padding: 8px;
+}
+.dl-card .dl-row.is-pick .dl-row-name::after {
+  content: none;
+}
+.dl-card .fine {
+  /* auto so the fine print sits on one baseline across cards of unequal
+     row counts; the padding keeps a gap when there is no slack to take. */
+  margin: auto 0 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+.dl-card .fine code {
+  font-size: 0.92em;
+}
+
+/* =============================================================
+   Stat strip — the numbers that are actually true.
+   ============================================================= */
+.stats-band {
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(10, 12, 15, 0.4);
+}
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding-top: 26px;
+  padding-bottom: 26px;
+}
+@media (max-width: 780px) {
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px 8px;
+  }
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border-subtle);
+}
+.stat b {
+  font-family: var(--font-display);
+  font-size: clamp(19px, 2.4vw, 26px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--kerf-400);
+  line-height: 1.1;
+}
+.stat span {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.stat:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+@media (max-width: 780px) {
+  .stat:nth-child(3) {
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+
+/* Nav: a download link that reads as the primary action. */
+.nav-dl {
+  padding: 7px 15px;
+  border-radius: var(--radius-full);
+  background: var(--kerf-500);
+  color: #1a1205 !important;
+  font-weight: 600;
+}
+.nav-dl:hover {
+  background: var(--kerf-400);
+}
+@media (max-width: 640px) {
+  .nav-links {
+    gap: 12px;
+  }
+}
+
+/* The staged-review tool reads as neither "sees" nor plain. */
+.chip.stage {
+  color: var(--kerf-300);
+  border-color: rgba(226, 157, 46, 0.28);
+  background: rgba(226, 157, 46, 0.07);
+}
+
+/* Keyboard focus was invisible on the dark surfaces. */
+:focus-visible {
+  outline: 2px solid var(--kerf-400);
+  outline-offset: 2px;
+  border-radius: var(--radius-md);
+}
+
 /* ---- Reduced motion: freeze everything on its legible still ---- */
 @media (prefers-reduced-motion: reduce) {
   html.js .reveal,
@@ -1633,5 +2072,8 @@ html.js .stagger.in > *:nth-child(n + 9) { transition-delay: 540ms; }
   }
   .flow-svg .pulse {
     display: none;
+  }
+  html.js .dl-menu:not([hidden]) {
+    animation: none;
   }
 }

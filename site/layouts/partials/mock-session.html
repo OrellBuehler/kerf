@@ -1,5 +1,5 @@
 <div class="mock-session reveal" role="img"
-  aria-label="Illustration of an agent session: the agent claims a task, skims frames, removes silences, previews the composited cut, and hands the edit back ready for review — while the timeline updates live in the GUI.">
+  aria-label="Illustration of an agent session: the agent claims a task, skims frames, removes silences, previews the composited cut, and hands the edit back as a diff you review — while the timeline updates live in the GUI.">
   <div class="ms-rail" aria-hidden="true">
     <div class="ms-steps"><span>queued</span><span>working</span><span>ready</span><span>applied</span></div>
     <div class="ms-line"><span class="ms-dot"></span></div>
@@ -51,7 +51,11 @@
         </div>
         <span class="ms-playhead"></span>
       </div>
-      <div class="ms-foot">every agent edit lands in the same project — revert any step from History</div>
+      <div class="ms-diff">
+        <span class="lead">4 changes · 2:00.0 → 1:40.0 (−20.0s)</span>
+        <i class="add">1 added</i><i class="cut">2 cut</i><i class="shift">1 moved</i>
+      </div>
+      <div class="ms-foot">nothing lands until you apply — and one revision reverts the lot</div>
     </div>
   </div>
 </div>
