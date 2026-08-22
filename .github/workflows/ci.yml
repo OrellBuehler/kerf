@@ -60,7 +60,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 
   msrv:
-    name: msrv (rust ${{ env.MSRV }})
+    # No `${{ env.MSRV }}` here: the `env` context is not available in a job
+    # `name`, and referencing it makes the whole workflow fail to start.
+    name: msrv
     runs-on: ubuntu-22.04
     env:
       # Keep in sync with `rust-version` in the workspace Cargo.toml and the
