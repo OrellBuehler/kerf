@@ -1,0 +1,48 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0}
+  html,body{width:1200px;height:630px}
+  body{
+    background:#0f1318;color:#eef1f5;
+    font-family:"Inter",sans-serif;
+    position:relative;overflow:hidden;
+  }
+  .glow{position:absolute;inset:0;
+    background:
+      radial-gradient(52% 62% at 88% 4%, rgba(226,157,46,.22), transparent 62%),
+      radial-gradient(46% 58% at 4% 96%, rgba(34,180,196,.16), transparent 60%);}
+  .pad{position:relative;padding:72px 76px;height:100%;display:flex;flex-direction:column}
+  .brand{display:flex;align-items:center;gap:16px}
+  .brand span{font-family:"Space Grotesk",sans-serif;font-weight:700;font-size:42px;letter-spacing:-.02em}
+  h1{font-family:"Space Grotesk",sans-serif;font-weight:700;font-size:76px;line-height:1.03;
+     letter-spacing:-.03em;margin-top:52px;max-width:900px}
+  .amber{color:#eab14e}
+  p{margin-top:26px;font-size:26px;line-height:1.45;color:#97a3b2;max-width:820px}
+  .eyebrow{margin-top:auto;display:flex;align-items:center;gap:14px;
+    font-family:"JetBrains Mono",monospace;font-size:19px;color:#7a8696;letter-spacing:.02em}
+  .dot{width:11px;height:11px;border-radius:99px;background:#e29d2e;box-shadow:0 0 16px rgba(226,157,46,.55)}
+  .tl{position:absolute;left:0;right:0;bottom:0;height:12px;display:flex;gap:3px;padding:0 0 0 0}
+  .tl i{height:100%;display:block}
+</style></head><body>
+<div class="glow"></div>
+<div class="pad">
+  <div class="brand">
+    <svg viewBox="0 0 34 42" height="52" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="4" width="13" height="34" rx="1" fill="#eef1f5"/>
+      <rect x="17" y="8" width="13" height="34" rx="1" fill="#aab3bf"/>
+      <rect x="14.5" y="0" width="2" height="42" rx="1" fill="#e29d2e"/>
+    </svg>
+    <span>Kerf</span>
+  </div>
+  <h1>The video editor<br>your <span class="amber">AI can drive</span>.</h1>
+  <p>A non-destructive desktop NLE with an embedded MCP server — the agent
+     drives the same engine as the GUI, and can see the frames it edits.</p>
+  <div class="eyebrow"><span class="dot"></span> NON-DESTRUCTIVE · MCP-NATIVE · FFMPEG-BACKED · macOS · WINDOWS · LINUX</div>
+</div>
+<div class="tl">
+  <i style="width:19%;background:#3a4552"></i><i style="width:26%;background:#4a5562"></i>
+  <i style="width:9%;background:#222932"></i><i style="width:21%;background:#3a4552"></i>
+  <i style="width:14%;background:#22b4c4"></i><i style="flex:1;background:#e29d2e"></i>
+</div>
+</body></html>

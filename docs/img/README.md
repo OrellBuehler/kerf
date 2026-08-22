@@ -17,7 +17,7 @@ timeline — a few clips across two or three tracks, a waveform, a scene marker 
 
 | Filename                     | What to capture                                                                 | Used by                  |
 | ---------------------------- | ------------------------------------------------------------------------------- | ------------------------ |
-| `screenshot-editor.png`      | The **full editor** window — title bar, media bin, preview, multi-track timeline. Hero shot. | README + site `og:image` |
+| `screenshot-editor.png`      | The **full editor** window — title bar, media bin, preview, multi-track timeline. Hero shot. | README                   |
 | `screenshot-agent.png`       | The **agent panel** — task queue (a `ready` task with Apply/Dismiss) + history. | README                   |
 | `screenshot-inspector.png`   | The **inspector** — an effects chain, the Transform/keyframe panel, or overlays. | README                   |
 
@@ -31,6 +31,20 @@ Tips:
 - Keep the amber playhead visible — it's the brand's signature.
 
 Until these exist, the `README` shows broken-image placeholders where they go. The
-landing site no longer embeds them — it renders animated CSS/SVG mockups instead — but
-its `og:image` still points at `screenshot-editor.png`, so social-link previews stay
-broken until the hero shot lands.
+landing site no longer embeds them — it renders animated CSS/SVG mockups instead.
+
+## `og.png` — the social-card image
+
+`og.png` (1200×630) is the site's `og:image`, and it is **generated, not captured**:
+[`../og-source.html`](../og-source.html) is the layout, rendered headless at exactly
+that size. It lives one level up so the Pages build, which mounts *this* folder at
+`static/img/`, does not publish it as a page.
+
+```bash
+google-chrome --headless=new --disable-gpu --hide-scrollbars \
+  --screenshot=docs/img/og.png --window-size=1200,630 \
+  --virtual-time-budget=6000 "file://$PWD/docs/og-source.html"
+```
+
+The budget matters: the page pulls Space Grotesk / Inter / JetBrains Mono from Google
+Fonts, and a shorter one screenshots the fallback faces.

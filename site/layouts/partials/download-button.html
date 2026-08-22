@@ -1,0 +1,43 @@
+{{- /* The hero's split download button: a primary action that download.js
+       retargets at the visitor's own platform, plus a menu holding every
+       published file. Without JS it is two links to the releases page. */ -}}
+{{- $rel := .Site.Params.releases -}}
+{{- $id := printf "dl-menu-%s" (default "hero" .id) -}}
+<div class="dl">
+  <a class="btn btn-primary dl-main" data-dl-primary href="{{ $rel }}" target="_blank" rel="noopener">
+    <svg class="dl-ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 1.8v8.4M4.6 7.2 8 10.6l3.4-3.4M2.2 13.4h11.6" />
+    </svg>
+    <span data-dl-label>Download</span>
+  </a>
+  <button type="button" class="btn btn-primary dl-toggle" data-dl-toggle aria-expanded="false" aria-haspopup="true" aria-controls="{{ $id }}">
+    <span class="sr-only">Choose a platform</span>
+    <svg class="dl-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M4 6.2 8 10.2l4-4" />
+    </svg>
+  </button>
+
+  <div class="dl-menu" id="{{ $id }}" data-dl-menu hidden>
+    <div class="dl-menu-head">
+      <span>All platforms</span>
+      <span class="dl-ver" data-dl-version hidden></span>
+    </div>
+    <div class="dl-group">
+      <div class="dl-group-head">{{ partial "os-icon.html" (dict "os" "macos") }} macOS</div>
+      {{ partial "dl-row.html" (dict "key" "macos-arm" "name" "Apple silicon" "ext" ".dmg" "rel" $rel) }}
+      {{ partial "dl-row.html" (dict "key" "macos-intel" "name" "Intel" "ext" ".dmg" "rel" $rel) }}
+    </div>
+    <div class="dl-group">
+      <div class="dl-group-head">{{ partial "os-icon.html" (dict "os" "windows") }} Windows</div>
+      {{ partial "dl-row.html" (dict "key" "windows-exe" "name" "Installer" "ext" ".exe" "rel" $rel) }}
+      {{ partial "dl-row.html" (dict "key" "windows-msi" "name" "MSI package" "ext" ".msi" "rel" $rel) }}
+    </div>
+    <div class="dl-group">
+      <div class="dl-group-head">{{ partial "os-icon.html" (dict "os" "linux") }} Linux</div>
+      {{ partial "dl-row.html" (dict "key" "linux-appimage" "name" "AppImage" "ext" "" "rel" $rel) }}
+      {{ partial "dl-row.html" (dict "key" "linux-deb" "name" "Debian / Ubuntu" "ext" ".deb" "rel" $rel) }}
+      {{ partial "dl-row.html" (dict "key" "linux-rpm" "name" "Fedora / RHEL" "ext" ".rpm" "rel" $rel) }}
+    </div>
+    <a class="dl-menu-foot" href="{{ $rel }}" target="_blank" rel="noopener">Release notes &amp; checksums ↗</a>
+  </div>
+</div>

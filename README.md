@@ -38,19 +38,21 @@ frames it's editing. Nothing is re-encoded until you export.
 Plenty of tools bolt a chatbot onto a video editor. Kerf inverts that: the editor **is**
 an API, exposed twice over one shared project — as the GUI you click, and as
 [Model Context Protocol](https://modelcontextprotocol.io) tools an agent calls. So the
-agent isn't scripting a black box; it drives the identical engine, and every edit it
-makes shows up **live** in your timeline for you to review.
+agent isn't scripting a black box; it drives the identical engine — and its edits are
+**staged for review**, so they never move the cut you are looking at.
 
 - 🎬 **The agent has eyes.** `get_frame`, `skim_asset` (a contact-sheet montage for
   finding the good parts), and `preview_timeline` (the composited cut at a given time)
   return real images the model *sees* — so it can find the right moment and confirm the
   cut, not guess from metadata.
 - 🧠 **Same engine, same project.** The MCP server and the webview hold the *same*
-  `Project`. When the agent trims a clip, your GUI re-renders it instantly.
-- 🤝 **You stay in control.** Work is handed back and forth through a **task queue**: you
-  enqueue plain-language tasks, the agent claims one, does the edits, and marks it *ready*
-  for you to apply or dismiss. Kerf never edits on its own, and every change is a
-  revertible entry in the edit history.
+  `Project` behind one lock — no import/export round-trip, no second copy of the truth,
+  and the agent previews its own work through the exact graph that renders your export.
+- 🤝 **You stay in control.** Agent edits **stage** — they build a *proposal*, not your
+  cut. The review card shows a real diff (added / cut / moved / retrimmed), you can
+  *watch* the proposed timeline play, and Apply lands it as one revertible revision.
+  Work is handed back through a persisted **task queue**, so an agent is safe to leave
+  running on someone's edit.
 - ✂️ **Truly non-destructive.** Everything is an EDL over source ranges. Cuts, effects,
   and keyframes are just data until you export a single `filter_complex`.
 - 📦 **Runs without FFmpeg dev libraries.** The engine drives the `ffmpeg`/`ffprobe`
@@ -63,16 +65,20 @@ makes shows up **live** in your timeline for you to review.
 
 | | |
 | --- | --- |
-| **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, ripple delete, snapping to edges / playhead / **beats**. |
-| **Audible playback** | Real Web-Audio playback with J/K/L shuttle + scrub; volume, fades, speed and reverse are auralized and the playhead follows the audio clock. |
-| **Analysis** | FFmpeg `silencedetect`, scene detection, audio energy/**beat** grid, and waveforms — all CLI-driven. Optional local **Whisper** transcription. |
-| **Effects & color** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, plus transform + color grade. |
+| **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, ripple delete, markers, mute/solo/lock, snapping to edges / playhead / **beats**. |
+| **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle and audible Web-Audio scrub. |
+| **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
+| **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
+| **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
+| **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
 | **Keyframe animation** | Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead. |
 | **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. An **Insta360 lens pair imports as one 360 asset** — Kerf stitches the two capture files into an equirect sphere once and caches it. Spherical sources are detected on import; anything unflagged can be marked by hand. |
-| **Titles & captions** | Text overlays / lower-thirds with their own keyframes, and one-click **captions from a transcript** (SRT export too). |
+| **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, one-click **captions from a transcript**, and SRT export. |
+| **Edit by transcript** | The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and `×` cuts that sentence out of the timeline and ripples the gap closed. |
 | **Smart mixing** | Per-track **ducking** (music dips under dialogue via sidechain) and single-pass **loudnorm** to −14 LUFS on export. |
-| **Export** | Positional, multi-track `filter_complex` with progress + cancel; **range export** renders just the region between your in/out marks. |
-| **Agent workflow** | 60 MCP tools, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **GPU-accelerated export** | NVENC / QSV / VideoToolbox / AMF are **verified with a real test encode** before being offered, hardware decode falls back to software on its own, and **range export** renders just the region between your in/out marks. |
+| **Agent workflow** | 78 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **Auto-update** | The app updates itself from its own GitHub releases; a bundle only installs if its **minisign signature** verifies against the embedded public key. |
 
 <div align="center">
 
@@ -88,10 +94,13 @@ makes shows up **live** in your timeline for you to review.
 
 ### Download a build
 
-Grab the installer for your platform from the
-[**latest release**](https://github.com/OrellBuehler/kerf/releases/latest) — `.dmg`/`.app`
-(macOS), `.AppImage`/`.deb` (Linux), or `.msi`/`.exe` (Windows). macOS and Linux builds
-expect a system FFmpeg on `PATH`; the Windows build bundles it.
+The [**Kerf site**](https://orellbuehler.github.io/kerf/#get) has a direct download
+button for your platform, or grab the installer from the
+[**latest release**](https://github.com/OrellBuehler/kerf/releases/latest) — `.dmg`
+(macOS, Apple silicon + Intel), `.AppImage`/`.deb`/`.rpm` (Linux), or `.exe`/`.msi`
+(Windows). macOS and Linux builds expect a system FFmpeg on `PATH`; the Windows build
+bundles it. The macOS build is unsigned, so open it once with right-click → **Open**.
+Once installed, Kerf updates itself from its own releases.
 
 ### Or build from source
 
@@ -131,7 +140,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (59)
+### The tools (78)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -146,8 +155,10 @@ the last three return images the model can see.
 <summary><b>Cut & arrange</b></summary>
 
 `cut_clip` · `add_clip_to_timeline` · `split_at` · `trim` · `reorder` · `move_clip` ·
-`remove` · `ripple_delete` · `cut_clip_range` · `add_track` · `remove_track` ·
-`set_track_duck` · `remove_silence` · `extract_audio` · `concatenate`
+`remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
+`add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
+`set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
+`snap_to_beats` · `extract_audio` · `concatenate`
 </details>
 
 <details>
@@ -158,18 +169,20 @@ the last three return images the model can see.
 `add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `add_overlay` · `update_overlay` ·
 `remove_overlay` · `set_overlay_keyframes` · `captions_from_transcript` · `export_srt` ·
-`list_fonts`
+`list_fonts` · `set_delivery_format` · `set_asset_projection`
 </details>
 
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
-`resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to`
+`export` · `export_capabilities` · `stage_edits` · `staged_diff` · `apply_staged_edits` ·
+`discard_staged_edits` · `revision_diff` · `list_tasks` · `add_task` · `claim_next_task` ·
+`complete_task` · `fail_task` · `resolve_task` · `remove_task` · `history` · `undo` ·
+`redo` · `revert_to` · `transcription_status` · `download_speech_model`
 </details>
 
-Every mutating tool emits a `project-changed` event, so edits appear in the GUI as the
-agent makes them.
+Every mutating tool emits a `project-changed` event, so the agent's proposal appears in
+the GUI for review as it is built — the live cut only moves when *you* apply it.
 
 ---
 
@@ -283,8 +296,7 @@ preview, transcript, analysis, effects, keyframes, captions, playback and export
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
 **Roadmap:** a live activity stream pushed from the MCP server (the queue is polled
-today), richer staged-edit diffs in the review step, and auralized effect chains in
-preview playback.
+today), transitions beyond crossfade / dip-to-black, and audible reverse shuttle.
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 

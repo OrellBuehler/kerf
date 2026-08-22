@@ -2,6 +2,7 @@
 {{ $gh := .Site.Params.github }}
 {{ $rel := .Site.Params.releases }}
 {{ $mcp := .Site.Params.mcpUrl }}
+{{ $tools := .Site.Params.toolCount }}
 
 <a class="skip" href="#features">Skip to content</a>
 
@@ -14,13 +15,16 @@
     <nav class="nav-links">
       <a href="#features">Features</a>
       <a href="#agent">The&nbsp;agent</a>
-      <a href="#get">Get&nbsp;it</a>
+      <a href="#mcp">MCP</a>
       <a class="ghost-link" href="{{ $gh }}" target="_blank" rel="noopener">GitHub&nbsp;↗</a>
+      <a class="nav-dl" href="#get">Download</a>
     </nav>
   </div>
 </header>
 
-<main>
+{{/* One `data-dl` scope for the whole page: download.js fills the hero menu and
+     the Get-it cards from a single GitHub API call. */}}
+<main data-dl data-repo="{{ .Site.Params.repo }}">
   <!-- ============ HERO ============ -->
   <section class="hero">
     <div class="wrap">
@@ -34,15 +38,27 @@
           it edits. Nothing is re-encoded until you export.
         </p>
         <div class="cta">
-          <a class="btn btn-primary" href="{{ $rel }}" target="_blank" rel="noopener">Download</a>
+          {{ partial "download-button.html" (dict "Site" .Site "id" "hero") }}
           <a class="btn btn-ghost" href="{{ $gh }}" target="_blank" rel="noopener">View source</a>
-          <a class="btn btn-agent" href="#agent">How the agent edits →</a>
         </div>
+        <p class="dl-meta" data-dl-meta hidden></p>
+        <p class="dl-note">Free for noncommercial use · macOS · Windows · Linux ·
+          <a href="#get">all builds &amp; requirements</a></p>
       </div>
       <figure class="hero-viz">
         {{ partial "mock-editor.html" . }}
         <figcaption>Illustrated: bin, preview, agent queue and a multi-track timeline — the agent is trimming a clip on V1.</figcaption>
       </figure>
+    </div>
+  </section>
+
+  <!-- ============ STAT STRIP ============ -->
+  <section class="stats-band">
+    <div class="wrap stats">
+      <div class="stat"><b>{{ $tools }}</b><span>MCP tools over one live project</span></div>
+      <div class="stat"><b>0</b><span>re-encodes before you export</span></div>
+      <div class="stat"><b>3</b><span>platforms, signed auto-updates</span></div>
+      <div class="stat"><b>16:9 · 9:16 · 1:1</b><span>delivery frames with safe areas</span></div>
     </div>
   </section>
 
@@ -55,8 +71,8 @@
         <p class="sub">
           The same <code>Project</code> is exposed twice — as the GUI you click and as
           <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol</a>
-          tools an agent calls. It doesn't script a black box; it drives the identical engine,
-          and every edit shows up live for you to review.
+          tools an agent calls. It doesn't script a black box; it drives the identical engine —
+          and its edits are <b>staged for review</b>, never applied behind your back.
         </p>
       </div>
       <figure class="viz reveal">
@@ -75,21 +91,21 @@
         <article class="card">
           <div class="ic">🔗</div>
           <h3>Same engine, same project</h3>
-          <p>The MCP server and the webview hold the <i>same</i> project behind one lock. When
-          the agent trims a clip, your GUI re-renders it instantly — no import/export
-          round-trip, no second copy of the truth.</p>
+          <p>The MCP server and the webview hold the <i>same</i> project behind one lock. No
+          import/export round-trip, no second copy of the truth — and the agent previews its
+          own work through the exact graph that renders your export.</p>
         </article>
         <article class="card">
-          <div class="ic">🤝</div>
-          <h3>You stay in control</h3>
-          <p>Work is handed back through a <b>task queue</b>: you enqueue plain-language tasks,
-          the agent marks one <i>ready</i>, and you apply or dismiss. Kerf never edits on its
-          own, and every change is revertible.</p>
+          <div class="ic">📋</div>
+          <h3>Staged, then reviewed</h3>
+          <p>Agent edits build a <b>proposal</b>, not your cut. The review card shows a real
+          diff — added, cut, moved, retrimmed — and you can <i>watch</i> the proposed timeline
+          play, then apply it as one revertible revision, or discard it.</p>
         </article>
       </div>
       <figure class="viz session-viz">
         {{ partial "mock-session.html" . }}
-        <figcaption>One loop of a real session: skim → cut → preview → hand back. You apply — or dismiss.</figcaption>
+        <figcaption>One loop of a real session: skim → cut → preview → hand back a diff. You apply — or discard.</figcaption>
       </figure>
     </div>
   </section>
@@ -102,7 +118,8 @@
         <h2>A real NLE — not a scaffold.</h2>
         <p class="sub">Everything below is wired to real backend state and renders from a pure,
         unit-tested export graph. Clip positions, gaps, track layering, effects, keyframes,
-        overlays, ducking and loudnorm all come out of one <code>filter_complex</code>.</p>
+        overlays, ducking and loudnorm all come out of one <code>filter_complex</code> —
+        the same one that draws your preview.</p>
       </div>
       <figure class="viz reveal">
         <div class="viz-scroll">{{ partial "edl-diagram.html" . }}</div>
@@ -110,15 +127,18 @@
         keyframes edit that data — sources are read once, at export.</figcaption>
       </figure>
       <div class="feature-grid reveal stagger">
-        {{ partial "feature.html" (dict "t" "Multi-track NLE" "d" "Bespoke timeline: video / audio / text tracks, free positioning with gaps, drag across tracks, edge-drag trim, razor split, ripple delete, snapping to edges, the playhead and beats.") }}
-        {{ partial "feature.html" (dict "t" "Audible playback" "d" "Real Web-Audio playback with J/K/L shuttle and scrub; volume, fades, speed and reverse are auralized and the playhead follows the audio clock.") }}
-        {{ partial "feature.html" (dict "t" "Analysis" "d" "FFmpeg silence detection, scene detection, an audio energy / beat grid and waveforms — all CLI-driven. Optional local Whisper transcription.") }}
-        {{ partial "feature.html" (dict "t" "Effects & color" "d" "Per-clip video (blur / sharpen / hue / negate / vignette / chroma-key) and audio (highpass / lowpass / EQ / compressor / gate) chains, plus transform and color grade.") }}
-        {{ partial "feature.html" (dict "t" "Keyframe animation" "d" "Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead.") }}
-        {{ partial "feature.html" (dict "t" "360 reframing" "d" "Cut a normal, flat shot out of equirect or Insta360 dual-fisheye footage: aim a virtual camera with yaw / pitch / roll / FOV and keyframe the pan. Spherical sources are detected on import.") }}
-        {{ partial "feature.html" (dict "t" "Titles & captions" "d" "Text overlays and lower-thirds with their own keyframes, plus one-click captions from a transcript and SRT export.") }}
-        {{ partial "feature.html" (dict "t" "Smart mixing" "d" "Per-track ducking dips music under dialogue via sidechain, and a single-pass loudnorm brings the final mix to −14 LUFS on export.") }}
-        {{ partial "feature.html" (dict "t" "Export" "d" "Positional, multi-track filter_complex with progress and cancel; range export renders just the region between your in / out marks.") }}
+        {{ partial "feature.html" (dict "t" "Multi-track NLE" "d" "Video / audio / text tracks with free positioning and gaps, drag across tracks, edge-drag trim, razor split, ripple delete, markers, mute / solo / lock, and snapping to edges, the playhead and beats.") }}
+        {{ partial "feature.html" (dict "t" "Real playback" "d" "Not a slideshow: one long-lived FFmpeg streams the composited cut — every track, effect, keyframe and overlay — paced against the audio clock, with J/K/L shuttle and audible Web-Audio scrub.") }}
+        {{ partial "feature.html" (dict "t" "Delivery frames" "d" "Cut for the shape you ship: 16:9, 9:16, 1:1 or 4:5 is a property of the project, so preview, scrub and export all render the same frame — with platform safe-area guides and cover-crop instead of letterboxing.") }}
+        {{ partial "feature.html" (dict "t" "Analysis & speech" "d" "Silence and scene detection, an onset / tempo grid, EBU R128 loudness and speech-vs-music from one decode — plus transcription in every build, via FFmpeg's whisper filter or in-process whisper.cpp.") }}
+        {{ partial "feature.html" (dict "t" "Cut to the beat" "d" "Tempo is mapped onto timeline time as a confidence-gated beat grid the ruler draws and drags snap to — then one call ripples a whole track's cuts onto it, retrimming each clip at its outgoing edge.") }}
+        {{ partial "feature.html" (dict "t" "Effects, color & looks" "d" "Per-clip video (blur / sharpen / hue / vignette / chroma-key) and audio (highpass / lowpass / EQ / compressor / gate) chains, a transform and color grade, and one-click Punchy / Warm / Cool / Faded / B&W looks.") }}
+        {{ partial "feature.html" (dict "t" "Keyframe animation" "d" "Zoom, position, rotation and opacity animate over piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead and shows the sampled pose.") }}
+        {{ partial "feature.html" (dict "t" "360 & Insta360" "d" "Cut a normal, flat shot out of spherical footage: aim a virtual camera with yaw / pitch / roll / FOV and keyframe the pan. An Insta360 lens pair imports as one asset — Kerf stitches the two fisheyes into an equirect sphere and caches it.") }}
+        {{ partial "feature.html" (dict "t" "Titles & captions" "d" "Text overlays and lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, one-click captions from a transcript, and SRT export.") }}
+        {{ partial "feature.html" (dict "t" "Edit by transcript" "d" "The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and × cuts that sentence out of the timeline and ripples the gap closed.") }}
+        {{ partial "feature.html" (dict "t" "Smart mixing" "d" "Per-track ducking dips music under dialogue via sidechain compression, and a single-pass loudnorm brings the final mix to −14 LUFS on export.") }}
+        {{ partial "feature.html" (dict "t" "GPU-accelerated export" "d" "NVENC / QSV / VideoToolbox / AMF are verified with a real test encode before they are offered, hardware decode falls back to software on its own, and range export renders just your in / out marks.") }}
       </div>
     </div>
   </section>
@@ -127,25 +147,28 @@
   <section id="mcp" class="band">
     <div class="wrap mcp-wrap">
       <div class="section-head left reveal">
-        <span class="kicker agent">59 tools, one live project</span>
+        <span class="kicker agent">{{ $tools }} tools, one live project</span>
         <h2>Connect any MCP client<br />and start editing.</h2>
         <p class="sub">The desktop app hosts the server over streamable HTTP. Point a client at
         it and ask in plain language — <i>“skim the interview, cut the dead air, drop in
-        captions.”</i> It claims a task, works, and hands back a reviewable result.</p>
+        captions.”</i> It claims a task, works, and hands back a diff you review.</p>
         <div class="chips reveal stagger">
           <span class="chip see">get_frame</span>
           <span class="chip see">skim_asset</span>
           <span class="chip see">preview_timeline</span>
+          <span class="chip">analyze_asset</span>
           <span class="chip">cut_clip</span>
-          <span class="chip">split_at</span>
           <span class="chip">ripple_delete</span>
           <span class="chip">remove_silence</span>
+          <span class="chip">snap_to_beats</span>
           <span class="chip">set_video_effects</span>
           <span class="chip">add_keyframe</span>
+          <span class="chip">set_reframe</span>
           <span class="chip">captions_from_transcript</span>
-          <span class="chip">set_track_duck</span>
+          <span class="chip">set_delivery_format</span>
+          <span class="chip stage">staged_diff</span>
           <span class="chip">export</span>
-          <span class="chip more">+43 more</span>
+          <span class="chip more">+{{ sub $tools 15 }} more</span>
         </div>
       </div>
       <div class="code-card reveal">
@@ -170,22 +193,34 @@
     <div class="wrap">
       <div class="section-head reveal">
         <span class="kicker">Get it</span>
-        <h2>Download a build, or run from source.</h2>
+        <h2>Download Kerf.</h2>
+        <p class="sub">Installers for every platform, straight from the latest GitHub release —
+        no account needed. Once installed, Kerf keeps itself up to date over a
+        signature-verified update feed.</p>
+        <div class="get-cta">
+          {{ partial "download-button.html" (dict "Site" .Site "id" "get") }}
+          <span class="dl-meta" data-dl-meta hidden></span>
+        </div>
       </div>
+
+      {{ partial "download-grid.html" . }}
+
       <div class="get-grid reveal stagger">
-        <article class="get-card">
-          <h3>Download</h3>
-          <p>Installers for macOS, Linux and Windows are published on every release.</p>
-          <p class="fine">macOS / Linux expect a system FFmpeg on <code>PATH</code>; the Windows build bundles it.</p>
-          <a class="btn btn-primary" href="{{ $rel }}" target="_blank" rel="noopener">Latest release ↗</a>
-        </article>
         <article class="get-card">
           <h3>Build from source</h3>
           <pre><code>git clone {{ $gh }}
-cd kerf/frontend && bun install && cd ..
+cd kerf/frontend &amp;&amp; bun install &amp;&amp; cd ..
 cargo run -p kerf-app</code></pre>
           <p class="fine">Needs Rust ≥ 1.95, Bun ≥ 1.2, and (for media) the FFmpeg dev libraries.
-          Builds without them via <code>--no-default-features</code>.</p>
+          Builds without them via <code>--no-default-features</code> — the engine drives the
+          <code>ffmpeg</code> / <code>ffprobe</code> binaries either way.</p>
+        </article>
+        <article class="get-card">
+          <h3>Then point an agent at it</h3>
+          <pre><code>claude mcp add --transport http \
+  kerf {{ $mcp }}</code></pre>
+          <p class="fine">The app hosts the MCP server itself — there is no second process to
+          start. Queue a task in the agent panel, and review the diff it hands back.</p>
         </article>
       </div>
     </div>
@@ -200,6 +235,7 @@ cargo run -p kerf-app</code></pre>
       <span class="foot-tag">non-destructive video editing, driven by AI</span>
     </div>
     <nav class="foot-links">
+      <a href="#get">Download</a>
       <a href="{{ $gh }}" target="_blank" rel="noopener">GitHub</a>
       <a href="{{ $rel }}" target="_blank" rel="noopener">Releases</a>
       <a href="{{ $gh }}/blob/main/LICENSE.md" target="_blank" rel="noopener">License</a>

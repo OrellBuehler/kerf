@@ -7,11 +7,16 @@ enableRobotsTXT = true
 disableKinds = ["taxonomy", "term", "RSS", "sitemap"]
 
 [params]
-  description = "Kerf is a non-destructive, FFmpeg-backed desktop video editor with an embedded MCP server, so an LLM can analyze your footage and assemble the cut through the same engine the GUI uses — and can see the frames it edits."
+  description = "Kerf is a non-destructive, FFmpeg-backed desktop video editor with an embedded MCP server, so an LLM can analyze your footage and assemble the cut through the same engine the GUI uses — and can see the frames it edits. Free download for macOS, Windows and Linux."
   tagline = "The non-destructive video editor your AI can drive."
   github = "https://github.com/OrellBuehler/kerf"
+  # owner/name — download.js resolves release assets through the GitHub API,
+  # because the asset file names carry the version and so cannot be addressed
+  # by the stable releases/latest/download/<name> URL.
+  repo = "OrellBuehler/kerf"
   releases = "https://github.com/OrellBuehler/kerf/releases/latest"
   mcpUrl = "http://127.0.0.1:7777/mcp"
+  toolCount = 78
 
 [minify]
   minifyOutput = true
