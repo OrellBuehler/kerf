@@ -144,10 +144,16 @@ jobs:
   # points at this release asset). Built after every bundle is uploaded, from the
   # `.sig` files tauri-action attached, so all platforms land in one manifest —
   # letting each build write it would leave whichever finished last.
+  #
+  # `!cancelled()` rather than plain success: the matrix is `fail-fast: false`, and
+  # one platform failing must not leave the release with *no* manifest at all —
+  # `releases/latest/download/latest.json` would 404 for everyone, breaking the
+  # update check on the platforms that did build. A partial manifest only means the
+  # missing platform sees "up to date" until the release is re-run.
   updater-manifest:
     name: latest.json
     needs: app-bundles
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !cancelled() && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
