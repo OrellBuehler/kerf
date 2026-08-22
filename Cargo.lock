@@ -2163,7 +2163,7 @@ version = "0.19.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "kerf-core",
  "rmcp",
  "schemars 1.2.1",
