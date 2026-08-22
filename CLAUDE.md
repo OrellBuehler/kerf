@@ -442,16 +442,24 @@ leave the release with no manifest at all, which would 404 the feed for
 *everyone*. Prereleases are skipped, so they never become the update everyone is
 offered.
 
-**Publishing a release opens a gap in the feed**: the new tag becomes
-`releases/latest` the moment it is published, but its `latest.json` is only
-attached ~25 min later when the slowest bundle (Windows) finishes, so
-`releases/latest/download/latest.json` 404s until then and every running install's
-check fails with the plugin's `Could not fetch a valid release JSON`. `api.ts`
-rewrites that one error into an explanation (`describeFeedFailure`); the durable
-fix, if the wait ever becomes a problem, is to publish as a *prerelease* — which
-leaves `releases/latest` on the previous version, so checks say "up to date"
-instead of erroring — and have the manifest job clear the flag once the bundles
-are up. In-place update is per-platform: macOS and Windows
+**Publishing a release would open a gap in the feed**, so the workflow closes it:
+the new tag becomes `releases/latest` the moment it is published, but its
+`latest.json` is only attached ~25 min later when the slowest bundle (Windows)
+finishes — `releases/latest/download/latest.json` would 404 until then and every
+running install's check fail with the plugin's `Could not fetch a valid release
+JSON`. A **`hold-release` job** (first in `release.yml`, no `needs:`, so it lands
+seconds after the publish event) marks the release a *prerelease*, which parks
+`releases/latest` on the previous version whose manifest is intact — a check
+during the build says "up to date" instead of erroring — and `updater-manifest`
+**promotes it back** (`gh release edit --prerelease=false --latest`) in the same
+step that uploads `latest.json`, so `releases/latest` only ever points at a
+release that already has its manifest. Both jobs gate on
+`!github.event.release.prerelease`, the *event payload*, which the hold's own
+edit cannot change — a release cut as a genuine prerelease is skipped by both and
+never becomes `releases/latest`. A release that fails outright just stays the
+prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
+plugin's error into an explanation (`describeFeedFailure`) as a backstop.
+In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a
 link to the release page.
