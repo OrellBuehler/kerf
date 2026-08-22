@@ -14,6 +14,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # `releases/latest` moves to a release the instant it is published, but its
+  # `latest.json` is only attached ~20 minutes later, once the slowest bundle has
+  # built — so `releases/latest/download/latest.json` 404s for that whole window
+  # and every running install's update check fails with "Could not fetch a valid
+  # release JSON from the remote". Marking the release a prerelease parks
+  # `releases/latest` on the *previous* version, whose manifest is intact, so a
+  # check during the build reports "up to date" instead of erroring;
+  # `updater-manifest` promotes it back once the feed asset actually exists.
+  #
+  # Deliberately no `needs:` — every second between the publish event and this
+  # step is a second of the gap it closes.
+  #
+  # It gates on the *event payload*, which our own edit below cannot change, so a
+  # release cut as a real prerelease is left alone: it is skipped here, skipped in
+  # `updater-manifest`, and never becomes `releases/latest`.
+  hold-release:
+    name: hold releases/latest
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Park releases/latest until latest.json exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release edit "$TAG" --prerelease
+
   # Fail before four platform builds burn if the tag and the versions baked into
   # the artifacts disagree. `latest.json` takes its `version` from the tag while
   # the installed app compares that against `tauri.conf.json`'s version — if the
@@ -150,9 +179,14 @@ jobs:
   # `releases/latest/download/latest.json` would 404 for everyone, breaking the
   # update check on the platforms that did build. A partial manifest only means the
   # missing platform sees "up to date" until the release is re-run.
+  #
+  # If this job never gets there the release simply stays the prerelease
+  # `hold-release` made it: `releases/latest` keeps pointing at the last version
+  # that has a manifest, so a failed release is invisible to the update feed
+  # rather than breaking it.
   updater-manifest:
     name: latest.json
-    needs: app-bundles
+    needs: [hold-release, app-bundles]
     if: ${{ !cancelled() && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     permissions:
@@ -215,3 +249,11 @@ jobs:
           print(json.dumps(sorted(platforms), indent=2))
           PY
           gh release upload "$TAG" latest.json --clobber
+      # Only now does `releases/latest` move to this tag — and it already carries
+      # the manifest the app is about to fetch from it, so the feed never 404s.
+      - name: Promote to releases/latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release edit "$TAG" --prerelease=false --latest
