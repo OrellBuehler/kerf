@@ -1,0 +1,8 @@
+{{- /* Hugo's built-in robots.txt is a bare `User-agent: *` with no Sitemap
+       line. On a project page under a shared github.io host there is no
+       domain-root robots.txt to inherit from, so this is the only place a
+       crawler is told where the sitemap lives. */ -}}
+User-agent: *
+Allow: /
+
+Sitemap: {{ "sitemap.xml" | absURL }}

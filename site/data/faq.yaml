@@ -1,0 +1,52 @@
+# One source of truth for the FAQ: layouts/partials/faq.html renders these as
+# visible page copy, and partials/schema.html emits the same pairs as FAQPage
+# JSON-LD. Google requires the answer it shows to be present on the page, so
+# these must never drift apart — hence one file, two consumers.
+- q: What is Kerf?
+  a: >-
+    Kerf is a free, cross-platform desktop video editor for non-destructive video and
+    audio editing. What makes it different is the embedded MCP server: an AI assistant
+    can analyze your footage, look at real frames, and assemble the cut through the same
+    engine the GUI uses — on the same live project you have open.
+- q: How is Kerf different from an AI video editor with a chat sidebar?
+  a: >-
+    Most tools bolt a chatbot onto an editor and let it script a black box. Kerf inverts
+    that: the editor is an API, exposed twice over one shared project — as the GUI you
+    click, and as 78 Model Context Protocol tools an agent calls. There is no import or
+    export round-trip and no second copy of the truth.
+- q: Which AI assistants can drive Kerf?
+  a: >-
+    Any MCP client. The desktop app hosts a streamable-HTTP MCP server on
+    127.0.0.1:7777/mcp, so Claude Code, Claude Desktop or any HTTP-capable Model Context
+    Protocol client connects with a single command and starts editing.
+- q: Does the AI change my timeline without asking?
+  a: >-
+    No. Agent edits build a staged proposal, not your cut. The review card shows a real
+    diff — added, cut, moved, retrimmed — and you can watch the proposed timeline play
+    before you apply it as one revertible revision, or discard it.
+- q: Is Kerf free?
+  a: >-
+    Yes, free to download and free for noncommercial use under the PolyForm Noncommercial
+    1.0.0 license. The full source is on GitHub, and installers for macOS, Windows and
+    Linux come straight from the latest release — no account needed.
+- q: Which platforms does Kerf run on?
+  a: >-
+    macOS 10.15 or later (Apple silicon and Intel .dmg), Windows 10/11 x64 (.exe
+    installer or .msi) and Linux x86_64 (AppImage, .deb, .rpm). The app keeps itself up
+    to date over a signature-verified update feed.
+- q: Do I need FFmpeg installed?
+  a: >-
+    On Windows, no — FFmpeg is bundled. On macOS and Linux, Kerf uses a system ffmpeg on
+    your PATH (brew install ffmpeg, or your distribution's package). The engine drives
+    the ffmpeg and ffprobe binaries, so the development libraries are never required.
+- q: What does non-destructive editing mean in Kerf?
+  a: >-
+    Your timeline is an edit list over the original media: a clip is just a source range
+    at a timeline position. Cuts, effects, colour and keyframes edit that data, never the
+    files. Sources are read once, at export — nothing is re-encoded before then.
+- q: Can Kerf edit 360 and Insta360 footage?
+  a: >-
+    Yes. Spherical footage is detected on import and clips cut from it are reframed to an
+    ordinary flat shot: aim a virtual camera with yaw, pitch, roll and field of view, and
+    keyframe the pan. An Insta360 lens pair imports as one asset — Kerf stitches the two
+    fisheyes into an equirectangular sphere and caches it.

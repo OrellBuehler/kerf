@@ -11,6 +11,8 @@ Kerf is a cross-platform desktop editor with an **embedded MCP server**, so an L
 **same engine the GUI uses, on the same live project** — and it can actually *see* the
 frames it's editing. Nothing is re-encoded until you export.
 
+**[kerf website](https://orellbuehler.github.io/kerf/)** · [download](https://orellbuehler.github.io/kerf/#get) · [FAQ](https://orellbuehler.github.io/kerf/#faq)
+
 [![CI](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml/badge.svg)](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/OrellBuehler/kerf?color=e29d2e&label=release)](https://github.com/OrellBuehler/kerf/releases)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-22b4c4.svg)](./LICENSE.md)

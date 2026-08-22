@@ -1,0 +1,20 @@
+{{- /* Visible FAQ. Renders data/faq.yaml, which partials/schema.html also emits
+       as FAQPage JSON-LD — same words in both, which is what Google requires of
+       a marked-up answer. */ -}}
+<section id="faq" class="band">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="kicker">Questions</span>
+      <h2>Kerf, answered.</h2>
+      <p class="sub">What the AI video editor is, what it costs, and what it needs to run.</p>
+    </div>
+    <div class="faq-grid reveal stagger">
+      {{- range $.Site.Data.faq }}
+      <article class="faq-item">
+        <h3>{{ .q }}</h3>
+        <p>{{ .a }}</p>
+      </article>
+      {{- end }}
+    </div>
+  </div>
+</section>

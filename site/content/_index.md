@@ -1,3 +1,3 @@
 ---
-title: "Kerf — the video editor your AI can drive"
+title: "Kerf — the AI video editor your agent can drive"
 ---
