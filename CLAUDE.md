@@ -336,9 +336,15 @@ no editing logic in the adapter.
 ### embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
 The app **is** the MCP server — there is no separate binary. `mcp::serve` hosts the
-tools over `rmcp` 1.7's **streamable-HTTP** transport (`StreamableHttpService` +
+tools over `rmcp` 3.1's **streamable-HTTP** transport (`StreamableHttpService` +
 `LocalSessionManager`, nested into an `axum` router) on `127.0.0.1:7777/mcp`
-(`KERF_MCP_ADDR` overrides). It is spawned from `lib.rs`'s Tauri `.setup` hook on
+(`KERF_MCP_ADDR` overrides). rmcp validates the inbound **`Host`** header against
+an allow-list that defaults to loopback (a DNS-rebinding guard), which would make
+every `KERF_MCP_ADDR` override reject its own clients — so `allowed_hosts` (pure +
+unit-tested) derives the list from the bind address: a concrete address is added to
+the loopback defaults, and a wildcard bind (`0.0.0.0` / `[::]`) can't be enumerated
+at all, so it yields an empty list, rmcp's "allow any".
+It is spawned from `lib.rs`'s Tauri `.setup` hook on
 `tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
 hold, so the agent edits the project the user has open. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no

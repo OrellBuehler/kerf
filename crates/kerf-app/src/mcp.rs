@@ -19,8 +19,10 @@ use kerf_core::{
     TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -1729,6 +1731,45 @@ pub fn endpoint_url() -> String {
     format!("http://{}/mcp", bind_addr())
 }
 
+/// The `Host` headers this server will accept.
+///
+/// rmcp validates the inbound `Host` against an allow-list that defaults to
+/// loopback, to blunt DNS-rebinding attacks against locally running servers.
+/// `KERF_MCP_ADDR` exists to move the server *off* loopback, so the bare
+/// default would make every such override reject its own clients. Extend the
+/// list with whatever the override names: a concrete address is added as-is,
+/// while a wildcard bind (`0.0.0.0` / `[::]`) cannot be enumerated at all —
+/// the client's `Host` is whichever of this machine's addresses it reached us
+/// on — so it yields an empty list, which is rmcp's documented "allow any".
+fn allowed_hosts(addr: &str) -> Vec<String> {
+    let defaults = ["localhost", "127.0.0.1", "::1"];
+    let mut hosts: Vec<String> = defaults.iter().map(|h| h.to_string()).collect();
+    let Some(host) = host_of(addr) else {
+        return hosts;
+    };
+    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        return Vec::new();
+    }
+    if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+        hosts.push(host);
+    }
+    hosts
+}
+
+/// The host part of a `host:port` bind address, tolerating a bracketed IPv6
+/// literal and a missing port.
+fn host_of(addr: &str) -> Option<String> {
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return Some(sock.ip().to_string());
+    }
+    let host = match addr.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => addr,
+    };
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Serve the MCP tools over streamable HTTP at `/mcp`, sharing `project` with
 /// the Tauri commands. Runs until the process exits.
 pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
@@ -1737,7 +1778,7 @@ pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Resu
     let service = StreamableHttpService::new(
         move || Ok(KerfMcp::new(project.clone(), app.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts(&addr)),
     );
     let router = axum::Router::new().nest_service("/mcp", service);
 
@@ -1790,7 +1831,7 @@ fn core_err(e: kerf_core::Error) -> McpError {
 /// not a `data:` URL).
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-    CallToolResult::success(vec![Content::text(caption), Content::image(b64, "image/jpeg")])
+    CallToolResult::success(vec![ContentBlock::text(caption), ContentBlock::image(b64, "image/jpeg")])
 }
 
 /// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
@@ -1809,7 +1850,7 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_ts;
+    use super::{allowed_hosts, fmt_ts, image_result, KerfMcp};
 
     #[test]
     fn fmt_ts_carries_at_minute_boundaries() {
@@ -1821,5 +1862,133 @@ mod tests {
         assert_eq!(fmt_ts(119.9997), "02:00.000");
         assert_eq!(fmt_ts(59.9994), "00:59.999");
         assert_eq!(fmt_ts(125.25), "02:05.250");
+    }
+
+    /// Every tool the agent can call must reach it with a description and an
+    /// object input schema. The router is built by the `tool_router` macro, so
+    /// this is what catches an rmcp upgrade silently changing how the tool
+    /// surface is generated.
+    #[test]
+    fn every_tool_has_a_description_and_object_schema() {
+        let tools = KerfMcp::tool_router().list_all();
+        assert!(tools.len() > 50, "expected the full tool surface, got {}", tools.len());
+
+        for tool in &tools {
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(!description.is_empty(), "tool `{}` has no description", tool.name);
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "tool `{}` input schema is not an object",
+                tool.name
+            );
+        }
+    }
+
+    /// `Option<T>` parameters must stay out of `required` — a great many tools
+    /// document a field as "omit to …", and a schema generator that started
+    /// requiring them would break that contract without failing to compile.
+    #[test]
+    fn optional_parameters_are_not_required() {
+        let tools = KerfMcp::tool_router().list_all();
+        let add_clip = tools
+            .iter()
+            .find(|t| t.name == "add_clip_to_timeline")
+            .expect("add_clip_to_timeline is registered");
+
+        let required: Vec<&str> = add_clip
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        // Documented as required by the tool.
+        assert!(required.contains(&"asset_id"), "asset_id should be required: {required:?}");
+        assert!(required.contains(&"source_in"), "source_in should be required: {required:?}");
+        // Documented as "omit to auto-select" / "omit to append".
+        assert!(!required.contains(&"track_id"), "track_id must stay optional: {required:?}");
+        assert!(
+            !required.contains(&"timeline_start"),
+            "timeline_start must stay optional: {required:?}"
+        );
+
+        let properties = add_clip
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("input schema has properties");
+        for field in ["asset_id", "track_id", "source_in", "source_out", "timeline_start"] {
+            assert!(properties.contains_key(field), "`{field}` missing from schema");
+        }
+    }
+    /// The default bind is loopback, which rmcp's own defaults already cover.
+    #[test]
+    fn loopback_binds_keep_the_default_allow_list() {
+        for addr in ["127.0.0.1:7777", "localhost:7777", "[::1]:7777"] {
+            let hosts = allowed_hosts(addr);
+            assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{addr} -> {hosts:?}");
+            assert!(hosts.iter().any(|h| h == "localhost"), "{addr} -> {hosts:?}");
+            assert!(hosts.iter().any(|h| h == "::1"), "{addr} -> {hosts:?}");
+            // No duplicates from re-adding a host the defaults already list.
+            assert_eq!(hosts.len(), 3, "{addr} -> {hosts:?}");
+        }
+    }
+
+    /// `KERF_MCP_ADDR` pointed at a concrete non-loopback address has to allow
+    /// that address, or the override rejects every client it just enabled.
+    #[test]
+    fn a_concrete_override_is_allowed() {
+        let hosts = allowed_hosts("192.168.1.5:7777");
+        assert!(hosts.iter().any(|h| h == "192.168.1.5"), "{hosts:?}");
+        // The loopback defaults survive alongside it.
+        assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{hosts:?}");
+
+        let named = allowed_hosts("kerf.local:7777");
+        assert!(named.iter().any(|h| h == "kerf.local"), "{named:?}");
+    }
+
+    /// A wildcard bind can be reached on any of this machine's addresses, so
+    /// there is no list to write: an empty list is rmcp's "allow any".
+    #[test]
+    fn a_wildcard_bind_disables_host_validation() {
+        for addr in ["0.0.0.0:7777", "[::]:7777"] {
+            assert!(allowed_hosts(addr).is_empty(), "{addr} should allow any host");
+        }
+    }
+
+    /// A malformed or port-less override must not silently drop the loopback
+    /// defaults and lock the user out of the default endpoint.
+    #[test]
+    fn odd_addresses_keep_loopback_reachable() {
+        for addr in ["", ":7777", "127.0.0.1", "not a host:port"] {
+            let hosts = allowed_hosts(addr);
+            assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{addr} must keep loopback: {hosts:?}");
+        }
+    }
+    /// The visual tools hand the model a caption plus a raw-base64 image block.
+    /// This asserts the shape that actually goes over the wire — rmcp wants
+    /// bare base64 under `data` with a sibling `mimeType`, never a `data:` URL,
+    /// and getting that wrong degrades silently into an image the model cannot
+    /// see rather than into a build failure.
+    #[test]
+    fn image_results_serialize_as_caption_plus_bare_base64() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        let value =
+            serde_json::to_value(image_result("at 00:02.000".to_string(), jpeg.to_vec())).expect("CallToolResult serializes");
+
+        let content = value["content"].as_array().expect("content is an array");
+        assert_eq!(content.len(), 2, "expected caption + image: {content:?}");
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "at 00:02.000");
+
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/jpeg");
+        let data = content[1]["data"].as_str().expect("image data is a string");
+        assert_eq!(data, "/9j/2Q==");
+        assert!(!data.starts_with("data:"), "must be bare base64, not a data: URL");
+
+        assert_eq!(value["isError"], false);
     }
 }
