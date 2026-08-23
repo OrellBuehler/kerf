@@ -6,6 +6,9 @@
     <title>{{ .Title }}</title>
     <meta name="description" content="{{ .Site.Params.description }}" />
     <meta name="author" content="{{ .Site.Params.author }}" />
+    {{ with .Site.Params.googleSiteVerification }}
+      <meta name="google-site-verification" content="{{ . }}" />
+    {{ end }}
 
     {{/* max-image-preview:large is what lets a result carry the big thumbnail
          rather than a 100px one; the -1s lift Google's snippet limits. */}}
