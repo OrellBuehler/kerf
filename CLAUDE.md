@@ -422,6 +422,14 @@ snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 which for this `crates/kerf-app` layout resolves to `crates/`, not the config dir or repo
 root — so they anchor to the repo via `cd "$(git rev-parse --show-toplevel)/frontend" && bun run dev`
 instead of a fragile relative path.
+`build.rs` takes the **Windows app manifest** away from Tauri
+(`new_without_app_manifest`) and embeds `windows-app-manifest.xml` through the
+linker instead: Tauri's copy rides in the `.res`, which cargo links into *bins*
+only, so the lib's test binary ran with no activation context, bound comctl32
+**v5**, and died with `STATUS_ENTRYPOINT_NOT_FOUND` on the `TaskDialogIndirect`
+import rfd (via `tauri-plugin-dialog`) contributes — before a single test ran.
+Whether the linker pulls that object in at all shifts with unrelated dependency
+bumps, which is how an rmcp upgrade broke `cargo test -p kerf-app` on Windows.
 `capabilities/default.json` grants `core:default` + `dialog:default` +
 `updater:default` + `process:allow-restart` + `opener:allow-open-url`. That last
 one enables the command **with no scope of its own** (`allow-default-urls` is a
