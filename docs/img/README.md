@@ -15,23 +15,25 @@ Capture these from the running desktop app (dark theme, a real project loaded) a
 them here with the **exact filenames** below. PNG, retina if you can. Aim for a populated
 timeline — a few clips across two or three tracks, a waveform, a scene marker or two.
 
-| Filename                     | What to capture                                                                 | Used by                  |
+| Filename                     | What to capture                                                                 | Wire into                |
 | ---------------------------- | ------------------------------------------------------------------------------- | ------------------------ |
-| `screenshot-editor.png`      | The **full editor** window — title bar, media bin, preview, multi-track timeline. Hero shot. | README                   |
-| `screenshot-agent.png`       | The **agent panel** — task queue (a `ready` task with Apply/Dismiss) + history. | README                   |
-| `screenshot-inspector.png`   | The **inspector** — an effects chain, the Transform/keyframe panel, or overlays. | README                   |
+| `screenshot-editor.png`      | The **full editor** window — title bar, media bin, preview, multi-track timeline. Hero shot. | README, under the badges |
+| `screenshot-agent.png`       | The **agent panel** — task queue (a `ready` task with Apply/Dismiss) + history. | README, after Features   |
+| `screenshot-inspector.png`   | The **inspector** — an effects chain, the Transform/keyframe panel, or overlays. | README, after Features   |
 
-Only those three are referenced today. `screenshot-timeline.png` (a tight crop of the
-timeline — clips, waveforms, beat ticks, playhead) is a nice-to-have you can add and wire
-into the features section later.
+**Nothing references these yet.** The README used to carry `<img>` tags for all three and
+rendered three broken-image placeholders on the repo page instead, so the tags were
+removed — add one back next to the file you drop in, not before. `screenshot-timeline.png`
+(a tight crop of the timeline — clips, waveforms, beat ticks, playhead) is a nice-to-have
+for the features section.
 
 Tips:
 - Hide any OS chrome; capture just the app window.
 - A 16:10-ish crop reads best in the README hero (≈ 880 px wide as displayed).
 - Keep the amber playhead visible — it's the brand's signature.
 
-Until these exist, the `README` shows broken-image placeholders where they go. The
-landing site no longer embeds them — it renders animated CSS/SVG mockups instead.
+The landing site does not embed them either — it renders animated CSS/SVG mockups
+instead — so a shot dropped here is a README-only change until you wire it in there too.
 
 ## `og.png` — the social-card image
 

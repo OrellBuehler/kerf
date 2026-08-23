@@ -11,19 +11,14 @@ Kerf is a cross-platform desktop editor with an **embedded MCP server**, so an L
 **same engine the GUI uses, on the same live project** — and it can actually *see* the
 frames it's editing. Nothing is re-encoded until you export.
 
+**[kerf website](https://orellbuehler.github.io/kerf/)** · [download](https://orellbuehler.github.io/kerf/#get) · [FAQ](https://orellbuehler.github.io/kerf/#faq)
+
 [![CI](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml/badge.svg)](https://github.com/OrellBuehler/kerf/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/OrellBuehler/kerf?color=e29d2e&label=release)](https://github.com/OrellBuehler/kerf/releases)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-22b4c4.svg)](./LICENSE.md)
 [![Rust](https://img.shields.io/badge/Rust-1.95+-dea584.svg?logo=rust&logoColor=white)](https://rustup.rs)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri&logoColor=white)](https://tauri.app)
 [![Stars](https://img.shields.io/github/stars/OrellBuehler/kerf?style=flat&color=e29d2e)](https://github.com/OrellBuehler/kerf/stargazers)
-
-</div>
-
-<div align="center">
-
-<!-- Drop a screenshot of the full editor here. See docs/img/README.md for the shot list. -->
-<img src="docs/img/screenshot-editor.png" alt="Kerf editor — multi-track timeline, preview, and agent panel" width="880" />
 
 </div>
 
@@ -79,14 +74,6 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **GPU-accelerated export** | NVENC / QSV / VideoToolbox / AMF are **verified with a real test encode** before being offered, hardware decode falls back to software on its own, and **range export** renders just the region between your in/out marks. |
 | **Agent workflow** | 78 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
 | **Auto-update** | The app updates itself from its own GitHub releases; a bundle only installs if its **minisign signature** verifies against the embedded public key. |
-
-<div align="center">
-
-<!-- Agent panel + inspector screenshots. See docs/img/README.md. -->
-<img src="docs/img/screenshot-agent.png" alt="Kerf agent panel — task queue and edit history" width="430" />
-<img src="docs/img/screenshot-inspector.png" alt="Kerf inspector — effects, keyframes, and overlays" width="430" />
-
-</div>
 
 ---
 

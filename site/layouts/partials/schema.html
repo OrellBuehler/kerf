@@ -1,0 +1,97 @@
+{{- /* Structured data. One @graph so the app, the site and the FAQ can
+       cross-reference by @id instead of repeating each other.
+
+       SoftwareApplication is the whole point: it is what makes a downloadable
+       app eligible for a rich result, and Google needs `offers` (or a rating —
+       which we will not invent) for that. The FAQ entries are the same
+       data/faq.yaml the page renders visibly; marking up an answer that is not
+       on the page is a manual-action offence. */ -}}
+{{- $p := .Site.Params -}}
+{{- $og := "img/og.png" | absURL -}}
+{{- $home := .Site.Home.Permalink -}}
+{{- $graph := slice
+  (dict
+    "@type" "SoftwareApplication"
+    "@id" (printf "%s#app" $home)
+    "name" "Kerf"
+    "alternateName" (slice "Kerf video editor" "Kerf editor")
+    "applicationCategory" (slice "MultimediaApplication" "DesignApplication")
+    "applicationSubCategory" "Video editor"
+    "url" $home
+    "downloadUrl" $p.releases
+    "installUrl" (printf "%s#get" $home)
+    "codeRepository" $p.github
+    "description" $p.about
+    "abstract" $p.description
+    "image" $og
+    "screenshot" $og
+    "operatingSystem" "macOS 10.15+, Windows 10, Windows 11, Linux"
+    "softwareRequirements" "FFmpeg (bundled on Windows; a system ffmpeg on macOS and Linux)"
+    "programmingLanguage" (slice "Rust" "TypeScript")
+    "license" $p.license
+    "isAccessibleForFree" true
+    "inLanguage" "en"
+    "keywords" "AI video editor, MCP video editor, non-destructive editing, FFmpeg, Model Context Protocol, Claude, desktop video editor, 360 video, Insta360"
+    "featureList" (slice
+      "Multi-track non-destructive timeline with ripple delete, razor split and edge-drag trim"
+      "Embedded Model Context Protocol server — 78 tools an LLM can call on the live project"
+      "Agent edits are staged as a reviewable diff, never applied behind your back"
+      "The agent sees real frames: contact-sheet skims, single frames and composited previews"
+      "Real streamed playback of the composited cut, paced against the audio clock"
+      "Silence and scene detection, beat grid, EBU R128 loudness and speech transcription"
+      "Per-clip video and audio effect chains, colour grading and keyframe animation"
+      "360 and Insta360 reframing — a flat shot cut out of spherical footage"
+      "Titles, lower-thirds, captions from a transcript and SRT export"
+      "GPU-accelerated export via NVENC, QSV, VideoToolbox or AMF"
+      "Delivery frames for 16:9, 9:16, 1:1 and 4:5 with platform safe-area guides")
+    "offers" (dict
+      "@type" "Offer"
+      "price" "0"
+      "priceCurrency" "USD"
+      "availability" "https://schema.org/InStock"
+      "url" (printf "%s#get" $home))
+    "author" (dict "@id" (printf "%s#author" $home))
+    "publisher" (dict "@id" (printf "%s#author" $home)))
+  (dict
+    "@type" "Person"
+    "@id" (printf "%s#author" $home)
+    "name" $p.author
+    "url" $p.authorUrl)
+  (dict
+    "@type" "WebSite"
+    "@id" (printf "%s#website" $home)
+    "url" $home
+    "name" "Kerf"
+    "description" $p.description
+    "inLanguage" "en"
+    "publisher" (dict "@id" (printf "%s#author" $home))
+    "about" (dict "@id" (printf "%s#app" $home)))
+  (dict
+    "@type" "WebPage"
+    "@id" (printf "%s#webpage" $home)
+    "url" .Permalink
+    "name" .Title
+    "description" $p.description
+    "isPartOf" (dict "@id" (printf "%s#website" $home))
+    "primaryImageOfPage" $og
+    "about" (dict "@id" (printf "%s#app" $home)))
+-}}
+{{- $qa := slice -}}
+{{- range .Site.Data.faq -}}
+  {{- $qa = $qa | append (dict
+      "@type" "Question"
+      "name" .q
+      "acceptedAnswer" (dict "@type" "Answer" "text" .a)) -}}
+{{- end -}}
+{{- with $qa -}}
+  {{- $graph = $graph | append (dict
+      "@type" "FAQPage"
+      "@id" (printf "%s#faq" $home)
+      "isPartOf" (dict "@id" (printf "%s#webpage" $home))
+      "mainEntity" .) -}}
+{{- end -}}
+{{- /* safeJS, because html/template treats a <script> body as JS and would
+       otherwise re-encode jsonify's string into a quoted JS literal — valid
+       JavaScript, but not JSON-LD any crawler can read. jsonify escapes
+       < > & to \u00xx, so nothing can close the tag from inside. */ -}}
+<script type="application/ld+json">{{ (dict "@context" "https://schema.org" "@graph" $graph) | jsonify | safeJS }}</script>

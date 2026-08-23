@@ -1,13 +1,30 @@
 baseURL = "https://orellbuehler.github.io/kerf/"
 languageCode = "en-us"
-title = "Kerf — the video editor your AI can drive"
+title = "Kerf — the AI video editor your agent can drive"
 enableRobotsTXT = true
 
-# Single landing page; no taxonomies/RSS clutter.
-disableKinds = ["taxonomy", "term", "RSS", "sitemap"]
+# Single landing page; no taxonomies/RSS clutter. The sitemap stays on — it is
+# what robots.txt points crawlers at, and a project page on a shared
+# github.io host is not discovered from a domain root.
+disableKinds = ["taxonomy", "term", "RSS"]
+
+[sitemap]
+  changefreq = "weekly"
+  priority = 1.0
 
 [params]
-  description = "Kerf is a non-destructive, FFmpeg-backed desktop video editor with an embedded MCP server, so an LLM can analyze your footage and assemble the cut through the same engine the GUI uses — and can see the frames it edits. Free download for macOS, Windows and Linux."
+  # Kept under ~155 chars: past that a search snippet is truncated mid-sentence.
+  # The longer pitch lives in `about`, which feeds the JSON-LD description where
+  # there is no such budget.
+  description = "Kerf is a free, non-destructive AI video editor for macOS, Windows and Linux. An embedded MCP server lets Claude — or any LLM — cut your footage with you."
+  about = "Kerf is a cross-platform desktop video editor for AI-assisted, non-destructive video and audio editing. An embedded Model Context Protocol (MCP) server exposes the same editing engine the GUI uses, so an LLM can analyze footage, see real frames, and assemble a cut on the live project — staged for your review. FFmpeg-backed; nothing is re-encoded until export."
+  author = "Orell Bühler"
+  # Proves ownership of the Search Console property. Public by design —
+  # it is only meaningful on a site Google already fetches from this URL.
+  # Removing it un-verifies the property, so leave it after verification.
+  googleSiteVerification = "aYnZ5m8jHpn8cqpi1FN2kkozCTdLCTb17VorcQm69JA"
+  authorUrl = "https://orellbuehler.ch"
+  license = "https://github.com/OrellBuehler/kerf/blob/main/LICENSE.md"
   tagline = "The non-destructive video editor your AI can drive."
   github = "https://github.com/OrellBuehler/kerf"
   # owner/name — download.js resolves release assets through the GitHub API,

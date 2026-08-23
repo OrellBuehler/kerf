@@ -633,6 +633,37 @@ code {
   line-height: 1.7;
 }
 
+/* ---------------- FAQ ---------------- */
+.faq-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px 28px;
+}
+@media (max-width: 760px) {
+  .faq-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.faq-item {
+  min-width: 0;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 18px;
+}
+.faq-item h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 17px;
+  line-height: 1.3;
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+.faq-item p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
 /* ---------------- Footer ---------------- */
 .footer {
   border-top: 1px solid var(--border-subtle);
