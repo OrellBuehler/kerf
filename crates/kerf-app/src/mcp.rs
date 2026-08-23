@@ -19,7 +19,7 @@ use kerf_core::{
     TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -1654,10 +1654,18 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
 }
 
+/// How the server introduces itself to clients. `ServerInfo::default()` fills
+/// `server_info` in from *rmcp's* own build env, so an untouched default has
+/// every client listing this server as "rmcp".
+fn server_identity() -> Implementation {
+    Implementation::new("kerf", env!("CARGO_PKG_VERSION"))
+}
+
 #[tool_handler]
 impl ServerHandler for KerfMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
+        info.server_info = server_identity();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "Kerf MCP server. The user queues editing tasks in the desktop app; \
@@ -1850,7 +1858,7 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, fmt_ts, image_result, KerfMcp};
+    use super::{allowed_hosts, fmt_ts, image_result, server_identity, KerfMcp};
 
     #[test]
     fn fmt_ts_carries_at_minute_boundaries() {
@@ -1966,6 +1974,16 @@ mod tests {
             assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{addr} must keep loopback: {hosts:?}");
         }
     }
+    /// Clients list a server by its `serverInfo`, and rmcp's default fills that
+    /// in from its own crate identity — so the app has to name itself.
+    #[test]
+    fn the_server_introduces_itself_as_kerf() {
+        let info = server_identity();
+        assert_eq!(info.name, "kerf");
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_ne!(info.name, "rmcp", "server_info must not be rmcp's own identity");
+    }
+
     /// The visual tools hand the model a caption plus a raw-base64 image block.
     /// This asserts the shape that actually goes over the wire — rmcp wants
     /// bare base64 under `data` with a sibling `mimeType`, never a `data:` URL,

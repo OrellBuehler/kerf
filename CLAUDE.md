@@ -350,7 +350,9 @@ hold, so the agent edits the project the user has open. Patterns that matter if 
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro calls `Self::tool_router()`).
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
-then mutates fields. Most tools return `Result<String, McpError>` (pretty JSON), but the
+then mutates fields — including `server_info` (`server_identity`), because that
+default is filled from **rmcp's own** crate identity and left alone the server
+introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (pretty JSON), but the
 three **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
 parts) and `preview_timeline` (the composited cut at a timeline time) — return
