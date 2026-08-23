@@ -197,6 +197,14 @@ jobs:
       # the adapter/MCP layer isn't a permanent blind spot.
       - name: Test kerf-app
         run: cargo test -p kerf-app --no-default-features --locked
+      - name: TEMP dump windows imports
+        if: always() && matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem target\debug\deps\kerf_app_lib-*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          Write-Host "exe: $exe"
+          $dumpbin = (Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          & $dumpbin /imports $exe | Select-String -Pattern 'comctl32|TaskDialog' | ForEach-Object { Write-Host "IMPORTLINE: $($_.Line.Trim())" }
 
   # Release bundles are built with `--features whisper` (in-process speech-to-text,
   # so transcription doesn't depend on how the user's ffmpeg was configured). Every
