@@ -281,7 +281,7 @@ kerf/
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |
-| MCP         | `rmcp` **1.7** (streamable-HTTP transport)      |
+| MCP         | `rmcp` **3.1** (streamable-HTTP transport)      |
 
 The engine's export and timeline-still paths are **pure and unit-tested** — clip
 positions, gaps, track layering, effects, keyframes, overlays, ducking and loudnorm all

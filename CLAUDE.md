@@ -336,15 +336,23 @@ no editing logic in the adapter.
 ### embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
 The app **is** the MCP server — there is no separate binary. `mcp::serve` hosts the
-tools over `rmcp` 1.7's **streamable-HTTP** transport (`StreamableHttpService` +
+tools over `rmcp` 3.1's **streamable-HTTP** transport (`StreamableHttpService` +
 `LocalSessionManager`, nested into an `axum` router) on `127.0.0.1:7777/mcp`
-(`KERF_MCP_ADDR` overrides). It is spawned from `lib.rs`'s Tauri `.setup` hook on
+(`KERF_MCP_ADDR` overrides). rmcp validates the inbound **`Host`** header against
+an allow-list that defaults to loopback (a DNS-rebinding guard), which would make
+every `KERF_MCP_ADDR` override reject its own clients — so `allowed_hosts` (pure +
+unit-tested) derives the list from the bind address: a concrete address is added to
+the loopback defaults, and a wildcard bind (`0.0.0.0` / `[::]`) can't be enumerated
+at all, so it yields an empty list, rmcp's "allow any".
+It is spawned from `lib.rs`'s Tauri `.setup` hook on
 `tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
 hold, so the agent edits the project the user has open. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro calls `Self::tool_router()`).
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
-then mutates fields. Most tools return `Result<String, McpError>` (pretty JSON), but the
+then mutates fields — including `server_info` (`server_identity`), because that
+default is filled from **rmcp's own** crate identity and left alone the server
+introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (pretty JSON), but the
 three **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
 parts) and `preview_timeline` (the composited cut at a timeline time) — return
@@ -414,6 +422,14 @@ snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 which for this `crates/kerf-app` layout resolves to `crates/`, not the config dir or repo
 root — so they anchor to the repo via `cd "$(git rev-parse --show-toplevel)/frontend" && bun run dev`
 instead of a fragile relative path.
+`build.rs` takes the **Windows app manifest** away from Tauri
+(`new_without_app_manifest`) and embeds `windows-app-manifest.xml` through the
+linker instead: Tauri's copy rides in the `.res`, which cargo links into *bins*
+only, so the lib's test binary ran with no activation context, bound comctl32
+**v5**, and died with `STATUS_ENTRYPOINT_NOT_FOUND` on the `TaskDialogIndirect`
+import rfd (via `tauri-plugin-dialog`) contributes — before a single test ran.
+Whether the linker pulls that object in at all shifts with unrelated dependency
+bumps, which is how an rmcp upgrade broke `cargo test -p kerf-app` on Windows.
 `capabilities/default.json` grants `core:default` + `dialog:default` +
 `updater:default` + `process:allow-restart` + `opener:allow-open-url`. That last
 one enables the command **with no scope of its own** (`allow-default-urls` is a
