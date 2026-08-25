@@ -615,6 +615,86 @@ impl Project {
         engine::timeline_frame(timeline, assets, &opts, time_secs, max_width, quality)
     }
 
+    /// How ready the current cut is for each publishing target — what a platform
+    /// would reject, what it would accept and then quietly under-distribute, and
+    /// what would simply be better.
+    ///
+    /// Reads the **working** timeline, so an agent assembling a cut sees the
+    /// verdict on its own proposal rather than on the user's live one.
+    pub fn platform_check(&self) -> Result<Vec<crate::platform::DeliveryCheck>> {
+        Ok(crate::platform::check_all(&self.cut_summary()?))
+    }
+
+    /// What the readiness check needs to know about the current cut.
+    pub fn cut_summary(&self) -> Result<crate::platform::CutSummary> {
+        let timeline = self.working_timeline()?;
+        let assets = self.list_assets()?;
+        // The same gate the export applies, so a muted track is as absent here
+        // as it will be in the file.
+        let rendered = timeline.for_render();
+        let (width, height) = engine::delivery_frame(&rendered, &assets);
+        // Audio-bearing means what the export means by it: any clip whose asset
+        // carries an audio stream, on a video track as much as an audio one.
+        let has_audio = rendered.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
+            assets
+                .iter()
+                .find(|a| a.id == c.asset_id)
+                .is_some_and(|a| a.has_audio())
+        });
+        Ok(crate::platform::CutSummary {
+            duration: rendered.duration(),
+            width,
+            height,
+            has_audio,
+            has_text: !rendered.overlays.is_empty(),
+        })
+    }
+
+    /// The owned inputs a **cover frame** render needs: the working timeline and
+    /// the **original** assets. Deliberately not the proxy-swapped preview list
+    /// — a cover is a delivered image, so it comes off the same media the export
+    /// reads. Resolved together so the caller can drop the project lock before
+    /// [`Project::render_still`] runs ffmpeg.
+    pub fn export_still_inputs(&self) -> Result<(Timeline, Vec<Asset>)> {
+        Ok((self.working_timeline()?, self.list_assets()?))
+    }
+
+    /// Write the composited frame at `time_secs` to `path` as a cover image,
+    /// **without** `&self` — the lock-free half of [`Project::export_still`].
+    ///
+    /// `format` defaults to whatever the path's extension asks for. The frame is
+    /// rendered at the project's full delivery resolution through the export
+    /// graph, so the cover is a real frame of the finished video.
+    pub fn render_still(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        path: impl AsRef<Path>,
+        format: Option<engine::ImageFormat>,
+    ) -> Result<PathBuf> {
+        let path = path.as_ref();
+        let format = format.unwrap_or_else(|| engine::ImageFormat::from_path(path));
+        let opts = engine::ExportOptions {
+            hwaccel: engine::decode_hwaccel(),
+            ..engine::ExportOptions::default()
+        };
+        // `-q:v 2` is the highest useful JPEG quality; a cover is re-encoded by
+        // whatever platform receives it, so there is nothing to gain by saving
+        // bytes here and plenty to lose.
+        engine::export_still(timeline, assets, &opts, time_secs, path, format, 2)
+    }
+
+    /// Render a cover frame for the current timeline at `time_secs`.
+    pub fn export_still(
+        &self,
+        time_secs: f64,
+        path: impl AsRef<Path>,
+        format: Option<engine::ImageFormat>,
+    ) -> Result<PathBuf> {
+        let (timeline, assets) = self.export_still_inputs()?;
+        Self::render_still(&timeline, &assets, time_secs, path, format)
+    }
+
     /// [`Project::list_assets`], but with each eligible asset's `path` swapped to
     /// its ready proxy — the asset list the timeline-preview compositor decodes
     /// from. Stream metadata (resolution / fps) is kept from the original, so the
@@ -2805,6 +2885,35 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
         assert!(total_clips >= 3);
+    }
+
+    #[test]
+    fn platform_check_reads_the_cut_the_export_would_render() {
+        let project = Project::sample().unwrap();
+        // Cut for a vertical feed: the frame the checks compare against is the
+        // project's delivery format, not the footage's shape.
+        project
+            .set_delivery_format(Some(crate::model::Delivery {
+                width: 1080,
+                height: 1920,
+                fit: Fit::Cover,
+            }))
+            .unwrap();
+        let summary = project.cut_summary().unwrap();
+        assert_eq!((summary.width, summary.height), (1080, 1920));
+        assert!(summary.duration > 0.0);
+        assert!(summary.has_audio, "the sample has audio-bearing clips");
+
+        let checks = project.platform_check().unwrap();
+        assert_eq!(checks.len(), crate::platform::TARGETS.len());
+        let reels = checks.iter().find(|c| c.target == "reels").unwrap();
+        assert!(reels.ok, "a short vertical cut is publishable: {:?}", reels.issues);
+        // The same cut is the wrong shape for a landscape player, and says so.
+        let youtube = checks.iter().find(|c| c.target == "youtube").unwrap();
+        assert!(youtube
+            .issues
+            .iter()
+            .any(|i| i.severity == crate::platform::Severity::Warning && i.message.contains("letterboxed")));
     }
 
     #[test]

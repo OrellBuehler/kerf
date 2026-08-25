@@ -1960,6 +1960,14 @@ impl ExportFormat {
 /// Derive the output shape from the first clip (across all tracks) that carries
 /// a video stream and the first that carries audio, falling back to 1080p30
 /// stereo defaults. When `opts` carries resolution or fps overrides those win.
+/// The frame this timeline actually renders at: the project's delivery format
+/// when one is set, otherwise the shape its footage gives it. What a readiness
+/// check has to compare a platform's expectations against.
+pub fn delivery_frame(timeline: &Timeline, assets: &[Asset]) -> (u32, u32) {
+    let f = export_format(timeline, assets, &ExportOptions::default());
+    (f.width, f.height)
+}
+
 fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> ExportFormat {
     let stream_of = |clip: &crate::model::Clip, kind: StreamKind| {
         assets
@@ -3994,15 +4002,59 @@ pub fn timeline_frame(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<u8>> {
+    run_still(timeline, assets, opts, t, max_width, &StillOutput::JpegPipe { quality })
+}
+
+/// Write the composited still at timeline time `t` to `path` as a **cover
+/// frame**: full delivery resolution (no preview downscale) in `format`.
+///
+/// A cover is the picture a platform shows before anyone presses play, and this
+/// renders it through the very graph the export uses — so the cover is literally
+/// a frame of the video it fronts, at the project's delivery shape, rather than
+/// a screenshot that has to be cropped back into agreement.
+pub fn export_still(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    path: &Path,
+    format: ImageFormat,
+    quality: u8,
+) -> Result<PathBuf> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let out = StillOutput::File {
+        path: path.to_string_lossy().into_owned(),
+        format,
+        quality,
+    };
+    // `u32::MAX` asks for no cap: `build_still_args` clamps to the delivery
+    // width, which is exactly the cover size.
+    run_still(timeline, assets, opts, t, u32::MAX, &out)?;
+    Ok(path.to_path_buf())
+}
+
+/// Run a composited still through ffmpeg, retrying in software if hardware
+/// decode was asked for and failed. Returns stdout (empty for a file sink).
+fn run_still(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    out: &StillOutput,
+) -> Result<Vec<u8>> {
+    let piping = matches!(out, StillOutput::JpegPipe { .. });
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
-        let args = build_timeline_frame_args(timeline, assets, o, t, max_width, quality)?;
+        let args = build_still_args(timeline, assets, o, t, max_width, out)?;
         let bin = ffmpeg_bin();
         let output = command(&bin)
             .args(&args)
             .stderr(Stdio::piped())
             .output()
             .map_err(|e| launch_err(&bin, e))?;
-        if !output.status.success() || output.stdout.is_empty() {
+        if !output.status.success() || (piping && output.stdout.is_empty()) {
             return Err(Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -4032,7 +4084,103 @@ pub fn timeline_frame(
     }
 }
 
-/// Pure arg builder for [`timeline_frame`] (no I/O, unit-tested).
+/// The JPEG-pipe still args — [`timeline_frame`]'s shape, and what every still
+/// test asserts against.
+#[cfg(test)]
+fn build_timeline_frame_args(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    quality: u8,
+) -> Result<Vec<String>> {
+    build_still_args(timeline, assets, opts, t, max_width, &StillOutput::JpegPipe { quality })
+}
+
+/// Where a composited still is written, and in what image format.
+///
+/// The still compositor serves two callers with the same graph: the preview /
+/// agent path wants JPEG bytes on stdout, and a **cover frame** wants a real
+/// file at full delivery resolution — so only the sink differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StillOutput {
+    /// MJPEG on stdout (`quality` = `-q:v`) — the preview and agent path.
+    JpegPipe { quality: u8 },
+    /// An image file. JPEG honors `quality`; PNG is lossless and ignores it.
+    File { path: String, format: ImageFormat, quality: u8 },
+}
+
+/// The image formats a cover frame can be written as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+}
+
+impl ImageFormat {
+    /// The customary file extension (no dot).
+    pub fn ext(self) -> &'static str {
+        match self {
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Png => "png",
+        }
+    }
+
+    /// The format a path's extension asks for, defaulting to JPEG — the format
+    /// every platform accepts as a cover.
+    pub fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(e) if e.eq_ignore_ascii_case("png") => ImageFormat::Png,
+            _ => ImageFormat::Jpeg,
+        }
+    }
+
+    fn encoder(self) -> &'static str {
+        match self {
+            ImageFormat::Jpeg => "mjpeg",
+            ImageFormat::Png => "png",
+        }
+    }
+}
+
+impl StillOutput {
+    /// The trailing output arguments: one frame, encoded and sent to the sink.
+    fn args(&self) -> Vec<String> {
+        let mut a: Vec<String> = vec!["-frames:v".to_string(), "1".to_string()];
+        match self {
+            StillOutput::JpegPipe { quality } => {
+                a.extend([
+                    "-q:v".to_string(),
+                    quality.to_string(),
+                    "-f".to_string(),
+                    "image2pipe".to_string(),
+                    "-vcodec".to_string(),
+                    "mjpeg".to_string(),
+                    "pipe:1".to_string(),
+                ]);
+            }
+            StillOutput::File { path, format, quality } => {
+                if *format == ImageFormat::Jpeg {
+                    a.extend(["-q:v".to_string(), quality.to_string()]);
+                }
+                a.extend([
+                    "-f".to_string(),
+                    "image2".to_string(),
+                    "-vcodec".to_string(),
+                    format.encoder().to_string(),
+                    "-y".to_string(),
+                    path.clone(),
+                ]);
+            }
+        }
+        a
+    }
+}
+
+/// Pure arg builder for a composited still, parameterized by its sink (no I/O,
+/// unit-tested).
 ///
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
@@ -4043,13 +4191,13 @@ pub fn timeline_frame(
 /// keeps the export aspect ratio capped to `max_width`. Static blends
 /// (mid-crossfade dissolve, dip-to-black) are intentionally *not* reproduced; the
 /// still shows the frame each visible clip contributes at `t`.
-fn build_timeline_frame_args(
+fn build_still_args(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
     t: f64,
     max_width: u32,
-    quality: u8,
+    out: &StillOutput,
 ) -> Result<Vec<String>> {
     // Same gate as the export, so the still shows the cut that would render.
     let rendered = timeline.for_render();
@@ -4142,21 +4290,8 @@ fn build_timeline_frame_args(
     chains.push(format!("[{cur}]null[outv]"));
     let filter = chains.join(";");
 
-    args.extend([
-        "-filter_complex".to_string(),
-        filter,
-        "-map".to_string(),
-        "[outv]".to_string(),
-        "-frames:v".to_string(),
-        "1".to_string(),
-        "-q:v".to_string(),
-        quality.to_string(),
-        "-f".to_string(),
-        "image2pipe".to_string(),
-        "-vcodec".to_string(),
-        "mjpeg".to_string(),
-        "pipe:1".to_string(),
-    ]);
+    args.extend(["-filter_complex".to_string(), filter, "-map".to_string(), "[outv]".to_string()]);
+    args.extend(out.args());
     Ok(args)
 }
 
@@ -4512,6 +4647,101 @@ mod tests {
         let at = args.iter().position(|a| a == "-hwaccel").expect("-hwaccel present");
         assert_eq!(args[at + 1], "auto");
         assert!(at < args.iter().position(|a| a == "-i").unwrap());
+    }
+
+    #[test]
+    fn cover_frame_renders_to_a_file_at_full_delivery_size() {
+        let asset = test_asset(vec![video_stream(3840, 2160, 30.0)]);
+        let assets = vec![asset.clone()];
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        timeline.format = Some(crate::model::Delivery {
+            width: 1080,
+            height: 1920,
+            fit: Fit::Cover,
+        });
+        let out = StillOutput::File {
+            path: "/covers/cover.jpg".to_string(),
+            format: ImageFormat::Jpeg,
+            quality: 2,
+        };
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, &out).unwrap();
+        // The uncapped width resolves to the project's delivery frame, not to a
+        // preview size — a cover is a delivered image.
+        let graph = args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
+        assert!(graph.contains("s=1080x1920"), "canvas is the delivery frame: {graph}");
+        // Written as a real file, overwriting, with the muxer stated.
+        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "image2"));
+        assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "mjpeg"));
+        assert!(args.windows(2).any(|w| w[0] == "-q:v" && w[1] == "2"));
+        assert!(args.contains(&"-y".to_string()));
+        assert!(!args.contains(&"pipe:1".to_string()));
+        assert_eq!(args.last().unwrap(), "/covers/cover.jpg");
+        // Exactly one frame, whichever sink it goes to.
+        assert!(args.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "1"));
+    }
+
+    #[test]
+    fn a_png_cover_is_lossless_and_carries_no_jpeg_quality() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let out = StillOutput::File {
+            path: "/covers/cover.png".to_string(),
+            format: ImageFormat::Png,
+            quality: 2,
+        };
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, &out).unwrap();
+        assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
+        assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_cover_frame_is_really_written_at_the_delivery_size() {
+        // The arg builder has unit tests, but nothing above ever ran the binary
+        // — and a still sink that never produced a file would look identical.
+        let dir = std::env::temp_dir().join(format!("kerf-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(1920, 1080, 30.0)];
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 2.0, 0.0)]);
+        timeline.format = Some(crate::model::Delivery {
+            width: 1080,
+            height: 1350,
+            fit: Fit::Cover,
+        });
+
+        for (name, format) in [("cover.jpg", ImageFormat::Jpeg), ("cover.png", ImageFormat::Png)] {
+            let out = dir.join(name);
+            export_still(&timeline, &[asset.clone()], &ExportOptions::default(), 1.0, &out, format, 2).expect("cover");
+            let size = std::fs::metadata(&out).expect("cover written").len();
+            assert!(size > 1024, "{name} should be a real image, got {size} bytes");
+            // And it is the delivery frame, not the source shape.
+            let probe = probe(&out).expect("probe the cover");
+            let stream = probe.streams.first().expect("a video stream");
+            assert_eq!((stream.width, stream.height), (Some(1080), Some(1350)), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_format_follows_the_file_extension() {
+        assert_eq!(ImageFormat::from_path(Path::new("/a/cover.png")), ImageFormat::Png);
+        assert_eq!(ImageFormat::from_path(Path::new("/a/cover.PNG")), ImageFormat::Png);
+        assert_eq!(ImageFormat::from_path(Path::new("/a/cover.jpg")), ImageFormat::Jpeg);
+        // Anything else falls back to the format every platform accepts.
+        assert_eq!(ImageFormat::from_path(Path::new("/a/cover")), ImageFormat::Jpeg);
     }
 
     #[test]
