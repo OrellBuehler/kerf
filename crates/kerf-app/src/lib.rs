@@ -1311,6 +1311,57 @@ async fn export_timeline(
     .await
 }
 
+/// Write the composited frame at `time_secs` to `output_path` as a **cover
+/// image** — full delivery resolution, decoded from the original media rather
+/// than a preview proxy. `format` follows the file extension when omitted.
+#[tauri::command]
+async fn export_cover(
+    state: State<'_, AppState>,
+    time_secs: f64,
+    output_path: String,
+    format: Option<kerf_core::ImageFormat>,
+) -> CmdResult<String> {
+    let shared = state.project.clone();
+    blocking(move || {
+        // Same shape as every heavy command: resolve under the lock, render
+        // without it. A 4K still is a real decode.
+        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
+        let path = Project::render_still(&timeline, &assets, time_secs, &output_path, format).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Every publishing target Kerf knows about, with its frame and length limits.
+#[tauri::command(async)]
+fn platform_targets() -> Vec<kerf_core::PlatformTarget> {
+    kerf_core::PLATFORM_TARGETS.to_vec()
+}
+
+/// How ready the current cut is for each target — what would be rejected, what
+/// would be accepted and then under-distributed, and what would just be better.
+#[tauri::command(async)]
+fn platform_check(state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
+    state.project().platform_check().map_err(|e| e.to_string())
+}
+
+/// Show a file in the OS file manager. The last step of an export: the render
+/// finished somewhere, and "somewhere" is not much use on its own.
+#[tauri::command(async)]
+fn reveal_path(app: AppHandle, path: String) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    // Open the containing folder, not the file — opening the file would launch
+    // a player, which is not what "show me where it went" means.
+    let target = std::path::Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(&path));
+    app.opener()
+        .open_path(target.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Request cancellation of the in-flight export (if any). The running
 /// [`export_timeline`] observes the flag on its next progress poll, stops
 /// ffmpeg, and returns the `"export cancelled"` error.
@@ -1553,6 +1604,10 @@ pub fn run() {
             hw_encoders,
             export_timeline,
             cancel_export,
+            export_cover,
+            platform_targets,
+            platform_check,
+            reveal_path,
             mcp_endpoint,
             log_dir,
             reveal_logs

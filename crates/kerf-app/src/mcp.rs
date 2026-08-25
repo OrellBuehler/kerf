@@ -648,6 +648,14 @@ struct TimelineFrameParams {
     max_width: Option<u32>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CoverParams {
+    #[schemars(description = "Timeline position to capture (seconds)")]
+    time_secs: f64,
+    #[schemars(description = "Output image path. A .png extension writes PNG, anything else JPEG.")]
+    output_path: String,
+}
+
 #[derive(Serialize)]
 struct AssetMetadata {
     asset: kerf_core::Asset,
@@ -1429,6 +1437,43 @@ impl KerfMcp {
         json(&serde_json::json!({ "output": output_path }))
     }
 
+    #[tool(
+        description = "Check the assembled cut against each publishing target (Instagram Reels / YouTube Shorts / \
+                       TikTok / Instagram feed / YouTube): length limits, frame shape, and the reach limits a platform \
+                       enforces silently — e.g. a Reel over 3 minutes uploads fine and is then shown only to existing \
+                       followers. Returns errors (would be rejected), warnings (accepted but under-distributed or \
+                       letterboxed) and tips. Advisory: export is never blocked. Use before reporting a cut finished."
+    )]
+    fn platform_check(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        let summary = project.cut_summary().map_err(core_err)?;
+        json(&serde_json::json!({
+            "cut": {
+                "duration_secs": summary.duration,
+                "frame": format!("{}x{}", summary.width, summary.height),
+                "has_audio": summary.has_audio,
+                "has_text": summary.has_text,
+            },
+            "targets": project.platform_check().map_err(core_err)?,
+        }))
+    }
+
+    #[tool(
+        description = "Write the composited timeline at a given time to an image file as a cover / thumbnail — full \
+                       delivery resolution, rendered through the export graph, so it is a real frame of the finished \
+                       video at the shape the project is cut for."
+    )]
+    async fn export_cover(&self, Parameters(p): Parameters<CoverParams>) -> Result<String, McpError> {
+        let project = self.project.clone();
+        let (time_secs, output_path) = (p.time_secs, p.output_path);
+        let written = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).export_still_inputs().map_err(core_err)?;
+            Project::render_still(&timeline, &assets, time_secs, &output_path, None).map_err(core_err)
+        })
+        .await?;
+        json(&serde_json::json!({ "output": written.to_string_lossy() }))
+    }
+
     // ---- agent task queue --------------------------------------------------
 
     #[tool(description = "List the agent task queue with each task's status (queued/working/ready/done/failed)")]
@@ -1719,7 +1764,12 @@ impl ServerHandler for KerfMcp {
              Every applied edit is tracked: history lists the revisions, \
              revision_diff explains one of them, and undo / redo / revert_to roll \
              changes back (they work on the live cut, so apply or discard your \
-             staged edits first). Call export to render."
+             staged edits first). Before you report a cut finished, run \
+             platform_check: it says whether the length and frame shape suit \
+             where it is going, including the reach limits a platform enforces \
+             silently (a Reel over 3 minutes uploads fine and then reaches only \
+             existing followers). Call export to render, and export_cover to \
+             write the thumbnail the platform shows before anyone presses play."
                 .to_string(),
         );
         info
