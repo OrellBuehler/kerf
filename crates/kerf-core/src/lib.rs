@@ -28,7 +28,10 @@ pub use engine::{
     SpeechModelInfo, DEFAULT_SPEECH_MODEL,
 };
 pub use error::{Error, Result};
-pub use platform::{check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, PlatformTarget, Severity, TARGETS as PLATFORM_TARGETS};
+pub use platform::{
+    check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
+    TARGETS as PLATFORM_TARGETS,
+};
 pub use fonts::list_system_fonts;
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, Clip, Color, Delivery, DiffEntry, DiffKind, EditSource, Keyframe, Marker, Projection,

@@ -621,18 +621,20 @@ impl Project {
     ///
     /// Reads the **working** timeline, so an agent assembling a cut sees the
     /// verdict on its own proposal rather than on the user's live one.
-    pub fn platform_check(&self) -> Result<Vec<crate::platform::DeliveryCheck>> {
-        Ok(crate::platform::check_all(&self.cut_summary()?))
+    /// `frame` overrides the shape the cut is judged at — what the export dialog
+    /// passes when a render is about to resize away from the project frame.
+    pub fn platform_check(&self, frame: Option<(u32, u32)>) -> Result<Vec<crate::platform::DeliveryCheck>> {
+        Ok(crate::platform::check_all(&self.cut_summary(frame)?))
     }
 
     /// What the readiness check needs to know about the current cut.
-    pub fn cut_summary(&self) -> Result<crate::platform::CutSummary> {
+    pub fn cut_summary(&self, frame: Option<(u32, u32)>) -> Result<crate::platform::CutSummary> {
         let timeline = self.working_timeline()?;
         let assets = self.list_assets()?;
         // The same gate the export applies, so a muted track is as absent here
         // as it will be in the file.
         let rendered = timeline.for_render();
-        let (width, height) = engine::delivery_frame(&rendered, &assets);
+        let (width, height) = frame.unwrap_or_else(|| engine::delivery_frame(&rendered, &assets));
         // Audio-bearing means what the export means by it: any clip whose asset
         // carries an audio stream, on a video track as much as an audio one.
         let has_audio = rendered.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
@@ -2899,12 +2901,12 @@ mod tests {
                 fit: Fit::Cover,
             }))
             .unwrap();
-        let summary = project.cut_summary().unwrap();
+        let summary = project.cut_summary(None).unwrap();
         assert_eq!((summary.width, summary.height), (1080, 1920));
         assert!(summary.duration > 0.0);
         assert!(summary.has_audio, "the sample has audio-bearing clips");
 
-        let checks = project.platform_check().unwrap();
+        let checks = project.platform_check(None).unwrap();
         assert_eq!(checks.len(), crate::platform::TARGETS.len());
         let reels = checks.iter().find(|c| c.target == "reels").unwrap();
         assert!(reels.ok, "a short vertical cut is publishable: {:?}", reels.issues);

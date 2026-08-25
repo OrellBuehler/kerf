@@ -24,9 +24,14 @@ so the feature is **only** activated through these forwards — which is what ma
   detection, preview frames (`frame_at`; `frame_jpeg` for a low-res JPEG), the
   per-asset **contact sheet** (`contact_sheet` — a `tile`d grid of frames sampled
   across a range, for skimming footage) and the **composited timeline still**
-  (`timeline_frame` / `build_timeline_frame_args`, pure + unit-tested — overlays
+  (`timeline_frame` / `build_still_args`, pure + unit-tested — overlays
   every clip visible at a timeline time onto a black canvas, mirroring the export
-  geometry, so an agent can *see the cut*), waveforms, and export all live here, so
+  geometry, so an agent can *see the cut*), the **cover frame** (`export_still` —
+  the same graph and the same builder, but a `StillOutput::File` sink and no
+  preview width cap, so the thumbnail is a real frame of the finished video at
+  the delivery shape rather than a screenshot to crop back into agreement; the
+  preview keeps its MJPEG pipe, which is why every pre-existing still test is
+  byte-identical), waveforms, and export all live here, so
   they work in the `--no-default-features` build — only the binaries are needed,
   never the dev libraries. Preview decodes go through a **cached all-intra proxy**
   (`generate_proxy` in the background, `ready_proxy` never blocks, resolved by
@@ -279,6 +284,24 @@ no editing logic in the adapter.
   every clip having been replaced, and a removed track is one entry instead of one
   per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
   labels, `stale`, and its diff).
+- `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
+  Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
+  length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
+  two limits apart that are usually conflated: a **hard** limit is what a
+  platform rejects, a **reach** limit is what it accepts and then stops
+  distributing — a four-minute Reel uploads fine and is shown only to existing
+  followers, the worse outcome because nothing tells you. Findings carry a
+  `Severity` (error / warning / tip) *and* an `IssueKind` (empty / length / shape
+  / resolution / captions), because a landscape cut earns a near-identical shape
+  complaint from every vertical feed and the UI has to collapse those into one
+  line naming four platforms. Messages are phrased with the real numbers
+  ("0:20 over", "cutting 1:00 would keep it in the feed"); aspect is compared as
+  a **ratio**, so 720x1280 reads as the right shape and merely soft. The numbers
+  are other companies' product decisions, verified 2026-08-25 and **advisory** —
+  nothing here ever blocks an export. `Project::platform_check(frame)` resolves
+  the summary from `working_timeline` (so an agent is judged on its own
+  proposal) with an optional frame override, which the export dialog passes when
+  a render resizes away from the project frame.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -367,6 +390,10 @@ proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
 `timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
+`platform_check` tells it whether the cut is publishable where it is going
+(and the server `instructions` tell it to run that before reporting a cut
+finished — an agent that assembles a four-minute Reel has done the work and lost
+the audience), and `export_cover` writes the thumbnail.
 `stage_edits` / `staged_diff` (the entries plus a rendered text summary) /
 `apply_staged_edits` / `discard_staged_edits` drive it explicitly, and
 `revision_diff` explains a past revision. The server `instructions` spell the flow
@@ -400,7 +427,12 @@ refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform
 counter, because start and stop are separate async calls that can arrive out of
 order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
-only non-JSON command — the preview's Web Audio playback decodes it), the
+only non-JSON command — the preview's Web Audio playback decodes it),
+delivery (`export_cover` → a cover image at the full delivery frame,
+`platform_targets` / `platform_check` → the readiness verdict, `reveal_path` →
+show a rendered file in the OS file manager, opening its *containing folder*
+rather than the file, since "show me where it went" is not a request to launch a
+player), the
 agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), the agent's staged proposal
 (`get_staged_edit` → the `StagedEdit` *with its diff*, so the review card renders
@@ -557,7 +589,18 @@ frame is height-bound in a wide pane, not squashed), and for a vertical or squar
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
 action column, plus a title-safe box; `ui.safeAreas`, toggled from the preview
 context menu). The export dialog's "Source" resolution relabels to
-**Project frame (WxH)** so the two surfaces cannot silently disagree.
+**Project frame (WxH)** so the two surfaces cannot silently disagree. It also
+leads with a **readiness panel**: "Ready for Instagram Reels · YouTube Shorts ·
+TikTok", then any length errors / reach warnings one line each, then a *single*
+collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
+in the toolbar") — grouped by `IssueKind`, because otherwise four vertical feeds
+each say the same thing. It re-checks against `opts.resolution`, so a 9:16
+project exported at 1920×1080 is judged as the landscape file it will be.
+`kerf_core::platform` decides all of it; `src/lib/platforms.ts` is a bun-tested
+mirror used **only** by the browser harness, so the panel is drivable under
+`bun run dev`. The **cover frame** is saved from the preview's context menu
+(`Save cover frame…` → `export_cover` at the playhead), and both a finished
+export and a saved cover offer **Show in folder** in their toast.
 `Preview` shows the composited frame under the playhead, and during
 **forward 1× playback it switches to the streamed frame source** (`start_playback`)
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the

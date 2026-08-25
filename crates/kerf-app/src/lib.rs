@@ -1341,8 +1341,12 @@ fn platform_targets() -> Vec<kerf_core::PlatformTarget> {
 /// How ready the current cut is for each target — what would be rejected, what
 /// would be accepted and then under-distributed, and what would just be better.
 #[tauri::command(async)]
-fn platform_check(state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
-    state.project().platform_check().map_err(|e| e.to_string())
+fn platform_check(state: State<'_, AppState>, width: Option<u32>, height: Option<u32>) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
+    // The export dialog can resize away from the project frame; when it does it
+    // passes the frame it is actually about to render, so the verdict is about
+    // the file that will exist rather than the one the project defaults to.
+    let frame = width.zip(height);
+    state.project().platform_check(frame).map_err(|e| e.to_string())
 }
 
 /// Show a file in the OS file manager. The last step of an export: the render

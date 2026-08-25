@@ -1446,7 +1446,7 @@ impl KerfMcp {
     )]
     fn platform_check(&self) -> Result<String, McpError> {
         let project = self.lock();
-        let summary = project.cut_summary().map_err(core_err)?;
+        let summary = project.cut_summary(None).map_err(core_err)?;
         json(&serde_json::json!({
             "cut": {
                 "duration_secs": summary.duration,
@@ -1454,7 +1454,7 @@ impl KerfMcp {
                 "has_audio": summary.has_audio,
                 "has_text": summary.has_text,
             },
-            "targets": project.platform_check().map_err(core_err)?,
+            "targets": project.platform_check(None).map_err(core_err)?,
         }))
     }
 

@@ -122,10 +122,29 @@ pub enum Severity {
     Tip,
 }
 
+/// What an issue is *about*, so a UI can group it. Four targets that all want a
+/// vertical frame produce four near-identical shape complaints; grouped, that is
+/// one line naming four platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueKind {
+    /// Nothing to publish.
+    Empty,
+    /// Too long or too short — includes the reach limit.
+    Length,
+    /// The wrong aspect for this target.
+    Shape,
+    /// The right aspect, too few pixels.
+    Resolution,
+    /// Advice about reading muted.
+    Captions,
+}
+
 /// One thing to know before publishing this cut to a target.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryIssue {
     pub severity: Severity,
+    pub kind: IssueKind,
     /// Already phrased for a person, with the actual numbers in it.
     pub message: String,
 }
@@ -194,6 +213,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
     if cut.duration <= 0.0 {
         issues.push(DeliveryIssue {
             severity: Severity::Error,
+            kind: IssueKind::Empty,
             message: "The timeline is empty — there is nothing to publish.".to_string(),
         });
     }
@@ -201,6 +221,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
         if cut.duration > 0.0 && cut.duration < min {
             issues.push(DeliveryIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Length,
                 message: format!(
                     "{} is shorter than {}'s {:.0}s minimum.",
                     fmt_dur(cut.duration),
@@ -214,6 +235,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
         if cut.duration > max {
             issues.push(DeliveryIssue {
                 severity: Severity::Error,
+                kind: IssueKind::Length,
                 message: format!(
                     "{} is over {}'s {} limit — trim {} to fit.",
                     fmt_dur(cut.duration),
@@ -230,6 +252,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
         if cut.duration > reach && within_hard {
             issues.push(DeliveryIssue {
                 severity: Severity::Warning,
+                kind: IssueKind::Length,
                 message: format!(
                     "Over {}, {} stops showing this to people who don't already follow you. Cutting {} would keep it in the feed.",
                     fmt_dur(reach),
@@ -256,6 +279,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
             .join(" or ");
         issues.push(DeliveryIssue {
             severity: Severity::Warning,
+            kind: IssueKind::Shape,
             message: format!(
                 "This cut is {} ({}×{}); {} shows {}, so it will be letterboxed. Set the delivery frame to {}×{}.",
                 ratio_label(cut.width, cut.height),
@@ -271,6 +295,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
         // Right shape, not enough pixels — the platform will upscale it.
         issues.push(DeliveryIssue {
             severity: Severity::Warning,
+            kind: IssueKind::Resolution,
             message: format!(
                 "{}×{} is below {}'s {}×{}; the platform will upscale it and it will look soft.",
                 cut.width, cut.height, target.label, target.width, target.height
@@ -281,6 +306,7 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
     if !cut.has_text && cut.has_audio {
         issues.push(DeliveryIssue {
             severity: Severity::Tip,
+            kind: IssueKind::Captions,
             message: "The feed autoplays muted. Captions or a title would carry this for the people who never turn sound on."
                 .to_string(),
         });

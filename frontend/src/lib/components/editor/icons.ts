@@ -50,6 +50,8 @@ import {
 	X,
 	Download,
 	RefreshCw,
+	TriangleAlert,
+	Lightbulb,
 	ExternalLink
 } from '@lucide/svelte';
 
@@ -105,7 +107,9 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'x': X,
 	'download': Download,
 	'refresh-cw': RefreshCw,
-	'external-link': ExternalLink
+	'external-link': ExternalLink,
+	'alert-triangle': TriangleAlert,
+	'lightbulb': Lightbulb
 };
 
 export type IconName = keyof typeof icons;

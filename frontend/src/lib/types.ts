@@ -399,6 +399,41 @@ export interface ExportOptions {
 /** How a clip's picture is fitted to an output frame of a different shape. */
 export type Fit = 'contain' | 'cover';
 
+/** A place a finished cut gets published, mirroring `kerf_core::platform`. */
+export interface PlatformTarget {
+	id: string;
+	label: string;
+	width: number;
+	height: number;
+	accepts: [number, number][];
+	max_secs: number | null;
+	reach_max_secs: number | null;
+	min_secs: number | null;
+	notes: string;
+}
+
+/** `error` = the platform rejects it, `warning` = accepted then under-distributed
+ *  or letterboxed, `tip` = advice. */
+export type Severity = 'error' | 'warning' | 'tip';
+
+/** What an issue is about, so a UI can group four identical shape complaints
+ *  into one line naming four platforms. */
+export type IssueKind = 'empty' | 'length' | 'shape' | 'resolution' | 'captions';
+
+export interface DeliveryIssue {
+	severity: Severity;
+	kind: IssueKind;
+	message: string;
+}
+
+/** A cut's readiness for one publishing target. */
+export interface DeliveryCheck {
+	target: string;
+	label: string;
+	ok: boolean;
+	issues: DeliveryIssue[];
+}
+
 /** Payload of the `export-progress` event streamed during a render. */
 export interface ExportProgress {
 	fraction: number;
