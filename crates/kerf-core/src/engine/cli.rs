@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Projection, Reframe, ReframeKeyframe, ResolvedReframe, StreamInfo, StreamKind, TextOverlay,
-    TimeRange, Timeline, Transform, TransitionKind, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind,
+    TextOverlay, TimeRange, Timeline, Transform, TransitionKind, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -554,6 +554,142 @@ fn field_after(line: &str, key: &str) -> Option<f64> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+// ---- salience sampling (smart crop) ----------------------------------------
+
+/// Grid the salience sampler decodes at. Coarse on purpose: the answer is a
+/// crop window, not a mask, and 64x36 gray pixels is 2.3 KB a frame — small
+/// enough that hundreds of samples cost less than one preview still.
+pub const SALIENCE_COLS: usize = 64;
+pub const SALIENCE_ROWS: usize = 36;
+
+/// Frames sampled across the window. Enough to average out a blink or a
+/// handheld wobble without decoding the whole clip's worth of pictures.
+const SALIENCE_SAMPLES: usize = 48;
+
+/// Weight of *motion* against *detail* in a cell's score. Motion is the stronger
+/// signal when there is any — a subject who moves is the subject — but a
+/// locked-off talking head has none at all, which is why detail carries the
+/// floor rather than being a tie-break.
+const SALIENCE_MOTION_WEIGHT: f64 = 3.0;
+
+/// Sample where the content of `path`'s `[start, end)` window sits, as a coarse
+/// [`SalienceMap`].
+///
+/// One ffmpeg pass decodes a few dozen tiny grayscale frames; each cell scores
+/// the picture's edge energy plus how much it changed since the last sample.
+/// Hardware-accelerated like [`detect_scenes`], with the same software retry —
+/// the decode is the expensive half on 4K footage, and the arithmetic here runs
+/// on 2 KB frames.
+pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
+    use std::sync::atomic::Ordering;
+
+    let bin = ffmpeg_bin();
+    let args = build_salience_args(path, start, end);
+    let run = |hw: Option<&str>| {
+        let mut cmd = command(&bin);
+        if let Some(hw) = hw {
+            cmd.args(["-hwaccel", hw]);
+        }
+        cmd.args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))
+    };
+    let hw = decode_hwaccel();
+    let output = match hw.as_deref() {
+        Some(h) => {
+            let out = run(Some(h))?;
+            if out.status.success() && !out.stdout.is_empty() {
+                out
+            } else {
+                let sw = run(None)?;
+                if sw.status.success() {
+                    HWACCEL_OK.store(false, Ordering::Relaxed);
+                    tracing::warn!("hardware decode failed while sampling salience; using software decode");
+                }
+                sw
+            }
+        }
+        None => run(None)?,
+    };
+    if !output.status.success() {
+        return Err(Error::Engine(format!(
+            "could not sample the shot: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(score_salience(&output.stdout))
+}
+
+/// Pure arg builder for [`salience_map`] (no I/O, unit-tested). Fast-seeks to
+/// the window, decodes at most [`SALIENCE_SAMPLES`] frames spread across it, and
+/// writes them as raw gray at the analysis grid. `-an` because nothing here
+/// looks at sound, and `fps` before `scale` so the scaler runs on the frames
+/// that survive rather than on every one.
+fn build_salience_args(path: &Path, start: f64, end: f64) -> Vec<String> {
+    let start = start.max(0.0);
+    let window = (end - start).max(0.04);
+    // Spread the samples across the window, but never ask for more frames per
+    // second than a sane source has — a 0.2s clip wants every frame it has, not
+    // 240 duplicated ones.
+    let fps = (SALIENCE_SAMPLES as f64 / window).clamp(0.2, 30.0);
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostats"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push("-ss".into());
+    args.push(format!("{start:.3}"));
+    args.push("-t".into());
+    args.push(format!("{window:.3}"));
+    args.push("-i".into());
+    args.push(path.to_string_lossy().into_owned());
+    args.push("-an".into());
+    args.push("-map".into());
+    args.push("0:v:0?".into());
+    args.push("-vf".into());
+    args.push(format!(
+        "fps={fps:.4},scale={SALIENCE_COLS}:{SALIENCE_ROWS}:flags=bilinear,format=gray"
+    ));
+    args.push("-frames:v".into());
+    args.push(SALIENCE_SAMPLES.to_string());
+    args.push("-f".into());
+    args.push("rawvideo".into());
+    args.push("-pix_fmt".into());
+    args.push("gray".into());
+    args.push("pipe:1".into());
+    args
+}
+
+/// Score a run of raw gray [`SALIENCE_COLS`]x[`SALIENCE_ROWS`] frames into a
+/// [`SalienceMap`]: per cell, the local edge energy of every frame plus the
+/// frame-to-frame change, averaged over the frames actually decoded. Pure over
+/// the decoded bytes, so the scoring is unit-testable without ffmpeg.
+fn score_salience(raw: &[u8]) -> SalienceMap {
+    let (w, h) = (SALIENCE_COLS, SALIENCE_ROWS);
+    let stride = w * h;
+    let frames = raw.len() / stride;
+    if frames == 0 {
+        return SalienceMap::default();
+    }
+    let mut cells = vec![0.0f64; stride];
+    let mut prev: Option<&[u8]> = None;
+    for f in 0..frames {
+        let frame = &raw[f * stride..(f + 1) * stride];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let p = frame[i] as f64;
+                // Edge energy: how much this pixel differs from its right and
+                // lower neighbours. Texture and outlines score, flat sky doesn't.
+                let dx = if x + 1 < w { (frame[i + 1] as f64 - p).abs() } else { 0.0 };
+                let dy = if y + 1 < h { (frame[i + w] as f64 - p).abs() } else { 0.0 };
+                let motion = prev.map_or(0.0, |q| (q[i] as f64 - p).abs());
+                cells[i] += dx + dy + SALIENCE_MOTION_WEIGHT * motion;
+            }
+        }
+        prev = Some(frame);
+    }
+    let scale = 1.0 / (frames as f64 * 255.0);
+    SalienceMap::new(w, h, cells.into_iter().map(|c| (c * scale) as f32).collect())
 }
 
 // ---- frame / waveform extraction ------------------------------------------
@@ -4468,6 +4604,81 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+
+    // ---- salience sampling --------------------------------------------------
+
+    #[test]
+    fn salience_args_sample_the_window_at_the_analysis_grid() {
+        let args = build_salience_args(Path::new("/m/a.mp4"), 12.0, 22.0);
+        let joined = args.join(" ");
+        assert!(joined.contains("-ss 12.000 -t 10.000 -i /m/a.mp4"), "{joined}");
+        // 48 samples over 10s.
+        assert!(joined.contains("fps=4.8000,scale=64:36:flags=bilinear,format=gray"), "{joined}");
+        assert!(joined.contains("-frames:v 48"), "{joined}");
+        assert!(joined.contains("-f rawvideo -pix_fmt gray pipe:1"), "{joined}");
+        assert!(joined.contains("-an"), "{joined}");
+    }
+
+    #[test]
+    fn salience_args_clamp_the_sample_rate_for_absurd_windows() {
+        // A quarter-second clip must not ask for 192 fps...
+        let fast = build_salience_args(Path::new("/m/a.mp4"), 0.0, 0.25).join(" ");
+        assert!(fast.contains("fps=30.0000"), "{fast}");
+        // ...nor an hour-long one for a frame every 75 seconds.
+        let slow = build_salience_args(Path::new("/m/a.mp4"), 0.0, 3600.0).join(" ");
+        assert!(slow.contains("fps=0.2000"), "{slow}");
+        // A zero-length window still produces a runnable command.
+        let empty = build_salience_args(Path::new("/m/a.mp4"), 5.0, 5.0).join(" ");
+        assert!(empty.contains("-t 0.040"), "{empty}");
+    }
+
+    #[test]
+    fn scoring_no_frames_yields_an_empty_map() {
+        assert_eq!(score_salience(&[]), SalienceMap::default());
+        // A partial frame is not a frame.
+        assert_eq!(score_salience(&[7u8; 128]), SalienceMap::default());
+    }
+
+    #[test]
+    fn scoring_finds_the_detailed_half_of_a_flat_frame() {
+        let (w, h) = (SALIENCE_COLS, SALIENCE_ROWS);
+        // Left half flat gray, right half a hard checkerboard.
+        let mut frame = vec![40u8; w * h];
+        for y in 0..h {
+            for x in w / 2..w {
+                frame[y * w + x] = if (x + y) % 2 == 0 { 0 } else { 255 };
+            }
+        }
+        let map = score_salience(&frame);
+        assert_eq!((map.cols, map.rows), (w, h));
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        assert!(crop.offset > 0.0, "the textured half pulls the window right: {crop:?}");
+    }
+
+    #[test]
+    fn scoring_weighs_a_moving_subject_over_a_static_one() {
+        let (w, h) = (SALIENCE_COLS, SALIENCE_ROWS);
+        let block = |frame: &mut Vec<u8>, from: usize, to: usize, v: u8| {
+            for y in h / 3..2 * h / 3 {
+                for x in from..to {
+                    frame[y * w + x] = v;
+                }
+            }
+        };
+        // Two frames: a static block on the left, a block on the right that moves.
+        let mut a = vec![0u8; w * h];
+        block(&mut a, 4, 12, 200);
+        block(&mut a, w - 16, w - 8, 200);
+        let mut b = a.clone();
+        block(&mut b, w - 16, w - 8, 0);
+        block(&mut b, w - 20, w - 12, 200);
+        let mut raw = a.clone();
+        raw.extend_from_slice(&b);
+        let map = score_salience(&raw);
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        assert!(crop.offset > 0.0, "motion wins over equal detail: {crop:?}");
+    }
+
     #[test]
     fn parses_silence_pairs() {
         let log = "\
@@ -7152,6 +7363,66 @@ mod tests {
         noisy.extend_from_slice(&a);
         let (s, e) = next_jpeg(&noisy).unwrap();
         assert_eq!(&noisy[s..e], &a[..]);
+    }
+
+    #[test]
+    fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
+        let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
+        let mut clip = make_clip(asset.id, 0.0, 5.0, 0.0);
+        // What `smart_crop` writes for a 9:16 delivery, pulled left of centre.
+        let map = SalienceMap::new(4, 2, vec![1.0, 1.0, 0.01, 0.01, 1.0, 1.0, 0.01, 0.01]);
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        clip.transform.crop_left = crop.left;
+        clip.transform.crop_right = crop.right;
+
+        let fmt = ExportFormat {
+            width: 1080,
+            height: 1920,
+            fit: Fit::Cover,
+            ..ExportFormat::default()
+        };
+        let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false, "c0");
+        let cropped = chain.find("crop=w=iw*").expect("the smart crop is in the graph");
+        let scaled = chain.find("scale=1080:1920").expect("the fit is in the graph");
+        assert!(cropped < scaled, "the crop must pick the window before the fit scales it: {chain}");
+        // The window is off-centre — a plain Cover would have taken the middle.
+        assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
+        assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");
+    }
+
+    /// End to end against the real `ffmpeg` binary: synthesize a 16:9 shot whose
+    /// only content sits in the left third, and check the sampler finds it and
+    /// the 9:16 crop keeps it — the case a centre crop gets wrong, and the whole
+    /// reason smart crop exists. Not part of the normal (binary-free) run:
+    /// `cargo test -p kerf-core --no-default-features -- --ignored samples_a_real`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn samples_a_real_shot_and_frames_its_subject() {
+        let dir = std::env::temp_dir().join(format!("kerf-salience-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("left.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=360x240:rate=30:duration=3"])
+            .args(["-f", "lavfi", "-i", "color=c=black:s=1280x720:rate=30:duration=3"])
+            .args(["-filter_complex", "[1][0]overlay=x=80:y=240"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success(), "could not synthesize test media");
+
+        let map = salience_map(&media, 0.0, 3.0).expect("sample");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((map.cols, map.rows), (SALIENCE_COLS, SALIENCE_ROWS));
+        assert!(map.cells.iter().any(|c| *c > 0.0), "the map is empty");
+
+        let crop = map.crop_for(1280, 720, 1080.0 / 1920.0).expect("crops");
+        assert!(crop.offset < 0.0, "the subject is on the left: {crop:?}");
+        // The subject spans x = 80..440 of 1280, i.e. 0.0625..0.344 — a centre
+        // crop (0.342..0.658) would miss it entirely.
+        assert!(crop.left < 0.0625 && 1.0 - crop.right > 0.344, "{crop:?}");
     }
 
     /// End to end against the real `ffmpeg` binary: synthesize a clip, play two

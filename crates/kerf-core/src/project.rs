@@ -13,10 +13,31 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, Delivery, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe,
-    Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    Asset, AssetAnalysis, AudioEffect, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection, Reframe,
+    ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
     TimelineDiff, Track, Transition, VideoEffect, MAX_FOV, MIN_FOV,
 };
+
+/// One clip queued for smart-crop sampling: which media to look at, over which
+/// source window, and the shape it was shot in.
+#[derive(Debug, Clone)]
+pub struct SmartCropJob {
+    pub clip_id: Uuid,
+    pub path: PathBuf,
+    pub start: f64,
+    pub end: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Everything the smart-crop sampler needs, resolved in one pass under the
+/// project lock so the decodes it drives can run with the guard dropped.
+#[derive(Debug, Clone)]
+pub struct SmartCropPlan {
+    /// The aspect of the delivery frame — what every job is framed for.
+    pub target_aspect: f64,
+    pub jobs: Vec<SmartCropJob>,
+}
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -1672,6 +1693,167 @@ impl Project {
                 return Err(Error::InvalidArgument("crop removes the entire frame".to_string()));
             }
             Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    // ---- smart crop ---------------------------------------------------------
+
+    /// Frame each shot for the delivery frame instead of centring it blindly.
+    ///
+    /// Reshaping a cut — 16:9 footage into a 9:16 Reel — throws away most of the
+    /// width, and both fits pick that width without looking: `Cover` takes the
+    /// middle, `Contain` keeps everything and shrinks it into a letterboxed
+    /// strip. Neither is right when the subject stands in the left third, which
+    /// is where a subject usually stands. This samples where each shot's content
+    /// actually is and writes the crop that keeps it, per clip — so a cut of six
+    /// shots gets six framings rather than one compromise.
+    ///
+    /// The result is an ordinary `Transform` crop: visible in the inspector,
+    /// adjustable by hand, undoable in one step, and rendered by the graph that
+    /// was already there. Kerf proposes the framing; the crop sliders remain the
+    /// truth. `clip_id` narrows it to one clip; `None` reframes every clip on an
+    /// unlocked video track. Returns how many clips moved.
+    pub fn smart_crop(&self, clip_id: Option<Uuid>) -> Result<usize> {
+        let plan = self.smart_crop_inputs(clip_id)?;
+        let crops = Self::sample_smart_crops(&plan)?;
+        self.apply_smart_crops(&crops)
+    }
+
+    /// Resolve what [`Project::smart_crop`] has to look at, **without** decoding
+    /// anything — so a caller can pull this out under the shared project lock and
+    /// drop the guard before [`Project::sample_smart_crops`] runs ffmpeg over
+    /// every clip. Mirrors [`Project::timeline_frame_inputs`]' shape.
+    ///
+    /// Clips already the right shape are left out rather than sampled: there is
+    /// no window to choose, and a no-op crop written into every clip would only
+    /// be noise. A 360 clip is left out too — its `reframe` already aims a camera
+    /// at the sphere, and that is the framing decision.
+    pub fn smart_crop_inputs(&self, clip_id: Option<Uuid>) -> Result<SmartCropPlan> {
+        let timeline = self.working_timeline()?;
+        let assets = self.list_assets()?;
+        let (fw, fh) = engine::delivery_frame(&timeline, &assets);
+        let target_aspect = fw as f64 / fh.max(1) as f64;
+
+        let mut jobs = Vec::new();
+        let mut skipped_shape = 0usize;
+        for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video) {
+            // A locked track is locked against a bulk pass, but naming one of its
+            // clips is still an explicit instruction.
+            if track.locked && clip_id.is_none() {
+                continue;
+            }
+            for clip in &track.clips {
+                if clip_id.is_some_and(|id| id != clip.id) {
+                    continue;
+                }
+                if clip.reframe.is_some() {
+                    continue;
+                }
+                let Some(asset) = assets.iter().find(|a| a.id == clip.asset_id) else {
+                    continue;
+                };
+                let Some((w, h)) = asset
+                    .streams
+                    .iter()
+                    .find(|s| s.kind == StreamKind::Video)
+                    .and_then(|s| s.width.zip(s.height))
+                else {
+                    continue;
+                };
+                // Nothing to choose when the shot is already the delivery shape.
+                if !crate::model::needs_crop(w, h, target_aspect) {
+                    skipped_shape += 1;
+                    continue;
+                }
+                // A still has one frame at t=0 and no source timeline to seek
+                // into — sampling its clip window would decode nothing.
+                let (start, end) = if asset.is_image() {
+                    (0.0, 0.04)
+                } else {
+                    (clip.source_in.min(clip.source_out), clip.source_in.max(clip.source_out))
+                };
+                jobs.push(SmartCropJob {
+                    clip_id: clip.id,
+                    path: PathBuf::from(&asset.path),
+                    start,
+                    end,
+                    width: w,
+                    height: h,
+                });
+            }
+        }
+
+        if jobs.is_empty() {
+            let why = if skipped_shape > 0 {
+                format!("every shot is already {fw}x{fh}-shaped — nothing to reframe")
+            } else if clip_id.is_some() {
+                "that clip cannot be reframed — it is 360 footage, or its asset has no video".to_string()
+            } else {
+                "no video clips to reframe".to_string()
+            };
+            return Err(Error::InvalidArgument(why));
+        }
+        Ok(SmartCropPlan { target_aspect, jobs })
+    }
+
+    /// Sample every job in `plan` and pick its crop. Static and lock-free — this
+    /// is the slow half (one short ffmpeg decode per clip), so it must not run
+    /// with the project locked. A clip whose media cannot be read is skipped
+    /// rather than failing the batch; if *nothing* could be read, the first error
+    /// is returned so the caller has something to show.
+    pub fn sample_smart_crops(plan: &SmartCropPlan) -> Result<Vec<(Uuid, CropFrame)>> {
+        let mut crops = Vec::new();
+        let mut first_error = None;
+        for job in &plan.jobs {
+            match engine::salience_map(&job.path, job.start, job.end) {
+                Ok(map) => {
+                    if let Some(crop) = map.crop_for(job.width, job.height, plan.target_aspect) {
+                        crops.push((job.clip_id, crop));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(clip = %job.clip_id, path = %job.path.display(), error = %e, "could not sample a shot for smart crop");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match (crops.is_empty(), first_error) {
+            (true, Some(e)) => Err(e),
+            _ => Ok(crops),
+        }
+    }
+
+    /// Write sampled crops onto their clips as one undoable edit. Returns how
+    /// many clips moved.
+    ///
+    /// Crops matching what a clip already had are dropped first, so re-running
+    /// the pass over an unchanged cut reports 0 *and* leaves the history alone —
+    /// a revision that changed nothing is only noise in the edit log.
+    pub fn apply_smart_crops(&self, crops: &[(Uuid, CropFrame)]) -> Result<usize> {
+        let timeline = self.working_timeline()?;
+        let pending: Vec<_> = crops
+            .iter()
+            .filter(|(clip_id, crop)| {
+                timeline.locate(*clip_id).is_some_and(|(ti, ci)| {
+                    let t = &timeline.tracks[ti].clips[ci].transform;
+                    (t.crop_left, t.crop_right, t.crop_top, t.crop_bottom) != (crop.left, crop.right, crop.top, crop.bottom)
+                })
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        self.edit_timeline("Smart crop", |timeline| {
+            let mut changed = 0;
+            for (clip_id, crop) in &pending {
+                let Some((ti, ci)) = timeline.locate(*clip_id) else {
+                    continue;
+                };
+                let t = &mut timeline.tracks[ti].clips[ci].transform;
+                (t.crop_left, t.crop_right, t.crop_top, t.crop_bottom) = (crop.left, crop.right, crop.top, crop.bottom);
+                changed += 1;
+            }
+            Ok(changed)
         })
     }
 
@@ -4042,5 +4224,126 @@ mod tests {
         );
         // The baseline revision changed nothing by definition.
         assert!(project.revision_diff(0).unwrap().is_empty());
+    }
+
+    // ---- smart crop ---------------------------------------------------------
+
+    #[test]
+    fn smart_crop_has_nothing_to_do_when_the_footage_is_already_the_frame() {
+        let project = Project::sample().unwrap();
+        // The sample is 1920x1080 with no explicit delivery frame, so the frame
+        // is derived from the footage and every shot already fills it.
+        let err = project.smart_crop_inputs(None).unwrap_err().to_string();
+        assert!(err.contains("already"), "{err}");
+    }
+
+    #[test]
+    fn smart_crop_plans_every_video_clip_for_a_vertical_delivery() {
+        let project = Project::sample().unwrap();
+        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        let plan = project.smart_crop_inputs(None).unwrap();
+        assert!((plan.target_aspect - 1080.0 / 1920.0).abs() < 1e-9);
+        let video_clips: usize = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .map(|t| t.clips.len())
+            .sum();
+        assert_eq!(plan.jobs.len(), video_clips);
+        // Each job points at real media over the clip's own source window.
+        for job in &plan.jobs {
+            assert!(job.path.to_string_lossy().ends_with(".mp4"));
+            assert!(job.end > job.start);
+            // Both sample sources are 16:9 — 1080p and 4K.
+            assert!((job.width as f64 / job.height as f64 - 16.0 / 9.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn smart_crop_can_be_narrowed_to_one_clip() {
+        let project = Project::sample().unwrap();
+        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        let clip = first_video_clip(&project);
+        let plan = project.smart_crop_inputs(Some(clip)).unwrap();
+        assert_eq!(plan.jobs.len(), 1);
+        assert_eq!(plan.jobs[0].clip_id, clip);
+    }
+
+    #[test]
+    fn smart_crop_skips_a_locked_track_but_not_a_clip_named_on_one() {
+        let project = Project::sample().unwrap();
+        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        let clip = first_video_clip(&project);
+        let track = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .find(|t| t.clips.iter().any(|c| c.id == clip))
+            .unwrap()
+            .id;
+        project.set_track_locked(track, true).unwrap();
+        // The bulk pass leaves the locked track alone...
+        let bulk = project.smart_crop_inputs(None);
+        assert!(!bulk.map(|p| p.jobs.iter().any(|j| j.clip_id == clip)).unwrap_or(false));
+        // ...but naming one of its clips is an explicit instruction.
+        assert_eq!(project.smart_crop_inputs(Some(clip)).unwrap().jobs.len(), 1);
+    }
+
+    #[test]
+    fn applying_crops_is_one_undoable_edit_that_only_counts_real_changes() {
+        let project = Project::sample().unwrap();
+        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        let clip = first_video_clip(&project);
+        let crop = CropFrame {
+            left: 0.1,
+            right: 0.5836,
+            top: 0.0,
+            bottom: 0.0,
+            offset: -0.6,
+        };
+        let before = project.history().unwrap().len();
+        assert_eq!(project.apply_smart_crops(&[(clip, crop)]).unwrap(), 1);
+        let t = clip_transform(&project, clip);
+        assert!((t.crop_left - 0.1).abs() < 1e-9 && (t.crop_right - 0.5836).abs() < 1e-9);
+        assert_eq!(project.history().unwrap().len(), before + 1);
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Smart crop");
+
+        // Re-running the same pass changes nothing, and leaves no revision behind.
+        assert_eq!(project.apply_smart_crops(&[(clip, crop)]).unwrap(), 0);
+        assert_eq!(project.history().unwrap().len(), before + 1);
+
+        // The whole pass undoes in one step.
+        project.undo().unwrap();
+        assert_eq!(clip_transform(&project, clip).crop_left, 0.0);
+    }
+
+    #[test]
+    fn applying_no_crops_writes_no_revision() {
+        let project = Project::sample().unwrap();
+        let before = project.history().unwrap().len();
+        assert_eq!(project.apply_smart_crops(&[]).unwrap(), 0);
+        assert_eq!(project.history().unwrap().len(), before);
+    }
+
+    fn first_video_clip(project: &Project) -> Uuid {
+        project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| t.clips.iter())
+            .next()
+            .unwrap()
+            .id
+    }
+
+    fn clip_transform(project: &Project, clip_id: Uuid) -> crate::model::Transform {
+        let timeline = project.timeline().unwrap();
+        let (ti, ci) = timeline.locate(clip_id).unwrap();
+        timeline.tracks[ti].clips[ci].transform
     }
 }
