@@ -329,9 +329,7 @@ pub fn check_all(cut: &CutSummary) -> Vec<DeliveryCheck> {
 /// UI with the one the user already chose to cut for.
 pub fn target_for(format: Option<&Delivery>) -> Option<&'static PlatformTarget> {
     let f = format?;
-    TARGETS
-        .iter()
-        .find(|t| t.width == f.width && t.height == f.height)
+    TARGETS.iter().find(|t| t.width == f.width && t.height == f.height)
 }
 
 #[cfg(test)]

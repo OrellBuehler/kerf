@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection, Reframe,
-    ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
-    TimelineDiff, Track, Transition, VideoEffect, MAX_FOV, MIN_FOV,
+    ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
+    Timeline, TimelineDiff, Track, Transition, VideoEffect, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -658,12 +658,11 @@ impl Project {
         let (width, height) = frame.unwrap_or_else(|| engine::delivery_frame(&rendered, &assets));
         // Audio-bearing means what the export means by it: any clip whose asset
         // carries an audio stream, on a video track as much as an audio one.
-        let has_audio = rendered.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
-            assets
-                .iter()
-                .find(|a| a.id == c.asset_id)
-                .is_some_and(|a| a.has_audio())
-        });
+        let has_audio = rendered
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .any(|c| assets.iter().find(|a| a.id == c.asset_id).is_some_and(|a| a.has_audio()));
         Ok(crate::platform::CutSummary {
             duration: rendered.duration(),
             width,
@@ -708,12 +707,7 @@ impl Project {
     }
 
     /// Render a cover frame for the current timeline at `time_secs`.
-    pub fn export_still(
-        &self,
-        time_secs: f64,
-        path: impl AsRef<Path>,
-        format: Option<engine::ImageFormat>,
-    ) -> Result<PathBuf> {
+    pub fn export_still(&self, time_secs: f64, path: impl AsRef<Path>, format: Option<engine::ImageFormat>) -> Result<PathBuf> {
         let (timeline, assets) = self.export_still_inputs()?;
         Self::render_still(&timeline, &assets, time_secs, path, format)
     }
@@ -4240,7 +4234,9 @@ mod tests {
     #[test]
     fn smart_crop_plans_every_video_clip_for_a_vertical_delivery() {
         let project = Project::sample().unwrap();
-        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
         let plan = project.smart_crop_inputs(None).unwrap();
         assert!((plan.target_aspect - 1080.0 / 1920.0).abs() < 1e-9);
         let video_clips: usize = project
@@ -4264,7 +4260,9 @@ mod tests {
     #[test]
     fn smart_crop_can_be_narrowed_to_one_clip() {
         let project = Project::sample().unwrap();
-        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
         let clip = first_video_clip(&project);
         let plan = project.smart_crop_inputs(Some(clip)).unwrap();
         assert_eq!(plan.jobs.len(), 1);
@@ -4274,7 +4272,9 @@ mod tests {
     #[test]
     fn smart_crop_skips_a_locked_track_but_not_a_clip_named_on_one() {
         let project = Project::sample().unwrap();
-        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
         let clip = first_video_clip(&project);
         let track = project
             .timeline()
@@ -4295,7 +4295,9 @@ mod tests {
     #[test]
     fn applying_crops_is_one_undoable_edit_that_only_counts_real_changes() {
         let project = Project::sample().unwrap();
-        project.set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover))).unwrap();
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
         let clip = first_video_clip(&project);
         let crop = CropFrame {
             left: 0.1,

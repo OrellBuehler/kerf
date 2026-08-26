@@ -592,7 +592,10 @@ pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
         if let Some(hw) = hw {
             cmd.args(["-hwaccel", hw]);
         }
-        cmd.args(&args).stderr(Stdio::piped()).output().map_err(|e| launch_err(&bin, e))
+        cmd.args(&args)
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| launch_err(&bin, e))
     };
     let hw = decode_hwaccel();
     let output = match hw.as_deref() {
@@ -4426,7 +4429,12 @@ fn build_still_args(
     chains.push(format!("[{cur}]null[outv]"));
     let filter = chains.join(";");
 
-    args.extend(["-filter_complex".to_string(), filter, "-map".to_string(), "[outv]".to_string()]);
+    args.extend([
+        "-filter_complex".to_string(),
+        filter,
+        "-map".to_string(),
+        "[outv]".to_string(),
+    ]);
     args.extend(out.args());
     Ok(args)
 }
@@ -4604,7 +4612,6 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-
     // ---- salience sampling --------------------------------------------------
 
     #[test]
@@ -4613,7 +4620,10 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("-ss 12.000 -t 10.000 -i /m/a.mp4"), "{joined}");
         // 48 samples over 10s.
-        assert!(joined.contains("fps=4.8000,scale=64:36:flags=bilinear,format=gray"), "{joined}");
+        assert!(
+            joined.contains("fps=4.8000,scale=64:36:flags=bilinear,format=gray"),
+            "{joined}"
+        );
         assert!(joined.contains("-frames:v 48"), "{joined}");
         assert!(joined.contains("-f rawvideo -pix_fmt gray pipe:1"), "{joined}");
         assert!(joined.contains("-an"), "{joined}");
@@ -7384,7 +7394,10 @@ mod tests {
         let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false, "c0");
         let cropped = chain.find("crop=w=iw*").expect("the smart crop is in the graph");
         let scaled = chain.find("scale=1080:1920").expect("the fit is in the graph");
-        assert!(cropped < scaled, "the crop must pick the window before the fit scales it: {chain}");
+        assert!(
+            cropped < scaled,
+            "the crop must pick the window before the fit scales it: {chain}"
+        );
         // The window is off-centre — a plain Cover would have taken the middle.
         assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
         assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");

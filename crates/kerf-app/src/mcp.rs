@@ -164,9 +164,7 @@ struct TrackIdParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SmartCropParams {
-    #[schemars(
-        description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted"
-    )]
+    #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
     clip_id: Option<String>,
 }
 
