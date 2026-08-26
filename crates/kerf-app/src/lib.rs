@@ -1332,6 +1332,27 @@ async fn export_cover(
     .await
 }
 
+/// Frame every shot for the delivery frame instead of centring it blindly —
+/// samples where each clip's content sits and writes the crop that keeps it.
+/// One clip when `clip_id` is given, otherwise every clip on an unlocked video
+/// track. The result is an ordinary transform crop, so the inspector's sliders
+/// still have the last word.
+#[tauri::command]
+async fn smart_crop(state: State<'_, AppState>, clip_id: Option<String>) -> CmdResult<Timeline> {
+    let clip = clip_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // The usual shape for a heavy command: plan under the lock, decode
+        // without it (one short ffmpeg pass per clip), apply under it again.
+        let plan = lock_user(&shared).smart_crop_inputs(clip).map_err(|e| e.to_string())?;
+        let crops = Project::sample_smart_crops(&plan).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project.apply_smart_crops(&crops).map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// Every publishing target Kerf knows about, with its frame and length limits.
 #[tauri::command(async)]
 fn platform_targets() -> Vec<kerf_core::PlatformTarget> {
@@ -1583,6 +1604,7 @@ pub fn run() {
             export_srt,
             remove_silence,
             snap_to_beats,
+            smart_crop,
             extract_audio,
             concatenate,
             get_history,
