@@ -41,6 +41,7 @@ import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from 
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
+import { centeredCrop } from './smart-crop';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1262,6 +1263,44 @@ export async function snapToBeats(trackId?: string, tolerance?: number): Promise
 		return snapshot();
 	}
 	return invoke<Timeline>('snap_to_beats', { trackId, tolerance });
+}
+
+/** Frame each shot for the delivery frame instead of centring it blindly.
+ *
+ *  The app samples where each clip's content actually sits (one short ffmpeg
+ *  pass per clip) and writes the crop that keeps it. The browser harness has no
+ *  decoder, so it applies the centre window from `smart-crop.ts` — the shape is
+ *  right, the choice of *which* part of the shot survives is the half that only
+ *  exists with media behind it. Either way the result is an ordinary transform
+ *  crop the inspector can adjust. */
+export async function smartCrop(clipId?: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const fmt = devTimeline.format;
+		const first = sampleAssets[0]?.streams.find((s) => s.kind === 'video');
+		const aspect = (fmt?.width ?? first?.width ?? 1920) / (fmt?.height ?? first?.height ?? 1080);
+		let moved = 0;
+		for (const track of devTimeline.tracks) {
+			if (track.kind !== 'video' || (track.locked && !clipId)) continue;
+			for (const clip of track.clips) {
+				if (clipId && clip.id !== clipId) continue;
+				const stream = assetById(clip.asset_id)?.streams.find((s) => s.kind === 'video');
+				const crop = stream?.width && stream?.height ? centeredCrop(stream.width, stream.height, aspect) : null;
+				if (!crop) continue;
+				clip.transform = {
+					...(clip.transform ?? DEFAULT_TRANSFORM),
+					crop_left: crop.left,
+					crop_right: crop.right,
+					crop_top: crop.top,
+					crop_bottom: crop.bottom
+				};
+				moved += 1;
+			}
+		}
+		if (!moved) throw new Error('every shot is already that shape — nothing to reframe');
+		recordDev('Smart crop');
+		return snapshot();
+	}
+	return invoke<Timeline>('smart_crop', { clipId });
 }
 
 export async function extractAudio(assetId: string): Promise<Timeline> {

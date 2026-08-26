@@ -23,7 +23,13 @@ so the feature is **only** activated through these forwards — which is what ma
   (override with `KERF_FFMPEG` / `KERF_FFPROBE`). Probe, `silencedetect`, scene
   detection, preview frames (`frame_at`; `frame_jpeg` for a low-res JPEG), the
   per-asset **contact sheet** (`contact_sheet` — a `tile`d grid of frames sampled
-  across a range, for skimming footage) and the **composited timeline still**
+  across a range, for skimming footage), the **salience map** behind smart crop
+  (`salience_map` / `build_salience_args` / `score_salience`, the last two pure +
+  unit-tested — one pass decodes ~48 tiny gray frames of a source window and scores
+  each cell by edge energy plus frame-to-frame motion, so a locked-off talking head
+  scores on detail and a follow shot on both; deliberately *not* face detection —
+  no model to ship, and the answer only has to beat a centre crop) and the
+  **composited timeline still**
   (`timeline_frame` / `build_still_args`, pure + unit-tested — overlays
   every clip visible at a timeline time onto a black canvas, mirroring the export
   geometry, so an agent can *see the cut*), the **cover frame** (`export_still` —
@@ -265,6 +271,12 @@ no editing logic in the adapter.
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
   re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
+  **Smart crop** is here too and pure + unit-tested: `SalienceMap::crop_for` slides a
+  window of the delivery aspect across the sampled map and returns the `CropFrame`
+  (per-edge fractions, plus how far off centre it landed) that keeps the content —
+  with a `CENTER_BIAS` so a flat map resolves to the plain centre crop rather than to
+  whichever edge won by rounding, and `needs_crop` short-circuiting footage that is
+  already the delivery shape.
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
@@ -315,7 +327,18 @@ no editing logic in the adapter.
   every asset's cached `Tempo`, builds the grid and aligns one track (or every
   unlocked video track) to it, defaulting the tolerance to half a beat so each cut
   moves to the beat it is already nearest; it errors when nothing rhythmic has been
-  analyzed rather than silently doing nothing. The **agent task queue** is a real `tasks` table (one row per `Task`,
+  analyzed rather than silently doing nothing.
+  `smart_crop(clip_id)` is "frame it for where it's going": reshaping a cut throws
+  away most of one axis and both fits pick that axis blindly — `Cover` takes the
+  middle, `Contain` letterboxes — so it samples where each shot's content actually
+  sits and writes the crop that keeps it, **per clip**, as one `Smart crop` revision.
+  Split three ways for the lock-free pattern (`smart_crop_inputs` under the lock →
+  the static `sample_smart_crops` with it released → `apply_smart_crops` under it
+  again); the result is an ordinary `Transform` crop, which the graph already applies
+  *before* the fit scale, so the preview, the still and the export all follow and the
+  inspector's sliders still have the last word. Clips already the delivery shape and
+  360-reframed clips are left out (that camera *is* the framing decision), and a pass
+  that changes nothing writes no revision. The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
   ready → done` (or `failed`) lifecycle in `model.rs`.
@@ -390,6 +413,9 @@ proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
 `timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
+`smart_crop` frames each shot for the delivery frame (the server `instructions`
+pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
+whatever was in the middle).
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
@@ -420,6 +446,7 @@ width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `captions_from_transcript`, `export_srt`, `remove_silence`, `snap_to_beats`,
+`smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `start_playback` / `stop_playback` — streamed composited frames over a
@@ -532,7 +559,10 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 `routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
 trim, volume, fades, speed, transform, color, transition, plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
-auto-keyframes at the playhead and shows the sampled pose), a **360 reframe**
+auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
+(a `Smart crop` button that frames *this* shot for the delivery frame, plus
+`Reset crop`, above the crop sliders it writes — greyed out with a reason when the
+shot already matches the frame or is 360), a **360 reframe**
 section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
 plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
@@ -598,7 +628,10 @@ each say the same thing. It re-checks against `opts.resolution`, so a 9:16
 project exported at 1920×1080 is judged as the landscape file it will be.
 `kerf_core::platform` decides all of it; `src/lib/platforms.ts` is a bun-tested
 mirror used **only** by the browser harness, so the panel is drivable under
-`bun run dev`. The **cover frame** is saved from the preview's context menu
+`bun run dev`. `src/lib/smart-crop.ts` is the same arrangement for smart crop: only
+the *shape* arithmetic is mirrored (bun-tested), because the harness has no decoder
+to sample with and so lands on the centre window — which part of the shot survives
+is the half that only exists with media behind it. The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
 `Preview` shows the composited frame under the playhead, and during
@@ -632,7 +665,8 @@ queue** (status · queue · history · add-task) — Kerf has no in-app chat; a 
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
-Three preset chips (`Remove silences` / `Assemble rough cut` / `Cut to the beat` — which
+Four preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
+/ `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them) also run the matching local op and

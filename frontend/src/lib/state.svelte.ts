@@ -40,6 +40,7 @@ import {
 	removeClip,
 	removeSilence,
 	snapToBeats,
+	smartCrop,
 	removeTrack,
 	setTrackDuck,
 	setDeliveryFormat,
@@ -664,6 +665,14 @@ class EditorState {
 	/** Ripple a track's cuts onto the music's beat grid; all video tracks by default. */
 	snapToBeats(trackId?: string, tolerance?: number) {
 		return this.#apply(snapToBeats(trackId, tolerance));
+	}
+	/**
+	 * Frame each shot for the delivery frame instead of centring it blindly.
+	 * One clip when `clipId` is given, otherwise every clip on an unlocked video
+	 * track. Lands as one undoable `Smart crop` revision.
+	 */
+	smartCrop(clipId?: string) {
+		return this.#apply(smartCrop(clipId));
 	}
 	extractAudio(assetId: string) {
 		return this.#apply(extractAudio(assetId));

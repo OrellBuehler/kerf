@@ -8,6 +8,7 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
+	import { needsCrop } from '$lib/smart-crop';
 	import type { TextStyle } from '$lib/style-presets';
 	import type {
 		AudioEffect,
@@ -243,6 +244,30 @@
 			.toString()
 			.padStart(2, '0')}`;
 	}
+
+	// Smart crop only has a decision to make when the shot and the delivery frame
+	// are different shapes — a 16:9 interview headed for a 9:16 Reel loses most
+	// of its width, and which half survives is the whole question. When they
+	// already match there is nothing to choose, so say so instead of offering a
+	// button that would refuse.
+	const deliveryAspect = $derived.by(() => {
+		const fmt = editor.timeline.format;
+		if (fmt?.width && fmt?.height) return fmt.width / fmt.height;
+		const first = editor.assets
+			.flatMap((a) => a.streams)
+			.find((st) => st.kind === 'video' && st.width && st.height);
+		return first?.width && first?.height ? first.width / first.height : 16 / 9;
+	});
+	const shotAspect = $derived.by(() => {
+		const v = asset?.streams.find((st) => st.kind === 'video');
+		return v?.width && v?.height ? { w: v.width, h: v.height } : null;
+	});
+	const reframable = $derived(
+		!!shotAspect && !clip?.reframe && needsCrop(shotAspect.w, shotAspect.h, deliveryAspect)
+	);
+	const hasCrop = $derived(
+		tf.crop_left > 0 || tf.crop_right > 0 || tf.crop_top > 0 || tf.crop_bottom > 0
+	);
 
 	async function run(op: () => Promise<unknown>) {
 		try {
@@ -747,6 +772,38 @@
 				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					setTf({ opacity: v })
 				)}
+				{@render secHead('Framing')}
+				<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+					<button
+						style={chip(false)}
+						disabled={editor.busy || !reframable}
+						title="Sample where this shot's content is and crop to the delivery frame around it"
+						onclick={() =>
+							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
+						>Smart crop</button
+					>
+					<button
+						style={chip(false)}
+						disabled={editor.busy || !hasCrop}
+						title="Clear the crop"
+						onclick={() =>
+							run(() =>
+								editor.setTransform(clip.id, {
+									crop_left: 0,
+									crop_right: 0,
+									crop_top: 0,
+									crop_bottom: 0
+								})
+							)}>Reset crop</button
+					>
+				</div>
+				{#if !reframable}
+					<div style="font:var(--type-caption);color:var(--text-muted);margin:-2px 0 6px">
+						{clip.reframe
+							? 'A 360 clip is framed by its virtual camera, above.'
+							: 'This shot already matches the delivery frame.'}
+					</div>
+				{/if}
 				{@render rangeRow('Crop L', tf.crop_left, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_left: v }))
 				)}
