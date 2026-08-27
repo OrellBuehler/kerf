@@ -9,6 +9,7 @@
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
 	import { needsCrop } from '$lib/smart-crop';
+	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
 	import type { TextStyle } from '$lib/style-presets';
 	import type {
 		AudioEffect,
@@ -889,13 +890,18 @@
 					onchange={(e) => {
 						const k = e.currentTarget.value as '' | TransitionKind;
 						if (!k) void run(() => editor.setTransition(clip.id, null));
-						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? 0.5 }));
+						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? DEFAULT_TRANSITION_SECONDS }));
 					}}
 					style={selectCss}
 				>
 					<option value="">None</option>
-					<option value="crossfade">Crossfade</option>
-					<option value="dip_to_black">Dip to black</option>
+					{#each TRANSITION_GROUPS as g (g.label)}
+						<optgroup label="{g.label} — {g.hint}">
+							{#each g.options as o (o.id)}
+								<option value={o.id}>{o.label}</option>
+							{/each}
+						</optgroup>
+					{/each}
 				</select>
 			</label>
 			{#if transition}

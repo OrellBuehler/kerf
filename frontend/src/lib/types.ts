@@ -98,7 +98,18 @@ export interface Color {
 	temperature: number;
 }
 
-export type TransitionKind = 'crossfade' | 'dip_to_black';
+export type TransitionKind =
+	| 'crossfade'
+	| 'dip_to_black'
+	| 'dip_to_white'
+	| 'slide_left'
+	| 'slide_right'
+	| 'slide_up'
+	| 'slide_down'
+	| 'push_left'
+	| 'push_right'
+	| 'push_up'
+	| 'push_down';
 
 export interface Transition {
 	kind: TransitionKind;
