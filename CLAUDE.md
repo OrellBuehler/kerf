@@ -97,6 +97,17 @@ so the feature is **only** activated through these forwards — which is what ma
   on the final mix, and `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
+  **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
+  fractions of the rendered frame, feathered, optionally inverted): outside it
+  the clip goes transparent and a lower track shows through. Deliberately *one*
+  primitive that composes with the track stack rather than a masking mode per
+  use — a blurred face is a duplicated shot on the track above, blurred and
+  masked; a region grade is the same with a colour. That is also what keeps it a
+  single filter in the linear per-clip chain (`mask_filter`, a `geq` rewriting
+  only the alpha plane — no branch in the graph): one expression covers both
+  shapes, each axis scaled so the edge is at distance 1, `max` for a rectangle
+  and `hypot` for an ellipse. `geq` is per-pixel and slow, the cost keyframed
+  opacity already pays.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
@@ -509,7 +520,8 @@ left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
-`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
+`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
@@ -635,7 +647,11 @@ effect chains** (add / tune / remove), **keyframe animation** (the Transform pan
 auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
-shot already matches the frame or is 360), a **360 reframe**
+shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
+Ellipse chips, then centre / size / feather / invert; picking a shape starts from
+a visible default rather than a collapsed one, and the caption carries the recipe
+the shape alone does not suggest — a lower track shows through, so a blurred face
+is a duplicated, blurred copy above, masked), a **360 reframe**
 section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
 plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
