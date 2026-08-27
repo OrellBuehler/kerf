@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe,
-    StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
+    ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -69,13 +69,17 @@ struct AssetIdParams {
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct CaptionParams {
-    #[schemars(description = "Most words on one caption line (default 4)")]
+    #[schemars(
+        description = "Look: `lines` (default) holds a few words as a subtitle line; `word_punch` puts one large word on screen at a time, the social-video style. Everything below is an override on top of the style — omit them to get the whole look."
+    )]
+    style: Option<CaptionStyle>,
+    #[schemars(description = "Most words on one caption line (lines: 4, word_punch: 1)")]
     max_words: Option<usize>,
     #[schemars(description = "Most characters on one caption line (default 28); the tighter of the two limits wins")]
     max_chars: Option<usize>,
-    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (default 0.88)")]
+    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (lines: 0.88, word_punch: 0.72)")]
     pos_y: Option<f64>,
-    #[schemars(description = "Font height as a fraction of frame height (default 0.05)")]
+    #[schemars(description = "Font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     size: Option<f64>,
 }
 
@@ -1269,22 +1273,16 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines (defaults: 4 words / 28 characters). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
+        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
     )]
     fn generate_captions(&self, Parameters(p): Parameters<CaptionParams>) -> Result<String, McpError> {
-        let mut opts = CaptionOptions::default();
-        if let Some(v) = p.max_words {
-            opts.max_words = v;
-        }
-        if let Some(v) = p.max_chars {
-            opts.max_chars = v;
-        }
-        if let Some(v) = p.pos_y {
-            opts.pos_y = v;
-        }
-        if let Some(v) = p.size {
-            opts.size = v;
-        }
+        let opts = CaptionOptions {
+            style: p.style.unwrap_or_default(),
+            max_words: p.max_words,
+            max_chars: p.max_chars,
+            pos_y: p.pos_y,
+            size: p.size,
+        };
         let project = self.lock();
         let out = project.generate_captions(opts).map_err(core_err)?;
         self.changed();
@@ -1812,7 +1810,10 @@ impl ServerHandler for KerfMcp {
              and captions with add_overlay / update_overlay / set_overlay_keyframes \
              (drawn over the cut; list_fonts lists installed system fonts to pass \
              as update_overlay's font), or generate_captions to caption the whole \
-             cut in one call. Caption LAST, after the cutting is done: captions \
+             cut in one call. Its style=word_punch puts one large word on \
+             screen at a time instead of a subtitle line — that is what social \
+             captions look like, so prefer it for a vertical cut unless the user \
+             asked for subtitles. Caption LAST, after the cutting is done: captions \
              are placed in timeline time, so a later trim or remove_silence moves \
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
