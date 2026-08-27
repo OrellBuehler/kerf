@@ -3254,8 +3254,9 @@ fn build_filter_complex(
     // deduplicated ffmpeg input index (may be shared, so the `[input:v]` source is
     // fanned out with `split` below).
     let mut video: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
-    // Audio entries also carry the owning track's `duck` flag for the bus split.
-    let mut audio: Vec<(usize, usize, &crate::model::Clip, bool)> = Vec::new();
+    // Audio entries also carry the owning track's mix — the duck flag for the bus
+    // split, the fader and the pan for the clip's own chain.
+    let mut audio: Vec<(usize, usize, &crate::model::Clip, TrackMix)> = Vec::new();
     let mut base = 0;
     for track in &timeline.tracks {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
@@ -3268,7 +3269,16 @@ fn build_filter_complex(
                 video.push((flat, input, clip));
             }
             if has_audio(clip) {
-                audio.push((flat, input, clip, track.duck));
+                audio.push((
+                    flat,
+                    input,
+                    clip,
+                    TrackMix {
+                        duck: track.duck,
+                        volume: track.volume,
+                        pan: track.pan_gains(),
+                    },
+                ));
             }
         }
         base += track.clips.len();
@@ -3433,7 +3443,7 @@ fn build_filter_complex(
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
     if has_audio_out {
-        for (flat, input, clip, _) in &audio {
+        for (flat, input, clip, mix) in &audio {
             let src = if acount[*input] > 1 {
                 let k = anext[*input];
                 anext[*input] += 1;
@@ -3443,7 +3453,7 @@ fn build_filter_complex(
             };
             chains.push(format!(
                 "[{src}]{chain}[a{flat}]",
-                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)
+                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout, *mix)
             ));
         }
         // Optional single-pass loudness normalization on the final mix; loudnorm
@@ -3454,8 +3464,8 @@ fn build_filter_complex(
             String::new()
         };
         let pads = |flats: &[usize]| flats.iter().map(|f| format!("[a{f}]")).collect::<String>();
-        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, d)| *d).map(|(f, _, _, _)| *f).collect();
-        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, d)| !*d).map(|(f, _, _, _)| *f).collect();
+        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, m)| m.duck).map(|(f, _, _, _)| *f).collect();
+        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, m)| !m.duck).map(|(f, _, _, _)| *f).collect();
         if ducked.is_empty() || keyed.is_empty() {
             // No ducking in play (nothing flagged, or nothing to key from): one
             // flat sum of every clip, exactly as before.
@@ -3492,6 +3502,17 @@ fn build_filter_complex(
         has_video,
         has_audio: has_audio_out,
     }
+}
+
+/// The owning track's mix settings, carried alongside each of its audio clips.
+/// The fader rides the *finished* clip — after its own gain and effect chain,
+/// the way a channel strip does — so pulling a music bed down does not change
+/// what its own compressor was reacting to.
+#[derive(Clone, Copy)]
+struct TrackMix {
+    duck: bool,
+    volume: f32,
+    pan: (f64, f64),
 }
 
 /// Per-clip render adjustments derived from transitions. `tail` extends an
@@ -4661,7 +4682,7 @@ fn still_overlay(t: &Transform) -> String {
 /// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
 /// optional reverse / tempo, gain, fades (including transition cross-fades) and
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
-fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) -> String {
+fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> String {
     let s = clip.speed_mag();
     let dur = clip.duration() + fx.tail;
     // Mirror the video crossfade tail (extends below source_in when reversed) and
@@ -4693,6 +4714,18 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) 
     if fo > 0.0 {
         p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
+    // The track fader and its pan, after the clip's own chain. Both are omitted
+    // at their neutral values, so a project that never touched a fader renders
+    // the graph it always did.
+    if (mix.volume - 1.0).abs() > f32::EPSILON {
+        p.push(format!("volume={}", mix.volume));
+    }
+    let (gl, gr) = mix.pan;
+    if layout == "stereo" && ((gl - 1.0).abs() > 1e-9 || (gr - 1.0).abs() > 1e-9) {
+        // A balance, not a mono re-pan: each side keeps its own channel and is
+        // attenuated, so a stereo music bed leans without collapsing.
+        p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
+    }
     p.push(format!(
         "aformat=sample_rates={sr}:channel_layouts={layout}",
         sr = fmt.sample_rate
@@ -4722,6 +4755,16 @@ fn atempo_chain(speed: f64) -> String {
 mod tests {
     use super::*;
     use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
+
+    /// A track mix that changes nothing — what every test that is not about the
+    /// mixer wants.
+    fn unity_mix() -> TrackMix {
+        TrackMix {
+            duck: false,
+            volume: 1.0,
+            pan: (1.0, 1.0),
+        }
+    }
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -5572,7 +5615,7 @@ mod tests {
                 makeup_db: 6.0,
             },
         ];
-        let chain = audio_clip_chain(&clip, &fmt, &ClipFx::default(), "stereo");
+        let chain = audio_clip_chain(&clip, &fmt, &ClipFx::default(), "stereo", unity_mix());
         let vi = chain.find("volume=").expect("gain");
         let hi = chain.find("highpass=f=80").expect("highpass");
         let ai = chain.find("acompressor=").expect("compressor");
@@ -6476,6 +6519,50 @@ mod tests {
         // The kept span is source 2..6 fast-sought to 2, so the in-graph trim
         // is seek-relative 0..4 — the graph really was built from the slice.
         assert!(joined.contains("trim=start=0:end=4"), "{joined}");
+    }
+
+    #[test]
+    fn the_track_fader_and_pan_ride_the_finished_clip() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.volume = 0.8;
+        clip.audio = vec![crate::model::AudioEffect::Highpass { hz: 80.0 }];
+        let mut timeline = single(vec![clip]);
+        timeline.tracks[0].volume = 0.5;
+        timeline.tracks[0].pan = -1.0;
+        let g = graph_of(&timeline, &[asset]);
+        // The clip's own gain, then its effects, then the fader: a channel strip,
+        // so the compressor upstream never sees the fader move.
+        let clip_gain = g.find("volume=0.8").expect("clip gain");
+        let effect = g.find("highpass").expect("clip effect");
+        let fader = g.find("volume=0.5").expect("track fader");
+        assert!(clip_gain < effect && effect < fader, "fader must come last: {g}");
+        // Hard left is the right channel gone and the left untouched.
+        assert!(g.contains("pan=stereo|c0=1*c0|c1=0*c1"), "{g}");
+    }
+
+    #[test]
+    fn an_untouched_track_mix_emits_nothing() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let g = graph_of(&timeline, &[asset]);
+        // Unity and centre are the historical graph exactly — no fader, no pan.
+        assert!(!g.contains("pan=stereo"), "{g}");
+        assert_eq!(g.matches("volume=").count(), 1, "only the clip's own gain: {g}");
+    }
+
+    #[test]
+    fn a_pan_is_dropped_when_there_is_nowhere_to_pan_to() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        timeline.tracks[0].pan = 1.0;
+        let opts = ExportOptions {
+            audio_channels: Some(1),
+            ..Default::default()
+        };
+        let args = build_export_args(&timeline, &[asset], "out.mp4", &opts).unwrap();
+        let g = args.join(" ");
+        assert!(!g.contains("pan=stereo"), "a mono delivery has no stereo field: {g}");
     }
 
     #[test]
@@ -7488,7 +7575,7 @@ mod tests {
         // whose chain is auralized cannot drift from the mix it will become.
         let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
         clip.audio = effects;
-        let exported = audio_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), "stereo");
+        let exported = audio_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), "stereo", unity_mix());
         assert!(exported.contains(&chain), "export chain {exported} must contain {chain}");
     }
 

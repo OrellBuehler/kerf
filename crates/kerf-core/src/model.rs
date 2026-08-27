@@ -1612,14 +1612,39 @@ pub struct Track {
     /// renders; the GUI refuses to drag, trim or razor its clips.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// The track fader: a linear gain riding every clip on the track *after* its
+    /// own volume and effect chain, the way a channel strip works — so pulling a
+    /// music bed down does not change what its compressor was reacting to.
+    /// 1.0 is unity. Defaulted, so a project written before there was a fader
+    /// reads back at unity and renders identically.
+    #[serde(default = "unity_gain", skip_serializing_if = "is_unity_gain")]
+    pub volume: f32,
+    /// Stereo placement, -1 (hard left) to 1 (hard right); 0 is centre. Applied
+    /// as a constant-power balance, so panning a track does not change how loud
+    /// it is — and it is a no-op on a mono delivery, where there is nowhere to
+    /// pan to.
+    #[serde(default, skip_serializing_if = "is_centred")]
+    pub pan: f32,
     pub kind: StreamKind,
     pub name: String,
     #[serde(default)]
     pub clips: Vec<Clip>,
 }
 
+fn unity_gain() -> f32 {
+    1.0
+}
+
+fn is_unity_gain(v: &f32) -> bool {
+    (*v - 1.0).abs() < f32::EPSILON
+}
+
+fn is_centred(v: &f32) -> bool {
+    v.abs() < f32::EPSILON
+}
+
 impl Track {
-    /// An empty track: not ducked, muted, soloed or locked.
+    /// An empty track: not ducked, muted, soloed or locked, at unity and centred.
     pub fn new(kind: StreamKind, name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -1627,9 +1652,28 @@ impl Track {
             muted: false,
             solo: false,
             locked: false,
+            volume: 1.0,
+            pan: 0.0,
             kind,
             name: name.into(),
             clips: Vec::new(),
+        }
+    }
+
+    /// The left / right gains for this track's `pan`, as a fraction of unity.
+    ///
+    /// A **balance**, not a constant-power pan: the side you turn towards stays
+    /// at unity and the other is attenuated away. A constant-power law would
+    /// boost the near side by 3 dB at the extremes, which is right for placing a
+    /// mono source in a field and wrong for leaning a finished stereo track —
+    /// nudging a music bed left should not make it louder. Centre is exactly
+    /// `(1, 1)`, so an untouched track is bit-for-bit what it always was.
+    pub fn pan_gains(&self) -> (f64, f64) {
+        let p = self.pan.clamp(-1.0, 1.0) as f64;
+        if p < 0.0 {
+            (1.0, 1.0 + p)
+        } else {
+            (1.0 - p, 1.0)
         }
     }
 
@@ -3566,6 +3610,27 @@ mod tests {
         assert!(clip.covers_source(8.0, 11.0), "straddling the in-point still shows");
         assert!(!clip.covers_source(0.0, 10.0), "ending exactly at the in-point shows nothing");
         assert!(!clip.covers_source(20.0, 25.0));
+    }
+
+    #[test]
+    fn a_track_pan_is_a_balance_and_centre_is_exactly_unity() {
+        let mut t = Track::new(StreamKind::Audio, "A1");
+        assert_eq!(t.pan_gains(), (1.0, 1.0), "an untouched track must not be touched");
+        t.pan = -1.0;
+        assert_eq!(t.pan_gains(), (1.0, 0.0), "hard left keeps the left at unity");
+        t.pan = 1.0;
+        assert_eq!(t.pan_gains(), (0.0, 1.0));
+        t.pan = -0.5;
+        assert_eq!(t.pan_gains(), (1.0, 0.5));
+        // Never a boost: leaning a finished stereo track must not make it louder.
+        for p in [-1.0, -0.5, 0.0, 0.25, 1.0] {
+            t.pan = p;
+            let (l, r) = t.pan_gains();
+            assert!(l <= 1.0 && r <= 1.0, "pan {p} boosted to ({l}, {r})");
+        }
+        // Out of range is clamped rather than inverted.
+        t.pan = 9.0;
+        assert_eq!(t.pan_gains(), (0.0, 1.0));
     }
 
     #[test]

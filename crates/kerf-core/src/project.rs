@@ -1493,6 +1493,27 @@ impl Project {
         })
     }
 
+    /// Set a track's fader, the gain riding every clip on it. Clamped to
+    /// `0..=4` (+12 dB), which is as far up as a fader has any business going.
+    pub fn set_track_volume(&self, track_id: Uuid, volume: f32) -> Result<Track> {
+        let volume = volume.clamp(0.0, 4.0);
+        self.edit_timeline("Set track level", |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.volume = volume;
+            Ok(track.clone())
+        })
+    }
+
+    /// Set a track's stereo placement, -1 (hard left) to 1 (hard right).
+    pub fn set_track_pan(&self, track_id: Uuid, pan: f32) -> Result<Track> {
+        let pan = pan.clamp(-1.0, 1.0);
+        self.edit_timeline("Set track pan", |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.pan = pan;
+            Ok(track.clone())
+        })
+    }
+
     /// Set (or clear) the frame this project is cut for.
     ///
     /// The delivery frame decides the shape of every rendered picture — the
