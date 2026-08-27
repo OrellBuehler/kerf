@@ -44,6 +44,8 @@ import {
 	smartCrop,
 	removeTrack,
 	setTrackDuck,
+	setTrackVolume,
+	setTrackPan,
 	setDeliveryFormat,
 	setTrackMuted,
 	setTrackSolo,
@@ -553,6 +555,12 @@ class EditorState {
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
 		return this.#apply(setTrackDuck(trackId, duck));
+	}
+	setTrackVolume(trackId: string, volume: number) {
+		return this.#apply(setTrackVolume(trackId, volume));
+	}
+	setTrackPan(trackId: string, pan: number) {
+		return this.#apply(setTrackPan(trackId, pan));
 	}
 	/** The frame this project is cut for; `null` follows the footage's shape. */
 	setDeliveryFormat(format: Delivery | null) {

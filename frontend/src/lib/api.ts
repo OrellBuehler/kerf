@@ -754,6 +754,30 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 	return invoke<Timeline>('set_track_duck', { trackId, duck });
 }
 
+/** Set a track's fader — the gain riding every clip on it. */
+export async function setTrackVolume(trackId: string, volume: number): Promise<Timeline> {
+	const v = Math.min(4, Math.max(0, volume));
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.volume = v;
+		recordDev('Set track level');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_volume', { trackId, volume: v });
+}
+
+/** Set a track's stereo placement, -1 (hard left) to 1 (hard right). */
+export async function setTrackPan(trackId: string, pan: number): Promise<Timeline> {
+	const p = Math.min(1, Math.max(-1, pan));
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.pan = p;
+		recordDev('Set track pan');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_pan', { trackId, pan: p });
+}
+
 /** Set the frame the project is cut for, or pass `null` to follow the footage. */
 export async function setDeliveryFormat(format: Delivery | null): Promise<Timeline> {
 	if (!inTauri()) {

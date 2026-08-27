@@ -13,6 +13,7 @@
 
 import { getAudio } from './api';
 import type { Clip, Timeline } from './types';
+import { panGains } from './mixer';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
  *  wire while staying honest enough to judge a cut. */
@@ -27,7 +28,7 @@ type Session = {
 	anchorTime: number; // timeline seconds when playback started
 	anchorCtx: number; // AudioContext.currentTime when playback started
 	rate: number;
-	nodes: { src: AudioBufferSourceNode; gain: GainNode }[];
+	nodes: { src: AudioBufferSourceNode; gain: GainNode; tail: AudioNode[] }[];
 };
 
 function speedMag(clip: Clip): number {
@@ -66,9 +67,10 @@ class AudioEngine {
 				if (!audioAssets.has(clip.asset_id)) continue;
 				const dur = (clip.source_out - clip.source_in) / speedMag(clip);
 				if (clip.timeline_start + dur <= t) continue;
+				const mix = { volume: track.volume ?? 1, pan: track.pan ?? 0 };
 				void this.#buffer(clip).then((buf) => {
 					// Buffers resolve async; only schedule into the session that asked.
-					if (buf && this.#session === session) this.#schedule(clip, buf, session);
+					if (buf && this.#session === session) this.#schedule(clip, buf, session, mix);
 				});
 			}
 		}
@@ -78,7 +80,7 @@ class AudioEngine {
 		const s = this.#session;
 		this.#session = null;
 		if (!s) return;
-		for (const { src, gain } of s.nodes) {
+		for (const { src, gain, tail } of s.nodes) {
 			try {
 				src.stop();
 			} catch {
@@ -86,10 +88,11 @@ class AudioEngine {
 			}
 			src.disconnect();
 			gain.disconnect();
+			for (const n of tail) n.disconnect();
 		}
 	}
 
-	#schedule(clip: Clip, buf: AudioBuffer, s: Session) {
+	#schedule(clip: Clip, buf: AudioBuffer, s: Session, mix: { volume: number; pan: number }) {
 		const ctx = this.#ctx!;
 		const mag = speedMag(clip);
 		const dur = (clip.source_out - clip.source_in) / mag;
@@ -103,8 +106,27 @@ class AudioEngine {
 		src.buffer = buf;
 		src.playbackRate.value = mag * s.rate;
 		const gain = ctx.createGain();
-		src.connect(gain).connect(ctx.destination);
-		s.nodes.push({ src, gain });
+		src.connect(gain);
+		// The track's pan, as the same balance the export renders. `get_audio`
+		// hands back mono, so the two legs *are* the stereo pair: one gain per
+		// side into a merger, rather than a StereoPannerNode whose constant-power
+		// law would quietly disagree with the file.
+		const tail: AudioNode[] = [];
+		const [gl, gr] = panGains(mix.pan);
+		if (gl !== 1 || gr !== 1) {
+			const left = ctx.createGain();
+			const right = ctx.createGain();
+			left.gain.value = gl;
+			right.gain.value = gr;
+			const merger = ctx.createChannelMerger(2);
+			gain.connect(left).connect(merger, 0, 0);
+			gain.connect(right).connect(merger, 0, 1);
+			merger.connect(ctx.destination);
+			tail.push(left, right, merger);
+		} else {
+			gain.connect(ctx.destination);
+		}
+		s.nodes.push({ src, gain, tail });
 
 		// Timeline time -> context time under this session's anchor and rate.
 		const at = (tl: number) => s.anchorCtx + (tl - s.anchorTime) / s.rate;
@@ -114,7 +136,8 @@ class AudioEngine {
 
 		// Gain envelope: clip volume shaped by fade-in/out. A transition
 		// approximates as an extra fade-in (the export folds it in the same way).
-		const vol = clip.volume ?? 1;
+		// The track fader multiplies the clip's own gain, as it does on export.
+		const vol = (clip.volume ?? 1) * mix.volume;
 		const fi = (clip.fade_in ?? 0) + (clip.transition_in?.duration ?? 0);
 		const fo = clip.fade_out ?? 0;
 		const env = (tl: number) => {

@@ -281,6 +281,10 @@ export interface Track {
 	solo?: boolean;
 	/** Guarded against editing. A locked track still renders. */
 	locked?: boolean;
+	/** Track fader: a linear gain over every clip on the track. 1 is unity. */
+	volume?: number;
+	/** Stereo placement, -1 hard left to 1 hard right. 0 is centre. */
+	pan?: number;
 }
 
 /** A named point on the timeline. Renders nothing — it is shared vocabulary
