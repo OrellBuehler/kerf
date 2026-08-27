@@ -94,7 +94,12 @@ so the feature is **only** activated through these forwards — which is what ma
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **Text overlays** (`Timeline.overlays`) are
+  `keyframe_expr` over clip-local time). **Any such expression must be quoted in
+  the filter value** — it contains commas, and an unquoted comma is where the
+  graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
+  x/y made every animated clip and every animated overlay abort the render with
+  `No such filter`, invisibly, because the graph *string* looked right and every
+  unit test asserted on the string. **Text overlays** (`Timeline.overlays`) are
   `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
   still / preview path samples `Clip::transform_at` and draws overlays statically.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
@@ -265,7 +270,20 @@ no editing logic in the adapter.
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
   `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
-  motion). Text titles / lower-thirds / captions live on the timeline itself as
+  motion).
+  **`TransitionKind` is three families, and the family decides the render**: a
+  **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
+  either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
+  **motion** transition travels the incoming clip in over the outgoing one
+  (`Slide*`) or carries the outgoing one out with it (`Push*`), four directions
+  each — the direction naming the direction of *travel*. The enum answers for
+  its own family (`dip_color` / `slide_from` / `pushes` / `overlaps`), so the
+  engine never matches on eleven variants, and `wire_names` derives the
+  expected-kind list both surfaces put in their errors. A dissolve or a motion
+  transition plays both shots at once, so it borrows the outgoing clip's unused
+  source handle: a clip trimmed to the very end of its footage has none to lend
+  and the transition degrades to a hard cut (a dip needs none). Text titles /
+  lower-thirds / captions live on the timeline itself as
   `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
   animation); `transcript_to_srt` serializes a transcript to SubRip.
   **Captions are timeline math, not a transcript dump**, and pure +
@@ -600,7 +618,10 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
 `Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
 `routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
-trim, volume, fades, speed, transform, color, transition, plus **video / audio
+trim, volume, fades, speed, transform, color, **transition** (a grouped picker
+over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
+that is the order the choice is actually made and a flat list of eleven names
+hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
 auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
