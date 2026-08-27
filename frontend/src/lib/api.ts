@@ -10,6 +10,7 @@ import type {
 	AssetAnalysis,
 	AssetMetadata,
 	AudioEffect,
+	CaptionOptions,
 	Clip,
 	Color,
 	Delivery,
@@ -34,6 +35,7 @@ import type {
 	Transform,
 	Transition,
 	TranscriptionStatus,
+	TranscriptSegment,
 	UpdateInfo,
 	VideoEffect
 } from './types';
@@ -42,6 +44,7 @@ import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
+import { captionsForTimeline, CAPTION_DEFAULTS } from './captions';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1192,30 +1195,34 @@ export async function setOverlayKeyframes(overlayId: string, keyframes: TextKeyf
 	return invoke<Timeline>('set_overlay_keyframes', { overlayId, keyframes });
 }
 
-/** Generate caption overlays from an asset's cached transcript. */
-export async function captionsFromTranscript(assetId: string): Promise<Timeline> {
+/** Caption the cut: project every clip's transcript through the current edit and
+ *  write the result as overlays, replacing any previously generated set. */
+export async function generateCaptions(options?: CaptionOptions): Promise<Timeline> {
 	if (!inTauri()) {
-		const segs = sampleAnalysis[assetId]?.transcript ?? [];
-		const overlays = (devTimeline.overlays ??= []);
-		for (const s of segs) {
-			if (!s.text.trim() || s.end <= s.start) continue;
-			overlays.push({
-				id: uid(),
-				text: s.text.trim(),
-				start: s.start,
-				end: s.end,
-				pos_x: 0.5,
-				pos_y: 0.88,
-				size: 0.05,
-				color: 'white',
-				bg: 'black@0.5',
-				bold: false
-			});
+		const transcripts: Record<string, TranscriptSegment[]> = {};
+		for (const track of devTimeline.tracks) {
+			for (const clip of track.clips) {
+				const segs = sampleAnalysis[clip.asset_id]?.transcript;
+				if (segs) transcripts[clip.asset_id] = segs;
+			}
 		}
-		recordDev('Add captions from transcript');
+		const created = captionsForTimeline(devTimeline, transcripts, { ...CAPTION_DEFAULTS, ...options });
+		const kept = (devTimeline.overlays ??= []).filter((o) => !o.generated);
+		devTimeline.overlays = [...kept, ...created.map((o) => ({ ...o, id: uid() }))];
+		recordDev('Generate captions');
 		return snapshot();
 	}
-	return invoke<Timeline>('captions_from_transcript', { assetId });
+	return invoke<Timeline>('generate_captions', { options: options ?? null });
+}
+
+/** Remove the generated captions, leaving typed titles and lower-thirds alone. */
+export async function clearCaptions(): Promise<Timeline> {
+	if (!inTauri()) {
+		devTimeline.overlays = (devTimeline.overlays ?? []).filter((o) => !o.generated);
+		recordDev('Clear captions');
+		return snapshot();
+	}
+	return invoke<Timeline>('clear_captions');
 }
 
 /** Write an asset's transcript to a `.srt` file; returns the path. */

@@ -7,7 +7,8 @@ import {
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
-	captionsFromTranscript,
+	generateCaptions,
+	clearCaptions,
 	clearKeyframes,
 	clearReframe,
 	concatenate,
@@ -78,6 +79,7 @@ import type {
 	AssetAnalysis,
 	AssetMetadata,
 	AudioEffect,
+	CaptionOptions,
 	Clip,
 	Color,
 	Delivery,
@@ -652,8 +654,11 @@ class EditorState {
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
 		return this.#apply(setOverlayKeyframes(overlayId, keyframes));
 	}
-	captionsFromTranscript(assetId: string) {
-		return this.#apply(captionsFromTranscript(assetId));
+	generateCaptions(options?: CaptionOptions) {
+		return this.#apply(generateCaptions(options));
+	}
+	clearCaptions() {
+		return this.#apply(clearCaptions());
 	}
 	/** Write the asset's transcript to `.srt`; returns the path (no timeline change). */
 	exportSrt(assetId: string, outputPath: string) {

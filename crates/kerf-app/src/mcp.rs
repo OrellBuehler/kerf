@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe, StreamKind,
-    TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe,
+    StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -65,6 +65,18 @@ struct RevisionDiffParams {
 struct AssetIdParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct CaptionParams {
+    #[schemars(description = "Most words on one caption line (default 4)")]
+    max_words: Option<usize>,
+    #[schemars(description = "Most characters on one caption line (default 28); the tighter of the two limits wins")]
+    max_chars: Option<usize>,
+    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (default 0.88)")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Font height as a fraction of frame height (default 0.05)")]
+    size: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1257,14 +1269,36 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Generate caption overlays from an asset's cached transcript (run analyze_asset first), one per segment, low-center with a translucent box. Captions use the transcript's timestamps, so they align when the asset sits at the start of the timeline at normal speed. Returns the overlays created."
+        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines (defaults: 4 words / 28 characters). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
     )]
-    fn captions_from_transcript(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+    fn generate_captions(&self, Parameters(p): Parameters<CaptionParams>) -> Result<String, McpError> {
+        let mut opts = CaptionOptions::default();
+        if let Some(v) = p.max_words {
+            opts.max_words = v;
+        }
+        if let Some(v) = p.max_chars {
+            opts.max_chars = v;
+        }
+        if let Some(v) = p.pos_y {
+            opts.pos_y = v;
+        }
+        if let Some(v) = p.size {
+            opts.size = v;
+        }
         let project = self.lock();
-        let out = project.captions_from_transcript(id).map_err(core_err)?;
+        let out = project.generate_captions(opts).map_err(core_err)?;
         self.changed();
         json(&out)
+    }
+
+    #[tool(
+        description = "Remove the captions generate_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
+    )]
+    fn clear_captions(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        let removed = project.clear_captions().map_err(core_err)?;
+        self.changed();
+        Ok(format!("removed {removed} generated caption(s)"))
     }
 
     #[tool(description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first)")]
@@ -1777,8 +1811,12 @@ impl ServerHandler for KerfMcp {
              the shot is actually about. Add titles, lower-thirds \
              and captions with add_overlay / update_overlay / set_overlay_keyframes \
              (drawn over the cut; list_fonts lists installed system fonts to pass \
-             as update_overlay's font), or captions_from_transcript to caption an \
-             analyzed asset in one call; export_srt writes a subtitle file. \
+             as update_overlay's font), or generate_captions to caption the whole \
+             cut in one call. Caption LAST, after the cutting is done: captions \
+             are placed in timeline time, so a later trim or remove_silence moves \
+             the words out from under them — re-run generate_captions after any \
+             further edit and it replaces its own set, leaving typed titles \
+             alone. export_srt writes a subtitle file. \
              When the cut is going somewhere vertical, set_delivery_format sets \
              the frame it is being made for and smart_crop then frames each shot \
              for it — reshaping 16:9 footage to 9:16 throws away most of the \

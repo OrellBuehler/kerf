@@ -188,6 +188,18 @@ export interface TextOverlay {
 	font?: string | null;
 	bold: boolean;
 	keyframes?: TextKeyframe[];
+	/** Written by `generate_captions` rather than by hand. Regenerating replaces
+	 *  these and leaves typed titles alone. */
+	generated?: boolean;
+}
+
+/** How a transcript is turned into on-screen captions. Omitted fields keep the
+ *  backend's social-video defaults (4 words / 28 chars, low-centre). */
+export interface CaptionOptions {
+	max_words?: number;
+	max_chars?: number;
+	pos_y?: number;
+	size?: number;
 }
 
 export interface Clip {
