@@ -267,7 +267,22 @@ no editing logic in the adapter.
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
   motion). Text titles / lower-thirds / captions live on the timeline itself as
   `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
-  animation); `transcript_to_srt` serializes a transcript to SubRip. A `Track`
+  animation); `transcript_to_srt` serializes a transcript to SubRip.
+  **Captions are timeline math, not a transcript dump**, and pure +
+  unit-tested: a transcript is in *source* time and an overlay is in *timeline*
+  time, so `Timeline::captions` projects each segment through the clips that
+  actually show its footage (`Clip::source_span_to_timeline`, honoring trim /
+  speed / reverse) — captions land on the words that survived the cut and words
+  that were cut out get none. It reads through `for_render`, so a muted track is
+  as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
+  (4 words / 28 chars by default — a speech model emits whole sentences and a
+  whole sentence does not fit a 9:16 frame), timing lines by *character share*
+  because neither speech backend reports word timings; lines too short to read
+  merge back into a neighbour instead of flashing; and no two lines are ever on
+  screen at once (captions are one lane of text, and the same footage reaching
+  the cut twice would otherwise collide with itself). `TextOverlay.generated`
+  marks what it wrote, so regenerating replaces its own set and leaves a typed
+  title alone. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
   re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
@@ -415,7 +430,11 @@ proposal appears for review, not that the cut changes: the read tools
 `timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
-whatever was in the middle).
+whatever was in the middle). `generate_captions` / `clear_captions` caption the
+cut; the `instructions` say to caption **last** and to re-run after any further
+edit, because captions are placed in timeline time and a later trim moves the
+words out from under them — which an agent has no way to infer from the tool
+list.
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
@@ -445,7 +464,8 @@ width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
-`captions_from_transcript`, `export_srt`, `remove_silence`, `snap_to_beats`,
+`generate_captions` / `clear_captions` (caption the whole cut, in timeline
+time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
@@ -568,8 +588,11 @@ at the playhead like Transform — note its `lerpAngle` takes the shortest arc, 
 plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
 detect as 360 it instead offers a projection picker that marks the whole asset via
 `set_asset_projection`), and an always-visible
-**Text overlays** section (add titles / lower-thirds, generate captions, edit
-text / timing / position / size / color / box / bold).
+**Text overlays** section (add titles / lower-thirds, caption the whole cut —
+the button relabels to `Recaption` once there are generated captions, since a
+later trim moves the words out from under them, with `Clear` beside it taking
+only the generated ones — and edit text / timing / position / size / color /
+box / bold).
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
 surfaces): the Color section leads with one-click **looks** —
 Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the sliders
@@ -579,7 +602,7 @@ omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
 tint) — and the Text overlays section leads with **Title / Lower third /
 Caption** style chips that create a styled overlay at the playhead with
 fade-in/out opacity keyframes; the caption style matches what
-`captions_from_transcript` generates, so manual and generated captions look
+`generate_captions` generates, so manual and generated captions look
 alike.
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
@@ -631,7 +654,11 @@ mirror used **only** by the browser harness, so the panel is drivable under
 `bun run dev`. `src/lib/smart-crop.ts` is the same arrangement for smart crop: only
 the *shape* arithmetic is mirrored (bun-tested), because the harness has no decoder
 to sample with and so lands on the centre window — which part of the shot survives
-is the half that only exists with media behind it. The **cover frame** is saved from the preview's context menu
+is the half that only exists with media behind it. `src/lib/captions.ts` is the
+same arrangement again, but *faithful* rather than approximate — captioning is
+arithmetic all the way down, so the harness produces exactly the captions the
+backend would (the mirror caught the two-captions-at-once collision the Rust
+tests had not). The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
 `Preview` shows the composited frame under the playhead, and during
@@ -665,8 +692,9 @@ queue** (status · queue · history · add-task) — Kerf has no in-app chat; a 
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
-Four preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
-/ `Cut to the beat` — which
+Five preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
+then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them) also run the matching local op and
