@@ -163,6 +163,12 @@ struct TrackIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SmartCropParams {
+    #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
+    clip_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SnapToBeatsParams {
     #[schemars(description = "UUID of the track to align; every unlocked video track when omitted")]
     track_id: Option<String>,
@@ -646,6 +652,14 @@ struct TimelineFrameParams {
     time_secs: f64,
     #[schemars(description = "Maximum output width in pixels (default 640)")]
     max_width: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CoverParams {
+    #[schemars(description = "Timeline position to capture (seconds)")]
+    time_secs: f64,
+    #[schemars(description = "Output image path. A .png extension writes PNG, anything else JPEG.")]
+    output_path: String,
 }
 
 #[derive(Serialize)]
@@ -1274,6 +1288,28 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Smart crop: frame each shot for the delivery frame instead of centring it. Samples where a clip's content actually sits and writes the crop that keeps it, per clip — so 16:9 footage delivered at 9:16 keeps the subject rather than whatever happened to be in the middle. Set the delivery frame first (set_delivery_format); clips already that shape are left alone. The result is an ordinary transform crop the user can adjust or undo"
+    )]
+    async fn smart_crop(&self, Parameters(p): Parameters<SmartCropParams>) -> Result<String, McpError> {
+        let clip = p.clip_id.as_deref().map(parse_id).transpose()?;
+        let project = self.project.clone();
+        let (moved, timeline) = blocking(move || {
+            // Plan under the lock, sample with it released (one short ffmpeg
+            // decode per clip), apply under it again — the same shape as
+            // analyze_asset, for the same reason.
+            let plan = lock_agent(&project).smart_crop_inputs(clip).map_err(core_err)?;
+            let crops = Project::sample_smart_crops(&plan).map_err(core_err)?;
+            let guard = lock_agent(&project);
+            let moved = guard.apply_smart_crops(&crops).map_err(core_err)?;
+            let timeline = guard.working_timeline().map_err(core_err)?;
+            Ok((moved, timeline))
+        })
+        .await?;
+        self.changed();
+        json(&serde_json::json!({ "clips_reframed": moved, "timeline": timeline }))
+    }
+
+    #[tool(
         description = "Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed music on the audio tracks, retrimming each clip so its outgoing cut lands on a beat. Analyze the music asset first"
     )]
     fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
@@ -1427,6 +1463,43 @@ impl KerfMcp {
         })
         .await?;
         json(&serde_json::json!({ "output": output_path }))
+    }
+
+    #[tool(
+        description = "Check the assembled cut against each publishing target (Instagram Reels / YouTube Shorts / \
+                       TikTok / Instagram feed / YouTube): length limits, frame shape, and the reach limits a platform \
+                       enforces silently — e.g. a Reel over 3 minutes uploads fine and is then shown only to existing \
+                       followers. Returns errors (would be rejected), warnings (accepted but under-distributed or \
+                       letterboxed) and tips. Advisory: export is never blocked. Use before reporting a cut finished."
+    )]
+    fn platform_check(&self) -> Result<String, McpError> {
+        let project = self.lock();
+        let summary = project.cut_summary(None).map_err(core_err)?;
+        json(&serde_json::json!({
+            "cut": {
+                "duration_secs": summary.duration,
+                "frame": format!("{}x{}", summary.width, summary.height),
+                "has_audio": summary.has_audio,
+                "has_text": summary.has_text,
+            },
+            "targets": project.platform_check(None).map_err(core_err)?,
+        }))
+    }
+
+    #[tool(
+        description = "Write the composited timeline at a given time to an image file as a cover / thumbnail — full \
+                       delivery resolution, rendered through the export graph, so it is a real frame of the finished \
+                       video at the shape the project is cut for."
+    )]
+    async fn export_cover(&self, Parameters(p): Parameters<CoverParams>) -> Result<String, McpError> {
+        let project = self.project.clone();
+        let (time_secs, output_path) = (p.time_secs, p.output_path);
+        let written = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).export_still_inputs().map_err(core_err)?;
+            Project::render_still(&timeline, &assets, time_secs, &output_path, None).map_err(core_err)
+        })
+        .await?;
+        json(&serde_json::json!({ "output": written.to_string_lossy() }))
     }
 
     // ---- agent task queue --------------------------------------------------
@@ -1706,6 +1779,12 @@ impl ServerHandler for KerfMcp {
              (drawn over the cut; list_fonts lists installed system fonts to pass \
              as update_overlay's font), or captions_from_transcript to caption an \
              analyzed asset in one call; export_srt writes a subtitle file. \
+             When the cut is going somewhere vertical, set_delivery_format sets \
+             the frame it is being made for and smart_crop then frames each shot \
+             for it — reshaping 16:9 footage to 9:16 throws away most of the \
+             width, and without this the middle is what survives, subject or \
+             not. Look at the result with preview_timeline; the crop is an \
+             ordinary transform the user can adjust. \
              Your task edits are STAGED, not applied: claiming a task opens a \
              proposal, and every edit you make goes into it instead of changing \
              the cut the user is looking at. Your own reads follow the proposal, \
@@ -1719,7 +1798,12 @@ impl ServerHandler for KerfMcp {
              Every applied edit is tracked: history lists the revisions, \
              revision_diff explains one of them, and undo / redo / revert_to roll \
              changes back (they work on the live cut, so apply or discard your \
-             staged edits first). Call export to render."
+             staged edits first). Before you report a cut finished, run \
+             platform_check: it says whether the length and frame shape suit \
+             where it is going, including the reach limits a platform enforces \
+             silently (a Reel over 3 minutes uploads fine and then reaches only \
+             existing followers). Call export to render, and export_cover to \
+             write the thumbnail the platform shows before anyone presses play."
                 .to_string(),
         );
         info

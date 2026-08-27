@@ -1365,6 +1365,190 @@ impl Delivery {
     }
 }
 
+/// A coarse map of where a shot's *content* is: `rows`×`cols` non-negative
+/// weights sampled across a source window, row-major.
+///
+/// Built by [`crate::engine::salience_map`] from a handful of tiny grayscale
+/// frames — per cell, the edge energy of the picture plus how much it moved.
+/// That combination is what makes it usable on both kinds of shot a social cut
+/// is made of: a locked-off talking head has no motion but plenty of facial
+/// detail against a soft background, and a handheld follow has both. It is
+/// deliberately *not* face detection — no model to ship, no licence to carry,
+/// and the answer only has to be good enough to beat a centre crop, which is
+/// what the alternative actually is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SalienceMap {
+    pub cols: usize,
+    pub rows: usize,
+    /// `rows * cols` weights, row-major.
+    pub cells: Vec<f32>,
+}
+
+/// How far the salient window is allowed to pull away from centre before the
+/// pull has to be *earned*. Scored against the window's share of total
+/// salience, so a flat map (an evenly-lit wide shot, a gradient, black) resolves
+/// to the centre crop rather than to whichever edge won by rounding.
+const CENTER_BIAS: f64 = 0.25;
+
+/// Candidate window positions evaluated across the cropped axis. The window
+/// edges are interpolated within a bucket, so this is finer than `cols`.
+const CROP_SEARCH_STEPS: usize = 240;
+
+/// Aspect ratios within this relative tolerance are the same shape — 1920x1080
+/// into a 1280x720 frame needs no crop, and neither does 1080x1350 into 4:5.
+const ASPECT_TOLERANCE: f64 = 0.01;
+
+/// A crop window as the per-edge source fractions [`Transform`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CropFrame {
+    pub left: f64,
+    pub right: f64,
+    pub top: f64,
+    pub bottom: f64,
+    /// How far the window sits from a plain centre crop, as a fraction of the
+    /// travel available to it (0.0 = dead centre, 1.0 = hard against an edge).
+    /// Reported so a caller can say *why* the shot moved.
+    pub offset: f64,
+}
+
+impl CropFrame {
+    /// The centred crop keeping `keep` of `axis` — what a `Cover` fit does on
+    /// its own, and the answer whenever the content gives no reason to move.
+    fn centered(keep: f64, horizontal: bool) -> Self {
+        Self::at(0.5 * (1.0 - keep), keep, horizontal, 0.0)
+    }
+
+    fn at(start: f64, keep: f64, horizontal: bool, offset: f64) -> Self {
+        let (near, far) = (start, (1.0 - start - keep).max(0.0));
+        if horizontal {
+            Self {
+                left: near,
+                right: far,
+                top: 0.0,
+                bottom: 0.0,
+                offset,
+            }
+        } else {
+            Self {
+                left: 0.0,
+                right: 0.0,
+                top: near,
+                bottom: far,
+                offset,
+            }
+        }
+    }
+
+    /// Whether this window is (near enough) the plain centre crop.
+    pub fn is_centered(&self) -> bool {
+        self.offset.abs() < 1e-6
+    }
+}
+
+/// Whether footage of this shape has to lose part of itself to fill a frame of
+/// `target_aspect`. False when the two are the same shape within
+/// [`ASPECT_TOLERANCE`] — 1920x1080 into a 1280x720 frame keeps all of itself —
+/// and when either shape is nonsense.
+pub fn needs_crop(source_w: u32, source_h: u32, target_aspect: f64) -> bool {
+    let source_aspect = source_w as f64 / source_h.max(1) as f64;
+    if !source_aspect.is_finite() || source_aspect <= 0.0 || !target_aspect.is_finite() || target_aspect <= 0.0 {
+        return false;
+    }
+    ((source_aspect - target_aspect) / target_aspect).abs() > ASPECT_TOLERANCE
+}
+
+impl SalienceMap {
+    pub fn new(cols: usize, rows: usize, cells: Vec<f32>) -> Self {
+        Self { cols, rows, cells }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.cols > 0 && self.rows > 0 && self.cells.len() == self.cols * self.rows
+    }
+
+    /// Salience collapsed onto one axis: per column when `horizontal`, else per
+    /// row. Negative weights are clamped away so a bad sample can't subtract.
+    fn axis(&self, horizontal: bool) -> Vec<f64> {
+        let n = if horizontal { self.cols } else { self.rows };
+        let mut out = vec![0.0; n];
+        for (i, cell) in self.cells.iter().enumerate() {
+            let bucket = if horizontal { i % self.cols } else { i / self.cols };
+            out[bucket] += (*cell as f64).max(0.0);
+        }
+        out
+    }
+
+    /// The crop that frames this shot's content for `target_aspect`.
+    ///
+    /// `None` when the source is already that shape — there is nothing to
+    /// choose, and writing a no-op crop into every clip would only be noise in
+    /// the inspector. Otherwise the long axis is cropped to the target ratio and
+    /// the window is placed where the content is, which is the whole point: a
+    /// 16:9 interview with the subject on the left third loses their head to a
+    /// centre crop, and that is the default every other path here would take.
+    pub fn crop_for(&self, source_w: u32, source_h: u32, target_aspect: f64) -> Option<CropFrame> {
+        if !needs_crop(source_w, source_h, target_aspect) {
+            return None;
+        }
+        let source_aspect = source_w as f64 / source_h.max(1) as f64;
+        // Wider than the frame → crop the width; taller → crop the height.
+        let horizontal = source_aspect > target_aspect;
+        let keep = if horizontal {
+            target_aspect / source_aspect
+        } else {
+            source_aspect / target_aspect
+        }
+        .clamp(0.01, 1.0);
+
+        if !self.is_valid() {
+            return Some(CropFrame::centered(keep, horizontal));
+        }
+        let weights = self.axis(horizontal);
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            return Some(CropFrame::centered(keep, horizontal));
+        }
+
+        let travel = 1.0 - keep;
+        let mut best = (f64::NEG_INFINITY, 0.5 * travel);
+        for step in 0..=CROP_SEARCH_STEPS {
+            let start = travel * step as f64 / CROP_SEARCH_STEPS as f64;
+            let share = window_sum(&weights, start, start + keep) / total;
+            let drift = ((start + 0.5 * keep) - 0.5).abs() * 2.0;
+            let score = share - CENTER_BIAS * drift;
+            if score > best.0 {
+                best = (score, start);
+            }
+        }
+
+        let start = best.1;
+        // Report — and store — the exact centre when the search landed on it, so
+        // an unmoved shot reads as unmoved instead of as a 0.4% pan.
+        let offset = if travel > 1e-9 { (start / travel - 0.5) * 2.0 } else { 0.0 };
+        if offset.abs() < 0.02 {
+            return Some(CropFrame::centered(keep, horizontal));
+        }
+        Some(CropFrame::at(start, keep, horizontal, offset))
+    }
+}
+
+/// Salience between two positions on a 0..1 axis, with the end buckets counted
+/// by the fraction of them the window actually covers — so sliding the window
+/// by less than a bucket changes the score smoothly instead of in steps.
+fn window_sum(weights: &[f64], from: f64, to: f64) -> f64 {
+    let n = weights.len() as f64;
+    let (from, to) = (from.clamp(0.0, 1.0) * n, to.clamp(0.0, 1.0) * n);
+    let mut sum = 0.0;
+    for (i, w) in weights.iter().enumerate() {
+        let (lo, hi) = (i as f64, i as f64 + 1.0);
+        let overlap = to.min(hi) - from.max(lo);
+        if overlap > 0.0 {
+            sum += w * overlap;
+        }
+    }
+    sum
+}
+
 /// The non-destructive timeline (EDL): a set of multi-kind tracks, the text
 /// overlays (titles / lower-thirds / captions) drawn over the composited
 /// picture, and the user's markers.
@@ -2745,5 +2929,99 @@ mod tests {
         );
         // Every entry lands in the rendered summary the agent reads back.
         assert_eq!(diff.summary().lines().count(), 4);
+    }
+
+    // ---- smart crop ---------------------------------------------------------
+
+    /// A map whose salience sits in one horizontal band of `cols`, so a test can
+    /// say "the subject is on the left third" and nothing else.
+    fn map_with_column_band(cols: usize, from: usize, to: usize) -> SalienceMap {
+        let rows = 4;
+        let mut cells = vec![0.01f32; cols * rows];
+        for r in 0..rows {
+            for c in from..to {
+                cells[r * cols + c] = 1.0;
+            }
+        }
+        SalienceMap::new(cols, rows, cells)
+    }
+
+    #[test]
+    fn a_matching_aspect_needs_no_crop() {
+        let map = map_with_column_band(32, 0, 32);
+        // 1080x1920 delivered at 9:16, and 1920x1080 at a 1280x720 frame.
+        assert!(map.crop_for(1080, 1920, 1080.0 / 1920.0).is_none());
+        assert!(map.crop_for(1920, 1080, 1280.0 / 720.0).is_none());
+    }
+
+    #[test]
+    fn a_vertical_delivery_crops_width_toward_the_subject() {
+        // 16:9 footage into a 9:16 frame with the subject in the left third.
+        let map = map_with_column_band(48, 4, 16);
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        assert_eq!((crop.top, crop.bottom), (0.0, 0.0));
+        // 9:16 of 16:9 keeps 0.3164 of the width; the rest is cut.
+        assert!((crop.left + crop.right - (1.0 - 1080.0 * 1080.0 / (1920.0 * 1920.0))).abs() < 1e-6);
+        // The kept window contains the band, which a centre crop would miss.
+        assert!(crop.left < 4.0 / 48.0 && 1.0 - crop.right > 16.0 / 48.0, "{crop:?}");
+        assert!(!crop.is_centered());
+        assert!(crop.offset < 0.0, "a left-hand subject pulls the window left");
+    }
+
+    #[test]
+    fn flat_salience_falls_back_to_the_centre_crop() {
+        let map = map_with_column_band(48, 0, 48);
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        assert!((crop.left - crop.right).abs() < 1e-9, "{crop:?}");
+        assert!(crop.is_centered());
+    }
+
+    #[test]
+    fn an_off_centre_subject_still_loses_to_a_hard_pull_it_cannot_earn() {
+        // Salience a hair off centre: the centre bias should hold the window put
+        // rather than pan for a rounding difference.
+        let map = map_with_column_band(48, 23, 27);
+        let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+        assert!(crop.is_centered(), "{crop:?}");
+    }
+
+    #[test]
+    fn a_landscape_delivery_crops_height_of_vertical_footage() {
+        // 9:16 footage into 16:9, subject in the top rows.
+        let cols = 4;
+        let rows = 32;
+        let mut cells = vec![0.01f32; cols * rows];
+        for r in 2..8 {
+            for c in 0..cols {
+                cells[r * cols + c] = 1.0;
+            }
+        }
+        let map = SalienceMap::new(cols, rows, cells);
+        let crop = map.crop_for(1080, 1920, 1920.0 / 1080.0).expect("crops");
+        assert_eq!((crop.left, crop.right), (0.0, 0.0));
+        // The search grid is finer than a bucket but not exact, so allow the top
+        // edge to land a hair inside the band it is framing.
+        assert!(crop.top <= 2.0 / 32.0 + 0.01 && 1.0 - crop.bottom > 8.0 / 32.0, "{crop:?}");
+    }
+
+    #[test]
+    fn a_map_with_nothing_in_it_still_yields_the_centre_crop() {
+        for map in [
+            SalienceMap::default(),
+            SalienceMap::new(8, 2, vec![0.0; 16]),
+            SalienceMap::new(8, 2, vec![0.0; 3]),
+        ] {
+            let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
+            assert!(crop.is_centered(), "{crop:?}");
+            assert!((crop.left - crop.right).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_degenerate_aspect_is_refused_rather_than_guessed() {
+        let map = map_with_column_band(8, 0, 4);
+        assert!(map.crop_for(1920, 1080, 0.0).is_none());
+        assert!(map.crop_for(1920, 1080, f64::NAN).is_none());
+        assert!(map.crop_for(0, 1080, 1.0).is_none());
     }
 }

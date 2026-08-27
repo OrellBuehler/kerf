@@ -205,6 +205,15 @@
 				// rather than claiming an alignment that never happened.
 				if (cutSignature() === before) toast.info('No cuts were near a beat');
 				else toast.success('Aligned the cuts to the beat');
+			} else if (task && p === 'Frame for the delivery') {
+				// Smart crop only matters once the project has a frame to be cut
+				// for; without one the frame follows the footage and every shot
+				// already fills it.
+				await editor.smartCrop();
+				await agent.resolve(task.id);
+				toast.success('Framed every shot for the delivery frame', {
+					action: { label: 'Undo', onClick: () => void editor.undo() }
+				});
 			} else {
 				toast.info(`Queued “${p}” — your connected agent claims tasks over MCP`);
 			}

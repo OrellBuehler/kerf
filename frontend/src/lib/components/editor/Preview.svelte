@@ -5,7 +5,8 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { getTimelineFrame, startPlayback } from '$lib/api';
+	import { exportCover, getTimelineFrame, inTauri, pickCoverPath, revealPath, startPlayback } from '$lib/api';
+	import { toast } from 'svelte-sonner';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
 	import { clipDuration } from '$lib/types';
 
@@ -196,6 +197,27 @@
 	const CHROME = { top: 0.08, bottom: 0.2, right: 0.14 };
 	const showGuides = $derived(ui.safeAreas && !!delivery && aspect < 1.2);
 
+	/** Write the frame under the playhead as a cover image — the thumbnail a
+	 *  platform shows before anyone presses play. Rendered at the full delivery
+	 *  frame from the original media, so it is the picture people actually see,
+	 *  not the downscaled preview on screen. */
+	async function saveCover() {
+		if (!inTauri()) {
+			toast.info('Cover frames are rendered with FFmpeg in the desktop app.');
+			return;
+		}
+		const path = await pickCoverPath();
+		if (!path) return;
+		try {
+			const out = await exportCover(ui.time, path);
+			toast.success(`Cover saved → ${out}`, {
+				action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
+			});
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		}
+	}
+
 	function onPreviewContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
 			{
@@ -220,6 +242,13 @@
 				icon: 'crop',
 				disabled: !delivery,
 				action: () => (ui.safeAreas = !ui.safeAreas)
+			},
+			{ type: 'separator' },
+			{
+				label: 'Save cover frame…',
+				icon: 'image',
+				disabled: empty,
+				action: () => void saveCover()
 			}
 		]);
 	}

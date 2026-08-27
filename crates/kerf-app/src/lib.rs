@@ -1311,6 +1311,86 @@ async fn export_timeline(
     .await
 }
 
+/// Write the composited frame at `time_secs` to `output_path` as a **cover
+/// image** — full delivery resolution, decoded from the original media rather
+/// than a preview proxy. `format` follows the file extension when omitted.
+#[tauri::command]
+async fn export_cover(
+    state: State<'_, AppState>,
+    time_secs: f64,
+    output_path: String,
+    format: Option<kerf_core::ImageFormat>,
+) -> CmdResult<String> {
+    let shared = state.project.clone();
+    blocking(move || {
+        // Same shape as every heavy command: resolve under the lock, render
+        // without it. A 4K still is a real decode.
+        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
+        let path = Project::render_still(&timeline, &assets, time_secs, &output_path, format).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Frame every shot for the delivery frame instead of centring it blindly —
+/// samples where each clip's content sits and writes the crop that keeps it.
+/// One clip when `clip_id` is given, otherwise every clip on an unlocked video
+/// track. The result is an ordinary transform crop, so the inspector's sliders
+/// still have the last word.
+#[tauri::command]
+async fn smart_crop(state: State<'_, AppState>, clip_id: Option<String>) -> CmdResult<Timeline> {
+    let clip = clip_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // The usual shape for a heavy command: plan under the lock, decode
+        // without it (one short ffmpeg pass per clip), apply under it again.
+        let plan = lock_user(&shared).smart_crop_inputs(clip).map_err(|e| e.to_string())?;
+        let crops = Project::sample_smart_crops(&plan).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project.apply_smart_crops(&crops).map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Every publishing target Kerf knows about, with its frame and length limits.
+#[tauri::command(async)]
+fn platform_targets() -> Vec<kerf_core::PlatformTarget> {
+    kerf_core::PLATFORM_TARGETS.to_vec()
+}
+
+/// How ready the current cut is for each target — what would be rejected, what
+/// would be accepted and then under-distributed, and what would just be better.
+#[tauri::command(async)]
+fn platform_check(
+    state: State<'_, AppState>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
+    // The export dialog can resize away from the project frame; when it does it
+    // passes the frame it is actually about to render, so the verdict is about
+    // the file that will exist rather than the one the project defaults to.
+    let frame = width.zip(height);
+    state.project().platform_check(frame).map_err(|e| e.to_string())
+}
+
+/// Show a file in the OS file manager. The last step of an export: the render
+/// finished somewhere, and "somewhere" is not much use on its own.
+#[tauri::command(async)]
+fn reveal_path(app: AppHandle, path: String) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    // Open the containing folder, not the file — opening the file would launch
+    // a player, which is not what "show me where it went" means.
+    let target = std::path::Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(&path));
+    app.opener()
+        .open_path(target.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Request cancellation of the in-flight export (if any). The running
 /// [`export_timeline`] observes the flag on its next progress poll, stops
 /// ffmpeg, and returns the `"export cancelled"` error.
@@ -1528,6 +1608,7 @@ pub fn run() {
             export_srt,
             remove_silence,
             snap_to_beats,
+            smart_crop,
             extract_audio,
             concatenate,
             get_history,
@@ -1553,6 +1634,10 @@ pub fn run() {
             hw_encoders,
             export_timeline,
             cancel_export,
+            export_cover,
+            platform_targets,
+            platform_check,
+            reveal_path,
             mcp_endpoint,
             log_dir,
             reveal_logs

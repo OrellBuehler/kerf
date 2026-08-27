@@ -13,4 +13,11 @@ export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label:
 	failed: { tone: 'neutral', icon: 'history', label: 'Failed' }
 };
 
-export const PRESETS = ['Remove silences', 'Cut to the beat', 'Assemble rough cut', 'Find best 60s', 'Color match'];
+export const PRESETS = [
+	'Remove silences',
+	'Cut to the beat',
+	'Frame for the delivery',
+	'Assemble rough cut',
+	'Find best 60s',
+	'Color match'
+];

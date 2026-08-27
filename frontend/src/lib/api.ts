@@ -13,6 +13,7 @@ import type {
 	Clip,
 	Color,
 	Delivery,
+	DeliveryCheck,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
@@ -39,6 +40,8 @@ import type {
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
+import { checkAll } from './platforms';
+import { centeredCrop } from './smart-crop';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1262,6 +1265,44 @@ export async function snapToBeats(trackId?: string, tolerance?: number): Promise
 	return invoke<Timeline>('snap_to_beats', { trackId, tolerance });
 }
 
+/** Frame each shot for the delivery frame instead of centring it blindly.
+ *
+ *  The app samples where each clip's content actually sits (one short ffmpeg
+ *  pass per clip) and writes the crop that keeps it. The browser harness has no
+ *  decoder, so it applies the centre window from `smart-crop.ts` — the shape is
+ *  right, the choice of *which* part of the shot survives is the half that only
+ *  exists with media behind it. Either way the result is an ordinary transform
+ *  crop the inspector can adjust. */
+export async function smartCrop(clipId?: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const fmt = devTimeline.format;
+		const first = sampleAssets[0]?.streams.find((s) => s.kind === 'video');
+		const aspect = (fmt?.width ?? first?.width ?? 1920) / (fmt?.height ?? first?.height ?? 1080);
+		let moved = 0;
+		for (const track of devTimeline.tracks) {
+			if (track.kind !== 'video' || (track.locked && !clipId)) continue;
+			for (const clip of track.clips) {
+				if (clipId && clip.id !== clipId) continue;
+				const stream = assetById(clip.asset_id)?.streams.find((s) => s.kind === 'video');
+				const crop = stream?.width && stream?.height ? centeredCrop(stream.width, stream.height, aspect) : null;
+				if (!crop) continue;
+				clip.transform = {
+					...(clip.transform ?? DEFAULT_TRANSFORM),
+					crop_left: crop.left,
+					crop_right: crop.right,
+					crop_top: crop.top,
+					crop_bottom: crop.bottom
+				};
+				moved += 1;
+			}
+		}
+		if (!moved) throw new Error('every shot is already that shape — nothing to reframe');
+		recordDev('Smart crop');
+		return snapshot();
+	}
+	return invoke<Timeline>('smart_crop', { clipId });
+}
+
 export async function extractAudio(assetId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const asset = assetById(assetId);
@@ -1618,6 +1659,52 @@ export async function pickExportPath(ext: string): Promise<string | null> {
 		defaultPath: `kerf-export.${ext}`
 	});
 	return typeof path === 'string' ? path : null;
+}
+
+/** Write the composited frame at `timeSecs` to `outputPath` as a cover image —
+ *  full delivery resolution, through the export graph. */
+export async function exportCover(timeSecs: number, outputPath: string): Promise<string> {
+	if (!inTauri()) throw new Error('saving a cover frame is only available in the desktop app');
+	return invoke<string>('export_cover', { timeSecs, outputPath, format: null });
+}
+
+/** Open a save dialog for a cover image. */
+export async function pickCoverPath(): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({
+		filters: [{ name: 'Image', extensions: ['jpg', 'png'] }],
+		defaultPath: 'kerf-cover.jpg'
+	});
+	return typeof path === 'string' ? path : null;
+}
+
+/** Show a rendered file in the OS file manager (opens its containing folder). */
+export async function revealPath(path: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('reveal_path', { path });
+}
+
+/** How ready the current cut is for each publishing target. `frame` overrides
+ *  the shape it is judged at — the export dialog passes the resolution it is
+ *  about to render when that differs from the project frame.
+ *
+ *  `kerf_core::platform` decides this in the app. The browser harness runs the
+ *  mirror in `platforms.ts` over the dev timeline so the panel is explorable
+ *  under `bun run dev`. */
+export async function platformCheck(frame?: [number, number] | null): Promise<DeliveryCheck[]> {
+	if (!inTauri()) {
+		const fmt = devTimeline.format;
+		const first = sampleAssets[0];
+		return checkAll({
+			duration: timelineDuration(devTimeline),
+			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
+			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
+			has_audio: true,
+			has_text: (devTimeline.overlays ?? []).length > 0
+		});
+	}
+	return invoke<DeliveryCheck[]>('platform_check', { width: frame?.[0] ?? null, height: frame?.[1] ?? null });
 }
 
 // ---- agent connection (MCP endpoint) ---------------------------------------
