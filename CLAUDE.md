@@ -275,14 +275,34 @@ no editing logic in the adapter.
   speed / reverse) — captions land on the words that survived the cut and words
   that were cut out get none. It reads through `for_render`, so a muted track is
   as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
-  (4 words / 28 chars by default — a speech model emits whole sentences and a
-  whole sentence does not fit a 9:16 frame), timing lines by *character share*
+  (a speech model emits whole sentences and a whole sentence does not fit a
+  9:16 frame), timing lines by *character share*
   because neither speech backend reports word timings; lines too short to read
   merge back into a neighbour instead of flashing; and no two lines are ever on
   screen at once (captions are one lane of text, and the same footage reaching
   the cut twice would otherwise collide with itself). `TextOverlay.generated`
   marks what it wrote, so regenerating replaces its own set and leaves a typed
-  title alone. A `Track`
+  title alone.
+  **`CaptionStyle` is the look**, and one decision rather than four:
+  `Lines` (4 words / 28 chars, 5% of frame height, low in the frame) is the
+  subtitle shape a line is *read* in; `WordPunch` (one word, 11%, higher, bold)
+  is the social shape a word is *watched* in, each landing on the beat of the
+  speech. Word count, size, position and the flicker floors move together
+  because they have to — held to `MIN_CAPTION` every short word would merge
+  into a neighbour and word punch would collapse back into lines, so it gets
+  its own `MIN_WORD_CAPTION` / `MIN_WORD_VISIBLE` and words merge far later.
+  `CaptionOptions` is that style plus **overrides**: every number is optional
+  and follows the style when omitted, `resolve()`ing to the `CaptionLayout`
+  captioning works from — so asking for `word_punch` alone gets the whole look
+  rather than one word left at subtitle size, and `CaptionOptions::default()`
+  is unchanged, so every pre-existing call captions identically. `fit_size`
+  then shrinks a caption to fit the frame: `drawtext` neither wraps nor scales
+  and a 9:16 frame is barely half as wide as it is tall, so a long word — or a
+  28-char subtitle line, already true before word punch — was drawn off both
+  edges. `fontsize` cannot be an expression over `text_w` (the width is what
+  depends on the size), so it is estimated from the character count against
+  `Timeline.format`'s aspect; an unframed project assumes 16:9, wide enough
+  that the fit never binds, so nothing that never picked a frame moved. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
   re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
@@ -431,7 +451,10 @@ proposal appears for review, not that the cut changes: the read tools
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `generate_captions` / `clear_captions` caption the
-cut; the `instructions` say to caption **last** and to re-run after any further
+cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
+prefer the latter for a vertical cut, since nothing in a tool list tells an
+agent that the subtitle shape is not what social captions look like. They also
+say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
@@ -588,7 +611,11 @@ at the playhead like Transform — note its `lerpAngle` takes the shortest arc, 
 plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
 detect as 360 it instead offers a projection picker that marks the whole asset via
 `set_asset_projection`), and an always-visible
-**Text overlays** section (add titles / lower-thirds, caption the whole cut —
+**Text overlays** section (add titles / lower-thirds, caption the whole cut in
+a **Lines / Word punch** style chosen by two chips above the button — the
+selection is deliberately *not* derived from the overlays already there, since
+a caption's style is not recoverable from its text and guessing it from the
+word count would flip the chip whenever a sentence happened to be short —
 the button relabels to `Recaption` once there are generated captions, since a
 later trim moves the words out from under them, with `Clear` beside it taking
 only the generated ones — and edit text / timing / position / size / color /
@@ -602,8 +629,9 @@ omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
 tint) — and the Text overlays section leads with **Title / Lower third /
 Caption** style chips that create a styled overlay at the playhead with
 fade-in/out opacity keyframes; the caption style matches what
-`generate_captions` generates, so manual and generated captions look
-alike.
+`generate_captions` writes in its `lines` style, so manual and generated
+captions look alike (`CAPTION_LOOKS` in the same file is only the two
+generate-time labels; their numbers live in `captions.ts`).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
