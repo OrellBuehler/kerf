@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
-    ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project,
+    Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -210,6 +210,28 @@ struct SetTrackDuckParams {
     track_id: String,
     #[schemars(description = "true to duck this track under the others on export, false to restore a flat mix")]
     duck: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMaskParams {
+    #[schemars(description = "UUID of the clip to mask")]
+    clip_id: String,
+    #[schemars(description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely")]
+    shape: Option<String>,
+    #[schemars(description = "Centre of the shape across the frame, 0 = left edge, 1 = right (default 0.5)")]
+    x: Option<f64>,
+    #[schemars(description = "Centre of the shape down the frame, 0 = top, 1 = bottom (default 0.5)")]
+    y: Option<f64>,
+    #[schemars(description = "Full width of the shape as a fraction of the frame, not a radius (default 0.5)")]
+    width: Option<f64>,
+    #[schemars(description = "Full height of the shape as a fraction of the frame (default 0.5)")]
+    height: Option<f64>,
+    #[schemars(
+        description = "Edge softness as a fraction of the shape's own half-size, 0 = hard (default 0.15). A hard-edged mask over a face reads as a sticker"
+    )]
+    feather: Option<f64>,
+    #[schemars(description = "Keep what is OUTSIDE the shape instead of inside it (default false)")]
+    inverted: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -917,6 +939,41 @@ impl KerfMcp {
         let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
         self.changed();
         json(&track)
+    }
+
+    #[tool(description = "Cut a clip to a shape: inside the shape the clip is kept, outside it goes \
+                       transparent and whatever is on a LOWER track shows through. Omit `shape` to \
+                       clear the mask. This is the one masking primitive, and it composes with the \
+                       track stack rather than replacing it — to blur a face, duplicate the shot onto \
+                       the track above with add_clip at the same timeline_start, give the copy a blur \
+                       with set_video_effects, then mask the copy to an ellipse over the face; to grade \
+                       one region, do the same with set_color. Check the result with preview_timeline: \
+                       positions are fractions of the frame, so you have to look to know you covered \
+                       the right thing.")]
+    fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let mask = match p.shape {
+            None => None,
+            Some(ref s) => {
+                let shape = MaskShape::parse(s).ok_or_else(|| {
+                    McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
+                })?;
+                let d = Mask::default();
+                Some(Mask {
+                    shape,
+                    x: p.x.unwrap_or(d.x),
+                    y: p.y.unwrap_or(d.y),
+                    width: p.width.unwrap_or(d.width),
+                    height: p.height.unwrap_or(d.height),
+                    feather: p.feather.unwrap_or(d.feather),
+                    inverted: p.inverted.unwrap_or(false),
+                })
+            }
+        };
+        let project = self.lock();
+        let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
+        self.changed();
+        json(&clip)
     }
 
     #[tool(
@@ -1843,7 +1900,10 @@ impl ServerHandler for KerfMcp {
              between scenes, a slide or push between the shots of a montage). \
              Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
-             track shows through), set_audio_effects (highpass / lowpass / EQ / \
+             track shows through), set_mask (cut a clip to a rectangle or ellipse so \
+             a lower track shows through — with a duplicated, blurred copy above, \
+             that is how a face or a number plate is blurred), \
+             set_audio_effects (highpass / lowpass / EQ / \
              compressor / gate). Mix with set_track_volume — a music bed belongs \
              on its own track pulled well under the speech (~0.3), which is most \
              of what makes a cut sound finished — plus set_track_duck to dip it \

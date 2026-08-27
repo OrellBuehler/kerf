@@ -31,9 +31,9 @@ pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionStyle, Clip, Color, CropFrame, Delivery, DiffEntry,
-    DiffKind, EditSource, Keyframe, Marker, Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
-    StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track,
-    TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
+    DiffKind, EditSource, Keyframe, Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision,
+    Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
 };
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,

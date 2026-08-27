@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
-    ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind,
-    VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, Project,
+    Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition,
+    TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -703,6 +703,16 @@ fn set_transition(
     let transition = parse_transition(kind, duration)?;
     let project = state.project();
     project.set_transition(id, transition).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Cut a clip to a shape (or clear it with `mask: null`), so a lower track shows
+/// through outside it.
+#[tauri::command(async)]
+fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_mask(id, mask).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1620,6 +1630,7 @@ pub fn run() {
             set_transform,
             set_color,
             set_transition,
+            set_mask,
             set_video_effects,
             set_audio_effects,
             set_keyframes,
