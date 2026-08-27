@@ -205,6 +205,18 @@
 				// rather than claiming an alignment that never happened.
 				if (cutSignature() === before) toast.info('No cuts were near a beat');
 				else toast.success('Aligned the cuts to the beat');
+			} else if (task && p === 'Caption the cut') {
+				// Captions read from the clips' transcripts, so analyze whatever is
+				// in the cut but has not been transcribed yet.
+				const sources = [...new Set(editor.timeline.tracks.flatMap((t) => t.clips.map((c) => c.asset_id)))];
+				if (sources.length === 0) throw new Error('Put a clip on the timeline first');
+				for (const id of sources) if (!editor.analysisFor(id)) await ui.runAnalysis(id);
+				await editor.generateCaptions();
+				await agent.resolve(task.id);
+				const n = (editor.timeline.overlays ?? []).filter((o) => o.generated).length;
+				toast.success(`Captioned the cut — ${n} line${n === 1 ? '' : 's'}`, {
+					action: { label: 'Undo', onClick: () => void editor.undo() }
+				});
 			} else if (task && p === 'Frame for the delivery') {
 				// Smart crop only matters once the project has a frame to be cut
 				// for; without one the frame follows the footage and every shot

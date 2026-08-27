@@ -17,6 +17,7 @@ export const PRESETS = [
 	'Remove silences',
 	'Cut to the beat',
 	'Frame for the delivery',
+	'Caption the cut',
 	'Assemble rough cut',
 	'Find best 60s',
 	'Color match'

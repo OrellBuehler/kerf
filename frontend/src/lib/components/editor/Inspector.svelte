@@ -219,13 +219,20 @@
 			editor.selectedOverlayId = created.id;
 		});
 	}
+	/** Captions are placed in timeline time, so they follow the cut — which also
+	 *  means a later trim moves the words out from under them. Re-running
+	 *  replaces the generated set, so the button stays the same after the first
+	 *  press and only its label admits what it is doing. */
+	const hasCaptions = $derived(overlays.some((o) => o.generated));
 	function makeCaptions() {
-		const id = clip?.asset_id ?? editor.selectedAssetId;
-		if (!id) {
-			toast.error('Select a clip or asset with a transcript first');
+		if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
+			toast.error('Put a clip on the timeline first');
 			return;
 		}
-		void run(() => editor.captionsFromTranscript(id));
+		void run(() => editor.generateCaptions());
+	}
+	function dropCaptions() {
+		void run(() => editor.clearCaptions());
 	}
 
 	// While a slider is being dragged, show its live value (keyed by row label)
@@ -300,8 +307,11 @@
 		}
 		items.push(
 			{ label: 'Add text overlay', icon: 'captions', action: addOverlayHere },
-			{ label: 'Generate captions', icon: 'captions', action: makeCaptions }
+			{ label: hasCaptions ? 'Regenerate captions' : 'Generate captions', icon: 'captions', action: makeCaptions }
 		);
+		if (hasCaptions) {
+			items.push({ label: 'Clear captions', icon: 'trash', action: dropCaptions });
+		}
 		contextMenu.show(e, items);
 	}
 
@@ -473,11 +483,17 @@
 	</div>
 	<div style="display:flex;gap:7px;margin-bottom:6px">
 		<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addOverlayHere}>+ Text</Btn>
-		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={makeCaptions}>Captions</Btn>
+		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={makeCaptions}>
+			{hasCaptions ? 'Recaption' : 'Captions'}
+		</Btn>
+		{#if hasCaptions}
+			<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={dropCaptions}>Clear</Btn>
+		{/if}
 	</div>
 	{#if overlays.length === 0}
 		<div style="font-size:11px;color:var(--text-muted);line-height:1.4">
-			No titles or captions yet. Add text, or generate captions from an analyzed asset's transcript.
+			No titles or captions yet. Add text, or caption the whole cut from the transcripts of the clips on
+			the timeline — captions land on the words that survived your edit.
 		</div>
 	{/if}
 	{#each overlays as o (o.id)}
