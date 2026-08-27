@@ -374,6 +374,18 @@ impl Color {
 }
 
 /// How a clip blends with the preceding clip on its track.
+///
+/// Three families, and the family is what decides how the cut is rendered:
+/// a **dip** takes both sides through a solid colour, a **dissolve** mixes them,
+/// and a **motion** transition slides the incoming clip in over the outgoing one
+/// (`Slide*`) or shoves the outgoing one out of frame with it (`Push*`). All of
+/// them borrow the outgoing clip's unused source handle to keep it playing under
+/// the transition, so a cut with no handle left degrades to a hard cut rather
+/// than to a fade from black.
+///
+/// The direction in a motion transition names the direction of **travel**, the
+/// way an editor says it: `SlideLeft` brings the new shot in from the right edge
+/// and moves it left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionKind {
@@ -381,6 +393,26 @@ pub enum TransitionKind {
     Crossfade,
     /// Dip to black: the outgoing clip fades to black, the incoming up from it.
     DipToBlack,
+    /// Dip to white — the same shape as [`Self::DipToBlack`], through white.
+    /// Reads as a brighter, faster beat than black, which is why a montage of
+    /// daylight footage usually wants it instead.
+    DipToWhite,
+    /// The incoming clip travels in from the right edge over the held outgoing one.
+    SlideLeft,
+    /// The incoming clip travels in from the left edge.
+    SlideRight,
+    /// The incoming clip travels up from the bottom edge.
+    SlideUp,
+    /// The incoming clip travels down from the top edge.
+    SlideDown,
+    /// Both clips travel left: the incoming pushes the outgoing out of frame.
+    PushLeft,
+    /// Both clips travel right.
+    PushRight,
+    /// Both clips travel up.
+    PushUp,
+    /// Both clips travel down.
+    PushDown,
 }
 
 impl TransitionKind {
@@ -388,6 +420,15 @@ impl TransitionKind {
         match self {
             TransitionKind::Crossfade => "crossfade",
             TransitionKind::DipToBlack => "dip_to_black",
+            TransitionKind::DipToWhite => "dip_to_white",
+            TransitionKind::SlideLeft => "slide_left",
+            TransitionKind::SlideRight => "slide_right",
+            TransitionKind::SlideUp => "slide_up",
+            TransitionKind::SlideDown => "slide_down",
+            TransitionKind::PushLeft => "push_left",
+            TransitionKind::PushRight => "push_right",
+            TransitionKind::PushUp => "push_up",
+            TransitionKind::PushDown => "push_down",
         }
     }
 
@@ -395,7 +436,87 @@ impl TransitionKind {
         match s {
             "crossfade" => Some(TransitionKind::Crossfade),
             "dip_to_black" | "diptoblack" => Some(TransitionKind::DipToBlack),
+            "dip_to_white" | "diptowhite" => Some(TransitionKind::DipToWhite),
+            "slide_left" => Some(TransitionKind::SlideLeft),
+            "slide_right" => Some(TransitionKind::SlideRight),
+            "slide_up" => Some(TransitionKind::SlideUp),
+            "slide_down" => Some(TransitionKind::SlideDown),
+            "push_left" => Some(TransitionKind::PushLeft),
+            "push_right" => Some(TransitionKind::PushRight),
+            "push_up" => Some(TransitionKind::PushUp),
+            "push_down" => Some(TransitionKind::PushDown),
             _ => None,
+        }
+    }
+
+    /// Every kind, in the order a picker should offer them.
+    pub const ALL: [TransitionKind; 11] = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ];
+
+    /// The solid colour this transition dips through, if it is a dip.
+    pub fn dip_color(self) -> Option<&'static str> {
+        match self {
+            TransitionKind::DipToBlack => Some("black"),
+            TransitionKind::DipToWhite => Some("white"),
+            _ => None,
+        }
+    }
+
+    /// Where the incoming clip starts, as an offset from its final position in
+    /// frame widths and heights, for a motion transition. It travels from here
+    /// to `(0, 0)` over the transition, so the vector points back along the
+    /// direction of travel: a `SlideLeft` starts one full frame to the right.
+    pub fn slide_from(self) -> Option<(f64, f64)> {
+        match self {
+            TransitionKind::SlideLeft | TransitionKind::PushLeft => Some((1.0, 0.0)),
+            TransitionKind::SlideRight | TransitionKind::PushRight => Some((-1.0, 0.0)),
+            TransitionKind::SlideUp | TransitionKind::PushUp => Some((0.0, 1.0)),
+            TransitionKind::SlideDown | TransitionKind::PushDown => Some((0.0, -1.0)),
+            _ => None,
+        }
+    }
+
+    /// True when the outgoing clip is carried out of frame by the incoming one
+    /// instead of being covered where it stands.
+    pub fn pushes(self) -> bool {
+        matches!(
+            self,
+            TransitionKind::PushLeft | TransitionKind::PushRight | TransitionKind::PushUp | TransitionKind::PushDown
+        )
+    }
+
+    /// True when both sides play at once — a dissolve or any motion transition.
+    /// Such a transition needs the outgoing clip's source handle; a dip does not,
+    /// because the two halves happen either side of the cut.
+    pub fn overlaps(self) -> bool {
+        !matches!(self, TransitionKind::DipToBlack | TransitionKind::DipToWhite)
+    }
+
+    /// Human name, for a diff line or a picker label.
+    pub fn label(self) -> &'static str {
+        match self {
+            TransitionKind::Crossfade => "Crossfade",
+            TransitionKind::DipToBlack => "Dip to black",
+            TransitionKind::DipToWhite => "Dip to white",
+            TransitionKind::SlideLeft => "Slide left",
+            TransitionKind::SlideRight => "Slide right",
+            TransitionKind::SlideUp => "Slide up",
+            TransitionKind::SlideDown => "Slide down",
+            TransitionKind::PushLeft => "Push left",
+            TransitionKind::PushRight => "Push right",
+            TransitionKind::PushUp => "Push up",
+            TransitionKind::PushDown => "Push down",
         }
     }
 }
