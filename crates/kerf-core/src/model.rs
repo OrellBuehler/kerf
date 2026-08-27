@@ -906,76 +906,170 @@ pub const MIN_CAPTION: f64 = 0.45;
 /// edge; showing it would caption footage that is no longer there.
 pub const MIN_CAPTION_VISIBLE: f64 = 0.15;
 
-/// How a transcript is turned into on-screen captions. The defaults are the
-/// social shape — a few words at a time, sized to be read on a phone — because a
-/// speech model emits whole sentences and a whole sentence does not fit a 9:16
-/// frame.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct CaptionOptions {
-    /// Most words on one caption line.
-    #[serde(default = "default_caption_words")]
-    pub max_words: usize,
-    /// Most characters on one caption line; the tighter of the two limits wins.
-    #[serde(default = "default_caption_chars")]
-    pub max_chars: usize,
-    /// Vertical position as a fraction of frame height.
-    #[serde(default = "default_caption_y")]
-    pub pos_y: f64,
-    /// Font height as a fraction of frame height.
-    #[serde(default = "default_caption_size")]
-    pub size: f64,
+/// The same two floors for [`CaptionStyle::WordPunch`], where a line *is* one
+/// word. Held to [`MIN_CAPTION`] every short word would merge into a neighbour
+/// and the style would collapse back into [`CaptionStyle::Lines`]; words still
+/// merge — a one-letter word's character share is a couple of frames — just far
+/// later.
+pub const MIN_WORD_CAPTION: f64 = 0.12;
+pub const MIN_WORD_VISIBLE: f64 = 0.06;
+
+/// The shape a generated caption set takes on screen.
+///
+/// Two, because they are consumed differently. A subtitle line is *read*: it
+/// holds still long enough to take several words in at once. The one-word form
+/// is *watched* — each word lands on the beat of the speech, which is the look
+/// social captions have converged on and most of why a muted feed video holds
+/// attention. It is not a font choice: the word count, the size, the position
+/// and the floors that stop a line flickering all move together, so it is one
+/// decision rather than four.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionStyle {
+    /// A few words at a time, held as a subtitle line low in the frame.
+    #[default]
+    Lines,
+    /// One word at a time, large and bold, cut in and out on the word.
+    WordPunch,
 }
 
-fn default_caption_words() -> usize {
-    4
-}
-
-fn default_caption_chars() -> usize {
-    28
-}
-
-fn default_caption_y() -> f64 {
-    0.88
-}
-
-fn default_caption_size() -> f64 {
-    0.05
-}
-
-impl Default for CaptionOptions {
-    fn default() -> Self {
-        Self {
-            max_words: default_caption_words(),
-            max_chars: default_caption_chars(),
-            pos_y: default_caption_y(),
-            size: default_caption_size(),
+impl CaptionStyle {
+    /// The style's own numbers, before any per-call override.
+    fn layout(self) -> CaptionLayout {
+        match self {
+            Self::Lines => CaptionLayout {
+                max_words: 4,
+                max_chars: 28,
+                pos_y: 0.88,
+                size: 0.05,
+                bold: false,
+                min_line: MIN_CAPTION,
+                min_visible: MIN_CAPTION_VISIBLE,
+            },
+            Self::WordPunch => CaptionLayout {
+                max_words: 1,
+                max_chars: 28,
+                // Higher and much larger than a subtitle: one word carries the
+                // whole frame, and sitting it on the bottom edge would put it
+                // under the platform's own caption rail.
+                pos_y: 0.72,
+                size: 0.11,
+                bold: true,
+                min_line: MIN_WORD_CAPTION,
+                min_visible: MIN_WORD_VISIBLE,
+            },
         }
     }
 }
 
+/// A [`CaptionStyle`]'s numbers with any per-call override applied — what
+/// [`Timeline::captions`] actually works from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptionLayout {
+    /// Most words on one caption line.
+    pub max_words: usize,
+    /// Most characters on one caption line; the tighter of the two limits wins.
+    pub max_chars: usize,
+    /// Vertical position as a fraction of frame height.
+    pub pos_y: f64,
+    /// Font height as a fraction of frame height.
+    pub size: f64,
+    /// Whether the text is drawn bold.
+    pub bold: bool,
+    /// Shortest a line may be before it merges into a neighbour.
+    pub min_line: f64,
+    /// Shortest a line clipped by a cut may be before it is dropped.
+    pub min_visible: f64,
+}
+
+/// How a transcript is turned into on-screen captions. Everything but the style
+/// is an *override*: omit a field and it follows the style, so asking for
+/// [`CaptionStyle::WordPunch`] on its own gets the whole look rather than one
+/// word left at subtitle size in the subtitle position.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CaptionOptions {
+    /// The look; defaults to [`CaptionStyle::Lines`].
+    #[serde(default)]
+    pub style: CaptionStyle,
+    /// Most words on one caption line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_words: Option<usize>,
+    /// Most characters on one caption line; the tighter of the two limits wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    /// Vertical position as a fraction of frame height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos_y: Option<f64>,
+    /// Font height as a fraction of frame height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+}
+
 impl CaptionOptions {
-    fn sanitized(self) -> Self {
+    /// A style with no overrides.
+    pub fn styled(style: CaptionStyle) -> Self {
         Self {
-            max_words: self.max_words.max(1),
-            max_chars: self.max_chars.max(1),
-            pos_y: if self.pos_y.is_finite() {
-                self.pos_y.clamp(0.0, 1.0)
-            } else {
-                default_caption_y()
-            },
-            size: if self.size.is_finite() {
-                self.size.clamp(0.005, 0.5)
-            } else {
-                default_caption_size()
-            },
+            style,
+            ..Self::default()
         }
+    }
+
+    /// The numbers to caption with: the style's, with any override that is
+    /// actually usable applied over them.
+    pub fn resolve(self) -> CaptionLayout {
+        let base = self.style.layout();
+        CaptionLayout {
+            max_words: self.max_words.map_or(base.max_words, |v| v.max(1)),
+            max_chars: self.max_chars.map_or(base.max_chars, |v| v.max(1)),
+            pos_y: overridden(self.pos_y, base.pos_y, 0.0, 1.0),
+            size: overridden(self.size, base.size, 0.005, 0.5),
+            ..base
+        }
+    }
+}
+
+/// Roughly how wide one character is as a fraction of the font size, measured
+/// off `drawtext`'s default face. Real caption text runs 0.44–0.75 depending on
+/// the word; 0.6 sits above the 0.52–0.55 that *long* text averages, and long
+/// text is the only kind that ever reaches the cap.
+const CHAR_ADVANCE: f64 = 0.6;
+
+/// How much of the frame width a caption may take.
+const CAPTION_WIDTH: f64 = 0.9;
+
+/// The frame captions assume when the project has not picked one. A timeline
+/// cannot see its assets, so it cannot derive the footage default `export_format`
+/// would use — and 16:9 is wide enough that the fit below never binds, which is
+/// what keeps an unframed project captioned exactly as it was before.
+const DEFAULT_CAPTION_ASPECT: f64 = 16.0 / 9.0;
+
+/// Shrink a caption's size (a fraction of frame height) until its text fits
+/// across a frame of `aspect` (width / height).
+///
+/// `drawtext` neither wraps nor scales: text wider than the frame is simply
+/// drawn off both edges. A 9:16 frame is barely half as wide as it is tall, so
+/// the social shape this whole feature is for is exactly where a long word runs
+/// off — and `fontsize` cannot be an expression over `text_w`, since the width
+/// is what depends on the size. So the fit is estimated here from the character
+/// count, which is the only measurement available before the filter runs.
+fn fit_size(text: &str, size: f64, aspect: f64) -> f64 {
+    let chars = text.chars().count().max(1) as f64;
+    size.min(CAPTION_WIDTH * aspect / (chars * CHAR_ADVANCE))
+}
+
+/// Apply an optional override, ignoring one that is not a finite number and
+/// clamping the rest into range.
+fn overridden(v: Option<f64>, base: f64, lo: f64, hi: f64) -> f64 {
+    match v {
+        Some(v) if v.is_finite() => v.clamp(lo, hi),
+        _ => base,
     }
 }
 
 /// Break a transcript line into caption-sized groups of words. Greedy: take
 /// words until either limit would be exceeded, always at least one (a single
 /// word longer than `max_chars` is its own line rather than being cut in half).
-fn chunk_words(text: &str, opts: CaptionOptions) -> Vec<String> {
+fn chunk_words(text: &str, layout: CaptionLayout) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut words = 0usize;
@@ -985,7 +1079,7 @@ fn chunk_words(text: &str, opts: CaptionOptions) -> Vec<String> {
         } else {
             word.chars().count() + 1
         };
-        let fits = words < opts.max_words && current.chars().count() + extra <= opts.max_chars;
+        let fits = words < layout.max_words && current.chars().count() + extra <= layout.max_chars;
         if !current.is_empty() && !fits {
             out.push(std::mem::take(&mut current));
             words = 0;
@@ -1054,7 +1148,10 @@ impl Timeline {
     /// Reads through [`Timeline::for_render`], so a muted track and a disabled
     /// clip are as uncaptioned as they are unheard.
     pub fn captions(&self, transcripts: &HashMap<Uuid, Vec<TranscriptSegment>>, opts: CaptionOptions) -> Vec<TextOverlay> {
-        let opts = opts.sanitized();
+        let layout = opts.resolve();
+        let aspect = self
+            .format
+            .map_or(DEFAULT_CAPTION_ASPECT, |d| f64::from(d.width) / f64::from(d.height));
         let rendered = self.for_render();
         let mut lines: Vec<(TimeRange, String)> = Vec::new();
         for track in &rendered.tracks {
@@ -1072,10 +1169,10 @@ impl Timeline {
                     // each line to the clip — so a sentence cut in half captions
                     // only the half that is still in the cut.
                     let span = clip.source_span_to_timeline(seg.start, seg.end);
-                    for (range, chunk) in time_chunks(chunk_words(text, opts), span, MIN_CAPTION) {
+                    for (range, chunk) in time_chunks(chunk_words(text, layout), span, layout.min_line) {
                         let start = range.start.max(visible_start);
                         let end = range.end.min(visible_end);
-                        if end - start < MIN_CAPTION_VISIBLE {
+                        if end - start < layout.min_visible {
                             continue;
                         }
                         lines.push((TimeRange { start, end }, chunk));
@@ -1099,7 +1196,7 @@ impl Timeline {
             let start = placed
                 .last()
                 .map_or(range.start, |(prev, _): &(TimeRange, String)| range.start.max(prev.end));
-            if range.end - start < MIN_CAPTION_VISIBLE {
+            if range.end - start < layout.min_visible {
                 continue;
             }
             placed.push((TimeRange { start, end: range.end }, text));
@@ -1107,9 +1204,11 @@ impl Timeline {
         placed
             .into_iter()
             .map(|(range, text)| {
+                let size = fit_size(&text, layout.size, aspect);
                 let mut o = TextOverlay::new(text, range.start.max(0.0), range.end);
-                o.pos_y = opts.pos_y;
-                o.size = opts.size;
+                o.pos_y = layout.pos_y;
+                o.size = size;
+                o.bold = layout.bold;
                 o.bg = Some("black@0.5".to_string());
                 o.generated = true;
                 o
@@ -3461,6 +3560,105 @@ mod tests {
                 pair[0]
             );
         }
+    }
+
+    #[test]
+    fn word_punch_puts_one_word_on_screen_at_a_time() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 5.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 5.0, "alpha bravo charlie delta echo")]);
+        let punched = timeline.captions(&map, CaptionOptions::styled(CaptionStyle::WordPunch));
+        assert_eq!(
+            punched.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(),
+            ["alpha", "bravo", "charlie", "delta", "echo"]
+        );
+        // The whole look, not just the word count: the line style would leave
+        // one word at subtitle size on the bottom edge.
+        let layout = CaptionStyle::WordPunch.layout();
+        assert!(punched
+            .iter()
+            .all(|o| o.bold && o.size == layout.size && o.pos_y == layout.pos_y));
+        // Each word hands the screen to the next with no gap and no overlap.
+        for pair in punched.windows(2) {
+            assert!((pair[1].start - pair[0].end).abs() < 1e-9, "{:?}", (&pair[0], &pair[1]));
+        }
+        // The default style is untouched by any of this.
+        let lines = timeline.captions(&map, CaptionOptions::default());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|o| !o.bold));
+    }
+
+    #[test]
+    fn a_word_too_short_to_read_joins_its_neighbour() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 2.0, 0.0));
+        let mut map = HashMap::new();
+        // "a" is one character of thirty, so its character share is ~0.07s —
+        // two frames, which is a flicker rather than a word.
+        map.insert(asset, vec![seg(0.0, 2.0, "a fairly quickly spoken sentence")]);
+        let punched = timeline.captions(&map, CaptionOptions::styled(CaptionStyle::WordPunch));
+        assert!(
+            punched.iter().all(|o| o.end - o.start >= MIN_WORD_CAPTION - 1e-6),
+            "{:?}",
+            punched.iter().map(|o| (&o.text, o.end - o.start)).collect::<Vec<_>>()
+        );
+        assert_eq!(punched[0].text, "a fairly", "the flicker merges instead of being dropped");
+    }
+
+    #[test]
+    fn an_override_moves_one_number_and_leaves_the_style_alone() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 5.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 5.0, "alpha bravo charlie delta echo")]);
+        let opts = CaptionOptions {
+            size: Some(0.2),
+            ..CaptionOptions::styled(CaptionStyle::WordPunch)
+        };
+        let punched = timeline.captions(&map, opts);
+        assert_eq!(punched.len(), 5, "still one word each");
+        assert!(punched.iter().all(|o| o.size == 0.2 && o.bold));
+        assert!(punched.iter().all(|o| o.pos_y == CaptionStyle::WordPunch.layout().pos_y));
+        // An unusable override falls back to the style rather than through it.
+        let junk = CaptionOptions {
+            size: Some(f64::NAN),
+            pos_y: Some(9.0),
+            ..CaptionOptions::styled(CaptionStyle::WordPunch)
+        };
+        let layout = junk.resolve();
+        assert_eq!(layout.size, CaptionStyle::WordPunch.layout().size);
+        assert_eq!(layout.pos_y, 1.0);
+    }
+
+    #[test]
+    fn a_long_word_is_shrunk_to_fit_a_vertical_frame() {
+        let asset = Uuid::new_v4();
+        let mut timeline = one_clip(Clip::new(asset, 0.0, 4.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 4.0, "non-destructive editing")]);
+        let opts = CaptionOptions::styled(CaptionStyle::WordPunch);
+        let full = CaptionStyle::WordPunch.layout().size;
+
+        // Unframed, so 16:9 — wide enough that nothing is shrunk, which is what
+        // keeps every project that never picked a frame captioned as it was.
+        let wide = timeline.captions(&map, opts);
+        assert!(wide.iter().all(|o| o.size == full), "{wide:?}");
+
+        // 9:16 is barely half as wide as it is tall, and `drawtext` neither
+        // wraps nor scales: the long word would be drawn off both edges.
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let tall = timeline.captions(&map, opts);
+        let long = tall.iter().find(|o| o.text == "non-destructive").expect("the long word");
+        let short = tall.iter().find(|o| o.text == "editing").expect("the short word");
+        assert!(long.size < full, "the long word shrinks: {}", long.size);
+        assert_eq!(short.size, full, "a word that already fits is left alone");
+        let aspect = 1080.0 / 1920.0;
+        assert!(
+            long.text.chars().count() as f64 * CHAR_ADVANCE * long.size <= CAPTION_WIDTH * aspect + 1e-9,
+            "still overflows: {}",
+            long.size
+        );
     }
 
     #[test]

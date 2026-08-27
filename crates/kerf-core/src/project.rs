@@ -13,9 +13,9 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection,
-    Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay,
-    TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker,
+    Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe,
+    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -2823,6 +2823,10 @@ impl Project {
     /// is on the wrong word. [`Timeline::captions`] does the projection, so
     /// captions follow the cut and words that were cut out get none.
     ///
+    /// `opts.style` picks the look — a held subtitle line, or one word at a
+    /// time — and everything else in [`CaptionOptions`] is an override on top
+    /// of it.
+    ///
     /// Errors when nothing on the timeline has a transcript to caption, rather
     /// than quietly writing no overlays.
     pub fn generate_captions(&self, opts: CaptionOptions) -> Result<Vec<TextOverlay>> {
@@ -2853,7 +2857,13 @@ impl Project {
             ));
         }
         let created = overlays.clone();
-        self.edit_timeline("Generate captions", move |timeline| {
+        // Name the style in the edit log: recaptioning in the other one is a
+        // different edit, and the history is where that has to be visible.
+        let label = match opts.style {
+            CaptionStyle::Lines => "Generate captions",
+            CaptionStyle::WordPunch => "Generate word captions",
+        };
+        self.edit_timeline(label, move |timeline| {
             timeline.overlays.retain(|o| !o.generated);
             timeline.overlays.extend(overlays);
             Ok(())
