@@ -1088,7 +1088,23 @@ impl Timeline {
         // and its detached audio both referencing the asset — and drawing one
         // caption twice is drawing it bolder, not twice.
         lines.dedup_by(|a, b| a.1 == b.1 && (a.0.start - b.0.start).abs() < 1e-3);
-        lines
+        // Captions are one lane of text at one screen position, so two at once is
+        // two unreadable ones. The same footage reaching the cut twice — a
+        // callback shot, or a full source parked under the edit — otherwise
+        // collides with whatever is already on screen. First line in wins the
+        // slot; the next starts where it ends, or is dropped if nothing readable
+        // is left of it.
+        let mut placed: Vec<(TimeRange, String)> = Vec::with_capacity(lines.len());
+        for (range, text) in lines {
+            let start = placed
+                .last()
+                .map_or(range.start, |(prev, _): &(TimeRange, String)| range.start.max(prev.end));
+            if range.end - start < MIN_CAPTION_VISIBLE {
+                continue;
+            }
+            placed.push((TimeRange { start, end: range.end }, text));
+        }
+        placed
             .into_iter()
             .map(|(range, text)| {
                 let mut o = TextOverlay::new(text, range.start.max(0.0), range.end);
@@ -3415,6 +3431,36 @@ mod tests {
         assert_eq!(lines[1].0, "first");
         assert!(lines[0].1.abs() < 1e-9);
         assert!((lines[1].1 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_captions_never_share_the_screen() {
+        let asset = Uuid::new_v4();
+        // The same footage twice in the cut at different offsets — a callback
+        // shot, or a full source parked under the edit. Both would caption the
+        // same words on top of each other.
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips = vec![Clip::new(asset, 3.0, 12.0, 0.0), Clip::new(asset, 0.0, 12.0, 0.0)];
+        let timeline = Timeline {
+            tracks: vec![track],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+        };
+        let lines = captioned(
+            &timeline,
+            asset,
+            vec![seg(0.0, 6.0, "alpha bravo charlie"), seg(6.0, 12.0, "delta echo foxtrot")],
+        );
+        assert!(lines.len() > 1, "{lines:?}");
+        for pair in lines.windows(2) {
+            assert!(
+                pair[1].1 >= pair[0].2 - 1e-6,
+                "{:?} starts before {:?} is off screen",
+                pair[1],
+                pair[0]
+            );
+        }
     }
 
     #[test]
