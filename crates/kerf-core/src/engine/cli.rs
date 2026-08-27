@@ -3363,8 +3363,11 @@ fn build_filter_complex(
                 let kf = clip.sorted_keyframes();
                 let xs: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_x)).collect();
                 let ys: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_y)).collect();
+                // Quoted for the same reason as the animated `drawtext` position:
+                // the piecewise expression contains commas, and an unquoted comma
+                // is where the graph parser thinks the filter ends.
                 format!(
-                    "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H:\
+                    "overlay=x='(W-w)/2+({px})*W':y='(H-h)/2+({py})*H':\
                      eof_action=pass:enable='between(t,{start},{end})'",
                     px = keyframe_expr(&xs, "t", clip.timeline_start),
                     py = keyframe_expr(&ys, "t", clip.timeline_start),
@@ -3788,8 +3791,10 @@ fn drawtext_export(o: &TextOverlay, fmt: &ExportFormat) -> String {
         let xs: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_x)).collect();
         let ys: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_y)).collect();
         let al: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.opacity)).collect();
-        parts.push(format!("x=(w*({})-text_w/2)", keyframe_expr(&xs, "t", o.start)));
-        parts.push(format!("y=(h*({})-text_h/2)", keyframe_expr(&ys, "t", o.start)));
+        // Quoted: a piecewise expression contains commas, and an unquoted comma
+        // ends the filter as far as the graph parser is concerned.
+        parts.push(format!("x='(w*({})-text_w/2)'", keyframe_expr(&xs, "t", o.start)));
+        parts.push(format!("y='(h*({})-text_h/2)'", keyframe_expr(&ys, "t", o.start)));
         parts.push(format!("alpha='{}'", keyframe_expr(&al, "t", o.start)));
     }
     parts.push(format!("enable='between(t,{},{})'", fnum(o.start), fnum(o.end)));
@@ -5520,7 +5525,7 @@ mod tests {
             &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
         );
         assert!(
-            g.filter.contains("overlay=x=(W-w)/2+(if(lt((t-2)"),
+            g.filter.contains("overlay=x='(W-w)/2+(if(lt((t-2)"),
             "animated overlay x: {}",
             g.filter
         );
@@ -7648,6 +7653,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(dark < 30.0, "contain should letterbox the top, got luma {dark}");
         assert!(bright > 60.0, "cover should fill the top with picture, got luma {bright}");
+    }
+
+    /// A piecewise position expression contains commas, and the filtergraph
+    /// parser treats an unquoted comma as the end of the filter — so a clip with
+    /// position keyframes, or an *animated text overlay*, made ffmpeg fail the
+    /// whole render with `No such filter`. Nothing caught it: every unit test
+    /// above asserts on the graph string, and the graph string looked right.
+    ///
+    /// Both are on the default path — the Text overlays style chips animate an
+    /// overlay's opacity, which puts it on the keyframed branch — so this renders
+    /// one of each and only asks that ffmpeg accept the graph.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored animated_positions`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn animated_positions_survive_the_filtergraph_parser() {
+        let dir = std::env::temp_dir().join(format!("kerf-anim-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(320, 180, 30.0)];
+
+        let mut clip = make_clip(asset.id, 0.0, 2.0, 0.0);
+        clip.keyframes = vec![
+            crate::model::Keyframe {
+                time: 0.0,
+                scale: 1.0,
+                pos_x: -0.2,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+            crate::model::Keyframe {
+                time: 2.0,
+                scale: 1.0,
+                pos_x: 0.2,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+        ];
+        let mut timeline = single(vec![clip]);
+        // An overlay animated the way the Text overlays style chips animate one.
+        let mut overlay = TextOverlay::new("Kerf".to_string(), 0.0, 2.0);
+        overlay.keyframes = vec![
+            crate::model::TextKeyframe {
+                time: 0.0,
+                pos_x: 0.5,
+                pos_y: 0.5,
+                opacity: 0.0,
+            },
+            crate::model::TextKeyframe {
+                time: 1.0,
+                pos_x: 0.5,
+                pos_y: 0.8,
+                opacity: 1.0,
+            },
+        ];
+        timeline.overlays = vec![overlay];
+
+        let out = dir.join("anim.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let rendered = render_with(&timeline, &[asset], &out, &opts);
+        let ok = rendered.is_ok() && out.exists();
+        let err = rendered.err().map(|e| e.to_string()).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "an animated clip and overlay must render: {err}");
     }
 
     /// The delivery frame is the point of the whole feature: with it set and
