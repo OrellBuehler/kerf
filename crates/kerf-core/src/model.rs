@@ -765,6 +765,12 @@ pub struct TextOverlay {
     /// opacity animate over the overlay's lifetime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keyframes: Vec<TextKeyframe>,
+    /// Written by [`Timeline::captions`] rather than by hand. Regenerating
+    /// captions replaces these and leaves everything else alone, so re-running
+    /// after a trim does not stack a second set on top of the first — and does
+    /// not throw away the title the editor typed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
 }
 
 impl TextOverlay {
@@ -782,6 +788,7 @@ impl TextOverlay {
             font: None,
             bold: false,
             keyframes: Vec::new(),
+            generated: false,
         }
     }
 
@@ -886,6 +893,213 @@ pub fn transcript_to_srt(segments: &[TranscriptSegment]) -> String {
         ));
     }
     out
+}
+
+/// Shortest a generated caption line is allowed to stay on screen (seconds).
+/// Splitting a fast sentence strictly by character share can hand a two-letter
+/// chunk a couple of frames, which reads as a flicker rather than as a word, so
+/// chunks below this are merged back into a neighbour instead.
+pub const MIN_CAPTION: f64 = 0.45;
+
+/// How much of a caption line has to survive a cut for it to be kept (seconds).
+/// A line whose words were trimmed away leaves a sliver of overlap at the clip
+/// edge; showing it would caption footage that is no longer there.
+pub const MIN_CAPTION_VISIBLE: f64 = 0.15;
+
+/// How a transcript is turned into on-screen captions. The defaults are the
+/// social shape — a few words at a time, sized to be read on a phone — because a
+/// speech model emits whole sentences and a whole sentence does not fit a 9:16
+/// frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CaptionOptions {
+    /// Most words on one caption line.
+    #[serde(default = "default_caption_words")]
+    pub max_words: usize,
+    /// Most characters on one caption line; the tighter of the two limits wins.
+    #[serde(default = "default_caption_chars")]
+    pub max_chars: usize,
+    /// Vertical position as a fraction of frame height.
+    #[serde(default = "default_caption_y")]
+    pub pos_y: f64,
+    /// Font height as a fraction of frame height.
+    #[serde(default = "default_caption_size")]
+    pub size: f64,
+}
+
+fn default_caption_words() -> usize {
+    4
+}
+
+fn default_caption_chars() -> usize {
+    28
+}
+
+fn default_caption_y() -> f64 {
+    0.88
+}
+
+fn default_caption_size() -> f64 {
+    0.05
+}
+
+impl Default for CaptionOptions {
+    fn default() -> Self {
+        Self {
+            max_words: default_caption_words(),
+            max_chars: default_caption_chars(),
+            pos_y: default_caption_y(),
+            size: default_caption_size(),
+        }
+    }
+}
+
+impl CaptionOptions {
+    fn sanitized(self) -> Self {
+        Self {
+            max_words: self.max_words.max(1),
+            max_chars: self.max_chars.max(1),
+            pos_y: if self.pos_y.is_finite() {
+                self.pos_y.clamp(0.0, 1.0)
+            } else {
+                default_caption_y()
+            },
+            size: if self.size.is_finite() {
+                self.size.clamp(0.005, 0.5)
+            } else {
+                default_caption_size()
+            },
+        }
+    }
+}
+
+/// Break a transcript line into caption-sized groups of words. Greedy: take
+/// words until either limit would be exceeded, always at least one (a single
+/// word longer than `max_chars` is its own line rather than being cut in half).
+fn chunk_words(text: &str, opts: CaptionOptions) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut words = 0usize;
+    for word in text.split_whitespace() {
+        let extra = if current.is_empty() {
+            word.chars().count()
+        } else {
+            word.chars().count() + 1
+        };
+        let fits = words < opts.max_words && current.chars().count() + extra <= opts.max_chars;
+        if !current.is_empty() && !fits {
+            out.push(std::mem::take(&mut current));
+            words = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        words += 1;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Spread `span` across `chunks` in proportion to how much text each carries,
+/// then merge away any line too short to read. Character share is the honest
+/// approximation available here: neither speech backend reports word timings
+/// (`TranscriptSegment` has only a start and an end), so within a segment the
+/// speaker is assumed to be at a steady pace.
+fn time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange, String)> {
+    let mut chunks = chunks;
+    let duration = (span.end - span.start).max(0.0);
+    loop {
+        let weights: Vec<f64> = chunks.iter().map(|c| c.chars().count().max(1) as f64).collect();
+        let total: f64 = weights.iter().sum();
+        let mut timed: Vec<(TimeRange, String)> = Vec::with_capacity(chunks.len());
+        let mut at = span.start;
+        for (i, text) in chunks.iter().enumerate() {
+            let share = if total > 0.0 { weights[i] / total } else { 1.0 };
+            let end = if i + 1 == chunks.len() {
+                span.end
+            } else {
+                at + duration * share
+            };
+            timed.push((TimeRange { start: at, end }, text.clone()));
+            at = end;
+        }
+        // A whole segment shorter than `min` is one line, not a merge loop.
+        if chunks.len() < 2 {
+            return timed;
+        }
+        let short = timed.iter().position(|(r, _)| r.end - r.start < min);
+        let Some(i) = short else { return timed };
+        // Merge into the shorter neighbour so the joined line stays as close to
+        // the requested width as the timing allows.
+        let merge_back = i > 0 && (i + 1 == chunks.len() || chunks[i - 1].chars().count() <= chunks[i + 1].chars().count());
+        let into = if merge_back { i - 1 } else { i };
+        let moved = chunks.remove(into + 1);
+        chunks[into] = format!("{}{}{}", chunks[into], ' ', moved);
+    }
+}
+
+impl Timeline {
+    /// Caption overlays for the cut as it currently stands.
+    ///
+    /// The point of doing this over the timeline rather than over an asset: a
+    /// transcript is in **source** time, an overlay is in **timeline** time, and
+    /// between them sit every trim, every reorder, every speed change and every
+    /// silence the editor removed. Each segment is projected through the clips
+    /// that actually show its footage ([`Clip::source_span_to_timeline`]), so
+    /// captions land on the words that survived the cut — and words that did not
+    /// survive get no caption at all.
+    ///
+    /// Reads through [`Timeline::for_render`], so a muted track and a disabled
+    /// clip are as uncaptioned as they are unheard.
+    pub fn captions(&self, transcripts: &HashMap<Uuid, Vec<TranscriptSegment>>, opts: CaptionOptions) -> Vec<TextOverlay> {
+        let opts = opts.sanitized();
+        let rendered = self.for_render();
+        let mut lines: Vec<(TimeRange, String)> = Vec::new();
+        for track in &rendered.tracks {
+            for clip in &track.clips {
+                let Some(segments) = transcripts.get(&clip.asset_id) else {
+                    continue;
+                };
+                let (visible_start, visible_end) = (clip.timeline_start, clip.timeline_end());
+                for seg in segments {
+                    let text = seg.text.trim();
+                    if text.is_empty() || seg.end <= seg.start || !clip.covers_source(seg.start, seg.end) {
+                        continue;
+                    }
+                    // Chunk over the segment's *whole* projected span, then clip
+                    // each line to the clip — so a sentence cut in half captions
+                    // only the half that is still in the cut.
+                    let span = clip.source_span_to_timeline(seg.start, seg.end);
+                    for (range, chunk) in time_chunks(chunk_words(text, opts), span, MIN_CAPTION) {
+                        let start = range.start.max(visible_start);
+                        let end = range.end.min(visible_end);
+                        if end - start < MIN_CAPTION_VISIBLE {
+                            continue;
+                        }
+                        lines.push((TimeRange { start, end }, chunk));
+                    }
+                }
+            }
+        }
+        lines.sort_by(|a, b| a.0.start.total_cmp(&b.0.start).then_with(|| a.1.cmp(&b.1)));
+        // The same words can reach two clips — `extract_audio` leaves the picture
+        // and its detached audio both referencing the asset — and drawing one
+        // caption twice is drawing it bolder, not twice.
+        lines.dedup_by(|a, b| a.1 == b.1 && (a.0.start - b.0.start).abs() < 1e-3);
+        lines
+            .into_iter()
+            .map(|(range, text)| {
+                let mut o = TextOverlay::new(text, range.start.max(0.0), range.end);
+                o.pos_y = opts.pos_y;
+                o.size = opts.size;
+                o.bg = Some("black@0.5".to_string());
+                o.generated = true;
+                o
+            })
+            .collect()
+    }
 }
 
 /// A single non-destructive edit referencing a source range of an asset.
@@ -1074,6 +1288,28 @@ impl Clip {
             source - self.source_in
         };
         self.timeline_start + offset / self.speed_mag()
+    }
+
+    /// True when any part of the source span `[from, to)` is inside this clip's
+    /// source window — i.e. whether this clip actually shows that footage.
+    pub fn covers_source(&self, from: f64, to: f64) -> bool {
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        hi.min(self.source_out) > lo.max(self.source_in)
+    }
+
+    /// Where a source span lands on the timeline, as an ordered range. The ends
+    /// are mapped through [`Clip::source_to_timeline`] and **not** clamped to the
+    /// clip, so a span that starts before the in-point maps to a time before
+    /// `timeline_start` — the caller decides what to do with the part that was
+    /// trimmed away. A reversed clip swaps the ends, which is why the result is
+    /// ordered rather than built from `from`/`to` directly.
+    pub fn source_span_to_timeline(&self, from: f64, to: f64) -> TimeRange {
+        let a = self.source_to_timeline(from);
+        let b = self.source_to_timeline(to);
+        TimeRange {
+            start: a.min(b),
+            end: a.max(b),
+        }
     }
 }
 
@@ -3023,5 +3259,189 @@ mod tests {
         assert!(map.crop_for(1920, 1080, 0.0).is_none());
         assert!(map.crop_for(1920, 1080, f64::NAN).is_none());
         assert!(map.crop_for(0, 1080, 1.0).is_none());
+    }
+
+    fn seg(start: f64, end: f64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+
+    fn captioned(timeline: &Timeline, asset: Uuid, segments: Vec<TranscriptSegment>) -> Vec<(String, f64, f64)> {
+        let mut map = HashMap::new();
+        map.insert(asset, segments);
+        timeline
+            .captions(&map, CaptionOptions::default())
+            .into_iter()
+            .map(|o| (o.text, (o.start * 100.0).round() / 100.0, (o.end * 100.0).round() / 100.0))
+            .collect()
+    }
+
+    fn one_clip(clip: Clip) -> Timeline {
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips = vec![clip];
+        Timeline {
+            tracks: vec![track],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+        }
+    }
+
+    #[test]
+    fn source_span_maps_through_trim_speed_and_reverse() {
+        let asset = Uuid::new_v4();
+        // Trimmed: the asset's 10s starts at the clip's in-point, placed at 4s.
+        let mut clip = Clip::new(asset, 10.0, 20.0, 4.0);
+        let r = clip.source_span_to_timeline(12.0, 14.0);
+        assert!((r.start - 6.0).abs() < 1e-9, "{r:?}");
+        assert!((r.end - 8.0).abs() < 1e-9, "{r:?}");
+
+        // Double speed halves the distance from the in-point.
+        clip.speed = 2.0;
+        let r = clip.source_span_to_timeline(12.0, 14.0);
+        assert!((r.start - 5.0).abs() < 1e-9, "{r:?}");
+        assert!((r.end - 6.0).abs() < 1e-9, "{r:?}");
+
+        // Reversed: the source's tail is heard first, and the range stays ordered.
+        clip.speed = -1.0;
+        let r = clip.source_span_to_timeline(12.0, 14.0);
+        assert!((r.start - 10.0).abs() < 1e-9, "{r:?}");
+        assert!((r.end - 12.0).abs() < 1e-9, "{r:?}");
+        assert!(r.end > r.start);
+    }
+
+    #[test]
+    fn covers_source_is_the_clips_own_window() {
+        let clip = Clip::new(Uuid::new_v4(), 10.0, 20.0, 0.0);
+        assert!(clip.covers_source(12.0, 14.0));
+        assert!(clip.covers_source(8.0, 11.0), "straddling the in-point still shows");
+        assert!(!clip.covers_source(0.0, 10.0), "ending exactly at the in-point shows nothing");
+        assert!(!clip.covers_source(20.0, 25.0));
+    }
+
+    #[test]
+    fn captions_follow_a_trimmed_and_moved_clip() {
+        let asset = Uuid::new_v4();
+        // The interesting case: the transcript says 30s, the cut says 0s.
+        let timeline = one_clip(Clip::new(asset, 30.0, 34.0, 0.0));
+        let lines = captioned(&timeline, asset, vec![seg(30.0, 34.0, "one two three four")]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "one two three four");
+        // Timeline time, not the transcript's 30.0.
+        assert!(lines[0].1.abs() < 1e-9, "{lines:?}");
+        assert!((lines[0].2 - 4.0).abs() < 1e-9, "{lines:?}");
+    }
+
+    #[test]
+    fn a_sentence_cut_in_half_only_captions_what_survived() {
+        let asset = Uuid::new_v4();
+        // A four-word line spoken over 0..4s, but the cut keeps only 0..2s.
+        let timeline = one_clip(Clip::new(asset, 0.0, 2.0, 0.0));
+        let lines = captioned(
+            &timeline,
+            asset,
+            vec![seg(0.0, 4.0, "alpha bravo charlie delta echo foxtrot")],
+        );
+        assert!(!lines.is_empty());
+        // Nothing runs past the end of the clip that carries it.
+        for (text, start, end) in &lines {
+            assert!(*end <= 2.0 + 1e-9, "{text:?} runs to {end} past the clip");
+            assert!(*start >= -1e-9);
+        }
+        // The words spoken in the discarded half are gone.
+        assert!(!lines.iter().any(|(t, _, _)| t.contains("foxtrot")), "{lines:?}");
+    }
+
+    #[test]
+    fn long_segments_split_into_readable_lines() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 8.0, 0.0));
+        let lines = captioned(
+            &timeline,
+            asset,
+            vec![seg(0.0, 8.0, "Today we are talking about non-destructive editing in Kerf")],
+        );
+        assert!(lines.len() > 1, "a ten-word sentence should not be one caption: {lines:?}");
+        for (text, _, _) in &lines {
+            assert!(text.split_whitespace().count() <= 4, "{text:?} is too many words");
+        }
+        // The lines are contiguous, in order, and cover the segment.
+        assert!(lines[0].1.abs() < 1e-9);
+        assert!((lines.last().unwrap().2 - 8.0).abs() < 1e-9);
+        for pair in lines.windows(2) {
+            assert!(pair[1].1 >= pair[0].1);
+        }
+        // Rejoining the lines gives the sentence back, word for word.
+        let rejoined = lines.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>().join(" ");
+        assert_eq!(rejoined, "Today we are talking about non-destructive editing in Kerf");
+    }
+
+    #[test]
+    fn fast_speech_merges_rather_than_flickering() {
+        let asset = Uuid::new_v4();
+        // Eight words in 0.9s: split four ways each line would last ~0.22s.
+        let timeline = one_clip(Clip::new(asset, 0.0, 0.9, 0.0));
+        let lines = captioned(&timeline, asset, vec![seg(0.0, 0.9, "a b c d e f g h")]);
+        for (text, start, end) in &lines {
+            assert!(
+                end - start >= MIN_CAPTION - 1e-6 || lines.len() == 1,
+                "{text:?} flashes for {}s",
+                end - start
+            );
+        }
+        // No words were lost to the merging.
+        let rejoined = lines.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>().join(" ");
+        assert_eq!(rejoined, "a b c d e f g h");
+    }
+
+    #[test]
+    fn captions_are_ordered_by_the_cut_not_by_the_source() {
+        let asset = Uuid::new_v4();
+        // The second half of the source is cut to play first.
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips = vec![Clip::new(asset, 10.0, 12.0, 0.0), Clip::new(asset, 0.0, 2.0, 2.0)];
+        let timeline = Timeline {
+            tracks: vec![track],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+        };
+        let lines = captioned(&timeline, asset, vec![seg(0.0, 2.0, "first"), seg(10.0, 12.0, "second")]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].0, "second", "the reordered cut leads with the later words");
+        assert_eq!(lines[1].0, "first");
+        assert!(lines[0].1.abs() < 1e-9);
+        assert!((lines[1].1 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_muted_track_is_not_captioned() {
+        let asset = Uuid::new_v4();
+        let mut timeline = one_clip(Clip::new(asset, 0.0, 4.0, 0.0));
+        assert!(!captioned(&timeline, asset, vec![seg(0.0, 4.0, "heard")]).is_empty());
+        timeline.tracks[0].muted = true;
+        assert!(captioned(&timeline, asset, vec![seg(0.0, 4.0, "heard")]).is_empty());
+    }
+
+    #[test]
+    fn the_same_words_on_two_tracks_are_captioned_once() {
+        let asset = Uuid::new_v4();
+        // What `extract_audio` leaves behind: picture and detached audio, both
+        // referencing the same asset over the same source window.
+        let mut video = Track::new(StreamKind::Video, "V1");
+        video.clips = vec![Clip::new(asset, 0.0, 3.0, 0.0)];
+        let mut audio = Track::new(StreamKind::Audio, "A1");
+        audio.clips = vec![Clip::new(asset, 0.0, 3.0, 0.0)];
+        let timeline = Timeline {
+            tracks: vec![video, audio],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+        };
+        let lines = captioned(&timeline, asset, vec![seg(0.0, 3.0, "only once")]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
     }
 }

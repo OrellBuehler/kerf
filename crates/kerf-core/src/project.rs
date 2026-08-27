@@ -13,9 +13,9 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection, Reframe,
-    ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
-    Timeline, TimelineDiff, Track, Transition, VideoEffect, MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection,
+    Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay,
+    TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -2811,35 +2811,64 @@ impl Project {
         })
     }
 
-    /// Generate caption overlays from an asset's cached transcript — one per
-    /// segment, low-center with a translucent box. The segments keep the
-    /// transcript's own timestamps, so they line up when the asset sits at the
-    /// start of the timeline at normal speed. Returns the overlays created.
-    pub fn captions_from_transcript(&self, asset_id: Uuid) -> Result<Vec<TextOverlay>> {
-        let analysis = self
-            .get_analysis(asset_id)?
-            .ok_or_else(|| Error::InvalidArgument("no analysis available for asset; run analysis first".to_string()))?;
-        let overlays: Vec<TextOverlay> = analysis
-            .transcript
-            .iter()
-            .filter(|s| !s.text.trim().is_empty() && s.end > s.start)
-            .map(|s| {
-                let mut o = TextOverlay::new(s.text.trim().to_string(), s.start.max(0.0), s.end);
-                o.pos_y = 0.88;
-                o.size = 0.05;
-                o.bg = Some("black@0.5".to_string());
-                o
-            })
-            .collect();
+    /// Caption the cut: project every clip's cached transcript through the edit
+    /// and write the result as text overlays, replacing any previous generated
+    /// set.
+    ///
+    /// This is deliberately timeline-scoped rather than asset-scoped. A
+    /// transcript is in source time and an overlay is in timeline time, and the
+    /// two only agree on an untouched asset sitting at zero — which is not a cut.
+    /// The moment anything is trimmed, reordered, retimed or (most of all)
+    /// silence-removed, source time and timeline time diverge and every caption
+    /// is on the wrong word. [`Timeline::captions`] does the projection, so
+    /// captions follow the cut and words that were cut out get none.
+    ///
+    /// Errors when nothing on the timeline has a transcript to caption, rather
+    /// than quietly writing no overlays.
+    pub fn generate_captions(&self, opts: CaptionOptions) -> Result<Vec<TextOverlay>> {
+        let timeline = self.working_timeline()?;
+        let mut transcripts: HashMap<Uuid, Vec<TranscriptSegment>> = HashMap::new();
+        let mut analyzed = false;
+        for track in &timeline.tracks {
+            for clip in &track.clips {
+                if transcripts.contains_key(&clip.asset_id) {
+                    continue;
+                }
+                let Some(analysis) = self.get_analysis(clip.asset_id)? else {
+                    continue;
+                };
+                analyzed = true;
+                transcripts.insert(clip.asset_id, analysis.transcript);
+            }
+        }
+        if !analyzed {
+            return Err(Error::InvalidArgument(
+                "no analysis available for the clips on the timeline; run analysis first".to_string(),
+            ));
+        }
+        let overlays = timeline.captions(&transcripts, opts);
         if overlays.is_empty() {
-            return Err(Error::InvalidArgument("asset has no usable transcript".to_string()));
+            return Err(Error::InvalidArgument(
+                "no speech was transcribed for the footage in this cut".to_string(),
+            ));
         }
         let created = overlays.clone();
-        self.edit_timeline("Add captions from transcript", move |timeline| {
+        self.edit_timeline("Generate captions", move |timeline| {
+            timeline.overlays.retain(|o| !o.generated);
             timeline.overlays.extend(overlays);
             Ok(())
         })?;
         Ok(created)
+    }
+
+    /// Remove the captions [`Project::generate_captions`] wrote, leaving titles
+    /// and lower-thirds alone.
+    pub fn clear_captions(&self) -> Result<usize> {
+        self.edit_timeline("Clear captions", move |timeline| {
+            let before = timeline.overlays.len();
+            timeline.overlays.retain(|o| !o.generated);
+            Ok(before - timeline.overlays.len())
+        })
     }
 
     /// Render an asset's cached transcript as a SubRip (`.srt`) document.
@@ -4347,5 +4376,60 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let (ti, ci) = timeline.locate(clip_id).unwrap();
         timeline.tracks[ti].clips[ci].transform
+    }
+
+    #[test]
+    fn captions_survive_the_cut_that_silence_removal_makes() {
+        let project = Project::sample().unwrap();
+        let asset = project.list_assets().unwrap()[0].id;
+        // The sample's transcript is two lines over 0..12.5s with a silence at
+        // 12.5..14.0; put the asset on the timeline at a non-zero position and
+        // trimmed, which is what makes source time and timeline time disagree.
+        let timeline = project.timeline().unwrap();
+        let track = timeline.tracks[0].id;
+        for t in &timeline.tracks {
+            for clip in &t.clips {
+                project.remove(clip.id).unwrap();
+            }
+        }
+        project
+            .add_clip_to_timeline(asset, Some(track), 5.5, 12.5, Some(2.0))
+            .unwrap();
+
+        let created = project.generate_captions(CaptionOptions::default()).unwrap();
+        assert!(!created.is_empty());
+        // Every caption sits inside the clip's timeline span (2.0 .. 9.0), not
+        // at the transcript's own 5.5 .. 12.5.
+        for o in &created {
+            assert!(o.start >= 2.0 - 1e-6 && o.end <= 9.0 + 1e-6, "{o:?} is in source time");
+            assert!(o.generated);
+        }
+        // The line spoken before the in-point was trimmed away, so it gets none.
+        assert!(
+            !created.iter().any(|o| o.text.contains("Welcome")),
+            "captioned words that are not in the cut: {created:?}"
+        );
+
+        // Regenerating replaces rather than stacks, and leaves a hand-made
+        // title alone.
+        let title = project.add_overlay("Chapter one".to_string(), 0.0, 1.5).unwrap();
+        let again = project.generate_captions(CaptionOptions::default()).unwrap();
+        let overlays = project.timeline().unwrap().overlays;
+        assert_eq!(overlays.iter().filter(|o| o.generated).count(), again.len());
+        assert!(overlays.iter().any(|o| o.id == title.id), "the typed title was thrown away");
+
+        // Clearing takes only the generated ones.
+        let cleared = project.clear_captions().unwrap();
+        assert_eq!(cleared, again.len());
+        let overlays = project.timeline().unwrap().overlays;
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].id, title.id);
+    }
+
+    #[test]
+    fn captions_need_something_transcribed_on_the_timeline() {
+        let project = Project::open_in_memory().unwrap();
+        let err = project.generate_captions(CaptionOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("run analysis first"), "{err}");
     }
 }
