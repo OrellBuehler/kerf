@@ -370,7 +370,9 @@ struct ColorParams {
 struct TransitionParams {
     #[schemars(description = "UUID of the clip whose start blends with the clip before it on the same track")]
     clip_id: String,
-    #[schemars(description = "Transition kind: \"crossfade\" or \"dip_to_black\". Omit to clear the transition")]
+    #[schemars(
+        description = "Transition kind. Fades: \"crossfade\", \"dip_to_black\", \"dip_to_white\". Motion, named for the direction of travel: \"slide_left\" / \"slide_right\" / \"slide_up\" / \"slide_down\" brings the new shot in over the old one, \"push_left\" / \"push_right\" / \"push_up\" / \"push_down\" carries the old one out with it. Omit to clear the transition"
+    )]
     kind: Option<String>,
     #[schemars(description = "Transition duration in seconds (required when a kind is given)")]
     duration: Option<f64>,
@@ -1092,7 +1094,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set or clear the transition blending a clip's start with the clip before it on the same track. kind is \"crossfade\" or \"dip_to_black\" with a duration in seconds; omit kind to clear."
+        description = "Set or clear the transition blending a clip's start with the clip before it on the same track, with a duration in seconds; omit kind to clear. A dissolve or a motion transition plays both shots at once, so it borrows the outgoing clip's unused source — a clip trimmed to the very end of its footage has none to lend and the transition falls back to a hard cut. Dips need no handle. Reach for a fade between scenes and a motion transition between shots in a montage; a cut needs no transition at all."
     )]
     fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -1672,7 +1674,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. Mid-transition blends (crossfade/dip-to-black) are approximated."
+        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. A moment inside a transition is not: dissolves, dips and slides render as the plain cut."
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
@@ -1792,8 +1794,9 @@ impl ServerHandler for KerfMcp {
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
-             crop — picture-in-picture), set_color and set_transition (crossfade \
-             / dip-to-black). Go further: set_video_effects (blur / sharpen / \
+             crop — picture-in-picture), set_color and set_transition (a fade \
+             between scenes, a slide or push between the shots of a montage). \
+             Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
              track shows through), set_audio_effects (highpass / lowpass / EQ / \
              compressor / gate), and animate a clip with set_keyframes / \
@@ -1942,7 +1945,10 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Optio
         Some(k) => {
             let kind = TransitionKind::parse(&k).ok_or_else(|| {
                 McpError::invalid_params(
-                    format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""),
+                    format!(
+                        "invalid transition kind '{k}'; expected one of {}",
+                        TransitionKind::wire_names()
+                    ),
                     None,
                 )
             })?;

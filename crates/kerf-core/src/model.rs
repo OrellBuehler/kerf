@@ -464,6 +464,16 @@ impl TransitionKind {
         TransitionKind::PushDown,
     ];
 
+    /// Every kind's wire name, quoted and comma-joined — so an error message
+    /// listing what was expected cannot drift from the enum.
+    pub fn wire_names() -> String {
+        Self::ALL
+            .iter()
+            .map(|k| format!("\"{}\"", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The solid colour this transition dips through, if it is a dip.
     pub fn dip_color(self) -> Option<&'static str> {
         match self {
@@ -3556,6 +3566,30 @@ mod tests {
         assert!(clip.covers_source(8.0, 11.0), "straddling the in-point still shows");
         assert!(!clip.covers_source(0.0, 10.0), "ending exactly at the in-point shows nothing");
         assert!(!clip.covers_source(20.0, 25.0));
+    }
+
+    #[test]
+    fn every_transition_kind_round_trips_and_knows_its_family() {
+        for k in TransitionKind::ALL {
+            assert_eq!(TransitionKind::parse(k.as_str()), Some(k), "{k:?} must survive the wire");
+            assert!(
+                TransitionKind::wire_names().contains(k.as_str()),
+                "{k:?} must be listed for a caller"
+            );
+            // Exactly one family each: a dip has a colour and never moves, a
+            // motion transition moves and never dips, a dissolve does neither.
+            assert!(
+                !(k.dip_color().is_some() && k.slide_from().is_some()),
+                "{k:?} cannot both dip and travel"
+            );
+            assert_eq!(k.dip_color().is_some(), !k.overlaps(), "{k:?}: only a dip skips the overlap");
+            assert!(!k.pushes() || k.slide_from().is_some(), "{k:?}: a push must have a direction");
+        }
+        // A slide and its push travel the same way; the difference is what
+        // happens to the outgoing clip, not where the incoming one comes from.
+        assert_eq!(TransitionKind::SlideLeft.slide_from(), TransitionKind::PushLeft.slide_from());
+        assert!(!TransitionKind::SlideLeft.pushes() && TransitionKind::PushLeft.pushes());
+        assert_eq!(TransitionKind::parse("nonsense"), None);
     }
 
     #[test]

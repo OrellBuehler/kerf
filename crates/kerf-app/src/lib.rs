@@ -85,8 +85,12 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
     match kind {
         None => Ok(None),
         Some(k) => {
-            let kind = TransitionKind::parse(&k)
-                .ok_or_else(|| format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""))?;
+            let kind = TransitionKind::parse(&k).ok_or_else(|| {
+                format!(
+                    "invalid transition kind '{k}'; expected one of {}",
+                    TransitionKind::wire_names()
+                )
+            })?;
             let duration = duration.ok_or("transition duration is required")?;
             Ok(Some(Transition { kind, duration }))
         }
