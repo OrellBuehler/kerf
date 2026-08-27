@@ -98,6 +98,35 @@ export interface Color {
 	temperature: number;
 }
 
+export type MaskShape = 'rect' | 'ellipse';
+
+/** A shape cut out of a clip: inside it the clip is kept, outside it goes
+ *  transparent so a lower track shows through. Everything is a fraction of the
+ *  rendered frame. Mirrors `Mask` in crates/kerf-core/src/model.rs. */
+export interface Mask {
+	shape: MaskShape;
+	/** Centre of the shape, 0..1 across and down the frame. */
+	x: number;
+	y: number;
+	/** Full width / height of the shape as a fraction of the frame. */
+	width: number;
+	height: number;
+	/** Edge softness as a fraction of the shape's half-size; 0 is a hard cut. */
+	feather: number;
+	/** Keep what is outside the shape instead of inside it. */
+	inverted?: boolean;
+}
+
+export const DEFAULT_MASK: Mask = {
+	shape: 'ellipse',
+	x: 0.5,
+	y: 0.5,
+	width: 0.5,
+	height: 0.5,
+	feather: 0.15,
+	inverted: false
+};
+
 export type TransitionKind =
 	| 'crossfade'
 	| 'dip_to_black'
@@ -234,6 +263,8 @@ export interface Clip {
 	transform?: Transform;
 	color?: Color;
 	transition_in?: Transition | null;
+	/** A shape cut out of this clip; absent is the whole frame. */
+	mask?: Mask | null;
 	effects?: VideoEffect[];
 	audio?: AudioEffect[];
 	keyframes?: Keyframe[];

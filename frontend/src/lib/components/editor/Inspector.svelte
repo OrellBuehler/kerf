@@ -6,7 +6,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
+	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
 	import { needsCrop } from '$lib/smart-crop';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
@@ -14,6 +14,7 @@
 	import type {
 		AudioEffect,
 		CaptionStyle,
+		Mask,
 		Projection,
 		Reframe,
 		Transform,
@@ -129,6 +130,10 @@
 	const col = $derived(clip?.color ?? DEFAULT_COLOR);
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
+	const mask = $derived(clip?.mask ?? null);
+	/** Patch the clip's mask, starting from the default when there is none. */
+	const patchMask = (patch: Partial<Mask>) =>
+		run(() => editor.setMask(clip!.id, { ...DEFAULT_MASK, ...(mask ?? {}), ...patch }));
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
@@ -879,6 +884,54 @@
 				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { gamma: v }))
 				)}
+			{/if}
+
+			{@render secHead('Mask')}
+			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+				<button
+					style={chip(!mask)}
+					disabled={editor.busy}
+					title="No mask — the whole frame"
+					onclick={() => run(() => editor.setMask(clip.id, null))}>None</button
+				>
+				<button
+					style={chip(mask?.shape === 'rect')}
+					disabled={editor.busy}
+					title="Cut this clip to a rectangle"
+					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</button
+				>
+				<button
+					style={chip(mask?.shape === 'ellipse')}
+					disabled={editor.busy}
+					title="Cut this clip to an ellipse"
+					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</button
+				>
+			</div>
+			{#if mask}
+				{@render rangeRow('Centre X', mask.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ x: v }))}
+				{@render rangeRow('Centre Y', mask.y, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ y: v }))}
+				{@render rangeRow('Width', mask.width, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ width: v })
+				)}
+				{@render rangeRow('Height', mask.height, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ height: v })
+				)}
+				{@render rangeRow('Feather', mask.feather, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ feather: v })
+				)}
+				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+					<span style="font-size:12px;color:var(--text-muted)">Invert</span>
+					<input
+						type="checkbox"
+						checked={!!mask.inverted}
+						disabled={editor.busy}
+						onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}
+					/>
+				</label>
+				<div style="font:var(--type-caption);color:var(--text-muted);margin:2px 0 6px">
+					Outside the shape this clip is transparent, so a lower track shows through. To blur a
+					face: duplicate the shot onto the track above, blur the copy, mask the copy.
+				</div>
 			{/if}
 
 			{@render secHead('Transition (in)')}

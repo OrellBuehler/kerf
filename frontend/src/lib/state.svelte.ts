@@ -44,6 +44,7 @@ import {
 	smartCrop,
 	removeTrack,
 	setTrackDuck,
+	setMask,
 	setTrackVolume,
 	setTrackPan,
 	setDeliveryFormat,
@@ -87,6 +88,7 @@ import type {
 	Delivery,
 	ExportOptions,
 	Keyframe,
+	Mask,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -555,6 +557,10 @@ class EditorState {
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
 		return this.#apply(setTrackDuck(trackId, duck));
+	}
+	/** Cut a clip to a shape, or `null` to clear the mask. */
+	setMask(clipId: string, mask: Mask | null) {
+		return this.#apply(setMask(clipId, mask));
 	}
 	setTrackVolume(trackId: string, volume: number) {
 		return this.#apply(setTrackVolume(trackId, volume));

@@ -12,6 +12,7 @@ import type {
 	AudioEffect,
 	CaptionOptions,
 	Clip,
+	Mask,
 	Color,
 	Delivery,
 	DeliveryCheck,
@@ -752,6 +753,17 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 		return snapshot();
 	}
 	return invoke<Timeline>('set_track_duck', { trackId, duck });
+}
+
+/** Cut a clip to a shape, or pass `null` to clear the mask. */
+export async function setMask(clipId: string, mask: Mask | null): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].mask = mask;
+		recordDev(mask ? 'Mask clip' : 'Clear mask');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_mask', { clipId, mask });
 }
 
 /** Set a track's fader — the gain riding every clip on it. */
