@@ -82,7 +82,16 @@ so the feature is **only** activated through these forwards — which is what ma
   `format` through so range export and playback keep it. `still_clip_chain` honors
   `fit` too (it used to letterbox unconditionally, so the one frame you looked at
   while cutting was the one shape you were never going to ship).
-  Tracks flagged `Track.duck` are mixed into their own bus and
+  Every track carries a **mixer strip**: `Track.volume` (the fader) and
+  `Track.pan`. The fader rides each clip *after* its own gain and effect chain —
+  a channel strip, so pulling a music bed down does not change what its
+  compressor was reacting to — and the pan is a **balance** (`Track::pan_gains`,
+  pure + unit-tested), not a constant-power law: the side you turn towards stays
+  at unity and the other is attenuated away, because leaning a finished stereo
+  track should not make it louder. Both are omitted from the graph at their
+  neutral values, so every pre-existing mix is byte-identical, and the pan is
+  dropped entirely on a mono delivery. Tracks flagged `Track.duck` are mixed
+  into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
   on the final mix, and `ExportOptions.range` renders only a span by building the
@@ -498,7 +507,7 @@ op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start`
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
-`set_track_duck`, `set_delivery_format` (the project's delivery frame; omit
+`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
@@ -682,7 +691,14 @@ playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
-(`set_track_duck`); the timeline is genuinely **multi-track**. The old
+(`set_track_duck`); the timeline is genuinely **multi-track**. Any track that can
+actually be heard — an audio track, or a video track whose clips carry sound —
+also gets a **mixer strip** (level fader + pan, double-click to return either to
+neutral, tooltips in dB and L/R); a silent track gets none. `src/lib/mixer.ts` is
+the *faithful* mirror of `Track::pan_gains`, because preview playback renders the
+pan as the same balance the export does — a `StereoPannerNode`'s constant-power
+law would quietly disagree with the file, and `get_audio` hands back mono, so the
+two gain legs into a merger *are* the stereo pair. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
