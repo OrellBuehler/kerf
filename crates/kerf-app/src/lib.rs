@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe,
-    Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
+    ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind,
+    VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -887,10 +888,18 @@ fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyfram
 }
 
 #[tauri::command(async)]
-fn captions_from_transcript(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
-    let id = id(&asset_id)?;
+fn generate_captions(state: State<'_, AppState>, options: Option<CaptionOptions>) -> CmdResult<Timeline> {
     let project = state.project();
-    project.captions_from_transcript(id).map_err(|e| e.to_string())?;
+    project
+        .generate_captions(options.unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn clear_captions(state: State<'_, AppState>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.clear_captions().map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1604,7 +1613,8 @@ pub fn run() {
             update_overlay,
             remove_overlay,
             set_overlay_keyframes,
-            captions_from_transcript,
+            generate_captions,
+            clear_captions,
             export_srt,
             remove_silence,
             snap_to_beats,
