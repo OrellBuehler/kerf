@@ -7,11 +7,12 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
-	import { COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
+	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
 	import { needsCrop } from '$lib/smart-crop';
 	import type { TextStyle } from '$lib/style-presets';
 	import type {
 		AudioEffect,
+		CaptionStyle,
 		Projection,
 		Reframe,
 		Transform,
@@ -224,12 +225,17 @@
 	 *  replaces the generated set, so the button stays the same after the first
 	 *  press and only its label admits what it is doing. */
 	const hasCaptions = $derived(overlays.some((o) => o.generated));
+	// Which look the button generates in. Not derived from the overlays already
+	// on the timeline: a caption's style is not recoverable from the text it
+	// carries, and guessing it from the word count would flip the selection
+	// every time a sentence happened to be short.
+	let captionStyle = $state<CaptionStyle>('lines');
 	function makeCaptions() {
 		if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
 			toast.error('Put a clip on the timeline first');
 			return;
 		}
-		void run(() => editor.generateCaptions());
+		void run(() => editor.generateCaptions({ style: captionStyle }));
 	}
 	function dropCaptions() {
 		void run(() => editor.clearCaptions());
@@ -479,6 +485,14 @@
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 		{#each TEXT_STYLES as s (s.id)}
 			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
+		{/each}
+	</div>
+	<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px">
+		<span style="font-size:11px;color:var(--text-muted)">Caption style</span>
+		{#each CAPTION_LOOKS as c (c.id)}
+			<button style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (captionStyle = c.id)}>
+				{c.label}
+			</button>
 		{/each}
 	</div>
 	<div style="display:flex;gap:7px;margin-bottom:6px">

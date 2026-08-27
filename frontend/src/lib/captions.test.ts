@@ -5,8 +5,11 @@ import {
 	coversSource,
 	sourceToTimeline,
 	timeChunks,
+	resolveCaptions,
 	CAPTION_DEFAULTS,
-	MIN_CAPTION
+	CAPTION_STYLES,
+	MIN_CAPTION,
+	MIN_WORD_CAPTION
 } from './captions';
 import type { Clip, Timeline, TranscriptSegment } from './types';
 
@@ -124,5 +127,64 @@ describe('captions follow the cut', () => {
 		expect(captionsForTimeline(tl, { a1: [seg(0, 4, 'heard')] })).toHaveLength(1);
 		tl.tracks[0].muted = true;
 		expect(captionsForTimeline(tl, { a1: [seg(0, 4, 'heard')] })).toHaveLength(0);
+	});
+
+	test('word punch puts one word on screen at a time', () => {
+		const tl = timelineOf([clip({ source_out: 5 })]);
+		const words = { a1: [seg(0, 5, 'alpha bravo charlie delta echo')] };
+		const punched = captionsForTimeline(tl, words, resolveCaptions({ style: 'word_punch' }));
+		expect(punched.map((o) => o.text)).toEqual(['alpha', 'bravo', 'charlie', 'delta', 'echo']);
+		// The whole look, not just the word count.
+		for (const o of punched) {
+			expect(o.bold).toBe(true);
+			expect(o.size).toBe(CAPTION_STYLES.word_punch.size);
+			expect(o.pos_y).toBe(CAPTION_STYLES.word_punch.pos_y);
+		}
+		// Each word hands the screen straight to the next.
+		for (let i = 1; i < punched.length; i++) expect(punched[i].start).toBeCloseTo(punched[i - 1].end, 9);
+		// The default style is untouched by any of this.
+		const lines = captionsForTimeline(tl, words);
+		expect(lines).toHaveLength(2);
+		expect(lines.every((o) => !o.bold)).toBe(true);
+	});
+
+	test('a word too short to read joins its neighbour', () => {
+		// "a" is one character of thirty, so its character share is two frames.
+		const punched = captionsForTimeline(
+			timelineOf([clip({ source_out: 2 })]),
+			{ a1: [seg(0, 2, 'a fairly quickly spoken sentence')] },
+			resolveCaptions({ style: 'word_punch' })
+		);
+		for (const o of punched) expect(o.end - o.start).toBeGreaterThanOrEqual(MIN_WORD_CAPTION - 1e-6);
+		expect(punched[0].text).toBe('a fairly');
+	});
+
+	test('an override moves one number and leaves the style alone', () => {
+		const resolved = resolveCaptions({ style: 'word_punch', size: 0.2 });
+		expect(resolved.max_words).toBe(1);
+		expect(resolved.size).toBe(0.2);
+		expect(resolved.pos_y).toBe(CAPTION_STYLES.word_punch.pos_y);
+		// An unusable override falls back to the style rather than through it.
+		expect(resolveCaptions({ style: 'word_punch', size: NaN }).size).toBe(CAPTION_STYLES.word_punch.size);
+		expect(resolveCaptions({ style: 'word_punch', pos_y: 9 }).pos_y).toBe(1);
+		// No options at all is the line style.
+		expect(resolveCaptions()).toEqual(CAPTION_DEFAULTS);
+	});
+
+	test('a long word is shrunk to fit a vertical frame', () => {
+		const tl = timelineOf([clip({ source_out: 4 })]);
+		const words = { a1: [seg(0, 4, 'non-destructive editing')] };
+		const punch = resolveCaptions({ style: 'word_punch' });
+		// Unframed, so 16:9 — wide enough that nothing is shrunk.
+		expect(captionsForTimeline(tl, words, punch).every((o) => o.size === punch.size)).toBe(true);
+		// 9:16: drawtext neither wraps nor scales, so the long word would be
+		// drawn off both edges.
+		tl.format = { width: 1080, height: 1920, fit: 'cover' };
+		const tall = captionsForTimeline(tl, words, punch);
+		const long = tall.find((o) => o.text === 'non-destructive')!;
+		const short = tall.find((o) => o.text === 'editing')!;
+		expect(long.size).toBeLessThan(punch.size);
+		expect(short.size).toBe(punch.size);
+		expect('non-destructive'.length * 0.6 * long.size).toBeLessThanOrEqual(0.9 * (1080 / 1920) + 1e-9);
 	});
 });

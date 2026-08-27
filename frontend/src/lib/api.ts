@@ -44,7 +44,7 @@ import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
-import { captionsForTimeline, CAPTION_DEFAULTS } from './captions';
+import { captionsForTimeline, resolveCaptions } from './captions';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -1206,10 +1206,10 @@ export async function generateCaptions(options?: CaptionOptions): Promise<Timeli
 				if (segs) transcripts[clip.asset_id] = segs;
 			}
 		}
-		const created = captionsForTimeline(devTimeline, transcripts, { ...CAPTION_DEFAULTS, ...options });
+		const created = captionsForTimeline(devTimeline, transcripts, resolveCaptions(options));
 		const kept = (devTimeline.overlays ??= []).filter((o) => !o.generated);
 		devTimeline.overlays = [...kept, ...created.map((o) => ({ ...o, id: uid() }))];
-		recordDev('Generate captions');
+		recordDev(options?.style === 'word_punch' ? 'Generate word captions' : 'Generate captions');
 		return snapshot();
 	}
 	return invoke<Timeline>('generate_captions', { options: options ?? null });

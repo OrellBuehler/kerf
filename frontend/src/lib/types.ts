@@ -193,9 +193,15 @@ export interface TextOverlay {
 	generated?: boolean;
 }
 
-/** How a transcript is turned into on-screen captions. Omitted fields keep the
- *  backend's social-video defaults (4 words / 28 chars, low-centre). */
+/** The look a generated caption set takes: a held subtitle line, or one large
+ *  word at a time — the style social captions have converged on. */
+export type CaptionStyle = 'lines' | 'word_punch';
+
+/** How a transcript is turned into on-screen captions. Everything but the style
+ *  is an override: omit a field and it follows the style, so asking for
+ *  `word_punch` alone gets the whole look. */
 export interface CaptionOptions {
+	style?: CaptionStyle;
 	max_words?: number;
 	max_chars?: number;
 	pos_y?: number;
