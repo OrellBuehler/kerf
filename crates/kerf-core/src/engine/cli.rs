@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind,
-    TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap,
+    StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -3712,6 +3712,36 @@ fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
     Some((keyframe_expr(&xs, "t", start), keyframe_expr(&ys, "t", start)))
 }
 
+/// The `geq` that cuts a clip to its [`Mask`]: the picture is passed through
+/// untouched and only the alpha plane is rewritten, so what is outside the shape
+/// (or inside it, `inverted`) becomes transparent and a lower track shows
+/// through.
+///
+/// One expression covers both shapes. Each axis is scaled so the shape's edge
+/// sits at distance 1, and the shapes differ only in how the two axes combine —
+/// `max` gives a rectangle, `hypot` an ellipse. Feathering is then a ramp over
+/// the last `feather` of that distance, measured *inside* the edge so a softened
+/// mask never grows beyond the shape that was drawn.
+///
+/// `geq` is per-pixel and therefore slow, the same cost keyframed opacity
+/// already pays; a mask is worth it and a full-frame one is simply not written.
+fn mask_filter(mask: &Mask) -> String {
+    let m = mask.normalized();
+    let dx = format!("(X-{cx}*W)/({rw}*W)", cx = fnum(m.x), rw = fnum(m.width / 2.0));
+    let dy = format!("(Y-{cy}*H)/({rh}*H)", cy = fnum(m.y), rh = fnum(m.height / 2.0));
+    let d = match m.shape {
+        MaskShape::Rect => format!("max(abs({dx})\\,abs({dy}))"),
+        MaskShape::Ellipse => format!("hypot({dx}\\,{dy})"),
+    };
+    let inside = if m.feather <= 1e-6 {
+        format!("lte({d}\\,1)")
+    } else {
+        format!("clip((1-{d})/{f}\\,0\\,1)", f = fnum(m.feather))
+    };
+    let keep = if m.inverted { format!("(1-{inside})") } else { inside };
+    format!("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'")
+}
+
 /// Build a piecewise-linear ffmpeg expression over **clip-local time** for a
 /// channel of keyframes. `points` are `(seconds_from_clip_start, value)` and are
 /// sorted here. `tvar` is the time variable the target filter exposes (`t` for
@@ -4068,7 +4098,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
     let transform_alpha = (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
-    let needs_alpha = transform_alpha || fx.xfade_in > 0.0;
+    let needs_alpha = transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some();
     let dur = clip.duration() + fx.tail;
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
@@ -4200,6 +4230,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         if let Some(f) = chroma_filter(e) {
             p.push(f);
         }
+    }
+    // The shape mask, once alpha exists: it only rewrites the alpha plane, so it
+    // composes with a chroma key above it and with the opacity below.
+    if let Some(mask) = &clip.mask {
+        p.push(mask_filter(mask));
     }
     // Opacity: animated via a per-frame geq alpha (geq's time var is `T`), else a
     // constant alpha mix.
@@ -4549,7 +4584,7 @@ fn build_still_args(
         let rf = clip.reframe_at(local);
         chains.push(format!(
             "[{n}:v]{chain}[v{n}]",
-            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas)
+            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas, clip.mask.as_ref())
         ));
         let out = format!("ov{n}");
         chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
@@ -4600,11 +4635,12 @@ fn still_clip_chain(
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
+    mask: Option<&Mask>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
-    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma;
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some();
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
@@ -4657,6 +4693,9 @@ fn still_clip_chain(
         if let Some(f) = chroma_filter(e) {
             p.push(f);
         }
+    }
+    if let Some(mask) = mask {
+        p.push(mask_filter(mask));
     }
     if tf.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", tf.opacity));
@@ -6522,6 +6561,77 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_cuts_the_clip_to_its_shape() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Ellipse,
+            x: 0.25,
+            y: 0.5,
+            width: 0.4,
+            height: 0.6,
+            feather: 0.2,
+            inverted: false,
+        });
+        let g = graph_of(&single(vec![clip.clone()]), &[asset.clone()]);
+        // A mask needs an alpha plane, and it must be established before the geq.
+        let alpha = g.find("format=yuva420p").expect("alpha");
+        let geq = g.find("geq=lum=").expect("mask");
+        assert!(alpha < geq, "alpha must precede the mask: {g}");
+        // An ellipse combines the axes with hypot; the edge sits at distance 1.
+        assert!(g.contains("hypot((X-0.25*W)/(0.2*W)"), "{g}");
+        assert!(g.contains("clip((1-hypot"), "feathered edge: {g}");
+
+        // A rectangle is the same expression with max instead of hypot…
+        let mut rect = clip.clone();
+        rect.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Rect,
+            feather: 0.0,
+            ..Default::default()
+        });
+        let g = graph_of(&single(vec![rect.clone()]), &[asset.clone()]);
+        assert!(g.contains("max(abs("), "{g}");
+        // …and no feather is a hard test rather than a ramp.
+        assert!(g.contains("lte(max(abs("), "{g}");
+        assert!(!g.contains("clip((1-"), "{g}");
+
+        // Inverted keeps what is outside the shape.
+        let mut inv = rect;
+        inv.mask = Some(crate::model::Mask {
+            inverted: true,
+            feather: 0.0,
+            ..Default::default()
+        });
+        let g = graph_of(&single(vec![inv]), &[asset]);
+        assert!(g.contains("a='((1-lte("), "{g}");
+    }
+
+    #[test]
+    fn an_unmasked_clip_writes_no_mask() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let g = graph_of(&single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), &[asset]);
+        assert!(!g.contains("geq="), "{g}");
+        assert!(!g.contains("format=yuva420p"), "no mask, no alpha: {g}");
+    }
+
+    #[test]
+    fn a_degenerate_mask_is_clamped_rather_than_blanking_the_clip() {
+        // A zero-width shape would make the whole clip transparent, which is
+        // never what was meant by dragging a handle too far.
+        let m = crate::model::Mask {
+            width: 0.0,
+            height: -3.0,
+            x: 9.0,
+            feather: f64::NAN,
+            ..Default::default()
+        }
+        .normalized();
+        assert!(m.width >= 0.01 && m.height >= 0.01);
+        assert_eq!(m.x, 1.0);
+        assert!((0.0..=1.0).contains(&m.feather));
+    }
+
+    #[test]
     fn the_track_fader_and_pan_ride_the_finished_clip() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -7538,11 +7648,18 @@ mod tests {
             fit,
             sf: String::new(),
         };
-        let contained = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Contain));
+        let contained = still_clip_chain(
+            &Transform::default(),
+            &Color::default(),
+            &[],
+            None,
+            &canvas(Fit::Contain),
+            None,
+        );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
 
-        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover));
+        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover), None);
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
         assert!(!covered.contains("pad="), "and never letterboxes: {covered}");
@@ -8022,6 +8139,83 @@ mod tests {
         let err = rendered.err().map(|e| e.to_string()).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok, "an animated clip and overlay must render: {err}");
+    }
+
+    /// A mask is only worth anything if a lower track really shows through it,
+    /// which no assertion on the graph string can establish. Black over white,
+    /// masked to a hard-edged ellipse: the middle must come out black and the
+    /// corners white.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored a_mask_really`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_mask_really_lets_the_track_below_show_through() {
+        let dir = std::env::temp_dir().join(format!("kerf-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mk = |name: &str, color: &str| -> PathBuf {
+            let out = dir.join(name);
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("color=c={color}:s=320x180:r=30:d=2")])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&out)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            out
+        };
+        let (white, black) = (mk("white.mp4", "white"), mk("black.mp4", "black"));
+        let mut lower = av_asset(Uuid::new_v4(), 2.0);
+        lower.path = white.to_string_lossy().into_owned();
+        lower.streams = vec![video_stream(320, 180, 30.0)];
+        let mut upper = av_asset(Uuid::new_v4(), 2.0);
+        upper.path = black.to_string_lossy().into_owned();
+        upper.streams = vec![video_stream(320, 180, 30.0)];
+
+        let mut top = make_clip(upper.id, 0.0, 2.0, 0.0);
+        top.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Ellipse,
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: 0.0,
+            inverted: false,
+        });
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(lower.id, 0.0, 2.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+
+        let out = dir.join("masked.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        render_with(&timeline, &[lower, upper], &out, &opts).expect("export");
+
+        // Mean luma of a 20x20 patch at (x, y) of the first frame.
+        let patch = |x: u32, y: u32| -> f64 {
+            let raw = dir.join("patch.raw");
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .arg("-i")
+                .arg(&out)
+                .args(["-vf", &format!("crop=20:20:{x}:{y}"), "-frames:v", "1"])
+                .args(["-f", "rawvideo", "-pix_fmt", "gray"])
+                .arg(&raw)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+        let (middle, corner) = (patch(150, 80), patch(0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(middle < 60.0, "inside the mask the upper clip is kept, got {middle}");
+        assert!(corner > 180.0, "outside it the lower track shows through, got {corner}");
     }
 
     /// A slide and a push look identical in the graph builder's assertions —

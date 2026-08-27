@@ -14,8 +14,9 @@ use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker,
-    Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe,
-    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV, MIN_FOV,
+    Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV,
+    MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -1920,6 +1921,20 @@ impl Project {
     }
 
     /// Set or clear (`None`) the transition that blends a clip's start with the
+    /// Cut a clip to a shape, or clear the mask. Outside the shape the clip goes
+    /// transparent, so whatever is on a lower track shows through — which is how
+    /// a face is blurred (a masked, blurred copy of the shot on the track above),
+    /// how a picture-in-picture is rounded off, and how one region gets its own
+    /// grade. Fields are clamped, since a zero-width shape would blank the clip.
+    pub fn set_mask(&self, clip_id: Uuid, mask: Option<Mask>) -> Result<Clip> {
+        let mask = mask.map(Mask::normalized);
+        self.edit_timeline(if mask.is_some() { "Mask clip" } else { "Clear mask" }, |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].mask = mask;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
     /// clip preceding it on the same track. Realized at export.
     pub fn set_transition(&self, clip_id: Uuid, transition: Option<Transition>) -> Result<Clip> {
         if transition.is_some_and(|t| !t.duration.is_finite() || t.duration <= 0.0) {

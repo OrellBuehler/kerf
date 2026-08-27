@@ -540,6 +540,112 @@ pub struct Transition {
     pub duration: f64,
 }
 
+/// The outline of a [`Mask`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskShape {
+    /// An axis-aligned rectangle — a sign, a screen, a lower band of the frame.
+    #[default]
+    Rect,
+    /// An ellipse — a face, a spotlight.
+    Ellipse,
+}
+
+impl MaskShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MaskShape::Rect => "rect",
+            MaskShape::Ellipse => "ellipse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rect" | "rectangle" => Some(MaskShape::Rect),
+            "ellipse" | "circle" | "oval" => Some(MaskShape::Ellipse),
+            _ => None,
+        }
+    }
+}
+
+/// A shape cut out of a clip: inside the shape the clip is kept, outside it goes
+/// transparent (or the other way round, `inverted`). Everything is a **fraction
+/// of the clip's rendered frame**, so a mask does not have to be redone when the
+/// delivery frame changes.
+///
+/// Deliberately one primitive rather than a masking *mode* per use. A mask makes
+/// a clip see-through, and the timeline already stacks tracks — so blurring a
+/// face is a copy of the shot on the track above, blurred, masked to the face;
+/// a picture-in-picture vignette is a mask on the upper clip; a region grade is
+/// a masked copy with its own colour. One thing to learn, and it composes with
+/// what is already there instead of adding a second compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Mask {
+    #[serde(default)]
+    pub shape: MaskShape,
+    /// Centre of the shape, as a fraction of the frame. 0.5, 0.5 is the middle.
+    #[serde(default = "half")]
+    pub x: f64,
+    #[serde(default = "half")]
+    pub y: f64,
+    /// Size of the shape as a fraction of the frame (its full width / height,
+    /// not a radius).
+    #[serde(default = "half")]
+    pub width: f64,
+    #[serde(default = "half")]
+    pub height: f64,
+    /// Softness of the edge, as a fraction of the shape's own half-size. 0 is a
+    /// hard cut — which on a face reads as a sticker, so the default is soft.
+    #[serde(default = "default_feather")]
+    pub feather: f64,
+    /// Keep what is *outside* the shape instead of inside it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverted: bool,
+}
+
+fn default_feather() -> f64 {
+    0.15
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Self {
+            shape: MaskShape::default(),
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: default_feather(),
+            inverted: false,
+        }
+    }
+}
+
+impl Mask {
+    /// The mask with every field clamped into range: sizes to a visible minimum,
+    /// the centre to the frame, feather to 0..1. A zero-width mask would blank
+    /// the clip entirely, which is never what was meant.
+    pub fn normalized(self) -> Self {
+        Self {
+            shape: self.shape,
+            x: clamp01(self.x),
+            y: clamp01(self.y),
+            width: self.width.clamp(0.01, 2.0),
+            height: self.height.clamp(0.01, 2.0),
+            feather: clamp01(self.feather),
+            inverted: self.inverted,
+        }
+    }
+}
+
+fn clamp01(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
 /// A per-clip video effect, realized as a filter inserted into the clip's video
 /// chain at export (after color correction). The order in `Clip::effects` is the
 /// order they are applied. `ChromaKey` is the one effect that establishes an
@@ -1398,6 +1504,10 @@ pub struct Clip {
     /// explicitly un-reframed, to work in the raw projection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reframe: Option<Reframe>,
+    /// A shape cut out of this clip, making the rest transparent so a lower
+    /// track shows through. `None` is the whole frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Mask>,
     /// Whether this clip renders. A disabled clip keeps its place on the
     /// timeline (and its trims, effects and keyframes) but is dropped before the
     /// render graph is built — the per-clip counterpart of muting a track.
@@ -1437,6 +1547,7 @@ impl Clip {
             audio: Vec::new(),
             keyframes: Vec::new(),
             reframe: None,
+            mask: None,
             enabled: true,
         }
     }
