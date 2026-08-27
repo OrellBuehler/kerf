@@ -213,6 +213,22 @@ struct SetTrackDuckParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackVolumeParams {
+    #[schemars(description = "UUID of the track to set the level of")]
+    track_id: String,
+    #[schemars(description = "Track fader as a linear gain: 1.0 is unity, 0.5 is -6 dB, 0 is silent. Clamped to 0..4")]
+    volume: f32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackPanParams {
+    #[schemars(description = "UUID of the track to place")]
+    track_id: String,
+    #[schemars(description = "Stereo placement: -1 hard left, 0 centre, 1 hard right")]
+    pan: f32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame width in pixels, e.g. 1080. Omit (with height) to clear the \
                               format and go back to following the footage's shape.")]
@@ -899,6 +915,35 @@ impl KerfMcp {
         let track_id = parse_id(&p.track_id)?;
         let project = self.lock();
         let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Set a track's fader — one linear gain riding every clip on the track, applied after \
+                       each clip's own volume and effects. This is how a music bed is balanced against a \
+                       voiceover: put the music on its own track and pull it to roughly 0.25-0.4 under \
+                       speech. Prefer it to editing every clip's volume, and to set_track_duck when the \
+                       level should simply sit lower rather than dip and recover."
+    )]
+    fn set_track_volume(&self, Parameters(p): Parameters<SetTrackVolumeParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Place a track in the stereo field, -1 hard left to 1 hard right. A balance, so a \
+                       panned track never gets louder, and a no-op on a mono delivery. Use it sparingly — \
+                       a hard-panned music bed sounds broken on a phone speaker, which is what most of \
+                       this footage is watched on."
+    )]
+    fn set_track_pan(&self, Parameters(p): Parameters<SetTrackPanParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
         self.changed();
         json(&track)
     }
@@ -1799,7 +1844,11 @@ impl ServerHandler for KerfMcp {
              Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
              track shows through), set_audio_effects (highpass / lowpass / EQ / \
-             compressor / gate), and animate a clip with set_keyframes / \
+             compressor / gate). Mix with set_track_volume — a music bed belongs \
+             on its own track pulled well under the speech (~0.3), which is most \
+             of what makes a cut sound finished — plus set_track_duck to dip it \
+             further under dialogue and set_track_pan to place it. Animate a clip \
+             with set_keyframes / \
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
              Burns zoom, a moving picture-in-picture). 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \

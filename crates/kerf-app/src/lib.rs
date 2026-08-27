@@ -513,6 +513,24 @@ fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> C
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Set a track's fader — the gain riding every clip on the track.
+#[tauri::command(async)]
+fn set_track_volume(state: State<'_, AppState>, track_id: String, volume: f32) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_volume(id, volume).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set a track's stereo placement, -1 (hard left) to 1 (hard right).
+#[tauri::command(async)]
+fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Set the frame the project is cut for, or clear it back to the source shape.
 /// The preview, the scrubbed still and the export all read it, so the vertical
 /// crop is visible while cutting instead of only in the rendered file.
@@ -1586,6 +1604,8 @@ pub fn run() {
             add_track,
             remove_track,
             set_track_duck,
+            set_track_volume,
+            set_track_pan,
             set_delivery_format,
             set_track_muted,
             set_track_solo,
