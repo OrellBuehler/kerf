@@ -3687,7 +3687,8 @@ fn fnum(v: f64) -> String {
 /// offset before the transition and travels to zero, an outgoing clip sits at
 /// zero until its own end and then travels away over its tail.
 fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
-    let (mut xs, mut ys): (Vec<(f64, f64)>, Vec<(f64, f64)>) = (Vec::new(), Vec::new());
+    let mut xs: Vec<(f64, f64)> = Vec::new();
+    let mut ys: Vec<(f64, f64)> = Vec::new();
     if let Some((dx, dy, secs)) = fx.move_in {
         xs.push((0.0, dx));
         xs.push((secs, 0.0));
