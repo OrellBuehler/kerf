@@ -6574,7 +6574,7 @@ mod tests {
             feather: 0.2,
             inverted: false,
         });
-        let g = graph_of(&single(vec![clip.clone()]), &[asset.clone()]);
+        let g = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
         // A mask needs an alpha plane, and it must be established before the geq.
         let alpha = g.find("format=yuva420p").expect("alpha");
         let geq = g.find("geq=lum=").expect("mask");
@@ -6590,7 +6590,7 @@ mod tests {
             feather: 0.0,
             ..Default::default()
         });
-        let g = graph_of(&single(vec![rect.clone()]), &[asset.clone()]);
+        let g = graph_of(&single(vec![rect.clone()]), std::slice::from_ref(&asset));
         assert!(g.contains("max(abs("), "{g}");
         // …and no feather is a hard test rather than a ramp.
         assert!(g.contains("lte(max(abs("), "{g}");
