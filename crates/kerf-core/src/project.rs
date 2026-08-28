@@ -1920,7 +1920,6 @@ impl Project {
         })
     }
 
-    /// Set or clear (`None`) the transition that blends a clip's start with the
     /// Cut a clip to a shape, or clear the mask. Outside the shape the clip goes
     /// transparent, so whatever is on a lower track shows through — which is how
     /// a face is blurred (a masked, blurred copy of the shot on the track above),
@@ -1935,6 +1934,7 @@ impl Project {
         })
     }
 
+    /// Set or clear (`None`) the transition that blends a clip's start with the
     /// clip preceding it on the same track. Realized at export.
     pub fn set_transition(&self, clip_id: Uuid, transition: Option<Transition>) -> Result<Clip> {
         if transition.is_some_and(|t| !t.duration.is_finite() || t.duration <= 0.0) {

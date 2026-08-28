@@ -39,15 +39,18 @@
 		return t.kind === 'video' ? 'var(--track-h-video)' : 'var(--track-h-audio)';
 	}
 
+	/** Assets that carry an audio stream, rebuilt only when the bin changes —
+	 *  hasSound runs per track on every timeline update, and a linear asset
+	 *  scan per clip made that O(clips x assets). */
+	const audibleAssets = $derived(
+		new Set(editor.assets.filter((a) => a.streams?.some((st) => st.kind === 'audio')).map((a) => a.id))
+	);
 	/** True when a track can actually be heard — an audio track, or a video track
 	 *  whose clips carry sound. A track with no audio at all gets no fader: a
 	 *  mixer strip on a silent track is furniture, not a control. */
 	function hasSound(t: Track): boolean {
 		if (t.kind === 'audio') return true;
-		return t.clips.some((c) => {
-			const a = editor.assets.find((x) => x.id === c.asset_id);
-			return !!a?.streams?.some((st) => st.kind === 'audio');
-		});
+		return t.clips.some((c) => audibleAssets.has(c.asset_id));
 	}
 
 	/** Shared look for the one-letter S / L track flags. */
@@ -1029,7 +1032,7 @@
 							<input
 								type="range"
 								min="0"
-								max="2"
+								max={Math.max(2, t.volume ?? 1)}
 								step="0.01"
 								value={t.volume ?? 1}
 								disabled={editor.busy}

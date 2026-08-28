@@ -216,7 +216,7 @@ struct SetTrackDuckParams {
 struct SetMaskParams {
     #[schemars(description = "UUID of the clip to mask")]
     clip_id: String,
-    #[schemars(description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely")]
+    #[schemars(description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely. Every other field, when omitted, keeps the clip's current value (or its default on a fresh mask)")]
     shape: Option<String>,
     #[schemars(description = "Centre of the shape across the frame, 0 = left edge, 1 = right (default 0.5)")]
     x: Option<f64>,
@@ -952,13 +952,21 @@ impl KerfMcp {
                        the right thing.")]
     fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
         let mask = match p.shape {
             None => None,
             Some(ref s) => {
                 let shape = MaskShape::parse(s).ok_or_else(|| {
                     McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
                 })?;
-                let d = Mask::default();
+                // Omitted fields keep the clip's current mask, so nudging one
+                // number (move the ellipse a little left) does not reset the
+                // size and feather back to the defaults out from under it.
+                let d = project
+                    .working_timeline()
+                    .ok()
+                    .and_then(|tl| tl.locate(clip_id).and_then(|(ti, ci)| tl.tracks[ti].clips[ci].mask))
+                    .unwrap_or_default();
                 Some(Mask {
                     shape,
                     x: p.x.unwrap_or(d.x),
@@ -966,11 +974,10 @@ impl KerfMcp {
                     width: p.width.unwrap_or(d.width),
                     height: p.height.unwrap_or(d.height),
                     feather: p.feather.unwrap_or(d.feather),
-                    inverted: p.inverted.unwrap_or(false),
+                    inverted: p.inverted.unwrap_or(d.inverted),
                 })
             }
         };
-        let project = self.lock();
         let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
         self.changed();
         json(&clip)

@@ -3548,6 +3548,7 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let mut fx = vec![ClipFx::default(); total_clips];
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
+    let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
 
     let mut base = 0;
     for track in &timeline.tracks {
@@ -3599,7 +3600,12 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
                             // The tail borrows the outgoing clip's unused source: for a
                             // forward clip that is the handle past source_out, for a
                             // reversed clip the handle below source_in.
-                            let avail = if p.is_reversed() {
+                            // A still loops (`-loop 1`), so it never runs out
+                            // of source: its handle is unbounded, the same
+                            // reason the timeline lets a still extend freely.
+                            let avail = if is_still(p.asset_id) {
+                                f64::INFINITY
+                            } else if p.is_reversed() {
                                 p.source_in / p.speed_mag()
                             } else {
                                 asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0) / p.speed_mag()
@@ -3727,6 +3733,16 @@ fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
 /// `geq` is per-pixel and therefore slow, the same cost keyframed opacity
 /// already pays; a mask is worth it and a full-frame one is simply not written.
 fn mask_filter(mask: &Mask) -> String {
+    format!(
+        "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'",
+        keep = mask_keep_expr(mask)
+    )
+}
+
+/// The 0..1 "keep" expression at the heart of [`mask_filter`], separated out so
+/// a clip with both a mask and keyframed opacity can fold the two into one
+/// `geq` pass instead of paying the per-pixel cost twice.
+fn mask_keep_expr(mask: &Mask) -> String {
     let m = mask.normalized();
     let dx = format!("(X-{cx}*W)/({rw}*W)", cx = fnum(m.x), rw = fnum(m.width / 2.0));
     let dy = format!("(Y-{cy}*H)/({rh}*H)", cy = fnum(m.y), rh = fnum(m.height / 2.0));
@@ -3739,8 +3755,11 @@ fn mask_filter(mask: &Mask) -> String {
     } else {
         format!("clip((1-{d})/{f}\\,0\\,1)", f = fnum(m.feather))
     };
-    let keep = if m.inverted { format!("(1-{inside})") } else { inside };
-    format!("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'")
+    if m.inverted {
+        format!("(1-{inside})")
+    } else {
+        inside
+    }
 }
 
 /// Build a piecewise-linear ffmpeg expression over **clip-local time** for a
@@ -4232,23 +4251,31 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             p.push(f);
         }
     }
-    // The shape mask, once alpha exists: it only rewrites the alpha plane, so it
-    // composes with a chroma key above it and with the opacity below.
-    if let Some(mask) = &clip.mask {
-        p.push(mask_filter(mask));
-    }
-    // Opacity: animated via a per-frame geq alpha (geq's time var is `T`), else a
-    // constant alpha mix.
-    if anim_opacity {
-        let expr = keyframe_expr(
+    // The shape mask (once alpha exists — it only rewrites the alpha plane, so
+    // it composes with a chroma key above it) and opacity: animated opacity is a
+    // per-frame geq alpha (geq's time var is `T`), else a constant alpha mix.
+    // The mask is the same alpha-plane geq, so a clip that
+    // has both shares one pass — geq is per-pixel and by far the most expensive
+    // filter in the chain, and two back-to-back passes would double it.
+    let opacity_expr = anim_opacity.then(|| {
+        keyframe_expr(
             &kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(),
             "T",
             clip.timeline_start,
-        );
-        p.push(format!(
+        )
+    });
+    match (&clip.mask, opacity_expr) {
+        (Some(mask), Some(expr)) => p.push(format!(
+            "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
+            keep = mask_keep_expr(mask)
+        )),
+        (Some(mask), None) => p.push(mask_filter(mask)),
+        (None, Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"
-        ));
-    } else if !anim && t.opacity < 1.0 {
+        )),
+        (None, None) => {}
+    }
+    if !anim && t.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
@@ -4754,22 +4781,26 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     if fo > 0.0 {
         p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
-    // The track fader and its pan, after the clip's own chain. Both are omitted
-    // at their neutral values, so a project that never touched a fader renders
-    // the graph it always did.
+    // The track fader, after the clip's own chain. Omitted at unity, so a
+    // project that never touched a fader renders the graph it always did.
     if (mix.volume - 1.0).abs() > f32::EPSILON {
         p.push(format!("volume={}", mix.volume));
     }
+    p.push(format!(
+        "aformat=sample_rates={sr}:channel_layouts={layout}",
+        sr = fmt.sample_rate
+    ));
+    // The track pan, after `aformat` has normalized the stream to the delivery
+    // layout: `pan` indexes channels by number, and run before the upmix a mono
+    // source has no c1 — the attenuated leg would be synthesized from silence,
+    // so panning a mono voice right would mute it instead of leaning it.
+    // Omitted at centre, so an untouched mix stays byte-identical.
     let (gl, gr) = mix.pan;
     if layout == "stereo" && ((gl - 1.0).abs() > 1e-9 || (gr - 1.0).abs() > 1e-9) {
         // A balance, not a mono re-pan: each side keeps its own channel and is
         // attenuated, so a stereo music bed leans without collapsing.
         p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
     }
-    p.push(format!(
-        "aformat=sample_rates={sr}:channel_layouts={layout}",
-        sr = fmt.sample_rate
-    ));
     p.push(format!("adelay={delay_ms}:all=1"));
     p.join(",")
 }
@@ -6608,6 +6639,29 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_and_keyframed_opacity_share_one_geq_pass() {
+        // Both rewrite only the alpha plane, and geq is the most expensive
+        // filter in the chain — a clip with both must fold them into one pass.
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.mask = Some(crate::model::Mask::default());
+        let key = |time: f64, opacity: f64| crate::model::Keyframe {
+            time,
+            scale: 1.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity,
+        };
+        clip.keyframes = vec![key(0.0, 0.0), key(5.0, 1.0)];
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert_eq!(g.matches("geq=").count(), 1, "one pass for both: {g}");
+        // The mask's keep expression and the opacity ramp share the alpha term.
+        assert!(g.contains("clip((1-max(abs("), "the mask survives: {g}");
+        assert!(g.contains(")*(if(lt((T"), "the opacity ramp survives: {g}");
+    }
+
+    #[test]
     fn an_unmasked_clip_writes_no_mask() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let g = graph_of(&single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), &[asset]);
@@ -6650,6 +6704,11 @@ mod tests {
         assert!(clip_gain < effect && effect < fader, "fader must come last: {g}");
         // Hard left is the right channel gone and the left untouched.
         assert!(g.contains("pan=stereo|c0=1*c0|c1=0*c1"), "{g}");
+        // And the pan runs after the aformat upmix: run before it, a mono
+        // source has no c1 and the attenuated leg would be pure silence.
+        let af = g.find("aformat=").expect("aformat");
+        let pan = g.find("pan=stereo").expect("pan");
+        assert!(af < pan, "pan must follow the layout normalize: {g}");
     }
 
     #[test]
@@ -7000,6 +7059,26 @@ mod tests {
             !g.contains("overlay=x="),
             "nothing moves when there is nothing to move over: {g}"
         );
+    }
+
+    #[test]
+    fn a_transition_out_of_a_still_keeps_its_transition() {
+        // A still loops, so it never runs out of source: a dissolve (or slide /
+        // push) out of a title card must not degrade to a hard cut just because
+        // the clip already spans the asset's nominal duration.
+        let still = img_asset(Uuid::new_v4());
+        let footage = av_asset(Uuid::new_v4(), 20.0);
+        let d = crate::model::DEFAULT_IMAGE_DURATION;
+        let a = make_clip(still.id, 0.0, d, 0.0);
+        let mut b = make_clip(footage.id, 0.0, 10.0, d);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[still, footage]);
+        // The still is held for the tail and the incoming clip dissolves in.
+        assert!(g.contains(&format!("trim=start=0:end={}", d + 1.0)), "{g}");
+        assert!(g.contains(":alpha=1"), "the dissolve must survive: {g}");
     }
 
     #[test]

@@ -117,8 +117,9 @@ export interface Mask {
 	inverted?: boolean;
 }
 
+/** Mirrors `Mask::default()` in crates/kerf-core/src/model.rs. */
 export const DEFAULT_MASK: Mask = {
-	shape: 'ellipse',
+	shape: 'rect',
 	x: 0.5,
 	y: 0.5,
 	width: 0.5,

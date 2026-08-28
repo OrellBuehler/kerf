@@ -1731,9 +1731,9 @@ pub struct Track {
     #[serde(default = "unity_gain", skip_serializing_if = "is_unity_gain")]
     pub volume: f32,
     /// Stereo placement, -1 (hard left) to 1 (hard right); 0 is centre. Applied
-    /// as a constant-power balance, so panning a track does not change how loud
-    /// it is — and it is a no-op on a mono delivery, where there is nowhere to
-    /// pan to.
+    /// as a balance (see [`Track::pan_gains`] — deliberately *not* a
+    /// constant-power law), so panning a track never makes it louder — and it
+    /// is a no-op on a mono delivery, where there is nowhere to pan to.
     #[serde(default, skip_serializing_if = "is_centred")]
     pub pan: f32,
     pub kind: StreamKind,
@@ -2707,6 +2707,14 @@ fn track_changes(before: &Track, after: &Track) -> Option<String> {
             parts.push((if is { on } else { off }).to_string());
         }
     }
+    // The mixer strip: without these an agent proposal that only rides a fader
+    // or a pan diffs as empty and apply_staged throws it away.
+    if (before.volume - after.volume).abs() > DIFF_EPS as f32 {
+        parts.push(format!("level {:.0}% → {:.0}%", before.volume * 100.0, after.volume * 100.0));
+    }
+    if (before.pan - after.pan).abs() > DIFF_EPS as f32 {
+        parts.push(format!("pan {:.2} → {:.2}", before.pan, after.pan));
+    }
     joined(parts)
 }
 
@@ -2841,6 +2849,12 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
         parts.push("keyframes retimed".to_string());
     }
     parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
+    if before.mask != after.mask {
+        parts.push(match &after.mask {
+            None => "mask cleared".to_string(),
+            Some(m) => format!("masked ({})", m.shape.as_str()),
+        });
+    }
     joined(parts)
 }
 
@@ -3537,6 +3551,30 @@ mod tests {
         assert!(detail.contains("speed 1.00× → 2.00×"), "{detail}");
         assert!(detail.contains("disabled"), "{detail}");
         assert!(detail.contains("video effects none → vignette"), "{detail}");
+    }
+
+    #[test]
+    fn diff_sees_a_mask_and_the_track_mix() {
+        // An agent proposal that only masks a clip or rides a fader must not
+        // diff as empty — apply_staged discards an empty proposal.
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)])],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        after.tracks[0].clips[0].mask = Some(Mask::default());
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        assert!(diff.entries[0].detail.as_deref().unwrap().contains("masked (rect)"));
+
+        let mut after = tl.clone();
+        after.tracks[0].volume = 0.5;
+        after.tracks[0].pan = -0.3;
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        let detail = diff.entries[0].detail.clone().unwrap();
+        assert!(detail.contains("level 100% → 50%"), "{detail}");
+        assert!(detail.contains("pan 0.00 → -0.30"), "{detail}");
     }
 
     #[test]
