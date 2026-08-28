@@ -216,7 +216,9 @@ struct SetTrackDuckParams {
 struct SetMaskParams {
     #[schemars(description = "UUID of the clip to mask")]
     clip_id: String,
-    #[schemars(description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely. Every other field, when omitted, keeps the clip's current value (or its default on a fresh mask)")]
+    #[schemars(
+        description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely. Every other field, when omitted, keeps the clip's current value (or its default on a fresh mask)"
+    )]
     shape: Option<String>,
     #[schemars(description = "Centre of the shape across the frame, 0 = left edge, 1 = right (default 0.5)")]
     x: Option<f64>,
