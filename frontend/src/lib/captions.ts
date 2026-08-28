@@ -8,21 +8,88 @@
  *  the same arrangement as `platforms.ts` and `smart-crop.ts`.
  */
 
-import type { Clip, TextOverlay, Timeline, TranscriptSegment } from './types';
+import type { CaptionOptions, CaptionStyle, Clip, TextOverlay, Timeline, TranscriptSegment } from './types';
 
 /** Shortest a generated line stays on screen; below this it reads as a flicker. */
 export const MIN_CAPTION = 0.45;
 /** How much of a line has to survive a cut for it to be kept. */
 export const MIN_CAPTION_VISIBLE = 0.15;
+/** The same two floors where a line *is* one word: held to `MIN_CAPTION` every
+ *  short word would merge into a neighbour and word punch would collapse back
+ *  into lines. */
+export const MIN_WORD_CAPTION = 0.12;
+export const MIN_WORD_VISIBLE = 0.06;
 
+/** A style's numbers with any override applied — what captioning works from. */
 export interface CaptionOpts {
 	max_words: number;
 	max_chars: number;
 	pos_y: number;
 	size: number;
+	bold: boolean;
+	min_line: number;
+	min_visible: number;
 }
 
-export const CAPTION_DEFAULTS: CaptionOpts = { max_words: 4, max_chars: 28, pos_y: 0.88, size: 0.05 };
+/** The two looks. A subtitle line is read; a punched word is watched — so the
+ *  word count, the size, the position and the flicker floors move together. */
+export const CAPTION_STYLES: Record<CaptionStyle, CaptionOpts> = {
+	lines: {
+		max_words: 4,
+		max_chars: 28,
+		pos_y: 0.88,
+		size: 0.05,
+		bold: false,
+		min_line: MIN_CAPTION,
+		min_visible: MIN_CAPTION_VISIBLE
+	},
+	word_punch: {
+		max_words: 1,
+		max_chars: 28,
+		pos_y: 0.72,
+		size: 0.11,
+		bold: true,
+		min_line: MIN_WORD_CAPTION,
+		min_visible: MIN_WORD_VISIBLE
+	}
+};
+
+export const CAPTION_DEFAULTS: CaptionOpts = CAPTION_STYLES.lines;
+
+/** The style's numbers with any usable override applied over them. Mirrors
+ *  `CaptionOptions::resolve`: omitted fields follow the style, so asking for
+ *  `word_punch` alone gets the whole look rather than one word left at subtitle
+ *  size in the subtitle position. */
+export function resolveCaptions(opts?: CaptionOptions): CaptionOpts {
+	const base = CAPTION_STYLES[opts?.style ?? 'lines'] ?? CAPTION_DEFAULTS;
+	const num = (v: number | undefined, fallback: number, lo: number, hi: number) =>
+		typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, lo), hi) : fallback;
+	return {
+		...base,
+		max_words: typeof opts?.max_words === 'number' ? Math.max(opts.max_words, 1) : base.max_words,
+		max_chars: typeof opts?.max_chars === 'number' ? Math.max(opts.max_chars, 1) : base.max_chars,
+		pos_y: num(opts?.pos_y, base.pos_y, 0, 1),
+		size: num(opts?.size, base.size, 0.005, 0.5)
+	};
+}
+
+/** Roughly how wide one character is as a fraction of the font size, measured
+ *  off `drawtext`'s default face; 0.6 sits above the ~0.53 that long text — the
+ *  only kind that reaches the cap — averages. */
+const CHAR_ADVANCE = 0.6;
+/** How much of the frame width a caption may take. */
+const CAPTION_WIDTH = 0.9;
+/** The frame captions assume when the project has not picked one: wide enough
+ *  that the fit never binds, so an unframed project captions as it always did. */
+const DEFAULT_CAPTION_ASPECT = 16 / 9;
+
+/** Shrink a caption's size until its text fits across a frame of `aspect`.
+ *  `drawtext` neither wraps nor scales, and a 9:16 frame is barely half as wide
+ *  as it is tall — so the social shape is exactly where a long word runs off
+ *  both edges. Mirrors `fit_size`. */
+export function fitSize(text: string, size: number, aspect: number): number {
+	return Math.min(size, (CAPTION_WIDTH * aspect) / (Math.max([...text].length, 1) * CHAR_ADVANCE));
+}
 
 const MIN_SPEED = 0.01;
 const speedMag = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), MIN_SPEED);
@@ -109,6 +176,8 @@ export function captionsForTimeline(
 	transcripts: Record<string, TranscriptSegment[]>,
 	opts: CaptionOpts = CAPTION_DEFAULTS
 ): Omit<TextOverlay, 'id'>[] {
+	const fmt = timeline.format;
+	const aspect = fmt && fmt.height ? fmt.width / fmt.height : DEFAULT_CAPTION_ASPECT;
 	const soloed = new Set(timeline.tracks.filter((t) => t.solo).map((t) => t.kind));
 	const lines: { start: number; end: number; text: string }[] = [];
 	for (const track of timeline.tracks) {
@@ -126,10 +195,10 @@ export function captionsForTimeline(
 				// line — so a sentence cut in half captions only the surviving half.
 				const a = sourceToTimeline(clip, seg.start);
 				const b = sourceToTimeline(clip, seg.end);
-				for (const line of timeChunks(chunkWords(text, opts), Math.min(a, b), Math.max(a, b))) {
+				for (const line of timeChunks(chunkWords(text, opts), Math.min(a, b), Math.max(a, b), opts.min_line)) {
 					const start = Math.max(line.start, visibleStart);
 					const end = Math.min(line.end, visibleEnd);
-					if (end - start < MIN_CAPTION_VISIBLE) continue;
+					if (end - start < opts.min_visible) continue;
 					lines.push({ start, end, text: line.text });
 				}
 			}
@@ -145,7 +214,7 @@ export function captionsForTimeline(
 	const placed: typeof deduped = [];
 	for (const l of deduped) {
 		const start = placed.length ? Math.max(l.start, placed[placed.length - 1].end) : l.start;
-		if (l.end - start < MIN_CAPTION_VISIBLE) continue;
+		if (l.end - start < opts.min_visible) continue;
 		placed.push({ ...l, start });
 	}
 	return placed.map((l) => ({
@@ -154,10 +223,10 @@ export function captionsForTimeline(
 		end: l.end,
 		pos_x: 0.5,
 		pos_y: opts.pos_y,
-		size: opts.size,
+		size: fitSize(l.text, opts.size, aspect),
 		color: 'white',
 		bg: 'black@0.5',
-		bold: false,
+		bold: opts.bold,
 		generated: true
 	}));
 }

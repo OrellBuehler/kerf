@@ -12,6 +12,7 @@ import type {
 	AudioEffect,
 	CaptionOptions,
 	Clip,
+	Mask,
 	Color,
 	Delivery,
 	DeliveryCheck,
@@ -44,7 +45,7 @@ import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
-import { captionsForTimeline, CAPTION_DEFAULTS } from './captions';
+import { captionsForTimeline, resolveCaptions } from './captions';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -754,6 +755,41 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 	return invoke<Timeline>('set_track_duck', { trackId, duck });
 }
 
+/** Cut a clip to a shape, or pass `null` to clear the mask. */
+export async function setMask(clipId: string, mask: Mask | null): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) found[0].clips[found[1]].mask = mask;
+		recordDev(mask ? 'Mask clip' : 'Clear mask');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_mask', { clipId, mask });
+}
+
+/** Set a track's fader — the gain riding every clip on it. */
+export async function setTrackVolume(trackId: string, volume: number): Promise<Timeline> {
+	const v = Math.min(4, Math.max(0, volume));
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.volume = v;
+		recordDev('Set track level');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_volume', { trackId, volume: v });
+}
+
+/** Set a track's stereo placement, -1 (hard left) to 1 (hard right). */
+export async function setTrackPan(trackId: string, pan: number): Promise<Timeline> {
+	const p = Math.min(1, Math.max(-1, pan));
+	if (!inTauri()) {
+		const track = devTimeline.tracks.find((t) => t.id === trackId);
+		if (track) track.pan = p;
+		recordDev('Set track pan');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_track_pan', { trackId, pan: p });
+}
+
 /** Set the frame the project is cut for, or pass `null` to follow the footage. */
 export async function setDeliveryFormat(format: Delivery | null): Promise<Timeline> {
 	if (!inTauri()) {
@@ -1206,10 +1242,10 @@ export async function generateCaptions(options?: CaptionOptions): Promise<Timeli
 				if (segs) transcripts[clip.asset_id] = segs;
 			}
 		}
-		const created = captionsForTimeline(devTimeline, transcripts, { ...CAPTION_DEFAULTS, ...options });
+		const created = captionsForTimeline(devTimeline, transcripts, resolveCaptions(options));
 		const kept = (devTimeline.overlays ??= []).filter((o) => !o.generated);
 		devTimeline.overlays = [...kept, ...created.map((o) => ({ ...o, id: uid() }))];
-		recordDev('Generate captions');
+		recordDev(options?.style === 'word_punch' ? 'Generate word captions' : 'Generate captions');
 		return snapshot();
 	}
 	return invoke<Timeline>('generate_captions', { options: options ?? null });

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection, ReframeKeyframe,
-    StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project,
+    Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -69,13 +69,17 @@ struct AssetIdParams {
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct CaptionParams {
-    #[schemars(description = "Most words on one caption line (default 4)")]
+    #[schemars(
+        description = "Look: `lines` (default) holds a few words as a subtitle line; `word_punch` puts one large word on screen at a time, the social-video style. Everything below is an override on top of the style — omit them to get the whole look."
+    )]
+    style: Option<CaptionStyle>,
+    #[schemars(description = "Most words on one caption line (lines: 4, word_punch: 1)")]
     max_words: Option<usize>,
     #[schemars(description = "Most characters on one caption line (default 28); the tighter of the two limits wins")]
     max_chars: Option<usize>,
-    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (default 0.88)")]
+    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (lines: 0.88, word_punch: 0.72)")]
     pos_y: Option<f64>,
-    #[schemars(description = "Font height as a fraction of frame height (default 0.05)")]
+    #[schemars(description = "Font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     size: Option<f64>,
 }
 
@@ -206,6 +210,46 @@ struct SetTrackDuckParams {
     track_id: String,
     #[schemars(description = "true to duck this track under the others on export, false to restore a flat mix")]
     duck: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMaskParams {
+    #[schemars(description = "UUID of the clip to mask")]
+    clip_id: String,
+    #[schemars(
+        description = "Shape outline: \"rect\" or \"ellipse\". Omit to CLEAR the mask entirely. Every other field, when omitted, keeps the clip's current value (or its default on a fresh mask)"
+    )]
+    shape: Option<String>,
+    #[schemars(description = "Centre of the shape across the frame, 0 = left edge, 1 = right (default 0.5)")]
+    x: Option<f64>,
+    #[schemars(description = "Centre of the shape down the frame, 0 = top, 1 = bottom (default 0.5)")]
+    y: Option<f64>,
+    #[schemars(description = "Full width of the shape as a fraction of the frame, not a radius (default 0.5)")]
+    width: Option<f64>,
+    #[schemars(description = "Full height of the shape as a fraction of the frame (default 0.5)")]
+    height: Option<f64>,
+    #[schemars(
+        description = "Edge softness as a fraction of the shape's own half-size, 0 = hard (default 0.15). A hard-edged mask over a face reads as a sticker"
+    )]
+    feather: Option<f64>,
+    #[schemars(description = "Keep what is OUTSIDE the shape instead of inside it (default false)")]
+    inverted: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackVolumeParams {
+    #[schemars(description = "UUID of the track to set the level of")]
+    track_id: String,
+    #[schemars(description = "Track fader as a linear gain: 1.0 is unity, 0.5 is -6 dB, 0 is silent. Clamped to 0..4")]
+    volume: f32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetTrackPanParams {
+    #[schemars(description = "UUID of the track to place")]
+    track_id: String,
+    #[schemars(description = "Stereo placement: -1 hard left, 0 centre, 1 hard right")]
+    pan: f32,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -366,7 +410,9 @@ struct ColorParams {
 struct TransitionParams {
     #[schemars(description = "UUID of the clip whose start blends with the clip before it on the same track")]
     clip_id: String,
-    #[schemars(description = "Transition kind: \"crossfade\" or \"dip_to_black\". Omit to clear the transition")]
+    #[schemars(
+        description = "Transition kind. Fades: \"crossfade\", \"dip_to_black\", \"dip_to_white\". Motion, named for the direction of travel: \"slide_left\" / \"slide_right\" / \"slide_up\" / \"slide_down\" brings the new shot in over the old one, \"push_left\" / \"push_right\" / \"push_up\" / \"push_down\" carries the old one out with it. Omit to clear the transition"
+    )]
     kind: Option<String>,
     #[schemars(description = "Transition duration in seconds (required when a kind is given)")]
     duration: Option<f64>,
@@ -897,6 +943,77 @@ impl KerfMcp {
         json(&track)
     }
 
+    #[tool(description = "Cut a clip to a shape: inside the shape the clip is kept, outside it goes \
+                       transparent and whatever is on a LOWER track shows through. Omit `shape` to \
+                       clear the mask. This is the one masking primitive, and it composes with the \
+                       track stack rather than replacing it — to blur a face, duplicate the shot onto \
+                       the track above with add_clip at the same timeline_start, give the copy a blur \
+                       with set_video_effects, then mask the copy to an ellipse over the face; to grade \
+                       one region, do the same with set_color. Check the result with preview_timeline: \
+                       positions are fractions of the frame, so you have to look to know you covered \
+                       the right thing.")]
+    fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let project = self.lock();
+        let mask = match p.shape {
+            None => None,
+            Some(ref s) => {
+                let shape = MaskShape::parse(s).ok_or_else(|| {
+                    McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
+                })?;
+                // Omitted fields keep the clip's current mask, so nudging one
+                // number (move the ellipse a little left) does not reset the
+                // size and feather back to the defaults out from under it.
+                let d = project
+                    .working_timeline()
+                    .ok()
+                    .and_then(|tl| tl.locate(clip_id).and_then(|(ti, ci)| tl.tracks[ti].clips[ci].mask))
+                    .unwrap_or_default();
+                Some(Mask {
+                    shape,
+                    x: p.x.unwrap_or(d.x),
+                    y: p.y.unwrap_or(d.y),
+                    width: p.width.unwrap_or(d.width),
+                    height: p.height.unwrap_or(d.height),
+                    feather: p.feather.unwrap_or(d.feather),
+                    inverted: p.inverted.unwrap_or(d.inverted),
+                })
+            }
+        };
+        let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
+        self.changed();
+        json(&clip)
+    }
+
+    #[tool(
+        description = "Set a track's fader — one linear gain riding every clip on the track, applied after \
+                       each clip's own volume and effects. This is how a music bed is balanced against a \
+                       voiceover: put the music on its own track and pull it to roughly 0.25-0.4 under \
+                       speech. Prefer it to editing every clip's volume, and to set_track_duck when the \
+                       level should simply sit lower rather than dip and recover."
+    )]
+    fn set_track_volume(&self, Parameters(p): Parameters<SetTrackVolumeParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
+    #[tool(
+        description = "Place a track in the stereo field, -1 hard left to 1 hard right. A balance, so a \
+                       panned track never gets louder, and a no-op on a mono delivery. Use it sparingly — \
+                       a hard-panned music bed sounds broken on a phone speaker, which is what most of \
+                       this footage is watched on."
+    )]
+    fn set_track_pan(&self, Parameters(p): Parameters<SetTrackPanParams>) -> Result<String, McpError> {
+        let track_id = parse_id(&p.track_id)?;
+        let project = self.lock();
+        let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
+        self.changed();
+        json(&track)
+    }
+
     #[tool(
         description = "Set the frame this project is cut for — the shape of the delivered video, e.g. \
                        1080x1920 for a vertical Reel or 1080x1080 for a square feed post. Everything \
@@ -1088,7 +1205,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set or clear the transition blending a clip's start with the clip before it on the same track. kind is \"crossfade\" or \"dip_to_black\" with a duration in seconds; omit kind to clear."
+        description = "Set or clear the transition blending a clip's start with the clip before it on the same track, with a duration in seconds; omit kind to clear. A dissolve or a motion transition plays both shots at once, so it borrows the outgoing clip's unused source — a clip trimmed to the very end of its footage has none to lend and the transition falls back to a hard cut. Dips need no handle. Reach for a fade between scenes and a motion transition between shots in a montage; a cut needs no transition at all."
     )]
     fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -1269,22 +1386,16 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines (defaults: 4 words / 28 characters). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
+        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
     )]
     fn generate_captions(&self, Parameters(p): Parameters<CaptionParams>) -> Result<String, McpError> {
-        let mut opts = CaptionOptions::default();
-        if let Some(v) = p.max_words {
-            opts.max_words = v;
-        }
-        if let Some(v) = p.max_chars {
-            opts.max_chars = v;
-        }
-        if let Some(v) = p.pos_y {
-            opts.pos_y = v;
-        }
-        if let Some(v) = p.size {
-            opts.size = v;
-        }
+        let opts = CaptionOptions {
+            style: p.style.unwrap_or_default(),
+            max_words: p.max_words,
+            max_chars: p.max_chars,
+            pos_y: p.pos_y,
+            size: p.size,
+        };
         let project = self.lock();
         let out = project.generate_captions(opts).map_err(core_err)?;
         self.changed();
@@ -1674,7 +1785,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. Mid-transition blends (crossfade/dip-to-black) are approximated."
+        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. A moment inside a transition is not: dissolves, dips and slides render as the plain cut."
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
@@ -1794,11 +1905,19 @@ impl ServerHandler for KerfMcp {
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
-             crop — picture-in-picture), set_color and set_transition (crossfade \
-             / dip-to-black). Go further: set_video_effects (blur / sharpen / \
+             crop — picture-in-picture), set_color and set_transition (a fade \
+             between scenes, a slide or push between the shots of a montage). \
+             Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
-             track shows through), set_audio_effects (highpass / lowpass / EQ / \
-             compressor / gate), and animate a clip with set_keyframes / \
+             track shows through), set_mask (cut a clip to a rectangle or ellipse so \
+             a lower track shows through — with a duplicated, blurred copy above, \
+             that is how a face or a number plate is blurred), \
+             set_audio_effects (highpass / lowpass / EQ / \
+             compressor / gate). Mix with set_track_volume — a music bed belongs \
+             on its own track pulled well under the speech (~0.3), which is most \
+             of what makes a cut sound finished — plus set_track_duck to dip it \
+             further under dialogue and set_track_pan to place it. Animate a clip \
+             with set_keyframes / \
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
              Burns zoom, a moving picture-in-picture). 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
@@ -1812,7 +1931,10 @@ impl ServerHandler for KerfMcp {
              and captions with add_overlay / update_overlay / set_overlay_keyframes \
              (drawn over the cut; list_fonts lists installed system fonts to pass \
              as update_overlay's font), or generate_captions to caption the whole \
-             cut in one call. Caption LAST, after the cutting is done: captions \
+             cut in one call. Its style=word_punch puts one large word on \
+             screen at a time instead of a subtitle line — that is what social \
+             captions look like, so prefer it for a vertical cut unless the user \
+             asked for subtitles. Caption LAST, after the cutting is done: captions \
              are placed in timeline time, so a later trim or remove_silence moves \
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
@@ -1941,7 +2063,10 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Optio
         Some(k) => {
             let kind = TransitionKind::parse(&k).ok_or_else(|| {
                 McpError::invalid_params(
-                    format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""),
+                    format!(
+                        "invalid transition kind '{k}'; expected one of {}",
+                        TransitionKind::wire_names()
+                    ),
                     None,
                 )
             })?;

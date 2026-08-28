@@ -374,6 +374,18 @@ impl Color {
 }
 
 /// How a clip blends with the preceding clip on its track.
+///
+/// Three families, and the family is what decides how the cut is rendered:
+/// a **dip** takes both sides through a solid colour, a **dissolve** mixes them,
+/// and a **motion** transition slides the incoming clip in over the outgoing one
+/// (`Slide*`) or shoves the outgoing one out of frame with it (`Push*`). All of
+/// them borrow the outgoing clip's unused source handle to keep it playing under
+/// the transition, so a cut with no handle left degrades to a hard cut rather
+/// than to a fade from black.
+///
+/// The direction in a motion transition names the direction of **travel**, the
+/// way an editor says it: `SlideLeft` brings the new shot in from the right edge
+/// and moves it left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionKind {
@@ -381,6 +393,26 @@ pub enum TransitionKind {
     Crossfade,
     /// Dip to black: the outgoing clip fades to black, the incoming up from it.
     DipToBlack,
+    /// Dip to white — the same shape as [`Self::DipToBlack`], through white.
+    /// Reads as a brighter, faster beat than black, which is why a montage of
+    /// daylight footage usually wants it instead.
+    DipToWhite,
+    /// The incoming clip travels in from the right edge over the held outgoing one.
+    SlideLeft,
+    /// The incoming clip travels in from the left edge.
+    SlideRight,
+    /// The incoming clip travels up from the bottom edge.
+    SlideUp,
+    /// The incoming clip travels down from the top edge.
+    SlideDown,
+    /// Both clips travel left: the incoming pushes the outgoing out of frame.
+    PushLeft,
+    /// Both clips travel right.
+    PushRight,
+    /// Both clips travel up.
+    PushUp,
+    /// Both clips travel down.
+    PushDown,
 }
 
 impl TransitionKind {
@@ -388,6 +420,15 @@ impl TransitionKind {
         match self {
             TransitionKind::Crossfade => "crossfade",
             TransitionKind::DipToBlack => "dip_to_black",
+            TransitionKind::DipToWhite => "dip_to_white",
+            TransitionKind::SlideLeft => "slide_left",
+            TransitionKind::SlideRight => "slide_right",
+            TransitionKind::SlideUp => "slide_up",
+            TransitionKind::SlideDown => "slide_down",
+            TransitionKind::PushLeft => "push_left",
+            TransitionKind::PushRight => "push_right",
+            TransitionKind::PushUp => "push_up",
+            TransitionKind::PushDown => "push_down",
         }
     }
 
@@ -395,7 +436,97 @@ impl TransitionKind {
         match s {
             "crossfade" => Some(TransitionKind::Crossfade),
             "dip_to_black" | "diptoblack" => Some(TransitionKind::DipToBlack),
+            "dip_to_white" | "diptowhite" => Some(TransitionKind::DipToWhite),
+            "slide_left" => Some(TransitionKind::SlideLeft),
+            "slide_right" => Some(TransitionKind::SlideRight),
+            "slide_up" => Some(TransitionKind::SlideUp),
+            "slide_down" => Some(TransitionKind::SlideDown),
+            "push_left" => Some(TransitionKind::PushLeft),
+            "push_right" => Some(TransitionKind::PushRight),
+            "push_up" => Some(TransitionKind::PushUp),
+            "push_down" => Some(TransitionKind::PushDown),
             _ => None,
+        }
+    }
+
+    /// Every kind, in the order a picker should offer them.
+    pub const ALL: [TransitionKind; 11] = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ];
+
+    /// Every kind's wire name, quoted and comma-joined — so an error message
+    /// listing what was expected cannot drift from the enum.
+    pub fn wire_names() -> String {
+        Self::ALL
+            .iter()
+            .map(|k| format!("\"{}\"", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The solid colour this transition dips through, if it is a dip.
+    pub fn dip_color(self) -> Option<&'static str> {
+        match self {
+            TransitionKind::DipToBlack => Some("black"),
+            TransitionKind::DipToWhite => Some("white"),
+            _ => None,
+        }
+    }
+
+    /// Where the incoming clip starts, as an offset from its final position in
+    /// frame widths and heights, for a motion transition. It travels from here
+    /// to `(0, 0)` over the transition, so the vector points back along the
+    /// direction of travel: a `SlideLeft` starts one full frame to the right.
+    pub fn slide_from(self) -> Option<(f64, f64)> {
+        match self {
+            TransitionKind::SlideLeft | TransitionKind::PushLeft => Some((1.0, 0.0)),
+            TransitionKind::SlideRight | TransitionKind::PushRight => Some((-1.0, 0.0)),
+            TransitionKind::SlideUp | TransitionKind::PushUp => Some((0.0, 1.0)),
+            TransitionKind::SlideDown | TransitionKind::PushDown => Some((0.0, -1.0)),
+            _ => None,
+        }
+    }
+
+    /// True when the outgoing clip is carried out of frame by the incoming one
+    /// instead of being covered where it stands.
+    pub fn pushes(self) -> bool {
+        matches!(
+            self,
+            TransitionKind::PushLeft | TransitionKind::PushRight | TransitionKind::PushUp | TransitionKind::PushDown
+        )
+    }
+
+    /// True when both sides play at once — a dissolve or any motion transition.
+    /// Such a transition needs the outgoing clip's source handle; a dip does not,
+    /// because the two halves happen either side of the cut.
+    pub fn overlaps(self) -> bool {
+        !matches!(self, TransitionKind::DipToBlack | TransitionKind::DipToWhite)
+    }
+
+    /// Human name, for a diff line or a picker label.
+    pub fn label(self) -> &'static str {
+        match self {
+            TransitionKind::Crossfade => "Crossfade",
+            TransitionKind::DipToBlack => "Dip to black",
+            TransitionKind::DipToWhite => "Dip to white",
+            TransitionKind::SlideLeft => "Slide left",
+            TransitionKind::SlideRight => "Slide right",
+            TransitionKind::SlideUp => "Slide up",
+            TransitionKind::SlideDown => "Slide down",
+            TransitionKind::PushLeft => "Push left",
+            TransitionKind::PushRight => "Push right",
+            TransitionKind::PushUp => "Push up",
+            TransitionKind::PushDown => "Push down",
         }
     }
 }
@@ -407,6 +538,112 @@ pub struct Transition {
     pub kind: TransitionKind,
     /// Duration of the transition in seconds.
     pub duration: f64,
+}
+
+/// The outline of a [`Mask`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskShape {
+    /// An axis-aligned rectangle — a sign, a screen, a lower band of the frame.
+    #[default]
+    Rect,
+    /// An ellipse — a face, a spotlight.
+    Ellipse,
+}
+
+impl MaskShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MaskShape::Rect => "rect",
+            MaskShape::Ellipse => "ellipse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rect" | "rectangle" => Some(MaskShape::Rect),
+            "ellipse" | "circle" | "oval" => Some(MaskShape::Ellipse),
+            _ => None,
+        }
+    }
+}
+
+/// A shape cut out of a clip: inside the shape the clip is kept, outside it goes
+/// transparent (or the other way round, `inverted`). Everything is a **fraction
+/// of the clip's rendered frame**, so a mask does not have to be redone when the
+/// delivery frame changes.
+///
+/// Deliberately one primitive rather than a masking *mode* per use. A mask makes
+/// a clip see-through, and the timeline already stacks tracks — so blurring a
+/// face is a copy of the shot on the track above, blurred, masked to the face;
+/// a picture-in-picture vignette is a mask on the upper clip; a region grade is
+/// a masked copy with its own colour. One thing to learn, and it composes with
+/// what is already there instead of adding a second compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Mask {
+    #[serde(default)]
+    pub shape: MaskShape,
+    /// Centre of the shape, as a fraction of the frame. 0.5, 0.5 is the middle.
+    #[serde(default = "half")]
+    pub x: f64,
+    #[serde(default = "half")]
+    pub y: f64,
+    /// Size of the shape as a fraction of the frame (its full width / height,
+    /// not a radius).
+    #[serde(default = "half")]
+    pub width: f64,
+    #[serde(default = "half")]
+    pub height: f64,
+    /// Softness of the edge, as a fraction of the shape's own half-size. 0 is a
+    /// hard cut — which on a face reads as a sticker, so the default is soft.
+    #[serde(default = "default_feather")]
+    pub feather: f64,
+    /// Keep what is *outside* the shape instead of inside it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverted: bool,
+}
+
+fn default_feather() -> f64 {
+    0.15
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Self {
+            shape: MaskShape::default(),
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: default_feather(),
+            inverted: false,
+        }
+    }
+}
+
+impl Mask {
+    /// The mask with every field clamped into range: sizes to a visible minimum,
+    /// the centre to the frame, feather to 0..1. A zero-width mask would blank
+    /// the clip entirely, which is never what was meant.
+    pub fn normalized(self) -> Self {
+        Self {
+            shape: self.shape,
+            x: clamp01(self.x),
+            y: clamp01(self.y),
+            width: self.width.clamp(0.01, 2.0),
+            height: self.height.clamp(0.01, 2.0),
+            feather: clamp01(self.feather),
+            inverted: self.inverted,
+        }
+    }
+}
+
+fn clamp01(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
 }
 
 /// A per-clip video effect, realized as a filter inserted into the clip's video
@@ -906,76 +1143,170 @@ pub const MIN_CAPTION: f64 = 0.45;
 /// edge; showing it would caption footage that is no longer there.
 pub const MIN_CAPTION_VISIBLE: f64 = 0.15;
 
-/// How a transcript is turned into on-screen captions. The defaults are the
-/// social shape — a few words at a time, sized to be read on a phone — because a
-/// speech model emits whole sentences and a whole sentence does not fit a 9:16
-/// frame.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct CaptionOptions {
-    /// Most words on one caption line.
-    #[serde(default = "default_caption_words")]
-    pub max_words: usize,
-    /// Most characters on one caption line; the tighter of the two limits wins.
-    #[serde(default = "default_caption_chars")]
-    pub max_chars: usize,
-    /// Vertical position as a fraction of frame height.
-    #[serde(default = "default_caption_y")]
-    pub pos_y: f64,
-    /// Font height as a fraction of frame height.
-    #[serde(default = "default_caption_size")]
-    pub size: f64,
+/// The same two floors for [`CaptionStyle::WordPunch`], where a line *is* one
+/// word. Held to [`MIN_CAPTION`] every short word would merge into a neighbour
+/// and the style would collapse back into [`CaptionStyle::Lines`]; words still
+/// merge — a one-letter word's character share is a couple of frames — just far
+/// later.
+pub const MIN_WORD_CAPTION: f64 = 0.12;
+pub const MIN_WORD_VISIBLE: f64 = 0.06;
+
+/// The shape a generated caption set takes on screen.
+///
+/// Two, because they are consumed differently. A subtitle line is *read*: it
+/// holds still long enough to take several words in at once. The one-word form
+/// is *watched* — each word lands on the beat of the speech, which is the look
+/// social captions have converged on and most of why a muted feed video holds
+/// attention. It is not a font choice: the word count, the size, the position
+/// and the floors that stop a line flickering all move together, so it is one
+/// decision rather than four.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionStyle {
+    /// A few words at a time, held as a subtitle line low in the frame.
+    #[default]
+    Lines,
+    /// One word at a time, large and bold, cut in and out on the word.
+    WordPunch,
 }
 
-fn default_caption_words() -> usize {
-    4
-}
-
-fn default_caption_chars() -> usize {
-    28
-}
-
-fn default_caption_y() -> f64 {
-    0.88
-}
-
-fn default_caption_size() -> f64 {
-    0.05
-}
-
-impl Default for CaptionOptions {
-    fn default() -> Self {
-        Self {
-            max_words: default_caption_words(),
-            max_chars: default_caption_chars(),
-            pos_y: default_caption_y(),
-            size: default_caption_size(),
+impl CaptionStyle {
+    /// The style's own numbers, before any per-call override.
+    fn layout(self) -> CaptionLayout {
+        match self {
+            Self::Lines => CaptionLayout {
+                max_words: 4,
+                max_chars: 28,
+                pos_y: 0.88,
+                size: 0.05,
+                bold: false,
+                min_line: MIN_CAPTION,
+                min_visible: MIN_CAPTION_VISIBLE,
+            },
+            Self::WordPunch => CaptionLayout {
+                max_words: 1,
+                max_chars: 28,
+                // Higher and much larger than a subtitle: one word carries the
+                // whole frame, and sitting it on the bottom edge would put it
+                // under the platform's own caption rail.
+                pos_y: 0.72,
+                size: 0.11,
+                bold: true,
+                min_line: MIN_WORD_CAPTION,
+                min_visible: MIN_WORD_VISIBLE,
+            },
         }
     }
 }
 
+/// A [`CaptionStyle`]'s numbers with any per-call override applied — what
+/// [`Timeline::captions`] actually works from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptionLayout {
+    /// Most words on one caption line.
+    pub max_words: usize,
+    /// Most characters on one caption line; the tighter of the two limits wins.
+    pub max_chars: usize,
+    /// Vertical position as a fraction of frame height.
+    pub pos_y: f64,
+    /// Font height as a fraction of frame height.
+    pub size: f64,
+    /// Whether the text is drawn bold.
+    pub bold: bool,
+    /// Shortest a line may be before it merges into a neighbour.
+    pub min_line: f64,
+    /// Shortest a line clipped by a cut may be before it is dropped.
+    pub min_visible: f64,
+}
+
+/// How a transcript is turned into on-screen captions. Everything but the style
+/// is an *override*: omit a field and it follows the style, so asking for
+/// [`CaptionStyle::WordPunch`] on its own gets the whole look rather than one
+/// word left at subtitle size in the subtitle position.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CaptionOptions {
+    /// The look; defaults to [`CaptionStyle::Lines`].
+    #[serde(default)]
+    pub style: CaptionStyle,
+    /// Most words on one caption line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_words: Option<usize>,
+    /// Most characters on one caption line; the tighter of the two limits wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    /// Vertical position as a fraction of frame height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos_y: Option<f64>,
+    /// Font height as a fraction of frame height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+}
+
 impl CaptionOptions {
-    fn sanitized(self) -> Self {
+    /// A style with no overrides.
+    pub fn styled(style: CaptionStyle) -> Self {
         Self {
-            max_words: self.max_words.max(1),
-            max_chars: self.max_chars.max(1),
-            pos_y: if self.pos_y.is_finite() {
-                self.pos_y.clamp(0.0, 1.0)
-            } else {
-                default_caption_y()
-            },
-            size: if self.size.is_finite() {
-                self.size.clamp(0.005, 0.5)
-            } else {
-                default_caption_size()
-            },
+            style,
+            ..Self::default()
         }
+    }
+
+    /// The numbers to caption with: the style's, with any override that is
+    /// actually usable applied over them.
+    pub fn resolve(self) -> CaptionLayout {
+        let base = self.style.layout();
+        CaptionLayout {
+            max_words: self.max_words.map_or(base.max_words, |v| v.max(1)),
+            max_chars: self.max_chars.map_or(base.max_chars, |v| v.max(1)),
+            pos_y: overridden(self.pos_y, base.pos_y, 0.0, 1.0),
+            size: overridden(self.size, base.size, 0.005, 0.5),
+            ..base
+        }
+    }
+}
+
+/// Roughly how wide one character is as a fraction of the font size, measured
+/// off `drawtext`'s default face. Real caption text runs 0.44–0.75 depending on
+/// the word; 0.6 sits above the 0.52–0.55 that *long* text averages, and long
+/// text is the only kind that ever reaches the cap.
+const CHAR_ADVANCE: f64 = 0.6;
+
+/// How much of the frame width a caption may take.
+const CAPTION_WIDTH: f64 = 0.9;
+
+/// The frame captions assume when the project has not picked one. A timeline
+/// cannot see its assets, so it cannot derive the footage default `export_format`
+/// would use — and 16:9 is wide enough that the fit below never binds, which is
+/// what keeps an unframed project captioned exactly as it was before.
+const DEFAULT_CAPTION_ASPECT: f64 = 16.0 / 9.0;
+
+/// Shrink a caption's size (a fraction of frame height) until its text fits
+/// across a frame of `aspect` (width / height).
+///
+/// `drawtext` neither wraps nor scales: text wider than the frame is simply
+/// drawn off both edges. A 9:16 frame is barely half as wide as it is tall, so
+/// the social shape this whole feature is for is exactly where a long word runs
+/// off — and `fontsize` cannot be an expression over `text_w`, since the width
+/// is what depends on the size. So the fit is estimated here from the character
+/// count, which is the only measurement available before the filter runs.
+fn fit_size(text: &str, size: f64, aspect: f64) -> f64 {
+    let chars = text.chars().count().max(1) as f64;
+    size.min(CAPTION_WIDTH * aspect / (chars * CHAR_ADVANCE))
+}
+
+/// Apply an optional override, ignoring one that is not a finite number and
+/// clamping the rest into range.
+fn overridden(v: Option<f64>, base: f64, lo: f64, hi: f64) -> f64 {
+    match v {
+        Some(v) if v.is_finite() => v.clamp(lo, hi),
+        _ => base,
     }
 }
 
 /// Break a transcript line into caption-sized groups of words. Greedy: take
 /// words until either limit would be exceeded, always at least one (a single
 /// word longer than `max_chars` is its own line rather than being cut in half).
-fn chunk_words(text: &str, opts: CaptionOptions) -> Vec<String> {
+fn chunk_words(text: &str, layout: CaptionLayout) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut words = 0usize;
@@ -985,7 +1316,7 @@ fn chunk_words(text: &str, opts: CaptionOptions) -> Vec<String> {
         } else {
             word.chars().count() + 1
         };
-        let fits = words < opts.max_words && current.chars().count() + extra <= opts.max_chars;
+        let fits = words < layout.max_words && current.chars().count() + extra <= layout.max_chars;
         if !current.is_empty() && !fits {
             out.push(std::mem::take(&mut current));
             words = 0;
@@ -1054,7 +1385,10 @@ impl Timeline {
     /// Reads through [`Timeline::for_render`], so a muted track and a disabled
     /// clip are as uncaptioned as they are unheard.
     pub fn captions(&self, transcripts: &HashMap<Uuid, Vec<TranscriptSegment>>, opts: CaptionOptions) -> Vec<TextOverlay> {
-        let opts = opts.sanitized();
+        let layout = opts.resolve();
+        let aspect = self
+            .format
+            .map_or(DEFAULT_CAPTION_ASPECT, |d| f64::from(d.width) / f64::from(d.height));
         let rendered = self.for_render();
         let mut lines: Vec<(TimeRange, String)> = Vec::new();
         for track in &rendered.tracks {
@@ -1072,10 +1406,10 @@ impl Timeline {
                     // each line to the clip — so a sentence cut in half captions
                     // only the half that is still in the cut.
                     let span = clip.source_span_to_timeline(seg.start, seg.end);
-                    for (range, chunk) in time_chunks(chunk_words(text, opts), span, MIN_CAPTION) {
+                    for (range, chunk) in time_chunks(chunk_words(text, layout), span, layout.min_line) {
                         let start = range.start.max(visible_start);
                         let end = range.end.min(visible_end);
-                        if end - start < MIN_CAPTION_VISIBLE {
+                        if end - start < layout.min_visible {
                             continue;
                         }
                         lines.push((TimeRange { start, end }, chunk));
@@ -1099,7 +1433,7 @@ impl Timeline {
             let start = placed
                 .last()
                 .map_or(range.start, |(prev, _): &(TimeRange, String)| range.start.max(prev.end));
-            if range.end - start < MIN_CAPTION_VISIBLE {
+            if range.end - start < layout.min_visible {
                 continue;
             }
             placed.push((TimeRange { start, end: range.end }, text));
@@ -1107,9 +1441,11 @@ impl Timeline {
         placed
             .into_iter()
             .map(|(range, text)| {
+                let size = fit_size(&text, layout.size, aspect);
                 let mut o = TextOverlay::new(text, range.start.max(0.0), range.end);
-                o.pos_y = opts.pos_y;
-                o.size = opts.size;
+                o.pos_y = layout.pos_y;
+                o.size = size;
+                o.bold = layout.bold;
                 o.bg = Some("black@0.5".to_string());
                 o.generated = true;
                 o
@@ -1168,6 +1504,10 @@ pub struct Clip {
     /// explicitly un-reframed, to work in the raw projection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reframe: Option<Reframe>,
+    /// A shape cut out of this clip, making the rest transparent so a lower
+    /// track shows through. `None` is the whole frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Mask>,
     /// Whether this clip renders. A disabled clip keeps its place on the
     /// timeline (and its trims, effects and keyframes) but is dropped before the
     /// render graph is built — the per-clip counterpart of muting a track.
@@ -1207,6 +1547,7 @@ impl Clip {
             audio: Vec::new(),
             keyframes: Vec::new(),
             reframe: None,
+            mask: None,
             enabled: true,
         }
     }
@@ -1382,14 +1723,39 @@ pub struct Track {
     /// renders; the GUI refuses to drag, trim or razor its clips.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// The track fader: a linear gain riding every clip on the track *after* its
+    /// own volume and effect chain, the way a channel strip works — so pulling a
+    /// music bed down does not change what its compressor was reacting to.
+    /// 1.0 is unity. Defaulted, so a project written before there was a fader
+    /// reads back at unity and renders identically.
+    #[serde(default = "unity_gain", skip_serializing_if = "is_unity_gain")]
+    pub volume: f32,
+    /// Stereo placement, -1 (hard left) to 1 (hard right); 0 is centre. Applied
+    /// as a balance (see [`Track::pan_gains`] — deliberately *not* a
+    /// constant-power law), so panning a track never makes it louder — and it
+    /// is a no-op on a mono delivery, where there is nowhere to pan to.
+    #[serde(default, skip_serializing_if = "is_centred")]
+    pub pan: f32,
     pub kind: StreamKind,
     pub name: String,
     #[serde(default)]
     pub clips: Vec<Clip>,
 }
 
+fn unity_gain() -> f32 {
+    1.0
+}
+
+fn is_unity_gain(v: &f32) -> bool {
+    (*v - 1.0).abs() < f32::EPSILON
+}
+
+fn is_centred(v: &f32) -> bool {
+    v.abs() < f32::EPSILON
+}
+
 impl Track {
-    /// An empty track: not ducked, muted, soloed or locked.
+    /// An empty track: not ducked, muted, soloed or locked, at unity and centred.
     pub fn new(kind: StreamKind, name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -1397,9 +1763,28 @@ impl Track {
             muted: false,
             solo: false,
             locked: false,
+            volume: 1.0,
+            pan: 0.0,
             kind,
             name: name.into(),
             clips: Vec::new(),
+        }
+    }
+
+    /// The left / right gains for this track's `pan`, as a fraction of unity.
+    ///
+    /// A **balance**, not a constant-power pan: the side you turn towards stays
+    /// at unity and the other is attenuated away. A constant-power law would
+    /// boost the near side by 3 dB at the extremes, which is right for placing a
+    /// mono source in a field and wrong for leaning a finished stereo track —
+    /// nudging a music bed left should not make it louder. Centre is exactly
+    /// `(1, 1)`, so an untouched track is bit-for-bit what it always was.
+    pub fn pan_gains(&self) -> (f64, f64) {
+        let p = self.pan.clamp(-1.0, 1.0) as f64;
+        if p < 0.0 {
+            (1.0, 1.0 + p)
+        } else {
+            (1.0 - p, 1.0)
         }
     }
 
@@ -2322,6 +2707,14 @@ fn track_changes(before: &Track, after: &Track) -> Option<String> {
             parts.push((if is { on } else { off }).to_string());
         }
     }
+    // The mixer strip: without these an agent proposal that only rides a fader
+    // or a pan diffs as empty and apply_staged throws it away.
+    if (before.volume - after.volume).abs() > DIFF_EPS as f32 {
+        parts.push(format!("level {:.0}% → {:.0}%", before.volume * 100.0, after.volume * 100.0));
+    }
+    if (before.pan - after.pan).abs() > DIFF_EPS as f32 {
+        parts.push(format!("pan {:.2} → {:.2}", before.pan, after.pan));
+    }
     joined(parts)
 }
 
@@ -2456,6 +2849,12 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
         parts.push("keyframes retimed".to_string());
     }
     parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
+    if before.mask != after.mask {
+        parts.push(match &after.mask {
+            None => "mask cleared".to_string(),
+            Some(m) => format!("masked ({})", m.shape.as_str()),
+        });
+    }
     joined(parts)
 }
 
@@ -3155,6 +3554,30 @@ mod tests {
     }
 
     #[test]
+    fn diff_sees_a_mask_and_the_track_mix() {
+        // An agent proposal that only masks a clip or rides a fader must not
+        // diff as empty — apply_staged discards an empty proposal.
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)])],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        after.tracks[0].clips[0].mask = Some(Mask::default());
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        assert!(diff.entries[0].detail.as_deref().unwrap().contains("masked (rect)"));
+
+        let mut after = tl.clone();
+        after.tracks[0].volume = 0.5;
+        after.tracks[0].pan = -0.3;
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        let detail = diff.entries[0].detail.clone().unwrap();
+        assert!(detail.contains("level 100% → 50%"), "{detail}");
+        assert!(detail.contains("pan 0.00 → -0.30"), "{detail}");
+    }
+
+    #[test]
     fn diff_covers_overlays_markers_and_the_delivery_frame() {
         let tl = Timeline::new();
         let mut after = tl.clone();
@@ -3339,6 +3762,51 @@ mod tests {
     }
 
     #[test]
+    fn a_track_pan_is_a_balance_and_centre_is_exactly_unity() {
+        let mut t = Track::new(StreamKind::Audio, "A1");
+        assert_eq!(t.pan_gains(), (1.0, 1.0), "an untouched track must not be touched");
+        t.pan = -1.0;
+        assert_eq!(t.pan_gains(), (1.0, 0.0), "hard left keeps the left at unity");
+        t.pan = 1.0;
+        assert_eq!(t.pan_gains(), (0.0, 1.0));
+        t.pan = -0.5;
+        assert_eq!(t.pan_gains(), (1.0, 0.5));
+        // Never a boost: leaning a finished stereo track must not make it louder.
+        for p in [-1.0, -0.5, 0.0, 0.25, 1.0] {
+            t.pan = p;
+            let (l, r) = t.pan_gains();
+            assert!(l <= 1.0 && r <= 1.0, "pan {p} boosted to ({l}, {r})");
+        }
+        // Out of range is clamped rather than inverted.
+        t.pan = 9.0;
+        assert_eq!(t.pan_gains(), (0.0, 1.0));
+    }
+
+    #[test]
+    fn every_transition_kind_round_trips_and_knows_its_family() {
+        for k in TransitionKind::ALL {
+            assert_eq!(TransitionKind::parse(k.as_str()), Some(k), "{k:?} must survive the wire");
+            assert!(
+                TransitionKind::wire_names().contains(k.as_str()),
+                "{k:?} must be listed for a caller"
+            );
+            // Exactly one family each: a dip has a colour and never moves, a
+            // motion transition moves and never dips, a dissolve does neither.
+            assert!(
+                !(k.dip_color().is_some() && k.slide_from().is_some()),
+                "{k:?} cannot both dip and travel"
+            );
+            assert_eq!(k.dip_color().is_some(), !k.overlaps(), "{k:?}: only a dip skips the overlap");
+            assert!(!k.pushes() || k.slide_from().is_some(), "{k:?}: a push must have a direction");
+        }
+        // A slide and its push travel the same way; the difference is what
+        // happens to the outgoing clip, not where the incoming one comes from.
+        assert_eq!(TransitionKind::SlideLeft.slide_from(), TransitionKind::PushLeft.slide_from());
+        assert!(!TransitionKind::SlideLeft.pushes() && TransitionKind::PushLeft.pushes());
+        assert_eq!(TransitionKind::parse("nonsense"), None);
+    }
+
+    #[test]
     fn captions_follow_a_trimmed_and_moved_clip() {
         let asset = Uuid::new_v4();
         // The interesting case: the transcript says 30s, the cut says 0s.
@@ -3461,6 +3929,105 @@ mod tests {
                 pair[0]
             );
         }
+    }
+
+    #[test]
+    fn word_punch_puts_one_word_on_screen_at_a_time() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 5.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 5.0, "alpha bravo charlie delta echo")]);
+        let punched = timeline.captions(&map, CaptionOptions::styled(CaptionStyle::WordPunch));
+        assert_eq!(
+            punched.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(),
+            ["alpha", "bravo", "charlie", "delta", "echo"]
+        );
+        // The whole look, not just the word count: the line style would leave
+        // one word at subtitle size on the bottom edge.
+        let layout = CaptionStyle::WordPunch.layout();
+        assert!(punched
+            .iter()
+            .all(|o| o.bold && o.size == layout.size && o.pos_y == layout.pos_y));
+        // Each word hands the screen to the next with no gap and no overlap.
+        for pair in punched.windows(2) {
+            assert!((pair[1].start - pair[0].end).abs() < 1e-9, "{:?}", (&pair[0], &pair[1]));
+        }
+        // The default style is untouched by any of this.
+        let lines = timeline.captions(&map, CaptionOptions::default());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|o| !o.bold));
+    }
+
+    #[test]
+    fn a_word_too_short_to_read_joins_its_neighbour() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 2.0, 0.0));
+        let mut map = HashMap::new();
+        // "a" is one character of thirty, so its character share is ~0.07s —
+        // two frames, which is a flicker rather than a word.
+        map.insert(asset, vec![seg(0.0, 2.0, "a fairly quickly spoken sentence")]);
+        let punched = timeline.captions(&map, CaptionOptions::styled(CaptionStyle::WordPunch));
+        assert!(
+            punched.iter().all(|o| o.end - o.start >= MIN_WORD_CAPTION - 1e-6),
+            "{:?}",
+            punched.iter().map(|o| (&o.text, o.end - o.start)).collect::<Vec<_>>()
+        );
+        assert_eq!(punched[0].text, "a fairly", "the flicker merges instead of being dropped");
+    }
+
+    #[test]
+    fn an_override_moves_one_number_and_leaves_the_style_alone() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 5.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 5.0, "alpha bravo charlie delta echo")]);
+        let opts = CaptionOptions {
+            size: Some(0.2),
+            ..CaptionOptions::styled(CaptionStyle::WordPunch)
+        };
+        let punched = timeline.captions(&map, opts);
+        assert_eq!(punched.len(), 5, "still one word each");
+        assert!(punched.iter().all(|o| o.size == 0.2 && o.bold));
+        assert!(punched.iter().all(|o| o.pos_y == CaptionStyle::WordPunch.layout().pos_y));
+        // An unusable override falls back to the style rather than through it.
+        let junk = CaptionOptions {
+            size: Some(f64::NAN),
+            pos_y: Some(9.0),
+            ..CaptionOptions::styled(CaptionStyle::WordPunch)
+        };
+        let layout = junk.resolve();
+        assert_eq!(layout.size, CaptionStyle::WordPunch.layout().size);
+        assert_eq!(layout.pos_y, 1.0);
+    }
+
+    #[test]
+    fn a_long_word_is_shrunk_to_fit_a_vertical_frame() {
+        let asset = Uuid::new_v4();
+        let mut timeline = one_clip(Clip::new(asset, 0.0, 4.0, 0.0));
+        let mut map = HashMap::new();
+        map.insert(asset, vec![seg(0.0, 4.0, "non-destructive editing")]);
+        let opts = CaptionOptions::styled(CaptionStyle::WordPunch);
+        let full = CaptionStyle::WordPunch.layout().size;
+
+        // Unframed, so 16:9 — wide enough that nothing is shrunk, which is what
+        // keeps every project that never picked a frame captioned as it was.
+        let wide = timeline.captions(&map, opts);
+        assert!(wide.iter().all(|o| o.size == full), "{wide:?}");
+
+        // 9:16 is barely half as wide as it is tall, and `drawtext` neither
+        // wraps nor scales: the long word would be drawn off both edges.
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let tall = timeline.captions(&map, opts);
+        let long = tall.iter().find(|o| o.text == "non-destructive").expect("the long word");
+        let short = tall.iter().find(|o| o.text == "editing").expect("the short word");
+        assert!(long.size < full, "the long word shrinks: {}", long.size);
+        assert_eq!(short.size, full, "a word that already fits is left alone");
+        let aspect = 1080.0 / 1920.0;
+        assert!(
+            long.text.chars().count() as f64 * CHAR_ADVANCE * long.size <= CAPTION_WIDTH * aspect + 1e-9,
+            "still overflows: {}",
+            long.size
+        );
     }
 
     #[test]

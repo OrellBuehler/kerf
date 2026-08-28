@@ -82,19 +82,44 @@ so the feature is **only** activated through these forwards — which is what ma
   `format` through so range export and playback keep it. `still_clip_chain` honors
   `fit` too (it used to letterbox unconditionally, so the one frame you looked at
   while cutting was the one shape you were never going to ship).
-  Tracks flagged `Track.duck` are mixed into their own bus and
+  Every track carries a **mixer strip**: `Track.volume` (the fader) and
+  `Track.pan`. The fader rides each clip *after* its own gain and effect chain —
+  a channel strip, so pulling a music bed down does not change what its
+  compressor was reacting to — and the pan is a **balance** (`Track::pan_gains`,
+  pure + unit-tested), not a constant-power law: the side you turn towards stays
+  at unity and the other is attenuated away, because leaning a finished stereo
+  track should not make it louder. Both are omitted from the graph at their
+  neutral values, so every pre-existing mix is byte-identical, and the pan is
+  dropped entirely on a mono delivery. Tracks flagged `Track.duck` are mixed
+  into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
   on the final mix, and `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
+  **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
+  fractions of the rendered frame, feathered, optionally inverted): outside it
+  the clip goes transparent and a lower track shows through. Deliberately *one*
+  primitive that composes with the track stack rather than a masking mode per
+  use — a blurred face is a duplicated shot on the track above, blurred and
+  masked; a region grade is the same with a colour. That is also what keeps it a
+  single filter in the linear per-clip chain (`mask_filter`, a `geq` rewriting
+  only the alpha plane — no branch in the graph): one expression covers both
+  shapes, each axis scaled so the edge is at distance 1, `max` for a rectangle
+  and `hypot` for an ellipse. `geq` is per-pixel and slow, the cost keyframed
+  opacity already pays.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **Text overlays** (`Timeline.overlays`) are
+  `keyframe_expr` over clip-local time). **Any such expression must be quoted in
+  the filter value** — it contains commas, and an unquoted comma is where the
+  graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
+  x/y made every animated clip and every animated overlay abort the render with
+  `No such filter`, invisibly, because the graph *string* looked right and every
+  unit test asserted on the string. **Text overlays** (`Timeline.overlays`) are
   `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
   still / preview path samples `Clip::transform_at` and draws overlays statically.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
@@ -265,7 +290,20 @@ no editing logic in the adapter.
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
   `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
-  motion). Text titles / lower-thirds / captions live on the timeline itself as
+  motion).
+  **`TransitionKind` is three families, and the family decides the render**: a
+  **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
+  either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
+  **motion** transition travels the incoming clip in over the outgoing one
+  (`Slide*`) or carries the outgoing one out with it (`Push*`), four directions
+  each — the direction naming the direction of *travel*. The enum answers for
+  its own family (`dip_color` / `slide_from` / `pushes` / `overlaps`), so the
+  engine never matches on eleven variants, and `wire_names` derives the
+  expected-kind list both surfaces put in their errors. A dissolve or a motion
+  transition plays both shots at once, so it borrows the outgoing clip's unused
+  source handle: a clip trimmed to the very end of its footage has none to lend
+  and the transition degrades to a hard cut (a dip needs none). Text titles /
+  lower-thirds / captions live on the timeline itself as
   `Timeline.overlays: Vec<TextOverlay>` (each with its own `TextKeyframe`
   animation); `transcript_to_srt` serializes a transcript to SubRip.
   **Captions are timeline math, not a transcript dump**, and pure +
@@ -275,14 +313,34 @@ no editing logic in the adapter.
   speed / reverse) — captions land on the words that survived the cut and words
   that were cut out get none. It reads through `for_render`, so a muted track is
   as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
-  (4 words / 28 chars by default — a speech model emits whole sentences and a
-  whole sentence does not fit a 9:16 frame), timing lines by *character share*
+  (a speech model emits whole sentences and a whole sentence does not fit a
+  9:16 frame), timing lines by *character share*
   because neither speech backend reports word timings; lines too short to read
   merge back into a neighbour instead of flashing; and no two lines are ever on
   screen at once (captions are one lane of text, and the same footage reaching
   the cut twice would otherwise collide with itself). `TextOverlay.generated`
   marks what it wrote, so regenerating replaces its own set and leaves a typed
-  title alone. A `Track`
+  title alone.
+  **`CaptionStyle` is the look**, and one decision rather than four:
+  `Lines` (4 words / 28 chars, 5% of frame height, low in the frame) is the
+  subtitle shape a line is *read* in; `WordPunch` (one word, 11%, higher, bold)
+  is the social shape a word is *watched* in, each landing on the beat of the
+  speech. Word count, size, position and the flicker floors move together
+  because they have to — held to `MIN_CAPTION` every short word would merge
+  into a neighbour and word punch would collapse back into lines, so it gets
+  its own `MIN_WORD_CAPTION` / `MIN_WORD_VISIBLE` and words merge far later.
+  `CaptionOptions` is that style plus **overrides**: every number is optional
+  and follows the style when omitted, `resolve()`ing to the `CaptionLayout`
+  captioning works from — so asking for `word_punch` alone gets the whole look
+  rather than one word left at subtitle size, and `CaptionOptions::default()`
+  is unchanged, so every pre-existing call captions identically. `fit_size`
+  then shrinks a caption to fit the frame: `drawtext` neither wraps nor scales
+  and a 9:16 frame is barely half as wide as it is tall, so a long word — or a
+  28-char subtitle line, already true before word punch — was drawn off both
+  edges. `fontsize` cannot be an expression over `text_w` (the width is what
+  depends on the size), so it is estimated from the character count against
+  `Timeline.format`'s aspect; an unframed project assumes 16:9, wide enough
+  that the fit never binds, so nothing that never picked a frame moved. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
   re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
@@ -431,7 +489,10 @@ proposal appears for review, not that the cut changes: the read tools
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `generate_captions` / `clear_captions` caption the
-cut; the `instructions` say to caption **last** and to re-run after any further
+cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
+prefer the latter for a vertical cut, since nothing in a tool list tells an
+agent that the subtitle shape is not what social captions look like. They also
+say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
@@ -457,9 +518,10 @@ op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start`
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
-`set_track_duck`, `set_delivery_format` (the project's delivery frame; omit
+`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
-`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_video_effects`,
+`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
@@ -577,18 +639,29 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
 `Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
 `routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
-trim, volume, fades, speed, transform, color, transition, plus **video / audio
+trim, volume, fades, speed, transform, color, **transition** (a grouped picker
+over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
+that is the order the choice is actually made and a flat list of eleven names
+hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
 auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
-shot already matches the frame or is 360), a **360 reframe**
+shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
+Ellipse chips, then centre / size / feather / invert; picking a shape starts from
+a visible default rather than a collapsed one, and the caption carries the recipe
+the shape alone does not suggest — a lower track shows through, so a blurred face
+is a duplicated, blurred copy above, masked), a **360 reframe**
 section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
 plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
 detect as 360 it instead offers a projection picker that marks the whole asset via
 `set_asset_projection`), and an always-visible
-**Text overlays** section (add titles / lower-thirds, caption the whole cut —
+**Text overlays** section (add titles / lower-thirds, caption the whole cut in
+a **Lines / Word punch** style chosen by two chips above the button — the
+selection is deliberately *not* derived from the overlays already there, since
+a caption's style is not recoverable from its text and guessing it from the
+word count would flip the chip whenever a sentence happened to be short —
 the button relabels to `Recaption` once there are generated captions, since a
 later trim moves the words out from under them, with `Clear` beside it taking
 only the generated ones — and edit text / timing / position / size / color /
@@ -602,8 +675,9 @@ omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
 tint) — and the Text overlays section leads with **Title / Lower third /
 Caption** style chips that create a styled overlay at the playhead with
 fade-in/out opacity keyframes; the caption style matches what
-`generate_captions` generates, so manual and generated captions look
-alike.
+`generate_captions` writes in its `lines` style, so manual and generated
+captions look alike (`CAPTION_LOOKS` in the same file is only the two
+generate-time labels; their numbers live in `captions.ts`).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
 utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
@@ -633,7 +707,14 @@ playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one
 (`add_track` / `remove_track`) and, on audio tracks, a **DUCK toggle**
-(`set_track_duck`); the timeline is genuinely **multi-track**. The old
+(`set_track_duck`); the timeline is genuinely **multi-track**. Any track that can
+actually be heard — an audio track, or a video track whose clips carry sound —
+also gets a **mixer strip** (level fader + pan, double-click to return either to
+neutral, tooltips in dB and L/R); a silent track gets none. `src/lib/mixer.ts` is
+the *faithful* mirror of `Track::pan_gains`, because preview playback renders the
+pan as the same balance the export does — a `StereoPannerNode`'s constant-power
+law would quietly disagree with the file, and `get_audio` hands back mono, so the
+two gain legs into a merger *are* the stereo pair. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the

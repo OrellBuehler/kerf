@@ -6,12 +6,15 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
-	import { COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
+	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
+	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
 	import { needsCrop } from '$lib/smart-crop';
+	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
 	import type { TextStyle } from '$lib/style-presets';
 	import type {
 		AudioEffect,
+		CaptionStyle,
+		Mask,
 		Projection,
 		Reframe,
 		Transform,
@@ -127,6 +130,10 @@
 	const col = $derived(clip?.color ?? DEFAULT_COLOR);
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
+	const mask = $derived(clip?.mask ?? null);
+	/** Patch the clip's mask, starting from the default when there is none. */
+	const patchMask = (patch: Partial<Mask>) =>
+		run(() => editor.setMask(clip!.id, { ...DEFAULT_MASK, ...(mask ?? {}), ...patch }));
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
@@ -224,12 +231,17 @@
 	 *  replaces the generated set, so the button stays the same after the first
 	 *  press and only its label admits what it is doing. */
 	const hasCaptions = $derived(overlays.some((o) => o.generated));
+	// Which look the button generates in. Not derived from the overlays already
+	// on the timeline: a caption's style is not recoverable from the text it
+	// carries, and guessing it from the word count would flip the selection
+	// every time a sentence happened to be short.
+	let captionStyle = $state<CaptionStyle>('lines');
 	function makeCaptions() {
 		if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
 			toast.error('Put a clip on the timeline first');
 			return;
 		}
-		void run(() => editor.generateCaptions());
+		void run(() => editor.generateCaptions({ style: captionStyle }));
 	}
 	function dropCaptions() {
 		void run(() => editor.clearCaptions());
@@ -479,6 +491,14 @@
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 		{#each TEXT_STYLES as s (s.id)}
 			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
+		{/each}
+	</div>
+	<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px">
+		<span style="font-size:11px;color:var(--text-muted)">Caption style</span>
+		{#each CAPTION_LOOKS as c (c.id)}
+			<button style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (captionStyle = c.id)}>
+				{c.label}
+			</button>
 		{/each}
 	</div>
 	<div style="display:flex;gap:7px;margin-bottom:6px">
@@ -866,6 +886,54 @@
 				)}
 			{/if}
 
+			{@render secHead('Mask')}
+			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+				<button
+					style={chip(!mask)}
+					disabled={editor.busy}
+					title="No mask — the whole frame"
+					onclick={() => run(() => editor.setMask(clip.id, null))}>None</button
+				>
+				<button
+					style={chip(mask?.shape === 'rect')}
+					disabled={editor.busy}
+					title="Cut this clip to a rectangle"
+					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</button
+				>
+				<button
+					style={chip(mask?.shape === 'ellipse')}
+					disabled={editor.busy}
+					title="Cut this clip to an ellipse"
+					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</button
+				>
+			</div>
+			{#if mask}
+				{@render rangeRow('Centre X', mask.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ x: v }))}
+				{@render rangeRow('Centre Y', mask.y, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ y: v }))}
+				{@render rangeRow('Width', mask.width, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ width: v })
+				)}
+				{@render rangeRow('Height', mask.height, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ height: v })
+				)}
+				{@render rangeRow('Feather', mask.feather, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
+					patchMask({ feather: v })
+				)}
+				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+					<span style="font-size:12px;color:var(--text-muted)">Invert</span>
+					<input
+						type="checkbox"
+						checked={!!mask.inverted}
+						disabled={editor.busy}
+						onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}
+					/>
+				</label>
+				<div style="font:var(--type-caption);color:var(--text-muted);margin:2px 0 6px">
+					Outside the shape this clip is transparent, so a lower track shows through. To blur a
+					face: duplicate the shot onto the track above, blur the copy, mask the copy.
+				</div>
+			{/if}
+
 			{@render secHead('Transition (in)')}
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 				<span style="font-size:12px;color:var(--text-muted)">Type</span>
@@ -875,13 +943,18 @@
 					onchange={(e) => {
 						const k = e.currentTarget.value as '' | TransitionKind;
 						if (!k) void run(() => editor.setTransition(clip.id, null));
-						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? 0.5 }));
+						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? DEFAULT_TRANSITION_SECONDS }));
 					}}
 					style={selectCss}
 				>
 					<option value="">None</option>
-					<option value="crossfade">Crossfade</option>
-					<option value="dip_to_black">Dip to black</option>
+					{#each TRANSITION_GROUPS as g (g.label)}
+						<optgroup label="{g.label} — {g.hint}">
+							{#each g.options as o (o.id)}
+								<option value={o.id}>{o.label}</option>
+							{/each}
+						</optgroup>
+					{/each}
 				</select>
 			</label>
 			{#if transition}

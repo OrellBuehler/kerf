@@ -7,6 +7,7 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import type { Clip, Marker, StreamKind, Track } from '$lib/types';
+	import { gainLabel, panLabel } from '$lib/mixer';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
 
@@ -36,6 +37,20 @@
 
 	function trackHeight(t: Track): string {
 		return t.kind === 'video' ? 'var(--track-h-video)' : 'var(--track-h-audio)';
+	}
+
+	/** Assets that carry an audio stream, rebuilt only when the bin changes —
+	 *  hasSound runs per track on every timeline update, and a linear asset
+	 *  scan per clip made that O(clips x assets). */
+	const audibleAssets = $derived(
+		new Set(editor.assets.filter((a) => a.streams?.some((st) => st.kind === 'audio')).map((a) => a.id))
+	);
+	/** True when a track can actually be heard — an audio track, or a video track
+	 *  whose clips carry sound. A track with no audio at all gets no fader: a
+	 *  mixer strip on a silent track is furniture, not a control. */
+	function hasSound(t: Track): boolean {
+		if (t.kind === 'audio') return true;
+		return t.clips.some((c) => audibleAssets.has(c.asset_id));
 	}
 
 	/** Shared look for the one-letter S / L track flags. */
@@ -944,8 +959,9 @@
 				<div
 					role="presentation"
 					oncontextmenu={(e) => onTrackHeaderContextMenu(e, t)}
-					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
+					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;flex-direction:column;justify-content:center;gap:4px;padding:0 8px;overflow:hidden"
 				>
+				<div style="display:flex;align-items:center;gap:6px">
 					<span
 						style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text-secondary);flex:none"
 						>{t.name}</span
@@ -1006,6 +1022,41 @@
 						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0;flex:none"
 						><Icon n="x" s={12} /></button
 					>
+				</div>
+					{#if hasSound(t)}
+						<!-- The mixer strip: a fader over every clip on the track, and its
+						     stereo placement. Balancing a music bed against a voice is the
+						     one audio move every cut needs, and doing it clip by clip is
+						     not the same control. -->
+						<div style="display:flex;align-items:center;gap:6px">
+							<input
+								type="range"
+								min="0"
+								max={Math.max(2, t.volume ?? 1)}
+								step="0.01"
+								value={t.volume ?? 1}
+								disabled={editor.busy}
+								aria-label="{t.name} level"
+								title="Level {gainLabel(t.volume ?? 1)} — double-click for unity"
+								onchange={(e) => void editor.setTrackVolume(t.id, +e.currentTarget.value).catch(err)}
+								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
+								style="flex:1;min-width:0;height:12px;accent-color:var(--kerf-400);cursor:pointer"
+							/>
+							<input
+								type="range"
+								min="-1"
+								max="1"
+								step="0.05"
+								value={t.pan ?? 0}
+								disabled={editor.busy}
+								aria-label="{t.name} pan"
+								title="Pan {panLabel(t.pan ?? 0)} — double-click to centre"
+								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
+								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
+								style="width:34px;flex:none;height:12px;accent-color:var(--text-muted);cursor:pointer"
+							/>
+						</div>
+					{/if}
 				</div>
 			{/each}
 		</div>

@@ -13,9 +13,10 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker, Projection,
-    Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay,
-    TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker,
+    Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV,
+    MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -1493,6 +1494,27 @@ impl Project {
         })
     }
 
+    /// Set a track's fader, the gain riding every clip on it. Clamped to
+    /// `0..=4` (+12 dB), which is as far up as a fader has any business going.
+    pub fn set_track_volume(&self, track_id: Uuid, volume: f32) -> Result<Track> {
+        let volume = volume.clamp(0.0, 4.0);
+        self.edit_timeline("Set track level", |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.volume = volume;
+            Ok(track.clone())
+        })
+    }
+
+    /// Set a track's stereo placement, -1 (hard left) to 1 (hard right).
+    pub fn set_track_pan(&self, track_id: Uuid, pan: f32) -> Result<Track> {
+        let pan = pan.clamp(-1.0, 1.0);
+        self.edit_timeline("Set track pan", |timeline| {
+            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            track.pan = pan;
+            Ok(track.clone())
+        })
+    }
+
     /// Set (or clear) the frame this project is cut for.
     ///
     /// The delivery frame decides the shape of every rendered picture — the
@@ -1894,6 +1916,20 @@ impl Project {
             if let Some(v) = temperature {
                 c.temperature = v;
             }
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Cut a clip to a shape, or clear the mask. Outside the shape the clip goes
+    /// transparent, so whatever is on a lower track shows through — which is how
+    /// a face is blurred (a masked, blurred copy of the shot on the track above),
+    /// how a picture-in-picture is rounded off, and how one region gets its own
+    /// grade. Fields are clamped, since a zero-width shape would blank the clip.
+    pub fn set_mask(&self, clip_id: Uuid, mask: Option<Mask>) -> Result<Clip> {
+        let mask = mask.map(Mask::normalized);
+        self.edit_timeline(if mask.is_some() { "Mask clip" } else { "Clear mask" }, |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].mask = mask;
             Ok(timeline.tracks[ti].clips[ci].clone())
         })
     }
@@ -2823,6 +2859,10 @@ impl Project {
     /// is on the wrong word. [`Timeline::captions`] does the projection, so
     /// captions follow the cut and words that were cut out get none.
     ///
+    /// `opts.style` picks the look — a held subtitle line, or one word at a
+    /// time — and everything else in [`CaptionOptions`] is an override on top
+    /// of it.
+    ///
     /// Errors when nothing on the timeline has a transcript to caption, rather
     /// than quietly writing no overlays.
     pub fn generate_captions(&self, opts: CaptionOptions) -> Result<Vec<TextOverlay>> {
@@ -2853,7 +2893,13 @@ impl Project {
             ));
         }
         let created = overlays.clone();
-        self.edit_timeline("Generate captions", move |timeline| {
+        // Name the style in the edit log: recaptioning in the other one is a
+        // different edit, and the history is where that has to be visible.
+        let label = match opts.style {
+            CaptionStyle::Lines => "Generate captions",
+            CaptionStyle::WordPunch => "Generate word captions",
+        };
+        self.edit_timeline(label, move |timeline| {
             timeline.overlays.retain(|o| !o.generated);
             timeline.overlays.extend(overlays);
             Ok(())

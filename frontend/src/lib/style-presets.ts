@@ -3,7 +3,7 @@
 // result without manual grading or typography, so these are deliberately few
 // and tasteful rather than deep.
 
-import type { Color, TextOverlay } from './types';
+import type { CaptionStyle, Color, TextOverlay } from './types';
 
 export interface ColorLook {
 	id: string;
@@ -48,8 +48,8 @@ export interface TextStyle {
 }
 
 /** Ready-made title / lower-third / caption styles. The caption style matches
- *  what `captions_from_transcript` generates, so manual and generated captions
- *  look the same. */
+ *  what `generate_captions` writes in its `lines` style, so a manual caption and
+ *  a generated one look the same. */
 export const TEXT_STYLES: TextStyle[] = [
 	{
 		id: 'title',
@@ -74,5 +74,23 @@ export const TEXT_STYLES: TextStyle[] = [
 		duration: 3,
 		style: { pos_x: 0.5, pos_y: 0.88, size: 0.05, color: 'white', bold: false, bg: 'black@0.5' },
 		fade: 0
+	}
+];
+
+export interface CaptionLook {
+	id: CaptionStyle;
+	label: string;
+	hint: string;
+}
+
+/** The two looks the caption button can generate in. Labels only — the numbers
+ *  behind them live in `captions.ts`, mirroring kerf-core, so there is one place
+ *  a style is defined. */
+export const CAPTION_LOOKS: CaptionLook[] = [
+	{ id: 'lines', label: 'Lines', hint: 'A few words held on screen, like subtitles' },
+	{
+		id: 'word_punch',
+		label: 'Word punch',
+		hint: 'One large word at a time, cut on the speech — the social-video look'
 	}
 ];

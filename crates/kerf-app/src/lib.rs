@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Project, Projection,
-    ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind,
-    VideoEffect,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, Project,
+    Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition,
+    TransitionKind, VideoEffect,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -85,8 +85,12 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
     match kind {
         None => Ok(None),
         Some(k) => {
-            let kind = TransitionKind::parse(&k)
-                .ok_or_else(|| format!("invalid transition kind '{k}'; expected \"crossfade\" or \"dip_to_black\""))?;
+            let kind = TransitionKind::parse(&k).ok_or_else(|| {
+                format!(
+                    "invalid transition kind '{k}'; expected one of {}",
+                    TransitionKind::wire_names()
+                )
+            })?;
             let duration = duration.ok_or("transition duration is required")?;
             Ok(Some(Transition { kind, duration }))
         }
@@ -509,6 +513,24 @@ fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> C
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Set a track's fader — the gain riding every clip on the track.
+#[tauri::command(async)]
+fn set_track_volume(state: State<'_, AppState>, track_id: String, volume: f32) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_volume(id, volume).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set a track's stereo placement, -1 (hard left) to 1 (hard right).
+#[tauri::command(async)]
+fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdResult<Timeline> {
+    let id = id(&track_id)?;
+    let project = state.project();
+    project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Set the frame the project is cut for, or clear it back to the source shape.
 /// The preview, the scrubbed still and the export all read it, so the vertical
 /// crop is visible while cutting instead of only in the rendered file.
@@ -681,6 +703,16 @@ fn set_transition(
     let transition = parse_transition(kind, duration)?;
     let project = state.project();
     project.set_transition(id, transition).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Cut a clip to a shape (or clear it with `mask: null`), so a lower track shows
+/// through outside it.
+#[tauri::command(async)]
+fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_mask(id, mask).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1582,6 +1614,8 @@ pub fn run() {
             add_track,
             remove_track,
             set_track_duck,
+            set_track_volume,
+            set_track_pan,
             set_delivery_format,
             set_track_muted,
             set_track_solo,
@@ -1596,6 +1630,7 @@ pub fn run() {
             set_transform,
             set_color,
             set_transition,
+            set_mask,
             set_video_effects,
             set_audio_effects,
             set_keyframes,

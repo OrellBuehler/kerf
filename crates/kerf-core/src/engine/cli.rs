@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind,
-    TextOverlay, TimeRange, Timeline, Transform, TransitionKind, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap,
+    StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -3254,8 +3254,9 @@ fn build_filter_complex(
     // deduplicated ffmpeg input index (may be shared, so the `[input:v]` source is
     // fanned out with `split` below).
     let mut video: Vec<(usize, usize, &crate::model::Clip)> = Vec::new();
-    // Audio entries also carry the owning track's `duck` flag for the bus split.
-    let mut audio: Vec<(usize, usize, &crate::model::Clip, bool)> = Vec::new();
+    // Audio entries also carry the owning track's mix — the duck flag for the bus
+    // split, the fader and the pan for the clip's own chain.
+    let mut audio: Vec<(usize, usize, &crate::model::Clip, TrackMix)> = Vec::new();
     let mut base = 0;
     for track in &timeline.tracks {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
@@ -3268,7 +3269,16 @@ fn build_filter_complex(
                 video.push((flat, input, clip));
             }
             if has_audio(clip) {
-                audio.push((flat, input, clip, track.duck));
+                audio.push((
+                    flat,
+                    input,
+                    clip,
+                    TrackMix {
+                        duck: track.duck,
+                        volume: track.volume,
+                        pan: track.pan_gains(),
+                    },
+                ));
             }
         }
         base += track.clips.len();
@@ -3358,30 +3368,47 @@ fn build_filter_complex(
                 format!("vov{n}")
             };
             let end = clip.timeline_end() + fx[*flat].tail;
+            // A slide / push adds its travel to whatever position the clip already
+            // has, so a transition composes with a static offset or an animated one
+            // instead of overriding it.
+            let motion = motion_expr(clip, &fx[*flat]);
+            // A position that varies over time is a piecewise expression, and a
+            // piecewise expression contains commas — which the graph parser reads
+            // as the end of the filter unless the value is quoted. A plain static
+            // offset has none, and stays unquoted.
+            let quote = |v: String, dynamic: bool| if dynamic { format!("'{v}'") } else { v };
             let overlay = if clip.is_animated() {
                 // Animated picture position: per-frame overlay x / y expressions.
                 let kf = clip.sorted_keyframes();
                 let xs: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_x)).collect();
                 let ys: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_y)).collect();
+                let px = keyframe_expr(&xs, "t", clip.timeline_start);
+                let py = keyframe_expr(&ys, "t", clip.timeline_start);
+                let (px, py) = match &motion {
+                    Some((mx, my)) => (format!("({px})+({mx})"), format!("({py})+({my})")),
+                    None => (px, py),
+                };
                 format!(
-                    "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H:\
-                     eof_action=pass:enable='between(t,{start},{end})'",
-                    px = keyframe_expr(&xs, "t", clip.timeline_start),
-                    py = keyframe_expr(&ys, "t", clip.timeline_start),
+                    "overlay=x={px}:y={py}:eof_action=pass:enable='between(t,{start},{end})'",
+                    px = quote(format!("(W-w)/2+({px})*W"), true),
+                    py = quote(format!("(H-h)/2+({py})*H"), true),
                     start = clip.timeline_start,
                 )
-            } else if clip.transform.is_identity() {
+            } else if clip.transform.is_identity() && motion.is_none() {
                 format!(
                     "overlay=eof_action=pass:enable='between(t,{start},{end})'",
                     start = clip.timeline_start
                 )
             } else {
                 let t = &clip.transform;
+                let (px, py) = match &motion {
+                    Some((mx, my)) => (format!("({})+({mx})", t.pos_x), format!("({})+({my})", t.pos_y)),
+                    None => (t.pos_x.to_string(), t.pos_y.to_string()),
+                };
                 format!(
-                    "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H:\
-                     eof_action=pass:enable='between(t,{start},{end})'",
-                    px = t.pos_x,
-                    py = t.pos_y,
+                    "overlay=x={px}:y={py}:eof_action=pass:enable='between(t,{start},{end})'",
+                    px = quote(format!("(W-w)/2+({px})*W"), motion.is_some()),
+                    py = quote(format!("(H-h)/2+({py})*H"), motion.is_some()),
                     start = clip.timeline_start,
                 )
             };
@@ -3416,7 +3443,7 @@ fn build_filter_complex(
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
     if has_audio_out {
-        for (flat, input, clip, _) in &audio {
+        for (flat, input, clip, mix) in &audio {
             let src = if acount[*input] > 1 {
                 let k = anext[*input];
                 anext[*input] += 1;
@@ -3426,7 +3453,7 @@ fn build_filter_complex(
             };
             chains.push(format!(
                 "[{src}]{chain}[a{flat}]",
-                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout)
+                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout, *mix)
             ));
         }
         // Optional single-pass loudness normalization on the final mix; loudnorm
@@ -3437,8 +3464,8 @@ fn build_filter_complex(
             String::new()
         };
         let pads = |flats: &[usize]| flats.iter().map(|f| format!("[a{f}]")).collect::<String>();
-        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, d)| *d).map(|(f, _, _, _)| *f).collect();
-        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, d)| !*d).map(|(f, _, _, _)| *f).collect();
+        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, m)| m.duck).map(|(f, _, _, _)| *f).collect();
+        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, m)| !m.duck).map(|(f, _, _, _)| *f).collect();
         if ducked.is_empty() || keyed.is_empty() {
             // No ducking in play (nothing flagged, or nothing to key from): one
             // flat sum of every clip, exactly as before.
@@ -3477,16 +3504,41 @@ fn build_filter_complex(
     }
 }
 
+/// The owning track's mix settings, carried alongside each of its audio clips.
+/// The fader rides the *finished* clip — after its own gain and effect chain,
+/// the way a channel strip does — so pulling a music bed down does not change
+/// what its own compressor was reacting to.
+#[derive(Clone, Copy)]
+struct TrackMix {
+    duck: bool,
+    volume: f32,
+    pan: (f64, f64),
+}
+
 /// Per-clip render adjustments derived from transitions. `tail` extends an
-/// outgoing clip so it keeps showing under the incoming crossfade; `xfade_in`
-/// is the incoming clip's alpha dissolve; `black_in`/`black_out` are the
-/// dip-to-black fades on either side of a cut.
+/// outgoing clip so it keeps showing under the incoming one; `xfade_in` is the
+/// incoming clip's alpha dissolve; `black_in`/`black_out` and `white_in`/
+/// `white_out` are the dip fades on either side of a cut; `move_in`/`move_out`
+/// carry a clip across the frame for a slide or a push.
 #[derive(Clone, Copy, Default)]
 struct ClipFx {
     tail: f64,
     xfade_in: f64,
     black_in: f64,
     black_out: f64,
+    /// Dip-to-white fades: the same shape as `black_in`/`black_out`, through white.
+    white_in: f64,
+    white_out: f64,
+    /// How long the incoming clip's **sound** dissolves up. Equal to `xfade_in`
+    /// for a crossfade; a motion transition sets it too, because the picture
+    /// sliding is no reason for the audio to cut hard.
+    afade_in: f64,
+    /// Motion transitions, as `(dx, dy, seconds)` with the offsets in frame
+    /// widths and heights. `move_in` is where the incoming clip starts before
+    /// travelling to its position; `move_out` is where the outgoing clip is
+    /// carried to over its tail (a push only — a slide covers it where it sits).
+    move_in: Option<(f64, f64, f64)>,
+    move_out: Option<(f64, f64, f64)>,
 }
 
 /// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
@@ -3496,6 +3548,7 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let mut fx = vec![ClipFx::default(); total_clips];
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
+    let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
 
     let mut base = 0;
     for track in &timeline.tracks {
@@ -3516,35 +3569,73 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
             let prev = (w > 0)
                 .then(|| order[w - 1])
                 .filter(|&pj| (track.clips[pj].timeline_end() - clip.timeline_start).abs() < 1e-3);
-            match tr.kind {
-                TransitionKind::Crossfade => match prev {
-                    Some(pj) => {
-                        let p = &track.clips[pj];
-                        // The tail borrows the outgoing clip's unused source: for a
-                        // forward clip that is the handle past source_out, for a
-                        // reversed clip the handle below source_in.
-                        let avail = if p.is_reversed() {
-                            p.source_in / p.speed_mag()
-                        } else {
-                            asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0) / p.speed_mag()
-                        };
-                        // Both sides share the achievable overlap so the dissolve
-                        // length matches the tail (no fade-from-black when there is
-                        // no handle — it just becomes a hard cut).
-                        let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
-                        fx[base + j].xfade_in = overlap;
-                        fx[base + pj].tail = fx[base + pj].tail.max(overlap);
+            match tr.kind.dip_color() {
+                // A dip happens either side of the cut — the two clips never share
+                // the screen, so neither needs a handle and neither is extended.
+                Some(color) => {
+                    let white = color == "white";
+                    let inn = (d / 2.0).min(clip.duration());
+                    if white {
+                        fx[base + j].white_in = inn;
+                    } else {
+                        fx[base + j].black_in = inn;
                     }
-                    // No adjacent predecessor: dissolve up from black.
-                    None => fx[base + j].xfade_in = d.min(clip.duration()),
-                },
-                TransitionKind::DipToBlack => {
-                    fx[base + j].black_in = (d / 2.0).min(clip.duration());
                     if let Some(pj) = prev {
                         let p = &track.clips[pj];
                         let out = (d / 2.0).min(p.duration());
-                        fx[base + pj].black_out = fx[base + pj].black_out.max(out);
+                        if white {
+                            fx[base + pj].white_out = fx[base + pj].white_out.max(out);
+                        } else {
+                            fx[base + pj].black_out = fx[base + pj].black_out.max(out);
+                        }
                     }
+                }
+                // A dissolve or a motion transition plays both sides at once, so
+                // the outgoing clip keeps rolling underneath on its unused handle.
+                None => {
+                    let slide = tr.kind.slide_from();
+                    let overlap = match prev {
+                        Some(pj) => {
+                            let p = &track.clips[pj];
+                            // The tail borrows the outgoing clip's unused source: for a
+                            // forward clip that is the handle past source_out, for a
+                            // reversed clip the handle below source_in.
+                            // A still loops (`-loop 1`), so it never runs out
+                            // of source: its handle is unbounded, the same
+                            // reason the timeline lets a still extend freely.
+                            let avail = if is_still(p.asset_id) {
+                                f64::INFINITY
+                            } else if p.is_reversed() {
+                                p.source_in / p.speed_mag()
+                            } else {
+                                asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0) / p.speed_mag()
+                            };
+                            // Both sides share the achievable overlap so the transition
+                            // length matches the tail (no fade-from-black when there is
+                            // no handle — it just becomes a hard cut).
+                            let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
+                            fx[base + pj].tail = fx[base + pj].tail.max(overlap);
+                            if overlap > 0.0 && tr.kind.pushes() {
+                                if let Some((dx, dy)) = slide {
+                                    // The outgoing clip leaves the way the incoming one
+                                    // arrives: at rest, then a whole frame the other way.
+                                    fx[base + pj].move_out = Some((-dx, -dy, overlap));
+                                }
+                            }
+                            overlap
+                        }
+                        // No adjacent predecessor: dissolve up from black, or travel in
+                        // over it.
+                        None => d.min(clip.duration()),
+                    };
+                    if overlap <= 0.0 {
+                        continue;
+                    }
+                    match slide {
+                        Some((dx, dy)) => fx[base + j].move_in = Some((dx, dy, overlap)),
+                        None => fx[base + j].xfade_in = overlap,
+                    }
+                    fx[base + j].afade_in = overlap;
                 }
             }
         }
@@ -3589,6 +3680,85 @@ fn fnum(v: f64) -> String {
         "0".to_string()
     } else {
         s
+    }
+}
+
+/// The overlay offset a motion transition puts on a clip, as `(x, y)`
+/// expressions in frame widths and heights over **timeline** time — or `None`
+/// when the clip does not move, which is what keeps every non-motion graph
+/// byte-identical.
+///
+/// Both halves are ordinary keyframes, so this is [`keyframe_expr`] twice over
+/// rather than a second expression language: an incoming clip holds its starting
+/// offset before the transition and travels to zero, an outgoing clip sits at
+/// zero until its own end and then travels away over its tail.
+fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
+    let mut xs: Vec<(f64, f64)> = Vec::new();
+    let mut ys: Vec<(f64, f64)> = Vec::new();
+    if let Some((dx, dy, secs)) = fx.move_in {
+        xs.push((0.0, dx));
+        xs.push((secs, 0.0));
+        ys.push((0.0, dy));
+        ys.push((secs, 0.0));
+    }
+    if let Some((dx, dy, secs)) = fx.move_out {
+        let t0 = clip.duration();
+        if xs.is_empty() {
+            xs.push((0.0, 0.0));
+            ys.push((0.0, 0.0));
+        }
+        xs.push((t0, 0.0));
+        xs.push((t0 + secs, dx));
+        ys.push((t0, 0.0));
+        ys.push((t0 + secs, dy));
+    }
+    if xs.is_empty() {
+        return None;
+    }
+    let start = clip.timeline_start;
+    Some((keyframe_expr(&xs, "t", start), keyframe_expr(&ys, "t", start)))
+}
+
+/// The `geq` that cuts a clip to its [`Mask`]: the picture is passed through
+/// untouched and only the alpha plane is rewritten, so what is outside the shape
+/// (or inside it, `inverted`) becomes transparent and a lower track shows
+/// through.
+///
+/// One expression covers both shapes. Each axis is scaled so the shape's edge
+/// sits at distance 1, and the shapes differ only in how the two axes combine —
+/// `max` gives a rectangle, `hypot` an ellipse. Feathering is then a ramp over
+/// the last `feather` of that distance, measured *inside* the edge so a softened
+/// mask never grows beyond the shape that was drawn.
+///
+/// `geq` is per-pixel and therefore slow, the same cost keyframed opacity
+/// already pays; a mask is worth it and a full-frame one is simply not written.
+fn mask_filter(mask: &Mask) -> String {
+    format!(
+        "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'",
+        keep = mask_keep_expr(mask)
+    )
+}
+
+/// The 0..1 "keep" expression at the heart of [`mask_filter`], separated out so
+/// a clip with both a mask and keyframed opacity can fold the two into one
+/// `geq` pass instead of paying the per-pixel cost twice.
+fn mask_keep_expr(mask: &Mask) -> String {
+    let m = mask.normalized();
+    let dx = format!("(X-{cx}*W)/({rw}*W)", cx = fnum(m.x), rw = fnum(m.width / 2.0));
+    let dy = format!("(Y-{cy}*H)/({rh}*H)", cy = fnum(m.y), rh = fnum(m.height / 2.0));
+    let d = match m.shape {
+        MaskShape::Rect => format!("max(abs({dx})\\,abs({dy}))"),
+        MaskShape::Ellipse => format!("hypot({dx}\\,{dy})"),
+    };
+    let inside = if m.feather <= 1e-6 {
+        format!("lte({d}\\,1)")
+    } else {
+        format!("clip((1-{d})/{f}\\,0\\,1)", f = fnum(m.feather))
+    };
+    if m.inverted {
+        format!("(1-{inside})")
+    } else {
+        inside
     }
 }
 
@@ -3788,8 +3958,10 @@ fn drawtext_export(o: &TextOverlay, fmt: &ExportFormat) -> String {
         let xs: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_x)).collect();
         let ys: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.pos_y)).collect();
         let al: Vec<(f64, f64)> = o.keyframes.iter().map(|k| (k.time, k.opacity)).collect();
-        parts.push(format!("x=(w*({})-text_w/2)", keyframe_expr(&xs, "t", o.start)));
-        parts.push(format!("y=(h*({})-text_h/2)", keyframe_expr(&ys, "t", o.start)));
+        // Quoted: a piecewise expression contains commas, and an unquoted comma
+        // ends the filter as far as the graph parser is concerned.
+        parts.push(format!("x='(w*({})-text_w/2)'", keyframe_expr(&xs, "t", o.start)));
+        parts.push(format!("y='(h*({})-text_h/2)'", keyframe_expr(&ys, "t", o.start)));
         parts.push(format!("alpha='{}'", keyframe_expr(&al, "t", o.start)));
     }
     parts.push(format!("enable='between(t,{},{})'", fnum(o.start), fnum(o.end)));
@@ -3946,7 +4118,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
     let transform_alpha = (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
-    let needs_alpha = transform_alpha || fx.xfade_in > 0.0;
+    let needs_alpha = transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some();
     let dur = clip.duration() + fx.tail;
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
@@ -4079,18 +4251,31 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             p.push(f);
         }
     }
-    // Opacity: animated via a per-frame geq alpha (geq's time var is `T`), else a
-    // constant alpha mix.
-    if anim_opacity {
-        let expr = keyframe_expr(
+    // The shape mask (once alpha exists — it only rewrites the alpha plane, so
+    // it composes with a chroma key above it) and opacity: animated opacity is a
+    // per-frame geq alpha (geq's time var is `T`), else a constant alpha mix.
+    // The mask is the same alpha-plane geq, so a clip that
+    // has both shares one pass — geq is per-pixel and by far the most expensive
+    // filter in the chain, and two back-to-back passes would double it.
+    let opacity_expr = anim_opacity.then(|| {
+        keyframe_expr(
             &kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(),
             "T",
             clip.timeline_start,
-        );
-        p.push(format!(
+        )
+    });
+    match (&clip.mask, opacity_expr) {
+        (Some(mask), Some(expr)) => p.push(format!(
+            "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
+            keep = mask_keep_expr(mask)
+        )),
+        (Some(mask), None) => p.push(mask_filter(mask)),
+        (None, Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"
-        ));
-    } else if !anim && t.opacity < 1.0 {
+        )),
+        (None, None) => {}
+    }
+    if !anim && t.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
@@ -4115,6 +4300,18 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     }
     if fo > 0.0 {
         p.push(format!("fade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+    }
+    // A dip through white is the same fade with a colour: it lands on the frame
+    // itself rather than on the alpha plane, so it needs no `format=yuva420p`.
+    if fx.white_in > 0.0 {
+        p.push(format!("fade=t=in:st=0:d={}:c=white", fx.white_in.clamp(0.0, dur)));
+    }
+    if fx.white_out > 0.0 {
+        p.push(format!(
+            "fade=t=out:st={}:d={}:c=white",
+            (dur - fx.white_out).max(0.0),
+            fx.white_out.clamp(0.0, dur)
+        ));
     }
     if fx.xfade_in > 0.0 {
         // The alpha plane is already established above (xfade implies needs_alpha).
@@ -4415,7 +4612,7 @@ fn build_still_args(
         let rf = clip.reframe_at(local);
         chains.push(format!(
             "[{n}:v]{chain}[v{n}]",
-            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas)
+            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas, clip.mask.as_ref())
         ));
         let out = format!("ov{n}");
         chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
@@ -4466,11 +4663,12 @@ fn still_clip_chain(
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
+    mask: Option<&Mask>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
-    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma;
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some();
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
@@ -4524,6 +4722,9 @@ fn still_clip_chain(
             p.push(f);
         }
     }
+    if let Some(mask) = mask {
+        p.push(mask_filter(mask));
+    }
     if tf.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", tf.opacity));
     }
@@ -4548,7 +4749,7 @@ fn still_overlay(t: &Transform) -> String {
 /// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
 /// optional reverse / tempo, gain, fades (including transition cross-fades) and
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
-fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) -> String {
+fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> String {
     let s = clip.speed_mag();
     let dur = clip.duration() + fx.tail;
     // Mirror the video crossfade tail (extends below source_in when reversed) and
@@ -4556,8 +4757,8 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) 
     let (trim_start, trim_end) = clip_source_window(clip, fx);
     let seek = clip_seek(trim_start);
     let delay_ms = (clip.timeline_start * 1000.0).round().max(0.0) as i64;
-    let fi = clip.fade_in + fx.black_in + fx.xfade_in;
-    let fo = clip.fade_out + fx.black_out + fx.tail;
+    let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
+    let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
 
     let mut p: Vec<String> = Vec::new();
     p.push(format!("atrim=start={}:end={}", trim_start - seek, trim_end - seek));
@@ -4580,10 +4781,26 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str) 
     if fo > 0.0 {
         p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
+    // The track fader, after the clip's own chain. Omitted at unity, so a
+    // project that never touched a fader renders the graph it always did.
+    if (mix.volume - 1.0).abs() > f32::EPSILON {
+        p.push(format!("volume={}", mix.volume));
+    }
     p.push(format!(
         "aformat=sample_rates={sr}:channel_layouts={layout}",
         sr = fmt.sample_rate
     ));
+    // The track pan, after `aformat` has normalized the stream to the delivery
+    // layout: `pan` indexes channels by number, and run before the upmix a mono
+    // source has no c1 — the attenuated leg would be synthesized from silence,
+    // so panning a mono voice right would mute it instead of leaning it.
+    // Omitted at centre, so an untouched mix stays byte-identical.
+    let (gl, gr) = mix.pan;
+    if layout == "stereo" && ((gl - 1.0).abs() > 1e-9 || (gr - 1.0).abs() > 1e-9) {
+        // A balance, not a mono re-pan: each side keeps its own channel and is
+        // attenuated, so a stereo music bed leans without collapsing.
+        p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
+    }
     p.push(format!("adelay={delay_ms}:all=1"));
     p.join(",")
 }
@@ -4608,7 +4825,17 @@ fn atempo_chain(speed: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track};
+    use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
+
+    /// A track mix that changes nothing — what every test that is not about the
+    /// mixer wants.
+    fn unity_mix() -> TrackMix {
+        TrackMix {
+            duck: false,
+            volume: 1.0,
+            pan: (1.0, 1.0),
+        }
+    }
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -5459,7 +5686,7 @@ mod tests {
                 makeup_db: 6.0,
             },
         ];
-        let chain = audio_clip_chain(&clip, &fmt, &ClipFx::default(), "stereo");
+        let chain = audio_clip_chain(&clip, &fmt, &ClipFx::default(), "stereo", unity_mix());
         let vi = chain.find("volume=").expect("gain");
         let hi = chain.find("highpass=f=80").expect("highpass");
         let ai = chain.find("acompressor=").expect("compressor");
@@ -5520,7 +5747,7 @@ mod tests {
             &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
         );
         assert!(
-            g.filter.contains("overlay=x=(W-w)/2+(if(lt((t-2)"),
+            g.filter.contains("overlay=x='(W-w)/2+(if(lt((t-2)"),
             "animated overlay x: {}",
             g.filter
         );
@@ -6366,6 +6593,149 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_cuts_the_clip_to_its_shape() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Ellipse,
+            x: 0.25,
+            y: 0.5,
+            width: 0.4,
+            height: 0.6,
+            feather: 0.2,
+            inverted: false,
+        });
+        let g = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
+        // A mask needs an alpha plane, and it must be established before the geq.
+        let alpha = g.find("format=yuva420p").expect("alpha");
+        let geq = g.find("geq=lum=").expect("mask");
+        assert!(alpha < geq, "alpha must precede the mask: {g}");
+        // An ellipse combines the axes with hypot; the edge sits at distance 1.
+        assert!(g.contains("hypot((X-0.25*W)/(0.2*W)"), "{g}");
+        assert!(g.contains("clip((1-hypot"), "feathered edge: {g}");
+
+        // A rectangle is the same expression with max instead of hypot…
+        let mut rect = clip.clone();
+        rect.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Rect,
+            feather: 0.0,
+            ..Default::default()
+        });
+        let g = graph_of(&single(vec![rect.clone()]), std::slice::from_ref(&asset));
+        assert!(g.contains("max(abs("), "{g}");
+        // …and no feather is a hard test rather than a ramp.
+        assert!(g.contains("lte(max(abs("), "{g}");
+        assert!(!g.contains("clip((1-"), "{g}");
+
+        // Inverted keeps what is outside the shape.
+        let mut inv = rect;
+        inv.mask = Some(crate::model::Mask {
+            inverted: true,
+            feather: 0.0,
+            ..Default::default()
+        });
+        let g = graph_of(&single(vec![inv]), &[asset]);
+        assert!(g.contains("a='((1-lte("), "{g}");
+    }
+
+    #[test]
+    fn a_mask_and_keyframed_opacity_share_one_geq_pass() {
+        // Both rewrite only the alpha plane, and geq is the most expensive
+        // filter in the chain — a clip with both must fold them into one pass.
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.mask = Some(crate::model::Mask::default());
+        let key = |time: f64, opacity: f64| crate::model::Keyframe {
+            time,
+            scale: 1.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity,
+        };
+        clip.keyframes = vec![key(0.0, 0.0), key(5.0, 1.0)];
+        let g = graph_of(&single(vec![clip]), &[asset]);
+        assert_eq!(g.matches("geq=").count(), 1, "one pass for both: {g}");
+        // The mask's keep expression and the opacity ramp share the alpha term.
+        assert!(g.contains("clip((1-max(abs("), "the mask survives: {g}");
+        assert!(g.contains(")*(if(lt((T"), "the opacity ramp survives: {g}");
+    }
+
+    #[test]
+    fn an_unmasked_clip_writes_no_mask() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let g = graph_of(&single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), &[asset]);
+        assert!(!g.contains("geq="), "{g}");
+        assert!(!g.contains("format=yuva420p"), "no mask, no alpha: {g}");
+    }
+
+    #[test]
+    fn a_degenerate_mask_is_clamped_rather_than_blanking_the_clip() {
+        // A zero-width shape would make the whole clip transparent, which is
+        // never what was meant by dragging a handle too far.
+        let m = crate::model::Mask {
+            width: 0.0,
+            height: -3.0,
+            x: 9.0,
+            feather: f64::NAN,
+            ..Default::default()
+        }
+        .normalized();
+        assert!(m.width >= 0.01 && m.height >= 0.01);
+        assert_eq!(m.x, 1.0);
+        assert!((0.0..=1.0).contains(&m.feather));
+    }
+
+    #[test]
+    fn the_track_fader_and_pan_ride_the_finished_clip() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.volume = 0.8;
+        clip.audio = vec![crate::model::AudioEffect::Highpass { hz: 80.0 }];
+        let mut timeline = single(vec![clip]);
+        timeline.tracks[0].volume = 0.5;
+        timeline.tracks[0].pan = -1.0;
+        let g = graph_of(&timeline, &[asset]);
+        // The clip's own gain, then its effects, then the fader: a channel strip,
+        // so the compressor upstream never sees the fader move.
+        let clip_gain = g.find("volume=0.8").expect("clip gain");
+        let effect = g.find("highpass").expect("clip effect");
+        let fader = g.find("volume=0.5").expect("track fader");
+        assert!(clip_gain < effect && effect < fader, "fader must come last: {g}");
+        // Hard left is the right channel gone and the left untouched.
+        assert!(g.contains("pan=stereo|c0=1*c0|c1=0*c1"), "{g}");
+        // And the pan runs after the aformat upmix: run before it, a mono
+        // source has no c1 and the attenuated leg would be pure silence.
+        let af = g.find("aformat=").expect("aformat");
+        let pan = g.find("pan=stereo").expect("pan");
+        assert!(af < pan, "pan must follow the layout normalize: {g}");
+    }
+
+    #[test]
+    fn an_untouched_track_mix_emits_nothing() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let g = graph_of(&timeline, &[asset]);
+        // Unity and centre are the historical graph exactly — no fader, no pan.
+        assert!(!g.contains("pan=stereo"), "{g}");
+        assert_eq!(g.matches("volume=").count(), 1, "only the clip's own gain: {g}");
+    }
+
+    #[test]
+    fn a_pan_is_dropped_when_there_is_nowhere_to_pan_to() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        timeline.tracks[0].pan = 1.0;
+        let opts = ExportOptions {
+            audio_channels: Some(1),
+            ..Default::default()
+        };
+        let args = build_export_args(&timeline, &[asset], "out.mp4", &opts).unwrap();
+        let g = args.join(" ");
+        assert!(!g.contains("pan=stereo"), "a mono delivery has no stereo field: {g}");
+    }
+
+    #[test]
     fn ducked_track_sidechains_under_the_rest() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let voice = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -6597,6 +6967,118 @@ mod tests {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"gif","width":480,"height":270,"r_frame_rate":"10/1"}],"format":{"duration":"3.0"}}"#;
         let r = probe_from_json(serde_json::from_str(json).unwrap(), None);
         assert!(!r.streams[0].image);
+    }
+
+    #[test]
+    fn dip_to_white_fades_both_sides_through_white() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(g.contains("fade=t=out:st=9.5:d=0.5:c=white"), "{g}");
+        assert!(g.contains("fade=t=in:st=0:d=0.5:c=white"), "{g}");
+        // A dip never borrows a handle: neither clip is extended.
+        assert!(g.contains("trim=start=0:end=10"), "{g}");
+        assert!(!g.contains(":alpha=1"), "a dip is not a dissolve: {g}");
+    }
+
+    #[test]
+    fn slide_travels_the_incoming_clip_in_over_the_held_outgoing_one() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::SlideLeft,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        // The outgoing clip keeps playing under the incoming one, as for a dissolve.
+        assert!(g.contains("trim=start=0:end=11"), "outgoing holds under the slide: {g}");
+        // The incoming clip starts a whole frame to the right and travels to 0 over
+        // the transition; local time is measured from its timeline start.
+        assert!(g.contains("(t-10)"), "motion is expressed in clip-local time: {g}");
+        assert!(g.contains("1+(-1)*((t-10)-0)/(1)"), "one frame of travel over 1s: {g}");
+        // A slide is not a dissolve — the picture stays hard-edged.
+        assert!(!g.contains(":alpha=1"), "{g}");
+        // …but the sound still crossfades.
+        assert!(g.contains("afade=t=in:st=0:d=1"), "{g}");
+    }
+
+    #[test]
+    fn push_carries_the_outgoing_clip_out_of_frame_too() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::PushUp,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        // The outgoing clip sits still until its own end, then leaves upwards over
+        // its tail: y travels 0 → -1 between local 10s and 11s.
+        assert!(g.contains("0+(-1)*((t-0)-10)/(1)"), "outgoing is pushed out: {g}");
+        // The incoming one arrives from below over the same second.
+        assert!(g.contains("1+(-1)*((t-10)-0)/(1)"), "incoming arrives: {g}");
+    }
+
+    #[test]
+    fn a_slide_composes_with_the_clip_position_it_already_has() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transform = crate::model::Transform {
+            pos_x: 0.25,
+            ..Default::default()
+        };
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::SlideLeft,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        // The travel is added to the offset the clip already has, not substituted
+        // for it — a picture-in-picture slides in to where it lives.
+        assert!(g.contains("x='(W-w)/2+((0.25)+(if(lt((t-10)"), "{g}");
+    }
+
+    #[test]
+    fn slide_without_source_handle_is_a_hard_cut() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 20.0, 0.0); // no handle left to borrow
+        let mut b = make_clip(asset.id, 0.0, 10.0, 20.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::PushLeft,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(g.contains("trim=start=0:end=20"), "outgoing tail must not be extended: {g}");
+        assert!(
+            !g.contains("overlay=x="),
+            "nothing moves when there is nothing to move over: {g}"
+        );
+    }
+
+    #[test]
+    fn a_transition_out_of_a_still_keeps_its_transition() {
+        // A still loops, so it never runs out of source: a dissolve (or slide /
+        // push) out of a title card must not degrade to a hard cut just because
+        // the clip already spans the asset's nominal duration.
+        let still = img_asset(Uuid::new_v4());
+        let footage = av_asset(Uuid::new_v4(), 20.0);
+        let d = crate::model::DEFAULT_IMAGE_DURATION;
+        let a = make_clip(still.id, 0.0, d, 0.0);
+        let mut b = make_clip(footage.id, 0.0, 10.0, d);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, b]), &[still, footage]);
+        // The still is held for the tail and the incoming clip dissolves in.
+        assert!(g.contains(&format!("trim=start=0:end={}", d + 1.0)), "{g}");
+        assert!(g.contains(":alpha=1"), "the dissolve must survive: {g}");
     }
 
     #[test]
@@ -7246,11 +7728,18 @@ mod tests {
             fit,
             sf: String::new(),
         };
-        let contained = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Contain));
+        let contained = still_clip_chain(
+            &Transform::default(),
+            &Color::default(),
+            &[],
+            None,
+            &canvas(Fit::Contain),
+            None,
+        );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
 
-        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover));
+        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover), None);
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
         assert!(!covered.contains("pad="), "and never letterboxes: {covered}");
@@ -7283,7 +7772,7 @@ mod tests {
         // whose chain is auralized cannot drift from the mix it will become.
         let mut clip = make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0);
         clip.audio = effects;
-        let exported = audio_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), "stereo");
+        let exported = audio_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), "stereo", unity_mix());
         assert!(exported.contains(&chain), "export chain {exported} must contain {chain}");
     }
 
@@ -7648,6 +8137,255 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(dark < 30.0, "contain should letterbox the top, got luma {dark}");
         assert!(bright > 60.0, "cover should fill the top with picture, got luma {bright}");
+    }
+
+    /// A piecewise position expression contains commas, and the filtergraph
+    /// parser treats an unquoted comma as the end of the filter — so a clip with
+    /// position keyframes, or an *animated text overlay*, made ffmpeg fail the
+    /// whole render with `No such filter`. Nothing caught it: every unit test
+    /// above asserts on the graph string, and the graph string looked right.
+    ///
+    /// Both are on the default path — the Text overlays style chips animate an
+    /// overlay's opacity, which puts it on the keyframed branch — so this renders
+    /// one of each and only asks that ffmpeg accept the graph.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored animated_positions`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn animated_positions_survive_the_filtergraph_parser() {
+        let dir = std::env::temp_dir().join(format!("kerf-anim-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(320, 180, 30.0)];
+
+        let mut clip = make_clip(asset.id, 0.0, 2.0, 0.0);
+        clip.keyframes = vec![
+            crate::model::Keyframe {
+                time: 0.0,
+                scale: 1.0,
+                pos_x: -0.2,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+            crate::model::Keyframe {
+                time: 2.0,
+                scale: 1.0,
+                pos_x: 0.2,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+        ];
+        let mut timeline = single(vec![clip]);
+        // An overlay animated the way the Text overlays style chips animate one.
+        let mut overlay = TextOverlay::new("Kerf".to_string(), 0.0, 2.0);
+        overlay.keyframes = vec![
+            crate::model::TextKeyframe {
+                time: 0.0,
+                pos_x: 0.5,
+                pos_y: 0.5,
+                opacity: 0.0,
+            },
+            crate::model::TextKeyframe {
+                time: 1.0,
+                pos_x: 0.5,
+                pos_y: 0.8,
+                opacity: 1.0,
+            },
+        ];
+        timeline.overlays = vec![overlay];
+
+        let out = dir.join("anim.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let rendered = render_with(&timeline, &[asset], &out, &opts);
+        let ok = rendered.is_ok() && out.exists();
+        let err = rendered.err().map(|e| e.to_string()).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "an animated clip and overlay must render: {err}");
+    }
+
+    /// A mask is only worth anything if a lower track really shows through it,
+    /// which no assertion on the graph string can establish. Black over white,
+    /// masked to a hard-edged ellipse: the middle must come out black and the
+    /// corners white.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored a_mask_really`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_mask_really_lets_the_track_below_show_through() {
+        let dir = std::env::temp_dir().join(format!("kerf-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mk = |name: &str, color: &str| -> PathBuf {
+            let out = dir.join(name);
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("color=c={color}:s=320x180:r=30:d=2")])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&out)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            out
+        };
+        let (white, black) = (mk("white.mp4", "white"), mk("black.mp4", "black"));
+        let mut lower = av_asset(Uuid::new_v4(), 2.0);
+        lower.path = white.to_string_lossy().into_owned();
+        lower.streams = vec![video_stream(320, 180, 30.0)];
+        let mut upper = av_asset(Uuid::new_v4(), 2.0);
+        upper.path = black.to_string_lossy().into_owned();
+        upper.streams = vec![video_stream(320, 180, 30.0)];
+
+        let mut top = make_clip(upper.id, 0.0, 2.0, 0.0);
+        top.mask = Some(crate::model::Mask {
+            shape: crate::model::MaskShape::Ellipse,
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: 0.0,
+            inverted: false,
+        });
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(lower.id, 0.0, 2.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+
+        let out = dir.join("masked.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        render_with(&timeline, &[lower, upper], &out, &opts).expect("export");
+
+        // Mean luma of a 20x20 patch at (x, y) of the first frame.
+        let patch = |x: u32, y: u32| -> f64 {
+            let raw = dir.join("patch.raw");
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .arg("-i")
+                .arg(&out)
+                .args(["-vf", &format!("crop=20:20:{x}:{y}"), "-frames:v", "1"])
+                .args(["-f", "rawvideo", "-pix_fmt", "gray"])
+                .arg(&raw)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+        let (middle, corner) = (patch(150, 80), patch(0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(middle < 60.0, "inside the mask the upper clip is kept, got {middle}");
+        assert!(corner > 180.0, "outside it the lower track shows through, got {corner}");
+    }
+
+    /// A slide and a push look identical in the graph builder's assertions —
+    /// both put the incoming clip a frame away and walk it home — and differ
+    /// only in whether the *outgoing* clip moves. Nothing above can tell them
+    /// apart, so this renders both and looks at the pixels.
+    ///
+    /// The outgoing source carries a white stripe down its left edge. Halfway
+    /// through the transition a slide has left it where it was (the stripe is
+    /// still on screen); a push has carried it half a frame left (the stripe has
+    /// gone with it).
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored slide_and_push`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn slide_and_push_really_move_the_picture() {
+        let dir = std::env::temp_dir().join(format!("kerf-motion-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Outgoing: black with a white stripe down the left edge. Incoming: gray.
+        let striped = dir.join("striped.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=4"])
+            .args(["-vf", "drawbox=x=0:y=0:w=64:h=360:color=white:t=fill"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&striped)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+        let plain = dir.join("gray.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=30:d=4"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&plain)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut out_asset = av_asset(Uuid::new_v4(), 4.0);
+        out_asset.path = striped.to_string_lossy().into_owned();
+        out_asset.streams = vec![video_stream(640, 360, 30.0)];
+        let mut in_asset = av_asset(Uuid::new_v4(), 4.0);
+        in_asset.path = plain.to_string_lossy().into_owned();
+        in_asset.streams = vec![video_stream(640, 360, 30.0)];
+
+        // Mean luma of the leftmost 32 px, one frame into the middle of the
+        // transition (the cut is at 2.0s, the transition runs a second).
+        let stripe_luma = |file: &Path| -> f64 {
+            let raw = dir.join("stripe.raw");
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-ss", "2.5"])
+                .arg("-i")
+                .arg(file)
+                .args(["-vf", "crop=32:360:0:0", "-frames:v", "1"])
+                .args(["-f", "rawvideo", "-pix_fmt", "gray"])
+                .arg(&raw)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+
+        let render = |kind: TransitionKind, name: &str| -> PathBuf {
+            let a = make_clip(out_asset.id, 0.0, 2.0, 0.0);
+            let mut b = make_clip(in_asset.id, 0.0, 2.0, 2.0);
+            b.transition_in = Some(crate::model::Transition { kind, duration: 1.0 });
+            let timeline = single(vec![a, b]);
+            let out = dir.join(name);
+            let opts = ExportOptions {
+                container: Container::Mp4,
+                video_codec: Some("libx264".into()),
+                include_audio: false,
+                ..Default::default()
+            };
+            render_with(&timeline, &[out_asset.clone(), in_asset.clone()], &out, &opts).expect("export");
+            out
+        };
+        let slid = stripe_luma(&render(TransitionKind::SlideLeft, "slide.mp4"));
+        let pushed = stripe_luma(&render(TransitionKind::PushLeft, "push.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(slid > 180.0, "a slide leaves the outgoing clip where it was, got luma {slid}");
+        assert!(
+            pushed < 60.0,
+            "a push carries the outgoing clip out of frame, got luma {pushed}"
+        );
     }
 
     /// The delivery frame is the point of the whole feature: with it set and

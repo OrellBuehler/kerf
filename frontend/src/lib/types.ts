@@ -98,7 +98,48 @@ export interface Color {
 	temperature: number;
 }
 
-export type TransitionKind = 'crossfade' | 'dip_to_black';
+export type MaskShape = 'rect' | 'ellipse';
+
+/** A shape cut out of a clip: inside it the clip is kept, outside it goes
+ *  transparent so a lower track shows through. Everything is a fraction of the
+ *  rendered frame. Mirrors `Mask` in crates/kerf-core/src/model.rs. */
+export interface Mask {
+	shape: MaskShape;
+	/** Centre of the shape, 0..1 across and down the frame. */
+	x: number;
+	y: number;
+	/** Full width / height of the shape as a fraction of the frame. */
+	width: number;
+	height: number;
+	/** Edge softness as a fraction of the shape's half-size; 0 is a hard cut. */
+	feather: number;
+	/** Keep what is outside the shape instead of inside it. */
+	inverted?: boolean;
+}
+
+/** Mirrors `Mask::default()` in crates/kerf-core/src/model.rs. */
+export const DEFAULT_MASK: Mask = {
+	shape: 'rect',
+	x: 0.5,
+	y: 0.5,
+	width: 0.5,
+	height: 0.5,
+	feather: 0.15,
+	inverted: false
+};
+
+export type TransitionKind =
+	| 'crossfade'
+	| 'dip_to_black'
+	| 'dip_to_white'
+	| 'slide_left'
+	| 'slide_right'
+	| 'slide_up'
+	| 'slide_down'
+	| 'push_left'
+	| 'push_right'
+	| 'push_up'
+	| 'push_down';
 
 export interface Transition {
 	kind: TransitionKind;
@@ -193,9 +234,15 @@ export interface TextOverlay {
 	generated?: boolean;
 }
 
-/** How a transcript is turned into on-screen captions. Omitted fields keep the
- *  backend's social-video defaults (4 words / 28 chars, low-centre). */
+/** The look a generated caption set takes: a held subtitle line, or one large
+ *  word at a time — the style social captions have converged on. */
+export type CaptionStyle = 'lines' | 'word_punch';
+
+/** How a transcript is turned into on-screen captions. Everything but the style
+ *  is an override: omit a field and it follows the style, so asking for
+ *  `word_punch` alone gets the whole look. */
 export interface CaptionOptions {
+	style?: CaptionStyle;
 	max_words?: number;
 	max_chars?: number;
 	pos_y?: number;
@@ -217,6 +264,8 @@ export interface Clip {
 	transform?: Transform;
 	color?: Color;
 	transition_in?: Transition | null;
+	/** A shape cut out of this clip; absent is the whole frame. */
+	mask?: Mask | null;
 	effects?: VideoEffect[];
 	audio?: AudioEffect[];
 	keyframes?: Keyframe[];
@@ -264,6 +313,10 @@ export interface Track {
 	solo?: boolean;
 	/** Guarded against editing. A locked track still renders. */
 	locked?: boolean;
+	/** Track fader: a linear gain over every clip on the track. 1 is unity. */
+	volume?: number;
+	/** Stereo placement, -1 hard left to 1 hard right. 0 is centre. */
+	pan?: number;
 }
 
 /** A named point on the timeline. Renders nothing — it is shared vocabulary
