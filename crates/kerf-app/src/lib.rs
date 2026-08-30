@@ -192,11 +192,25 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
 /// Progress of a slow import (an Insta360 lens pair being stitched), tagged with
 /// the file the user picked so the UI can label it while several import at once.
 #[derive(Clone, serde::Serialize)]
-struct ImportProgress {
+pub(crate) struct ImportProgress {
     path: String,
     fraction: f64,
     elapsed_secs: f64,
     eta_secs: Option<f64>,
+}
+
+impl ImportProgress {
+    /// Tag a render-progress tick with the file it belongs to. Shared with the
+    /// MCP `import_asset` tool so an agent's import reports on the same event
+    /// and drives the same overlay the user's own import does.
+    pub(crate) fn new(path: &str, p: kerf_core::ExportProgress) -> Self {
+        Self {
+            path: path.to_string(),
+            fraction: p.fraction,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: p.eta_secs,
+        }
+    }
 }
 
 #[tauri::command]
@@ -207,15 +221,7 @@ async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) 
         // parallel imports really run in parallel and a multi-minute stitch never
         // freezes the GUI or the agent — then take it only for the quick insert.
         let mut on_progress = |p: kerf_core::ExportProgress| {
-            let _ = app.emit(
-                "import-progress",
-                ImportProgress {
-                    path: path.clone(),
-                    fraction: p.fraction,
-                    elapsed_secs: p.elapsed_secs,
-                    eta_secs: p.eta_secs,
-                },
-            );
+            let _ = app.emit("import-progress", ImportProgress::new(&path, p));
         };
         let asset = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(|e| e.to_string())?;
         // Importing the pair's other lens (or the same file twice) resolves to

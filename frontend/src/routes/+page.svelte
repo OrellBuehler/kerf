@@ -68,6 +68,10 @@
 				unlisteners.push(
 					await listen('project-changed', () => void onProjectChanged()),
 					await listen('proxy-ready', () => ui.refreshPreview()),
+					// An agent can pick the speech model over MCP; the status is
+					// otherwise only read at launch, so the picker would keep
+					// showing the previous model until the next start.
+					await listen('speech-model-changed', () => void ui.loadTranscriptionStatus()),
 					// Only a 360 lens pair reports here — its stitch is a full
 					// re-encode, so the import overlay shows how far along it is.
 					await listen<{ fraction: number }>(

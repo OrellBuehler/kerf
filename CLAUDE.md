@@ -485,9 +485,14 @@ parts) and `preview_timeline` (the composited cut at a timeline time) — return
 `Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). The `lock()`
 helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
-helper sets `User` the same way); every **mutating** tool calls `self.changed()`, which
-emits a `project-changed` Tauri event so the webview re-fetches and the edit shows up
-live in the GUI. Because agent edits **stage**, "live in the GUI" now means the
+helper sets `User` the same way); every **mutating** tool goes through the `edit()`
+helper, which runs the op under the lock, **releases it**, and only then emits a
+`project-changed` Tauri event so the webview re-fetches and the edit shows up
+live in the GUI — that order matters, because the re-fetch the event triggers
+takes the same lock. `set_speech_model` emits `speech-model-changed` instead,
+which the webview listens for to re-read the transcription status: it reads that
+once at launch, and `project-changed` would re-fetch the timeline, history and
+task queue, none of which moved. Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
@@ -515,6 +520,17 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
+`import_asset` is the one write that does **not** stage — a file on disk is not
+an edit to the user's cut, so imported media (and its background proxy) lands for
+them immediately, reporting on the same `import-progress` event a lens-pair
+stitch drives for the GUI. `export` takes rmcp's `RequestContext` beside its
+`Parameters`: a render runs for minutes, so it forwards ffmpeg's progress to the
+client's `progressToken` and passes `context.ct` as the cancel callback, deleting
+the half-written file on cancel the way the GUI's export does. Progress goes
+through an unbounded channel to a spawned forwarder because the render itself is
+on the blocking pool and `notify_progress` is async; the forwarder drains the
+channel even with no token, so a client that asked for no progress doesn't leave
+ticks piling up.
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
