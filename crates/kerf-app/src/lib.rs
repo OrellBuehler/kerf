@@ -14,6 +14,7 @@
 //! and releasing it before the slow part.
 
 mod mcp;
+mod settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -259,11 +260,10 @@ pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
 
 /// How many proxy encodes may run at once. Importing many large sources (or
 /// reopening a project full of them) would otherwise spawn one full-file
-/// re-encode per file *at once* — and each ffmpeg grabs every core — so the CPU
-/// saturates and both the GUI and the agent freeze. The default of 1 keeps at
-/// most one encode running; raise it with `KERF_PROXY_WORKERS` on a machine with
-/// cores to spare (pair with `KERF_PROXY_THREADS` so workers × threads stays
-/// under your core count, or you're back to oversubscribing).
+/// re-encode per file *at once*. The engine's CPU budget now gates every heavy
+/// job anyway (`kerf_core::engine::cpu`), so raising `KERF_PROXY_WORKERS` above
+/// the default of 1 buys queued encodes rather than concurrent ones — the knob
+/// that decides how much of the machine they get is the CPU limit in Settings.
 fn proxy_workers() -> usize {
     std::env::var("KERF_PROXY_WORKERS")
         .ok()
@@ -1505,6 +1505,29 @@ fn agent_status() -> AgentStatus {
     }
 }
 
+// ---- app settings ----------------------------------------------------------
+
+/// The current preferences, resolved against the engine (see
+/// [`settings::SettingsView`]).
+#[tauri::command(async)]
+fn get_settings() -> settings::SettingsView {
+    settings::SettingsView::current()
+}
+
+/// Write the preferences and put them into force. Returns the resolved view, so
+/// the dialog can show the clamped percentage and the cores it works out to
+/// without a second round-trip.
+#[tauri::command(async)]
+fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
+    // Clamp through the engine first, then persist what was actually applied —
+    // storing an out-of-range value would keep re-clamping on every launch.
+    let stored = settings::Settings {
+        cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
+    };
+    settings::save(&app, &stored)?;
+    Ok(settings::SettingsView::current())
+}
+
 // ---- diagnostics (logs) ----------------------------------------------------
 
 #[tauri::command(async)]
@@ -1627,6 +1650,8 @@ pub fn run() {
             init_logging(app.handle());
             install_panic_hook();
             use_bundled_ffmpeg();
+            // Before anything can spawn ffmpeg: how much of the machine it may take.
+            settings::apply(&settings::load(app.handle()));
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 os = std::env::consts::OS,
@@ -1742,6 +1767,8 @@ pub fn run() {
             reveal_path,
             mcp_endpoint,
             agent_status,
+            get_settings,
+            set_settings,
             log_dir,
             reveal_logs
         ])

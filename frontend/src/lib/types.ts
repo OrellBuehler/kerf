@@ -566,6 +566,25 @@ export interface UpdateInfo {
 	notes?: string | null;
 }
 
+/** App preferences — machine settings, not project state, so they live in the
+ *  platform config directory rather than in the `.kerf` file. */
+export interface AppSettings {
+	/** Share of the machine one heavy job (analysis, transcription, proxy,
+	 *  stitch, export) may take. Kerf runs one such job at a time; this is how
+	 *  much of the computer that job gets. */
+	cpu_percent: number;
+}
+
+/** `AppSettings` resolved against the engine, which is what the settings
+ *  surface renders: the effective percentage (an environment override may win
+ *  over the stored one), the cores it works out to, and the machine it is a
+ *  share of. */
+export interface SettingsView extends AppSettings {
+	cpu_cores: number;
+	cpu_threads: number;
+	cpu_min_percent: number;
+}
+
 /** The dialog's baseline options (a preset is applied over this). One deliberate
  *  departure from the bare Rust `Default`: source decode is `hwaccel: 'auto'`,
  *  so exports GPU-decode where the machine can (ffmpeg falls back to software

@@ -22,6 +22,9 @@ pub use analysis::{
     FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector,
     Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
+pub use engine::cpu::{
+    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
+};
 pub use engine::{
     download_speech_model, export_still, generate_proxy, hw_encoders, insta360_pair, proxy_path, proxy_width, render_with,
     render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export,

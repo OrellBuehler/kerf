@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use super::cli::{command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
+use super::cli::{bg_command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
+use super::cpu;
 use crate::error::{Error, Result};
 use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 
@@ -18,7 +19,11 @@ use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 /// with the measured `input_i` / `input_lra` / `input_tp` / `input_thresh`.
 pub fn measure_loudness(path: &Path) -> Result<Loudness> {
     let bin = ffmpeg_bin();
-    let output = command(&bin)
+    // Another whole-file decode; it takes the heavy-job slot like the rest.
+    let cpu = cpu::lease();
+    let mut cmd = bg_command(&bin);
+    cpu::limit_cmd(&mut cmd, cpu.threads());
+    let output = cmd
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)

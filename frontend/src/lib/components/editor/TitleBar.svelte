@@ -5,6 +5,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { notifications } from '$lib/notifications.svelte';
+	import { settings } from '$lib/settings.svelte';
 
 	// An available update stays offered here after the dialog is dismissed;
 	// otherwise the version label doubles as a manual "check for updates".
@@ -23,6 +24,18 @@
 			<Badge tone="warning" dot>Unsaved</Badge>
 		{/if}
 	</div>
+	<button
+		onclick={() => settings.toggle()}
+		title="Settings — how much of this machine Kerf may use (⌘,)"
+		aria-label="Settings"
+		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {settings.open
+			? 'var(--border-strong)'
+			: 'transparent'};background:{settings.open ? 'var(--surface-active)' : 'transparent'};color:{settings.open
+			? 'var(--text-primary)'
+			: 'var(--text-disabled)'}"
+	>
+		<Icon n="settings" s={13} color="currentColor" />
+	</button>
 	<!-- Toasts are gone in seconds; this is where they can be read afterwards.
 	     The badge only turns red when something unread actually failed. -->
 	<button

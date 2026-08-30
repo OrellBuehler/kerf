@@ -10,6 +10,7 @@
 	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
+	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
@@ -18,6 +19,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { updater } from '$lib/updater.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { inTauri, isMediaPath } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -37,6 +39,7 @@
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
+		void settings.load();
 		// Ask GitHub whether a newer signed release exists (silently — offline is
 		// not worth an interruption) and offer it in the title bar / dialog.
 		const stopUpdater = updater.init();
@@ -256,6 +259,9 @@
 			} else if (k === 'i') {
 				e.preventDefault();
 				void onImport();
+			} else if (e.key === ',') {
+				e.preventDefault();
+				settings.toggle();
 			} else if (k === 'a') {
 				e.preventDefault();
 				editor.selectAll();
@@ -414,6 +420,10 @@
 
 {#if exportOpen}
 	<ExportDialog onClose={() => (exportOpen = false)} />
+{/if}
+
+{#if settings.open}
+	<SettingsDialog onClose={() => settings.close()} />
 {/if}
 
 {#if updater.dialogOpen}

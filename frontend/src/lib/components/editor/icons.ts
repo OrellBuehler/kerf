@@ -3,6 +3,7 @@ import {
 	MousePointer2,
 	Scissors,
 	Bookmark,
+	Settings,
 	Magnet,
 	SkipBack,
 	SkipForward,
@@ -111,7 +112,8 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'external-link': ExternalLink,
 	'alert-triangle': TriangleAlert,
 	'lightbulb': Lightbulb,
-	'bell': Bell
+	'bell': Bell,
+	'settings': Settings
 };
 
 export type IconName = keyof typeof icons;

@@ -59,6 +59,30 @@ so the feature is **only** activated through these forwards — which is what ma
   software fallback shared with the preview path; the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
+  **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
+  written to finish as fast as it can — every run grabs every core and nothing
+  coordinates one run with the next — so an agent analyzing eight sources over
+  MCP used to spawn eight all-cores, whole-file decodes at once (each buffering
+  its PCM, so gigabytes too) and leave the desktop unusable for no wall-clock
+  gain. Two moving parts: **one heavy job at a time** (`cpu::lease`, a reentrant
+  gate — an export's second pass and a stitch inside an import must not queue
+  behind themselves) and **a share of the cores for that job** (`cpu_percent`,
+  seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). Gated =
+  anything that reads a *whole file*: silence / scene / loudness detection, the
+  PCM decode behind rhythm and in-process whisper, transcription, proxy, stitch,
+  export. **Ungated** = anything that reads a *moment*: a scrubbed frame, the
+  composited still, a clip's audio, the preview stream, a waveform, a contact
+  sheet — the UI (and an agent *looking* at footage) must not wait out a render.
+  The share becomes `-threads` / `-filter_threads` / `-filter_complex_threads`,
+  written in at **spawn** time (`cpu::limit_args` / `limit_cmd`) rather than in
+  the pure argument builders, so those keep describing exactly what ffmpeg is
+  handed; `-threads` goes in twice because ffmpeg assigns it to whichever *file
+  group* it sits in — at the front for the decoder, immediately before the last
+  argument (the output sink) for the encoder. Plus below-normal scheduling
+  priority (`cpu::background`, a creation flag on Windows / `nice` on unix),
+  which is the half that actually keeps the desktop responsive. At **100%** none
+  of the second half applies: no flags, no priority change, byte-identical
+  invocations to the ones Kerf always issued.
   Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
@@ -593,7 +617,13 @@ from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit
 `discard_staged_edit`) and `revision_diff`, `export_timeline` (emits
 `export-progress` events) / `cancel_export`, `cancel_analysis` (the same shape,
 for the analysis pass — importing ten clips must not be an unbreakable
-commitment to ten transcriptions) and `agent_status` (the MCP endpoint plus how
+commitment to ten transcriptions), app preferences (`get_settings` /
+`set_settings` → a `SettingsView`: the *effective* CPU budget read back out of
+the engine, the cores it works out to, and the machine it is a share of —
+`settings.rs` persists them as JSON in the platform config dir, since how much
+of *this* computer Kerf may use is not something that should travel inside a
+`.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after)
+and `agent_status` (the MCP endpoint plus how
 many seconds ago an agent last spoke to it, or `null` if none ever has —
 `mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
 `initialize` is the one moment an agent is known to be there; a
@@ -871,6 +901,17 @@ since an hour later it would undo whatever the newest revision is, not the edit 
 notice was about. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
 calls) now report: a notice that is never raised cannot be recovered from a log.
+
+**Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
+the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
+panel, so the next preference is a row in a list rather than new chrome. Its one
+section is **Performance** — the CPU limit as three named budgets (Background /
+Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
+left for everything else", because the complaint this answers arrives in those
+terms and not in percentages. The percentage is clamped by the engine, so the
+view that comes *back* from `set_settings` is what renders, not the value asked
+for; in the browser harness `api.ts` answers from localStorage over
+`navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
 alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every

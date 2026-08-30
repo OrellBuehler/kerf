@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
+use super::cpu;
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
@@ -218,6 +219,17 @@ pub(super) fn command(bin: &str) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     };
+    cmd
+}
+
+/// A `Command` for a **background** ffmpeg run: everything [`command`] does,
+/// plus below-normal scheduling priority so a render or an analysis pass never
+/// out-prioritizes the window the user is actually looking at. Interactive
+/// decodes (a scrubbed frame, the preview stream) keep normal priority — they
+/// are short, and the whole point of them is to land now.
+pub(super) fn bg_command(bin: &str) -> Command {
+    let mut cmd = command(bin);
+    cpu::background(&mut cmd);
     cmd
 }
 
@@ -456,7 +468,11 @@ fn parse_rational(s: &str) -> Option<f64> {
 pub fn detect_silence(path: &Path, noise_db: f64, min_silence: f64) -> Result<Vec<TimeRange>> {
     let bin = ffmpeg_bin();
     let filter = format!("silencedetect=noise={noise_db}dB:d={min_silence}");
-    let output = command(&bin)
+    // A whole-file decode: takes the heavy-job slot and the budget's threads.
+    let cpu = cpu::lease();
+    let mut cmd = bg_command(&bin);
+    cpu::limit_cmd(&mut cmd, cpu.threads());
+    let output = cmd
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)
@@ -501,8 +517,11 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
 
     let bin = ffmpeg_bin();
     let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    // The whole file is decoded, so this queues behind any other heavy job.
+    let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
-        let mut cmd = command(&bin);
+        let mut cmd = bg_command(&bin);
+        cpu::limit_cmd(&mut cmd, cpu.threads());
         cmd.args(["-hide_banner", "-nostats"]);
         if let Some(hw) = hw {
             cmd.args(["-hwaccel", hw]);
@@ -586,9 +605,11 @@ pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
-    let args = build_salience_args(path, start, end);
+    let cpu = cpu::lease();
+    let mut args = build_salience_args(path, start, end);
+    cpu::limit_args(&mut args, cpu.threads());
     let run = |hw: Option<&str>| {
-        let mut cmd = command(&bin);
+        let mut cmd = bg_command(&bin);
         if let Some(hw) = hw {
             cmd.args(["-hwaccel", hw]);
         }
@@ -779,6 +800,9 @@ fn run_frame_decode(
     hw: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut cmd = command(bin);
+    // Interactive: never gated and never de-prioritized — a scrubbed frame is
+    // wanted now — but still held to the budget's threads.
+    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if let Some(hw) = hw {
         cmd.args(["-hwaccel", hw]);
@@ -823,9 +847,13 @@ pub fn contact_sheet(
     let path = path
         .to_str()
         .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
-    let (args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
+    let (mut args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
     let bin = ffmpeg_bin();
-    let output = command(&bin)
+    // Deliberately ungated: this is how an agent *looks* at the footage, and
+    // making it wait out a ten-minute render would read as a hung server. It
+    // still runs thread-capped and at background priority.
+    cpu::limit_args(&mut args, cpu::budget_threads());
+    let output = bg_command(&bin)
         .args(&args)
         .stderr(Stdio::piped())
         .output()
@@ -899,7 +927,11 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
     // otherwise (held twice — raw stdout then the parsed Vec). Here memory is
     // O(buckets) regardless of length, and ffmpeg's decode is the only cost.
     let bin = ffmpeg_bin();
-    let mut child = command(&bin)
+    // Ungated like the other reads the timeline draws from — a clip's waveform
+    // appearing is not worth queueing behind an export — but capped and niced.
+    let mut cmd = bg_command(&bin);
+    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    let mut child = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
@@ -1035,7 +1067,12 @@ pub fn decode_audio_16k_mono(path: &Path) -> Result<Vec<f32>> {
 
 pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
     let bin = ffmpeg_bin();
-    let output = command(&bin)
+    // Decodes the whole stream *into memory* — eight of these at once is the
+    // several gigabytes an unsupervised agent used to cost — so it is gated.
+    let cpu = cpu::lease();
+    let mut cmd = bg_command(&bin);
+    cpu::limit_cmd(&mut cmd, cpu.threads());
+    let output = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
@@ -1076,6 +1113,8 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
 pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filters: Option<&str>) -> Result<Vec<u8>> {
     let bin = ffmpeg_bin();
     let mut cmd = command(&bin);
+    // Interactive, like the frame decode: the preview's playback is waiting on it.
+    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .args(["-ss", &start.max(0.0).to_string()])
         .arg("-i")
@@ -1180,17 +1219,16 @@ pub fn ready_proxy(src: &Path, width: u32) -> Option<PathBuf> {
     proxy_path(src, width).filter(|p| p.is_file())
 }
 
-/// How many CPU threads a single preview-proxy encode may use. Capped to leave
-/// at least one core free so the GUI and a working agent stay responsive while a
-/// proxy transcodes in the background (an uncapped `libx264` grabs every core).
-/// Override with `KERF_PROXY_THREADS` (clamped to >= 1).
-fn proxy_threads() -> usize {
+/// How many CPU threads a single preview-proxy encode may use. Follows the
+/// engine's CPU budget (see [`cpu`]), except that it never takes the whole
+/// machine even at 100% — an uncapped `libx264` grabs every core, and a proxy
+/// is background work the user did not ask to wait for. `KERF_PROXY_THREADS`
+/// still overrides it outright (clamped to >= 1).
+fn proxy_threads(budget: usize) -> usize {
     if let Some(n) = std::env::var("KERF_PROXY_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.max(1);
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1).max(1))
-        .unwrap_or(1)
+    budget.min(cpu::cores().saturating_sub(1).max(1)).max(1)
 }
 
 /// Constant-quality flags for encoder `vc` at software-CRF-scale `crf` — the
@@ -1308,9 +1346,14 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
         .to_str()
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
     let bin = ffmpeg_bin();
+    // A full-file re-encode. Importing a folder queues them one behind the next
+    // rather than starting one per file at once.
+    let cpu = cpu::lease();
+    let threads = proxy_threads(cpu.threads());
     let run = |encoder: &str, hw_decode: Option<&str>| -> Result<std::process::Output> {
-        let args = build_proxy_args(src_str, tmp_str, proxy_threads(), width, encoder, hw_decode);
-        command(&bin)
+        let mut args = build_proxy_args(src_str, tmp_str, threads, width, encoder, hw_decode);
+        cpu::limit_args(&mut args, threads);
+        bg_command(&bin)
             .args(&args)
             .stderr(Stdio::piped())
             .output()
@@ -2798,6 +2841,9 @@ pub fn stream_preview(
     let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
+    // Playback is paced to the wall clock, so it never races ahead; the cap is
+    // there so the budget means the same thing while the cut is playing.
+    cpu::limit_args(&mut args, cpu::budget_threads());
 
     let bin = ffmpeg_bin();
     tracing::debug!(start, fps, "starting preview stream");
@@ -3122,12 +3168,18 @@ fn run_ffmpeg_progress(
     use std::process::Stdio;
 
     let bin = ffmpeg_bin();
+    // The heaviest thing the engine does. The lease is reentrant, so an export's
+    // second pass and a stitch inside an import do not queue behind themselves.
+    let cpu = cpu::lease();
+    let mut args = args.to_vec();
+    cpu::limit_args(&mut args, cpu.threads());
+    let args = &args[..];
     tracing::info!(output = %output.display(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
     // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
     // `-stats_period` bounds how often, and thus the cancel-poll latency.
-    let mut child = command(&bin)
+    let mut child = bg_command(&bin)
         .arg("-progress")
         .arg("pipe:1")
         .arg("-stats_period")
@@ -4383,7 +4435,8 @@ fn run_still(
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
-        let args = build_still_args(timeline, assets, o, t, max_width, out)?;
+        let mut args = build_still_args(timeline, assets, o, t, max_width, out)?;
+        cpu::limit_args(&mut args, cpu::budget_threads());
         let bin = ffmpeg_bin();
         let output = command(&bin)
             .args(&args)

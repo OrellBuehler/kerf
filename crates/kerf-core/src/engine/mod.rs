@@ -23,6 +23,10 @@ pub struct ProbeResult {
 
 mod cli;
 
+// How much of the machine the engine may take: the one-heavy-job-at-a-time gate
+// and the thread / priority caps every ffmpeg run is launched under.
+pub mod cpu;
+
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
