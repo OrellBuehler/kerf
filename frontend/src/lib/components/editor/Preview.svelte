@@ -6,7 +6,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { exportCover, getTimelineFrame, inTauri, pickCoverPath, revealPath, startPlayback } from '$lib/api';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
 	import { clipDuration } from '$lib/types';
 

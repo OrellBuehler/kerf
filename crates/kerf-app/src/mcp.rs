@@ -11,7 +11,8 @@
 //! [`EditSource::User`] the same way), so attribution stays correct even though
 //! both front doors share one `Project`.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
@@ -19,7 +20,8 @@ use kerf_core::{
     Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -30,6 +32,15 @@ use uuid::Uuid;
 
 /// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
 const DEFAULT_ADDR: &str = "127.0.0.1:7777";
+
+/// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
+/// model reading a schema description, not from a UI slider, so they are
+/// clamped rather than trusted — `skim_asset` already clamps its grid the same
+/// way. A frame far wider than the model can resolve costs a decode and a
+/// base64 payload nobody benefits from, and a waveform of a million buckets is
+/// megabytes of JSON that would bury the answer it was fetched to support.
+const MAX_PREVIEW_WIDTH: u32 = 1920;
+const MAX_WAVEFORM_BUCKETS: usize = 4096;
 
 #[derive(Clone)]
 pub struct KerfMcp {
@@ -59,6 +70,12 @@ struct RevisionDiffParams {
     seq: i64,
     #[schemars(description = "Compare against this revision seq instead of `seq - 1`")]
     from: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ImportParams {
+    #[schemars(description = "Absolute path to the media file to import")]
+    path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -674,7 +691,7 @@ struct TaskIdParams {
 struct WaveformParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
-    #[schemars(description = "Number of peak-magnitude buckets to return")]
+    #[schemars(description = "Number of buckets to return (1–4096; a few hundred is plenty to read a shape from)")]
     buckets: usize,
 }
 
@@ -684,7 +701,7 @@ struct FrameParams {
     asset_id: String,
     #[schemars(description = "Time in the source asset to decode (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Maximum output width in pixels (default 640)")]
+    #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
 }
 
@@ -708,7 +725,7 @@ struct SkimParams {
 struct TimelineFrameParams {
     #[schemars(description = "Timeline position to render (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Maximum output width in pixels (default 640)")]
+    #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
 }
 
@@ -726,6 +743,13 @@ struct AssetMetadata {
     analysis: Option<kerf_core::AssetAnalysis>,
 }
 
+/// A span of a track where nothing renders.
+#[derive(Serialize)]
+struct Gap {
+    start_secs: f64,
+    end_secs: f64,
+}
+
 #[derive(Serialize)]
 struct TrackSummary {
     id: String,
@@ -733,6 +757,11 @@ struct TrackSummary {
     kind: String,
     clip_count: usize,
     duration_secs: f64,
+    /// Where this track renders nothing — black picture on a video track,
+    /// silence on an audio one — including a hole at the head when the first
+    /// clip doesn't start at 0. Omitted entirely when the track is gapless.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gaps: Vec<Gap>,
 }
 
 #[derive(Serialize)]
@@ -761,6 +790,36 @@ impl KerfMcp {
     )]
     fn list_fonts(&self) -> Result<String, McpError> {
         json(&kerf_core::list_system_fonts())
+    }
+
+    #[tool(
+        description = "Import a media file into the project and return the Asset (probed streams, duration, \
+                       resolution, fps, codecs). Importing a file the project already holds resolves to that \
+                       asset instead of duplicating it, so this is safe to re-run. One Insta360 lens file pulls \
+                       in its sibling and stitches the pair into a single 360 asset — a full re-encode that can \
+                       run for minutes. An import is NOT part of your staged proposal: media lands for the user \
+                       immediately, because a file on disk is not an edit to their cut."
+    )]
+    async fn import_asset(&self, Parameters(p): Parameters<ImportParams>) -> Result<String, McpError> {
+        let project = self.project.clone();
+        let app = self.app.clone();
+        let path = p.path;
+        let asset = blocking(move || {
+            // Probe (and, for a lens pair, stitch) with the lock released, taking
+            // it only for the quick insert — the same shape as the GUI's import,
+            // so a multi-minute stitch never freezes the user's editing.
+            let mut on_progress = |pr: kerf_core::ExportProgress| {
+                let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
+            };
+            let probed = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(core_err)?;
+            lock_agent(&project).insert_or_get_asset(&probed).map_err(core_err)
+        })
+        .await?;
+        // Preview decodes come off a proxy; queue it now so the first frame
+        // anyone asks for is not a seek into a long GOP.
+        crate::spawn_proxy(&self.app, &asset);
+        self.changed();
+        json(&asset)
     }
 
     #[tool(description = "List all media assets in the project")]
@@ -794,7 +853,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache so the next analyze_asset transcribes without waiting for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
+        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache, so the next analyze_asset does not wait for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This only fills the cache: transcription keeps using whichever model is *selected*, so to transcribe with a model you name here, call set_speech_model too. Blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
     )]
     async fn download_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
         let name = p.name.unwrap_or_else(|| kerf_core::DEFAULT_SPEECH_MODEL.to_string());
@@ -824,55 +883,78 @@ impl KerfMcp {
         json(&analysis)
     }
 
+    #[tool(
+        description = "Pick the speech-to-text model transcription uses, remembered in the project (omit the name to \
+                       go back to the default). Same names as download_speech_model. Selecting a model does not \
+                       download it — the next transcription fetches it if the cache is cold, or call \
+                       download_speech_model first to get that wait out of the way. Returns the resulting \
+                       transcription status."
+    )]
+    fn set_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
+        let name = p.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        kerf_core::set_speech_model(name);
+        // Both writes the GUI's picker makes: the process setting transcription
+        // reads, and the project meta that restores the choice on reopen.
+        self.lock()
+            .set_meta(crate::SPEECH_MODEL_KEY, name.unwrap_or(""))
+            .map_err(core_err)?;
+        // The GUI reads the transcription status once, at launch, so it has to be
+        // told the choice moved or its picker shows the old model until the next
+        // start. Deliberately not `project-changed`: that re-fetches the timeline,
+        // the history and the task queue, and none of those moved.
+        self.notify("speech-model-changed");
+        json(&kerf_core::transcription_status())
+    }
+
     #[tool(description = "Cut [start, end) of an asset and append it to the matching track")]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Add a clip referencing a source range of an asset to the timeline")]
     fn add_clip_to_timeline(&self, Parameters(p): Parameters<AddClipParams>) -> Result<String, McpError> {
         let asset_id = parse_id(&p.asset_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
-        let project = self.lock();
-        let out = project
-            .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Split a timeline clip at a timeline time into two adjacent clips")]
     fn split_at(&self, Parameters(p): Parameters<SplitParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let (left, right) = project.split_at(clip_id, p.at).map_err(core_err)?;
-        self.changed();
-        json(&serde_json::json!({ "left": left, "right": right }))
+        self.edit(|project| {
+            let (left, right) = project.split_at(clip_id, p.at).map_err(core_err)?;
+            json(&serde_json::json!({ "left": left, "right": right }))
+        })
     }
 
     #[tool(description = "Trim a clip's source in/out points (timeline position preserved unless timeline_start is passed)")]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .trim(clip_id, p.source_in, p.source_out, p.timeline_start)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .trim(clip_id, p.source_in, p.source_out, p.timeline_start)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Move a clip to a new index within its track (re-flows the track gaplessly)")]
     fn reorder(&self, Parameters(p): Parameters<ReorderParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(
@@ -881,10 +963,10 @@ impl KerfMcp {
     fn move_clip(&self, Parameters(p): Parameters<MoveClipParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
-        let project = self.lock();
-        let out = project.move_clip(clip_id, p.timeline_start, track_id).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.move_clip(clip_id, p.timeline_start, track_id).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -892,10 +974,10 @@ impl KerfMcp {
     )]
     fn ripple_delete(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        project.ripple_delete(clip_id).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.ripple_delete(clip_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(
@@ -905,10 +987,10 @@ impl KerfMcp {
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let pieces = project.cut_clip_range(clip_id, p.from, p.to).map_err(core_err)?;
-        self.changed();
-        json(&pieces)
+        self.edit(|project| {
+            let pieces = project.cut_clip_range(clip_id, p.from, p.to).map_err(core_err)?;
+            json(&pieces)
+        })
     }
 
     #[tool(
@@ -916,19 +998,19 @@ impl KerfMcp {
     )]
     fn add_track(&self, Parameters(p): Parameters<AddTrackParams>) -> Result<String, McpError> {
         let kind = parse_kind(&p.kind)?;
-        let project = self.lock();
-        let track = project.add_track(kind, p.name).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.add_track(kind, p.name).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(description = "Remove a track and all of its clips (refuses to remove the last track)")]
     fn remove_track(&self, Parameters(p): Parameters<TrackIdParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        project.remove_track(track_id).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.remove_track(track_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(
@@ -937,10 +1019,10 @@ impl KerfMcp {
     )]
     fn set_track_duck(&self, Parameters(p): Parameters<SetTrackDuckParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(description = "Cut a clip to a shape: inside the shape the clip is kept, outside it goes \
@@ -954,35 +1036,39 @@ impl KerfMcp {
                        the right thing.")]
     fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let mask = match p.shape {
-            None => None,
-            Some(ref s) => {
-                let shape = MaskShape::parse(s).ok_or_else(|| {
-                    McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
-                })?;
-                // Omitted fields keep the clip's current mask, so nudging one
-                // number (move the ellipse a little left) does not reset the
-                // size and feather back to the defaults out from under it.
-                let d = project
-                    .working_timeline()
-                    .ok()
-                    .and_then(|tl| tl.locate(clip_id).and_then(|(ti, ci)| tl.tracks[ti].clips[ci].mask))
-                    .unwrap_or_default();
-                Some(Mask {
-                    shape,
-                    x: p.x.unwrap_or(d.x),
-                    y: p.y.unwrap_or(d.y),
-                    width: p.width.unwrap_or(d.width),
-                    height: p.height.unwrap_or(d.height),
-                    feather: p.feather.unwrap_or(d.feather),
-                    inverted: p.inverted.unwrap_or(d.inverted),
-                })
-            }
-        };
-        let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
-        self.changed();
-        json(&clip)
+        self.edit(|project| {
+            let mask = match p.shape {
+                None => None,
+                Some(ref s) => {
+                    let shape = MaskShape::parse(s).ok_or_else(|| {
+                        McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
+                    })?;
+                    // Omitted fields keep the clip's current mask, so nudging one
+                    // number (move the ellipse a little left) does not reset the
+                    // size and feather back to the defaults out from under it.
+                    // Deliberately not `.ok()…unwrap_or_default()`: a read that
+                    // failed is not the same answer as "this clip has no mask
+                    // yet", and collapsing the two silently resets every field
+                    // the caller did not name.
+                    let timeline = project.working_timeline().map_err(core_err)?;
+                    let (ti, ci) = timeline
+                        .locate(clip_id)
+                        .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+                    let d = timeline.tracks[ti].clips[ci].mask.unwrap_or_default();
+                    Some(Mask {
+                        shape,
+                        x: p.x.unwrap_or(d.x),
+                        y: p.y.unwrap_or(d.y),
+                        width: p.width.unwrap_or(d.width),
+                        height: p.height.unwrap_or(d.height),
+                        feather: p.feather.unwrap_or(d.feather),
+                        inverted: p.inverted.unwrap_or(d.inverted),
+                    })
+                }
+            };
+            let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
+            json(&clip)
+        })
     }
 
     #[tool(
@@ -994,10 +1080,10 @@ impl KerfMcp {
     )]
     fn set_track_volume(&self, Parameters(p): Parameters<SetTrackVolumeParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(
@@ -1008,10 +1094,10 @@ impl KerfMcp {
     )]
     fn set_track_pan(&self, Parameters(p): Parameters<SetTrackPanParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(
@@ -1028,10 +1114,10 @@ impl KerfMcp {
             (Some(w), Some(h)) => Some(Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover))),
             _ => None,
         };
-        let project = self.lock();
-        let timeline = project.set_delivery_format(format).map_err(core_err)?;
-        self.changed();
-        json(&timeline)
+        self.edit(|project| {
+            let timeline = project.set_delivery_format(format).map_err(core_err)?;
+            json(&timeline)
+        })
     }
 
     #[tool(
@@ -1040,28 +1126,28 @@ impl KerfMcp {
                        the user can see and jump to. Good for reporting findings from skim_asset."
     )]
     fn add_marker(&self, Parameters(p): Parameters<AddMarkerParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let marker = project.add_marker(p.time, p.name, p.color).map_err(core_err)?;
-        self.changed();
-        json(&marker)
+        self.edit(|project| {
+            let marker = project.add_marker(p.time, p.name, p.color).map_err(core_err)?;
+            json(&marker)
+        })
     }
 
     #[tool(description = "Move, rename or recolor a marker; omitted fields are left alone")]
     fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
         let marker_id = parse_id(&p.marker_id)?;
-        let project = self.lock();
-        let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
-        self.changed();
-        json(&marker)
+        self.edit(|project| {
+            let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
+            json(&marker)
+        })
     }
 
     #[tool(description = "Remove a marker from the timeline")]
     fn remove_marker(&self, Parameters(p): Parameters<MarkerIdParams>) -> Result<String, McpError> {
         let marker_id = parse_id(&p.marker_id)?;
-        let project = self.lock();
-        project.remove_marker(marker_id).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.remove_marker(marker_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(
@@ -1071,10 +1157,10 @@ impl KerfMcp {
     )]
     fn set_track_muted(&self, Parameters(p): Parameters<SetTrackMutedParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(
@@ -1084,10 +1170,10 @@ impl KerfMcp {
     )]
     fn set_track_solo(&self, Parameters(p): Parameters<SetTrackSoloParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(
@@ -1096,10 +1182,10 @@ impl KerfMcp {
     )]
     fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
-        let project = self.lock();
-        let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
-        self.changed();
-        json(&track)
+        self.edit(|project| {
+            let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
+            json(&track)
+        })
     }
 
     #[tool(
@@ -1108,10 +1194,10 @@ impl KerfMcp {
     )]
     fn set_clip_enabled(&self, Parameters(p): Parameters<SetClipEnabledParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
-        self.changed();
-        json(&clip)
+        self.edit(|project| {
+            let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
+            json(&clip)
+        })
     }
 
     #[tool(
@@ -1123,37 +1209,37 @@ impl KerfMcp {
     )]
     fn duplicate_clips(&self, Parameters(p): Parameters<DuplicateClipsParams>) -> Result<String, McpError> {
         let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
-        let project = self.lock();
-        let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
-        self.changed();
-        json(&clips)
+        self.edit(|project| {
+            let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
+            json(&clips)
+        })
     }
 
     #[tool(description = "Remove a clip from the timeline")]
     fn remove(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        project.remove(clip_id).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.remove(clip_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(description = "Set the linear volume gain of a clip")]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Set a clip's fade-in / fade-out duration in seconds (omit a field to leave it unchanged, 0 to clear)")]
     fn set_fade(&self, Parameters(p): Parameters<FadeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1161,10 +1247,10 @@ impl KerfMcp {
     )]
     fn set_speed(&self, Parameters(p): Parameters<SpeedParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_speed(clip_id, p.speed).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_speed(clip_id, p.speed).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1172,23 +1258,23 @@ impl KerfMcp {
     )]
     fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .set_transform(
-                clip_id,
-                p.scale,
-                p.pos_x,
-                p.pos_y,
-                p.rotation,
-                p.opacity,
-                p.crop_left,
-                p.crop_right,
-                p.crop_top,
-                p.crop_bottom,
-            )
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .set_transform(
+                    clip_id,
+                    p.scale,
+                    p.pos_x,
+                    p.pos_y,
+                    p.rotation,
+                    p.opacity,
+                    p.crop_left,
+                    p.crop_right,
+                    p.crop_top,
+                    p.crop_bottom,
+                )
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1196,12 +1282,12 @@ impl KerfMcp {
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1210,10 +1296,10 @@ impl KerfMcp {
     fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         let transition = parse_transition(p.kind, p.duration)?;
-        let project = self.lock();
-        let out = project.set_transition(clip_id, transition).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_transition(clip_id, transition).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1221,10 +1307,10 @@ impl KerfMcp {
     )]
     fn set_video_effects(&self, Parameters(p): Parameters<VideoEffectsParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1232,10 +1318,10 @@ impl KerfMcp {
     )]
     fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1243,10 +1329,10 @@ impl KerfMcp {
     )]
     fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1254,21 +1340,21 @@ impl KerfMcp {
     )]
     fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Remove all transform keyframes from a clip (back to its static transform)")]
     fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.clear_keyframes(clip_id).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.clear_keyframes(clip_id).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1279,12 +1365,12 @@ impl KerfMcp {
     )]
     fn set_reframe(&self, Parameters(p): Parameters<ReframeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1307,10 +1393,10 @@ impl KerfMcp {
     )]
     fn clear_reframe(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.clear_reframe(clip_id).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.clear_reframe(clip_id).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1320,10 +1406,10 @@ impl KerfMcp {
     )]
     fn set_reframe_keyframes(&self, Parameters(p): Parameters<ReframeKeyframesParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1332,22 +1418,22 @@ impl KerfMcp {
     )]
     fn add_reframe_keyframe(&self, Parameters(p): Parameters<AddReframeKeyframeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
-        let project = self.lock();
-        let out = project
-            .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
         description = "Add a text overlay (title / lower-third / caption / watermark) drawn over the composited picture between start and end (timeline seconds). Returns the overlay; style or animate it with update_overlay / set_overlay_keyframes."
     )]
     fn add_overlay(&self, Parameters(p): Parameters<AddOverlayParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let out = project.add_overlay(p.text, p.start, p.end).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.add_overlay(p.text, p.start, p.end).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1355,23 +1441,23 @@ impl KerfMcp {
     )]
     fn update_overlay(&self, Parameters(p): Parameters<UpdateOverlayParams>) -> Result<String, McpError> {
         let overlay_id = parse_id(&p.overlay_id)?;
-        let project = self.lock();
-        let out = project
-            .update_overlay(
-                overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.font, p.bold,
-            )
-            .map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project
+                .update_overlay(
+                    overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.font, p.bold,
+                )
+                .map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Remove a text overlay")]
     fn remove_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
         let overlay_id = parse_id(&p.overlay_id)?;
-        let project = self.lock();
-        project.remove_overlay(overlay_id).map_err(core_err)?;
-        self.changed();
-        Ok("ok".to_string())
+        self.edit(|project| {
+            project.remove_overlay(overlay_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
     }
 
     #[tool(
@@ -1379,10 +1465,10 @@ impl KerfMcp {
     )]
     fn set_overlay_keyframes(&self, Parameters(p): Parameters<OverlayKeyframesParams>) -> Result<String, McpError> {
         let overlay_id = parse_id(&p.overlay_id)?;
-        let project = self.lock();
-        let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1396,20 +1482,20 @@ impl KerfMcp {
             pos_y: p.pos_y,
             size: p.size,
         };
-        let project = self.lock();
-        let out = project.generate_captions(opts).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.generate_captions(opts).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
         description = "Remove the captions generate_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
     )]
     fn clear_captions(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let removed = project.clear_captions().map_err(core_err)?;
-        self.changed();
-        Ok(format!("removed {removed} generated caption(s)"))
+        self.edit(|project| {
+            let removed = project.clear_captions().map_err(core_err)?;
+            Ok(format!("removed {removed} generated caption(s)"))
+        })
     }
 
     #[tool(description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first)")]
@@ -1426,10 +1512,10 @@ impl KerfMcp {
     #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let out = project.remove_silence(id).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.remove_silence(id).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1459,30 +1545,33 @@ impl KerfMcp {
     )]
     fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
         let track = p.track_id.as_deref().map(parse_id).transpose()?;
-        let project = self.lock();
-        let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
-        let timeline = project.timeline().map_err(core_err)?;
-        drop(project);
-        self.changed();
-        json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": timeline }))
+        self.edit(|project| {
+            let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
+            // The *working* timeline, like every other read here: inside a task the
+            // alignment lands in the staged proposal, and `timeline()` would hand
+            // back the user's untouched cut — a timeline with none of the moves the
+            // `cuts_aligned` count beside it just reported.
+            let timeline = project.working_timeline().map_err(core_err)?;
+            json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": timeline }))
+        })
     }
 
     #[tool(description = "Append the full audio of an asset to the first audio track")]
     fn extract_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let out = project.extract_audio(id).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.extract_audio(id).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Stitch the full length of several assets together in order")]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
         let ids = p.asset_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
-        let project = self.lock();
-        let out = project.concatenate(&ids).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.concatenate(&ids).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1492,10 +1581,10 @@ impl KerfMcp {
                        before handing it over. claim_next_task already does this for you."
     )]
     fn stage_edits(&self, Parameters(p): Parameters<StageEditsParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let staged = project.begin_staging(None, p.note.as_deref()).map_err(core_err)?;
-        self.changed();
-        json(&staged)
+        self.edit(|project| {
+            let staged = project.begin_staging(None, p.note.as_deref()).map_err(core_err)?;
+            json(&staged)
+        })
     }
 
     #[tool(
@@ -1519,18 +1608,18 @@ impl KerfMcp {
                        the timeline since you staged, unless `force`."
     )]
     fn apply_staged_edits(&self, Parameters(p): Parameters<ApplyStagedParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let timeline = project.apply_staged(p.force.unwrap_or(false)).map_err(core_err)?;
-        self.changed();
-        json(&timeline)
+        self.edit(|project| {
+            let timeline = project.apply_staged(p.force.unwrap_or(false)).map_err(core_err)?;
+            json(&timeline)
+        })
     }
 
     #[tool(description = "Throw your staged edits away, leaving the user's timeline untouched")]
     fn discard_staged_edits(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let timeline = project.discard_staged().map_err(core_err)?;
-        self.changed();
-        json(&timeline)
+        self.edit(|project| {
+            let timeline = project.discard_staged().map_err(core_err)?;
+            json(&timeline)
+        })
     }
 
     #[tool(description = "Explain what one revision changed (see history), as a list of edits to the cut")]
@@ -1552,26 +1641,26 @@ impl KerfMcp {
 
     #[tool(description = "Undo the last timeline edit, returning the restored timeline")]
     fn undo(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let out = project.undo().map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.undo().map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Redo the next timeline edit, returning the restored timeline")]
     fn redo(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let out = project.redo().map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.redo().map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(description = "Revert the timeline to a specific revision seq (see history), returning the restored timeline")]
     fn revert_to(&self, Parameters(p): Parameters<RevertParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let out = project.revert_to(p.seq).map_err(core_err)?;
-        self.changed();
-        json(&out)
+        self.edit(|project| {
+            let out = project.revert_to(p.seq).map_err(core_err)?;
+            json(&out)
+        })
     }
 
     #[tool(
@@ -1587,12 +1676,47 @@ impl KerfMcp {
     #[tool(
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
-                       safe H.264/AAC MP4 default."
+                       safe H.264/AAC MP4 default. A render takes minutes: send a `progressToken` in the request's \
+                       `_meta` to receive progress notifications while it runs, and cancel the request \
+                       (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
+                       rather than leaving a broken one behind."
     )]
-    async fn export(&self, Parameters(p): Parameters<ExportParams>) -> Result<String, McpError> {
+    async fn export(
+        &self,
+        Parameters(p): Parameters<ExportParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let opts = p.options.unwrap_or_default();
         let project = self.project.clone();
-        let output_path = blocking(move || {
+        let output_path = p.output_path;
+
+        // A render runs for minutes. Without progress an agent cannot tell a slow
+        // export from a hung one, and without cancellation it cannot abandon a
+        // render whose settings it already knows are wrong — it can only wait for
+        // a file it does not want. Both ride the protocol rather than a Kerf-
+        // specific channel: the client's `progressToken`, and the cancellation
+        // token rmcp trips when `notifications/cancelled` arrives.
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kerf_core::ExportProgress>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            // The task drains the channel either way, so a client that asked for
+            // no progress does not leave ffmpeg's ticks piling up in it.
+            tauri::async_runtime::spawn(async move {
+                while let Some(progress) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let mut param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
+                    if let Some(eta) = progress.eta_secs {
+                        param = param.with_message(format!("rendering, {} to go", fmt_ts(eta)));
+                    }
+                    let _ = peer.notify_progress(param).await;
+                }
+            })
+        };
+
+        let render_path = output_path.clone();
+        let status = blocking(move || {
             // Snapshot the timeline + assets under the lock, then render with the
             // lock released so a long export doesn't freeze the GUI (or block other
             // agent tools) for its whole duration.
@@ -1603,11 +1727,39 @@ impl KerfMcp {
                     project.list_assets().map_err(core_err)?,
                 )
             };
-            kerf_core::render_with(&timeline, &assets, std::path::Path::new(&p.output_path), &opts).map_err(core_err)?;
-            Ok(p.output_path)
+            let mut on_progress = |progress: kerf_core::ExportProgress| {
+                let _ = tx.send(progress);
+            };
+            let status = kerf_core::render_with_progress(
+                &timeline,
+                &assets,
+                std::path::Path::new(&render_path),
+                &opts,
+                &mut on_progress,
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(core_err)?;
+            if status == kerf_core::RenderStatus::Cancelled {
+                // Mirrors the GUI: a cancelled export leaves no debris, and in
+                // particular no truncated file that reads as a finished render.
+                // Done *here*, not after the await — cancelling the request can
+                // drop this handler's future, while a blocking job runs to
+                // completion whether or not anyone is still holding its handle.
+                let _ = std::fs::remove_file(&render_path);
+            }
+            Ok(status)
         })
-        .await?;
-        json(&serde_json::json!({ "output": output_path }))
+        .await;
+        // `tx` died with the closure, so the forwarder has already run dry.
+        let _ = forward.await;
+
+        match status? {
+            kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "output": output_path })),
+            kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
+                format!("export cancelled; {output_path} was removed"),
+                None,
+            )),
+        }
     }
 
     #[tool(
@@ -1618,8 +1770,11 @@ impl KerfMcp {
                        letterboxed) and tips. Advisory: export is never blocked. Use before reporting a cut finished."
     )]
     fn platform_check(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let summary = project.cut_summary(None).map_err(core_err)?;
+        // One summary, not two: `Project::platform_check` resolves its own, and
+        // each resolve deserializes the whole timeline and re-reads every asset
+        // row to answer the identical question.
+        let summary = self.lock().cut_summary(None).map_err(core_err)?;
+        let targets = kerf_core::platform::check_all(&summary);
         json(&serde_json::json!({
             "cut": {
                 "duration_secs": summary.duration,
@@ -1627,7 +1782,7 @@ impl KerfMcp {
                 "has_audio": summary.has_audio,
                 "has_text": summary.has_text,
             },
-            "targets": project.platform_check(None).map_err(core_err)?,
+            "targets": targets,
         }))
     }
 
@@ -1657,66 +1812,67 @@ impl KerfMcp {
 
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
     fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> Result<String, McpError> {
-        let project = self.lock();
-        let task = project.add_task(&p.prompt).map_err(core_err)?;
-        self.changed();
-        json(&task)
+        self.edit(|project| {
+            let task = project.add_task(&p.prompt).map_err(core_err)?;
+            json(&task)
+        })
     }
 
     #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
     fn claim_next_task(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let task = project.claim_next_task().map_err(core_err)?;
-        self.changed();
-        json(&task)
+        self.edit(|project| {
+            let task = project.claim_next_task().map_err(core_err)?;
+            json(&task)
+        })
     }
 
     #[tool(description = "Mark a claimed task ready for the user to review, with a summary of the edits made")]
     fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
-        let project = self.lock();
-        let task = project.complete_task(id, p.result).map_err(core_err)?;
-        self.changed();
-        json(&task)
+        self.edit(|project| {
+            let task = project.complete_task(id, p.result).map_err(core_err)?;
+            json(&task)
+        })
     }
 
     #[tool(description = "Mark a task failed with an error message")]
     fn fail_task(&self, Parameters(p): Parameters<FailTaskParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
-        let project = self.lock();
-        let task = project.fail_task(id, &p.error).map_err(core_err)?;
-        self.changed();
-        json(&task)
+        self.edit(|project| {
+            let task = project.fail_task(id, &p.error).map_err(core_err)?;
+            json(&task)
+        })
     }
 
     #[tool(description = "Mark a task done (user accepted the staged edit), returning the updated task")]
     fn resolve_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
-        let project = self.lock();
-        let task = project.resolve_task(id).map_err(core_err)?;
-        self.changed();
-        json(&task)
+        self.edit(|project| {
+            let task = project.resolve_task(id).map_err(core_err)?;
+            json(&task)
+        })
     }
 
     #[tool(description = "Remove a task from the queue permanently, returning the updated task list")]
     fn remove_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.task_id)?;
-        let project = self.lock();
-        project.remove_task(id).map_err(core_err)?;
-        self.changed();
-        json(&project.list_tasks().map_err(core_err)?)
+        self.edit(|project| {
+            project.remove_task(id).map_err(core_err)?;
+            json(&project.list_tasks().map_err(core_err)?)
+        })
     }
 
     #[tool(description = "Get peak-magnitude waveform data (0.0–1.0) for an asset's first audio stream")]
     async fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
+        let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let buckets = blocking(move || {
             // Resolve under the lock, decode the whole audio stream with it
             // released — bucketing a long source takes seconds and must not
             // stall the GUI's commands on the shared mutex.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_waveform(&asset, p.buckets).map_err(core_err)
+            Project::decode_waveform(&asset, count).map_err(core_err)
         })
         .await?;
         json(&buckets)
@@ -1727,11 +1883,12 @@ impl KerfMcp {
     )]
     async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
+        let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let energy = blocking(move || {
             // Same lock-free decode shape as `get_waveform`.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_energy(&asset, p.buckets).map_err(core_err)
+            Project::decode_energy(&asset, count).map_err(core_err)
         })
         .await?;
         json(&energy)
@@ -1743,7 +1900,7 @@ impl KerfMcp {
     async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.project.clone();
-        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let jpeg = blocking(move || {
             // Resolve under the lock, decode with it released — mirrors the GUI's
             // `get_frame` so an agent drill-in can't stall the user's edits.
@@ -1789,7 +1946,7 @@ impl KerfMcp {
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
-        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let jpeg = blocking(move || {
             // Snapshot the inputs under the lock, composite with it released —
             // mirrors the GUI's `get_timeline_frame`.
@@ -1816,6 +1973,7 @@ impl KerfMcp {
                 kind: format!("{:?}", t.kind).to_lowercase(),
                 clip_count: t.clips.len(),
                 duration_secs: t.end(),
+                gaps: track_gaps(t),
             })
             .collect();
         let total_clip_count = tracks.iter().map(|t| t.clip_count).sum();
@@ -1845,10 +2003,29 @@ impl KerfMcp {
         lock_agent(&self.project)
     }
 
+    /// Run one operation under the shared lock, release the lock, *then* tell the
+    /// webview. Every mutating tool is this shape, and the order matters: the
+    /// event makes the GUI re-fetch, and that re-fetch takes the same lock. A
+    /// failed operation notifies nothing, because nothing changed.
+    fn edit<T>(&self, op: impl FnOnce(&Project) -> Result<T, McpError>) -> Result<T, McpError> {
+        // The guard is a temporary of this statement, so it is dropped here —
+        // before the emit, and before anything the emit wakes up comes asking
+        // for the lock.
+        let out = op(&self.lock())?;
+        self.changed();
+        Ok(out)
+    }
+
     /// Tell the webview the project changed so it re-fetches and renders live.
     fn changed(&self) {
-        if let Err(e) = self.app.emit("project-changed", ()) {
-            tracing::warn!(error = %e, "failed to emit project-changed");
+        self.notify("project-changed");
+    }
+
+    /// Emit a webview event, logging rather than failing when there is no window
+    /// listening — a headless agent session is a perfectly good way to run this.
+    fn notify(&self, event: &str) {
+        if let Err(e) = self.app.emit(event, ()) {
+            tracing::warn!(error = %e, event, "failed to emit webview event");
         }
     }
 }
@@ -1858,9 +2035,40 @@ impl KerfMcp {
 /// mutex (a panic while another op held the lock) rather than panicking here
 /// too — a single failed op shouldn't brick the agent endpoint for the session.
 fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
+    note_agent_activity();
     let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
     guard.set_actor(EditSource::Agent);
     guard
+}
+
+// ---- agent presence --------------------------------------------------------
+
+/// Unix seconds of the last thing an agent did — its `initialize` handshake, or
+/// any tool call that reached the project — or 0 if nothing ever has.
+///
+/// The agent panel used to show a green "live" dot unconditionally, which said
+/// the same thing whether or not anything was connected. Nothing here claims a
+/// *socket* is open: a streamable-HTTP client holds no connection between
+/// calls, so the only honest signal is when it last spoke. Every agent-side
+/// project access goes through `lock_agent`, which makes that the one choke
+/// point worth stamping.
+static LAST_AGENT_ACTIVITY: AtomicI64 = AtomicI64::new(0);
+
+fn note_agent_activity() {
+    LAST_AGENT_ACTIVITY.store(unix_now(), Ordering::Relaxed);
+}
+
+/// Seconds since an agent last spoke, or `None` if none ever has.
+pub fn agent_last_seen_secs() -> Option<i64> {
+    let at = LAST_AGENT_ACTIVITY.load(Ordering::Relaxed);
+    (at > 0).then(|| (unix_now() - at).max(0))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Run a blocking (ffmpeg) job on the blocking thread pool and await it, so a
@@ -1872,6 +2080,19 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
 }
 
+/// The tool router, built once for the life of the process.
+///
+/// `#[tool_handler]`'s default router expression is `Self::tool_router()`, and
+/// the generated `call_tool`, `list_tools` and `get_tool` each evaluate it — so
+/// every request rebuilds all ~85 routes: a schema-cache lookup, a boxed
+/// handler and a map insert apiece, ~250 µs of release-build work per tool call
+/// that produces the identical router every time. The routes are fixed at
+/// compile time, so build them once and hand out a borrow.
+fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
+    static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
+    ROUTER.get_or_init(KerfMcp::tool_router)
+}
+
 /// How the server introduces itself to clients. `ServerInfo::default()` fills
 /// `server_info` in from *rmcp's* own build env, so an untouched default has
 /// every client listing this server as "rmcp".
@@ -1879,9 +2100,12 @@ fn server_identity() -> Implementation {
     Implementation::new("kerf", env!("CARGO_PKG_VERSION"))
 }
 
-#[tool_handler]
+#[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
     fn get_info(&self) -> ServerInfo {
+        // `initialize` is the one moment we know an agent is on the other end
+        // of the socket, so it counts as being seen even before it calls a tool.
+        note_agent_activity();
         let mut info = ServerInfo::default();
         info.server_info = server_identity();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -1889,7 +2113,8 @@ impl ServerHandler for KerfMcp {
             "Kerf MCP server. The user queues editing tasks in the desktop app; \
              call claim_next_task to take the oldest one (or list_tasks to see \
              the whole queue). To work a task, inspect loaded media with \
-             list_assets / get_asset_metadata / get_timeline_state, run \
+             list_assets / get_asset_metadata / get_timeline_state (import_asset \
+             loads a file the user has not added yet), run \
              analyze_asset to populate silence / scene / transcript / loudness \
              (EBU R128 LUFS) / onset / tempo (BPM + beat grid) / speech-vs-music \
              metadata. \
@@ -2077,8 +2302,29 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Optio
     }
 }
 
+/// Map a core error onto the MCP error the model should act on.
+///
+/// A stale id, an out-of-range value or an operation that doesn't fit the
+/// current state is the *caller's* mistake, and saying so as `invalid_params`
+/// is what tells the model to fix its arguments and retry. Reported as
+/// `internal_error` — the old blanket mapping — a mistyped uuid reads as a
+/// broken server, which an agent has no move against but giving up.
 fn core_err(e: kerf_core::Error) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+    use kerf_core::Error as E;
+    match e {
+        E::AssetNotFound(_)
+        | E::ClipNotFound(_)
+        | E::TrackNotFound(_)
+        | E::OverlayNotFound(_)
+        | E::RevisionNotFound(_)
+        | E::TaskNotFound(_)
+        | E::InvalidArgument(_)
+        | E::NoStagedEdit
+        | E::StagedEditPending
+        | E::StagedEditStale => McpError::invalid_params(e.to_string(), None),
+        // A database, io, ffmpeg or engine failure is ours, not the caller's.
+        other => McpError::internal_error(other.to_string(), None),
+    }
 }
 
 /// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
@@ -2087,6 +2333,29 @@ fn core_err(e: kerf_core::Error) -> McpError {
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
     CallToolResult::success(vec![ContentBlock::text(caption), ContentBlock::image(b64, "image/jpeg")])
+}
+
+/// The spans of a track that render nothing: the hole before the first clip and
+/// every hole between clips. Clips are not held in start order, so this walks a
+/// sorted copy of their spans, and it tolerates overlap by carrying the furthest
+/// end reached rather than the previous clip's. A hole under a millisecond is
+/// float noise from a retrim, not a gap.
+fn track_gaps(track: &kerf_core::Track) -> Vec<Gap> {
+    const EPSILON: f64 = 1e-3;
+    let mut spans: Vec<(f64, f64)> = track.clips.iter().map(|c| (c.timeline_start, c.timeline_end())).collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut gaps = Vec::new();
+    let mut cursor = 0.0f64;
+    for (start, end) in spans {
+        if start - cursor > EPSILON {
+            gaps.push(Gap {
+                start_secs: cursor,
+                end_secs: start,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    gaps
 }
 
 /// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
@@ -2105,7 +2374,7 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, fmt_ts, image_result, server_identity, KerfMcp};
+    use super::{allowed_hosts, core_err, fmt_ts, image_result, router, server_identity, track_gaps};
 
     #[test]
     fn fmt_ts_carries_at_minute_boundaries() {
@@ -2125,7 +2394,7 @@ mod tests {
     /// surface is generated.
     #[test]
     fn every_tool_has_a_description_and_object_schema() {
-        let tools = KerfMcp::tool_router().list_all();
+        let tools = router().list_all();
         assert!(tools.len() > 50, "expected the full tool surface, got {}", tools.len());
 
         for tool in &tools {
@@ -2145,7 +2414,7 @@ mod tests {
     /// requiring them would break that contract without failing to compile.
     #[test]
     fn optional_parameters_are_not_required() {
-        let tools = KerfMcp::tool_router().list_all();
+        let tools = router().list_all();
         let add_clip = tools
             .iter()
             .find(|t| t.name == "add_clip_to_timeline")
@@ -2255,5 +2524,121 @@ mod tests {
         assert!(!data.starts_with("data:"), "must be bare base64, not a data: URL");
 
         assert_eq!(value["isError"], false);
+    }
+
+    /// `timeline_summary` promises the agent "any per-track gaps", and a gap is
+    /// a real defect in a cut — the picture goes black there. The head of the
+    /// track counts: a cut that opens two seconds late opens on black.
+    #[test]
+    fn track_gaps_finds_holes_including_the_one_at_the_head() {
+        use kerf_core::{Clip, StreamKind, Track};
+        let asset = uuid::Uuid::new_v4();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        // Deliberately out of start order — clips are not stored sorted.
+        track.clips.push(Clip::new(asset, 0.0, 1.0, 6.0));
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 2.0));
+
+        let gaps = track_gaps(&track);
+        assert_eq!(gaps.len(), 2, "head gap + the hole between the clips");
+        assert_eq!((gaps[0].start_secs, gaps[0].end_secs), (0.0, 2.0));
+        assert_eq!((gaps[1].start_secs, gaps[1].end_secs), (4.0, 6.0));
+    }
+
+    /// A gapless track reports nothing, and float noise from a retrim is not a
+    /// gap — otherwise every summary would be a wall of sub-millisecond holes.
+    #[test]
+    fn track_gaps_ignores_a_gapless_track_and_float_noise() {
+        use kerf_core::{Clip, StreamKind, Track};
+        let asset = uuid::Uuid::new_v4();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 0.0));
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 2.000_04));
+        assert!(
+            track_gaps(&track).is_empty(),
+            "40 microseconds of drift is not a gap, got {:?}",
+            track_gaps(&track).len()
+        );
+
+        // An overlap must not be read as a gap by the clip that follows it.
+        let mut overlapping = Track::new(StreamKind::Video, "V1");
+        overlapping.clips.push(Clip::new(asset, 0.0, 5.0, 0.0));
+        overlapping.clips.push(Clip::new(asset, 0.0, 1.0, 1.0));
+        assert!(track_gaps(&overlapping).is_empty());
+    }
+
+    /// A stale id or an out-of-range value is the caller's mistake, and the
+    /// model can only act on that if it is told so: `invalid_params` means "fix
+    /// the arguments", `internal_error` means "the server is broken".
+    #[test]
+    fn caller_mistakes_are_reported_as_invalid_params() {
+        use rmcp::model::ErrorCode;
+        let id = uuid::Uuid::new_v4();
+        for e in [
+            kerf_core::Error::ClipNotFound(id),
+            kerf_core::Error::AssetNotFound(id),
+            kerf_core::Error::TrackNotFound(id),
+            kerf_core::Error::InvalidArgument("marker time must be >= 0".to_string()),
+            kerf_core::Error::StagedEditStale,
+        ] {
+            let rendered = e.to_string();
+            assert_eq!(core_err(e).code, ErrorCode::INVALID_PARAMS, "{rendered}");
+        }
+        // Ours, not theirs.
+        assert_eq!(
+            core_err(kerf_core::Error::Engine("ffmpeg exited 1".to_string())).code,
+            ErrorCode::INTERNAL_ERROR
+        );
+    }
+
+    /// The router is fixed at compile time but the `#[tool_handler]` default
+    /// rebuilds it per request. This pins that it is built once — a regression
+    /// here is invisible except as latency on every single tool call.
+    #[test]
+    fn the_tool_router_is_built_once() {
+        assert!(std::ptr::eq(router(), router()));
+    }
+
+    /// `export` takes a `RequestContext` alongside its `Parameters` so it can
+    /// report progress and honour cancellation. That second argument must stay
+    /// out of the *input schema* — a context extractor leaking in would ask the
+    /// model to invent a request context, and the tool would be uncallable.
+    #[test]
+    fn the_context_extractor_stays_out_of_the_export_schema() {
+        let tools = router().list_all();
+        let export = tools.iter().find(|t| t.name == "export").expect("export is registered");
+
+        let properties = export
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("input schema has properties");
+        assert!(properties.contains_key("output_path"), "{properties:?}");
+        assert!(properties.contains_key("options"), "{properties:?}");
+        assert_eq!(properties.len(), 2, "only the declared params belong here: {properties:?}");
+
+        let required: Vec<&str> = export
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, ["output_path"], "options is optional");
+    }
+
+    /// An agent with no way to load media can only rearrange what it was handed.
+    #[test]
+    fn media_can_be_imported_over_mcp() {
+        let tools = router().list_all();
+        let import = tools
+            .iter()
+            .find(|t| t.name == "import_asset")
+            .expect("import_asset is registered");
+        let required: Vec<&str> = import
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, ["path"]);
     }
 }

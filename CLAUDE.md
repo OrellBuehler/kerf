@@ -218,6 +218,13 @@ transcript tab and an agent both read it to explain an empty transcript.
 `analyze_asset_media_with_progress` streams a per-step `AnalysisProgress`
 (`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
 transcription runs **last** so the markers land before minutes of inference.
+**A pass is abandonable** (`analyze_asset_media_cancellable` / `analyze_cancellable`,
+a `CancelFn` alongside the `ProgressFn`): the check lands between steps *and* inside
+transcription — the ffmpeg `whisper` run polls it about once a second off
+`-stats_period 1` and kills the child, and the model download polls it per chunk,
+keeping the `.part` file so the next attempt resumes rather than re-fetching 148 MB.
+A cancelled pass returns `Error::Cancelled` and caches **nothing**: a half-analyzed
+asset would read as analyzed, and its missing transcript as "no speech".
 
 Two more optional features: `libav-render` (above) and `whisper` (in-process
 `whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time). Both are
@@ -446,8 +453,10 @@ no editing logic in the adapter.
   re-decoding the whole file), `WhisperFilterTranscriber` (the ffmpeg `whisper`
   filter, always compiled) and
   `WhisperTranscriber` (in-process, `whisper` feature); `NullAnalyzer` is still the
-  fallback. `Transcriber::transcribe` takes a `ProgressFn` — alone among the
-  providers, because it can download a model and then run for minutes.
+  fallback. `Transcriber::transcribe` takes a `ProgressFn` *and* a `CancelFn` —
+  alone among the providers, because it can download a model and then run for
+  minutes, which is both the only step worth reporting on and the only one worth
+  being able to give up on.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
@@ -467,7 +476,13 @@ It is spawned from `lib.rs`'s Tauri `.setup` hook on
 `tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
 hold, so the agent edits the project the user has open. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
-`tool_router` field on the struct** (the macro calls `Self::tool_router()`).
+`tool_router` field on the struct** (the macro would call `Self::tool_router()`).
+That default is also the reason for the `router()` `OnceLock`: the generated
+`call_tool` / `list_tools` / `get_tool` each *evaluate* the router expression, so
+`Self::tool_router()` rebuilds all ~85 routes — a schema lookup, a boxed handler
+and a map insert apiece, ~250 µs of release-build work — on **every request**.
+The routes are fixed at compile time, so it is built once and
+`#[tool_handler(router = router())]` hands out a borrow.
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
@@ -479,13 +494,31 @@ parts) and `preview_timeline` (the composited cut at a timeline time) — return
 `Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). The `lock()`
 helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
-helper sets `User` the same way); every **mutating** tool calls `self.changed()`, which
-emits a `project-changed` Tauri event so the webview re-fetches and the edit shows up
-live in the GUI. Because agent edits **stage**, "live in the GUI" now means the
+helper sets `User` the same way); every **mutating** tool goes through the `edit()`
+helper, which runs the op under the lock, **releases it**, and only then emits a
+`project-changed` Tauri event so the webview re-fetches and the edit shows up
+live in the GUI — that order matters, because the re-fetch the event triggers
+takes the same lock. `set_speech_model` emits `speech-model-changed` instead,
+which the webview listens for to re-read the transcription status: it reads that
+once at launch, and `project-changed` would re-fetch the timeline, history and
+task queue, none of which moved. Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
-`timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
+`timeline_summary` carries `staged_changes` so it cannot mistake one for the other,
+and a per-track `gaps` list — a hole between clips (or before the first one) is
+black picture, which is the kind of defect an agent has to be *told* about since
+it never watches the cut. `core_err` splits the caller's mistakes (a stale id, an
+out-of-range value, a stale staged edit) out as `invalid_params`: reported as
+`internal_error`, a mistyped uuid reads to a model as a broken server rather than
+as something it can fix and retry. Sizes an agent picks out of a schema
+description — `get_waveform`/`get_energy` buckets, `get_frame`/`preview_timeline`
+widths — are clamped rather than trusted, the way `skim_asset` already clamps its
+grid. `set_speech_model` is the write side of `transcription_status`
+(`download_speech_model` only fills the cache; transcription uses whichever model
+is *selected*, so downloading without selecting was a silent no-op) — it makes
+both writes the GUI picker makes, though the picker itself only re-reads at
+launch, so a model an agent selects shows there on the next start.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `generate_captions` / `clear_captions` caption the
@@ -496,6 +529,17 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
+`import_asset` is the one write that does **not** stage — a file on disk is not
+an edit to the user's cut, so imported media (and its background proxy) lands for
+them immediately, reporting on the same `import-progress` event a lens-pair
+stitch drives for the GUI. `export` takes rmcp's `RequestContext` beside its
+`Parameters`: a render runs for minutes, so it forwards ffmpeg's progress to the
+client's `progressToken` and passes `context.ct` as the cancel callback, deleting
+the half-written file on cancel the way the GUI's export does. Progress goes
+through an unbounded channel to a spawned forwarder because the render itself is
+on the blocking pool and `notify_progress` is async; the forwarder drains the
+channel even with no token, so a client that asked for no progress doesn't leave
+ticks piling up.
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
@@ -546,8 +590,16 @@ agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), the agent's staged proposal
 (`get_staged_edit` → the `StagedEdit` *with its diff*, so the review card renders
 from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit` /
-`discard_staged_edit`) and `revision_diff`, and `export_timeline` (emits
-`export-progress` events) / `cancel_export`. **No command runs on the main thread** (a plain sync
+`discard_staged_edit`) and `revision_diff`, `export_timeline` (emits
+`export-progress` events) / `cancel_export`, `cancel_analysis` (the same shape,
+for the analysis pass — importing ten clips must not be an unbreakable
+commitment to ten transcriptions) and `agent_status` (the MCP endpoint plus how
+many seconds ago an agent last spoke to it, or `null` if none ever has —
+`mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
+`initialize` is the one moment an agent is known to be there; a
+streamable-HTTP client holds no connection between calls, so there is no socket
+to report and the panel judges from the age instead of the green dot it used to
+show unconditionally). **No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
@@ -638,7 +690,11 @@ The editor UI is implemented from the **Kerf design system** (claude.ai/design):
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
 `Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
-`routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
+`routes/+page.svelte`. The `Inspector` (right panel) is **mounted whether or not a
+clip is selected** and toggled from the toolbar (`ui.inspectorOpen`): its Text
+overlays section belongs to the timeline rather than to any one clip, so gating the
+whole panel on a selection made titles and captions unreachable until you clicked a
+clip. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
@@ -762,7 +818,11 @@ from the playhead rather than playing it out in slow motion against the sound.
 playback moves under `bun run dev` and that failure mode is reproducible without a
 desktop build. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
-loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
+loudness normalize, and a **Range: In → out** choice when marks are set. It **opens on
+the frame the project is cut for** (`initialExport`): the preset whose resolution is
+that frame when one matches, else the default preset with its resolution cleared so
+"Project frame" renders — otherwise a 9:16 project opened its export already
+landscape and the readiness panel warned about the shape the user had just chosen. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
@@ -798,6 +858,20 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+Every toast is also a **notification log** entry (`src/lib/notifications.svelte.ts`,
+a fourth runes singleton). Components import `toast` from *there* rather than from
+`svelte-sonner` — a drop-in wrapper, so no call site changed — because a toast is
+gone in four seconds, which is fine for "Clip copied" and useless for the model
+download that failed with a reason worth reading. The title bar's bell opens
+`NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
+read, clear) and badges the unread count, red when anything unread actually failed.
+Errors and warnings also linger longer on screen than sonner's default. The log is
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
+since an hour later it would undo whatever the newest revision is, not the edit the
+notice was about. It is also why the failure paths that used to reject into nothing
+(`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
+calls) now report: a notice that is never raised cannot be recovered from a log.
+
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
 alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp`, and drives
@@ -824,11 +898,21 @@ keeps its placeholder). This browser sample is a **dev harness only** — the de
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
-(`export const ui` — chrome state, playhead/zoom/playback, and `runAnalysis` which runs real
-analysis and toggles the `analyzing` flag). There is **no scripted demo phase machine**: the
+(`export const ui` — chrome state, playhead/zoom/playback, and `analyzeQueue` /
+`runAnalysis` / `stopAnalysis`: a batch analyzes **one asset at a time** — each pass is
+ffmpeg-bound, so running them together only makes each slower — and stopping drops
+the whole rest of the queue). There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
-duration, and `Preview` shows the decoded frame or a "No media loaded" placeholder.
+duration (plus the analysis step, what is still queued behind it and a **Stop**), and
+`Preview` shows the decoded frame or a "No media loaded" placeholder.
+**Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
+`onDragDropEvent`, filters by `isMediaPath` — the same extension list the picker
+filters by, so a dropped folder of mixed files doesn't answer with one error per
+README — and runs the same `editor.importPaths` the picker resolves to), which is
+what the bin's "Drop media to start" had been promising. `editor.error` renders as a
+dismissible banner under the toolbar: it was recorded and never shown, so a `.kerf`
+that would not open opened as silence.
 
 ## Conventions
 

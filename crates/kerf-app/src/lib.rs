@@ -33,6 +33,11 @@ struct AppState {
     /// Set by `cancel_export` and polled by the in-flight export; lives outside
     /// the project lock so a cancel lands even while a render holds it.
     export_cancel: Arc<AtomicBool>,
+    /// Same, for the in-flight analysis pass. Analysis downloads a speech model
+    /// and then transcribes for minutes, so it has to be abandonable — and the
+    /// GUI runs imported assets through it one after another, which is a long
+    /// commitment to make on the user's behalf without an exit.
+    analysis_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -192,11 +197,25 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
 /// Progress of a slow import (an Insta360 lens pair being stitched), tagged with
 /// the file the user picked so the UI can label it while several import at once.
 #[derive(Clone, serde::Serialize)]
-struct ImportProgress {
+pub(crate) struct ImportProgress {
     path: String,
     fraction: f64,
     elapsed_secs: f64,
     eta_secs: Option<f64>,
+}
+
+impl ImportProgress {
+    /// Tag a render-progress tick with the file it belongs to. Shared with the
+    /// MCP `import_asset` tool so an agent's import reports on the same event
+    /// and drives the same overlay the user's own import does.
+    pub(crate) fn new(path: &str, p: kerf_core::ExportProgress) -> Self {
+        Self {
+            path: path.to_string(),
+            fraction: p.fraction,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: p.eta_secs,
+        }
+    }
 }
 
 #[tauri::command]
@@ -207,15 +226,7 @@ async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) 
         // parallel imports really run in parallel and a multi-minute stitch never
         // freezes the GUI or the agent — then take it only for the quick insert.
         let mut on_progress = |p: kerf_core::ExportProgress| {
-            let _ = app.emit(
-                "import-progress",
-                ImportProgress {
-                    path: path.clone(),
-                    fraction: p.fraction,
-                    elapsed_secs: p.elapsed_secs,
-                    eta_secs: p.eta_secs,
-                },
-            );
+            let _ = app.emit("import-progress", ImportProgress::new(&path, p));
         };
         let asset = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(|e| e.to_string())?;
         // Importing the pair's other lens (or the same file twice) resolves to
@@ -308,6 +319,9 @@ struct AnalysisProgressEvent {
 async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
+    // Fresh cancel flag for this pass; `cancel_analysis` flips it from the UI.
+    let cancel = state.analysis_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
     blocking(move || {
         // Resolve the asset under the lock, run the multi-second ffmpeg analysis
         // with the lock released, then re-acquire it only to cache the result —
@@ -327,7 +341,15 @@ async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Str
                 },
             );
         };
-        let analysis = kerf_core::analyze_asset_media_with_progress(&asset, &mut on_progress).map_err(|e| e.to_string())?;
+        let analysis = kerf_core::analyze_asset_media_cancellable(&asset, &mut on_progress, &|| cancel.load(Ordering::SeqCst))
+            .map_err(|e| match e {
+                // A cancel is the user's own doing, not a failure — the
+                // caller keys off this string to stay quiet about it.
+                kerf_core::Error::Cancelled => ANALYSIS_CANCELLED.to_string(),
+                other => other.to_string(),
+            })?;
+        // Nothing is cached for a cancelled pass: a half-analyzed asset would
+        // read as analyzed, and the missing transcript as "no speech".
         lock_user(&shared).set_analysis(&analysis).map_err(|e| e.to_string())?;
         Ok(analysis)
     })
@@ -337,7 +359,7 @@ async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Str
 // ---- speech-to-text -------------------------------------------------------
 
 /// The project-meta key holding the user's speech-model choice.
-const SPEECH_MODEL_KEY: &str = "speech_model";
+pub(crate) const SPEECH_MODEL_KEY: &str = "speech_model";
 
 /// Which transcription backend this build will use, and whether its model is
 /// already downloaded. The transcript tab reads this to explain an empty
@@ -1432,6 +1454,18 @@ fn reveal_path(app: AppHandle, path: String) -> CmdResult<()> {
         .map_err(|e| e.to_string())
 }
 
+/// The error an abandoned analysis pass returns. The webview matches on it to
+/// tell "the user stopped this" apart from "this broke".
+const ANALYSIS_CANCELLED: &str = "analysis cancelled";
+
+/// Request cancellation of the in-flight analysis pass (if any). The running
+/// [`analyze_asset`] observes the flag between steps — and, during
+/// transcription, about once a second — then gives up and caches nothing.
+#[tauri::command(async)]
+fn cancel_analysis(state: State<'_, AppState>) {
+    state.analysis_cancel.store(true, Ordering::SeqCst);
+}
+
 /// Request cancellation of the in-flight export (if any). The running
 /// [`export_timeline`] observes the flag on its next progress poll, stops
 /// ffmpeg, and returns the `"export cancelled"` error.
@@ -1448,6 +1482,27 @@ fn cancel_export(state: State<'_, AppState>) {
 #[tauri::command(async)]
 fn mcp_endpoint() -> String {
     mcp::endpoint_url()
+}
+
+/// Where the endpoint is, and how long ago an agent last used it.
+///
+/// A streamable-HTTP client holds no connection between calls, so there is no
+/// "is it plugged in" to report — `last_seen_secs` is `None` until something
+/// has spoken to the endpoint at all, and the panel decides from its age
+/// whether to call that connected. Anything else would be the green dot the
+/// panel used to show whether or not an agent existed.
+#[derive(Serialize)]
+struct AgentStatus {
+    endpoint: String,
+    last_seen_secs: Option<i64>,
+}
+
+#[tauri::command(async)]
+fn agent_status() -> AgentStatus {
+    AgentStatus {
+        endpoint: mcp::endpoint_url(),
+        last_seen_secs: mcp::agent_last_seen_secs(),
+    }
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
@@ -1564,6 +1619,7 @@ pub fn run() {
         .manage(AppState {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
+            analysis_cancel: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
             // Logging needs the resolved platform log directory, so set it up here
@@ -1679,11 +1735,13 @@ pub fn run() {
             hw_encoders,
             export_timeline,
             cancel_export,
+            cancel_analysis,
             export_cover,
             platform_targets,
             platform_check,
             reveal_path,
             mcp_endpoint,
+            agent_status,
             log_dir,
             reveal_logs
         ])

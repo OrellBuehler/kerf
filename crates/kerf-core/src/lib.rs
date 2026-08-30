@@ -17,9 +17,10 @@ mod engine;
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analyze, analyze_asset_media, analyze_asset_media_with_progress, analyze_with_progress, transcription_status,
-    AnalysisProgress, AnalysisProviders, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
-    ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
+    analyze, analyze_asset_media, analyze_asset_media_cancellable, analyze_asset_media_with_progress, analyze_cancellable,
+    analyze_with_progress, transcription_status, AnalysisProgress, AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer,
+    FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector,
+    Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
 pub use engine::{
     download_speech_model, export_still, generate_proxy, hw_encoders, insta360_pair, proxy_path, proxy_width, render_with,

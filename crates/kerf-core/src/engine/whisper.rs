@@ -209,7 +209,11 @@ impl DownloadProgress {
 ///
 /// A user-supplied path is never fetched — if it is missing that is a
 /// configuration error, not something to paper over with a different model.
-pub fn ensure_model(progress: &mut dyn FnMut(DownloadProgress)) -> Result<PathBuf> {
+/// `cancel` is polled while downloading: a model is hundreds of megabytes, and
+/// without this, asking analysis to stop meant waiting out a fetch it had
+/// already started. The partial `.part` file is deliberately *kept* on a
+/// cancel, so the next attempt resumes it.
+pub fn ensure_model(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
     match configured_model() {
         ModelChoice::File(p) => {
             if p.is_file() {
@@ -221,7 +225,7 @@ pub fn ensure_model(progress: &mut dyn FnMut(DownloadProgress)) -> Result<PathBu
                 )))
             }
         }
-        ModelChoice::Named(name) => download_model(&name, progress),
+        ModelChoice::Named(name) => download_model_cancellable(&name, progress, cancel),
     }
 }
 
@@ -233,6 +237,15 @@ pub fn ensure_model(progress: &mut dyn FnMut(DownloadProgress)) -> Result<PathBu
 /// leftover `.part` is resumed with a range request rather than restarted —
 /// these are hundreds of megabytes.
 pub fn download_model(name: &str, progress: &mut dyn FnMut(DownloadProgress)) -> Result<PathBuf> {
+    download_model_cancellable(name, progress, &|| false)
+}
+
+/// [`download_model`], polling `cancel` as it streams.
+pub fn download_model_cancellable(
+    name: &str,
+    progress: &mut dyn FnMut(DownloadProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
     if model_info(name).is_none() {
         return Err(Error::Engine(format!(
             "unknown speech model '{name}'; expected one of: {}",
@@ -251,8 +264,13 @@ pub fn download_model(name: &str, progress: &mut dyn FnMut(DownloadProgress)) ->
     let tmp = dst.with_extension(format!("{}.part", std::process::id()));
     let url = model_url(name);
     tracing::info!(model = name, %url, "downloading speech model");
-    stream_to_file(&url, &tmp, progress).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
+    // A cancel keeps the `.part` file: it is a valid prefix of the model, and
+    // the next attempt resumes it with a range request. Any other failure is a
+    // file we can't trust, so it goes.
+    stream_to_file(&url, &tmp, progress, cancel).inspect_err(|e| {
+        if !matches!(e, Error::Cancelled) {
+            let _ = std::fs::remove_file(&tmp);
+        }
     })?;
 
     // A model that isn't one (an HTML error page, a truncated CDN response)
@@ -271,7 +289,7 @@ pub fn download_model(name: &str, progress: &mut dyn FnMut(DownloadProgress)) ->
 }
 
 /// Stream `url` into `tmp`, resuming a partial file when one is there.
-fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress)) -> Result<()> {
+fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<()> {
     let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
     // A connect timeout but no global one: reaching the host should fail fast
     // (a firewalled or DNS-blackholed mirror otherwise stalls for minutes before
@@ -312,6 +330,12 @@ fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgre
     progress(DownloadProgress { downloaded, total });
     let mut last_report = downloaded;
     loop {
+        if cancel() {
+            // Flush what we have so the `.part` file is a usable prefix to
+            // resume from rather than however much happened to reach the OS.
+            let _ = file.flush();
+            return Err(Error::Cancelled);
+        }
         let n = reader
             .read(&mut buf)
             .map_err(|e| Error::Engine(format!("speech model download failed: {e}")))?;
@@ -449,6 +473,7 @@ pub fn transcribe(
     language: Option<&str>,
     duration: f64,
     progress: &mut dyn FnMut(f64),
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<TranscriptSegment>> {
     let model_dir = model
         .parent()
@@ -502,8 +527,17 @@ pub fn transcribe(
     });
 
     let stdout = child.stdout.take().expect("stdout piped");
+    // `-stats_period 1` makes ffmpeg write a progress block every second, so the
+    // cancel is polled about that often — inference on a long take runs for
+    // minutes and is the one wait worth being able to abandon.
+    let mut cancelled = false;
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
+        if cancel() {
+            cancelled = true;
+            let _ = child.kill();
+            break;
+        }
         if line == "progress=end" {
             break;
         }
@@ -516,6 +550,9 @@ pub fn transcribe(
 
     let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
     if !status.success() {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
         tail.reverse();
@@ -771,13 +808,47 @@ mod tests {
         let _cleanup = TempFile(tmp.clone());
 
         let mut seen = Vec::new();
-        stream_to_file(&url, &tmp, &mut |p| seen.push(p)).expect("download");
+        stream_to_file(&url, &tmp, &mut |p| seen.push(p), &|| false).expect("download");
 
         assert_eq!(std::fs::read(&tmp).expect("read"), body);
         verify_ggml(&tmp).expect("magic");
         assert_eq!(seen.last().expect("progress").fraction(), Some(1.0));
         // Intermediate reports, not just the bookends.
         assert!(seen.len() > 2, "expected streaming progress, got {seen:?}");
+    }
+
+    /// Cancelling mid-download has to leave something worth resuming: the whole
+    /// point of abandoning a 148 MB fetch is not paying for it twice.
+    #[test]
+    fn a_cancelled_download_keeps_a_resumable_part_file() {
+        let body = fake_model(3 * 1024 * 1024);
+        let url = spawn_server(body.clone(), true, 0);
+        let tmp = temp_path("cancel");
+        let _cleanup = TempFile(tmp.clone());
+
+        // Cancel as soon as the first megabyte has been reported.
+        let mut seen = 0u64;
+        let cancelled = std::cell::Cell::new(false);
+        let err = stream_to_file(
+            &url,
+            &tmp,
+            &mut |p| {
+                seen = p.downloaded;
+                if seen > 0 {
+                    cancelled.set(true);
+                }
+            },
+            &|| cancelled.get(),
+        )
+        .expect_err("cancelled");
+
+        assert!(matches!(err, Error::Cancelled), "expected Cancelled, got {err:?}");
+        let on_disk = std::fs::metadata(&tmp).expect("part file").len();
+        assert!(
+            on_disk > 0 && on_disk < body.len() as u64,
+            "expected a partial file, got {on_disk}"
+        );
+        assert_eq!(std::fs::read(&tmp).expect("read"), body[..on_disk as usize]);
     }
 
     #[test]
@@ -790,9 +861,14 @@ mod tests {
         std::fs::write(&tmp, &body[..body.len() / 2]).expect("seed");
 
         let mut first = None;
-        stream_to_file(&url, &tmp, &mut |p| {
-            first.get_or_insert(p);
-        })
+        stream_to_file(
+            &url,
+            &tmp,
+            &mut |p| {
+                first.get_or_insert(p);
+            },
+            &|| false,
+        )
         .expect("resume");
 
         assert_eq!(std::fs::read(&tmp).expect("read"), body);
@@ -812,7 +888,7 @@ mod tests {
         // Stale bytes that must not be prepended to the fresh 200 response.
         std::fs::write(&tmp, vec![0xffu8; 4096]).expect("seed");
 
-        stream_to_file(&url, &tmp, &mut |_| {}).expect("download");
+        stream_to_file(&url, &tmp, &mut |_| {}, &|| false).expect("download");
         assert_eq!(std::fs::read(&tmp).expect("read"), body);
     }
 
@@ -823,7 +899,7 @@ mod tests {
         let tmp = temp_path("short");
         let _cleanup = TempFile(tmp.clone());
 
-        assert!(stream_to_file(&url, &tmp, &mut |_| {}).is_err());
+        assert!(stream_to_file(&url, &tmp, &mut |_| {}, &|| false).is_err());
     }
 
     #[test]

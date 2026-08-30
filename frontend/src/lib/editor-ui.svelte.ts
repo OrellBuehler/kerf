@@ -4,8 +4,9 @@
    in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
-import { downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
+import { cancelAnalysis, downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
 import { audio } from './audio';
+import { toast } from './notifications.svelte';
 import type { AnalysisProgress, TranscriptionStatus } from './types';
 
 export type Tool = 'pointer' | 'razor';
@@ -14,6 +15,12 @@ class EditorUi {
 	tool = $state<Tool>('pointer');
 	snap = $state(true);
 	agentOpen = $state(true);
+	/** Whether the Inspector panel is shown. It carries the whole text-overlay
+	 *  and caption surface, which belongs to the timeline rather than to any one
+	 *  clip, so the panel is not gated on a selection — it explains itself when
+	 *  nothing is selected and is closed from the toolbar when the width is
+	 *  wanted elsewhere. */
+	inspectorOpen = $state(true);
 	/** Draw the delivery safe areas over the preview. Only has an effect while
 	 *  the project is cut for a delivery frame; a 16:9 web export has no chrome
 	 *  to stay clear of. */
@@ -36,6 +43,11 @@ class EditorUi {
 	downloadingModel = $state<string | null>(null);
 	/** 0..1 for that download. */
 	modelFraction = $state(0);
+	/** How many assets are still queued behind the one being analyzed, so the
+	 *  UI can say "2 of 5" rather than spin at an unknown length. */
+	analysisQueued = $state(0);
+	/** Set while a stop has been asked for but the pass hasn't given up yet. */
+	stoppingAnalysis = $state(false);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
@@ -117,6 +129,12 @@ class EditorUi {
 		try {
 			await downloadSpeechModel(name);
 			await this.loadTranscriptionStatus();
+		} catch (e) {
+			// A few hundred megabytes over someone else's CDN fails often enough
+			// to be routine — offline, a proxy, a half-written cache file. It used
+			// to reject into nothing, so the download simply stopped looking like
+			// it was happening.
+			toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
 		} finally {
 			this.downloadingModel = null;
 			this.modelFraction = 0;
@@ -124,8 +142,8 @@ class EditorUi {
 	}
 
 	/** Analyze an asset, flagging `analyzing` while kerf-core works and following
-	 *  the streamed step reports. */
-	async runAnalysis(assetId: string) {
+	 *  the streamed step reports. Resolves false when the pass was stopped. */
+	async runAnalysis(assetId: string): Promise<boolean> {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
@@ -133,11 +151,48 @@ class EditorUi {
 			await editor.analyze(assetId);
 			// Transcription may have downloaded a model on the way.
 			if (this.transcription && !this.transcription.model_ready) await this.loadTranscriptionStatus();
+			return true;
+		} catch (e) {
+			// A stop is the user's own doing, not a failure to report.
+			if (isCancelled(e)) return false;
+			throw e;
 		} finally {
 			this.analyzing = false;
 			this.analyzingId = null;
 			this.analysisStage = null;
+			this.stoppingAnalysis = false;
 		}
+	}
+
+	/** Analyze a batch one at a time — each pass is ffmpeg-bound, so running
+	 *  them together would only make every one of them slower. Stopping drops
+	 *  the whole rest of the queue: importing ten clips must not be a
+	 *  commitment to ten transcriptions. */
+	async analyzeQueue(assetIds: string[]) {
+		for (let i = 0; i < assetIds.length; i++) {
+			this.analysisQueued = assetIds.length - i - 1;
+			try {
+				if (!(await this.runAnalysis(assetIds[i]))) break;
+			} catch (e) {
+				// One unanalyzable file shouldn't abandon the rest of the import;
+				// its media is already in the bin either way. Say so, though —
+				// swallowed, a failed transcription reads as one that found no
+				// speech.
+				const name = editor.assets.find((a) => a.id === assetIds[i])?.name ?? 'that clip';
+				toast.error(`Couldn't analyze ${name} — ${message(e)}`);
+			}
+		}
+		this.analysisQueued = 0;
+	}
+
+	/** Ask the running analysis pass to give up. It stops between steps, and
+	 *  within about a second during transcription — the step long enough for
+	 *  the wait to matter. */
+	stopAnalysis() {
+		if (!this.analyzing) return;
+		this.stoppingAnalysis = true;
+		this.analysisQueued = 0;
+		void cancelAnalysis();
 	}
 
 	// ---- playback ----------------------------------------------------------
@@ -238,6 +293,17 @@ class EditorUi {
 			audio.stop();
 		}
 	}
+}
+
+/** The readable part of whatever the backend rejected with. */
+function message(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+/** Whether a rejected analysis was cancelled rather than broken. The backend
+ *  reports a stop as an ordinary error string; this is the one it uses. */
+function isCancelled(e: unknown): boolean {
+	return String(e instanceof Error ? e.message : e).includes('analysis cancelled');
 }
 
 export const ui = new EditorUi();

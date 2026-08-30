@@ -1,11 +1,11 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
-	import { mcpEndpoint } from '$lib/api';
+	import { agentStatus } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
@@ -24,9 +24,43 @@
 	let copied = $state<string | null>(null);
 	const claudeCmd = $derived(`claude mcp add --transport http kerf ${endpoint}`);
 
+	// Seconds since an agent last spoke to the endpoint, or null if none ever
+	// has. A streamable-HTTP client holds no connection between calls, so there
+	// is no socket to watch — this panel used to show a green "live" dot whether
+	// or not anything was on the other end, which is the one thing it must not
+	// say. Polled, because an agent arriving is not an event the app hears.
+	let lastSeen = $state<number | null>(null);
 	$effect(() => {
-		mcpEndpoint().then((e) => (endpoint = e)).catch(() => {});
+		let stop = false;
+		const poll = async () => {
+			try {
+				const s = await agentStatus();
+				if (stop) return;
+				endpoint = s.endpoint;
+				lastSeen = s.last_seen_secs;
+			} catch {
+				/* the endpoint is part of the app; a failed read is not worth a toast */
+			}
+		};
+		void poll();
+		const t = setInterval(() => void poll(), 5000);
+		return () => {
+			stop = true;
+			clearInterval(t);
+		};
 	});
+
+	/** An agent counts as connected while it has spoken recently. The window is
+	 *  generous because an agent thinking, or waiting on a long analyze_asset,
+	 *  is still there. */
+	const CONNECTED_WITHIN = 120;
+	const connected = $derived(lastSeen !== null && lastSeen <= CONNECTED_WITHIN);
+
+	function ago(secs: number): string {
+		if (secs < 60) return `${Math.max(1, Math.round(secs))}s ago`;
+		if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+		return `${Math.round(secs / 3600)}h ago`;
+	}
 
 	async function copy(text: string, key: string) {
 		try {
@@ -373,37 +407,57 @@
 	</div>
 
 	<div style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:16px">
-		<!-- MCP status -->
+		<!-- MCP status. What is actually knowable is when an agent last spoke to
+		     the endpoint — so that, and not a dot that means nothing. -->
 		<div
-			style="flex:none;display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:var(--radius-md);background:var(--agent-surface);border:1px solid var(--agent-border)"
+			style="flex:none;display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:var(--radius-md);background:{connected
+				? 'var(--agent-surface)'
+				: 'var(--surface-raised)'};border:1px solid {connected ? 'var(--agent-border)' : 'var(--border-default)'}"
 		>
 			<span
-				style="flex:none;width:28px;height:28px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--agent-border);display:grid;place-items:center;color:var(--agent-300)"
+				style="flex:none;width:28px;height:28px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid {connected
+					? 'var(--agent-border)'
+					: 'var(--border-default)'};display:grid;place-items:center;color:{connected ? 'var(--agent-300)' : 'var(--text-muted)'}"
 				><Icon n="plug-zap" s={15} /></span
 			>
 			<div style="flex:1;min-width:0">
 				<div style="display:flex;align-items:center;gap:6px">
-					<span style="font-size:13px;font-weight:600;color:var(--text-primary)">Connected agent</span>
+					<span style="font-size:13px;font-weight:600;color:var(--text-primary)"
+						>{connected ? 'Agent connected' : lastSeen === null ? 'No agent yet' : 'Agent idle'}</span
+					>
 					<span
-						style="font-family:var(--font-mono);font-size:9px;color:var(--agent-300);letter-spacing:.08em;border:1px solid var(--agent-border);border-radius:3px;padding:0 4px"
-						>MCP</span
+						style="font-family:var(--font-mono);font-size:9px;color:{connected
+							? 'var(--agent-300)'
+							: 'var(--text-muted)'};letter-spacing:.08em;border:1px solid {connected
+							? 'var(--agent-border)'
+							: 'var(--border-default)'};border-radius:3px;padding:0 4px">MCP</span
 					>
 				</div>
 				<div style="font-size:11px;color:var(--text-muted);margin-top:2px">
-					Claims tasks over MCP · {working ? 'working a task' : 'idle'}
+					{#if working}
+						Working a task
+					{:else if lastSeen === null}
+						Nothing has connected to this endpoint yet
+					{:else}
+						Last seen {ago(lastSeen)}
+					{/if}
 				</div>
 			</div>
 			<span
 				style="display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px;color:{working
 					? 'var(--agent-300)'
-					: 'var(--green-400)'}"
+					: connected
+						? 'var(--green-400)'
+						: 'var(--text-disabled)'}"
 			>
 				<span
 					style="width:7px;height:7px;border-radius:50%;background:{working
 						? 'var(--agent-400)'
-						: 'var(--green-500)'};box-shadow:{working ? '0 0 8px var(--agent-400)' : 'none'}"
+						: connected
+							? 'var(--green-500)'
+							: 'var(--text-disabled)'};box-shadow:{working ? '0 0 8px var(--agent-400)' : 'none'}"
 				></span>
-				{working ? 'working' : 'live'}
+				{working ? 'working' : connected ? 'live' : lastSeen === null ? 'waiting' : 'away'}
 			</span>
 		</div>
 

@@ -5,7 +5,7 @@
 //! be swapped in without touching the rest of the core.
 
 use crate::engine::whisper;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{Asset, AssetAnalysis, Loudness, Rhythm, TimeRange, TranscriptSegment};
 
 /// A step of an analysis pass, reported as it runs.
@@ -47,6 +47,18 @@ impl AnalysisProgress {
 /// A progress sink for an analysis pass.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(AnalysisProgress);
 
+/// Polled while an analysis pass runs; once it returns true the pass gives up
+/// with [`Error::Cancelled`] instead of finishing.
+///
+/// Analysis is not a few seconds of ffmpeg any more — the first transcription
+/// downloads a model and then runs inference for a good fraction of the media's
+/// duration — so it has to be abandonable. The same shape as the export's
+/// cancel callback.
+pub type CancelFn<'a> = &'a dyn Fn() -> bool;
+
+/// The no-op cancel, for callers that never abandon a pass.
+pub(crate) const NEVER_CANCEL: CancelFn<'static> = &|| false;
+
 /// Detects silent spans in an asset's audio.
 pub trait SilenceDetector: Send + Sync {
     fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>>;
@@ -62,7 +74,7 @@ pub trait SceneDetector: Send + Sync {
 /// Transcription is the one analysis step that can take minutes and, on its
 /// first run, download a model — so unlike its siblings it reports progress.
 pub trait Transcriber: Send + Sync {
-    fn transcribe(&self, asset: &Asset, progress: ProgressFn) -> Result<Vec<TranscriptSegment>>;
+    fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>>;
 }
 
 /// Measures EBU R128 loudness of an asset's audio (`None` for silent / video-only
@@ -189,8 +201,8 @@ pub struct WhisperFilterTranscriber {
 }
 
 impl Transcriber for WhisperFilterTranscriber {
-    fn transcribe(&self, asset: &Asset, progress: ProgressFn) -> Result<Vec<TranscriptSegment>> {
-        let model = whisper::ensure_model(&mut model_progress(progress))?;
+    fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
+        let model = whisper::ensure_model(&mut model_progress(progress), cancel)?;
         progress(AnalysisProgress::with_fraction("transcribe", 0.0));
         whisper::transcribe(
             std::path::Path::new(&asset.path),
@@ -198,6 +210,7 @@ impl Transcriber for WhisperFilterTranscriber {
             self.language.as_deref(),
             asset.duration,
             &mut |f| progress(AnalysisProgress::with_fraction("transcribe", f)),
+            cancel,
         )
     }
 }
@@ -214,11 +227,12 @@ pub struct WhisperTranscriber {
 
 #[cfg(feature = "whisper")]
 impl Transcriber for WhisperTranscriber {
-    fn transcribe(&self, asset: &Asset, progress: ProgressFn) -> Result<Vec<TranscriptSegment>> {
-        use crate::error::Error;
-
-        let model = whisper::ensure_model(&mut model_progress(progress))?;
+    fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
+        let model = whisper::ensure_model(&mut model_progress(progress), cancel)?;
         progress(AnalysisProgress::with_fraction("transcribe", 0.0));
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
         let samples = crate::engine::decode_audio_16k_mono(std::path::Path::new(&asset.path))?;
         let language = self.language.clone();
 
@@ -373,7 +387,7 @@ impl SceneDetector for NullAnalyzer {
 }
 
 impl Transcriber for NullAnalyzer {
-    fn transcribe(&self, _asset: &Asset, _progress: ProgressFn) -> Result<Vec<TranscriptSegment>> {
+    fn transcribe(&self, _asset: &Asset, _progress: ProgressFn, _cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
         Ok(Vec::new())
     }
 }
@@ -459,6 +473,16 @@ pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
 /// so the adapters use this variant and forward the events to the GUI / an
 /// agent; the silent wrapper above stays for callers that don't care.
 pub fn analyze_asset_media_with_progress(asset: &Asset, progress: ProgressFn) -> Result<AssetAnalysis> {
+    analyze_asset_media_cancellable(asset, progress, NEVER_CANCEL)
+}
+
+/// [`analyze_asset_media_with_progress`], abandoning the pass once `cancel`
+/// returns true.
+///
+/// The check lands between steps *and* inside transcription, which is where the
+/// wait actually is: a model download and then inference for minutes. A
+/// cancelled pass caches nothing — a half-analyzed asset would look analyzed.
+pub fn analyze_asset_media_cancellable(asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<AssetAnalysis> {
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
@@ -475,7 +499,7 @@ pub fn analyze_asset_media_with_progress(asset: &Asset, progress: ProgressFn) ->
         loudness: &loudness,
         rhythm: &rhythm,
     };
-    analyze_with_progress(asset, &providers, progress)
+    analyze_cancellable(asset, &providers, progress, cancel)
 }
 
 /// Run every configured provider and assemble an [`AssetAnalysis`].
@@ -485,19 +509,44 @@ pub fn analyze(asset: &Asset, providers: &AnalysisProviders) -> Result<AssetAnal
 
 /// [`analyze`], announcing each step to `progress` as it begins.
 pub fn analyze_with_progress(asset: &Asset, providers: &AnalysisProviders, progress: ProgressFn) -> Result<AssetAnalysis> {
+    analyze_cancellable(asset, providers, progress, NEVER_CANCEL)
+}
+
+/// [`analyze_with_progress`], checked against `cancel` before each step.
+pub fn analyze_cancellable(
+    asset: &Asset,
+    providers: &AnalysisProviders,
+    progress: ProgressFn,
+    cancel: CancelFn,
+) -> Result<AssetAnalysis> {
+    // Each step is one whole-file ffmpeg pass, so a cancel lands within one of
+    // them rather than instantly; transcription, the only step long enough for
+    // that to matter, polls the same callback itself.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if cancel() {
+                return Err(Error::Cancelled);
+            }
+        };
+    }
+    bail_if_cancelled!();
     progress(AnalysisProgress::stage("silence"));
     let silence_segments = providers.silence.detect_silence(asset)?;
+    bail_if_cancelled!();
     progress(AnalysisProgress::stage("scenes"));
     let scene_changes = providers.scene.detect_scenes(asset)?;
+    bail_if_cancelled!();
     progress(AnalysisProgress::stage("loudness"));
     let loudness = providers.loudness.measure(asset)?;
+    bail_if_cancelled!();
     progress(AnalysisProgress::stage("rhythm"));
     // One provider call for onsets + tempo + class: they share a single decode.
     let rhythm = providers.rhythm.analyze_rhythm(asset)?;
+    bail_if_cancelled!();
     // Transcription runs last: it is by far the slowest step, and the ones above
     // are what the timeline draws — markers and waveform regions appear as soon
     // as the caller caches this, rather than waiting behind minutes of inference.
-    let transcript = providers.transcriber.transcribe(asset, progress)?;
+    let transcript = providers.transcriber.transcribe(asset, progress, cancel)?;
     progress(AnalysisProgress::stage("done"));
     Ok(AssetAnalysis {
         asset_id: asset.id,

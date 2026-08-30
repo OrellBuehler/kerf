@@ -259,22 +259,28 @@ export async function importAsset(path: string): Promise<Asset> {
 }
 
 /** Open a native (multi-select) file picker and return the chosen media paths. */
+/** The file types Kerf imports. Shared by the picker's filter and the
+ *  drag-and-drop handler, so dropping a file onto the window accepts exactly
+ *  what browsing for one does. */
+export const MEDIA_EXTENSIONS = [
+	'mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac',
+	'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif',
+	// Insta360 captures (360 video / photo) — MP4 under a custom extension.
+	'insv', 'insp'
+];
+
+/** Whether a path looks like media Kerf can import. */
+export function isMediaPath(path: string): boolean {
+	const ext = path.split('.').pop()?.toLowerCase() ?? '';
+	return MEDIA_EXTENSIONS.includes(ext);
+}
+
 export async function pickMediaPaths(): Promise<string[]> {
 	if (!inTauri()) return [];
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: true,
-		filters: [
-			{
-				name: 'Media',
-				extensions: [
-					'mp4', 'mov', 'mkv', 'webm', 'wav', 'mp3', 'm4a', 'aac',
-					'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif',
-					// Insta360 captures (360 video / photo) — MP4 under a custom extension.
-					'insv', 'insp'
-				]
-			}
-		]
+		filters: [{ name: 'Media', extensions: MEDIA_EXTENSIONS }]
 	});
 	if (selected == null) return [];
 	return Array.isArray(selected) ? selected : [selected];
@@ -1676,6 +1682,13 @@ export async function cancelExport(): Promise<void> {
 	return invoke<void>('cancel_export');
 }
 
+/** Ask the running analysis pass to give up. It stops between steps, and about
+ *  once a second during transcription — the step that runs for minutes. */
+export async function cancelAnalysis(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_analysis');
+}
+
 /** Subscribe to `export-progress` events for the running render. Returns an unlisten fn. */
 export async function onExportProgress(cb: (p: ExportProgress) => void): Promise<() => void> {
 	if (!inTauri()) return () => {};
@@ -1756,6 +1769,15 @@ export async function platformCheck(frame?: [number, number] | null): Promise<De
 export async function mcpEndpoint(): Promise<string> {
 	if (!inTauri()) return 'http://127.0.0.1:7777/mcp';
 	return invoke<string>('mcp_endpoint');
+}
+
+/** Where the endpoint is, and how long ago an agent last used it — `null` when
+ *  none ever has. A streamable-HTTP client holds no connection between calls,
+ *  so there is no socket to report as open; the panel judges from the age. In
+ *  the browser harness there is no server at all, hence `null`. */
+export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null }> {
+	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null };
+	return invoke<{ endpoint: string; last_seen_secs: number | null }>('agent_status');
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------

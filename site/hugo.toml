@@ -35,6 +35,13 @@ disableKinds = ["taxonomy", "term", "RSS"]
   mcpUrl = "http://127.0.0.1:7777/mcp"
   toolCount = 78
 
+  # Umami (self-hosted): cookieless, no personal data, so no consent banner.
+  # Only loaded in a production build — `hugo server` is the development
+  # environment, and local page views are not traffic.
+  [params.analytics]
+    script = "https://a.orellbuehler.ch/script.js"
+    websiteId = "9c1e5fe5-7017-438c-b0d9-ff9b5ab932ac"
+
 [minify]
   minifyOutput = true
 

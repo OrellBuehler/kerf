@@ -21,7 +21,7 @@
 		TransitionKind,
 		VideoEffect
 	} from '$lib/types';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
