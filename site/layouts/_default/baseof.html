@@ -55,6 +55,12 @@
 
     {{ $css := resources.Get "css/kerf.css" | minify | fingerprint }}
     <link rel="stylesheet" href="{{ $css.RelPermalink }}" integrity="{{ $css.Data.Integrity }}" />
+
+    {{ with .Site.Params.analytics }}
+      {{ if hugo.IsProduction }}
+        <script defer src="{{ .script }}" data-website-id="{{ .websiteId }}"></script>
+      {{ end }}
+    {{ end }}
   </head>
   <body>
     {{ block "main" . }}{{ end }}
