@@ -337,7 +337,7 @@ async fn analyze_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Str
 // ---- speech-to-text -------------------------------------------------------
 
 /// The project-meta key holding the user's speech-model choice.
-const SPEECH_MODEL_KEY: &str = "speech_model";
+pub(crate) const SPEECH_MODEL_KEY: &str = "speech_model";
 
 /// Which transcription backend this build will use, and whether its model is
 /// already downloaded. The transcript tab reads this to explain an empty

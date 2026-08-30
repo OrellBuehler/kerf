@@ -11,7 +11,7 @@
 //! [`EditSource::User`] the same way), so attribution stays correct even though
 //! both front doors share one `Project`.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
@@ -30,6 +30,15 @@ use uuid::Uuid;
 
 /// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
 const DEFAULT_ADDR: &str = "127.0.0.1:7777";
+
+/// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
+/// model reading a schema description, not from a UI slider, so they are
+/// clamped rather than trusted — `skim_asset` already clamps its grid the same
+/// way. A frame far wider than the model can resolve costs a decode and a
+/// base64 payload nobody benefits from, and a waveform of a million buckets is
+/// megabytes of JSON that would bury the answer it was fetched to support.
+const MAX_PREVIEW_WIDTH: u32 = 1920;
+const MAX_WAVEFORM_BUCKETS: usize = 4096;
 
 #[derive(Clone)]
 pub struct KerfMcp {
@@ -674,7 +683,7 @@ struct TaskIdParams {
 struct WaveformParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
-    #[schemars(description = "Number of peak-magnitude buckets to return")]
+    #[schemars(description = "Number of buckets to return (1–4096; a few hundred is plenty to read a shape from)")]
     buckets: usize,
 }
 
@@ -684,7 +693,7 @@ struct FrameParams {
     asset_id: String,
     #[schemars(description = "Time in the source asset to decode (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Maximum output width in pixels (default 640)")]
+    #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
 }
 
@@ -708,7 +717,7 @@ struct SkimParams {
 struct TimelineFrameParams {
     #[schemars(description = "Timeline position to render (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Maximum output width in pixels (default 640)")]
+    #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
 }
 
@@ -726,6 +735,13 @@ struct AssetMetadata {
     analysis: Option<kerf_core::AssetAnalysis>,
 }
 
+/// A span of a track where nothing renders.
+#[derive(Serialize)]
+struct Gap {
+    start_secs: f64,
+    end_secs: f64,
+}
+
 #[derive(Serialize)]
 struct TrackSummary {
     id: String,
@@ -733,6 +749,11 @@ struct TrackSummary {
     kind: String,
     clip_count: usize,
     duration_secs: f64,
+    /// Where this track renders nothing — black picture on a video track,
+    /// silence on an audio one — including a hole at the head when the first
+    /// clip doesn't start at 0. Omitted entirely when the track is gapless.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gaps: Vec<Gap>,
 }
 
 #[derive(Serialize)]
@@ -794,7 +815,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache so the next analyze_asset transcribes without waiting for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
+        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache, so the next analyze_asset does not wait for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This only fills the cache: transcription keeps using whichever model is *selected*, so to transcribe with a model you name here, call set_speech_model too. Blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
     )]
     async fn download_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
         let name = p.name.unwrap_or_else(|| kerf_core::DEFAULT_SPEECH_MODEL.to_string());
@@ -822,6 +843,24 @@ impl KerfMcp {
         .await?;
         self.changed();
         json(&analysis)
+    }
+
+    #[tool(
+        description = "Pick the speech-to-text model transcription uses, remembered in the project (omit the name to \
+                       go back to the default). Same names as download_speech_model. Selecting a model does not \
+                       download it — the next transcription fetches it if the cache is cold, or call \
+                       download_speech_model first to get that wait out of the way. Returns the resulting \
+                       transcription status."
+    )]
+    fn set_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
+        let name = p.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        kerf_core::set_speech_model(name);
+        // Both writes the GUI's picker makes: the process setting transcription
+        // reads, and the project meta that restores the choice on reopen.
+        self.lock()
+            .set_meta(crate::SPEECH_MODEL_KEY, name.unwrap_or(""))
+            .map_err(core_err)?;
+        json(&kerf_core::transcription_status())
     }
 
     #[tool(description = "Cut [start, end) of an asset and append it to the matching track")]
@@ -1461,7 +1500,11 @@ impl KerfMcp {
         let track = p.track_id.as_deref().map(parse_id).transpose()?;
         let project = self.lock();
         let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
-        let timeline = project.timeline().map_err(core_err)?;
+        // The *working* timeline, like every other read here: inside a task the
+        // alignment lands in the staged proposal, and `timeline()` would hand
+        // back the user's untouched cut — a timeline with none of the moves the
+        // `cuts_aligned` count beside it just reported.
+        let timeline = project.working_timeline().map_err(core_err)?;
         drop(project);
         self.changed();
         json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": timeline }))
@@ -1618,8 +1661,11 @@ impl KerfMcp {
                        letterboxed) and tips. Advisory: export is never blocked. Use before reporting a cut finished."
     )]
     fn platform_check(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let summary = project.cut_summary(None).map_err(core_err)?;
+        // One summary, not two: `Project::platform_check` resolves its own, and
+        // each resolve deserializes the whole timeline and re-reads every asset
+        // row to answer the identical question.
+        let summary = self.lock().cut_summary(None).map_err(core_err)?;
+        let targets = kerf_core::platform::check_all(&summary);
         json(&serde_json::json!({
             "cut": {
                 "duration_secs": summary.duration,
@@ -1627,7 +1673,7 @@ impl KerfMcp {
                 "has_audio": summary.has_audio,
                 "has_text": summary.has_text,
             },
-            "targets": project.platform_check(None).map_err(core_err)?,
+            "targets": targets,
         }))
     }
 
@@ -1710,13 +1756,14 @@ impl KerfMcp {
     #[tool(description = "Get peak-magnitude waveform data (0.0–1.0) for an asset's first audio stream")]
     async fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
+        let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let buckets = blocking(move || {
             // Resolve under the lock, decode the whole audio stream with it
             // released — bucketing a long source takes seconds and must not
             // stall the GUI's commands on the shared mutex.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_waveform(&asset, p.buckets).map_err(core_err)
+            Project::decode_waveform(&asset, count).map_err(core_err)
         })
         .await?;
         json(&buckets)
@@ -1727,11 +1774,12 @@ impl KerfMcp {
     )]
     async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
+        let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let energy = blocking(move || {
             // Same lock-free decode shape as `get_waveform`.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_energy(&asset, p.buckets).map_err(core_err)
+            Project::decode_energy(&asset, count).map_err(core_err)
         })
         .await?;
         json(&energy)
@@ -1743,7 +1791,7 @@ impl KerfMcp {
     async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
         let project = self.project.clone();
-        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let jpeg = blocking(move || {
             // Resolve under the lock, decode with it released — mirrors the GUI's
             // `get_frame` so an agent drill-in can't stall the user's edits.
@@ -1789,7 +1837,7 @@ impl KerfMcp {
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
-        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640));
+        let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let jpeg = blocking(move || {
             // Snapshot the inputs under the lock, composite with it released —
             // mirrors the GUI's `get_timeline_frame`.
@@ -1816,6 +1864,7 @@ impl KerfMcp {
                 kind: format!("{:?}", t.kind).to_lowercase(),
                 clip_count: t.clips.len(),
                 duration_secs: t.end(),
+                gaps: track_gaps(t),
             })
             .collect();
         let total_clip_count = tracks.iter().map(|t| t.clip_count).sum();
@@ -1872,6 +1921,19 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
 }
 
+/// The tool router, built once for the life of the process.
+///
+/// `#[tool_handler]`'s default router expression is `Self::tool_router()`, and
+/// the generated `call_tool`, `list_tools` and `get_tool` each evaluate it — so
+/// every request rebuilds all ~85 routes: a schema-cache lookup, a boxed
+/// handler and a map insert apiece, ~250 µs of release-build work per tool call
+/// that produces the identical router every time. The routes are fixed at
+/// compile time, so build them once and hand out a borrow.
+fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
+    static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
+    ROUTER.get_or_init(KerfMcp::tool_router)
+}
+
 /// How the server introduces itself to clients. `ServerInfo::default()` fills
 /// `server_info` in from *rmcp's* own build env, so an untouched default has
 /// every client listing this server as "rmcp".
@@ -1879,7 +1941,7 @@ fn server_identity() -> Implementation {
     Implementation::new("kerf", env!("CARGO_PKG_VERSION"))
 }
 
-#[tool_handler]
+#[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
@@ -2077,8 +2139,29 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> Result<Optio
     }
 }
 
+/// Map a core error onto the MCP error the model should act on.
+///
+/// A stale id, an out-of-range value or an operation that doesn't fit the
+/// current state is the *caller's* mistake, and saying so as `invalid_params`
+/// is what tells the model to fix its arguments and retry. Reported as
+/// `internal_error` — the old blanket mapping — a mistyped uuid reads as a
+/// broken server, which an agent has no move against but giving up.
 fn core_err(e: kerf_core::Error) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+    use kerf_core::Error as E;
+    match e {
+        E::AssetNotFound(_)
+        | E::ClipNotFound(_)
+        | E::TrackNotFound(_)
+        | E::OverlayNotFound(_)
+        | E::RevisionNotFound(_)
+        | E::TaskNotFound(_)
+        | E::InvalidArgument(_)
+        | E::NoStagedEdit
+        | E::StagedEditPending
+        | E::StagedEditStale => McpError::invalid_params(e.to_string(), None),
+        // A database, io, ffmpeg or engine failure is ours, not the caller's.
+        other => McpError::internal_error(other.to_string(), None),
+    }
 }
 
 /// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
@@ -2087,6 +2170,29 @@ fn core_err(e: kerf_core::Error) -> McpError {
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
     CallToolResult::success(vec![ContentBlock::text(caption), ContentBlock::image(b64, "image/jpeg")])
+}
+
+/// The spans of a track that render nothing: the hole before the first clip and
+/// every hole between clips. Clips are not held in start order, so this walks a
+/// sorted copy of their spans, and it tolerates overlap by carrying the furthest
+/// end reached rather than the previous clip's. A hole under a millisecond is
+/// float noise from a retrim, not a gap.
+fn track_gaps(track: &kerf_core::Track) -> Vec<Gap> {
+    const EPSILON: f64 = 1e-3;
+    let mut spans: Vec<(f64, f64)> = track.clips.iter().map(|c| (c.timeline_start, c.timeline_end())).collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut gaps = Vec::new();
+    let mut cursor = 0.0f64;
+    for (start, end) in spans {
+        if start - cursor > EPSILON {
+            gaps.push(Gap {
+                start_secs: cursor,
+                end_secs: start,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    gaps
 }
 
 /// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
@@ -2105,7 +2211,7 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, fmt_ts, image_result, server_identity, KerfMcp};
+    use super::{allowed_hosts, core_err, fmt_ts, image_result, router, server_identity, track_gaps};
 
     #[test]
     fn fmt_ts_carries_at_minute_boundaries() {
@@ -2125,7 +2231,7 @@ mod tests {
     /// surface is generated.
     #[test]
     fn every_tool_has_a_description_and_object_schema() {
-        let tools = KerfMcp::tool_router().list_all();
+        let tools = router().list_all();
         assert!(tools.len() > 50, "expected the full tool surface, got {}", tools.len());
 
         for tool in &tools {
@@ -2145,7 +2251,7 @@ mod tests {
     /// requiring them would break that contract without failing to compile.
     #[test]
     fn optional_parameters_are_not_required() {
-        let tools = KerfMcp::tool_router().list_all();
+        let tools = router().list_all();
         let add_clip = tools
             .iter()
             .find(|t| t.name == "add_clip_to_timeline")
@@ -2255,5 +2361,77 @@ mod tests {
         assert!(!data.starts_with("data:"), "must be bare base64, not a data: URL");
 
         assert_eq!(value["isError"], false);
+    }
+
+    /// `timeline_summary` promises the agent "any per-track gaps", and a gap is
+    /// a real defect in a cut — the picture goes black there. The head of the
+    /// track counts: a cut that opens two seconds late opens on black.
+    #[test]
+    fn track_gaps_finds_holes_including_the_one_at_the_head() {
+        use kerf_core::{Clip, StreamKind, Track};
+        let asset = uuid::Uuid::new_v4();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        // Deliberately out of start order — clips are not stored sorted.
+        track.clips.push(Clip::new(asset, 0.0, 1.0, 6.0));
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 2.0));
+
+        let gaps = track_gaps(&track);
+        assert_eq!(gaps.len(), 2, "head gap + the hole between the clips");
+        assert_eq!((gaps[0].start_secs, gaps[0].end_secs), (0.0, 2.0));
+        assert_eq!((gaps[1].start_secs, gaps[1].end_secs), (4.0, 6.0));
+    }
+
+    /// A gapless track reports nothing, and float noise from a retrim is not a
+    /// gap — otherwise every summary would be a wall of sub-millisecond holes.
+    #[test]
+    fn track_gaps_ignores_a_gapless_track_and_float_noise() {
+        use kerf_core::{Clip, StreamKind, Track};
+        let asset = uuid::Uuid::new_v4();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 0.0));
+        track.clips.push(Clip::new(asset, 0.0, 2.0, 2.000_04));
+        assert!(
+            track_gaps(&track).is_empty(),
+            "40 microseconds of drift is not a gap, got {:?}",
+            track_gaps(&track).len()
+        );
+
+        // An overlap must not be read as a gap by the clip that follows it.
+        let mut overlapping = Track::new(StreamKind::Video, "V1");
+        overlapping.clips.push(Clip::new(asset, 0.0, 5.0, 0.0));
+        overlapping.clips.push(Clip::new(asset, 0.0, 1.0, 1.0));
+        assert!(track_gaps(&overlapping).is_empty());
+    }
+
+    /// A stale id or an out-of-range value is the caller's mistake, and the
+    /// model can only act on that if it is told so: `invalid_params` means "fix
+    /// the arguments", `internal_error` means "the server is broken".
+    #[test]
+    fn caller_mistakes_are_reported_as_invalid_params() {
+        use rmcp::model::ErrorCode;
+        let id = uuid::Uuid::new_v4();
+        for e in [
+            kerf_core::Error::ClipNotFound(id),
+            kerf_core::Error::AssetNotFound(id),
+            kerf_core::Error::TrackNotFound(id),
+            kerf_core::Error::InvalidArgument("marker time must be >= 0".to_string()),
+            kerf_core::Error::StagedEditStale,
+        ] {
+            let rendered = e.to_string();
+            assert_eq!(core_err(e).code, ErrorCode::INVALID_PARAMS, "{rendered}");
+        }
+        // Ours, not theirs.
+        assert_eq!(
+            core_err(kerf_core::Error::Engine("ffmpeg exited 1".to_string())).code,
+            ErrorCode::INTERNAL_ERROR
+        );
+    }
+
+    /// The router is fixed at compile time but the `#[tool_handler]` default
+    /// rebuilds it per request. This pins that it is built once — a regression
+    /// here is invisible except as latency on every single tool call.
+    #[test]
+    fn the_tool_router_is_built_once() {
+        assert!(std::ptr::eq(router(), router()));
     }
 }

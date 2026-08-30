@@ -467,7 +467,13 @@ It is spawned from `lib.rs`'s Tauri `.setup` hook on
 `tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
 hold, so the agent edits the project the user has open. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
-`tool_router` field on the struct** (the macro calls `Self::tool_router()`).
+`tool_router` field on the struct** (the macro would call `Self::tool_router()`).
+That default is also the reason for the `router()` `OnceLock`: the generated
+`call_tool` / `list_tools` / `get_tool` each *evaluate* the router expression, so
+`Self::tool_router()` rebuilds all ~85 routes — a schema lookup, a boxed handler
+and a map insert apiece, ~250 µs of release-build work — on **every request**.
+The routes are fixed at compile time, so it is built once and
+`#[tool_handler(router = router())]` hands out a borrow.
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
@@ -485,7 +491,20 @@ live in the GUI. Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
-`timeline_summary` carries `staged_changes` so it cannot mistake one for the other.
+`timeline_summary` carries `staged_changes` so it cannot mistake one for the other,
+and a per-track `gaps` list — a hole between clips (or before the first one) is
+black picture, which is the kind of defect an agent has to be *told* about since
+it never watches the cut. `core_err` splits the caller's mistakes (a stale id, an
+out-of-range value, a stale staged edit) out as `invalid_params`: reported as
+`internal_error`, a mistyped uuid reads to a model as a broken server rather than
+as something it can fix and retry. Sizes an agent picks out of a schema
+description — `get_waveform`/`get_energy` buckets, `get_frame`/`preview_timeline`
+widths — are clamped rather than trusted, the way `skim_asset` already clamps its
+grid. `set_speech_model` is the write side of `transcription_status`
+(`download_speech_model` only fills the cache; transcription uses whichever model
+is *selected*, so downloading without selecting was a silent no-op) — it makes
+both writes the GUI picker makes, though the picker itself only re-reads at
+launch, so a model an agent selects shows there on the next start.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `generate_captions` / `clear_captions` caption the
