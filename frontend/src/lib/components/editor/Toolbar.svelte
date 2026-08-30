@@ -6,7 +6,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 
 	let {
 		onNew,
@@ -127,6 +127,13 @@
 		title="Save project as…">Save</Btn
 	>
 	{@render divider()}
+	<Btn
+		variant={ui.inspectorOpen ? 'secondary' : 'ghost'}
+		size="sm"
+		icon="sliders-horizontal"
+		title="Inspector — clip settings, titles and captions"
+		onclick={() => (ui.inspectorOpen = !ui.inspectorOpen)}>Inspector</Btn
+	>
 	<Btn
 		variant={ui.agentOpen ? 'agent' : 'ghost'}
 		size="sm"

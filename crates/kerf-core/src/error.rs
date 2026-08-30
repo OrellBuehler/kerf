@@ -49,6 +49,9 @@ pub enum Error {
     #[error("media engine error: {0}")]
     Engine(String),
 
+    #[error("cancelled")]
+    Cancelled,
+
     #[cfg(feature = "ffmpeg")]
     #[error("ffmpeg error: {0}")]
     Ffmpeg(#[from] ffmpeg_next::Error),

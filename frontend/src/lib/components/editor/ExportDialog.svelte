@@ -4,7 +4,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { inTauri, pickExportPath, cancelExport, onExportProgress, hwEncoders, platformCheck, revealPath } from '$lib/api';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 	import { ratioLabel } from '$lib/delivery-formats';
 	import type { Container, DeliveryCheck, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
 	import {
@@ -33,9 +33,26 @@
 
 	let { onClose }: { onClose: () => void } = $props();
 
-	let opts = $state<ExportOptions>(applyPreset('web_1080p'));
+	// The export opens on the frame the project is cut for. A 9:16 project whose
+	// dialog defaulted to Web 1080p opened already landscape — and the readiness
+	// panel below then warned about the shape the user had just chosen. When a
+	// preset renders exactly the project frame, start from it; otherwise start
+	// from the default preset with its resolution cleared, so "Project frame" is
+	// what renders.
+	function initialExport(): { id: string; opts: ExportOptions } {
+		const d = editor.timeline.format;
+		if (!d) return { id: 'web_1080p', opts: applyPreset('web_1080p') };
+		const hit = PRESETS.find(
+			(p) => p.opts.resolution?.[0] === d.width && p.opts.resolution?.[1] === d.height
+		);
+		if (hit) return { id: hit.id, opts: applyPreset(hit.id) };
+		return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: d.fit } };
+	}
+	const initial = initialExport();
+
+	let opts = $state<ExportOptions>(initial.opts);
 	let outputPath = $state('');
-	let activePreset = $state('web_1080p');
+	let activePreset = $state(initial.id);
 	let customRes = $state(false);
 	let rendering = $state(false);
 	let progress = $state<ExportProgress | null>(null);

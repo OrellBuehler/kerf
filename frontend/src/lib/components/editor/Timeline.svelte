@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -10,6 +10,7 @@
 	import { gainLabel, panLabel } from '$lib/mixer';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
+	import { transitionLabel } from '$lib/transitions';
 
 	const pxPerSec = $derived(ui.zoom);
 	const duration = $derived(Math.max(editor.duration, 8));
@@ -1253,7 +1254,7 @@
 							{/if}
 							{#if c.transition_in}
 								<span
-									title="{c.transition_in.kind === 'crossfade' ? 'Crossfade' : 'Dip to black'} {c.transition_in.duration.toFixed(2)}s"
+									title="{transitionLabel(c.transition_in.kind)} {c.transition_in.duration.toFixed(2)}s"
 									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
 										c.transition_in.duration * pxPerSec,
 										width

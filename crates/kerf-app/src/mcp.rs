@@ -11,6 +11,7 @@
 //! [`EditSource::User`] the same way), so attribution stays correct even though
 //! both front doors share one `Project`.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
@@ -2034,9 +2035,40 @@ impl KerfMcp {
 /// mutex (a panic while another op held the lock) rather than panicking here
 /// too — a single failed op shouldn't brick the agent endpoint for the session.
 fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
+    note_agent_activity();
     let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
     guard.set_actor(EditSource::Agent);
     guard
+}
+
+// ---- agent presence --------------------------------------------------------
+
+/// Unix seconds of the last thing an agent did — its `initialize` handshake, or
+/// any tool call that reached the project — or 0 if nothing ever has.
+///
+/// The agent panel used to show a green "live" dot unconditionally, which said
+/// the same thing whether or not anything was connected. Nothing here claims a
+/// *socket* is open: a streamable-HTTP client holds no connection between
+/// calls, so the only honest signal is when it last spoke. Every agent-side
+/// project access goes through `lock_agent`, which makes that the one choke
+/// point worth stamping.
+static LAST_AGENT_ACTIVITY: AtomicI64 = AtomicI64::new(0);
+
+fn note_agent_activity() {
+    LAST_AGENT_ACTIVITY.store(unix_now(), Ordering::Relaxed);
+}
+
+/// Seconds since an agent last spoke, or `None` if none ever has.
+pub fn agent_last_seen_secs() -> Option<i64> {
+    let at = LAST_AGENT_ACTIVITY.load(Ordering::Relaxed);
+    (at > 0).then(|| (unix_now() - at).max(0))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Run a blocking (ffmpeg) job on the blocking thread pool and await it, so a
@@ -2071,6 +2103,9 @@ fn server_identity() -> Implementation {
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
     fn get_info(&self) -> ServerInfo {
+        // `initialize` is the one moment we know an agent is on the other end
+        // of the socket, so it counts as being seen even before it calls a tool.
+        note_agent_activity();
         let mut info = ServerInfo::default();
         info.server_info = server_identity();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

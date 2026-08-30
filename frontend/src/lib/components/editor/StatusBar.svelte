@@ -3,7 +3,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { inTauri, revealLogs } from '$lib/api';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 
 	const showLogs = inTauri();
 
@@ -44,11 +44,28 @@
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
-	{#if ui.analyzing}
+	{#if editor.loading}
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--text-muted)">
+			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--text-muted);border-top-color:transparent;border-radius:50%"></span>
+			Loading project…
+		</span>
+	{:else if ui.analyzing}
+		<!-- Analysis is a long commitment (a speech model download, then minutes
+		     of inference per asset), so say which step it is on, how much is
+		     still queued behind it, and offer the way out. -->
 		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--agent-300)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
-			Analyzing…
+			{ui.analysisLabel ?? 'analyzing'}{ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} queued` : ''}
 		</span>
+		<button
+			type="button"
+			disabled={ui.stoppingAnalysis}
+			title="Stop analyzing — it gives up between steps, and within about a second during transcription"
+			onclick={() => ui.stopAnalysis()}
+			style="background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+		>
+			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
+		</button>
 	{:else}
 		<span style="font-size:10px;color:var(--text-disabled)">
 			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===

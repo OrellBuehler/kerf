@@ -401,7 +401,12 @@ class EditorState {
 	 *  concurrently (each lands in the bin as it resolves); imports continue
 	 *  past a failed file and resolve to the successes plus per-file errors. */
 	async importMedia(): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
-		const paths = await pickMediaPaths();
+		return this.importPaths(await pickMediaPaths());
+	}
+
+	/** Import specific files — what the picker resolves to, and what a drop onto
+	 *  the window hands over. */
+	async importPaths(paths: string[]): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
 		if (paths.length === 0) return { imported: [], failed: [] };
 		this.importing = true;
 		this.error = null;

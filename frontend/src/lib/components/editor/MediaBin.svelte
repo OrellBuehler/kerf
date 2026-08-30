@@ -7,7 +7,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { inTauri } from '$lib/api';
-	import { toast } from 'svelte-sonner';
+	import { toast } from '$lib/notifications.svelte';
 	import type { Clip } from '$lib/types';
 
 	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; image: boolean; tag: string };
@@ -143,8 +143,7 @@
 				toast.success(
 					imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
 				);
-				for (const a of imported) await ui.runAnalysis(a.id);
-				toast.success('Analysis complete');
+				await ui.analyzeQueue(imported.map((a) => a.id));
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
@@ -195,7 +194,8 @@
 				label: analyzed ? 'Re-analyze' : 'Analyze',
 				icon: 'scan-line',
 				disabled: ui.analyzingId === a.id,
-				action: () => void ui.runAnalysis(a.id)
+				action: () =>
+					void ui.runAnalysis(a.id).catch((err) => toast.error(err instanceof Error ? err.message : String(err)))
 			}
 		]);
 	}
@@ -387,7 +387,10 @@
 							{/if}
 						</div>
 					{:else if tx.action === 'analyze' && editor.selectedAssetId}
-						<Btn size="sm" onclick={() => void ui.runAnalysis(editor.selectedAssetId!)}>Analyze &amp; transcribe</Btn>
+						<Btn size="sm" onclick={() =>
+								void ui
+									.runAnalysis(editor.selectedAssetId!)
+									.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Analyze &amp; transcribe</Btn>
 					{/if}
 				</div>
 			{:else}

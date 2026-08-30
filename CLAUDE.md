@@ -218,6 +218,13 @@ transcript tab and an agent both read it to explain an empty transcript.
 `analyze_asset_media_with_progress` streams a per-step `AnalysisProgress`
 (`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
 transcription runs **last** so the markers land before minutes of inference.
+**A pass is abandonable** (`analyze_asset_media_cancellable` / `analyze_cancellable`,
+a `CancelFn` alongside the `ProgressFn`): the check lands between steps *and* inside
+transcription — the ffmpeg `whisper` run polls it about once a second off
+`-stats_period 1` and kills the child, and the model download polls it per chunk,
+keeping the `.part` file so the next attempt resumes rather than re-fetching 148 MB.
+A cancelled pass returns `Error::Cancelled` and caches **nothing**: a half-analyzed
+asset would read as analyzed, and its missing transcript as "no speech".
 
 Two more optional features: `libav-render` (above) and `whisper` (in-process
 `whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time). Both are
@@ -446,8 +453,10 @@ no editing logic in the adapter.
   re-decoding the whole file), `WhisperFilterTranscriber` (the ffmpeg `whisper`
   filter, always compiled) and
   `WhisperTranscriber` (in-process, `whisper` feature); `NullAnalyzer` is still the
-  fallback. `Transcriber::transcribe` takes a `ProgressFn` — alone among the
-  providers, because it can download a model and then run for minutes.
+  fallback. `Transcriber::transcribe` takes a `ProgressFn` *and* a `CancelFn` —
+  alone among the providers, because it can download a model and then run for
+  minutes, which is both the only step worth reporting on and the only one worth
+  being able to give up on.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
@@ -581,8 +590,16 @@ agent task queue (`list_tasks`, `add_task` → the new `Task`; `resolve_task` /
 `remove_task` → the refreshed `Task[]`), the agent's staged proposal
 (`get_staged_edit` → the `StagedEdit` *with its diff*, so the review card renders
 from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit` /
-`discard_staged_edit`) and `revision_diff`, and `export_timeline` (emits
-`export-progress` events) / `cancel_export`. **No command runs on the main thread** (a plain sync
+`discard_staged_edit`) and `revision_diff`, `export_timeline` (emits
+`export-progress` events) / `cancel_export`, `cancel_analysis` (the same shape,
+for the analysis pass — importing ten clips must not be an unbreakable
+commitment to ten transcriptions) and `agent_status` (the MCP endpoint plus how
+many seconds ago an agent last spoke to it, or `null` if none ever has —
+`mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
+`initialize` is the one moment an agent is known to be there; a
+streamable-HTTP client holds no connection between calls, so there is no socket
+to report and the panel judges from the age instead of the green dot it used to
+show unconditionally). **No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
@@ -673,7 +690,11 @@ The editor UI is implemented from the **Kerf design system** (claude.ai/design):
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
 `IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
 `Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
-`routes/+page.svelte`. The `Inspector` (right panel) edits the selected clip —
+`routes/+page.svelte`. The `Inspector` (right panel) is **mounted whether or not a
+clip is selected** and toggled from the toolbar (`ui.inspectorOpen`): its Text
+overlays section belongs to the timeline rather than to any one clip, so gating the
+whole panel on a selection made titles and captions unreachable until you clicked a
+clip. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
@@ -797,7 +818,11 @@ from the playhead rather than playing it out in slow motion against the sound.
 playback moves under `bun run dev` and that failure mode is reproducible without a
 desktop build. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
-loudness normalize, and a **Range: In → out** choice when marks are set. `MediaBin`'s
+loudness normalize, and a **Range: In → out** choice when marks are set. It **opens on
+the frame the project is cut for** (`initialExport`): the preset whose resolution is
+that frame when one matches, else the default preset with its resolution cleared so
+"Project frame" renders — otherwise a 9:16 project opened its export already
+landscape and the readiness panel warned about the shape the user had just chosen. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
@@ -859,11 +884,21 @@ keeps its placeholder). This browser sample is a **dev harness only** — the de
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
-(`export const ui` — chrome state, playhead/zoom/playback, and `runAnalysis` which runs real
-analysis and toggles the `analyzing` flag). There is **no scripted demo phase machine**: the
+(`export const ui` — chrome state, playhead/zoom/playback, and `analyzeQueue` /
+`runAnalysis` / `stopAnalysis`: a batch analyzes **one asset at a time** — each pass is
+ffmpeg-bound, so running them together only makes each slower — and stopping drops
+the whole rest of the queue). There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
-duration, and `Preview` shows the decoded frame or a "No media loaded" placeholder.
+duration (plus the analysis step, what is still queued behind it and a **Stop**), and
+`Preview` shows the decoded frame or a "No media loaded" placeholder.
+**Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
+`onDragDropEvent`, filters by `isMediaPath` — the same extension list the picker
+filters by, so a dropped folder of mixed files doesn't answer with one error per
+README — and runs the same `editor.importPaths` the picker resolves to), which is
+what the bin's "Drop media to start" had been promising. `editor.error` renders as a
+dismissible banner under the toolbar: it was recorded and never shown, so a `.kerf`
+that would not open opened as silence.
 
 ## Conventions
 
