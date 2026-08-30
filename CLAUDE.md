@@ -858,6 +858,20 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+Every toast is also a **notification log** entry (`src/lib/notifications.svelte.ts`,
+a fourth runes singleton). Components import `toast` from *there* rather than from
+`svelte-sonner` — a drop-in wrapper, so no call site changed — because a toast is
+gone in four seconds, which is fine for "Clip copied" and useless for the model
+download that failed with a reason worth reading. The title bar's bell opens
+`NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
+read, clear) and badges the unread count, red when anything unread actually failed.
+Errors and warnings also linger longer on screen than sonner's default. The log is
+deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
+since an hour later it would undo whatever the newest revision is, not the edit the
+notice was about. It is also why the failure paths that used to reject into nothing
+(`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
+calls) now report: a notice that is never raised cannot be recovered from a log.
+
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
 alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 6 h through `api.ts`'s `checkUpdate` / `installUpdate` / `relaunchApp`, and drives

@@ -4,6 +4,7 @@
 	import Icon from './Icon.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { updater } from '$lib/updater.svelte';
+	import { notifications } from '$lib/notifications.svelte';
 
 	// An available update stays offered here after the dialog is dismissed;
 	// otherwise the version label doubles as a manual "check for updates".
@@ -22,6 +23,30 @@
 			<Badge tone="warning" dot>Unsaved</Badge>
 		{/if}
 	</div>
+	<!-- Toasts are gone in seconds; this is where they can be read afterwards.
+	     The badge only turns red when something unread actually failed. -->
+	<button
+		data-notification-bell
+		onclick={() => notifications.toggle()}
+		title={notifications.unread
+			? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
+			: 'Notifications'}
+		aria-label="Notifications"
+		style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {notifications.open
+			? 'var(--border-strong)'
+			: 'transparent'};background:{notifications.open ? 'var(--surface-active)' : 'transparent'};color:{notifications.open
+			? 'var(--text-primary)'
+			: 'var(--text-disabled)'}"
+	>
+		<Icon n="bell" s={13} color="currentColor" />
+		{#if notifications.unread}
+			<span
+				style="position:absolute;top:0;right:0;min-width:13px;height:13px;padding:0 3px;border-radius:999px;display:grid;place-items:center;font-family:var(--font-mono);font-size:9px;line-height:1;color:var(--text-on-accent);background:{notifications.unreadProblem
+					? 'var(--danger)'
+					: 'var(--kerf-500)'}">{notifications.unread > 99 ? '99+' : notifications.unread}</span
+			>
+		{/if}
+	</button>
 	<button
 		onclick={() => updater.open()}
 		title={available

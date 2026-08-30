@@ -52,7 +52,8 @@ import {
 	RefreshCw,
 	TriangleAlert,
 	Lightbulb,
-	ExternalLink
+	ExternalLink,
+	Bell
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -109,7 +110,8 @@ export const icons: Record<string, typeof LucideIcon> = {
 	'refresh-cw': RefreshCw,
 	'external-link': ExternalLink,
 	'alert-triangle': TriangleAlert,
-	'lightbulb': Lightbulb
+	'lightbulb': Lightbulb,
+	'bell': Bell
 };
 
 export type IconName = keyof typeof icons;
