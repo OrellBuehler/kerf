@@ -3121,22 +3121,50 @@ impl Drop for GraphScript {
     }
 }
 
+/// The argv spelling that points *this* ffmpeg at a filtergraph file, probed
+/// once per process: FFmpeg 8 removed `-filter_complex_script` (deprecated in
+/// 7.0 as equivalent to the generic `-/filter_complex <file>` form), so on a
+/// bundled FFmpeg 8 the old spelling aborts every spilled render with
+/// `Unrecognized option` — while a pre-7.0 binary knows only the old one.
+/// `-h full` still lists the option wherever it exists; a probe that cannot
+/// run at all answers with the modern form, since any render on that binary is
+/// about to fail the same way regardless.
+fn graph_script_flag() -> &'static str {
+    static FLAG: OnceLock<&'static str> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let legacy = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "quiet", "-h", "full"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("-filter_complex_script"))
+            .unwrap_or(false);
+        tracing::debug!(legacy, "probed ffmpeg for -filter_complex_script");
+        if legacy { "-filter_complex_script" } else { "-/filter_complex" }
+    })
+}
+
 /// Move an oversized filtergraph out of argv into a script file, pointing ffmpeg
-/// at it with `-filter_complex_script`. Leaves ordinary exports untouched, so
-/// their argv stays byte-identical (and every pure arg-builder test with it).
-///
-/// `-filter_complex_script` takes the path as its own argv token, which is why
-/// it beats the obvious alternative of `sendcmd=f=`: that would bury the path
-/// *inside* a filtergraph value, where `\` escapes and `:` separates options, so
-/// a Windows path would have to be mangled first.
+/// at it with [`graph_script_flag`]'s spelling. Leaves ordinary exports
+/// untouched, so their argv stays byte-identical (and every pure arg-builder
+/// test with it).
 fn externalize_filter_complex(args: &mut [String], tag: &str) -> Result<GraphScript> {
+    spill_graph(args, tag, graph_script_flag())
+}
+
+/// The pure half of [`externalize_filter_complex`], with the flag decided.
+///
+/// Either flag takes the path as its own argv token, which is why this beats
+/// the obvious alternative of `sendcmd=f=`: that would bury the path *inside* a
+/// filtergraph value, where `\` escapes and `:` separates options, so a Windows
+/// path would have to be mangled first.
+fn spill_graph(args: &mut [String], tag: &str, flag: &str) -> Result<GraphScript> {
     let Some(i) = oversized_graph_index(args) else {
         return Ok(GraphScript(None));
     };
     let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}.txt", std::process::id()));
     std::fs::write(&path, &args[i]).map_err(|e| Error::Engine(format!("could not write the filtergraph script: {e}")))?;
     args[i] = path.to_string_lossy().into_owned();
-    args[i - 1] = "-filter_complex_script".to_string();
+    args[i - 1] = flag.to_string();
     Ok(GraphScript(Some(path)))
 }
 
@@ -6468,9 +6496,12 @@ mod tests {
         let i = oversized_graph_index(&args).expect("a long pan must spill out of argv");
         assert!(args[i].len() > GRAPH_ARG_MAX);
 
+        // spill_graph rather than externalize_filter_complex: the wrapper
+        // probes the real binary for which flag spelling it takes, and the
+        // default test run must stay binary-free.
         let mut spilled = args.clone();
-        let guard = externalize_filter_complex(&mut spilled, "test").unwrap();
-        assert_eq!(spilled[i - 1], "-filter_complex_script");
+        let guard = spill_graph(&mut spilled, "test", "-/filter_complex").unwrap();
+        assert_eq!(spilled[i - 1], "-/filter_complex");
         let path = std::path::PathBuf::from(&spilled[i]);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

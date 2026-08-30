@@ -166,7 +166,9 @@ so the feature is **only** activated through these forwards — which is what ma
   `fov` maps to `d_fov` (aspect-correct on its own; `h_fov` would stretch). The
   resulting graph outgrows argv — Linux caps one argument at 128 KiB, Windows the
   whole command line at 32767 — so `externalize_filter_complex` spills anything
-  over `GRAPH_ARG_MAX` to a temp file passed via `-filter_complex_script`. The
+  over `GRAPH_ARG_MAX` to a temp file, passed via `-filter_complex_script` or,
+  where FFmpeg 8 removed that option, the `-/filter_complex <file>` form that
+  replaced it (`graph_script_flag` probes `-h full` once per process). The
   still path samples `Clip::reframe_at` to a constant `v360` instead, and
   `export_format` ignores a reframed clip's source dimensions so a 5760x2880
   capture does not become the deliverable size.
