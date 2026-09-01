@@ -235,12 +235,18 @@ impl Transcriber for WhisperTranscriber {
         }
         let samples = crate::engine::decode_audio_16k_mono(std::path::Path::new(&asset.path))?;
         let language = self.language.clone();
+        // In-process inference is as CPU-hungry as the ffmpeg filter backend, so
+        // it takes the same heavy-job slot and the same share of the cores. The
+        // lease is held here while the worker below does the work, which is what
+        // the join makes safe.
+        let cpu = crate::engine::cpu::lease();
+        let threads = cpu.threads();
 
         // whisper-rs wants a `'static` progress callback, and `full()` blocks
         // for the whole inference — so run it on a worker and pump percentages
         // back over a channel instead of holding a borrow across the call.
         let (tx, rx) = std::sync::mpsc::channel::<i32>();
-        let worker = std::thread::spawn(move || run_whisper_rs(samples, model, language, tx));
+        let worker = std::thread::spawn(move || run_whisper_rs(samples, model, language, threads, tx));
         for pct in rx {
             progress(AnalysisProgress::with_fraction("transcribe", pct as f64 / 100.0));
         }
@@ -259,6 +265,7 @@ fn run_whisper_rs(
     samples: Vec<f32>,
     model: std::path::PathBuf,
     language: Option<String>,
+    threads: usize,
     progress: std::sync::mpsc::Sender<i32>,
 ) -> Result<Vec<TranscriptSegment>> {
     use crate::error::Error;
@@ -269,6 +276,9 @@ fn run_whisper_rs(
     let mut state = ctx.create_state().map_err(|e| Error::Engine(format!("whisper: {e}")))?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // whisper.cpp otherwise sizes its thread pool from the machine, not from
+    // what Kerf was told it may use.
+    params.set_n_threads(threads.clamp(1, i32::MAX as usize) as i32);
     if let Some(lang) = &language {
         params.set_language(Some(lang));
     }

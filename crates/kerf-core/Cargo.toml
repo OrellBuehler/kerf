@@ -41,3 +41,8 @@ fontdb.workspace = true
 ureq = "3.4"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
+
+# Scheduling priority for background ffmpeg runs (see engine::cpu). Unix only —
+# Windows sets its priority class through a process creation flag instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

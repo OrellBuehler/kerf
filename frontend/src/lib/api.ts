@@ -25,6 +25,8 @@ import type {
 	Reframe,
 	ReframeKeyframe,
 	Revision,
+	AppSettings,
+	SettingsView,
 	StagedEdit,
 	StreamKind,
 	Task,
@@ -1778,6 +1780,56 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null }>('agent_status');
+}
+
+// ---- app settings ----------------------------------------------------------
+
+/**
+ * Read the preferences in force, resolved against the engine. In the browser
+ * harness there is no engine, so it answers from `localStorage` over the
+ * webview's own core count — enough to drive the dialog under `bun run dev`.
+ */
+export async function getSettings(): Promise<SettingsView> {
+	if (!inTauri()) return browserSettings(readBrowserCpuPercent());
+	return invoke<SettingsView>('get_settings');
+}
+
+/** Persist the preferences and put them into force; returns the resolved view. */
+export async function setSettings(settings: AppSettings): Promise<SettingsView> {
+	if (!inTauri()) {
+		const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, settings.cpu_percent)));
+		try {
+			localStorage.setItem(CPU_KEY, String(percent));
+		} catch {
+			// A private window with storage blocked still gets a working dialog.
+		}
+		return browserSettings(percent);
+	}
+	return invoke<SettingsView>('set_settings', { settings });
+}
+
+const CPU_KEY = 'kerf.settings.cpuPercent';
+const MIN_CPU_PERCENT = 10;
+const DEFAULT_CPU_PERCENT = 75;
+
+function readBrowserCpuPercent(): number {
+	try {
+		const stored = Number(localStorage.getItem(CPU_KEY));
+		if (Number.isFinite(stored) && stored > 0) return stored;
+	} catch {
+		// Ignore — fall through to the default.
+	}
+	return DEFAULT_CPU_PERCENT;
+}
+
+function browserSettings(percent: number): SettingsView {
+	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
+	return {
+		cpu_percent: percent,
+		cpu_cores: cores,
+		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * percent) / 100))),
+		cpu_min_percent: MIN_CPU_PERCENT
+	};
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------

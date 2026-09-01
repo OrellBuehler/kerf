@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 
-use super::cli::{command, ffmpeg_bin, launch_err};
+use super::cli::{bg_command, command, ffmpeg_bin, launch_err};
+use super::cpu;
 use crate::error::{Error, Result};
 use crate::model::TranscriptSegment;
 
@@ -500,11 +501,15 @@ pub fn transcribe(
         .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?
         .to_string();
 
-    let args = build_transcribe_args(&input, model_file, &out_name, language);
+    let mut args = build_transcribe_args(&input, model_file, &out_name, language);
     let bin = ffmpeg_bin();
+    // Minutes of inference over the whole file — the single heaviest thing an
+    // analysis pass does, and the one worth keeping off the user's other cores.
+    let cpu = cpu::lease();
+    cpu::limit_args(&mut args, cpu.threads());
     tracing::info!(path = %path.display(), model = %model.display(), "transcribing with the ffmpeg whisper filter");
 
-    let mut child = command(&bin)
+    let mut child = bg_command(&bin)
         .current_dir(&model_dir)
         .arg("-progress")
         .arg("pipe:1")
