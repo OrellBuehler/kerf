@@ -513,6 +513,20 @@ impl Project {
     /// before the (potentially slow) ffmpeg decode runs, instead of freezing
     /// every other project op for its duration. `accurate = false` snaps to the
     /// nearest keyframe for fast scrubbing; a still decodes its one frame at t=0.
+    /// [`Project::decode_preview_frame`] zoomed into `region` (fractions of
+    /// the frame). Reads the **original** source rather than the 1280-wide
+    /// proxy: a zoom is a request for the pixels the proxy threw away.
+    pub fn decode_preview_region(
+        asset: &Asset,
+        time_secs: f64,
+        region: engine::Region,
+        max_width: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>> {
+        let time_secs = if asset.is_image() { 0.0 } else { time_secs };
+        engine::frame_jpeg_region(Path::new(&asset.path), time_secs, region, max_width, quality, true)
+    }
+
     pub fn decode_preview_frame(asset: &Asset, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
         // A still image has one frame at t=0; seeking past it decodes nothing.
         let time_secs = if asset.is_image() { 0.0 } else { time_secs };
@@ -635,6 +649,24 @@ impl Project {
             ..engine::ExportOptions::default()
         };
         engine::timeline_frame(timeline, assets, &opts, time_secs, max_width, quality)
+    }
+
+    /// [`Project::composite_timeline_frame`] zoomed into `region` of the
+    /// composited canvas — the same lock-free shape, for an agent checking a
+    /// detail of the cut (a caption against the safe area, a mask edge).
+    pub fn composite_timeline_region(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        region: engine::Region,
+        max_width: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>> {
+        let opts = engine::ExportOptions {
+            hwaccel: engine::decode_hwaccel(),
+            ..engine::ExportOptions::default()
+        };
+        engine::timeline_frame_region(timeline, assets, &opts, time_secs, region, max_width, quality)
     }
 
     /// How ready the current cut is for each publishing target — what a platform

@@ -26,10 +26,10 @@ pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
-    download_speech_model, export_still, generate_proxy, hw_encoders, insta360_pair, proxy_path, proxy_width, render_with,
-    render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export,
-    Container, DownloadProgress, ExportOptions, ExportProgress, Fit, ImageFormat, PreviewFrame, RateControl, RenderStatus,
-    SpeechModelInfo, DEFAULT_SPEECH_MODEL,
+    contact_sheet_times, download_speech_model, export_still, generate_proxy, hw_encoders, insta360_pair, proxy_path,
+    proxy_width, render_with, render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path,
+    stream_preview, validate_export, Container, DownloadProgress, ExportOptions, ExportProgress, Fit, ImageFormat, PreviewFrame,
+    RateControl, Region, RenderStatus, SpeechModelInfo, DEFAULT_SPEECH_MODEL,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

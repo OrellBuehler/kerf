@@ -43,10 +43,11 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, contact_sheet, decode_hwaccel, delivery_frame, detect_scenes, detect_silence, export_still,
-    frame_at, frame_jpeg, generate_proxy, hw_encoders, insta360_pair, proxy_path, proxy_width, ready_proxy, salience_map,
-    stitch_insta360, stitched_path, stream_preview, timeline_frame, validate_export, waveform, Container, ExportOptions,
-    ExportProgress, Fit, ImageFormat, PreviewFrame, RateControl, RenderStatus,
+    audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame, detect_scenes,
+    detect_silence, export_still, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy, hw_encoders, insta360_pair,
+    proxy_path, proxy_width, ready_proxy, salience_map, stitch_insta360, stitched_path, stream_preview, timeline_frame,
+    timeline_frame_region, validate_export, waveform, Container, ExportOptions, ExportProgress, Fit, ImageFormat, PreviewFrame,
+    RateControl, Region, RenderStatus,
 };
 
 pub(crate) use cli::insta360_pair_name;
