@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project,
-    Projection, ReframeKeyframe, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo};
@@ -40,6 +40,10 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 /// base64 payload nobody benefits from, and a waveform of a million buckets is
 /// megabytes of JSON that would bury the answer it was fetched to support.
 const MAX_PREVIEW_WIDTH: u32 = 1920;
+/// JPEG `-q:v` for a zoomed frame: a zoom exists to read fine detail, and the
+/// preview's `4` smears text and edges that `2` keeps. The image is small
+/// anyway, so the bytes hardly move.
+const ZOOM_QUALITY: u8 = 2;
 const MAX_WAVEFORM_BUCKETS: usize = 4096;
 
 #[derive(Clone)]
@@ -703,6 +707,49 @@ struct FrameParams {
     time_secs: f64,
     #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
+    #[schemars(
+        description = "Zoom into part of the frame instead of seeing all of it: a rectangle in fractions of the full frame (0..1), `left`/`top` its top-left corner, `width`/`height` its size. The region is cropped out first and then scaled to max_width, so a quarter of the frame shows four times the detail for the same image cost — use it to check a face, on-screen text, a caption, a mask edge. Omit for the whole frame."
+    )]
+    region: Option<RegionParams>,
+}
+
+/// A region of a frame to zoom into, as the schema hands it to a model: the
+/// same fractions [`Region`] takes, kept as a separate type so the tool schema
+/// documents each edge.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+struct RegionParams {
+    #[schemars(description = "Left edge of the region as a fraction of the frame width (0 = left edge)")]
+    left: f64,
+    #[schemars(description = "Top edge of the region as a fraction of the frame height (0 = top edge)")]
+    top: f64,
+    #[schemars(description = "Width of the region as a fraction of the frame width")]
+    width: f64,
+    #[schemars(description = "Height of the region as a fraction of the frame height")]
+    height: f64,
+}
+
+impl RegionParams {
+    /// The engine region, pulled into the frame — a model's fractions are a
+    /// request, not a proof.
+    fn region(self) -> Region {
+        Region {
+            left: self.left,
+            top: self.top,
+            width: self.width,
+            height: self.height,
+        }
+        .normalized()
+    }
+
+    /// The region as the caption echoes it back, after normalization, so the
+    /// model's next crop is in the coordinates that were actually used.
+    fn describe(self) -> String {
+        let r = self.region();
+        format!(
+            "region left={:.3} top={:.3} width={:.3} height={:.3} of the full frame",
+            r.left, r.top, r.width, r.height
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -719,6 +766,12 @@ struct SkimParams {
     rows: Option<u32>,
     #[schemars(description = "Width of each grid cell in pixels (default 240)")]
     cell_width: Option<u32>,
+    #[schemars(
+        description = "Zoom into one cell of the sheet instead of building it: the 1-based, row-major cell number from a previous skim with the same range and grid. Returns that cell's moment as a single full-detail frame (max_width wide, from the original source) — the shortcut from 'cell 7 looks promising' to seeing it properly."
+    )]
+    cell: Option<u32>,
+    #[schemars(description = "Width of the zoomed cell frame in pixels when `cell` is given (default 640, capped at 1920)")]
+    max_width: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -727,6 +780,10 @@ struct TimelineFrameParams {
     time_secs: f64,
     #[schemars(description = "Maximum output width in pixels (default 640, capped at 1920)")]
     max_width: Option<u32>,
+    #[schemars(
+        description = "Zoom into part of the frame instead of seeing all of it: a rectangle in fractions of the full frame (0..1), `left`/`top` its top-left corner, `width`/`height` its size. The region is cropped out first and then scaled to max_width, so a quarter of the frame shows four times the detail for the same image cost — use it to check a face, on-screen text, a caption, a mask edge. Omit for the whole frame."
+    )]
+    region: Option<RegionParams>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1901,21 +1958,29 @@ impl KerfMcp {
         let id = parse_id(&p.asset_id)?;
         let project = self.project.clone();
         let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
+        let region = p.region;
         let jpeg = blocking(move || {
             // Resolve under the lock, decode with it released — mirrors the GUI's
             // `get_frame` so an agent drill-in can't stall the user's edits.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_preview_frame(&asset, time_secs, max_width, 4, true).map_err(core_err)
+            match region {
+                // A zoom is a request for detail, so it decodes the original at
+                // the best JPEG quality rather than the proxy at the preview one.
+                Some(r) => Project::decode_preview_region(&asset, time_secs, r.region(), max_width, ZOOM_QUALITY),
+                None => Project::decode_preview_frame(&asset, time_secs, max_width, 4, true),
+            }
+            .map_err(core_err)
         })
         .await?;
-        Ok(image_result(
-            format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0))),
-            jpeg,
-        ))
+        let mut caption = format!("asset {} @ {}", p.asset_id, fmt_ts(p.time_secs.max(0.0)));
+        if let Some(r) = region {
+            caption.push_str(&format!(", {}", r.describe()));
+        }
+        Ok(image_result(caption, jpeg))
     }
 
     #[tool(
-        description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then call get_frame to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
+        description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then pass `cell` (same range and grid) to see one cell at full detail, or call get_frame — with a `region` to zoom — to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
     )]
     async fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -1923,6 +1988,9 @@ impl KerfMcp {
         let rows = p.rows.unwrap_or(4).clamp(1, 8);
         let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
         let project = self.project.clone();
+        if let Some(cell) = p.cell {
+            return self.skim_cell(id, &p, columns, rows, cell).await;
+        }
         let (jpeg, times) = blocking(move || {
             // Resolve under the lock, sample the (columns × rows) frames with it
             // released — a contact sheet is many seeks and would otherwise freeze
@@ -1941,23 +2009,71 @@ impl KerfMcp {
         Ok(image_result(caption, jpeg))
     }
 
+    /// The `cell` form of [`Self::skim_asset`]: the moment one cell of a sheet
+    /// showed, decoded on its own at full detail. The sheet is never rebuilt —
+    /// the cell's timestamp is pure arithmetic over the same range and grid.
+    async fn skim_cell(
+        &self,
+        id: uuid::Uuid,
+        p: &SkimParams,
+        columns: u32,
+        rows: u32,
+        cell: u32,
+    ) -> Result<CallToolResult, McpError> {
+        let cells = columns * rows;
+        if cell < 1 || cell > cells {
+            return Err(McpError::invalid_params(
+                format!("cell must be 1..={cells} for a {columns}x{rows} sheet, got {cell}"),
+                None,
+            ));
+        }
+        let max_width = p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH);
+        let (start, end) = (p.start, p.end);
+        let project = self.project.clone();
+        let (jpeg, time) = blocking(move || {
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            // The same range defaults `decode_contact_sheet` applies, so the cell
+            // lands on the frame the sheet showed.
+            let start = start.unwrap_or(0.0).max(0.0);
+            let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
+            let time = kerf_core::contact_sheet_times(start, end, columns, rows)[(cell - 1) as usize];
+            let jpeg = Project::decode_preview_region(&asset, time, Region::FULL, max_width, ZOOM_QUALITY).map_err(core_err)?;
+            Ok::<_, McpError>((jpeg, time))
+        })
+        .await?;
+        Ok(image_result(
+            format!(
+                "cell {cell} of {columns}x{rows} sheet, asset {} @ {}",
+                p.asset_id,
+                fmt_ts(time)
+            ),
+            jpeg,
+        ))
+    }
+
     #[tool(
-        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made. A moment inside a transition is not: dissolves, dips and slides render as the plain cut."
+        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made; pass `region` to zoom into a detail of it. A moment inside a transition is not: dissolves, dips and slides render as the plain cut."
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
         let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
+        let region = p.region;
         let jpeg = blocking(move || {
             // Snapshot the inputs under the lock, composite with it released —
             // mirrors the GUI's `get_timeline_frame`.
             let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
-            Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width, 4).map_err(core_err)
+            match region {
+                Some(r) => Project::composite_timeline_region(&timeline, &assets, time_secs, r.region(), max_width, ZOOM_QUALITY),
+                None => Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width, 4),
+            }
+            .map_err(core_err)
         })
         .await?;
-        Ok(image_result(
-            format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0))),
-            jpeg,
-        ))
+        let mut caption = format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0)));
+        if let Some(r) = region {
+            caption.push_str(&format!(", {}", r.describe()));
+        }
+        Ok(image_result(caption, jpeg))
     }
 
     #[tool(description = "Summarise the timeline: total duration, track count, clips per track, and any per-track gaps")]
@@ -2121,7 +2237,13 @@ impl ServerHandler for KerfMcp {
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \
-             have assembled at a given time so you can check it on screen. \
+             have assembled at a given time so you can check it on screen. Look, \
+             then look closer: skim_asset with `cell` opens one sheet cell at \
+             full detail, and get_frame / preview_timeline take a `region` \
+             (fractions of the frame) that is cropped out and enlarged — the way \
+             to read a face, on-screen text, a caption against the safe area or \
+             a mask edge, since a whole frame at the same width shows a fraction \
+             of that detail. Prefer a region to a larger max_width. \
              Then assemble a non-destructive edit with the \
              cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
              (move_clip frees a clip to any position or same-kind track; \

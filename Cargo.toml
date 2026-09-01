@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kerf-core", "crates/kerf-app"]
 
 [workspace.package]
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 rust-version = "1.95"
 license = "PolyForm-Noncommercial-1.0.0"

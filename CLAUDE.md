@@ -518,7 +518,24 @@ contact-sheet montage of an asset + a text index of cell→timestamp, for findin
 parts) and `preview_timeline` (the composited cut at a timeline time) — return
 `Result<CallToolResult, McpError>` built by the `image_result` helper: a caption
 `Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
-actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). The `lock()`
+actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL).
+**Look, then look closer**: `get_frame` and `preview_timeline` take an optional
+`region` (a `Region` — fractions of the frame, normalized into it) that is
+cropped out *before* the scale to `max_width`, and `skim_asset` takes a `cell`
+that opens one sheet cell as a full frame (`contact_sheet_times` recomputes the
+cell's moment, so the sheet is never rebuilt). A vision model spends the same
+image tokens on whatever it is handed, so a quarter of the frame at 640 px
+shows four times the detail of the whole frame at 640 px — and beats a larger
+`max_width`, which costs more and still loses small text. A zoom reads the
+**original** source rather than the 1280 proxy (`decode_preview_region` — the
+proxy threw away the pixels being asked for), at `ZOOM_QUALITY` 2 instead of
+the preview's 4, and never upscales: the composite (`timeline_frame_region`)
+renders a canvas wide enough for the region alone to be `max_width`, capped at
+the delivery frame, then crops. A full region is the byte-identical plain
+decode. The caption echoes the region back after normalization so the model's
+next crop is in the coordinates that were actually used. There is deliberately
+no general image-ops tool — a crop for inspection is how a frame is presented,
+not an edit. The `lock()`
 helper sets `EditSource::Agent` per-op under the shared lock (the GUI's `project()`
 helper sets `User` the same way); every **mutating** tool goes through the `edit()`
 helper, which runs the op under the lock, **releases it**, and only then emits a

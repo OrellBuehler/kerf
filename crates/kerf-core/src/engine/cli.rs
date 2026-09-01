@@ -725,6 +725,76 @@ pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> 
     decode_frame(path, time_secs, &scale, "png", None, true)
 }
 
+/// A rectangle of a frame to look at more closely, as fractions of the full
+/// frame: `left`/`top` place its corner, `width`/`height` size it.
+///
+/// This is the *zoom* half of "look, then look closer": a vision model spends
+/// its image budget on whatever it is handed, so a quarter of the frame cropped
+/// out and scaled to the same width shows four times the detail of the whole
+/// frame for the same cost — a face, a caption, a mask edge. Nothing here is an
+/// edit; it is only how a frame is presented.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Region {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Region {
+    /// The smallest side a region may have, as a fraction of the frame: below
+    /// this a crop of a 640 px preview is a handful of pixels.
+    pub const MIN_SIDE: f64 = 0.02;
+
+    /// The whole frame, which is what "no region" means.
+    pub const FULL: Region = Region {
+        left: 0.0,
+        top: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+
+    /// Clamp into the frame: sides at least [`Region::MIN_SIDE`], the corner
+    /// inside, and the far edge pulled back to 1.0 by shrinking the size, not
+    /// by moving the corner — the corner is what the caller pointed at.
+    pub fn normalized(self) -> Region {
+        let n = |v: f64| if v.is_finite() { v } else { 0.0 };
+        let left = n(self.left).clamp(0.0, 1.0 - Self::MIN_SIDE);
+        let top = n(self.top).clamp(0.0, 1.0 - Self::MIN_SIDE);
+        let width = n(self.width).clamp(Self::MIN_SIDE, 1.0 - left);
+        let height = n(self.height).clamp(Self::MIN_SIDE, 1.0 - top);
+        Region {
+            left,
+            top,
+            width,
+            height,
+        }
+    }
+
+    /// Whether this is (within rounding) the whole frame — then no crop is
+    /// added, so a caller passing the full region gets the byte-identical
+    /// invocation it always got.
+    pub fn is_full(&self) -> bool {
+        let r = self.normalized();
+        r.left < 1e-6 && r.top < 1e-6 && r.width > 1.0 - 1e-6 && r.height > 1.0 - 1e-6
+    }
+
+    /// The `crop` filter for this region against whatever frame it is applied
+    /// to, in `iw`/`ih` terms so it needs no knowledge of the frame size. The
+    /// width and height are kept even: MJPEG is 4:2:0 and an odd crop would be
+    /// realigned by the filter to a size the scale after it cannot predict.
+    fn crop_filter(&self) -> String {
+        let r = self.normalized();
+        format!(
+            "crop=2*trunc(iw*{w:.4}/2):2*trunc(ih*{h:.4}/2):iw*{l:.4}:ih*{t:.4}",
+            w = r.width,
+            h = r.height,
+            l = r.left,
+            t = r.top
+        )
+    }
+}
+
 /// Decode a single frame at `time_secs` as **JPEG** bytes, scaled to at most
 /// `max_width` pixels wide, at `quality` (ffmpeg `-q:v`, 2 = best … 31 = worst).
 /// JPEG is dramatically smaller than the PNG of [`frame_at`], which matters when
@@ -734,6 +804,35 @@ pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> 
 pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
     decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate)
+}
+
+/// [`frame_jpeg`] of one `region` of the frame: the region is cropped out of
+/// the decoded frame *first* and then scaled to at most `max_width`, so the
+/// width budget is spent on the region rather than on the whole picture. Never
+/// upscaled past the source's own pixels — a zoom shows real detail or none.
+/// A full region is exactly [`frame_jpeg`].
+pub fn frame_jpeg_region(
+    path: &Path,
+    time_secs: f64,
+    region: Region,
+    max_width: u32,
+    quality: u8,
+    accurate: bool,
+) -> Result<Vec<u8>> {
+    if region.is_full() {
+        return frame_jpeg(path, time_secs, max_width, quality, accurate);
+    }
+    let vf = region_frame_filter(region, max_width);
+    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate)
+}
+
+/// Pure filter chain for [`frame_jpeg_region`] (unit-tested): crop, then scale
+/// to an even width no wider than `max_width` or the crop itself.
+fn region_frame_filter(region: Region, max_width: u32) -> String {
+    format!(
+        "{crop},scale='2*trunc(min({max_width},iw)/2)':-2",
+        crop = region.crop_filter()
+    )
 }
 
 /// Seek to `time_secs`, run the `-vf` chain on a single frame and pipe it out in
@@ -867,6 +966,18 @@ pub fn contact_sheet(
     Ok((output.stdout, times))
 }
 
+/// The source timestamp each cell of a `columns`×`rows` [`contact_sheet`] over
+/// `[start, end)` shows, row-major: the start of each of the equal slices the
+/// window is cut into. Public so a caller holding a sheet can turn "cell 7"
+/// back into a moment to look at more closely without re-sampling the sheet.
+pub fn contact_sheet_times(start: f64, end: f64, columns: u32, rows: u32) -> Vec<f64> {
+    let cells = (columns.max(1) * rows.max(1)) as usize;
+    let start = start.max(0.0);
+    let window = (end - start).max(0.0);
+    let step = if window > 0.0 { window / cells as f64 } else { 0.0 };
+    (0..cells).map(|k| start + step * k as f64).collect()
+}
+
 /// Pure arg builder for [`contact_sheet`] (no I/O, unit-tested): the ffmpeg
 /// argument list and the row-major per-cell timestamps. Frames are sampled at
 /// the start of each of `columns*rows` equal slices of the window via the `fps`
@@ -885,8 +996,7 @@ fn build_contact_sheet_args(
     let cells = (columns * rows) as usize;
     let start = start.max(0.0);
     let window = (end - start).max(0.0);
-    let step = if window > 0.0 { window / cells as f64 } else { 0.0 };
-    let times: Vec<f64> = (0..cells).map(|k| start + step * k as f64).collect();
+    let times = contact_sheet_times(start, end, columns, rows);
     // `fps` = one frame per slice over the seeked window; `tile` packs them and
     // `-frames:v 1` emits the single sheet. A degenerate window falls back to 1.
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
@@ -4422,7 +4532,32 @@ pub fn timeline_frame(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<u8>> {
-    run_still(timeline, assets, opts, t, max_width, &StillOutput::JpegPipe { quality })
+    run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
+}
+
+/// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
+/// rendered large enough that the region alone comes out `max_width` wide
+/// (capped at the delivery frame, so nothing is invented), then cropped — a
+/// zoom into the cut rather than a screenshot of it.
+pub fn timeline_frame_region(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    region: Region,
+    max_width: u32,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let region = (!region.is_full()).then_some(region);
+    run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        region,
+        &StillOutput::JpegPipe { quality },
+    )
 }
 
 /// Write the composited still at timeline time `t` to `path` as a **cover
@@ -4451,7 +4586,7 @@ pub fn export_still(
     };
     // `u32::MAX` asks for no cap: `build_still_args` clamps to the delivery
     // width, which is exactly the cover size.
-    run_still(timeline, assets, opts, t, u32::MAX, &out)?;
+    run_still(timeline, assets, opts, t, u32::MAX, None, &out)?;
     Ok(path.to_path_buf())
 }
 
@@ -4463,11 +4598,12 @@ fn run_still(
     opts: &ExportOptions,
     t: f64,
     max_width: u32,
+    region: Option<Region>,
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
-        let mut args = build_still_args(timeline, assets, o, t, max_width, out)?;
+        let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         cpu::limit_args(&mut args, cpu::budget_threads());
         let bin = ffmpeg_bin();
         let output = command(&bin)
@@ -4516,7 +4652,7 @@ fn build_timeline_frame_args(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<String>> {
-    build_still_args(timeline, assets, opts, t, max_width, &StillOutput::JpegPipe { quality })
+    build_still_args(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
 }
 
 /// Where a composited still is written, and in what image format.
@@ -4618,6 +4754,7 @@ fn build_still_args(
     opts: &ExportOptions,
     t: f64,
     max_width: u32,
+    region: Option<Region>,
     out: &StillOutput,
 ) -> Result<Vec<String>> {
     // Same gate as the export, so the still shows the cut that would render.
@@ -4625,8 +4762,15 @@ fn build_still_args(
     let timeline = &rendered;
 
     let fmt = export_format(timeline, assets, opts);
+    // A region zoom composites a canvas wide enough that the region alone is
+    // `max_width` — the delivery frame caps it, so a zoom never upscales.
+    let region = region.map(Region::normalized);
+    let canvas_width = match region {
+        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
+        None => max_width,
+    };
     // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
-    let ow = (max_width.min(fmt.width).max(2)) & !1;
+    let ow = (canvas_width.min(fmt.width).max(2)) & !1;
     let oh = ((((ow as u64) * (fmt.height as u64)) / (fmt.width.max(1) as u64)) as u32).max(2) & !1;
     let t = t.max(0.0);
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
@@ -4708,7 +4852,10 @@ fn build_still_args(
         chains.push(format!("[{cur}]{f}[{out}]", f = drawtext_still(ov, oh, t)));
         cur = out;
     }
-    chains.push(format!("[{cur}]null[outv]"));
+    match region {
+        Some(r) => chains.push(format!("[{cur}]{crop}[outv]", crop = r.crop_filter())),
+        None => chains.push(format!("[{cur}]null[outv]")),
+    }
     let filter = chains.join(";");
 
     args.extend([
@@ -5197,7 +5344,7 @@ mod tests {
             format: ImageFormat::Jpeg,
             quality: 2,
         };
-        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, &out).unwrap();
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         // The uncapped width resolves to the project's delivery frame, not to a
         // preview size — a cover is a delivered image.
         let graph = args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
@@ -5223,7 +5370,7 @@ mod tests {
             format: ImageFormat::Png,
             quality: 2,
         };
-        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, &out).unwrap();
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
     }
@@ -5953,6 +6100,90 @@ mod tests {
         assert!(joined.contains("-vcodec mjpeg"));
         assert!(joined.contains("-q:v 5"));
         assert!(joined.ends_with("pipe:1"));
+    }
+
+    /// A region zoom crops before it scales, so the width budget lands on the
+    /// region; the whole frame is left byte-identical to the plain decode.
+    #[test]
+    fn region_frame_crops_then_scales_and_a_full_region_is_no_crop() {
+        let r = Region {
+            left: 0.25,
+            top: 0.1,
+            width: 0.5,
+            height: 0.3,
+        };
+        let vf = region_frame_filter(r, 640);
+        assert_eq!(
+            vf,
+            "crop=2*trunc(iw*0.5000/2):2*trunc(ih*0.3000/2):iw*0.2500:ih*0.1000,scale='2*trunc(min(640,iw)/2)':-2"
+        );
+        assert!(Region::FULL.is_full());
+        assert!(!r.is_full());
+    }
+
+    /// Whatever the model asks for is pulled into the frame: a corner past the
+    /// far edge comes back in, and a region hanging over the edge is shrunk
+    /// rather than moved — the corner is the thing that was pointed at.
+    #[test]
+    fn region_normalizes_into_the_frame() {
+        let r = Region {
+            left: 0.8,
+            top: -0.5,
+            width: 0.6,
+            height: f64::NAN,
+        }
+        .normalized();
+        assert!((r.left - 0.8).abs() < 1e-9);
+        assert_eq!(r.top, 0.0);
+        assert!((r.width - 0.2).abs() < 1e-9, "shrunk to the edge: {r:?}");
+        assert_eq!(r.height, Region::MIN_SIDE);
+        let far = Region {
+            left: 2.0,
+            top: 0.0,
+            width: 1.0,
+            height: 1.0,
+        }
+        .normalized();
+        assert!((far.left - (1.0 - Region::MIN_SIDE)).abs() < 1e-9);
+        assert!((far.width - Region::MIN_SIDE).abs() < 1e-9);
+    }
+
+    /// Zooming the composite renders a canvas large enough for the region to
+    /// fill the requested width, then crops it — never past the delivery frame.
+    #[test]
+    fn timeline_region_widens_the_canvas_and_crops_the_composite() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let r = Region {
+            left: 0.5,
+            top: 0.5,
+            width: 0.25,
+            height: 0.25,
+        };
+        let out = StillOutput::JpegPipe { quality: 2 };
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, 320, Some(r), &out).unwrap();
+        let graph = args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
+        // 320 / 0.25 = 1280 canvas, so the crop comes out 320 wide.
+        assert!(graph.contains("s=1280x720"), "{graph}");
+        assert!(
+            graph.ends_with("crop=2*trunc(iw*0.2500/2):2*trunc(ih*0.2500/2):iw*0.5000:ih*0.5000[outv]"),
+            "{graph}"
+        );
+        // Capped at the delivery frame: a zoom invents no pixels.
+        let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, 1920, Some(r), &out).unwrap();
+        let graph = args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
+        assert!(graph.contains("s=1920x1080"), "{graph}");
+        // Without a region the graph is what it always was.
+        let plain = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, 320, None, &out).unwrap();
+        let graph = plain[plain.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone();
+        assert!(graph.contains("s=320x180") && graph.ends_with("null[outv]"), "{graph}");
+    }
+
+    #[test]
+    fn contact_sheet_times_match_the_sheet() {
+        let (_, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3);
+        assert_eq!(times, contact_sheet_times(10.0, 20.0, 2, 2));
     }
 
     #[test]
