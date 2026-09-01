@@ -3139,7 +3139,11 @@ fn graph_script_flag() -> &'static str {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("-filter_complex_script"))
             .unwrap_or(false);
         tracing::debug!(legacy, "probed ffmpeg for -filter_complex_script");
-        if legacy { "-filter_complex_script" } else { "-/filter_complex" }
+        if legacy {
+            "-filter_complex_script"
+        } else {
+            "-/filter_complex"
+        }
     })
 }
 
