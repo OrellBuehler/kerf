@@ -1374,6 +1374,76 @@ async fn export_timeline(
     .await
 }
 
+/// Render the cut once per delivery frame — one file per shape beside
+/// `output_path`, named by shape (`cut-9x16.mp4`). With `smart_crop`, every
+/// shot is framed for every shape first (one revision, reused by later
+/// exports); the project frame's own crop is never touched. Streams the same
+/// `export-progress` event as a single export, with `variant` / `total` added.
+#[tauri::command]
+async fn export_variants(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    output_path: String,
+    formats: Vec<Delivery>,
+    smart_crop: bool,
+    options: ExportOptions,
+) -> CmdResult<Vec<String>> {
+    if formats.is_empty() {
+        return Err("pick at least one delivery frame".to_string());
+    }
+    let base = std::path::PathBuf::from(&output_path);
+    let mut deliveries: Vec<Delivery> = Vec::new();
+    for d in formats {
+        let d = Delivery::new(d.width, d.height, d.fit);
+        if !deliveries.contains(&d) {
+            deliveries.push(d);
+        }
+    }
+    let variants: Vec<kerf_core::ExportVariant> = deliveries
+        .iter()
+        .map(|d| kerf_core::ExportVariant::beside(&base, *d))
+        .collect();
+    let shared = state.project.clone();
+    let cancel = state.export_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    blocking(move || {
+        // Frame first — plan under the lock, sample without it, apply under it
+        // again — then snapshot and render with the lock released, like a
+        // single export.
+        if smart_crop {
+            let plan = lock_user(&shared).framing_inputs(&deliveries).map_err(|e| e.to_string())?;
+            if !plan.jobs.is_empty() {
+                let framings = Project::sample_framings(&plan).map_err(|e| e.to_string())?;
+                let framed = lock_user(&shared).apply_framings(&framings).map_err(|e| e.to_string())?;
+                if framed > 0 {
+                    let _ = app.emit("project-changed", ());
+                }
+            }
+        }
+        let (timeline, assets) = {
+            let project = lock_user(&shared);
+            (
+                project.timeline().map_err(|e| e.to_string())?,
+                project.list_assets().map_err(|e| e.to_string())?,
+            )
+        };
+        let mut on_progress = |p: kerf_core::VariantProgress| {
+            let _ = app.emit("export-progress", p);
+        };
+        let (status, _) = kerf_core::render_variants(&timeline, &assets, &variants, &options, &mut on_progress, &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(|e| e.to_string())?;
+        match status {
+            kerf_core::RenderStatus::Completed => Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect()),
+            // The variant in flight is already gone; the finished ones stay.
+            kerf_core::RenderStatus::Cancelled => Err("export cancelled".to_string()),
+        }
+    })
+    .await
+}
+
 /// Write the composited frame at `time_secs` to `output_path` as a **cover
 /// image** — full delivery resolution, decoded from the original media rather
 /// than a preview proxy. `format` follows the file extension when omitted.
@@ -1759,6 +1829,7 @@ pub fn run() {
             remove_task,
             hw_encoders,
             export_timeline,
+            export_variants,
             cancel_export,
             cancel_analysis,
             export_cover,

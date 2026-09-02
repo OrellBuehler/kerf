@@ -444,7 +444,37 @@ no editing logic in the adapter.
   *before* the fit scale, so the preview, the still and the export all follow and the
   inspector's sliders still have the last word. Clips already the delivery shape and
   360-reframed clips are left out (that camera *is* the framing decision), and a pass
-  that changes nothing writes no revision. The **agent task queue** is a real `tasks` table (one row per `Task`,
+  that changes nothing writes no revision.
+  **One cut, every platform**: the same project can be delivered at several
+  frames in one pass (a 9:16 Reel, a 1:1 post and a 16:9 upload), which is
+  what exposed the tension in smart crop — its crop is baked into the
+  transform for *one* shape, and framing for a second overwrote the first. So
+  a clip carries **`Clip.framings`**, a crop per delivery shape (`Framing`,
+  keyed by the reduced ratio `Delivery::ratio`, `(9, 16)`) beside the
+  transform's, and **`Timeline::for_delivery(delivery)`** (pure +
+  unit-tested) is the render of the cut at another frame: a copy whose format
+  is that delivery and whose clips wear the crop they carry for its shape — the
+  same change-the-timeline-not-the-graph pattern as `for_render`, so the graph
+  builders never learned about it. A clip with no framing for the shape keeps
+  the crop it has (never throw away a hand-made crop), which is why the framing
+  pass writes an *identity* framing for a shot already that shape: a lookup
+  miss would otherwise leave a 16:9 shot cut 9:16 delivering at 16:9 as the
+  strip its 9:16 crop keeps. Generated captions are re-fit to the new aspect
+  (`fit_size` again); typed titles are left alone. The framing pass is the
+  smart-crop trio again for the *other* shapes — `framing_inputs(deliveries)`
+  under the lock (the project frame's own ratio excluded, duplicates
+  collapsed), the static `sample_framings` with it released (**one** salience
+  decode per clip, a crop per shape from it — the map is a property of the
+  shot, the crop of the frame), `apply_framings` under it as one `Frame for
+  9:16, 1:1` revision that a re-run leaves alone — and `engine::render_variants`
+  renders `ExportVariant`s (a `Delivery` + an output path; `ExportVariant::beside`
+  names each file by shape, `cut-9x16.mp4`, an `x` because `:` is not a Windows
+  filename character) **one after another**, each variant's `resolution` / `fit`
+  taken from its delivery, reporting a `VariantProgress` (which file of how many
+  plus the overall fraction). Sequential on purpose: an export takes every core
+  it is given and `cpu::lease` would serialize them anyway, and a cancel is
+  then clean — the file in flight is deleted, the finished ones kept.
+  The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
   ready → done` (or `failed`) lifecycle in `model.rs`.
@@ -564,7 +594,15 @@ both writes the GUI picker makes, though the picker itself only re-reads at
 launch, so a model an agent selects shows there on the next start.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
-whatever was in the middle). `generate_captions` / `clear_captions` caption the
+whatever was in the middle). `export_variants` is the one-call multi-format
+delivery: `formats` are shape names (`9:16` / `1:1` / `4:5` / `16:9`, or
+`WxH` — `Delivery::parse`), it runs the framing pass first unless
+`smart_crop` is false (the one write it makes, `project-changed` only when a
+clip actually changed), renders through `render_variants` with progress on
+the client's token naming the file in flight, and reports each file with the
+platforms it is `ready_for` and its non-tip issues — judged at *that* file's
+frame via `cut_summary(Some(frame))`, so the agent does not run
+`platform_check` per variant afterwards. `generate_captions` / `clear_captions` caption the
 cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
 prefer the latter for a vertical cut, since nothing in a tool list tells an
 agent that the subtitle shape is not what social captions look like. They also
@@ -871,7 +909,15 @@ loudness normalize, and a **Range: In → out** choice when marks are set. It **
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
 that frame when one matches, else the default preset with its resolution cleared so
 "Project frame" renders — otherwise a 9:16 project opened its export already
-landscape and the readiness panel warned about the shape the user had just chosen. `MediaBin`'s
+landscape and the readiness panel warned about the shape the user had just chosen.
+Its **Deliver to** section is the multi-format export: shape chips (the
+`DELIVERY_PRESETS` minus Source) that each add a file beside the chosen path
+named by shape (`variantPath`, the bun-tested mirror of
+`ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
+per-file readiness line judged at that file's frame (`platformCheck([w, h])`),
+in place of the single panel — with shapes picked, the Scaling rows hide (each
+delivery brings its own resolution and fit) and the button reads `Export N
+files`; `export-progress` then carries `variant` / `total`. `MediaBin`'s
 **Transcript tab is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which

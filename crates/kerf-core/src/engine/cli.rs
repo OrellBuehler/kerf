@@ -11,13 +11,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use super::cpu;
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap,
-    StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Delivery, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
+    SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -3092,6 +3093,97 @@ pub fn render_with_progress(
         }
         result => result,
     }
+}
+
+/// One delivery of a multi-format export: the frame and where its file goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportVariant {
+    pub delivery: Delivery,
+    pub output: PathBuf,
+}
+
+impl ExportVariant {
+    /// The variant's file beside `base`, its shape spliced into the name:
+    /// `cut.mp4` at 9:16 becomes `cut-9x16.mp4`. The `x` rather than a `:`
+    /// because a colon is not a filename character on Windows.
+    pub fn beside(base: &Path, delivery: Delivery) -> Self {
+        let (w, h) = delivery.ratio();
+        let stem = base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = match base.extension() {
+            Some(ext) => format!("{stem}-{w}x{h}.{}", ext.to_string_lossy()),
+            None => format!("{stem}-{w}x{h}"),
+        };
+        Self {
+            delivery,
+            output: base.with_file_name(name),
+        }
+    }
+}
+
+/// Progress across a multi-format export: the overall [`ExportProgress`] plus
+/// which variant is rendering, so a bar can say "2 of 3 · 9:16".
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct VariantProgress {
+    /// Zero-based index of the variant being rendered.
+    pub variant: usize,
+    pub total: usize,
+    /// Progress through all of them: each variant owns an equal share.
+    pub fraction: f64,
+    pub elapsed_secs: f64,
+    /// Time left across the remaining variants, estimated from how long the
+    /// completed share has taken.
+    pub eta_secs: Option<f64>,
+}
+
+/// Render the same cut once per variant — one file per delivery frame, each
+/// shot wearing the crop it carries for that shape ([`Timeline::for_delivery`]).
+///
+/// Variants render one after another rather than at once: an export already
+/// takes every core it is given (`cpu::lease` would serialize them anyway),
+/// and a cancelled batch is then clean — the variant in flight is deleted like
+/// a cancelled single export, the ones already finished are kept, and the ones
+/// not started never existed. `opts` is the encode shared by all of them; its
+/// `resolution` and `fit` are replaced per variant by the delivery. Returns the
+/// status and how many files were completed.
+pub fn render_variants(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(RenderStatus, usize)> {
+    if variants.is_empty() {
+        return Err(Error::InvalidArgument("no delivery formats to export".to_string()));
+    }
+    let total = variants.len();
+    let started = Instant::now();
+    for (i, variant) in variants.iter().enumerate() {
+        let framed = timeline.for_delivery(variant.delivery);
+        let per_variant = ExportOptions {
+            resolution: Some((variant.delivery.width, variant.delivery.height)),
+            fit: variant.delivery.fit,
+            ..opts.clone()
+        };
+        let mut on_progress = |p: ExportProgress| {
+            let fraction = (i as f64 + p.fraction.clamp(0.0, 1.0)) / total as f64;
+            let elapsed_secs = started.elapsed().as_secs_f64();
+            let eta_secs = (fraction > 0.0).then(|| elapsed_secs / fraction - elapsed_secs);
+            progress(VariantProgress {
+                variant: i,
+                total,
+                fraction,
+                elapsed_secs,
+                eta_secs,
+            });
+        };
+        let status = render_with_progress(&framed, assets, &variant.output, &per_variant, &mut on_progress, cancel)?;
+        if status == RenderStatus::Cancelled {
+            let _ = std::fs::remove_file(&variant.output);
+            return Ok((RenderStatus::Cancelled, i));
+        }
+    }
+    Ok((RenderStatus::Completed, total))
 }
 
 /// One export run with `opts` exactly as given (no fallback).
@@ -8209,6 +8301,116 @@ mod tests {
         // The window is off-centre — a plain Cover would have taken the middle.
         assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
         assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");
+    }
+
+    #[test]
+    fn variant_files_land_beside_the_base_named_by_shape() {
+        let v = ExportVariant::beside(Path::new("/renders/cut.mp4"), Delivery::new(1080, 1920, Fit::Cover));
+        assert_eq!(v.output, PathBuf::from("/renders/cut-9x16.mp4"));
+        let v = ExportVariant::beside(Path::new("cut"), Delivery::new(1080, 1080, Fit::Cover));
+        assert_eq!(v.output, PathBuf::from("cut-1x1"));
+        let v = ExportVariant::beside(Path::new("/r/my.cut.mov"), Delivery::new(1920, 1080, Fit::Contain));
+        assert_eq!(v.output, PathBuf::from("/r/my.cut-16x9.mov"));
+    }
+
+    #[test]
+    fn each_variant_renders_its_own_frame_and_its_own_crop() {
+        let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
+        let mut clip = make_clip(asset.id, 0.0, 5.0, 0.0);
+        // Cut 9:16 with a left-leaning smart crop in the transform, and a
+        // different framing kept for 1:1.
+        clip.transform.crop_left = 0.05;
+        clip.transform.crop_right = 0.6336;
+        clip.framings.push(crate::model::Framing {
+            aspect_w: 1,
+            aspect_h: 1,
+            crop_left: 0.3,
+            crop_right: 0.2625,
+            crop_top: 0.0,
+            crop_bottom: 0.0,
+        });
+        let mut timeline = timeline_of(vec![video_track(vec![clip])]);
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+
+        let graph_for = |d: Delivery| {
+            let framed = timeline.for_delivery(d);
+            let opts = ExportOptions {
+                resolution: Some((d.width, d.height)),
+                fit: d.fit,
+                ..ExportOptions::default()
+            };
+            build_export_args(&framed, &[asset.clone()], "out.mp4", &opts)
+                .unwrap()
+                .join(" ")
+        };
+        let vertical = graph_for(Delivery::new(1080, 1920, Fit::Cover));
+        assert!(vertical.contains("scale=1080:1920"), "{vertical}");
+        assert!(
+            vertical.contains("x=iw*0.05"),
+            "the project frame keeps its own crop: {vertical}"
+        );
+
+        let square = graph_for(Delivery::new(1080, 1080, Fit::Cover));
+        assert!(square.contains("scale=1080:1080"), "{square}");
+        assert!(
+            square.contains("x=iw*0.3"),
+            "the 1:1 delivery wears the 1:1 framing: {square}"
+        );
+        assert!(!square.contains("x=iw*0.05"), "{square}");
+
+        // A shape nothing was framed for keeps the crop it has, and the
+        // delivery's own fit.
+        let wide = graph_for(Delivery::new(1920, 1080, Fit::Contain));
+        assert!(wide.contains("scale=1920:1080"), "{wide}");
+        assert!(wide.contains("x=iw*0.05"), "{wide}");
+    }
+
+    /// End to end: two files from one cut, each at its delivery frame. Run with
+    /// `cargo test -p kerf-core --no-default-features -- --ignored renders_every`.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn renders_every_variant_to_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("kerf-variants-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success(), "could not synthesize test media");
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(640, 360, 30.0)];
+        let timeline = timeline_of(vec![video_track(vec![make_clip(asset.id, 0.0, 2.0, 0.0)])]);
+
+        let base = dir.join("cut.mp4");
+        let variants = vec![
+            ExportVariant::beside(&base, Delivery::new(180, 320, Fit::Cover)),
+            ExportVariant::beside(&base, Delivery::new(200, 200, Fit::Cover)),
+        ];
+        let mut ticks = Vec::new();
+        let (status, done) = render_variants(
+            &timeline,
+            &[asset],
+            &variants,
+            &ExportOptions::default(),
+            &mut |p| ticks.push(p),
+            &|| false,
+        )
+        .expect("render");
+        assert_eq!((status, done), (RenderStatus::Completed, 2));
+        for (v, (w, h)) in variants.iter().zip([(180, 320), (200, 200)]) {
+            let probed = probe(&v.output).expect("probe the variant");
+            let video = probed.streams.iter().find(|s| s.kind == StreamKind::Video).expect("video");
+            assert_eq!((video.width, video.height), (Some(w), Some(h)), "{}", v.output.display());
+        }
+        assert!(ticks.iter().any(|p| p.variant == 1), "progress names the second variant");
+        assert!(ticks.iter().all(|p| p.total == 2 && (0.0..=1.0).contains(&p.fraction)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End to end against the real `ffmpeg` binary: synthesize a 16:9 shot whose
