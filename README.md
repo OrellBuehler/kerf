@@ -63,16 +63,20 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, ripple delete, markers, mute/solo/lock, snapping to edges / playhead / **beats**. |
 | **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle and audible Web-Audio scrub. |
 | **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
+| **Smart crop** | Reshaping 16:9 to 9:16 throws away most of one axis. `smart_crop` samples where each shot's content actually is (edge detail + motion, no model to ship) and writes the crop that keeps it, per clip — an ordinary transform the sliders can still override. |
+| **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. **Cover frames** save at the full delivery resolution. |
 | **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
 | **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
+| **Transitions & masks** | Eleven transitions — crossfade, dip to black / white, **slide** and **push** in four directions — that borrow the outgoing clip's handle and degrade to a hard cut when there is none. **Masks** cut a clip to a feathered rectangle or ellipse so a lower track shows through: a blurred face is a duplicated shot above, blurred and masked. |
 | **Keyframe animation** | Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead. |
 | **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. An **Insta360 lens pair imports as one 360 asset** — Kerf stitches the two capture files into an equirect sphere once and caches it. Spherical sources are detected on import; anything unflagged can be marked by hand. |
-| **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, one-click **captions from a transcript**, and SRT export. |
+| **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, and SRT export. **Captions follow the cut**: the transcript is projected through the clips that actually show its footage (trim / speed / reverse honored), so words you cut out get no caption — in a subtitle **Lines** style or the social **Word punch** style, one large word on the beat of the speech, fitted to the delivery frame. |
 | **Edit by transcript** | The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and `×` cuts that sentence out of the timeline and ripples the gap closed. |
-| **Smart mixing** | Per-track **ducking** (music dips under dialogue via sidechain) and single-pass **loudnorm** to −14 LUFS on export. |
+| **Smart mixing** | A **mixer strip** per audible track (fader + pan, mirrored exactly in preview), per-track **ducking** (music dips under dialogue via sidechain) and single-pass **loudnorm** to −14 LUFS on export. |
 | **GPU-accelerated export** | NVENC / QSV / VideoToolbox / AMF are **verified with a real test encode** before being offered, hardware decode falls back to software on its own, and **range export** renders just the region between your in/out marks. |
-| **Agent workflow** | 78 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **Agent workflow** | 87 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **Plays nicely with your machine** | One heavy FFmpeg job at a time, at a **CPU budget** you set (Background / Balanced / Full speed in Settings, or `KERF_CPU_PERCENT`) and below-normal priority — an agent analyzing eight sources no longer takes the desktop down. Every toast lands in a **notification center**, so a failure is still readable after it fades. |
 | **Auto-update** | The app updates itself from its own GitHub releases; a bundle only installs if its **minisign signature** verifies against the embedded public key. |
 
 ---
@@ -127,15 +131,17 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (78)
+### The tools (87)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
-`list_assets` · `get_asset_metadata` · `analyze_asset` · `get_timeline_state` ·
-`timeline_summary` · `get_waveform` · `get_energy` · **`get_frame`** (drill-in frame) ·
-**`skim_asset`** (contact-sheet montage) · **`preview_timeline`** (the composited cut) —
-the last three return images the model can see.
+`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` ·
+`get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
+**`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
+**`preview_timeline`** (the composited cut) — the last three return images the model can
+see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of the
+frame at full source detail.
 </details>
 
 <details>
@@ -145,27 +151,29 @@ the last three return images the model can see.
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
-`snap_to_beats` · `extract_audio` · `concatenate`
+`snap_to_beats` · `smart_crop` · `extract_audio` · `concatenate`
 </details>
 
 <details>
 <summary><b>Style & animate</b></summary>
 
 `set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
-`set_transition` · `set_video_effects` · `set_audio_effects` · `set_keyframes` ·
-`add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
-`set_reframe_keyframes` · `add_reframe_keyframe` · `add_overlay` · `update_overlay` ·
-`remove_overlay` · `set_overlay_keyframes` · `captions_from_transcript` · `export_srt` ·
-`list_fonts` · `set_delivery_format` · `set_asset_projection`
+`set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
+`set_keyframes` · `add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
+`set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
+`add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
+`generate_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
+`set_delivery_format` · `set_asset_projection`
 </details>
 
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `stage_edits` · `staged_diff` · `apply_staged_edits` ·
-`discard_staged_edits` · `revision_diff` · `list_tasks` · `add_task` · `claim_next_task` ·
-`complete_task` · `fail_task` · `resolve_task` · `remove_task` · `history` · `undo` ·
-`redo` · `revert_to` · `transcription_status` · `download_speech_model`
+`export` · `export_capabilities` · `export_cover` · `platform_check` · `stage_edits` ·
+`staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
+`list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
+`resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·
+`transcription_status` · `set_speech_model` · `download_speech_model`
 </details>
 
 Every mutating tool emits a `project-changed` event, so the agent's proposal appears in
@@ -282,8 +290,8 @@ Kerf is a working editor under active development — not a scaffold. The timeli
 preview, transcript, analysis, effects, keyframes, captions, playback and export are all
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
-**Roadmap:** a live activity stream pushed from the MCP server (the queue is polled
-today), transitions beyond crossfade / dip-to-black, and audible reverse shuttle.
+**Roadmap:** exporting one cut at every delivery frame in a single pass, a live activity
+stream pushed from the MCP server (the queue is polled today), and audible reverse shuttle.
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 

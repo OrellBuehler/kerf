@@ -12,7 +12,7 @@
   a: >-
     Most tools bolt a chatbot onto an editor and let it script a black box. Kerf inverts
     that: the editor is an API, exposed twice over one shared project — as the GUI you
-    click, and as 78 Model Context Protocol tools an agent calls. There is no import or
+    click, and as 87 Model Context Protocol tools an agent calls. There is no import or
     export round-trip and no second copy of the truth.
 - q: Which AI assistants can drive Kerf?
   a: >-
