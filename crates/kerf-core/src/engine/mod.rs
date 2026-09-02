@@ -47,7 +47,7 @@ pub use cli::{
     detect_silence, export_still, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy, hw_encoders, insta360_pair,
     proxy_path, proxy_width, ready_proxy, salience_map, stitch_insta360, stitched_path, stream_preview, timeline_frame,
     timeline_frame_region, validate_export, waveform, Container, ExportOptions, ExportProgress, Fit, ImageFormat, PreviewFrame,
-    RateControl, Region, RenderStatus,
+    ExportVariant, RateControl, Region, RenderStatus, VariantProgress,
 };
 
 pub(crate) use cli::insta360_pair_name;
@@ -116,4 +116,16 @@ pub fn render_with_progress(
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
     cli::render_with_progress(timeline, assets, output, opts, progress, cancel)
+}
+
+/// Render one file per delivery frame — see [`cli::render_variants`].
+pub fn render_variants(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(RenderStatus, usize)> {
+    cli::render_variants(timeline, assets, variants, opts, progress, cancel)
 }

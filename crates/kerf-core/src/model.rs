@@ -1508,6 +1508,13 @@ pub struct Clip {
     /// track shows through. `None` is the whole frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<Mask>,
+    /// Crops for delivery shapes other than the one the project is cut for —
+    /// what lets one cut render as a 9:16 Reel *and* a 1:1 post with each shot
+    /// framed for each. Written by the multi-format export's framing pass, read
+    /// only by [`Timeline::for_delivery`]; the project frame's own crop stays in
+    /// `transform`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub framings: Vec<Framing>,
     /// Whether this clip renders. A disabled clip keeps its place on the
     /// timeline (and its trims, effects and keyframes) but is dropped before the
     /// render graph is built — the per-clip counterpart of muting a track.
@@ -1548,7 +1555,29 @@ impl Clip {
             keyframes: Vec::new(),
             reframe: None,
             mask: None,
+            framings: Vec::new(),
             enabled: true,
+        }
+    }
+
+    /// The crop this clip carries for a delivery shape, if it was framed for it.
+    pub fn framing_for(&self, ratio: (u32, u32)) -> Option<&Framing> {
+        self.framings.iter().find(|f| f.ratio() == ratio)
+    }
+
+    /// Record the crop for one delivery shape, replacing an earlier one for the
+    /// same shape. Returns whether anything changed.
+    pub fn set_framing(&mut self, framing: Framing) -> bool {
+        match self.framings.iter_mut().find(|f| f.ratio() == framing.ratio()) {
+            Some(existing) if *existing == framing => false,
+            Some(existing) => {
+                *existing = framing;
+                true
+            }
+            None => {
+                self.framings.push(framing);
+                true
+            }
         }
     }
 
@@ -2000,6 +2029,98 @@ impl Delivery {
     pub fn aspect(&self) -> f64 {
         self.width as f64 / self.height.max(1) as f64
     }
+
+    /// The frame's shape reduced to lowest terms — `(9, 16)` for 1080x1920 —
+    /// which is what a per-clip [`Framing`] is keyed by, so a 720x1280 render
+    /// and a 1080x1920 one share the crop.
+    pub fn ratio(&self) -> (u32, u32) {
+        reduce_ratio(self.width, self.height)
+    }
+
+    /// The shape as people write it: `9:16`.
+    pub fn ratio_label(&self) -> String {
+        let (w, h) = self.ratio();
+        format!("{w}:{h}")
+    }
+
+    /// The delivery frame a shape name stands for: `"9:16"`, `"1:1"`, `"4:5"`,
+    /// `"16:9"` — the sizes the app's delivery picker uses, with the fit that
+    /// picker pairs them with (a vertical or square frame fills and crops, the
+    /// landscape one keeps the whole picture) — or an explicit `WxH`, which
+    /// covers when it is not 16:9. `None` for anything else.
+    pub fn parse(name: &str) -> Option<Delivery> {
+        let name = name.trim();
+        let (w, h) = match name {
+            "9:16" | "vertical" | "portrait" => (1080, 1920),
+            "1:1" | "square" => (1080, 1080),
+            "4:5" => (1080, 1350),
+            "16:9" | "landscape" => (1920, 1080),
+            _ => {
+                let (w, h) = name.split_once(['x', 'X', '×'])?;
+                (w.trim().parse().ok()?, h.trim().parse().ok()?)
+            }
+        };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let fit = if reduce_ratio(w, h) == (16, 9) { Fit::Contain } else { Fit::Cover };
+        Some(Delivery::new(w, h, fit))
+    }
+}
+
+fn reduce_ratio(w: u32, h: u32) -> (u32, u32) {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let d = gcd(w, h).max(1);
+    (w / d, h / d)
+}
+
+/// A crop a clip carries for **one** delivery shape it is not being cut in.
+///
+/// Smart crop writes its result into `Transform.crop_*`, which is right for the
+/// frame the project is cut for and wrong for every other: the crop that keeps
+/// the subject in a 9:16 Reel throws the subject away in a 1:1 post, and
+/// re-framing for the second shape overwrote the first. A `Framing` is that
+/// second answer kept beside the first, keyed by the reduced shape, so one cut
+/// can be delivered at several frames with each shot framed for each. It is
+/// only read by [`Timeline::for_delivery`] — the ordinary render of the project
+/// frame never sees it, so a project with none renders byte-identically.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Framing {
+    /// The delivery shape this crop is for, in lowest terms — `(9, 16)`.
+    pub aspect_w: u32,
+    pub aspect_h: u32,
+    /// Fraction of the source cropped from each edge.
+    pub crop_left: f64,
+    pub crop_right: f64,
+    pub crop_top: f64,
+    pub crop_bottom: f64,
+}
+
+impl Framing {
+    pub fn new(ratio: (u32, u32), crop: &CropFrame) -> Self {
+        Self {
+            aspect_w: ratio.0,
+            aspect_h: ratio.1,
+            crop_left: crop.left,
+            crop_right: crop.right,
+            crop_top: crop.top,
+            crop_bottom: crop.bottom,
+        }
+    }
+
+    pub fn ratio(&self) -> (u32, u32) {
+        (self.aspect_w, self.aspect_h)
+    }
+
+    pub fn ratio_label(&self) -> String {
+        format!("{}:{}", self.aspect_w, self.aspect_h)
+    }
+
+    fn crop(&self) -> (f64, f64, f64, f64) {
+        (self.crop_left, self.crop_right, self.crop_top, self.crop_bottom)
+    }
 }
 
 /// A coarse map of where a shot's *content* is: `rows`×`cols` non-negative
@@ -2036,7 +2157,7 @@ const CROP_SEARCH_STEPS: usize = 240;
 const ASPECT_TOLERANCE: f64 = 0.01;
 
 /// A crop window as the per-edge source fractions [`Transform`] takes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CropFrame {
     pub left: f64,
     pub right: f64,
@@ -2328,6 +2449,60 @@ impl Timeline {
             overlays: self.overlays.clone(),
             markers: self.markers.clone(),
             format: self.format,
+        }
+    }
+
+    /// The same cut delivered at another frame: a copy whose format is
+    /// `delivery` and whose clips wear the crop they carry for *that* shape.
+    ///
+    /// This is the multi-format export's whole trick, and it is the same one
+    /// `for_render` uses — change the timeline, not the graph. A clip framed for
+    /// the shape ([`Clip::framing_for`]) swaps that crop in for its transform's;
+    /// one that never was keeps whatever crop it has, since the alternative is
+    /// throwing away a crop someone made by hand. Generated captions are re-fit
+    /// to the new aspect the way [`Timeline::captions`] fit them to the old one
+    /// (a 9:16 frame is half as wide, and `drawtext` draws off the edge rather
+    /// than wrapping); a typed title is left alone. Delivering the shape the
+    /// project is already cut for changes only the size.
+    pub fn for_delivery(&self, delivery: Delivery) -> Timeline {
+        let ratio = delivery.ratio();
+        let same_shape = self.format.is_some_and(|f| f.ratio() == ratio);
+        let aspect = delivery.aspect();
+        Timeline {
+            tracks: self
+                .tracks
+                .iter()
+                .map(|track| Track {
+                    clips: track
+                        .clips
+                        .iter()
+                        .map(|clip| {
+                            let mut clip = clip.clone();
+                            if !same_shape {
+                                if let Some(f) = clip.framing_for(ratio).copied() {
+                                    let t = &mut clip.transform;
+                                    (t.crop_left, t.crop_right, t.crop_top, t.crop_bottom) = f.crop();
+                                }
+                            }
+                            clip
+                        })
+                        .collect(),
+                    ..track.clone()
+                })
+                .collect(),
+            overlays: self
+                .overlays
+                .iter()
+                .map(|o| {
+                    let mut o = o.clone();
+                    if o.generated && !same_shape {
+                        o.size = fit_size(&o.text, o.size, aspect);
+                    }
+                    o
+                })
+                .collect(),
+            markers: self.markers.clone(),
+            format: Some(delivery),
         }
     }
 
@@ -2823,6 +2998,17 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     }
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));
+    // A framing pass before a multi-format export is an edit like any other,
+    // and one an agent proposal has to be able to show.
+    let framed: Vec<String> = after
+        .framings
+        .iter()
+        .filter(|f| before.framing_for(f.ratio()) != Some(*f))
+        .map(Framing::ratio_label)
+        .collect();
+    if !framed.is_empty() {
+        parts.push(format!("framed for {}", framed.join(", ")));
+    }
     if before.transition_in != after.transition_in {
         parts.push(match &after.transition_in {
             None => "transition removed".to_string(),
@@ -3352,6 +3538,121 @@ mod tests {
             format: None,
         };
         assert!(tl.for_render().tracks[0].clips.is_empty());
+    }
+
+    fn framed(ratio: (u32, u32), left: f64, right: f64) -> Framing {
+        Framing {
+            aspect_w: ratio.0,
+            aspect_h: ratio.1,
+            crop_left: left,
+            crop_right: right,
+            crop_top: 0.0,
+            crop_bottom: 0.0,
+        }
+    }
+
+    #[test]
+    fn delivery_shapes_reduce_and_parse() {
+        assert_eq!(Delivery::new(1080, 1920, Fit::Cover).ratio(), (9, 16));
+        assert_eq!(Delivery::new(720, 1280, Fit::Cover).ratio(), (9, 16));
+        assert_eq!(Delivery::new(1080, 1350, Fit::Cover).ratio_label(), "4:5");
+        let v = Delivery::parse("9:16").unwrap();
+        assert_eq!((v.width, v.height, v.fit), (1080, 1920, Fit::Cover));
+        let l = Delivery::parse("16:9").unwrap();
+        assert_eq!((l.width, l.height, l.fit), (1920, 1080, Fit::Contain));
+        let custom = Delivery::parse("1440x1800").unwrap();
+        assert_eq!((custom.width, custom.height, custom.fit), (1440, 1800, Fit::Cover));
+        assert_eq!(Delivery::parse("3840x2160").unwrap().fit, Fit::Contain);
+        assert!(Delivery::parse("wide").is_none());
+        assert!(Delivery::parse("0x10").is_none());
+    }
+
+    #[test]
+    fn a_framing_replaces_its_own_shape_and_keeps_the_others() {
+        let mut clip = clip_at(0.0, 2.0);
+        assert!(clip.set_framing(framed((9, 16), 0.1, 0.5)));
+        assert!(clip.set_framing(framed((1, 1), 0.2, 0.3)));
+        assert!(!clip.set_framing(framed((9, 16), 0.1, 0.5)), "unchanged is not a change");
+        assert!(clip.set_framing(framed((9, 16), 0.3, 0.3)));
+        assert_eq!(clip.framings.len(), 2);
+        assert_eq!(clip.framing_for((9, 16)).unwrap().crop_left, 0.3);
+        assert_eq!(clip.framing_for((1, 1)).unwrap().crop_left, 0.2);
+        assert!(clip.framing_for((4, 5)).is_none());
+    }
+
+    #[test]
+    fn for_delivery_swaps_in_the_crop_for_that_shape() {
+        let mut clip = clip_at(0.0, 2.0);
+        // The project is cut 9:16 and the clip carries that crop as its transform.
+        clip.transform.crop_left = 0.1;
+        clip.transform.crop_right = 0.5836;
+        clip.set_framing(framed((1, 1), 0.2, 0.3));
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip])],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: Some(Delivery::new(1080, 1920, Fit::Cover)),
+        };
+
+        let square = tl.for_delivery(Delivery::new(1080, 1080, Fit::Cover));
+        let t = square.tracks[0].clips[0].transform;
+        assert_eq!((t.crop_left, t.crop_right), (0.2, 0.3));
+        assert_eq!(square.format.unwrap().ratio(), (1, 1));
+
+        // No framing for 4:5: the crop it has is kept rather than thrown away.
+        let portrait = tl.for_delivery(Delivery::new(1080, 1350, Fit::Cover));
+        let t = portrait.tracks[0].clips[0].transform;
+        assert_eq!((t.crop_left, t.crop_right), (0.1, 0.5836));
+
+        // The project's own shape at another size changes only the size.
+        let small = tl.for_delivery(Delivery::new(720, 1280, Fit::Cover));
+        assert_eq!(small.tracks[0].clips[0].transform, tl.tracks[0].clips[0].transform);
+        assert_eq!((small.format.unwrap().width, small.format.unwrap().height), (720, 1280));
+
+        // Never touches the original.
+        assert_eq!(tl.tracks[0].clips[0].transform.crop_left, 0.1);
+    }
+
+    #[test]
+    fn for_delivery_refits_generated_captions_only() {
+        let long = "a caption line that is wide";
+        let mut caption = TextOverlay::new(long, 0.0, 1.0);
+        caption.size = 0.05;
+        caption.generated = true;
+        let mut title = TextOverlay::new(long, 0.0, 1.0);
+        title.size = 0.05;
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
+            overlays: vec![caption, title],
+            markers: Vec::new(),
+            format: Some(Delivery::new(1920, 1080, Fit::Contain)),
+        };
+        let vertical = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
+        let fitted = vertical.overlays[0].size;
+        assert!(fitted < 0.05, "a 9:16 frame is too narrow for the line at 5%");
+        assert!(
+            long.chars().count() as f64 * CHAR_ADVANCE * fitted <= CAPTION_WIDTH * (1080.0 / 1920.0) + 1e-9,
+            "fits across the frame"
+        );
+        assert_eq!(vertical.overlays[1].size, 0.05, "a typed title is not resized");
+    }
+
+    #[test]
+    fn a_new_framing_reads_in_the_diff() {
+        let before = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+        };
+        let mut after = before.clone();
+        after.tracks[0].clips[0].set_framing(framed((9, 16), 0.1, 0.5));
+        after.tracks[0].clips[0].set_framing(framed((1, 1), 0.2, 0.3));
+        let diff = before.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        let detail = diff.entries[0].detail.clone().unwrap_or_default();
+        assert!(detail.contains("framed for 9:16, 1:1"), "{detail}");
+        assert!(after.diff(&after).entries.is_empty());
     }
 
     #[test]
