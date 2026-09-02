@@ -303,9 +303,15 @@ fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgre
     if have > 0 {
         request = request.header("Range", &format!("bytes={have}-"));
     }
-    let mut response = request
-        .call()
-        .map_err(|e| Error::Engine(format!("could not download speech model: {e}")))?;
+    // Name the URL: the fetch is redirected to a CDN host, so which lookup or
+    // connect failed is otherwise invisible — and a resolver that works for the
+    // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
+    let mut response = request.call().map_err(|e| {
+        Error::Engine(format!(
+            "could not download speech model from {url}: {e} (Kerf resolves names through the OS resolver and \
+             honours HTTPS_PROXY, not the browser's DNS or proxy settings; KERF_WHISPER_MODEL_URL points it at a mirror)"
+        ))
+    })?;
 
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
