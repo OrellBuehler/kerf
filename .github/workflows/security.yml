@@ -91,7 +91,7 @@ jobs:
         run: uvx zizmor@1.29.0 --persona=regular --min-severity=medium --format=sarif . > zizmor.sarif
       # The exit code above is the gate; this only makes the findings readable in
       # the Security tab, and shouldn't fail the job if code scanning is off.
-      - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+      - uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         if: always()
         continue-on-error: true
         with:
