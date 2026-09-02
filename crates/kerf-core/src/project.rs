@@ -14,8 +14,7 @@ use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Framing, Keyframe,
-    Marker,
-    Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
+    Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV,
     MIN_FOV,
 };

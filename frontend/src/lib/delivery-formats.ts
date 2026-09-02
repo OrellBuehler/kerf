@@ -46,6 +46,18 @@ export function ratioLabel(width: number, height: number): string {
 	return `${width / d}:${height / d}`;
 }
 
+/** Where a multi-format export puts one delivery: beside `base`, its shape in
+ *  the name — `cut.mp4` at 9:16 is `cut-9x16.mp4`. Mirrors
+ *  `ExportVariant::beside`; an `x` because `:` is not a filename character on
+ *  Windows. */
+export function variantPath(base: string, format: Delivery): string {
+	const shape = ratioLabel(format.width, format.height).replace(':', 'x');
+	const m = base.match(/^(.*?)(\.[^./\\]+)?$/);
+	const stem = m?.[1] ?? base;
+	const ext = m?.[2] ?? '';
+	return `${stem}-${shape}${ext}`;
+}
+
 export function fitLabel(fit: Fit): string {
 	return fit === 'cover' ? 'fill & crop' : 'fit & letterbox';
 }

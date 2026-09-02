@@ -5,8 +5,8 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { inTauri, pickExportPath, cancelExport, onExportProgress, hwEncoders, platformCheck, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import { ratioLabel } from '$lib/delivery-formats';
-	import type { Container, DeliveryCheck, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
+	import { DELIVERY_PRESETS, ratioLabel, variantPath } from '$lib/delivery-formats';
+	import type { Container, Delivery, DeliveryCheck, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
 		CONTAINERS,
@@ -60,6 +60,39 @@
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
 	let useRange = $state(false);
+
+	// One cut, every platform: the delivery frames to render as separate files
+	// beside the chosen path, each named by shape. Empty means the ordinary
+	// single export at the resolution below. Every shot is framed for every
+	// shape first unless the toggle is off — reshaping without looking keeps
+	// whatever was in the middle.
+	let variantIds = $state<string[]>([]);
+	let smartCropVariants = $state(true);
+	const variantPresets = DELIVERY_PRESETS.filter((p) => p.format !== null);
+	const variantFormats = $derived(
+		variantPresets.filter((p) => variantIds.includes(p.id)).map((p) => p.format as Delivery)
+	);
+	function toggleVariant(id: string) {
+		variantIds = variantIds.includes(id) ? variantIds.filter((v) => v !== id) : [...variantIds, id];
+	}
+	// Each variant judged at its own frame: a 9:16 file is a Reel whatever the
+	// project is cut in.
+	let variantChecks = $state<Record<string, DeliveryCheck[]>>({});
+	$effect(() => {
+		const wanted = variantPresets.filter((p) => variantIds.includes(p.id));
+		for (const p of wanted) {
+			if (variantChecks[p.id]) continue;
+			const f = p.format as Delivery;
+			platformCheck([f.width, f.height])
+				.then((c) => (variantChecks = { ...variantChecks, [p.id]: c }))
+				.catch(() => {});
+		}
+	});
+	function readyLabels(checks: DeliveryCheck[] | undefined): string {
+		if (!checks) return '';
+		const ready = checks.filter((c) => !c.issues.some((i) => i.severity !== 'tip')).map((c) => c.label);
+		return ready.length ? `Ready for ${ready.join(' · ')}` : 'Not ready for any target';
+	}
 
 	// Where this cut is going: the platform limits it meets or misses. Judged at
 	// the resolution *this render* will produce, which is not always the project
@@ -236,6 +269,15 @@
 		});
 		try {
 			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;
+			if (variantFormats.length) {
+				const outs = await editor.exportVariants(outputPath, variantFormats, smartCropVariants, finalOpts);
+				const first = outs[0];
+				toast.success(`Exported ${outs.length} files → ${outs.map((o) => o.split(/[\\/]/).pop()).join(', ')}`, {
+					action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
+				});
+				onClose();
+				return;
+			}
 			const out = await editor.export(outputPath, finalOpts);
 			// A path in a toast is not much use on its own — offer the folder.
 			toast.success(`Exported → ${out}`, {
@@ -375,8 +417,8 @@
 				{summary}
 			</div>
 
-			<!-- where this is going -->
-			{#if checks.length}
+			<!-- where this is going (per file when several are being written) -->
+			{#if checks.length && !variantFormats.length}
 				<div
 					style="margin-top:10px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
 				>
@@ -447,6 +489,50 @@
 					],
 					(v) => (useRange = v === 'range')
 				)}
+			{/if}
+
+			<!-- one cut, every platform -->
+			{#if showVideo}
+				{@render secHead('Deliver to')}
+				<div style="display:flex;flex-wrap:wrap;gap:6px;padding:2px 0">
+					{#each variantPresets as p (p.id)}
+						{@const on = variantIds.includes(p.id)}
+						<button
+							title={p.hint}
+							onclick={() => toggleVariant(p.id)}
+							style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid {on
+								? 'var(--kerf-500)'
+								: 'var(--border-strong)'};background:{on
+								? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
+								: 'var(--surface-inset)'};color:{on ? 'var(--text-primary)' : 'var(--text-secondary)'}"
+							>{p.label}</button
+						>
+					{/each}
+				</div>
+				{#if variantFormats.length}
+					<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
+						One file per shape, each shot framed for each — beside the file above as
+						{#each variantFormats as f, i (f.width + 'x' + f.height)}{i ? ', ' : ''}<span
+								style="font-family:var(--font-mono);color:var(--text-secondary)"
+								>{variantPath(outputPath || 'cut.' + info.ext, f).split(/[\\/]/).pop()}</span
+							>{/each}.
+					</div>
+					{@render toggleRow('Smart crop each shot for every shape', smartCropVariants, (v) => (smartCropVariants = v))}
+					<div style="display:flex;flex-direction:column;gap:3px;padding:2px 0 4px">
+						{#each variantPresets.filter((p) => variantIds.includes(p.id)) as p (p.id)}
+							<div style="display:flex;align-items:center;gap:6px;font-size:12px">
+								<span style="font-family:var(--font-mono);color:var(--text-secondary);width:36px">{p.label}</span>
+								<span style="color:{readyLabels(variantChecks[p.id]).startsWith('Ready') ? 'var(--success)' : 'var(--warning)'}"
+									>{readyLabels(variantChecks[p.id])}</span
+								>
+							</div>
+						{/each}
+					</div>
+				{:else}
+					<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
+						Pick shapes to write one file each — a Reel, a feed post and a YouTube upload from this one cut.
+					</div>
+				{/if}
 			{/if}
 
 			<!-- video -->
@@ -560,6 +646,11 @@
 				{/if}
 
 				{@render secHead('Scaling')}
+				{#if variantFormats.length}
+					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
+						Resolution and fit come from each delivery frame above.
+					</div>
+				{:else}
 				{@render selectRow(
 					'Resolution',
 					resValue(),
@@ -610,6 +701,7 @@
 					<div style="font-size:11px;color:var(--text-muted);padding:0 0 6px;text-align:right">
 						{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
 					</div>
+				{/if}
 				{/if}
 				{@render selectRow(
 					'Frame rate',
@@ -716,9 +808,9 @@
 						<span
 							style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
 						>
-							{Math.round((progress?.fraction ?? 0) * 100)}%{progress?.eta_secs != null
-								? ` · ${fmtEta(progress.eta_secs)} left`
-								: ''}
+							{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
+								(progress?.fraction ?? 0) * 100
+							)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}
 						</span>
 					</div>
 					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>
@@ -727,7 +819,9 @@
 				{:else}
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="upload" disabled={!canExport} onclick={doExport}>Export</Btn>
+					<Btn variant="primary" size="md" icon="upload" disabled={!canExport} onclick={doExport}>
+						{variantFormats.length > 1 ? `Export ${variantFormats.length} files` : 'Export'}
+					</Btn>
 				{/if}
 			</div>
 		</div>

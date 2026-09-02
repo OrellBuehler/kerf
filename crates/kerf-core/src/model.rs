@@ -2063,14 +2063,22 @@ impl Delivery {
         if w == 0 || h == 0 {
             return None;
         }
-        let fit = if reduce_ratio(w, h) == (16, 9) { Fit::Contain } else { Fit::Cover };
+        let fit = if reduce_ratio(w, h) == (16, 9) {
+            Fit::Contain
+        } else {
+            Fit::Cover
+        };
         Some(Delivery::new(w, h, fit))
     }
 }
 
 fn reduce_ratio(w: u32, h: u32) -> (u32, u32) {
     fn gcd(a: u32, b: u32) -> u32 {
-        if b == 0 { a } else { gcd(b, a % b) }
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
     }
     let d = gcd(w, h).max(1);
     (w / d, h / d)
