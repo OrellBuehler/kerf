@@ -13,7 +13,8 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Keyframe, Marker,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Framing, Keyframe,
+    Marker,
     Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV,
     MIN_FOV,
@@ -37,6 +38,17 @@ pub struct SmartCropJob {
 pub struct SmartCropPlan {
     /// The aspect of the delivery frame — what every job is framed for.
     pub target_aspect: f64,
+    pub jobs: Vec<SmartCropJob>,
+}
+
+/// A framing pass for a multi-format export: the delivery shapes the cut is
+/// about to be rendered at *besides* the one it is cut for, and the clips to
+/// frame for each. Same lock-free shape as [`SmartCropPlan`].
+#[derive(Debug, Clone)]
+pub struct FramingPlan {
+    /// The shapes to frame for, in lowest terms, the project frame's own
+    /// excluded — its crop is the clip's transform already.
+    pub ratios: Vec<(u32, u32)>,
     pub jobs: Vec<SmartCropJob>,
 }
 
@@ -1902,6 +1914,162 @@ impl Project {
                 changed += 1;
             }
             Ok(changed)
+        })
+    }
+
+    // ---- framing for other deliveries -----------------------------------------
+
+    /// Plan a framing pass for the shapes a multi-format export is about to
+    /// render at, **without** decoding anything — the lock-held half, like
+    /// [`Project::smart_crop_inputs`].
+    ///
+    /// Smart crop bakes its answer into each clip's transform for the *one*
+    /// frame the project is cut for. Delivering the same cut at a second shape
+    /// needs a second answer per clip, kept beside the first ([`Framing`]) —
+    /// this plans it for every requested shape that is not the project's own.
+    /// A plan with no jobs is not an error: a cut with nothing to frame (every
+    /// shape requested is the project's, or there is no flat video) is simply
+    /// exported as it is.
+    pub fn framing_inputs(&self, deliveries: &[Delivery]) -> Result<FramingPlan> {
+        let timeline = self.working_timeline()?;
+        let assets = self.list_assets()?;
+        let (fw, fh) = engine::delivery_frame(&timeline, &assets);
+        let own = Delivery::new(fw, fh, crate::model::Fit::Contain).ratio();
+
+        let mut ratios: Vec<(u32, u32)> = Vec::new();
+        for d in deliveries {
+            let r = d.ratio();
+            if r != own && !ratios.contains(&r) {
+                ratios.push(r);
+            }
+        }
+
+        let mut jobs = Vec::new();
+        if !ratios.is_empty() {
+            for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video && !t.locked) {
+                for clip in &track.clips {
+                    // A 360 clip's virtual camera is its framing for every shape.
+                    if clip.reframe.is_some() {
+                        continue;
+                    }
+                    let Some(asset) = assets.iter().find(|a| a.id == clip.asset_id) else {
+                        continue;
+                    };
+                    let Some((w, h)) = asset
+                        .streams
+                        .iter()
+                        .find(|s| s.kind == StreamKind::Video)
+                        .and_then(|s| s.width.zip(s.height))
+                    else {
+                        continue;
+                    };
+                    let (start, end) = if asset.is_image() {
+                        (0.0, 0.04)
+                    } else {
+                        (clip.source_in.min(clip.source_out), clip.source_in.max(clip.source_out))
+                    };
+                    jobs.push(SmartCropJob {
+                        clip_id: clip.id,
+                        path: PathBuf::from(&asset.path),
+                        start,
+                        end,
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
+        }
+        Ok(FramingPlan { ratios, jobs })
+    }
+
+    /// Sample every job in `plan` once and pick a crop for each shape. Static
+    /// and lock-free — one short ffmpeg decode per clip, shared by all the
+    /// shapes, since the salience map is a property of the shot and the crop
+    /// is what changes with the frame.
+    ///
+    /// A shot already a shape gets an *identity* framing for it (no crop)
+    /// rather than none: the render looks the framing up by shape, and a miss
+    /// would leave the shot wearing the project frame's crop — a 16:9 shot cut
+    /// 9:16 would deliver at 16:9 as the narrow strip that crop keeps. A clip
+    /// whose media cannot be read is skipped like in smart crop; if nothing
+    /// could be read at all, the first error is returned.
+    pub fn sample_framings(plan: &FramingPlan) -> Result<Vec<(Uuid, Framing)>> {
+        let mut out = Vec::new();
+        let mut first_error = None;
+        for job in &plan.jobs {
+            let needs: Vec<(u32, u32)> = plan
+                .ratios
+                .iter()
+                .copied()
+                .filter(|&(w, h)| crate::model::needs_crop(job.width, job.height, w as f64 / h as f64))
+                .collect();
+            let map = if needs.is_empty() {
+                None
+            } else {
+                match engine::salience_map(&job.path, job.start, job.end) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        tracing::warn!(clip = %job.clip_id, path = %job.path.display(), error = %e, "could not sample a shot for framing");
+                        first_error.get_or_insert(e);
+                        continue;
+                    }
+                }
+            };
+            for &ratio in &plan.ratios {
+                let crop = if needs.contains(&ratio) {
+                    let aspect = ratio.0 as f64 / ratio.1 as f64;
+                    match map.as_ref().and_then(|m| m.crop_for(job.width, job.height, aspect)) {
+                        Some(crop) => crop,
+                        None => continue,
+                    }
+                } else {
+                    CropFrame::default()
+                };
+                out.push((job.clip_id, Framing::new(ratio, &crop)));
+            }
+        }
+        match (out.is_empty(), first_error) {
+            (true, Some(e)) => Err(e),
+            _ => Ok(out),
+        }
+    }
+
+    /// Write sampled framings onto their clips as one undoable edit, labelled
+    /// with the shapes it framed for. Returns how many clips changed; framings
+    /// a clip already carries are dropped first, so a re-run over an unchanged
+    /// cut reports 0 and leaves the history alone.
+    pub fn apply_framings(&self, framings: &[(Uuid, Framing)]) -> Result<usize> {
+        let timeline = self.working_timeline()?;
+        let pending: Vec<_> = framings
+            .iter()
+            .filter(|(clip_id, f)| {
+                timeline
+                    .locate(*clip_id)
+                    .is_some_and(|(ti, ci)| timeline.tracks[ti].clips[ci].framing_for(f.ratio()) != Some(f))
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut shapes: Vec<String> = Vec::new();
+        for (_, f) in &pending {
+            let label = f.ratio_label();
+            if !shapes.contains(&label) {
+                shapes.push(label);
+            }
+        }
+        let label = format!("Frame for {}", shapes.join(", "));
+        self.edit_timeline(&label, |timeline| {
+            let mut touched: Vec<Uuid> = Vec::new();
+            for (clip_id, f) in &pending {
+                let Some((ti, ci)) = timeline.locate(*clip_id) else {
+                    continue;
+                };
+                if timeline.tracks[ti].clips[ci].set_framing(*f) && !touched.contains(clip_id) {
+                    touched.push(*clip_id);
+                }
+            }
+            Ok(touched.len())
         })
     }
 
@@ -4435,6 +4603,76 @@ mod tests {
         let before = project.history().unwrap().len();
         assert_eq!(project.apply_smart_crops(&[]).unwrap(), 0);
         assert_eq!(project.history().unwrap().len(), before);
+    }
+
+    #[test]
+    fn framing_plans_every_shape_but_the_projects_own() {
+        let project = Project::sample().unwrap();
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, Fit::Cover)))
+            .unwrap();
+        let plan = project
+            .framing_inputs(&[
+                Delivery::new(1080, 1920, Fit::Cover),
+                Delivery::new(1080, 1080, Fit::Cover),
+                Delivery::new(720, 1280, Fit::Cover),
+                Delivery::new(1920, 1080, Fit::Contain),
+            ])
+            .unwrap();
+        // 9:16 is the project frame (and 720x1280 the same shape); the rest dedupe.
+        assert_eq!(plan.ratios, vec![(1, 1), (16, 9)]);
+        let video_clips: usize = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .map(|t| t.clips.len())
+            .sum();
+        assert_eq!(plan.jobs.len(), video_clips);
+
+        // Only the project's own shape asked for: nothing to frame, not an error.
+        let none = project.framing_inputs(&[Delivery::new(1080, 1920, Fit::Cover)]).unwrap();
+        assert!(none.ratios.is_empty() && none.jobs.is_empty());
+    }
+
+    #[test]
+    fn framings_land_as_one_labelled_revision_and_only_when_they_change() {
+        let project = Project::sample().unwrap();
+        let clip = first_video_clip(&project);
+        let crop = CropFrame {
+            left: 0.3,
+            right: 0.2625,
+            top: 0.0,
+            bottom: 0.0,
+            offset: 0.2,
+        };
+        let framings = vec![
+            (clip, Framing::new((1, 1), &crop)),
+            (clip, Framing::new((4, 5), &CropFrame::default())),
+        ];
+        let before = project.history().unwrap().len();
+        assert_eq!(project.apply_framings(&framings).unwrap(), 1, "one clip changed");
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), before + 1);
+        assert_eq!(history.last().unwrap().label, "Frame for 1:1, 4:5");
+        let timeline = project.timeline().unwrap();
+        let (ti, ci) = timeline.locate(clip).unwrap();
+        let framed = &timeline.tracks[ti].clips[ci];
+        assert_eq!(framed.framing_for((1, 1)).unwrap().crop_left, 0.3);
+        assert_eq!(framed.framing_for((4, 5)).unwrap().crop_left, 0.0);
+        // The project frame's own crop is untouched.
+        assert!(!framed.transform.has_crop());
+
+        // Same framings again: no change, no revision.
+        assert_eq!(project.apply_framings(&framings).unwrap(), 0);
+        assert_eq!(project.history().unwrap().len(), before + 1);
+
+        // The whole pass undoes in one step.
+        project.undo().unwrap();
+        let timeline = project.timeline().unwrap();
+        let (ti, ci) = timeline.locate(clip).unwrap();
+        assert!(timeline.tracks[ti].clips[ci].framings.is_empty());
     }
 
     fn first_video_clip(project: &Project) -> Uuid {
