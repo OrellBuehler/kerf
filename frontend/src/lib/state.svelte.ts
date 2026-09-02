@@ -15,6 +15,7 @@ import {
 	cutClip,
 	exportSrt,
 	exportTimeline,
+	exportVariants,
 	extractAudio,
 	getAssetMetadata,
 	getHistory,
@@ -730,6 +731,23 @@ class EditorState {
 			return await exportTimeline(outputPath, options);
 		} finally {
 			this.busy = false;
+		}
+	}
+
+	async exportVariants(
+		outputPath: string,
+		formats: Delivery[],
+		smartCrop: boolean,
+		options: ExportOptions
+	): Promise<string[]> {
+		this.busy = true;
+		try {
+			return await exportVariants(outputPath, formats, smartCrop, options);
+		} finally {
+			this.busy = false;
+			// The framing pass wrote onto the clips; the history has a revision
+			// the panel has not seen.
+			await this.refreshTimeline().catch(() => {});
 		}
 	}
 

@@ -17,8 +17,8 @@ use super::cpu;
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap,
-    StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Delivery, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
+    SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
@@ -8345,11 +8345,17 @@ mod tests {
         };
         let vertical = graph_for(Delivery::new(1080, 1920, Fit::Cover));
         assert!(vertical.contains("scale=1080:1920"), "{vertical}");
-        assert!(vertical.contains("x=iw*0.05"), "the project frame keeps its own crop: {vertical}");
+        assert!(
+            vertical.contains("x=iw*0.05"),
+            "the project frame keeps its own crop: {vertical}"
+        );
 
         let square = graph_for(Delivery::new(1080, 1080, Fit::Cover));
         assert!(square.contains("scale=1080:1080"), "{square}");
-        assert!(square.contains("x=iw*0.3"), "the 1:1 delivery wears the 1:1 framing: {square}");
+        assert!(
+            square.contains("x=iw*0.3"),
+            "the 1:1 delivery wears the 1:1 framing: {square}"
+        );
         assert!(!square.contains("x=iw*0.05"), "{square}");
 
         // A shape nothing was framed for keeps the crop it has, and the

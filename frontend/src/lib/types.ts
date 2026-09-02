@@ -271,8 +271,22 @@ export interface Clip {
 	keyframes?: Keyframe[];
 	/** 360 reprojection; absent for ordinary flat footage. */
 	reframe?: Reframe | null;
+	/** Crops kept for delivery shapes other than the project's own, written by
+	 *  the multi-format export's framing pass. The project frame's crop is the
+	 *  transform's. */
+	framings?: Framing[];
 	/** Whether the clip renders. Absent means enabled (the backend omits it when true). */
 	enabled?: boolean;
+}
+
+/** A crop for one delivery shape (`aspect_w:aspect_h` in lowest terms). */
+export interface Framing {
+	aspect_w: number;
+	aspect_h: number;
+	crop_left: number;
+	crop_right: number;
+	crop_top: number;
+	crop_bottom: number;
 }
 
 export const DEFAULT_TRANSFORM: Transform = {
@@ -504,6 +518,10 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
+	/** Set by a multi-format export: which file is rendering, of how many.
+	 *  `fraction` then spans all of them. */
+	variant?: number;
+	total?: number;
 }
 
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
