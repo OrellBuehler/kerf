@@ -4,6 +4,7 @@
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { inTauri } from '$lib/api';
@@ -106,7 +107,7 @@
 	 * backend, a model still to download, analysis not run, or genuinely no
 	 * speech — and telling them apart is the difference between a dead end and
 	 * one click. */
-	const tx = $derived.by<{ title: string; body?: string; action?: 'download' | 'analyze' }>(() => {
+	const tx = $derived.by<{ title: string; body?: string; action?: 'download' | 'analyze' | 'settings' }>(() => {
 		const st = ui.transcription;
 		const mb = (b?: number | null) => (b ? `${Math.round(b / 1024 / 1024)} MB` : 'a few hundred MB');
 		if (ui.analyzing) {
@@ -117,6 +118,13 @@
 		}
 		if (st && !st.available) {
 			return { title: 'Transcription unavailable', body: st.reason ?? undefined };
+		}
+		if (st && !st.enabled) {
+			return {
+				title: 'Speech-to-text is off',
+				body: 'Analysis skips transcription while it is off. Turn it on in Settings, then analyze the clip.',
+				action: 'settings'
+			};
 		}
 		if (st && !st.model_ready) {
 			return {
@@ -386,6 +394,8 @@
 								>
 							{/if}
 						</div>
+					{:else if tx.action === 'settings'}
+						<Btn size="sm" onclick={() => settings.toggle()}>Open Settings</Btn>
 					{:else if tx.action === 'analyze' && editor.selectedAssetId}
 						<Btn size="sm" onclick={() =>
 								void ui

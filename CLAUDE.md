@@ -923,11 +923,18 @@ calls) now report: a notice that is never raised cannot be recovered from a log.
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Its one
-section is **Performance** — the CPU limit as three named budgets (Background /
+panel, so the next preference is a row in a list rather than new chrome. Two
+sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
-terms and not in percentages. The percentage is clamped by the engine, so the
+terms and not in percentages — and **Speech**, one checkbox for whether the
+analysis pass transcribes at all (`Settings.transcribe` →
+`kerf_core::set_transcription_enabled`, a process-wide flag `analyze_asset_media_*`
+reads to swap in the null transcriber): every import analyzes, and someone who
+never wants a model fetched or minutes of inference spent needs the whole pass
+to survive that, not to fail on the download. `TranscriptionStatus.enabled`
+reports it, so the transcript tab's empty state can say "Speech-to-text is
+off" and open Settings rather than offer a download. The percentage is clamped by the engine, so the
 view that comes *back* from `set_settings` is what renders, not the value asked
 for; in the browser harness `api.ts` answers from localStorage over
 `navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.

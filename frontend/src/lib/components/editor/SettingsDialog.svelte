@@ -1,7 +1,7 @@
 <script lang="ts">
-	// Kerf's preferences. One section so far — how much of the machine the media
-	// engine may take — but the shape (a section list on the left, panels on the
-	// right) is what the next one slots into.
+	// Kerf's preferences: how much of the machine the media engine may take, and
+	// whether an analysis pass transcribes speech. A section list on the left,
+	// panels on the right, so the next one is a row in a list.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
@@ -14,7 +14,10 @@
 	});
 
 	// Sections are a list rather than markup so adding one is a data change.
-	const SECTIONS = [{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' }] as const;
+	const SECTIONS = [
+		{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' },
+		{ id: 'speech', label: 'Speech', icon: 'mic' }
+	] as const;
 	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
 
 	const cores = $derived(settings.cpuCores);
@@ -146,6 +149,29 @@
 					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
 						A job already running keeps the cores it started with — FFmpeg cannot be told otherwise
 						mid-render. The next one picks this up.
+					</p>
+				{:else if section === 'speech'}
+					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+						Speech-to-text
+					</div>
+					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+						<input
+							type="checkbox"
+							checked={settings.transcribe}
+							onchange={(e) => settings.setTranscribe(e.currentTarget.checked)}
+							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+						/>
+						<span style="display:flex;flex-direction:column;gap:3px">
+							<span style="font-size:12px;color:var(--text-primary)">Transcribe speech when analyzing media</span>
+							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+								Every import runs an analysis pass. With this on, the pass also transcribes the speech — which
+								downloads a model on first use and then runs for a good fraction of each clip's length.
+							</span>
+						</span>
+					</label>
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						Off, analysis still detects silence, scenes, loudness and the beat; the Transcript tab and captions
+						have nothing to work from until it is turned back on and the clip re-analyzed.
 					</p>
 				{/if}
 			</div>

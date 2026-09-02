@@ -18,7 +18,7 @@ mod engine;
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
     analyze, analyze_asset_media, analyze_asset_media_cancellable, analyze_asset_media_with_progress, analyze_cancellable,
-    analyze_with_progress, transcription_status, AnalysisProgress, AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer,
+    analyze_with_progress, set_transcription_enabled, transcription_enabled, transcription_status, AnalysisProgress, AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer,
     FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector,
     Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };

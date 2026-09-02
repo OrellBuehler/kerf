@@ -13,6 +13,7 @@
 
 import { getSettings, setSettings } from './api';
 import { toast } from './notifications.svelte';
+import { ui } from './editor-ui.svelte';
 import type { SettingsView } from './types';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -44,6 +45,7 @@ class SettingsStore {
 	saving = $state(false);
 
 	cpuPercent = $state(75);
+	transcribe = $state(true);
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
@@ -55,6 +57,7 @@ class SettingsStore {
 
 	private absorb(view: SettingsView) {
 		this.cpuPercent = view.cpu_percent;
+		this.transcribe = view.transcribe;
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -78,9 +81,25 @@ class SettingsStore {
 		this.cpuPercent = want; // optimistic: the slider must not lag the drag
 		this.saving = true;
 		try {
-			this.absorb(await setSettings({ cpu_percent: want }));
+			this.absorb(await setSettings({ cpu_percent: want, transcribe: this.transcribe }));
 		} catch (e) {
 			toast.error('Could not save the CPU limit', { description: String(e) });
+			await this.load();
+		} finally {
+			this.saving = false;
+		}
+	}
+
+	/** Turn speech-to-text in the analysis pass on or off. */
+	async setTranscribe(on: boolean) {
+		if (on === this.transcribe) return;
+		this.transcribe = on;
+		this.saving = true;
+		try {
+			this.absorb(await setSettings({ cpu_percent: this.cpuPercent, transcribe: on }));
+			await ui.loadTranscriptionStatus();
+		} catch (e) {
+			toast.error('Could not save the transcription setting', { description: String(e) });
 			await this.load();
 		} finally {
 			this.saving = false;

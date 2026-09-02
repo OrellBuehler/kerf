@@ -546,6 +546,8 @@ export interface TranscriptionStatus {
 	/** `libwhisper` (in-process) · `ffmpeg_filter` · `none` */
 	backend: string;
 	available: boolean;
+	/** The Settings toggle: off, an analyzed asset has no transcript. */
+	enabled: boolean;
 	model?: string | null;
 	model_path?: string | null;
 	model_ready: boolean;
@@ -573,6 +575,10 @@ export interface AppSettings {
 	 *  stitch, export) may take. Kerf runs one such job at a time; this is how
 	 *  much of the computer that job gets. */
 	cpu_percent: number;
+	/** Whether the analysis pass transcribes speech. Off, importing media still
+	 *  detects silence / scenes / loudness / rhythm but never fetches a speech
+	 *  model or runs inference. */
+	transcribe: boolean;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

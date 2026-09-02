@@ -444,6 +444,7 @@ export async function transcriptionStatus(): Promise<TranscriptionStatus> {
 		return {
 			backend: 'none',
 			available: false,
+			enabled: readBrowserTranscribe(),
 			model: null,
 			model_path: null,
 			model_ready: false,
@@ -1790,7 +1791,7 @@ export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs:
  * webview's own core count — enough to drive the dialog under `bun run dev`.
  */
 export async function getSettings(): Promise<SettingsView> {
-	if (!inTauri()) return browserSettings(readBrowserCpuPercent());
+	if (!inTauri()) return browserSettings(readBrowserCpuPercent(), readBrowserTranscribe());
 	return invoke<SettingsView>('get_settings');
 }
 
@@ -1800,15 +1801,17 @@ export async function setSettings(settings: AppSettings): Promise<SettingsView> 
 		const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, settings.cpu_percent)));
 		try {
 			localStorage.setItem(CPU_KEY, String(percent));
+			localStorage.setItem(TRANSCRIBE_KEY, settings.transcribe ? '1' : '0');
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
-		return browserSettings(percent);
+		return browserSettings(percent, settings.transcribe);
 	}
 	return invoke<SettingsView>('set_settings', { settings });
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';
+const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 
@@ -1822,10 +1825,19 @@ function readBrowserCpuPercent(): number {
 	return DEFAULT_CPU_PERCENT;
 }
 
-function browserSettings(percent: number): SettingsView {
+function readBrowserTranscribe(): boolean {
+	try {
+		return localStorage.getItem(TRANSCRIBE_KEY) !== '0';
+	} catch {
+		return true;
+	}
+}
+
+function browserSettings(percent: number, transcribe: boolean): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
 	return {
 		cpu_percent: percent,
+		transcribe,
 		cpu_cores: cores,
 		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT

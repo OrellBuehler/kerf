@@ -1521,8 +1521,10 @@ fn get_settings() -> settings::SettingsView {
 fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
     // Clamp through the engine first, then persist what was actually applied —
     // storing an out-of-range value would keep re-clamping on every launch.
+    kerf_core::set_transcription_enabled(settings.transcribe);
     let stored = settings::Settings {
         cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
+        transcribe: settings.transcribe,
     };
     settings::save(&app, &stored)?;
     Ok(settings::SettingsView::current())

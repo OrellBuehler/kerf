@@ -25,12 +25,17 @@ pub struct Settings {
     /// Share of the machine one heavy job (analysis, transcription, proxy,
     /// stitch, export) may take, in percent. See `kerf_core::engine::cpu`.
     pub cpu_percent: u8,
+    /// Whether the analysis pass transcribes speech. Off, importing media still
+    /// detects silence / scenes / loudness / rhythm but never fetches a speech
+    /// model or runs inference.
+    pub transcribe: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             cpu_percent: kerf_core::DEFAULT_CPU_PERCENT,
+            transcribe: true,
         }
     }
 }
@@ -42,6 +47,7 @@ impl Default for Settings {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsView {
     pub cpu_percent: u8,
+    pub transcribe: bool,
     pub cpu_cores: usize,
     pub cpu_threads: usize,
     pub cpu_min_percent: u8,
@@ -54,6 +60,7 @@ impl SettingsView {
     pub fn current() -> Self {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
+            transcribe: kerf_core::transcription_enabled(),
             cpu_cores: kerf_core::cpu_cores(),
             cpu_threads: kerf_core::cpu_threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
@@ -99,6 +106,7 @@ pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
 /// environment meant it for this run. Moving the slider afterwards still takes
 /// effect — a runtime choice is the newer instruction of the two.
 pub fn apply(settings: &Settings) {
+    kerf_core::set_transcription_enabled(settings.transcribe);
     if std::env::var_os(CPU_ENV).is_some() {
         tracing::info!(percent = kerf_core::cpu_percent(), "CPU budget set from {CPU_ENV}");
         return;

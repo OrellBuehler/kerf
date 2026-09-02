@@ -327,6 +327,9 @@ pub struct TranscriptionStatus {
     pub backend: String,
     /// Whether transcription can run at all in this build / install.
     pub available: bool,
+    /// Whether the analysis pass transcribes (the Settings toggle). Off, an
+    /// analyzed asset has no transcript regardless of `available`.
+    pub enabled: bool,
     /// The whisper.cpp model name in use, when one is being managed for the
     /// user (`None` when `KERF_WHISPER_MODEL` names a file directly).
     pub model: Option<String>,
@@ -340,6 +343,22 @@ pub struct TranscriptionStatus {
     pub models: Vec<whisper::ModelInfo>,
     /// Why transcription is unavailable, when it is.
     pub reason: Option<String>,
+}
+
+/// Whether the analysis pass transcribes at all. Off, `analyze_*` still runs
+/// silence / scene / loudness / rhythm and leaves the transcript empty — the
+/// switch behind the Settings toggle, for someone who never wants a 148 MB
+/// model fetched (or minutes of inference spent) on every import.
+static TRANSCRIPTION_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn transcription_enabled() -> bool {
+    TRANSCRIPTION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn speech-to-text on or off for every later analysis pass. A pass already
+/// running finishes whatever it was doing.
+pub fn set_transcription_enabled(enabled: bool) {
+    TRANSCRIPTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Describe the speech-to-text backend this build would use.
@@ -370,6 +389,7 @@ pub fn transcription_status() -> TranscriptionStatus {
     TranscriptionStatus {
         backend: backend.to_string(),
         available,
+        enabled: transcription_enabled(),
         approx_download_bytes: (!ready)
             .then(|| model.as_deref().and_then(whisper::model_info).map(|m| m.approx_bytes))
             .flatten(),
@@ -499,7 +519,7 @@ pub fn analyze_asset_media_cancellable(asset: &Asset, progress: ProgressFn, canc
     let rhythm = FfmpegRhythmAnalyzer::default();
     let null = NullAnalyzer;
 
-    let transcriber = default_transcriber();
+    let transcriber = transcription_enabled().then(default_transcriber).flatten();
     let transcriber: &dyn Transcriber = transcriber.as_deref().unwrap_or(&null);
 
     let providers = AnalysisProviders {
