@@ -167,7 +167,11 @@ mod tests {
     fn layout_and_theme_round_trip_untouched() {
         let layout = serde_json::json!({"grid": {"root": {"type": "leaf"}}, "panels": {}});
         let theme = serde_json::json!({"name": "Mine", "version": 1, "colors": {"kerf-500": "#ffffff"}});
-        let s = Settings { layout: Some(layout.clone()), theme: Some(theme.clone()), ..Settings::default() };
+        let s = Settings {
+            layout: Some(layout.clone()),
+            theme: Some(theme.clone()),
+            ..Settings::default()
+        };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.layout, Some(layout));
         assert_eq!(back.theme, Some(theme));
