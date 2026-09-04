@@ -582,6 +582,11 @@ export interface AppSettings {
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;
+	/** The workspace arrangement (dockview's serialized layout), validated by
+	 *  `layout.ts` on the way back in. */
+	layout: unknown | null;
+	/** The color theme, validated by `theme.ts` on the way back in. */
+	theme: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

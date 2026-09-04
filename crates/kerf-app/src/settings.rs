@@ -34,6 +34,12 @@ pub struct Settings {
     /// UI covers a vertical cut. Off by default: it is a check you turn on,
     /// not a view you cut behind.
     pub safe_areas: bool,
+    /// The workspace arrangement (dockview's serialized layout). Opaque here:
+    /// the frontend validates it and falls back to its default layout.
+    pub layout: Option<serde_json::Value>,
+    /// The color theme. Opaque for the same reason — the frontend owns the
+    /// token list, presets and the JSON file format.
+    pub theme: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -42,6 +48,8 @@ impl Default for Settings {
             cpu_percent: kerf_core::DEFAULT_CPU_PERCENT,
             transcribe: true,
             safe_areas: false,
+            layout: None,
+            theme: None,
         }
     }
 }
@@ -70,13 +78,17 @@ pub struct SettingsView {
     pub cpu_cores: usize,
     pub cpu_threads: usize,
     pub cpu_min_percent: u8,
+    pub layout: Option<serde_json::Value>,
+    pub theme: Option<serde_json::Value>,
 }
 
 impl SettingsView {
-    /// Read straight from the engine rather than from the stored file, so what
-    /// the dialog shows is what is actually in force — including an environment
-    /// override the user set outside the app.
-    pub fn current() -> Self {
+    /// The engine-held preferences read straight from the engine rather than
+    /// from the stored file, so what the dialog shows is what is actually in
+    /// force — including an environment override the user set outside the
+    /// app. The layout and theme only exist in the file, so those come from
+    /// `stored`.
+    pub fn current(stored: &Settings) -> Self {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
             transcribe: kerf_core::transcription_enabled(),
@@ -84,6 +96,8 @@ impl SettingsView {
             cpu_cores: kerf_core::cpu_cores(),
             cpu_threads: kerf_core::cpu_threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
+            layout: stored.layout.clone(),
+            theme: stored.theme.clone(),
         }
     }
 }
@@ -134,4 +148,28 @@ pub fn apply(settings: &Settings) {
     }
     let applied = kerf_core::set_cpu_percent(settings.cpu_percent);
     tracing::info!(percent = applied, cores = kerf_core::cpu_cores(), "CPU budget applied");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_older_file_reads_as_defaults_for_what_it_lacks() {
+        let s: Settings = serde_json::from_str(r#"{"cpu_percent": 50}"#).unwrap();
+        assert_eq!(s.cpu_percent, 50);
+        assert!(s.transcribe);
+        assert!(s.layout.is_none());
+        assert!(s.theme.is_none());
+    }
+
+    #[test]
+    fn layout_and_theme_round_trip_untouched() {
+        let layout = serde_json::json!({"grid": {"root": {"type": "leaf"}}, "panels": {}});
+        let theme = serde_json::json!({"name": "Mine", "version": 1, "colors": {"kerf-500": "#ffffff"}});
+        let s = Settings { layout: Some(layout.clone()), theme: Some(theme.clone()), ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.layout, Some(layout));
+        assert_eq!(back.theme, Some(theme));
+    }
 }
