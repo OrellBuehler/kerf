@@ -45,6 +45,9 @@ class SettingsStore {
 	saving = $state(false);
 
 	cpuPercent = $state(75);
+	/** What the backend last confirmed. `cpuPercent` runs ahead of it while a
+	 *  slider is being dragged, so "nothing changed" is judged against this. */
+	private savedPercent = 75;
 	transcribe = $state(true);
 	/** Shade the delivery safe areas over the preview. Only visible while the
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
@@ -65,6 +68,7 @@ class SettingsStore {
 
 	private absorb(view: SettingsView) {
 		this.cpuPercent = view.cpu_percent;
+		this.savedPercent = view.cpu_percent;
 		this.transcribe = view.transcribe;
 		this.safeAreas = view.safe_areas;
 		this.cpuCores = view.cpu_cores;
@@ -86,7 +90,7 @@ class SettingsStore {
 	 *  back — not the value asked for — is what gets shown. */
 	async setCpuPercent(percent: number) {
 		const want = Math.round(percent);
-		if (want === this.cpuPercent) return;
+		if (want === this.savedPercent) return;
 		this.cpuPercent = want; // optimistic: the slider must not lag the drag
 		this.saving = true;
 		try {
