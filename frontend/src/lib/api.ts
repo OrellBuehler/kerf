@@ -1791,7 +1791,7 @@ export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs:
  * webview's own core count — enough to drive the dialog under `bun run dev`.
  */
 export async function getSettings(): Promise<SettingsView> {
-	if (!inTauri()) return browserSettings(readBrowserCpuPercent(), readBrowserTranscribe());
+	if (!inTauri()) return browserSettings(readBrowserCpuPercent(), readBrowserTranscribe(), readBrowserSafeAreas());
 	return invoke<SettingsView>('get_settings');
 }
 
@@ -1802,16 +1802,18 @@ export async function setSettings(settings: AppSettings): Promise<SettingsView> 
 		try {
 			localStorage.setItem(CPU_KEY, String(percent));
 			localStorage.setItem(TRANSCRIBE_KEY, settings.transcribe ? '1' : '0');
+			localStorage.setItem(SAFE_AREAS_KEY, settings.safe_areas ? '1' : '0');
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
-		return browserSettings(percent, settings.transcribe);
+		return browserSettings(percent, settings.transcribe, settings.safe_areas);
 	}
 	return invoke<SettingsView>('set_settings', { settings });
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';
 const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
+const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 
@@ -1833,11 +1835,20 @@ function readBrowserTranscribe(): boolean {
 	}
 }
 
-function browserSettings(percent: number, transcribe: boolean): SettingsView {
+function readBrowserSafeAreas(): boolean {
+	try {
+		return localStorage.getItem(SAFE_AREAS_KEY) === '1';
+	} catch {
+		return false;
+	}
+}
+
+function browserSettings(percent: number, transcribe: boolean, safeAreas: boolean): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
 	return {
 		cpu_percent: percent,
 		transcribe,
+		safe_areas: safeAreas,
 		cpu_cores: cores,
 		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT

@@ -3,6 +3,7 @@
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { exportCover, getTimelineFrame, inTauri, pickCoverPath, revealPath, startPlayback } from '$lib/api';
@@ -195,7 +196,7 @@
 	// right. Percentages of the frame, deliberately generous — every app differs,
 	// so this is "keep the subject out of here", not a pixel contract.
 	const CHROME = { top: 0.08, bottom: 0.2, right: 0.14 };
-	const showGuides = $derived(ui.safeAreas && !!delivery && aspect < 1.2);
+	const showGuides = $derived(settings.safeAreas && !!delivery && aspect < 1.2);
 
 	/** Write the frame under the playhead as a cover image — the thumbnail a
 	 *  platform shows before anyone presses play. Rendered at the full delivery
@@ -238,10 +239,10 @@
 			},
 			{ type: 'separator' },
 			{
-				label: ui.safeAreas ? 'Hide safe areas' : 'Show safe areas',
+				label: settings.safeAreas ? 'Hide safe areas' : 'Show safe areas',
 				icon: 'crop',
 				disabled: !delivery,
-				action: () => (ui.safeAreas = !ui.safeAreas)
+				action: () => void settings.setSafeAreas(!settings.safeAreas)
 			},
 			{ type: 'separator' },
 			{

@@ -46,9 +46,17 @@ class SettingsStore {
 
 	cpuPercent = $state(75);
 	transcribe = $state(true);
+	/** Shade the delivery safe areas over the preview. Only visible while the
+	 *  project is cut for a vertical or square frame; a 16:9 web export has no
+	 *  chrome to stay clear of. */
+	safeAreas = $state(false);
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
+
+	private get current() {
+		return { cpu_percent: this.cpuPercent, transcribe: this.transcribe, safe_areas: this.safeAreas };
+	}
 
 	/** The preset the current percentage *is*, or null when it sits between them. */
 	get cpuPreset() {
@@ -58,6 +66,7 @@ class SettingsStore {
 	private absorb(view: SettingsView) {
 		this.cpuPercent = view.cpu_percent;
 		this.transcribe = view.transcribe;
+		this.safeAreas = view.safe_areas;
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -81,7 +90,7 @@ class SettingsStore {
 		this.cpuPercent = want; // optimistic: the slider must not lag the drag
 		this.saving = true;
 		try {
-			this.absorb(await setSettings({ cpu_percent: want, transcribe: this.transcribe }));
+			this.absorb(await setSettings({ ...this.current, cpu_percent: want }));
 		} catch (e) {
 			toast.error('Could not save the CPU limit', { description: String(e) });
 			await this.load();
@@ -96,10 +105,25 @@ class SettingsStore {
 		this.transcribe = on;
 		this.saving = true;
 		try {
-			this.absorb(await setSettings({ cpu_percent: this.cpuPercent, transcribe: on }));
+			this.absorb(await setSettings({ ...this.current, transcribe: on }));
 			await ui.loadTranscriptionStatus();
 		} catch (e) {
 			toast.error('Could not save the transcription setting', { description: String(e) });
+			await this.load();
+		} finally {
+			this.saving = false;
+		}
+	}
+
+	/** Show or hide the safe-area guides over the preview. */
+	async setSafeAreas(on: boolean) {
+		if (on === this.safeAreas) return;
+		this.safeAreas = on;
+		this.saving = true;
+		try {
+			this.absorb(await setSettings({ ...this.current, safe_areas: on }));
+		} catch (e) {
+			toast.error('Could not save the safe-area setting', { description: String(e) });
 			await this.load();
 		} finally {
 			this.saving = false;

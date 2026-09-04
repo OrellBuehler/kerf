@@ -826,8 +826,10 @@ from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — 
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
-action column, plus a title-safe box; `ui.safeAreas`, toggled from the preview
-context menu). The export dialog's "Source" resolution relabels to
+action column, plus a title-safe box; `settings.safeAreas`, **off by default**, toggled from
+Settings › Preview or the preview context menu, which both write the same
+persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
+rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. It also
 leads with a **readiness panel**: "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
@@ -923,7 +925,7 @@ calls) now report: a notice that is never raised cannot be recovered from a log.
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Two
+panel, so the next preference is a row in a list rather than new chrome. Three
 sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
@@ -934,7 +936,8 @@ reads to swap in the null transcriber): every import analyzes, and someone who
 never wants a model fetched or minutes of inference spent needs the whole pass
 to survive that, not to fail on the download. `TranscriptionStatus.enabled`
 reports it, so the transcript tab's empty state can say "Speech-to-text is
-off" and open Settings rather than offer a download. The percentage is clamped by the engine, so the
+off" and open Settings rather than offer a download. And **Preview**, one checkbox
+for the safe-area guides over a vertical or square cut. The percentage is clamped by the engine, so the
 view that comes *back* from `set_settings` is what renders, not the value asked
 for; in the browser harness `api.ts` answers from localStorage over
 `navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.

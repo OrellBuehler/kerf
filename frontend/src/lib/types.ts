@@ -579,6 +579,9 @@ export interface AppSettings {
 	 *  detects silence / scenes / loudness / rhythm but never fetches a speech
 	 *  model or runs inference. */
 	transcribe: boolean;
+	/** Whether the preview shades the delivery safe areas — where a phone's
+	 *  own UI covers a vertical or square cut. */
+	safe_areas: boolean;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

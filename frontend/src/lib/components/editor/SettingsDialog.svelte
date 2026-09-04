@@ -1,6 +1,6 @@
 <script lang="ts">
-	// Kerf's preferences: how much of the machine the media engine may take, and
-	// whether an analysis pass transcribes speech. A section list on the left,
+	// Kerf's preferences: how much of the machine the media engine may take,
+	// whether an analysis pass transcribes speech, and what the preview draws. A section list on the left,
 	// panels on the right, so the next one is a row in a list.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
@@ -16,7 +16,8 @@
 	// Sections are a list rather than markup so adding one is a data change.
 	const SECTIONS = [
 		{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' },
-		{ id: 'speech', label: 'Speech', icon: 'mic' }
+		{ id: 'speech', label: 'Speech', icon: 'mic' },
+		{ id: 'preview', label: 'Preview', icon: 'eye' }
 	] as const;
 	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
 
@@ -172,6 +173,30 @@
 					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
 						Off, analysis still detects silence, scenes, loudness and the beat; the Transcript tab and captions
 						have nothing to work from until it is turned back on and the clip re-analyzed.
+					</p>
+				{:else if section === 'preview'}
+					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+						Safe areas
+					</div>
+					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+						<input
+							type="checkbox"
+							checked={settings.safeAreas}
+							onchange={(e) => settings.setSafeAreas(e.currentTarget.checked)}
+							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+						/>
+						<span style="display:flex;flex-direction:column;gap:3px">
+							<span style="font-size:12px;color:var(--text-primary)">Shade the safe areas over the preview</span>
+							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+								Where a phone's own interface covers a vertical or square cut: the status strip at the top,
+								the caption rail along the bottom and the action buttons on the right, plus a title-safe box
+								inset from every edge. Keep faces and text out of the shaded zones.
+							</span>
+						</span>
+					</label>
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
+						toggles the same setting.
 					</p>
 				{/if}
 			</div>

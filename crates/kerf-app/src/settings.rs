@@ -11,6 +11,7 @@
 //! worth failing a launch over.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -29,6 +30,10 @@ pub struct Settings {
     /// detects silence / scenes / loudness / rhythm but never fetches a speech
     /// model or runs inference.
     pub transcribe: bool,
+    /// Whether the preview shades the delivery safe areas — where a phone's own
+    /// UI covers a vertical cut. Off by default: it is a check you turn on,
+    /// not a view you cut behind.
+    pub safe_areas: bool,
 }
 
 impl Default for Settings {
@@ -36,8 +41,21 @@ impl Default for Settings {
         Self {
             cpu_percent: kerf_core::DEFAULT_CPU_PERCENT,
             transcribe: true,
+            safe_areas: false,
         }
     }
+}
+
+/// The safe-area preference in force. Nothing in the engine cares about it, so
+/// unlike the CPU budget and the transcription flag it is held here.
+static SAFE_AREAS: AtomicBool = AtomicBool::new(false);
+
+pub fn safe_areas() -> bool {
+    SAFE_AREAS.load(Ordering::Relaxed)
+}
+
+pub fn set_safe_areas(on: bool) {
+    SAFE_AREAS.store(on, Ordering::Relaxed);
 }
 
 /// What the settings surface actually shows: the stored preference resolved
@@ -48,6 +66,7 @@ impl Default for Settings {
 pub struct SettingsView {
     pub cpu_percent: u8,
     pub transcribe: bool,
+    pub safe_areas: bool,
     pub cpu_cores: usize,
     pub cpu_threads: usize,
     pub cpu_min_percent: u8,
@@ -61,6 +80,7 @@ impl SettingsView {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
             transcribe: kerf_core::transcription_enabled(),
+            safe_areas: safe_areas(),
             cpu_cores: kerf_core::cpu_cores(),
             cpu_threads: kerf_core::cpu_threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
@@ -107,6 +127,7 @@ pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
 /// effect — a runtime choice is the newer instruction of the two.
 pub fn apply(settings: &Settings) {
     kerf_core::set_transcription_enabled(settings.transcribe);
+    set_safe_areas(settings.safe_areas);
     if std::env::var_os(CPU_ENV).is_some() {
         tracing::info!(percent = kerf_core::cpu_percent(), "CPU budget set from {CPU_ENV}");
         return;
