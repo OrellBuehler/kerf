@@ -5,6 +5,8 @@
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
+	import { workspace } from '$lib/workspace.svelte';
+	import { PANEL_IDS, PANELS } from '$lib/layout';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
 	import { toast } from '$lib/notifications.svelte';
 
@@ -42,6 +44,18 @@
 				}
 			}))
 		);
+	}
+
+	function pickPanels(e: MouseEvent) {
+		contextMenu.show(e, [
+			...PANEL_IDS.map((id) => ({
+				label: PANELS[id].title,
+				icon: workspace.isOpen(id) ? 'check' : undefined,
+				action: () => workspace.toggle(id)
+			})),
+			{ type: 'separator' as const },
+			{ label: 'Reset layout', icon: 'rotate-ccw', action: () => workspace.reset() }
+		]);
 	}
 
 	function tc(s: number): string {
@@ -128,17 +142,11 @@
 	>
 	{@render divider()}
 	<Btn
-		variant={ui.inspectorOpen ? 'secondary' : 'ghost'}
+		variant="ghost"
 		size="sm"
-		icon="sliders-horizontal"
-		title="Inspector — clip settings, titles and captions"
-		onclick={() => (ui.inspectorOpen = !ui.inspectorOpen)}>Inspector</Btn
-	>
-	<Btn
-		variant={ui.agentOpen ? 'agent' : 'ghost'}
-		size="sm"
-		icon="plug"
-		onclick={() => (ui.agentOpen = !ui.agentOpen)}>Agent</Btn
+		icon="layout-panel-left"
+		title="Show or hide panels — drag a panel's tab to move it"
+		onclick={pickPanels}>Panels</Btn
 	>
 	{@render divider()}
 	<Btn variant="primary" size="sm" icon="upload" onclick={onExport}>Export</Btn>

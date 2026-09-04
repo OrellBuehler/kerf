@@ -14,13 +14,6 @@ export type Tool = 'pointer' | 'razor';
 class EditorUi {
 	tool = $state<Tool>('pointer');
 	snap = $state(true);
-	agentOpen = $state(true);
-	/** Whether the Inspector panel is shown. It carries the whole text-overlay
-	 *  and caption surface, which belongs to the timeline rather than to any one
-	 *  clip, so the panel is not gated on a selection — it explains itself when
-	 *  nothing is selected and is closed from the toolbar when the width is
-	 *  wanted elsewhere. */
-	inspectorOpen = $state(true);
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);
@@ -55,8 +48,6 @@ class EditorUi {
 	markOut = $state<number | null>(null);
 	/** Timeline zoom, pixels per second. */
 	zoom = $state(36);
-	/** Height of the timeline panel in px, dragged from its top edge. */
-	timelineH = $state(296);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
