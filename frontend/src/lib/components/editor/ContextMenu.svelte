@@ -79,7 +79,7 @@
 						: 'pointer'};text-align:left;font-size:12.5px;color:{item.disabled
 						? 'var(--text-disabled)'
 						: item.danger
-							? 'var(--red-400, #f08a82)'
+							? 'var(--red-400)'
 							: 'var(--text-primary)'};opacity:{item.disabled ? 0.55 : 1}"
 					onpointerenter={(e) => {
 						if (!item.disabled) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover)';

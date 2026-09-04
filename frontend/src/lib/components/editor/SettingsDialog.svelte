@@ -1,10 +1,12 @@
 <script lang="ts">
 	// Kerf's preferences: how much of the machine the media engine may take,
-	// whether an analysis pass transcribes speech, and what the preview draws. A section list on the left,
-	// panels on the right, so the next one is a row in a list.
+	// whether an analysis pass transcribes speech, what the preview draws and
+	// what colors the editor is drawn in. A section list on the left, panels on
+	// the right, so the next one is a row in a list.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
+	import { COLOR_GROUPS, PRESETS, PRESET_IDS } from '$lib/theme';
 
 	let { onClose }: { onClose: () => void } = $props();
 
@@ -17,7 +19,8 @@
 	const SECTIONS = [
 		{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' },
 		{ id: 'speech', label: 'Speech', icon: 'mic' },
-		{ id: 'preview', label: 'Preview', icon: 'eye' }
+		{ id: 'preview', label: 'Preview', icon: 'eye' },
+		{ id: 'appearance', label: 'Appearance', icon: 'palette' }
 	] as const;
 	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
 
@@ -29,6 +32,8 @@
 	// What the number actually buys, in the terms the complaint arrives in:
 	// how much of the machine is left for everything that is not Kerf.
 	const spare = $derived(Math.max(0, cores - threads));
+
+	const themePreset = $derived(settings.themePreset);
 
 	const chip = (active: boolean) =>
 		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid ${
@@ -51,7 +56,7 @@
 		if (e.key === 'Escape') onClose();
 		e.stopPropagation();
 	}}
-	style="position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:24px"
+	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
@@ -198,6 +203,67 @@
 						A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
 						toggles the same setting.
 					</p>
+				{:else if section === 'appearance'}
+					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+						Theme
+					</div>
+					<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+						{#each PRESET_IDS as id (id)}
+							<button onclick={() => settings.applyPreset(id)} style={chip(themePreset === id)}>
+								{PRESETS[id].name}
+							</button>
+						{/each}
+						{#if themePreset === 'custom'}
+							<span style={chip(true)}>Custom</span>
+						{/if}
+						<div style="flex:1"></div>
+						<Btn variant="ghost" size="sm" icon="folder-open" onclick={() => settings.importTheme()}>Import…</Btn>
+						<Btn variant="ghost" size="sm" icon="save" onclick={() => settings.exportTheme()}>Export…</Btn>
+					</div>
+
+					<div style="margin-top:12px;display:flex;gap:10px;align-items:center">
+						<input
+							type="text"
+							value={settings.theme.name}
+							aria-label="Theme name"
+							onchange={(e) => settings.setThemeName(e.currentTarget.value)}
+							style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
+						/>
+						<button onclick={() => settings.setScheme('dark')} style={chip(settings.theme.scheme === 'dark')}>Dark</button>
+						<button onclick={() => settings.setScheme('light')} style={chip(settings.theme.scheme === 'light')}
+							>Light</button
+						>
+					</div>
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						Every color the editor draws with. Changing one makes the theme custom; a theme exports as a
+						JSON file you can share or bring back with Import.
+					</p>
+
+					{#each COLOR_GROUPS as g (g.label)}
+						<div
+							style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+						>
+							{g.label}
+						</div>
+						<div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px">
+							{#each g.tokens as t (t.name)}
+								<label
+									style="display:flex;align-items:center;gap:8px;height:28px;font-size:12px;color:var(--text-secondary);cursor:pointer"
+								>
+									<input
+										type="color"
+										value={settings.theme.colors[t.name]}
+										oninput={(e) => settings.setColor(t.name, e.currentTarget.value)}
+										style="width:26px;height:20px;padding:0;border:1px solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
+									/>
+									<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{t.label}</span>
+									<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled)"
+										>{settings.theme.colors[t.name]}</span
+									>
+								</label>
+							{/each}
+						</div>
+					{/each}
 				{/if}
 			</div>
 		</div>

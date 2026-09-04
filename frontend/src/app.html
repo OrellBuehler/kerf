@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- The paint before the app loads; `applyTheme` replaces all three once the settings are read. -->
 <html lang="en" class="dark" style="background: #0f1318; color-scheme: dark">
 	<head>
 		<meta charset="utf-8" />
@@ -6,7 +7,7 @@
 		<meta name="text-scale" content="scale" />
 		%sveltekit.head%
 	</head>
-	<body data-sveltekit-preload-data="hover" style="background: #0f1318">
+	<body data-sveltekit-preload-data="hover">
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
 </html>
