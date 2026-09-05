@@ -1510,8 +1510,8 @@ fn agent_status() -> AgentStatus {
 /// The current preferences, resolved against the engine (see
 /// [`settings::SettingsView`]).
 #[tauri::command(async)]
-fn get_settings() -> settings::SettingsView {
-    settings::SettingsView::current()
+fn get_settings(app: AppHandle) -> settings::SettingsView {
+    settings::SettingsView::current(&settings::load(&app))
 }
 
 /// Write the preferences and put them into force. Returns the resolved view, so
@@ -1521,11 +1521,46 @@ fn get_settings() -> settings::SettingsView {
 fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
     // Clamp through the engine first, then persist what was actually applied —
     // storing an out-of-range value would keep re-clamping on every launch.
+    kerf_core::set_transcription_enabled(settings.transcribe);
+    settings::set_safe_areas(settings.safe_areas);
     let stored = settings::Settings {
         cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
+        transcribe: settings.transcribe,
+        safe_areas: settings.safe_areas,
+        layout: settings.layout,
+        theme: settings.theme,
     };
     settings::save(&app, &stored)?;
-    Ok(settings::SettingsView::current())
+    Ok(settings::SettingsView::current(&stored))
+}
+
+// ---- theme files -----------------------------------------------------------
+
+/// The largest file `read_text_file` will read: a theme is a few KB, and the
+/// path comes from a file picker the user could point at anything.
+const TEXT_FILE_MAX: u64 = 1 << 20;
+
+/// A small text file picked by the user (a theme to import).
+#[tauri::command]
+async fn read_text_file(path: String) -> CmdResult<String> {
+    blocking(move || {
+        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        if len > TEXT_FILE_MAX {
+            return Err(format!("{path} is larger than 1 MiB — not a theme file"));
+        }
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Write a text file to a path the user chose (a theme to export).
+#[tauri::command]
+async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
+    blocking(move || {
+        std::fs::write(&path, contents).map_err(|e| e.to_string())?;
+        Ok(path)
+    })
+    .await
 }
 
 // ---- diagnostics (logs) ----------------------------------------------------
@@ -1769,6 +1804,8 @@ pub fn run() {
             agent_status,
             get_settings,
             set_settings,
+            read_text_file,
+            write_text_file,
             log_dir,
             reveal_logs
         ])

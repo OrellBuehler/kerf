@@ -641,7 +641,13 @@ commitment to ten transcriptions), app preferences (`get_settings` /
 the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
-`.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after)
+`.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
+The file also carries the **workspace layout** and the **color theme** as two
+opaque `serde_json::Value`s — the frontend owns their shape and validates them
+on the way back in, so `get_settings` re-reads the file for those where the
+engine-held values are read live), `read_text_file` / `write_text_file`
+(a theme file the user picked, imported or exported — the only commands that
+read a caller-chosen path, so the read is capped at 1 MiB)
 and `agent_status` (the MCP endpoint plus how
 many seconds ago an agent last spoke to it, or `null` if none ever has —
 `mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
@@ -731,19 +737,47 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `prerender = true`. Dev port is pinned to **1420** for Tauri.
 - **Tailwind 4 = CSS config**, no `tailwind.config.js`. `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
-  semantic vars onto them; the app is **dark-only** (`<html class="dark">` in `app.html`).
-  That file is also the `tailwind.css` in `components.json`. Run
-  `bunx shadcn-svelte add <name>` to add primitives.
+  semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
+  the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
+  bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
+  `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
+  filled from the scheme's preset) and `applyTheme`, which writes the tokens as
+  inline properties on `<html>` (beating the stylesheet), toggles the `dark`
+  class and `color-scheme`. Every translucent token in `kerf-tokens.css`
+  (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
+  theme is a flat list of hex colors an `<input type=color>` can edit, and the
+  editor components carry no color literals (`--scrim`, `--text-on-video`,
+  `--drag-ghost`, `--frame-matte` exist for the few places that used to).
+  `app.html` still paints dark before hydration. That file is also the
+  `tailwind.css` in `components.json`. Run `bunx shadcn-svelte add <name>` to
+  add primitives.
 
-The editor UI is implemented from the **Kerf design system** (claude.ai/design): a dark,
+The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
-`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `MediaBin`,
-`Preview`, `Timeline`, `Inspector`, `AgentPanel`, `StatusBar`, composed by
-`routes/+page.svelte`. The `Inspector` (right panel) is **mounted whether or not a
-clip is selected** and toggled from the toolbar (`ui.inspectorOpen`): its Text
-overlays section belongs to the timeline rather than to any one clip, so gating the
-whole panel on a selection made titles and captions unreachable until you clicked a
-clip. It edits the selected clip —
+`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `StatusBar` as
+fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
+`routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
+`--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
+it follows the theme) hosting six panels — `MediaBin`, `TranscriptPanel`,
+`Preview`, `Timeline`, `Inspector`, `AgentPanel` — each a Svelte component
+`mount`ed into a dockview content element, so every panel is resizable by its
+sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
+and closable; the toolbar's **Panels** menu reopens one beside the active group
+or resets the arrangement. `src/lib/layout.ts` is the pure, bun-tested side:
+the panel registry (titles, minimum sizes — the Inspector's px-tuned controls
+need ~250), `DEFAULT_LAYOUT` (dockview's serialized form of the historical
+arrangement) and `sanitizeLayout`, which turns a stored layout into one that can
+be trusted (known panel ids, each shown once, titles/minimums re-taken from the
+registry, floating groups dropped) or `null` so the default is used. The
+arrangement is saved through `settings.setLayout` (debounced off
+`onDidLayoutChange`) into `Settings.layout`, and `+page.svelte` mounts the dock
+only once the settings are loaded so it restores rather than rebuilds;
+`workspace.svelte.ts` is the runes singleton the menu drives. Panels own no
+width: their roots are `flex:1;min-height:0`, and a panel's minimum comes from
+the registry. The `Inspector` is **mounted whether or not a clip is selected**:
+its Text overlays section belongs to the timeline rather than to any one clip, so
+gating the panel on a selection made titles and captions unreachable until you
+clicked a clip. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
@@ -826,8 +860,10 @@ from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — 
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
-action column, plus a title-safe box; `ui.safeAreas`, toggled from the preview
-context menu). The export dialog's "Source" resolution relabels to
+action column, plus a title-safe box; `settings.safeAreas`, **off by default**, toggled from
+Settings › Preview or the preview context menu, which both write the same
+persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
+rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. It also
 leads with a **readiness panel**: "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
@@ -871,8 +907,9 @@ loudness normalize, and a **Range: In → out** choice when marks are set. It **
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
 that frame when one matches, else the default preset with its resolution cleared so
 "Project frame" renders — otherwise a 9:16 project opened its export already
-landscape and the readiness panel warned about the shape the user had just chosen. `MediaBin`'s
-**Transcript tab is an editing surface**: lines resolve to the clip carrying them,
+landscape and the readiness panel warned about the shape the user had just chosen. The
+**Transcript panel** (`TranscriptPanel.svelte`, over the pure, bun-tested
+`src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
 of the five reasons applies (nothing selected / no backend / model not downloaded /
@@ -923,13 +960,31 @@ calls) now report: a notice that is never raised cannot be recovered from a log.
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Its one
-section is **Performance** — the CPU limit as three named budgets (Background /
+panel, so the next preference is a row in a list rather than new chrome. Four
+sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
-terms and not in percentages. The percentage is clamped by the engine, so the
+terms and not in percentages — and **Speech**, one checkbox for whether the
+analysis pass transcribes at all (`Settings.transcribe` →
+`kerf_core::set_transcription_enabled`, a process-wide flag `analyze_asset_media_*`
+reads to swap in the null transcriber): every import analyzes, and someone who
+never wants a model fetched or minutes of inference spent needs the whole pass
+to survive that, not to fail on the download. `TranscriptionStatus.enabled`
+reports it, so the transcript tab's empty state can say "Speech-to-text is
+off" and open Settings rather than offer a download. And **Preview**, one checkbox
+for the safe-area guides over a vertical or square cut. And **Appearance**: the
+three theme presets as chips, a name and a dark/light scheme, **Import… /
+Export…** (a `.json` file through the dialog plugin and `read_text_file` /
+`write_text_file`; the harness uses an `<input type=file>` and a download), then
+every color token as a picker grouped by `COLOR_GROUPS`. A color edit applies
+at once (`applyTheme`) and is written 300 ms later — a picker fires per pixel
+of a drag — and while one is pending a view coming back from another write
+leaves the theme alone, so the newer colors never flicker back. Changing any
+color makes the theme `Custom` (`presetIdFor` compares colors, not the name).
+The percentage is clamped by the engine, so the
 view that comes *back* from `set_settings` is what renders, not the value asked
-for; in the browser harness `api.ts` answers from localStorage over
+for; in the browser harness `api.ts` answers from localStorage
+(`kerf.settings.*`, the layout and theme as JSON strings) over
 `navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
@@ -966,6 +1021,19 @@ editor chrome derives from real state — `MediaBin` shows a dropzone until `edi
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
 duration (plus the analysis step, what is still queued behind it and a **Stop**), and
 `Preview` shows the decoded frame or a "No media loaded" placeholder.
+Each **bin row is the asset's specs**, not just its name: a real decoded frame
+(`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
+browser harness, which has no decoder), the spec line
+(`1920×1080 · 29.97 fps · h264 · stereo`), and badges for 360 / still / how many
+clips already use it / analyzed. Its **context menu leads with the facts** — the
+frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
+import date, then what analysis found (loudness, tempo, silence, shots,
+transcript, or "not analyzed") — above the actions that need them: add at the
+playhead / append, extract audio, remove silences (greyed out until silence has
+been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
+in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
+row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
+it, which the shared `ContextMenu` renders non-interactively.
 **Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
 `onDragDropEvent`, filters by `isMediaPath` — the same extension list the picker
 filters by, so a dropped folder of mixed files doesn't answer with one error per

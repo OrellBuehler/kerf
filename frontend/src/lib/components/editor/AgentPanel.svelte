@@ -392,7 +392,7 @@
 <div
 	role="presentation"
 	oncontextmenu={onAgentContextMenu}
-	style="width:var(--agent-panel-w);flex:none;background:var(--surface-panel);border-left:1px solid var(--border-default);display:flex;flex-direction:column;overflow:hidden"
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
 	<div
 		style="height:40px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-default)"

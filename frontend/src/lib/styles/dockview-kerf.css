@@ -1,0 +1,68 @@
+/* dockview drawn in Kerf's tokens. Every value is a var(), so a theme change
+   reaches the tab strips and sashes the same way it reaches the panels. */
+.dockview-theme-kerf {
+	--dv-group-view-background-color: var(--surface-panel);
+	--dv-tabs-and-actions-container-background-color: var(--surface-app);
+	--dv-tabs-and-actions-container-height: 30px;
+	--dv-tabs-and-actions-container-font-size: 12px;
+	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
+	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
+	--dv-inactivegroup-visiblepanel-tab-background-color: var(--surface-panel);
+	--dv-inactivegroup-hiddenpanel-tab-background-color: var(--surface-app);
+	--dv-activegroup-visiblepanel-tab-color: var(--text-primary);
+	--dv-activegroup-hiddenpanel-tab-color: var(--text-muted);
+	--dv-inactivegroup-visiblepanel-tab-color: var(--text-secondary);
+	--dv-inactivegroup-hiddenpanel-tab-color: var(--text-muted);
+	--dv-tab-divider-color: var(--border-subtle);
+	--dv-separator-border: var(--border-default);
+	--dv-paneview-header-border-color: var(--border-default);
+	--dv-paneview-active-outline-color: var(--kerf-500);
+	--dv-drag-over-background-color: var(--selection-fill);
+	--dv-drag-over-border-color: var(--selection-border);
+	--dv-sash-color: transparent;
+	--dv-active-sash-color: var(--kerf-500);
+	--dv-active-sash-transition-delay: 0.2s;
+	--dv-icon-hover-background-color: var(--surface-hover);
+	--dv-tabs-container-scrollbar-color: var(--scrollbar-thumb);
+	--dv-floating-box-shadow: var(--shadow-lg);
+	--dv-floating-border: 1px solid var(--border-strong);
+	--dv-overlay-z-index: 45;
+	--dv-tab-font-size: 12px;
+	--dv-border-radius: 0px;
+	--dv-tab-border-radius: 0px;
+	--dv-sash-border-radius: 0px;
+	--dv-dropdown-border-radius: var(--radius-sm);
+	--dv-tab-margin: 0;
+	--dv-spacing-padding: 0px;
+	--dv-tab-close-icon-size: 12px;
+	--dv-floating-group-border: none;
+	--dv-drag-over-border: none;
+	--dv-floating-group-dragging-opacity: 0.5;
+	--dv-floating-titlebar-height: 22px;
+	--dv-floating-titlebar-background-color: var(--surface-app);
+	--dv-floating-titlebar-border-bottom: var(--dv-floating-border);
+	--dv-context-menu-background-color: var(--surface-raised);
+	--dv-context-menu-color: var(--text-primary);
+	--dv-scrollbar-background-color: var(--scrollbar-thumb);
+	--dv-tab-group-color-grey: var(--text-muted);
+	--dv-tab-group-color-blue: var(--track-video-edge);
+	--dv-tab-group-color-red: var(--red-500);
+	--dv-tab-group-color-yellow: var(--kerf-500);
+	--dv-tab-group-color-green: var(--green-500);
+	--dv-tab-group-color-pink: var(--track-text-edge);
+	--dv-tab-group-color-purple: var(--track-text-edge);
+	--dv-tab-group-color-cyan: var(--agent-500);
+	--dv-tab-group-color-orange: var(--orange-500);
+	--dv-tab-group-chip-padding: 4px 8px;
+	--dv-tab-group-chip-border-radius: var(--radius-md);
+	--dv-tab-group-chip-font-size: 11px;
+	--dv-tab-group-line-height: 2px;
+	--dv-tab-group-line-opacity: 0.6;
+}
+.dockview-theme-kerf .dv-tab {
+	font-family: var(--font-sans);
+	font-weight: 500;
+}
+.dockview-theme-kerf .dv-tab.dv-active-tab {
+	box-shadow: inset 0 -2px 0 var(--kerf-500);
+}

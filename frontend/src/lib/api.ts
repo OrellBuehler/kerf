@@ -327,6 +327,47 @@ export async function saveProjectAs(defaultPath?: string): Promise<string | null
 	return (await invoke<string | null>('save_project_as', { path })) ?? null;
 }
 
+/** Pick a theme file and read it; `null` if cancelled. In the browser the
+ *  file comes through an `<input type=file>` instead of the native picker. */
+export async function importThemeFile(): Promise<string | null> {
+	if (!inTauri()) {
+		return new Promise((resolve) => {
+			const input = document.createElement('input');
+			input.type = 'file';
+			input.accept = '.json,application/json';
+			input.onchange = () => {
+				const f = input.files?.[0];
+				if (!f) return resolve(null);
+				f.text().then(resolve, () => resolve(null));
+			};
+			input.oncancel = () => resolve(null);
+			input.click();
+		});
+	}
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({ multiple: false, filters: [{ name: 'Kerf theme', extensions: ['json'] }] });
+	if (typeof selected !== 'string') return null;
+	return invoke<string>('read_text_file', { path: selected });
+}
+
+/** Save a theme as a JSON file; resolves to where it went, `null` if
+ *  cancelled. The browser harness hands the file to the download manager. */
+export async function exportThemeFile(contents: string, defaultName: string): Promise<string | null> {
+	if (!inTauri()) {
+		const url = URL.createObjectURL(new Blob([contents], { type: 'application/json' }));
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = defaultName;
+		a.click();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+		return defaultName;
+	}
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({ filters: [{ name: 'Kerf theme', extensions: ['json'] }], defaultPath: defaultName });
+	if (typeof path !== 'string') return null;
+	return invoke<string>('write_text_file', { path, contents });
+}
+
 export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
 	if (!inTauri()) {
 		await new Promise((r) => setTimeout(r, 900));
@@ -444,6 +485,7 @@ export async function transcriptionStatus(): Promise<TranscriptionStatus> {
 		return {
 			backend: 'none',
 			available: false,
+			enabled: readBrowserTranscribe(),
 			model: null,
 			model_path: null,
 			model_ready: false,
@@ -1790,7 +1832,15 @@ export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs:
  * webview's own core count — enough to drive the dialog under `bun run dev`.
  */
 export async function getSettings(): Promise<SettingsView> {
-	if (!inTauri()) return browserSettings(readBrowserCpuPercent());
+	if (!inTauri()) {
+		return browserSettings({
+			cpu_percent: readBrowserCpuPercent(),
+			transcribe: readBrowserTranscribe(),
+			safe_areas: readBrowserSafeAreas(),
+			layout: readBrowserJson(LAYOUT_KEY),
+			theme: readBrowserJson(THEME_KEY)
+		});
+	}
 	return invoke<SettingsView>('get_settings');
 }
 
@@ -1800,15 +1850,23 @@ export async function setSettings(settings: AppSettings): Promise<SettingsView> 
 		const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, settings.cpu_percent)));
 		try {
 			localStorage.setItem(CPU_KEY, String(percent));
+			localStorage.setItem(TRANSCRIBE_KEY, settings.transcribe ? '1' : '0');
+			localStorage.setItem(SAFE_AREAS_KEY, settings.safe_areas ? '1' : '0');
+			writeBrowserJson(LAYOUT_KEY, settings.layout);
+			writeBrowserJson(THEME_KEY, settings.theme);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
-		return browserSettings(percent);
+		return browserSettings({ ...settings, cpu_percent: percent });
 	}
 	return invoke<SettingsView>('set_settings', { settings });
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';
+const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
+const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
+const LAYOUT_KEY = 'kerf.settings.layout';
+const THEME_KEY = 'kerf.settings.theme';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 
@@ -1822,12 +1880,42 @@ function readBrowserCpuPercent(): number {
 	return DEFAULT_CPU_PERCENT;
 }
 
-function browserSettings(percent: number): SettingsView {
+function readBrowserTranscribe(): boolean {
+	try {
+		return localStorage.getItem(TRANSCRIBE_KEY) !== '0';
+	} catch {
+		return true;
+	}
+}
+
+function readBrowserSafeAreas(): boolean {
+	try {
+		return localStorage.getItem(SAFE_AREAS_KEY) === '1';
+	} catch {
+		return false;
+	}
+}
+
+function readBrowserJson(key: string): unknown | null {
+	try {
+		const raw = localStorage.getItem(key);
+		return raw ? JSON.parse(raw) : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeBrowserJson(key: string, value: unknown) {
+	if (value == null) localStorage.removeItem(key);
+	else localStorage.setItem(key, JSON.stringify(value));
+}
+
+function browserSettings(settings: AppSettings): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
 	return {
-		cpu_percent: percent,
+		...settings,
 		cpu_cores: cores,
-		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * percent) / 100))),
+		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * settings.cpu_percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT
 	};
 }

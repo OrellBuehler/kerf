@@ -3,11 +3,7 @@
 	import { toast } from '$lib/notifications.svelte';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
-	import MediaBin from '$lib/components/editor/MediaBin.svelte';
-	import Preview from '$lib/components/editor/Preview.svelte';
-	import Timeline from '$lib/components/editor/Timeline.svelte';
-	import Inspector from '$lib/components/editor/Inspector.svelte';
-	import AgentPanel from '$lib/components/editor/AgentPanel.svelte';
+	import Workspace from '$lib/components/editor/Workspace.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
@@ -388,26 +384,20 @@
 			>
 		</div>
 	{/if}
-	<div style="flex:1;display:flex;min-height:0">
-		<MediaBin />
-		<div style="flex:1;display:flex;flex-direction:column;min-width:0">
-			<Preview />
-			<Timeline />
-		</div>
-		{#if ui.inspectorOpen}
-			<Inspector />
-		{/if}
-		{#if ui.agentOpen}
-			<AgentPanel />
-		{/if}
-	</div>
+	<!-- The dock waits for the settings so it can restore the saved arrangement
+	     rather than build the default and then rebuild. -->
+	{#if settings.loaded}
+		<Workspace />
+	{:else}
+		<div style="flex:1"></div>
+	{/if}
 	<StatusBar />
 </div>
 
 <!-- Files are over the window and about to be dropped. -->
 {#if dropHover}
 	<div
-		style="position:fixed;inset:0;z-index:60;display:grid;place-items:center;background:color-mix(in srgb,var(--surface-void) 72%,transparent);pointer-events:none"
+		style="position:fixed;inset:0;z-index:60;display:grid;place-items:center;background:var(--surface-overlay);pointer-events:none"
 	>
 		<div
 			style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:26px 40px;border-radius:var(--radius-md);border:1.5px dashed var(--kerf-400);background:var(--surface-panel);color:var(--text-primary)"

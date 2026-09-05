@@ -334,7 +334,7 @@
 		if (e.key === 'Escape') onClose();
 		e.stopPropagation();
 	}}
-	style="position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:24px"
+	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
 >
 	<div
 		onclick={(e) => e.stopPropagation()}

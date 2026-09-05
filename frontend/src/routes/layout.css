@@ -3,14 +3,16 @@
 @import 'shadcn-svelte/tailwind.css';
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
 @import '$lib/styles/kerf-tokens.css';
+@import 'dockview/dist/styles/dockview.css';
+@import '$lib/styles/dockview-kerf.css';
 
 @custom-variant dark (&:is(.dark *));
 @plugin '@tailwindcss/typography';
 
-/* Kerf is dark-only and editor-grade. Map the shadcn-svelte semantic
-   variables onto the Kerf token system so any shadcn primitive (toasts,
-   inputs) inherits the editor theme. The bespoke editor chrome references
-   the Kerf tokens directly. */
+/* Map the shadcn-svelte semantic variables onto the Kerf token system so any
+   shadcn primitive (toasts, inputs) inherits the editor theme. The bespoke
+   editor chrome references the Kerf tokens directly. Dark by default; a
+   theme (`lib/theme.ts`) toggles the class and the color-scheme with it. */
 :root {
 	color-scheme: dark;
 
@@ -41,6 +43,10 @@
 	--sidebar-accent-foreground: var(--text-primary);
 	--sidebar-border: var(--border-default);
 	--sidebar-ring: var(--kerf-500);
+}
+
+html:not(.dark) {
+	color-scheme: light;
 }
 
 @theme inline {
@@ -113,23 +119,23 @@
 		background: var(--selection);
 		color: var(--text-primary);
 	}
-	/* Thin, dark, tool-grade scrollbars */
+	/* Thin, tool-grade scrollbars */
 	* {
 		scrollbar-width: thin;
-		scrollbar-color: var(--neutral-720) transparent;
+		scrollbar-color: var(--scrollbar-thumb) transparent;
 	}
 	*::-webkit-scrollbar {
 		width: 10px;
 		height: 10px;
 	}
 	*::-webkit-scrollbar-thumb {
-		background: var(--neutral-720);
+		background: var(--scrollbar-thumb);
 		border-radius: var(--radius-full);
 		border: 3px solid transparent;
 		background-clip: content-box;
 	}
 	*::-webkit-scrollbar-thumb:hover {
-		background: var(--neutral-680);
+		background: var(--scrollbar-thumb-hover);
 		background-clip: content-box;
 	}
 }

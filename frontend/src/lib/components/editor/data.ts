@@ -13,6 +13,10 @@ export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label:
 	failed: { tone: 'neutral', icon: 'history', label: 'Failed' }
 };
 
+/** The placeholder a video clip gets where a thumbnail would go. */
+export const VIDEO_THUMB_BG =
+	'linear-gradient(135deg, var(--track-video), color-mix(in srgb, var(--track-video) 60%, var(--track-video-edge)))';
+
 export const PRESETS = [
 	'Remove silences',
 	'Cut to the beat',

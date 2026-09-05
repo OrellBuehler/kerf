@@ -57,7 +57,7 @@
 	/** Shared look for the one-letter S / L track flags. */
 	const flagBtn = (on: boolean, accent: string) =>
 		`flex:none;font-family:var(--font-mono);font-size:9px;font-weight:700;line-height:1;padding:2px 3px;border-radius:3px;cursor:pointer;` +
-		`border:1px solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? '#0b0b0c' : 'var(--text-disabled)'}`;
+		`border:1px solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-disabled)'}`;
 
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
@@ -383,11 +383,6 @@
 	}
 
 	function onPointerMove(e: PointerEvent) {
-		if (resizeFrom) {
-			const max = Math.max(180, window.innerHeight - 180);
-			ui.timelineH = Math.min(Math.max(140, resizeFrom.h + (resizeFrom.y - e.clientY)), max);
-			return;
-		}
 		if (scrubbing) {
 			ui.seek(rulerTime(e.clientX));
 			return;
@@ -425,10 +420,6 @@
 	}
 
 	function onPointerUp() {
-		if (resizeFrom) {
-			resizeFrom = null;
-			return;
-		}
 		if (scrubbing) {
 			scrubbing = false;
 			return;
@@ -746,14 +737,6 @@
 		ui.zoom = next;
 	}
 
-	let resizeFrom: { y: number; h: number } | null = null;
-
-	function onResizePointerDown(e: PointerEvent) {
-		if (e.button !== 0) return;
-		e.preventDefault();
-		resizeFrom = { y: e.clientY, h: ui.timelineH };
-	}
-
 	// ---- ruler scrub + draggable in/out marks ---------------------------------
 
 	let scrubbing = false;
@@ -843,15 +826,8 @@
 <svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
 
 <div
-	style="height:{ui.timelineH}px;flex:none;border-top:1px solid var(--border-default);background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
-	<!-- drag the top edge to resize the panel -->
-	<div
-		role="presentation"
-		title="Drag to resize the timeline"
-		onpointerdown={onResizePointerDown}
-		style="position:absolute;top:-2px;left:0;right:0;height:6px;cursor:row-resize;z-index:60;touch-action:none"
-	></div>
 
 	<!-- timeline toolbar -->
 	<div
@@ -981,7 +957,7 @@
 							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:1px solid {t.duck
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
-								? '#fff'
+								? 'var(--text-on-accent)'
 								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px;flex:none"
 							>DUCK</button
 						>
@@ -1122,7 +1098,7 @@
 							/>
 						{:else}
 							<span
-								style="position:relative;flex:none;margin-left:3px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;font-weight:600;line-height:1;padding:2px 4px;border-radius:3px;background:{accent};color:#04181c;pointer-events:none"
+								style="position:relative;flex:none;margin-left:3px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;font-weight:600;line-height:1;padding:2px 4px;border-radius:3px;background:{accent};color:var(--text-on-accent);pointer-events:none"
 								>{m.name}</span
 							>
 						{/if}
@@ -1236,20 +1212,20 @@
 								{#each silenceRegions(c) as r (r.left)}
 									<span
 										title="Detected silence"
-										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid rgba(229,84,75,.3);border-radius:2px"
+										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
 							{/if}
 							{#if c.fade_in > 0}
 								<span
 									title="Fade in {c.fade_in.toFixed(2)}s"
-									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, rgba(0,0,0,.7), transparent);pointer-events:none"
+									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
 								></span>
 							{/if}
 							{#if c.fade_out > 0}
 								<span
 									title="Fade out {c.fade_out.toFixed(2)}s"
-									style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, rgba(0,0,0,.7), transparent);pointer-events:none"
+									style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
 								></span>
 							{/if}
 							{#if c.transition_in}
@@ -1258,18 +1234,18 @@
 									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
 										c.transition_in.duration * pxPerSec,
 										width
-									)}px;background:linear-gradient(to right, rgba(120,140,255,.55), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
+									)}px;background:linear-gradient(to right, color-mix(in srgb,var(--drag-ghost) 55%,transparent), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
 								></span>
 							{/if}
 							<span
-								style="position:relative;font-size:10px;font-weight:600;color:rgba(255,255,255,.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 								>{editor.assetName(c.asset_id)}</span
 							>
 							{#if (c.speed ?? 1) !== 1}
 								{@const sp = c.speed ?? 1}
 								<span
 									title="Speed {sp}×"
-									style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:1px 4px;pointer-events:none"
+									style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);border-radius:3px;padding:1px 4px;pointer-events:none"
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
 							{/if}
@@ -1292,7 +1268,7 @@
 							style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 								6,
 								drag.dur * pxPerSec
-							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
 						></div>
 					{/if}
 					{#if trimDrag?.moved && trimDrag.trackId === t.id}
@@ -1302,7 +1278,7 @@
 							style="position:absolute;left:{gl * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 								2,
 								(gr - gl) * pxPerSec
-							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:rgba(120,140,255,.16);pointer-events:none;z-index:25"
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
 						></div>
 					{/if}
 					{#if dropGhost && dropGhost.trackId === t.id}

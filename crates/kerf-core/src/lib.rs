@@ -18,9 +18,9 @@ mod engine;
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
     analyze, analyze_asset_media, analyze_asset_media_cancellable, analyze_asset_media_with_progress, analyze_cancellable,
-    analyze_with_progress, transcription_status, AnalysisProgress, AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer,
-    FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector,
-    Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
+    analyze_with_progress, set_transcription_enabled, transcription_enabled, transcription_status, AnalysisProgress,
+    AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn,
+    RhythmAnalyzer, SceneDetector, SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,

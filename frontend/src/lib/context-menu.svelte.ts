@@ -12,7 +12,11 @@ export type MenuItem =
 			disabled?: boolean;
 			action: () => void;
 	  }
-	| { type: 'separator' };
+	| { type: 'separator' }
+	/** A non-interactive title row: what the menu is about. */
+	| { type: 'header'; label: string; sub?: string }
+	/** A non-interactive fact row (`label` left, `value` right, mono). */
+	| { type: 'info'; label: string; value: string; title?: string };
 
 class ContextMenuState {
 	visible = $state(false);

@@ -45,7 +45,8 @@
 	}
 
 	function run(item: MenuItem) {
-		if (item.type === 'separator' || item.disabled) return;
+		if (item.type !== undefined && item.type !== 'item') return;
+		if (item.disabled) return;
 		contextMenu.close();
 		item.action();
 	}
@@ -69,6 +70,34 @@
 		{#each contextMenu.items as item, i (i)}
 			{#if item.type === 'separator'}
 				<div style="height:1px;margin:5px 4px;background:var(--border-subtle)"></div>
+			{:else if item.type === 'header'}
+				<div style="padding:5px 8px 4px;min-width:0;max-width:300px">
+					<div
+						style="font-size:12px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+						title={item.label}
+					>
+						{item.label}
+					</div>
+					{#if item.sub}
+						<div
+							style="font-size:10.5px;color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							title={item.sub}
+						>
+							{item.sub}
+						</div>
+					{/if}
+				</div>
+			{:else if item.type === 'info'}
+				<div
+					style="display:flex;align-items:baseline;gap:12px;padding:2px 8px;font-size:11px;line-height:16px;max-width:300px"
+					title={item.title ?? item.value}
+				>
+					<span style="flex:none;color:var(--text-muted)">{item.label}</span>
+					<span
+						style="flex:1;min-width:0;text-align:right;font-family:var(--font-mono);font-size:10.5px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+						>{item.value}</span
+					>
+				</div>
 			{:else}
 				<button
 					role="menuitem"
@@ -79,7 +108,7 @@
 						: 'pointer'};text-align:left;font-size:12.5px;color:{item.disabled
 						? 'var(--text-disabled)'
 						: item.danger
-							? 'var(--red-400, #f08a82)'
+							? 'var(--red-400)'
 							: 'var(--text-primary)'};opacity:{item.disabled ? 0.55 : 1}"
 					onpointerenter={(e) => {
 						if (!item.disabled) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover)';

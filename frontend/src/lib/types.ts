@@ -546,6 +546,8 @@ export interface TranscriptionStatus {
 	/** `libwhisper` (in-process) · `ffmpeg_filter` · `none` */
 	backend: string;
 	available: boolean;
+	/** The Settings toggle: off, an analyzed asset has no transcript. */
+	enabled: boolean;
 	model?: string | null;
 	model_path?: string | null;
 	model_ready: boolean;
@@ -573,6 +575,18 @@ export interface AppSettings {
 	 *  stitch, export) may take. Kerf runs one such job at a time; this is how
 	 *  much of the computer that job gets. */
 	cpu_percent: number;
+	/** Whether the analysis pass transcribes speech. Off, importing media still
+	 *  detects silence / scenes / loudness / rhythm but never fetches a speech
+	 *  model or runs inference. */
+	transcribe: boolean;
+	/** Whether the preview shades the delivery safe areas — where a phone's
+	 *  own UI covers a vertical or square cut. */
+	safe_areas: boolean;
+	/** The workspace arrangement (dockview's serialized layout), validated by
+	 *  `layout.ts` on the way back in. */
+	layout: unknown | null;
+	/** The color theme, validated by `theme.ts` on the way back in. */
+	theme: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

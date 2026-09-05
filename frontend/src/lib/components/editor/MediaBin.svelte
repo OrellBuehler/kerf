@@ -1,134 +1,53 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { inTauri } from '$lib/api';
+	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { getFrame, inTauri, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import type { Clip } from '$lib/types';
+	import { analysisFacts, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
+	import type { Asset } from '$lib/types';
 
-	type BinAsset = { id: string; name: string; dur: string; kind: 'video' | 'audio'; image: boolean; tag: string };
-
-	let tab = $state<'bin' | 'tx'>('bin');
+	type BinAsset = { asset: Asset; info: MediaInfo };
 
 	const loaded = $derived(editor.assets.length > 0);
 
-	function fmt(s: number): string {
-		const m = Math.floor(s / 60);
-		const sec = Math.floor(s % 60);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-	}
-
 	const assets = $derived<BinAsset[]>(
-		editor.assets.map((a) => {
-			const hasVideo = a.streams.some((s) => s.kind === 'video');
-			const isImage = a.streams.some((s) => s.image);
-			const primary = a.streams[0];
-			return {
-				id: a.id,
-				name: a.name,
-				dur: fmt(a.duration),
-				kind: hasVideo ? 'video' : 'audio',
-				image: isImage,
-				tag: isImage ? 'image' : (primary?.codec ?? (hasVideo ? 'video' : 'audio'))
-			};
-		})
+		editor.assets.map((a) => ({ asset: a, info: mediaInfo(a, editor.timeline) }))
 	);
 
-	type TxLine = { t: string; s: string; start: number; end: number; clip: Clip | null };
+	// One decoded frame per asset, so a row shows the footage rather than an icon.
+	// Cached across mounts (the panel is dockable, and a re-dock would otherwise
+	// re-decode every asset); `null` in the browser harness, where the icon stays.
+	const thumbCache = new Map<string, string | null>();
+	const requested = new Set<string>();
+	let thumbs = $state<Record<string, string>>({});
 
-	/** Transcript lines of the selected asset, each resolved (by its midpoint)
-	 * to the timeline clip currently carrying it — null once cut out. */
-	const txLines = $derived.by<TxLine[]>(() => {
-		const assetId = editor.selectedAssetId;
-		return (editor.selectedMetadata?.analysis?.transcript ?? []).map((seg) => {
-			const mid = (seg.start + seg.end) / 2;
-			let clip: Clip | null = null;
-			outer: for (const tr of editor.timeline.tracks) {
-				for (const c of tr.clips) {
-					if (c.asset_id === assetId && mid > c.source_in && mid < c.source_out) {
-						clip = c;
-						break outer;
-					}
-				}
+	$effect(() => {
+		for (const { asset, info } of assets) {
+			if (requested.has(asset.id)) continue;
+			requested.add(asset.id);
+			const cached = thumbCache.get(asset.id);
+			if (cached !== undefined) {
+				if (cached) thumbs[asset.id] = cached;
+				continue;
 			}
-			return { t: fmt(seg.start), s: seg.text, start: seg.start, end: seg.end, clip };
-		});
-	});
-
-	/** Timeline time of a source point within a clip (mirrors the timeline's
-	 * mapping, honoring speed and reverse). */
-	function srcToTimeline(c: Clip, src: number): number {
-		const sp = c.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
-		const off = sp < 0 ? c.source_out - src : src - c.source_in;
-		return c.timeline_start + Math.max(0, off) / mag;
-	}
-
-	function seekLine(l: TxLine) {
-		if (l.clip) ui.seek(srcToTimeline(l.clip, l.start));
-	}
-
-	async function cutLine(l: TxLine) {
-		if (!l.clip) return;
-		try {
-			await editor.cutRange(l.clip.id, l.start, l.end);
-			toast('Line cut from timeline', {
-				action: { label: 'Undo', onClick: () => void editor.undo() }
-			});
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			if (info.kind === 'audio') {
+				thumbCache.set(asset.id, null);
+				continue;
+			}
+			void getFrame(asset.id, thumbTime(asset.duration), 160, false)
+				.then((url) => {
+					thumbCache.set(asset.id, url);
+					if (url) thumbs[asset.id] = url;
+				})
+				.catch(() => thumbCache.set(asset.id, null));
 		}
-	}
-
-	/** Index of the transcript line under the playhead, for the highlight. */
-	const activeTx = $derived.by(() => {
-		for (let i = 0; i < txLines.length; i++) {
-			const l = txLines[i];
-			if (!l.clip) continue;
-			const a = srcToTimeline(l.clip, Math.max(l.start, l.clip.source_in));
-			const b = srcToTimeline(l.clip, Math.min(l.end, l.clip.source_out));
-			if (ui.time >= Math.min(a, b) && ui.time < Math.max(a, b)) return i;
-		}
-		return -1;
-	});
-
-	const tabs = $derived([
-		{ id: 'bin' as const, label: 'Media', count: assets.length || undefined },
-		{ id: 'tx' as const, label: 'Transcript', count: txLines.length || undefined }
-	]);
-
-	/** What the empty transcript panel should say and offer. An empty transcript
-	 * has several quite different causes — nothing selected, no speech-to-text
-	 * backend, a model still to download, analysis not run, or genuinely no
-	 * speech — and telling them apart is the difference between a dead end and
-	 * one click. */
-	const tx = $derived.by<{ title: string; body?: string; action?: 'download' | 'analyze' }>(() => {
-		const st = ui.transcription;
-		const mb = (b?: number | null) => (b ? `${Math.round(b / 1024 / 1024)} MB` : 'a few hundred MB');
-		if (ui.analyzing) {
-			return { title: ui.analysisLabel ?? 'analyzing', body: ui.analysisStage?.detail ?? undefined };
-		}
-		if (!editor.selectedAssetId) {
-			return { title: 'No media selected', body: 'Pick a clip in the Media tab to see its transcript.' };
-		}
-		if (st && !st.available) {
-			return { title: 'Transcription unavailable', body: st.reason ?? undefined };
-		}
-		if (st && !st.model_ready) {
-			return {
-				title: 'Speech model not downloaded',
-				body: `Transcription needs a speech model (${mb(st.approx_download_bytes)}). It downloads on first use, or fetch it now.`,
-				action: 'download'
-			};
-		}
-		if (!editor.selectedMetadata?.analysis) {
-			return { title: 'Not analyzed yet', body: 'Analyze this clip to transcribe its speech.', action: 'analyze' };
-		}
-		return { title: 'No speech found', body: 'This media was analyzed but no speech was detected in it.' };
 	});
 
 	async function onImport() {
@@ -154,17 +73,19 @@
 		void editor.select(assetId);
 	}
 
+	function err(e: unknown) {
+		toast.error(e instanceof Error ? e.message : String(e));
+	}
+
 	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
 	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).
-	function onAssetDragStart(e: DragEvent, a: BinAsset) {
-		const asset = editor.assets.find((x) => x.id === a.id);
-		if (!asset) return;
-		ui.dndAsset = { id: a.id, kind: a.kind, duration: asset.duration };
+	function onAssetDragStart(e: DragEvent, { asset, info }: BinAsset) {
+		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: asset.duration };
 		if (e.dataTransfer) {
 			e.dataTransfer.effectAllowed = 'copy';
 			// A custom MIME so an off-target drop on a text field doesn't paste the
 			// name; the drop is coordinated entirely via `ui.dndAsset`.
-			e.dataTransfer.setData('application/x-kerf-asset', a.id);
+			e.dataTransfer.setData('application/x-kerf-asset', asset.id);
 		}
 	}
 
@@ -172,267 +93,260 @@
 		ui.dndAsset = null;
 	}
 
-	function onAssetContextMenu(e: MouseEvent, a: BinAsset) {
-		void editor.select(a.id);
-		const asset = editor.assets.find((x) => x.id === a.id);
-		const analyzed = !!editor.analysisFor(a.id);
-		contextMenu.show(e, [
-			{
-				label: 'Add to timeline',
-				icon: 'plus',
-				disabled: !asset,
-				action: () => {
-					if (asset)
-						void editor
-							.add(a.id, 0, asset.duration)
-							.then(() => toast.success(`Added ${a.name}`))
-							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
-				}
-			},
-			{ type: 'separator' },
-			{
-				label: analyzed ? 'Re-analyze' : 'Analyze',
-				icon: 'scan-line',
-				disabled: ui.analyzingId === a.id,
+	function onAssetContextMenu(e: MouseEvent, { asset, info }: BinAsset) {
+		void editor.select(asset.id);
+		const analysis = editor.analysisFor(asset.id);
+		const analyzing = ui.analyzingId === asset.id;
+		const spherical = !!info.projection;
+		const facts = analysisFacts(analysis, asset.duration);
+		const imported = new Date(asset.imported_at);
+
+		const items: MenuItem[] = [{ type: 'header', label: asset.name, sub: shortPath(asset.path) }];
+
+		items.push({ type: 'info', label: 'Duration', value: info.duration });
+		if (info.resolution)
+			items.push({
+				type: 'info',
+				label: 'Frame',
+				value: info.aspect ? `${info.resolution} · ${info.aspect}` : info.resolution
+			});
+		if (info.fps) items.push({ type: 'info', label: 'Rate', value: info.fps });
+		if (info.codec) items.push({ type: 'info', label: 'Codec', value: info.codec });
+		if (info.audio) items.push({ type: 'info', label: 'Audio', value: info.audio });
+		if (info.projection) items.push({ type: 'info', label: 'Projection', value: info.projection });
+		if (info.stitched)
+			items.push({
+				type: 'info',
+				label: 'Stitched',
+				value: `${asset.source_paths?.length ?? 0} lens files`,
+				title: asset.source_paths?.join('\n')
+			});
+		items.push({ type: 'info', label: 'Used in', value: info.uses === 1 ? '1 clip' : `${info.uses} clips` });
+		if (!Number.isNaN(imported.getTime()))
+			items.push({ type: 'info', label: 'Imported', value: imported.toLocaleDateString() });
+
+		items.push({ type: 'separator' });
+		if (facts.length) for (const f of facts) items.push({ type: 'info', label: f.label, value: f.value });
+		else items.push({ type: 'info', label: 'Analysis', value: analyzing ? 'running…' : 'not analyzed' });
+
+		items.push({ type: 'separator' });
+		items.push({
+			label: 'Add at playhead',
+			icon: 'plus',
+			action: () =>
+				void editor
+					.add(asset.id, 0, asset.duration, undefined, ui.time)
+					.then(() => toast.success(`Added ${asset.name}`))
+					.catch(err)
+		});
+		items.push({
+			label: 'Append to timeline',
+			icon: 'list-plus',
+			action: () =>
+				void editor
+					.add(asset.id, 0, asset.duration, undefined, editor.duration)
+					.then(() => toast.success(`Appended ${asset.name}`))
+					.catch(err)
+		});
+		if (info.kind === 'video' && info.audio)
+			items.push({
+				label: 'Extract audio to a track',
+				icon: 'audio-waveform',
+				action: () => void editor.extractAudio(asset.id).catch(err)
+			});
+		items.push({
+			label: 'Remove silences',
+			icon: 'Scissors',
+			disabled: !analysis?.silence_segments.length,
+			action: () =>
+				void editor
+					.removeSilence(asset.id)
+					.then(() => toast.success(`Removed ${analysis?.silence_segments.length} silent gaps`))
+					.catch(err)
+		});
+
+		items.push({ type: 'separator' });
+		items.push(
+			analyzing
+				? { label: 'Stop analysis', icon: 'x', action: () => ui.stopAnalysis() }
+				: {
+						label: analysis ? 'Re-analyze' : 'Analyze',
+						icon: 'scan-line',
+						action: () => void ui.runAnalysis(asset.id).catch(err)
+					}
+		);
+		if (info.kind === 'video')
+			items.push({
+				label: spherical ? 'Mark as flat footage' : 'Mark as 360 (equirect)',
+				icon: 'rotate-ccw',
 				action: () =>
-					void ui.runAnalysis(a.id).catch((err) => toast.error(err instanceof Error ? err.message : String(err)))
-			}
-		]);
+					void editor
+						.setAssetProjection(asset.id, spherical ? 'flat' : 'equirect')
+						.then(() => toast.success(spherical ? `${asset.name} is flat` : `${asset.name} is 360 footage`))
+						.catch(err)
+			});
+
+		items.push({ type: 'separator' });
+		items.push({
+			label: 'Copy path',
+			icon: 'copy',
+			action: () =>
+				void navigator.clipboard
+					.writeText(asset.path)
+					.then(() => toast.success('Path copied'))
+					.catch(() => toast.error('Could not copy the path'))
+		});
+		items.push({
+			label: 'Show in folder',
+			icon: 'folder-open',
+			disabled: !inTauri(),
+			action: () => void revealPath(asset.path).catch(err)
+		});
+
+		contextMenu.show(e, items);
 	}
 </script>
 
 <div
-	style="width:var(--sidebar-w);flex:none;background:var(--surface-panel);border-right:1px solid var(--border-default);display:flex;flex-direction:column;overflow:hidden"
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
-	<!-- tab bar -->
-	<div style="display:flex;border-bottom:1px solid var(--border-default);flex:none;padding:0 6px">
-		{#each tabs as t (t.id)}
-			{@const on = t.id === tab}
-			<button
-				onclick={() => (tab = t.id)}
-				style="position:relative;display:inline-flex;align-items:center;gap:6px;padding:10px;background:none;border:none;cursor:pointer;font-family:var(--font-sans);font-size:13px;font-weight:500;color:{on
-					? 'var(--text-primary)'
-					: 'var(--text-muted)'}"
-			>
-				{t.label}
-				{#if t.count != null}
-					<span
-						style="font-family:var(--font-mono);font-size:10px;color:{on
-							? 'var(--kerf-400)'
-							: 'var(--text-disabled)'}">{t.count}</span
-					>
-				{/if}
-				<span
-					style="position:absolute;left:4px;right:4px;bottom:-1px;height:2px;background:{on
-						? 'var(--kerf-500)'
-						: 'transparent'}"
-				></span>
-			</button>
-		{/each}
-	</div>
-
 	<div style="flex:1;overflow-y:auto;padding:12px">
-		{#if tab === 'bin'}
-			{#if !loaded}
-				{#if editor.importing}
-					<!-- import in flight -->
-					<div
-						style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;background:var(--surface-inset);text-align:center"
-					>
-						<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={22} /></span>
-						<div>
-							<div style="font:var(--type-ui);color:var(--text-primary)">Importing media…</div>
-							<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-								{#if editor.importProgress !== null}
-									Stitching 360 lens pair · {Math.round(editor.importProgress * 100)}%
-								{:else}
-									Probing streams locally
-								{/if}
-							</div>
+		{#if !loaded}
+			{#if editor.importing}
+				<!-- import in flight -->
+				<div
+					style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;background:var(--surface-inset);text-align:center"
+				>
+					<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={22} /></span>
+					<div>
+						<div style="font:var(--type-ui);color:var(--text-primary)">Importing media…</div>
+						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
+							{#if editor.importProgress !== null}
+								Stitching 360 lens pair · {Math.round(editor.importProgress * 100)}%
+							{:else}
+								Probing streams locally
+							{/if}
 						</div>
 					</div>
-				{:else}
-					<!-- dropzone -->
+				</div>
+			{:else}
+				<!-- dropzone -->
+				<div
+					onclick={onImport}
+					role="button"
+					tabindex="0"
+					onkeydown={(e) => e.key === 'Enter' && onImport()}
+					style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;cursor:pointer;background:var(--surface-inset);text-align:center"
+				>
 					<div
-						onclick={onImport}
+						style="width:40px;height:40px;border-radius:var(--radius-md);display:grid;place-items:center;background:var(--surface-hover);color:var(--text-muted)"
+					>
+						<Icon n="film" s={20} />
+					</div>
+					<div>
+						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
+						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
+							Kerf transcribes & detects locally on import
+						</div>
+					</div>
+					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
+				</div>
+			{/if}
+		{:else}
+			<!-- asset grid -->
+			<div style="display:flex;flex-direction:column;gap:8px">
+				<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+					<span
+						style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
+						>{assets.length} assets</span
+					>
+					{#if editor.importing}
+						<span style="display:inline-flex;align-items:center;gap:5px">
+							{#if editor.importProgress !== null}
+								<span
+									style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+									title="Stitching a 360 lens pair"
+									>{Math.round(editor.importProgress * 100)}%</span
+								>
+							{/if}
+							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+						</span>
+					{:else}
+						<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+					{/if}
+				</div>
+				{#each assets as a (a.asset.id)}
+					{@const sel = a.asset.id === editor.selectedAssetId}
+					{@const spec = specLine(a.info)}
+					<div
 						role="button"
 						tabindex="0"
-						onkeydown={(e) => e.key === 'Enter' && onImport()}
-						style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;cursor:pointer;background:var(--surface-inset);text-align:center"
+						draggable={true}
+						ondragstart={(e) => onAssetDragStart(e, a)}
+						ondragend={onAssetDragEnd}
+						oncontextmenu={(e) => onAssetContextMenu(e, a)}
+						onclick={() => onSelect(a.asset.id)}
+						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
+						title="{a.asset.path}&#10;Drag onto a timeline track to add a clip · right-click for details"
+						style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div
-							style="width:40px;height:40px;border-radius:var(--radius-md);display:grid;place-items:center;background:var(--surface-hover);color:var(--text-muted)"
+							style="width:56px;height:36px;border-radius:3px;flex:none;overflow:hidden;background:{a.info
+								.kind === 'audio'
+								? 'var(--track-audio)'
+								: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 						>
-							<Icon n="film" s={20} />
-						</div>
-						<div>
-							<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
-							<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-								Kerf transcribes & detects locally on import
-							</div>
-						</div>
-						<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
-					</div>
-				{/if}
-			{:else}
-				<!-- asset grid -->
-				<div style="display:flex;flex-direction:column;gap:8px">
-					<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
-						<span
-							style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-							>{assets.length} assets</span
-						>
-						{#if editor.importing}
-							<span style="display:inline-flex;align-items:center;gap:5px">
-								{#if editor.importProgress !== null}
-									<span
-										style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
-										title="Stitching a 360 lens pair"
-										>{Math.round(editor.importProgress * 100)}%</span
-									>
-								{/if}
-								<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
-							</span>
-						{:else}
-							<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
-						{/if}
-					</div>
-					{#each assets as a (a.id)}
-						{@const sel = a.id === editor.selectedAssetId}
-						<div
-							role="button"
-							tabindex="0"
-							draggable={true}
-							ondragstart={(e) => onAssetDragStart(e, a)}
-							ondragend={onAssetDragEnd}
-							oncontextmenu={(e) => onAssetContextMenu(e, a)}
-							onclick={() => onSelect(a.id)}
-							onkeydown={(e) => e.key === 'Enter' && onSelect(a.id)}
-							title="Drag onto a timeline track to add a clip"
-							style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
-						>
-							<div
-								style="width:46px;height:30px;border-radius:3px;flex:none;background:{a.kind ===
-								'audio'
-									? 'var(--track-audio)'
-									: 'linear-gradient(135deg,#22303f,#33424f)'};display:grid;place-items:center;color:rgba(255,255,255,.8)"
-							>
-								<Icon n={a.image ? 'image' : a.kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
-							</div>
-							<div style="flex:1;min-width:0">
-								<div
-									style="font-size:12px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-								>
-									{a.name}
-								</div>
-								<div style="display:flex;gap:6px;align-items:center;margin-top:3px">
-									<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{a.dur}</span>
-									{#if ui.analyzingId === a.id}
-										<Badge tone="agent" dot>analyzing</Badge>
-									{:else}
-										<Badge tone="neutral">{a.tag}</Badge>
-									{/if}
-								</div>
-							</div>
-						</div>
-					{/each}
-				</div>
-			{/if}
-		{:else if tab === 'tx'}
-			{#if txLines.length === 0}
-				<div
-					style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-disabled);text-align:center"
-				>
-					<Icon n="captions" s={22} />
-					<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
-					{#if tx.body}
-						<span style="font-size:11px;line-height:1.5;max-width:240px">{tx.body}</span>
-					{/if}
-					{#if ui.analyzing}
-						<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{Math.round(
-									(ui.analysisStage?.fraction ?? 0) * 100
-								)}%;background:var(--kerf-500);transition:width .2s"
-							></div>
-						</div>
-					{:else if tx.action === 'download'}
-						<div style="display:flex;flex-direction:column;gap:8px;align-items:center">
-							<select
-								value={ui.transcription?.model ?? ''}
-								onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
-								disabled={!!ui.downloadingModel}
-								style="background:var(--surface-inset);color:var(--text-secondary);border:1px solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
-							>
-								{#each ui.transcription?.models ?? [] as m (m.name)}
-									<option value={m.name}
-										>{m.name} · {Math.round(m.approx_bytes / 1024 / 1024)} MB{m.multilingual
-											? ''
-											: ' · English'}</option
-									>
-								{/each}
-							</select>
-							{#if ui.downloadingModel}
-								<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-									<div
-										style="height:100%;width:{Math.round(
-											ui.modelFraction * 100
-										)}%;background:var(--kerf-500);transition:width .2s"
-									></div>
-								</div>
+							{#if thumbs[a.asset.id]}
+								<img
+									src={thumbs[a.asset.id]}
+									alt=""
+									draggable={false}
+									style="width:100%;height:100%;object-fit:cover;display:block"
+								/>
 							{:else}
-								<Btn size="sm" onclick={() => void ui.fetchSpeechModel(ui.transcription?.model ?? 'base')}
-									>Download model</Btn
-								>
+								<Icon
+									n={a.info.kind === 'image' ? 'image' : a.info.kind === 'audio' ? 'audio-waveform' : 'video'}
+									s={14}
+								/>
 							{/if}
 						</div>
-					{:else if tx.action === 'analyze' && editor.selectedAssetId}
-						<Btn size="sm" onclick={() =>
-								void ui
-									.runAnalysis(editor.selectedAssetId!)
-									.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Analyze &amp; transcribe</Btn>
-					{/if}
-				</div>
-			{:else}
-				<div data-selectable style="display:flex;flex-direction:column;gap:2px">
-					{#each txLines as l, i (i)}
-						<div
-							style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);align-items:flex-start;background:{i ===
-							activeTx
-								? 'var(--surface-inset)'
-								: 'transparent'}"
-						>
-							<button
-								onclick={() => seekLine(l)}
-								disabled={!l.clip}
-								title={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
-								style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;cursor:{l.clip
-									? 'pointer'
-									: 'default'}"
+						<div style="flex:1;min-width:0">
+							<div
+								style="font-size:12px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 							>
-								<span
-									style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none;padding-top:1px"
-									>{l.t}</span
+								{a.asset.name}
+							</div>
+							{#if spec}
+								<div
+									style="font-size:10.5px;color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+									title={spec}
 								>
-								<span
-									style="font-size:12px;line-height:1.45;color:{l.clip
-										? 'var(--text-secondary)'
-										: 'var(--text-disabled)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
-								>
-							</button>
-							{#if l.clip}
-								<button
-									title="Cut this line out of the timeline"
-									aria-label="Cut line"
-									onclick={() => void cutLine(l)}
-									style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:1px 0 0"
-									><Icon n="x" s={11} /></button
-								>
+									{spec}
+								</div>
 							{/if}
+							<div style="display:flex;gap:5px;align-items:center;margin-top:4px;flex-wrap:wrap">
+								<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+									>{a.info.duration}</span
+								>
+								{#if a.info.projection}
+									<Badge tone="kerf">360</Badge>
+								{/if}
+								{#if a.info.kind === 'image'}
+									<Badge tone="neutral">still</Badge>
+								{/if}
+								{#if a.info.uses > 0}
+									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
+								{/if}
+								{#if ui.analyzingId === a.asset.id}
+									<Badge tone="agent" dot>analyzing</Badge>
+								{:else if editor.analysisFor(a.asset.id)}
+									<Badge tone="success" dot>analyzed</Badge>
+								{/if}
+							</div>
 						</div>
-					{/each}
-				</div>
-			{/if}
+					</div>
+				{/each}
+			</div>
 		{/if}
 	</div>
 </div>

@@ -3,6 +3,7 @@
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { exportCover, getTimelineFrame, inTauri, pickCoverPath, revealPath, startPlayback } from '$lib/api';
@@ -195,7 +196,7 @@
 	// right. Percentages of the frame, deliberately generous — every app differs,
 	// so this is "keep the subject out of here", not a pixel contract.
 	const CHROME = { top: 0.08, bottom: 0.2, right: 0.14 };
-	const showGuides = $derived(ui.safeAreas && !!delivery && aspect < 1.2);
+	const showGuides = $derived(settings.safeAreas && !!delivery && aspect < 1.2);
 
 	/** Write the frame under the playhead as a cover image — the thumbnail a
 	 *  platform shows before anyone presses play. Rendered at the full delivery
@@ -238,10 +239,10 @@
 			},
 			{ type: 'separator' },
 			{
-				label: ui.safeAreas ? 'Hide safe areas' : 'Show safe areas',
+				label: settings.safeAreas ? 'Hide safe areas' : 'Show safe areas',
 				icon: 'crop',
 				disabled: !delivery,
-				action: () => (ui.safeAreas = !ui.safeAreas)
+				action: () => void settings.setSafeAreas(!settings.safeAreas)
 			},
 			{ type: 'separator' },
 			{
@@ -266,13 +267,13 @@
 			</div>
 		{:else}
 			<div
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, #2b3a49 0%, #161d24 55%, #0d1116 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if frameUrl}
-					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000" />
+					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)" />
 				{:else}
-					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, rgba(226,157,46,.06) 60%)"></div>
-					<div style="position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.22)">
+					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, color-mix(in srgb,var(--kerf-500) 6%,transparent) 60%)"></div>
+					<div style="position:absolute;inset:0;display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 22%,transparent)">
 						<Icon n={ui.playing ? 'pause' : 'play'} s={44} />
 					</div>
 				{/if}
@@ -281,13 +282,13 @@
 					     cropped: the pixels still render, they are just not yours to
 					     put a face or a caption in. -->
 					<div style="position:absolute;inset:0;pointer-events:none">
-						<div style="position:absolute;left:0;right:0;top:0;height:{CHROME.top * 100}%;background:rgba(0,0,0,.34);border-bottom:1px dashed rgba(255,255,255,.28)"></div>
-						<div style="position:absolute;left:0;right:0;bottom:0;height:{CHROME.bottom * 100}%;background:rgba(0,0,0,.34);border-top:1px dashed rgba(255,255,255,.28)"></div>
+						<div style="position:absolute;left:0;right:0;top:0;height:{CHROME.top * 100}%;background:color-mix(in srgb,var(--scrim) 34%,transparent);border-bottom:1px dashed color-mix(in srgb,var(--text-on-video) 28%,transparent)"></div>
+						<div style="position:absolute;left:0;right:0;bottom:0;height:{CHROME.bottom * 100}%;background:color-mix(in srgb,var(--scrim) 34%,transparent);border-top:1px dashed color-mix(in srgb,var(--text-on-video) 28%,transparent)"></div>
 						<div
-							style="position:absolute;right:0;top:{CHROME.top * 100}%;bottom:{CHROME.bottom * 100}%;width:{CHROME.right * 100}%;background:rgba(0,0,0,.24);border-left:1px dashed rgba(255,255,255,.2)"
+							style="position:absolute;right:0;top:{CHROME.top * 100}%;bottom:{CHROME.bottom * 100}%;width:{CHROME.right * 100}%;background:color-mix(in srgb,var(--scrim) 24%,transparent);border-left:1px dashed color-mix(in srgb,var(--text-on-video) 20%,transparent)"
 						></div>
 						<div
-							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:1px solid rgba(255,255,255,.14);border-radius:2px"
+							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:1px solid color-mix(in srgb,var(--text-on-video) 14%,transparent);border-radius:2px"
 						></div>
 					</div>
 				{/if}
@@ -296,7 +297,7 @@
 					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
 				</div>
 				<div
-					style="position:absolute;right:14px;top:12px;font-family:var(--font-mono);font-size:11px;color:rgba(255,255,255,.55)"
+					style="position:absolute;right:14px;top:12px;font-family:var(--font-mono);font-size:11px;color:color-mix(in srgb,var(--text-on-video) 55%,transparent)"
 				>
 					{resolution}{fpsLabel ? ` · ${fpsLabel}` : ''}
 				</div>

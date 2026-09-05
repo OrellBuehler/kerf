@@ -4,6 +4,11 @@
    two saturated accents carry meaning — KERF AMBER (you / the cut /
    primary action) and AGENT CYAN (the AI / proposals / analysis).
    Source of truth: claude.ai/design "Kerf Design System".
+
+   These are the defaults — a theme (`lib/theme.ts`) overrides the opaque
+   color tokens as inline properties on <html>. Every translucent value is
+   derived here with color-mix from an opaque base, so a theme is a flat list
+   of hex colors and the alphas follow.
    ============================================================= */
 
 :root {
@@ -31,7 +36,7 @@
 	--kerf-500: #e29d2e;
 	--kerf-600: #c8851c;
 	--kerf-700: #9a6413;
-	--kerf-glow: rgba(226, 157, 46, 0.35);
+	--kerf-glow: color-mix(in srgb, var(--kerf-500) 35%, transparent);
 
 	/* ---------- Agent cyan — the AI / proposals / analysis ---------- */
 	--agent-200: #aef0ec;
@@ -41,8 +46,8 @@
 	--agent-600: #1894a6;
 	--agent-700: #126f80;
 	--agent-fg: #04181c;
-	--agent-surface: rgba(34, 180, 196, 0.1);
-	--agent-border: rgba(34, 180, 196, 0.32);
+	--agent-surface: color-mix(in srgb, var(--agent-500) 10%, transparent);
+	--agent-border: color-mix(in srgb, var(--agent-500) 32%, transparent);
 
 	/* ---------- Semantic hues ---------- */
 	--green-400: #5fe0a8;
@@ -61,13 +66,20 @@
 	--surface-inset: var(--neutral-950);
 	--surface-hover: var(--neutral-800);
 	--surface-active: var(--neutral-720);
-	--surface-overlay: rgba(10, 12, 15, 0.72);
+	--surface-overlay: color-mix(in srgb, var(--surface-void) 72%, transparent);
 	--input: #10151b;
+	/* Dialog backdrops and fades: the color darkness is made of. */
+	--scrim: #000000;
+	/* Behind the picture in the preview. */
+	--frame-matte: #000000;
+	--scrollbar-thumb: var(--neutral-720);
+	--scrollbar-thumb-hover: var(--neutral-680);
 
 	/* ---------- Borders ---------- */
-	--border-subtle: rgba(255, 255, 255, 0.06);
-	--border-default: rgba(255, 255, 255, 0.1);
-	--border-strong: rgba(255, 255, 255, 0.16);
+	--border-base: var(--white);
+	--border-subtle: color-mix(in srgb, var(--border-base) 6%, transparent);
+	--border-default: color-mix(in srgb, var(--border-base) 10%, transparent);
+	--border-strong: color-mix(in srgb, var(--border-base) 16%, transparent);
 
 	/* ---------- Text ---------- */
 	--text-primary: var(--neutral-050);
@@ -76,26 +88,28 @@
 	--text-disabled: var(--neutral-500);
 	--text-on-accent: #1a1205;
 	--text-inverted: var(--neutral-950);
+	/* Labels drawn over footage and clips, whatever the chrome's scheme. */
+	--text-on-video: var(--white);
 
 	/* ---------- Primary / accent ---------- */
 	--selection: var(--kerf-500);
 	--selection-border: var(--kerf-400);
-	--selection-fill: rgba(226, 157, 46, 0.16);
+	--selection-fill: color-mix(in srgb, var(--kerf-500) 16%, transparent);
 
 	/* ---------- Status ---------- */
 	--success: var(--green-500);
-	--success-surface: rgba(40, 197, 133, 0.12);
+	--success-surface: color-mix(in srgb, var(--green-500) 12%, transparent);
 	--warning: var(--orange-500);
-	--warning-surface: rgba(245, 144, 32, 0.12);
+	--warning-surface: color-mix(in srgb, var(--orange-500) 12%, transparent);
 	--danger: var(--red-500);
-	--danger-surface: rgba(241, 84, 63, 0.12);
+	--danger-surface: color-mix(in srgb, var(--red-500) 12%, transparent);
 	--info: var(--agent-500);
 
 	/* ---------- AI proposal DIFF states (timeline preview) ---------- */
 	--diff-add: var(--green-500);
-	--diff-add-surface: rgba(40, 197, 133, 0.14);
+	--diff-add-surface: color-mix(in srgb, var(--green-500) 14%, transparent);
 	--diff-remove: var(--red-500);
-	--diff-remove-surface: rgba(241, 84, 63, 0.14);
+	--diff-remove-surface: color-mix(in srgb, var(--red-500) 14%, transparent);
 	--diff-shift: var(--orange-500);
 
 	/* ---------- The cut line ---------- */
@@ -113,9 +127,11 @@
 	--waveform: #6fcfa8;
 	--scene-marker: var(--kerf-500);
 	--beat-marker: var(--agent-500);
-	--silence-region: rgba(241, 84, 63, 0.12);
-	--timeline-grid: rgba(255, 255, 255, 0.04);
-	--timeline-grid-major: rgba(255, 255, 255, 0.08);
+	--silence-region: color-mix(in srgb, var(--red-500) 12%, transparent);
+	--timeline-grid: color-mix(in srgb, var(--border-base) 4%, transparent);
+	--timeline-grid-major: color-mix(in srgb, var(--border-base) 8%, transparent);
+	/* The trim / move ghost and the transition ramp. */
+	--drag-ghost: #788cff;
 
 	/* ---------- Typography ---------- */
 	--font-display: 'Space Grotesk', 'Geist', ui-sans-serif, system-ui, sans-serif;
@@ -194,9 +210,6 @@
 	--titlebar-h: 36px;
 	--toolbar-h: 44px;
 	--statusbar-h: 26px;
-	--sidebar-w: 248px;
-	--agent-panel-w: 340px;
-	--inspector-w: 268px;
 	--track-header-w: 156px;
 	--ruler-h: 26px;
 	--track-h-video: 64px;
@@ -220,7 +233,7 @@
 	--shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.66);
 	--shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
 
-	--focus-ring: 0 0 0 2px var(--surface-app), 0 0 0 4px rgba(226, 157, 46, 0.45);
+	--focus-ring: 0 0 0 2px var(--surface-app), 0 0 0 4px color-mix(in srgb, var(--kerf-500) 45%, transparent);
 
 	/* ---------- Motion ---------- */
 	--ease-out: cubic-bezier(0.22, 1, 0.36, 1);

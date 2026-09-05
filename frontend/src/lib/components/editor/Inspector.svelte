@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -605,14 +606,8 @@
 <div
 	role="presentation"
 	oncontextmenu={onInspectorContextMenu}
-	style="width:var(--inspector-w);flex:none;background:var(--surface-panel);border-left:1px solid var(--border-default);display:flex;flex-direction:column;overflow:hidden"
+	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
-	<div
-		style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-default)"
-	>
-		<Icon n="sliders-horizontal" s={14} color="var(--text-secondary)" />
-		<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary)">Inspector</span>
-	</div>
 
 	<div style="flex:1;overflow-y:auto;padding:12px">
 		{#if clip}
@@ -620,7 +615,7 @@
 				<div
 					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
 						? 'var(--track-audio)'
-						: 'linear-gradient(135deg,#22303f,#33424f)'};display:grid;place-items:center;color:rgba(255,255,255,.8)"
+						: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
 					<Icon n={kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
 				</div>
