@@ -1021,6 +1021,19 @@ editor chrome derives from real state — `MediaBin` shows a dropzone until `edi
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
 duration (plus the analysis step, what is still queued behind it and a **Stop**), and
 `Preview` shows the decoded frame or a "No media loaded" placeholder.
+Each **bin row is the asset's specs**, not just its name: a real decoded frame
+(`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
+browser harness, which has no decoder), the spec line
+(`1920×1080 · 29.97 fps · h264 · stereo`), and badges for 360 / still / how many
+clips already use it / analyzed. Its **context menu leads with the facts** — the
+frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
+import date, then what analysis found (loudness, tempo, silence, shots,
+transcript, or "not analyzed") — above the actions that need them: add at the
+playhead / append, extract audio, remove silences (greyed out until silence has
+been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
+in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
+row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
+it, which the shared `ContextMenu` renders non-interactively.
 **Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
 `onDragDropEvent`, filters by `isMediaPath` — the same extension list the picker
 filters by, so a dropped folder of mixed files doesn't answer with one error per
