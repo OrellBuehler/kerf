@@ -45,11 +45,14 @@ function hostTriple() {
 
 // FFmpeg 9.0 across all three platforms. BtbN's dated `autobuild-*` tags are
 // immutable, unlike the rolling `latest` tag; the `-gpl-9.0` assets track the
-// 9.0 release branch rather than a master snapshot. Note these builds are
+// 9.0 release branch rather than a master snapshot. They are also *pruned* after
+// about two weeks, so a pin left alone eventually 404s the Windows release build
+// (it did, for 0.21.0) — re-pin to a current tag with `--print-hashes` when it
+// does, or before cutting a release that has been a while coming. Note these builds are
 // configured `--disable-whisper`, so the bundled binary has no `whisper` filter
 // — transcription on a bundled platform needs the `whisper` cargo feature.
-const BTBN_TAG = "autobuild-2026-08-21-13-40";
-const BTBN_BUILD = "n9.0.1-6-g9d4ca21220";
+const BTBN_TAG = "autobuild-2026-09-04-14-01";
+const BTBN_BUILD = "n9.0.1-11-ge47273f4d9";
 const BTBN_BRANCH = "9.0";
 const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 // evermeet.cx serves per-version URLs alongside its rolling `getrelease` ones.
@@ -62,7 +65,7 @@ const SOURCES = {
     archives: [
       {
         url: `${BTBN}/ffmpeg-${BTBN_BUILD}-win64-gpl-${BTBN_BRANCH}.zip`,
-        sha256: "6c0a3c1256cba57c62a3bb012c1e8f5e794d38a16c6509d05349237d2b66340f",
+        sha256: "41d735c9364a8deda25b3bd5f05abf37720316be9495edfe94f51bc088ce9d86",
         wants: ["ffmpeg.exe", "ffprobe.exe"],
       },
     ],
@@ -72,7 +75,7 @@ const SOURCES = {
     archives: [
       {
         url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linux64-gpl-${BTBN_BRANCH}.tar.xz`,
-        sha256: "da7c861c44cc6f92fff7f3f6aefb47690e3e88702826d06fbf9ac592a5f24083",
+        sha256: "1a4fa0f89f690bd81bddbb7cf3a65554095e8e9f9dc98693494e6f5fb97918c5",
         wants: ["ffmpeg", "ffprobe"],
       },
     ],
