@@ -28,7 +28,7 @@
 		"mode-watcher": "^1.1.0",
 		"paneforge": "^1.0.2",
 		"shadcn-svelte": "^1.5.0",
-		"svelte": "^5.56.10",
+		"svelte": "^5.57.0",
 		"svelte-check": "^4.7.6",
 		"svelte-sonner": "^1.2.1",
 		"tailwind-merge": "^3.6.0",
