@@ -664,6 +664,32 @@ struct ExportParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportVariantsParams {
+    #[schemars(
+        description = "Base output path; each delivery lands beside it with its shape in the name — \
+                              `/renders/cut.mp4` at 9:16 and 1:1 writes `cut-9x16.mp4` and `cut-1x1.mp4`."
+    )]
+    output_path: String,
+    #[schemars(
+        description = "The delivery frames to render, one file each: \"9:16\" (1080x1920, Reels / Shorts / \
+                              TikTok), \"1:1\" (1080x1080, feed), \"4:5\" (1080x1350, Instagram portrait), \"16:9\" \
+                              (1920x1080, YouTube), or an explicit \"WxH\"."
+    )]
+    formats: Vec<String>,
+    #[schemars(
+        description = "Frame each shot for every shape first (default true): samples where each clip's \
+                              content sits and keeps a crop per shape on the clip, so a 9:16 and a 1:1 delivery \
+                              each keep the subject rather than the middle. The project frame's own crop is never \
+                              touched. false renders whatever crop each clip already has."
+    )]
+    smart_crop: Option<bool>,
+    #[schemars(description = "Encode settings shared by every variant — the same fields as `export`. Its \
+                              resolution and fit are replaced per variant by the delivery frame.")]
+    #[serde(default)]
+    options: Option<ExportOptions>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AddTaskParams {
     #[schemars(description = "What the task should accomplish, in plain language")]
     prompt: String,
@@ -1820,6 +1846,156 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Export the same cut at several delivery frames in one call — one file per shape, each shot \
+                       framed for each: a 9:16 Reel, a 1:1 post and a 16:9 upload from one timeline. Shots are \
+                       smart-cropped per shape first (unless smart_crop is false), which is recorded on the clips as \
+                       one revision and reused by later exports; generated captions are re-fit to each frame. The \
+                       project's own frame is untouched. Files land beside output_path named by shape \
+                       (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
+                       there is no need to run platform_check per variant afterwards. Progress and cancellation \
+                       work as in `export`; cancelling keeps the files already finished and deletes the one in \
+                       flight."
+    )]
+    async fn export_variants(
+        &self,
+        Parameters(p): Parameters<ExportVariantsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        if p.formats.is_empty() {
+            return Err(McpError::invalid_params(
+                "formats must name at least one delivery frame",
+                None,
+            ));
+        }
+        let mut deliveries: Vec<Delivery> = Vec::new();
+        for name in &p.formats {
+            let d = Delivery::parse(name).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("unknown delivery format {name:?}: expected 9:16, 1:1, 4:5, 16:9 or WxH"),
+                    None,
+                )
+            })?;
+            if !deliveries.contains(&d) {
+                deliveries.push(d);
+            }
+        }
+        let opts = p.options.unwrap_or_default();
+        let base = std::path::PathBuf::from(&p.output_path);
+        let variants: Vec<kerf_core::ExportVariant> = deliveries
+            .iter()
+            .map(|d| kerf_core::ExportVariant::beside(&base, *d))
+            .collect();
+        let project = self.project.clone();
+
+        // Same protocol plumbing as `export`: progress on the client's token,
+        // cancellation off the request's token.
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kerf_core::VariantProgress>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            let labels: Vec<String> = deliveries.iter().map(Delivery::ratio_label).collect();
+            tauri::async_runtime::spawn(async move {
+                while let Some(progress) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
+                    let mut message = format!(
+                        "rendering {} of {} ({})",
+                        progress.variant + 1,
+                        progress.total,
+                        labels.get(progress.variant).cloned().unwrap_or_default()
+                    );
+                    if let Some(eta) = progress.eta_secs {
+                        message.push_str(&format!(", {} to go", fmt_ts(eta)));
+                    }
+                    let _ = peer.notify_progress(param.with_message(message)).await;
+                }
+            })
+        };
+
+        let smart_crop = p.smart_crop.unwrap_or(true);
+        let deliveries_for_plan = deliveries.clone();
+        let render_variants = variants.clone();
+        let result = blocking(move || {
+            // Frame first: plan under the lock, sample with it released (one
+            // short decode per clip, shared by every shape), apply under it again.
+            let mut framed = 0;
+            if smart_crop {
+                let plan = lock_agent(&project).framing_inputs(&deliveries_for_plan).map_err(core_err)?;
+                if !plan.jobs.is_empty() {
+                    let framings = Project::sample_framings(&plan).map_err(core_err)?;
+                    framed = lock_agent(&project).apply_framings(&framings).map_err(core_err)?;
+                }
+            }
+            let (timeline, assets) = {
+                let project = lock_agent(&project);
+                (
+                    project.working_timeline().map_err(core_err)?,
+                    project.list_assets().map_err(core_err)?,
+                )
+            };
+            let mut on_progress = |progress: kerf_core::VariantProgress| {
+                let _ = tx.send(progress);
+            };
+            let (status, done) =
+                kerf_core::render_variants(&timeline, &assets, &render_variants, &opts, &mut on_progress, &|| {
+                    cancel.is_cancelled()
+                })
+                .map_err(core_err)?;
+            // Judged per file, at the frame that file actually is.
+            let mut outputs = Vec::new();
+            let project = lock_agent(&project);
+            for v in render_variants.iter().take(done) {
+                let summary = project
+                    .cut_summary(Some((v.delivery.width, v.delivery.height)))
+                    .map_err(core_err)?;
+                let checks = kerf_core::platform::check_all(&summary);
+                let is_tip = |i: &kerf_core::platform::DeliveryIssue| i.severity == kerf_core::platform::Severity::Tip;
+                let ready_for: Vec<&str> = checks
+                    .iter()
+                    .filter(|c| c.issues.iter().all(is_tip))
+                    .map(|c| c.label.as_str())
+                    .collect();
+                let issues: Vec<serde_json::Value> = checks
+                    .iter()
+                    .flat_map(|c| {
+                        c.issues
+                            .iter()
+                            .filter(|i| !is_tip(i))
+                            .map(move |i| serde_json::json!({ "target": c.label, "severity": i.severity, "message": i.message }))
+                    })
+                    .collect();
+                outputs.push(serde_json::json!({
+                    "format": v.delivery.ratio_label(),
+                    "width": v.delivery.width,
+                    "height": v.delivery.height,
+                    "output": v.output.to_string_lossy(),
+                    "ready_for": ready_for,
+                    "issues": issues,
+                }));
+            }
+            Ok((status, framed, outputs))
+        })
+        .await;
+        let _ = forward.await;
+        let (status, framed, outputs) = result?;
+        if framed > 0 {
+            self.changed();
+        }
+        match status {
+            kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "clips_framed": framed, "outputs": outputs })),
+            kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
+                format!(
+                    "export cancelled after {} of {} files; the one in flight was removed",
+                    outputs.len(),
+                    variants.len()
+                ),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
         description = "Check the assembled cut against each publishing target (Instagram Reels / YouTube Shorts / \
                        TikTok / Instagram feed / YouTube): length limits, frame shape, and the reach limits a platform \
                        enforces silently — e.g. a Reel over 3 minutes uploads fine and is then shown only to existing \
@@ -2291,7 +2467,11 @@ impl ServerHandler for KerfMcp {
              for it — reshaping 16:9 footage to 9:16 throws away most of the \
              width, and without this the middle is what survives, subject or \
              not. Look at the result with preview_timeline; the crop is an \
-             ordinary transform the user can adjust. \
+             ordinary transform the user can adjust. When the same cut is \
+             going to several places, export_variants renders it once per \
+             shape (9:16, 1:1, 4:5, 16:9) in one call, framing each shot for \
+             each shape and reporting what each file is ready for — prefer it \
+             to exporting three times by hand. \
              Your task edits are STAGED, not applied: claiming a task opens a \
              proposal, and every edit you make goes into it instead of changing \
              the cut the user is looking at. Your own reads follow the proposal, \

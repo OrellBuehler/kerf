@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { DELIVERY_PRESETS, fitLabel, presetFor, ratioLabel } from './delivery-formats';
+import { DELIVERY_PRESETS, fitLabel, presetFor, ratioLabel, variantPath } from './delivery-formats';
+
+describe('variantPath', () => {
+	test('splices the shape into the file name beside the base', () => {
+		expect(variantPath('/renders/cut.mp4', { width: 1080, height: 1920, fit: 'cover' })).toBe('/renders/cut-9x16.mp4');
+		expect(variantPath('C:\\out\\my.cut.mov', { width: 1080, height: 1080, fit: 'cover' })).toBe('C:\\out\\my.cut-1x1.mov');
+		expect(variantPath('cut', { width: 1920, height: 1080, fit: 'contain' })).toBe('cut-16x9');
+	});
+});
 
 describe('ratioLabel', () => {
 	test('reduces a frame to its aspect', () => {
