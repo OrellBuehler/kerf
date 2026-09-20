@@ -3,6 +3,12 @@ import { DEFAULT_LAYOUT, PANEL_IDS, openPanelIds, sanitizeLayout } from './layou
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const clone = (v: unknown): any => JSON.parse(JSON.stringify(v));
+const group = (raw: any, id: string): any => {
+	const visit = (node: any): any => node.type === 'leaf'
+		? (node.data.id === id ? node.data : undefined)
+		: node.data.map(visit).find(Boolean);
+	return visit(raw.grid.root);
+};
 
 describe('DEFAULT_LAYOUT', () => {
 	test('shows every panel and survives sanitizing unchanged', () => {
@@ -20,7 +26,7 @@ describe('sanitizeLayout', () => {
 
 	test('rejects a panel id it does not know', () => {
 		const raw = clone(DEFAULT_LAYOUT);
-		raw.grid.root.data[2].data.views = ['effects'];
+		group(raw, 'inspector').views = ['effects'];
 		raw.panels.effects = { id: 'effects', contentComponent: 'effects' };
 		expect(sanitizeLayout(raw)).toBeNull();
 	});
@@ -36,13 +42,13 @@ describe('sanitizeLayout', () => {
 
 	test('rejects the same panel shown twice', () => {
 		const raw = clone(DEFAULT_LAYOUT);
-		raw.grid.root.data[3].data.views = ['agent', 'media'];
+		group(raw, 'inspector').views = ['agent', 'media'];
 		expect(sanitizeLayout(raw)).toBeNull();
 	});
 
 	test('accepts a subset of panels — closing one is a valid layout', () => {
 		const raw = clone(DEFAULT_LAYOUT);
-		raw.grid.root.data.pop();
+		group(raw, 'inspector').views = ['inspector'];
 		delete raw.panels.agent;
 		const out = sanitizeLayout(raw);
 		expect(out).not.toBeNull();
@@ -51,7 +57,7 @@ describe('sanitizeLayout', () => {
 
 	test('drops panel entries no group shows', () => {
 		const raw = clone(DEFAULT_LAYOUT);
-		raw.grid.root.data.pop();
+		group(raw, 'inspector').views = ['inspector'];
 		const out = sanitizeLayout(raw)!;
 		expect(out.panels.agent).toBeUndefined();
 	});
@@ -68,7 +74,7 @@ describe('sanitizeLayout', () => {
 		const raw = clone(DEFAULT_LAYOUT);
 		raw.floatingGroups = [{ data: {}, position: {} }];
 		raw.activeGroup = 'gone';
-		raw.grid.root.data[0].data.locked = true;
+		group(raw, 'left').locked = true;
 		const out = sanitizeLayout(raw)!;
 		expect(out.floatingGroups).toBeUndefined();
 		expect(out.activeGroup).toBeUndefined();
@@ -77,8 +83,8 @@ describe('sanitizeLayout', () => {
 
 	test('falls back to the first view when the active one is not in the group', () => {
 		const raw = clone(DEFAULT_LAYOUT);
-		raw.grid.root.data[0].data.activeView = 'preview';
+		group(raw, 'left').activeView = 'preview';
 		const out = sanitizeLayout(raw)!;
-		expect(clone(out).grid.root.data[0].data.activeView).toBe('media');
+		expect(group(out, 'left').activeView).toBe('media');
 	});
 });

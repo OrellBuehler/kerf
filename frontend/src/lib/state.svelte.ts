@@ -105,8 +105,10 @@ import type {
 	VideoEffect
 } from './types';
 import { clipDuration } from './types';
+import { timelineFps } from './timecode';
 
 class EditorState {
+	get fps(): number { return timelineFps(this.timeline, this.assets); }
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
 	selectedAssetId = $state<string | null>(null);

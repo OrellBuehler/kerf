@@ -177,6 +177,14 @@
 	);
 	const info = $derived(containerInfo(opts.container));
 	const vc = $derived(opts.video_codec ? VIDEO_CODECS[opts.video_codec] : undefined);
+	const qualityOptions = $derived(vc?.crf ? [
+		{ value: String(Math.min(vc.crf[1], vc.crf[2] + 6)), label: 'Smaller file' },
+		{ value: String(vc.crf[2]), label: 'Balanced' },
+		{ value: String(Math.max(vc.crf[0], vc.crf[2] - 4)), label: 'Higher quality' }
+	] : []);
+	const qualityValue = $derived(opts.rate_control === 'crf' && qualityOptions.some(q => Number(q.value) === (opts.crf ?? vc?.crf?.[2]))
+		? String(opts.crf ?? vc?.crf?.[2]) : 'custom');
+
 	const ac = $derived(opts.audio_codec ? AUDIO_CODECS[opts.audio_codec] : undefined);
 	const issues = $derived(validateExport(opts, hasVideo, hasAudio));
 	const summary = $derived(buildSummary(opts, hasVideo, hasAudio));
@@ -186,9 +194,9 @@
 	const canExport = $derived(!editor.busy && !rendering && issues.length === 0 && (hasVideo || hasAudio));
 
 	const selectCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px;min-width:140px';
+		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:180px;max-width:100%';
 	const inputCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:5px 7px';
+		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:13px;min-height:32px;padding:5px 7px';
 
 	function msg(e: unknown): string {
 		return e instanceof Error ? e.message : String(e);
@@ -370,6 +378,7 @@
 	bind:this={dialogEl}
 	role="dialog"
 	aria-modal="true"
+	aria-label="Export video"
 	tabindex="-1"
 	onclick={onClose}
 	onkeydown={(e) => {
@@ -380,7 +389,7 @@
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
-		style="width:560px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
+		style="width:600px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
 	>
 		<!-- header -->
 		<div
@@ -392,88 +401,26 @@
 		</div>
 
 		<div style="flex:1;overflow-y:auto;padding:12px 16px">
-			<!-- preset chips -->
-			<div style="display:flex;flex-wrap:wrap;gap:6px">
-				{#each PRESETS as p (p.id)}
-					<button
-						title={p.description}
-						onclick={() => choosePreset(p.id)}
-						style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid {activePreset ===
-						p.id
-							? 'var(--kerf-500)'
-							: 'var(--border-strong)'};background:{activePreset === p.id
-							? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
-							: 'var(--surface-inset)'};color:{activePreset === p.id ? 'var(--text-primary)' : 'var(--text-secondary)'}"
-						>{p.label}</button
-					>
-				{/each}
-			</div>
-
-			<!-- summary -->
-			<div
-				data-selectable
-					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
-			>
-				{summary}
-			</div>
-
-			<!-- where this is going (per file when several are being written) -->
-			{#if checks.length && !variantFormats.length}
-				<div
-					style="margin-top:10px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
-				>
-					{#if readyFor.length}
-						<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--success)">
-							<Icon n="check" s={13} color="var(--success)" />
-							<span>Ready for {readyFor.map((c) => c.label).join(' · ')}</span>
-						</div>
-					{/if}
-					{#each notes as note, i (i)}
-						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-							<span style="flex:none;margin-top:1px">
-								<Icon
-									n={note.severity === 'error' ? 'x' : 'alert-triangle'}
-									s={13}
-									color={note.severity === 'error' ? 'var(--danger)' : 'var(--warning)'}
-								/>
-							</span>
-							<span style="color:var(--text-secondary)">
-								<span style="color:var(--text-primary);font-weight:600">{note.label}</span>
-								— {note.message}
-							</span>
-						</div>
-					{/each}
-					{#if wrongShape.length}
-						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-							<span style="flex:none;margin-top:1px"><Icon n="alert-triangle" s={13} color="var(--warning)" /></span>
-							<span style="color:var(--text-secondary)">
-								{#if cutRatio}A {cutRatio} cut is letterboxed on{:else}This frame is letterboxed on{/if}
-								{listLabels(wrongShape)}. Pick a delivery frame in the toolbar to cut for one of them.
-							</span>
-						</div>
-					{/if}
-					{#each tips as tip (tip)}
-						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45;color:var(--text-tertiary)">
-							<span style="flex:none;margin-top:1px"><Icon n="lightbulb" s={13} color="var(--text-tertiary)" /></span>
-							<span>{tip}</span>
-						</div>
-					{/each}
-				</div>
-			{/if}
-
+			{@render selectRow(
+				'Preset',
+				activePreset,
+				[
+					...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : []),
+					...PRESETS.map((p) => ({ value: p.id, label: p.label }))
+				],
+				choosePreset
+			)}
+			<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
+				{PRESETS.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
+			</p>
 			<!-- destination -->
 			{@render secHead('Destination')}
-			{@render selectRow(
-				'Container',
-				opts.container,
-				CONTAINERS.map((c) => ({ value: c.id, label: `${c.label} (.${c.ext})` })),
-				(v) => changeContainer(v as Container)
-			)}
 			<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
 				<input
 					type="text"
 					readonly
 					value={outputPath}
+					aria-label="Export destination"
 					placeholder="Choose a file…"
 					style="{inputCss};flex:1;text-align:left;color:var(--text-secondary)"
 				/>
@@ -491,6 +438,98 @@
 				)}
 			{/if}
 
+			{#if showVideo}
+				{@render secHead('Picture')}
+				{#if variantFormats.length}
+					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
+						Resolution and fit come from each delivery frame below.
+					</div>
+				{:else}
+				{@render selectRow(
+					'Resolution',
+					resValue(),
+					[
+						...RESOLUTIONS.map((r) => ({
+							value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source',
+							// With a project frame set, "Source" is that frame — the export and
+							// the preview must not be able to disagree about the deliverable.
+							label: r.value ? r.label : projectFrame ? `Project frame (${projectFrame})` : r.label
+						})),
+						{ value: 'custom', label: 'Custom…' }
+					],
+					setRes
+				)}
+				{#if !opts.resolution && projectFrame}
+					<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+						Renders the frame you have been cutting in. Pick a size to override it here only.
+					</div>
+				{/if}
+				{#if customRes}
+					<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
+						<input
+							type="number"
+							min="2"
+							step="2"
+							value={opts.resolution?.[0] ?? 1920}
+							onchange={(e) => patch({ resolution: [parseInt(e.currentTarget.value) || 1920, opts.resolution?.[1] ?? 1080] })}
+							style="{inputCss};width:90px;text-align:right"
+						/>
+						<span style="color:var(--text-muted)">×</span>
+						<input
+							type="number"
+							min="2"
+							step="2"
+							value={opts.resolution?.[1] ?? 1080}
+							onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
+							style="{inputCss};width:90px;text-align:right"
+						/>
+					</div>
+				{/if}
+				{#if opts.resolution}
+					{@render selectRow(
+						'Aspect fit',
+						opts.fit ?? 'contain',
+						FITS.map((f) => ({ value: f.id, label: f.label })),
+						(v) => patch({ fit: v as Fit })
+					)}
+					<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+						{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
+					</div>
+				{/if}
+				{/if}
+				{@render selectRow(
+					'Frame rate',
+					opts.fps ? String(opts.fps) : 'source',
+					FRAME_RATES.map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
+					(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
+				)}
+				{#if qualityOptions.length}
+					{@render selectRow(
+						'Quality',
+						qualityValue,
+						[
+							...(qualityValue === 'custom' ? [{ value: 'custom', label: 'Custom · see Advanced' }] : []),
+							...qualityOptions
+						],
+						(v) => {
+							if (v !== 'custom') patch({ rate_control: 'crf', crf: Number(v) });
+						}
+					)}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Higher quality keeps more detail and makes a larger file.</p>
+				{:else if opts.video_codec === 'gif'}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">GIF quality follows the picture size and the palette settings in Advanced.</p>
+				{:else}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">This preset is a mastering format. Its profile is in Advanced.</p>
+				{/if}
+			{/if}
+			{#if showAudio}
+				{@render secHead('Sound')}
+				{@render toggleRow('Include audio', !!opts.include_audio, (v) => patch({ include_audio: v }))}
+				{#if opts.include_audio}
+					{@render toggleRow('Normalize loudness (−14 LUFS)', !!opts.loudnorm, (v) => patch({ loudnorm: v }))}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Evens out the level so it matches what platforms play at.</p>
+				{/if}
+			{/if}
 			<!-- one cut, every platform -->
 			{#if showVideo}
 				{@render secHead('Deliver to')}
@@ -535,6 +574,72 @@
 				{/if}
 			{/if}
 
+			<!-- where this is going (per file when several are being written) -->
+			{#if checks.length && !variantFormats.length}
+				{@render secHead('Where it is going')}
+				<div
+					style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
+				>
+					{#if readyFor.length}
+						<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--success)">
+							<Icon n="check" s={13} color="var(--success)" />
+							<span>Ready for {readyFor.map((c) => c.label).join(' · ')}</span>
+						</div>
+					{/if}
+					{#each notes as note, i (i)}
+						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
+							<span style="flex:none;margin-top:1px">
+								<Icon
+									n={note.severity === 'error' ? 'x' : 'alert-triangle'}
+									s={13}
+									color={note.severity === 'error' ? 'var(--danger)' : 'var(--warning)'}
+								/>
+							</span>
+							<span style="color:var(--text-secondary)">
+								<span style="color:var(--text-primary);font-weight:600">{note.label}</span>
+								— {note.message}
+							</span>
+						</div>
+					{/each}
+					{#if wrongShape.length}
+						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
+							<span style="flex:none;margin-top:1px"><Icon n="alert-triangle" s={13} color="var(--warning)" /></span>
+							<span style="color:var(--text-secondary)">
+								{#if cutRatio}A {cutRatio} cut is letterboxed on{:else}This frame is letterboxed on{/if}
+								{listLabels(wrongShape)}. Pick a delivery frame in the toolbar to cut for one of them.
+							</span>
+						</div>
+					{/if}
+					{#if tips.length}
+						<details>
+							<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)">{tips.length} tip{tips.length === 1 ? '' : 's'}</summary>
+							{#each tips as tip (tip)}
+								<div style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)">
+									<span style="flex:none;margin-top:1px"><Icon n="lightbulb" s={13} color="var(--text-muted)" /></span>
+									<span>{tip}</span>
+								</div>
+							{/each}
+						</details>
+					{/if}
+				</div>
+			{/if}
+
+			<details bind:open={showAdvanced} style="margin-top:12px;border-top:1px solid var(--border-default)">
+				<summary style="cursor:pointer;padding:12px 0;font-size:13px;font-weight:600;color:var(--text-secondary)">Advanced encoding</summary>
+			<!-- summary -->
+			<div
+				data-selectable
+					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+			>
+				{summary}
+			</div>
+
+			{@render selectRow(
+				'Container',
+				opts.container,
+				CONTAINERS.map((c) => ({ value: c.id, label: `${c.label} (.${c.ext})` })),
+				(v) => changeContainer(v as Container)
+			)}
 			<!-- video -->
 			{#if showVideo}
 				{@render secHead('Video')}
@@ -565,7 +670,7 @@
 							{#each RATE_CONTROLS.filter((rc) => rc.id !== 'two_pass' || !isHwCodec(opts.video_codec)) as rc (rc.id)}
 								<button
 									onclick={() => setRate(rc.id)}
-									style="flex:1;padding:5px 4px;font-size:11px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid {opts.rate_control ===
+									style="flex:1;padding:5px 4px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid {opts.rate_control ===
 									rc.id
 										? 'var(--kerf-500)'
 										: 'var(--border-strong)'};background:{opts.rate_control === rc.id
@@ -581,11 +686,11 @@
 						{@render sliderRow('Quality (CRF)', opts.crf ?? vc.crf[2], vc.crf[0], vc.crf[1], 1, String(opts.crf ?? vc.crf[2]), (v) =>
 							patch({ crf: Math.round(v) })
 						)}
-						<div style="font-size:11px;color:var(--text-disabled);padding:0 0 2px 100px">lower = higher quality &amp; larger file</div>
+						<div style="font-size:12px;color:var(--text-disabled);padding:0 0 2px 100px">lower = higher quality &amp; larger file</div>
 					{:else if opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass'}
 						{@render textRow('Target bitrate', opts.video_bitrate ?? '', 'e.g. 8M', (v) => patch({ video_bitrate: v }))}
 						{#if opts.rate_control === 'two_pass'}
-							<div style="font-size:11px;color:var(--text-disabled);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
+							<div style="font-size:12px;color:var(--text-disabled);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
 						{/if}
 					{:else if opts.rate_control === 'lossless'}
 						<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Mathematically lossless — very large files.</div>
@@ -601,13 +706,7 @@
 					{/if}
 				{/if}
 
-				<!-- advanced video -->
-				<button
-					onclick={() => (showAdvanced = !showAdvanced)}
-					style="margin-top:8px;background:none;border:none;color:var(--text-secondary);font-size:12px;cursor:pointer;padding:2px 0"
-					>{showAdvanced ? '▾' : '▸'} Advanced video</button
-				>
-				{#if showAdvanced && opts.video_codec !== 'gif'}
+				{#if opts.video_codec !== 'gif'}
 					{#if vc && opts.video_codec !== 'prores_ks'}
 						{#if vc.tunes.length}
 							{@render selectRow(
@@ -645,78 +744,13 @@
 					)}
 				{/if}
 
-				{@render secHead('Scaling')}
-				{#if variantFormats.length}
-					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
-						Resolution and fit come from each delivery frame above.
-					</div>
-				{:else}
-				{@render selectRow(
-					'Resolution',
-					resValue(),
-					[
-						...RESOLUTIONS.map((r) => ({
-							value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source',
-							// With a project frame set, "Source" is that frame — the export and
-							// the preview must not be able to disagree about the deliverable.
-							label: r.value ? r.label : projectFrame ? `Project frame (${projectFrame})` : r.label
-						})),
-						{ value: 'custom', label: 'Custom…' }
-					],
-					setRes
-				)}
-				{#if !opts.resolution && projectFrame}
-					<div style="font-size:11px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-						Renders the frame you have been cutting in. Pick a size to override it here only.
-					</div>
-				{/if}
-				{#if customRes}
-					<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
-						<input
-							type="number"
-							min="2"
-							step="2"
-							value={opts.resolution?.[0] ?? 1920}
-							onchange={(e) => patch({ resolution: [parseInt(e.currentTarget.value) || 1920, opts.resolution?.[1] ?? 1080] })}
-							style="{inputCss};width:90px;text-align:right"
-						/>
-						<span style="color:var(--text-muted)">×</span>
-						<input
-							type="number"
-							min="2"
-							step="2"
-							value={opts.resolution?.[1] ?? 1080}
-							onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
-							style="{inputCss};width:90px;text-align:right"
-						/>
-					</div>
-				{/if}
-				{#if opts.resolution}
-					{@render selectRow(
-						'Aspect fit',
-						opts.fit ?? 'contain',
-						FITS.map((f) => ({ value: f.id, label: f.label })),
-						(v) => patch({ fit: v as Fit })
-					)}
-					<div style="font-size:11px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-						{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
-					</div>
-				{/if}
-				{/if}
-				{@render selectRow(
-					'Frame rate',
-					opts.fps ? String(opts.fps) : 'source',
-					FRAME_RATES.map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
-					(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
-				)}
+
 			{/if}
 
 			<!-- audio -->
 			{#if showAudio}
 				{@render secHead('Audio')}
-				{@render toggleRow('Strip audio', !opts.include_audio, (v) => patch({ include_audio: !v }))}
 				{#if opts.include_audio}
-					{@render toggleRow('Normalize loudness (−14 LUFS)', !!opts.loudnorm, (v) => patch({ loudnorm: v }))}
 					{@render selectRow(
 						'Codec',
 						opts.audio_codec ?? '',
@@ -782,8 +816,9 @@
 			{#if showCommand}
 				<pre
 					data-selectable
-					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
+					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
 			{/if}
+			</details>
 		</div>
 
 		<!-- footer -->

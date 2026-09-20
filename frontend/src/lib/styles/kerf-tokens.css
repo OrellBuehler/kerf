@@ -210,10 +210,10 @@
 	--titlebar-h: 36px;
 	--toolbar-h: 44px;
 	--statusbar-h: 26px;
-	--track-header-w: 156px;
+	--track-header-w: 224px;
 	--ruler-h: 26px;
 	--track-h-video: 64px;
-	--track-h-audio: 48px;
+	--track-h-audio: 64px;
 
 	/* ---------- Radii ---------- */
 	--radius-none: 0;

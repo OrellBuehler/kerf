@@ -803,8 +803,10 @@ sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the toolbar's **Panels** menu reopens one beside the active group
 or resets the arrangement. `src/lib/layout.ts` is the pure, bun-tested side:
 the panel registry (titles, minimum sizes — the Inspector's px-tuned controls
-need ~250), `DEFAULT_LAYOUT` (dockview's serialized form of the historical
-arrangement) and `sanitizeLayout`, which turns a stored layout into one that can
+need ~250), `DEFAULT_LAYOUT` (bin | preview | inspector-with-agent-tabbed over a
+**full-width timeline** — the cut is what an editor looks at most, and a
+timeline squeezed between two side panels showed thirty seconds of it; a saved
+custom layout is left as it was) and `sanitizeLayout`, which turns a stored layout into one that can
 be trusted (known panel ids, each shown once, titles/minimums re-taken from the
 registry, floating groups dropped) or `null` so the default is used. The
 arrangement is saved through `settings.setLayout` (debounced off
@@ -815,7 +817,11 @@ width: their roots are `flex:1;min-height:0`, and a panel's minimum comes from
 the registry. The `Inspector` is **mounted whether or not a clip is selected**:
 its Text overlays section belongs to the timeline rather than to any one clip, so
 gating the panel on a selection made titles and captions unreachable until you
-clicked a clip. It edits the selected clip —
+clicked a clip. Its sections are `InspectorSection`s — native `<details>`
+disclosures, so they are keyboard-operable for free — each with a one-line
+**summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
+section still says what it holds; Timing, Volume and Titles open by default,
+everything else is folded. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
@@ -902,8 +908,16 @@ action column, plus a title-safe box; `settings.safeAreas`, **off by default**, 
 Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
-**Project frame (WxH)** so the two surfaces cannot silently disagree. It also
-leads with a **readiness panel**: "Ready for Instagram Reels · YouTube Shorts ·
+**Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
+is **preset → destination → picture → sound → where it is going**, with a
+`Quality` select of three named CRF points (Smaller file / Balanced / Higher
+quality, derived from the codec's CRF range) standing in for the encoder; the
+codec, rate control, tune/profile/pixel format, audio codec and container knobs
+all live behind one **Advanced encoding** disclosure, and a CRF typed there
+reads back as `Custom` in the select. Loudness normalization sits beside
+`Include audio` rather than in Advanced, because for the social-video user it is
+a polish switch, not an encoder setting. The **readiness panel** stays visible
+(only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
 collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
 in the toolbar") — grouped by `IssueKind`, because otherwise four vertical feeds
@@ -965,7 +979,11 @@ queue** (status · queue · history · add-task) — Kerf has no in-app chat; a 
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
-Five preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
+The panel orders **review card → queue (ready first) → quick edits → connect →
+history**, and since it shares a tab group with the Inspector by default,
+`+page.svelte` brings it forward once when a proposal lands (`editor.staged`
+going null → set) — a review nobody can see is not a review. Under **Quick
+edits**, five preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
 / `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
 then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says

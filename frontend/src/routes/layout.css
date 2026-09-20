@@ -10,9 +10,9 @@
 @plugin '@tailwindcss/typography';
 
 /* Map the shadcn-svelte semantic variables onto the Kerf token system so any
-   shadcn primitive (toasts, inputs) inherits the editor theme. The bespoke
-   editor chrome references the Kerf tokens directly. Dark by default; a
-   theme (`lib/theme.ts`) toggles the class and the color-scheme with it. */
+			shadcn primitive (toasts, inputs) inherits the editor theme. The bespoke
+			editor chrome references the Kerf tokens directly. Dark by default; a
+			theme (`lib/theme.ts`) toggles the class and the color-scheme with it. */
 :root {
 	color-scheme: dark;
 
@@ -139,3 +139,10 @@ html:not(.dark) {
 		background-clip: content-box;
 	}
 }
+
+/* Native editor controls share a clear keyboard focus and disabled state. */
+button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible {
+	outline: 2px solid var(--kerf-400);
+	outline-offset: 2px;
+}
+button:disabled { opacity: .5; cursor: not-allowed !important; }

@@ -13,14 +13,15 @@
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
 
 	const working = $derived(agent.working);
-	const disabled = $derived(editor.assets.length === 0);
+	const disabled = $derived(editor.assets.length === 0 || editor.busy);
+	const LOCAL_PRESETS = new Set(['Remove silences', 'Assemble rough cut', 'Cut to the beat', 'Caption the cut', 'Frame for the delivery']);
 
 	let draft = $state('');
 
 	// How to connect an agent: the local MCP endpoint + a ready-to-run Claude Code
 	// command. Loaded from the backend so the displayed URL honors KERF_MCP_ADDR.
 	let endpoint = $state('http://127.0.0.1:7777/mcp');
-	let showConnect = $state(true);
+	let showConnect = $state(false);
 	let copied = $state<string | null>(null);
 	const claudeCmd = $derived(`claude mcp add --transport http kerf ${endpoint}`);
 
@@ -75,7 +76,7 @@
 	}
 
 	// Most actionable first: the agent's current work and anything awaiting review.
-	const RANK: Record<TaskStatus, number> = { working: 0, ready: 1, queued: 2, failed: 3, done: 4 };
+	const RANK: Record<TaskStatus, number> = { ready: 0, working: 1, queued: 2, failed: 3, done: 4 };
 	const queue = $derived(
 		[...agent.tasks].sort((a, b) => RANK[a.status] - RANK[b.status] || a.created_at.localeCompare(b.created_at))
 	);
@@ -187,7 +188,7 @@
 		draft = '';
 		try {
 			await agent.add(v);
-			toast.success('Queued — your connected agent claims tasks over MCP');
+			toast.success(connected ? 'Task queued for your agent' : 'Task queued — waiting for an agent');
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
@@ -217,7 +218,7 @@
 		}
 		try {
 			const task = await agent.add(p);
-			// Three presets map to a local op we can run now; the rest wait for the agent.
+			// Some presets map to a local op we can run now; the rest wait for the agent.
 			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
 				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
 				await editor.removeSilence(assetId);
@@ -261,7 +262,7 @@
 					action: { label: 'Undo', onClick: () => void editor.undo() }
 				});
 			} else {
-				toast.info(`Queued “${p}” — your connected agent claims tasks over MCP`);
+				toast.info(connected ? `Queued “${p}” for your agent` : `Queued “${p}” — waiting for an agent`);
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
@@ -284,7 +285,7 @@
 			{ label: 'Copy connect command', icon: 'copy', action: () => void copy(claudeCmd, 'cmd') },
 			{ type: 'separator' },
 			...PRESETS.map(
-				(p): MenuItem => ({ label: `Queue: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
+				(p): MenuItem => ({ label: `${LOCAL_PRESETS.has(p) ? 'Run now' : 'Queue for agent'}: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
 			)
 		];
 		contextMenu.show(e, items);
@@ -298,7 +299,7 @@
 			>{label}</span
 		>
 		<div style="flex:1;height:1px;background:var(--border-subtle)"></div>
-		{#if right}<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{right}</span>{/if}
+		{#if right}<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{right}</span>{/if}
 	</div>
 {/snippet}
 
@@ -308,13 +309,13 @@
 	>
 		<code
 			data-selectable
-			style="flex:1;min-width:0;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:nowrap;overflow-x:auto"
+			style="flex:1;min-width:0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:nowrap;overflow-x:auto"
 			>{value}</code
 		>
 		<button
 			title="Copy to clipboard"
 			onclick={() => copy(value, key)}
-			style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;flex:none;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:var(--surface-raised);color:{copied ===
+			style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:var(--surface-raised);color:{copied ===
 			key
 				? 'var(--green-400)'
 				: 'var(--text-secondary)'};cursor:pointer"
@@ -336,23 +337,25 @@
 		<div style="display:flex;align-items:center;gap:8px">
 			<Icon n={s.icon} s={13} color={iconColor(t.status)} />
 			<span
-				style="flex:1;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				style="flex:1;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);line-height:1.45;overflow-wrap:anywhere"
 				title={t.prompt}>{t.prompt}</span
 			>
-			<Badge tone={s.tone as 'neutral' | 'agent' | 'success'} dot={t.status === 'working'}>{s.label}</Badge>
 			{#if t.status !== 'ready'}
 				<button
 					title="Remove from queue"
 					onclick={() => agent.remove(t.id)}
-					style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex:none;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
+					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
 				>
 					<Icon n="plus" s={13} style="transform:rotate(45deg)" />
 				</button>
 			{/if}
 		</div>
+		<div style="margin:7px 0 0 21px">
+			<Badge tone={s.tone as 'neutral' | 'agent' | 'success'} dot={t.status === 'working'}>{s.label}</Badge>
+		</div>
 		{#if meta}
-			<div data-selectable style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px;padding-left:21px">
-				{meta}
+			<div data-selectable style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);margin-top:7px;padding-left:21px">
+				{t.status === 'queued' ? (connected ? 'Waiting for your agent to start' : 'Waiting for an agent') : meta}
 			</div>
 		{/if}
 		{#if t.status === 'working'}
@@ -369,8 +372,8 @@
 		{/if}
 		{#if t.status === 'ready'}
 			{#if staged?.task_id === t.id}
-				<div style="font-size:11px;color:var(--agent-300);margin-top:8px;padding-left:21px">
-					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} below — applying accepts them
+				<div style="font-size:12px;color:var(--agent-300);margin-top:8px;padding-left:21px">
+					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} above — applying accepts them
 				</div>
 			{/if}
 			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
@@ -406,59 +409,10 @@
 		<Badge tone={working ? 'agent' : 'neutral'} dot={working}>{working ? 'working' : 'idle'}</Badge>
 	</div>
 
-	<div style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:16px">
-		<!-- MCP status. What is actually knowable is when an agent last spoke to
-		     the endpoint — so that, and not a dot that means nothing. -->
-		<div
-			style="flex:none;display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:var(--radius-md);background:{connected
-				? 'var(--agent-surface)'
-				: 'var(--surface-raised)'};border:1px solid {connected ? 'var(--agent-border)' : 'var(--border-default)'}"
-		>
-			<span
-				style="flex:none;width:28px;height:28px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid {connected
-					? 'var(--agent-border)'
-					: 'var(--border-default)'};display:grid;place-items:center;color:{connected ? 'var(--agent-300)' : 'var(--text-muted)'}"
-				><Icon n="plug-zap" s={15} /></span
-			>
-			<div style="flex:1;min-width:0">
-				<div style="display:flex;align-items:center;gap:6px">
-					<span style="font-size:13px;font-weight:600;color:var(--text-primary)"
-						>{connected ? 'Agent connected' : lastSeen === null ? 'No agent yet' : 'Agent idle'}</span
-					>
-					<span
-						style="font-family:var(--font-mono);font-size:9px;color:{connected
-							? 'var(--agent-300)'
-							: 'var(--text-muted)'};letter-spacing:.08em;border:1px solid {connected
-							? 'var(--agent-border)'
-							: 'var(--border-default)'};border-radius:3px;padding:0 4px">MCP</span
-					>
-				</div>
-				<div style="font-size:11px;color:var(--text-muted);margin-top:2px">
-					{#if working}
-						Working a task
-					{:else if lastSeen === null}
-						Nothing has connected to this endpoint yet
-					{:else}
-						Last seen {ago(lastSeen)}
-					{/if}
-				</div>
-			</div>
-			<span
-				style="display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px;color:{working
-					? 'var(--agent-300)'
-					: connected
-						? 'var(--green-400)'
-						: 'var(--text-disabled)'}"
-			>
-				<span
-					style="width:7px;height:7px;border-radius:50%;background:{working
-						? 'var(--agent-400)'
-						: connected
-							? 'var(--green-500)'
-							: 'var(--text-disabled)'};box-shadow:{working ? '0 0 8px var(--agent-400)' : 'none'}"
-				></span>
-				{working ? 'working' : connected ? 'live' : lastSeen === null ? 'waiting' : 'away'}
-			</span>
+	<div style="flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px">
+		<div style="display:flex;align-items:center;gap:8px;flex:none;font-size:12px;color:var(--text-secondary)">
+			<Icon n="plug" s={16} color={connected ? 'var(--agent-300)' : 'var(--text-muted)'} />
+			<span style="flex:1">{connected ? 'Agent connected' : lastSeen === null ? 'No agent connected' : `Last seen ${ago(lastSeen)}`}</span>
 		</div>
 
 		<!-- the agent's pending proposal -->
@@ -475,15 +429,15 @@
 					{#if staged.note}
 						<div style="font-size:12px;color:var(--text-secondary);margin-bottom:3px">{staged.note}</div>
 					{/if}
-					<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{headline}</div>
-					<div style="font-size:10px;color:var(--text-disabled);margin-top:3px">
+					<div style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{headline}</div>
+					<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
 						Your timeline is untouched until you apply these.
 					</div>
 				</div>
 
 				{#if staged.stale}
 					<div
-						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:1px solid var(--diff-remove);font-size:11px;color:var(--text-secondary);line-height:1.45"
+						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:1px solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.45"
 					>
 						You have edited the timeline since these were staged — applying replaces your newer cut.
 					</div>
@@ -510,10 +464,10 @@
 											: 'pointer'}"
 									>
 										<span
-											style="flex:none;width:9px;font-family:var(--font-mono);font-size:11px;color:{polarityTint[tone]}"
+											style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[tone]}"
 											>{polarityMark[tone]}</span
 										>
-										<span style="flex:1;min-width:0;font-size:11px;line-height:1.45;color:var(--text-secondary)">
+										<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
 											{e.summary}
 											{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}
 										</span>
@@ -554,11 +508,34 @@
 			</div>
 		{/if}
 
+		<!-- queue -->
+		<div style="flex:none">
+			{@render secHead('Queue', agent.summary)}
+			<div style="display:flex;flex-direction:column;gap:8px">
+				{#if queue.length === 0}
+					<div
+						style="display:flex;flex-direction:column;align-items:center;gap:7px;padding:22px 16px;border-radius:var(--radius-md);border:1px dashed var(--border-strong);background:var(--surface-inset);text-align:center"
+					>
+						<Icon n="list-plus" s={20} color="var(--text-disabled)" />
+						<div style="font-size:12px;color:var(--text-secondary)">No tasks queued</div>
+						<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
+							Queue a task below. Your connected agent claims it and proposes edits.
+						</div>
+					</div>
+				{:else}
+					{#each queue as t (t.id)}
+						{@render taskCard(t)}
+					{/each}
+				{/if}
+			</div>
+		</div>
+
 		<!-- how to connect an agent -->
 		<div
 			style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);overflow:hidden"
 		>
 			<button
+				aria-expanded={showConnect}
 				onclick={() => (showConnect = !showConnect)}
 				style="display:flex;align-items:center;gap:8px;width:100%;padding:10px 11px;background:transparent;border:none;cursor:pointer;text-align:left"
 			>
@@ -574,18 +551,18 @@
 			{#if showConnect}
 				<div style="padding:0 11px 12px;display:flex;flex-direction:column;gap:11px">
 					<div>
-						<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+						<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
 							Point any MCP client at this local endpoint:
 						</div>
 						{@render copyRow(endpoint, 'endpoint')}
 					</div>
 					<div>
-						<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+						<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
 							Using <span style="color:var(--text-secondary)">Claude Code</span>? Run this in your terminal:
 						</div>
 						{@render copyRow(claudeCmd, 'cmd')}
 					</div>
-					<div style="font-size:10px;color:var(--text-disabled);line-height:1.5">
+					<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
 						The agent edits the project you have open and proposes cuts you review here. Override the address
 						with <span style="font-family:var(--font-mono)">KERF_MCP_ADDR</span>.
 					</div>
@@ -593,27 +570,28 @@
 			{/if}
 		</div>
 
-		<!-- queue -->
-		<div style="flex:none">
-			{@render secHead('Queue', agent.summary)}
-			<div style="display:flex;flex-direction:column;gap:8px">
-				{#if queue.length === 0}
-					<div
-						style="display:flex;flex-direction:column;align-items:center;gap:7px;padding:22px 16px;border-radius:var(--radius-md);border:1px dashed var(--border-strong);background:var(--surface-inset);text-align:center"
-					>
-						<Icon n="list-plus" s={20} color="var(--text-disabled)" />
-						<div style="font-size:12px;color:var(--text-secondary)">No tasks queued</div>
-						<div style="font-size:11px;color:var(--text-muted);line-height:1.5">
-							Queue a task below. Your connected agent claims it and proposes edits.
-						</div>
-					</div>
-				{:else}
-					{#each queue as t (t.id)}
-						{@render taskCard(t)}
+		<!-- One-click edits. Open by default: for most cuts these chips are the
+		     whole reason to open the panel, and an agent is optional. -->
+		<details open style="flex:none;border-top:1px solid var(--border-default);padding-top:4px">
+			<summary style="cursor:pointer;font-size:13px;font-weight:600;padding:8px 0;color:var(--text-secondary)">Quick edits</summary>
+			{#each [true, false] as local (local)}
+				<p style="font-size:12px;color:var(--text-muted);margin:8px 0 6px">
+					{local ? 'Runs now and lands in your history' : 'Queued for your agent — you review before it lands'}
+				</p>
+				<div style="display:flex;flex-wrap:wrap;gap:6px">
+					{#each PRESETS.filter((p) => LOCAL_PRESETS.has(p) === local) as p (p)}
+						<button
+							{disabled}
+							onclick={() => runPreset(p)}
+							title={local ? `Run now: ${p}` : `Queue for agent: ${p}`}
+							style="display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:5px 10px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:var(--text-secondary);font-size:12px;cursor:pointer;text-align:left"
+						>
+							<Icon n={local ? 'play' : 'list-plus'} s={12} />{p}
+						</button>
 					{/each}
-				{/if}
-			</div>
-		</div>
+				</div>
+			{/each}
+		</details>
 
 		<!-- history -->
 		<div style="flex:none">
@@ -636,7 +614,7 @@
 							>
 								{rev.label}
 							</div>
-							<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
+							<div style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">
 								{sourceLabel[rev.source]}
 							</div>
 						</button>
@@ -660,13 +638,13 @@
 						{@const d = revisionDiffs[rev.seq]}
 						<div style="padding:2px 4px 8px 26px;display:flex;flex-direction:column;gap:2px">
 							{#if d === undefined}
-								<span style="font-size:11px;color:var(--text-disabled)">Reading the change…</span>
+								<span style="font-size:12px;color:var(--text-disabled)">Reading the change…</span>
 							{:else if d === null}
-								<span style="font-size:11px;color:var(--text-disabled)"
+								<span style="font-size:12px;color:var(--text-disabled)"
 									>Change details are available in the desktop app.</span
 								>
 							{:else if d.entries.length === 0}
-								<span style="font-size:11px;color:var(--text-disabled)">Changed nothing.</span>
+								<span style="font-size:12px;color:var(--text-disabled)">Changed nothing.</span>
 							{:else}
 								<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
 									>{diffHeadline(d)}</span
@@ -674,11 +652,11 @@
 								{#each d.entries as e, i (`${rev.seq}-${i}`)}
 									<span style="display:flex;gap:6px;align-items:baseline">
 										<span
-											style="flex:none;width:9px;font-family:var(--font-mono);font-size:11px;color:{polarityTint[
+											style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[
 												polarity(e.kind)
 											]}">{polarityMark[polarity(e.kind)]}</span
 										>
-										<span style="flex:1;min-width:0;font-size:11px;line-height:1.45;color:var(--text-secondary)"
+										<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)"
 											>{e.summary}{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}</span
 										>
 									</span>
@@ -695,19 +673,6 @@
 	<div
 		style="flex:none;padding:12px;border-top:1px solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:9px"
 	>
-		<div style="display:flex;flex-wrap:wrap;gap:6px">
-			{#each PRESETS as p (p)}
-				<button
-					{disabled}
-					onclick={() => runPreset(p)}
-					style="display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:{disabled
-						? 'var(--text-disabled)'
-						: 'var(--text-secondary)'};font-size:11px;cursor:{disabled ? 'not-allowed' : 'pointer'}"
-				>
-					<Icon n="plus" s={12} />{p}
-				</button>
-			{/each}
-		</div>
 		<div
 			style="display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;background:var(--surface-inset);border:1px solid var(--input);border-radius:var(--radius-sm);opacity:{disabled
 				? 0.5
@@ -718,22 +683,24 @@
 				{disabled}
 				bind:value={draft}
 				onkeydown={onInputKey}
-				placeholder="Describe a task to queue…"
-				style="flex:1;background:none;border:none;outline:none;color:var(--text-primary);font-family:var(--font-sans);font-size:13px"
+				aria-label="Task for your agent"
+				placeholder="Describe a task for your agent…"
+				style="flex:1;min-width:0;background:none;border:none;outline:none;color:var(--text-primary);font-family:var(--font-sans);font-size:13px"
 			/>
 			<button
-				title="Add to queue"
+				title="Queue task for agent"
+				aria-label="Queue task for agent"
 				disabled={disabled || !draft.trim()}
 				onclick={submit}
-				style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:{draft.trim()
+				style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:{draft.trim()
 					? 'var(--kerf-300)'
 					: 'var(--text-secondary)'};cursor:{disabled || !draft.trim() ? 'not-allowed' : 'pointer'}"
 			>
 				<Icon n="corner-down-left" s={14} />
 			</button>
 		</div>
-		<span style="font-size:10px;color:var(--text-disabled);line-height:1.4">
-			Tasks run when your connected agent claims them — Kerf never edits on its own.
+		<span style="font-size:12px;color:var(--text-muted);line-height:1.4">
+			{connected ? 'Queued tasks run when your agent picks them up.' : 'Queued tasks wait here until you connect an agent.'}
 		</span>
 	</div>
 </div>

@@ -264,7 +264,7 @@
 						<span style="display:inline-flex;align-items:center;gap:5px">
 							{#if editor.importProgress !== null}
 								<span
-									style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+									style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
 									title="Stitching a 360 lens pair"
 									>{Math.round(editor.importProgress * 100)}%</span
 								>
@@ -272,7 +272,7 @@
 							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
 						</span>
 					{:else}
-						<IconBtn title="Import" size={24} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+						<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
 					{/if}
 				</div>
 				{#each assets as a (a.asset.id)}
@@ -318,14 +318,14 @@
 							</div>
 							{#if spec}
 								<div
-									style="font-size:10.5px;color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+									style="font-size:12px;color:var(--text-muted);margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
 									title={spec}
 								>
 									{spec}
 								</div>
 							{/if}
 							<div style="display:flex;gap:5px;align-items:center;margin-top:4px;flex-wrap:wrap">
-								<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
+								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
 									>{a.info.duration}</span
 								>
 								{#if a.info.projection}

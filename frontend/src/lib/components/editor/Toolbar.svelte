@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { formatTimecode } from '$lib/timecode';
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
@@ -59,10 +60,7 @@
 	}
 
 	function tc(s: number): string {
-		const m = Math.floor(s / 60);
-		const sec = Math.floor(s % 60);
-		const frames = Math.floor((s % 1) * 24);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}:${frames.toString().padStart(2, '0')}`;
+		return formatTimecode(s, editor.fps);
 	}
 </script>
 
@@ -112,9 +110,10 @@
 		<Icon n={ui.playing ? 'pause' : 'play'} />
 	</IconBtn>
 	<IconBtn title="Skip to end" onclick={() => ui.seek(editor.duration)}><Icon n="skip-forward" /></IconBtn>
-	<span style="font-family:var(--font-mono);font-size:13px;color:var(--kerf-300);margin-left:6px;font-weight:500">
+	<span title={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`} style="font-family:var(--font-mono);font-size:13px;color:var(--kerf-300);margin-left:6px;font-weight:500">
 		{tc(ui.time)}
 	</span>
+	<span style="font-size:11px;color:var(--text-muted)" title="Timeline frame rate; non-drop timecode">{Number(editor.fps.toFixed(3))} fps</span>
 
 	{@render divider()}
 

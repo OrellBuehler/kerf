@@ -16,6 +16,7 @@
 	import { agent } from '$lib/agent.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { workspace } from '$lib/workspace.svelte';
 	import { inTauri, isMediaPath } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -204,13 +205,20 @@
 		}
 	}
 
-	/** One step for arrow-key seeking: a single source frame (derived from the
-	 *  selected asset's fps, default 30), or a whole second when Shift is held. */
+	// A proposal the agent stages is only visible in the Agent panel, which
+	// shares a tab group with the Inspector by default — so when one lands,
+	// bring that panel forward once. Switching away again is left alone.
+	let hadStaged = false;
+	$effect(() => {
+		const has = editor.staged !== null;
+		if (workspace.open.length === 0) return;
+		if (has && !hadStaged) workspace.show('agent');
+		hadStaged = has;
+	});
+
+	/** Step by one timeline frame; Shift seeks a whole second. */
 	function frameStep(coarse: boolean): number {
-		if (coarse) return 1;
-		const v = editor.selectedAsset?.streams.find((s) => s.kind === 'video');
-		const fps = v?.fps && v.fps > 0 ? v.fps : 30;
-		return 1 / fps;
+		return coarse ? 1 : 1 / editor.fps;
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -225,8 +233,14 @@
 	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
 
 	function onKey(e: KeyboardEvent) {
-		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		if (e.defaultPrevented) return;
+		const target = e.target instanceof Element ? e.target : null;
+		// Typing goes to the field. A range / checkbox only needs the keys that
+		// operate it, so J/K/L still shuttle after a fader was clicked.
+		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
 		const k = e.key.toLowerCase();
+		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
+		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
 
 		// File operations (⌘/Ctrl). Handled first so they win over the bare-key
 		// tool shortcuts, and any other modified combo returns without falling
