@@ -56,7 +56,7 @@
 
 	/** Shared look for the one-letter S / L track flags. */
 	const flagBtn = (on: boolean, accent: string) =>
-		`flex:none;font-family:var(--font-mono);font-size:9px;font-weight:700;line-height:1;padding:2px 3px;border-radius:3px;cursor:pointer;` +
+		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
 		`border:1px solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-disabled)'}`;
 
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
@@ -879,7 +879,7 @@
 			bind:value={ui.zoom}
 			title="Zoom — {ui.zoom} px/s (⌘/Ctrl + wheel zooms at the cursor)"
 			aria-label="Timeline zoom"
-			style="width:90px;height:4px;accent-color:var(--kerf-500);cursor:pointer"
+			style="width:90px;height:24px;accent-color:var(--kerf-500);cursor:pointer"
 		/>
 		<button
 			title="Zoom in"
@@ -940,7 +940,7 @@
 				>
 				<div style="display:flex;align-items:center;gap:6px">
 					<span
-						style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text-secondary);flex:none"
+						style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary);flex:none"
 						>{t.name}</span
 					>
 					<!-- No "Video"/"Audio" caption: the name (V1 / A1) and the eye vs
@@ -958,7 +958,7 @@
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
 								? 'var(--text-on-accent)'
-								: 'var(--text-disabled)'};font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 4px;flex:none"
+								: 'var(--text-disabled)'};font-size:12px;font-weight:600;min-height:26px;padding:2px 4px;flex:none"
 							>DUCK</button
 						>
 					{/if}
@@ -973,7 +973,7 @@
 						aria-label="Toggle mute"
 						aria-pressed={!!t.muted}
 						onclick={() => void editor.setTrackMuted(t.id, !t.muted).catch(err)}
-						style="background:none;border:none;cursor:pointer;padding:0;flex:none;display:grid;place-items:center;color:{t.muted
+						style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:{t.muted
 							? 'var(--red-500)'
 							: 'var(--text-disabled)'}"
 						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
@@ -996,7 +996,7 @@
 						title="Remove track"
 						aria-label="Remove track"
 						onclick={() => onRemoveTrack(t)}
-						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0;flex:none"
+						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
 						><Icon n="x" s={12} /></button
 					>
 				</div>
@@ -1017,7 +1017,7 @@
 								title="Level {gainLabel(t.volume ?? 1)} — double-click for unity"
 								onchange={(e) => void editor.setTrackVolume(t.id, +e.currentTarget.value).catch(err)}
 								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
-								style="flex:1;min-width:0;height:12px;accent-color:var(--kerf-400);cursor:pointer"
+								style="flex:1;min-width:0;height:20px;accent-color:var(--kerf-400);cursor:pointer"
 							/>
 							<input
 								type="range"
@@ -1030,7 +1030,7 @@
 								title="Pan {panLabel(t.pan ?? 0)} — double-click to centre"
 								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
 								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
-								style="width:34px;flex:none;height:12px;accent-color:var(--text-muted);cursor:pointer"
+								style="width:48px;flex:none;height:20px;accent-color:var(--text-muted);cursor:pointer"
 							/>
 						</div>
 					{/if}

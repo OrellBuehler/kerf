@@ -21,8 +21,8 @@
 	} = $props();
 
 	const sizes = {
-		sm: { h: 26, p: '0 10px', f: 12 },
-		md: { h: 32, p: '0 14px', f: 13 },
+		sm: { h: 30, p: '0 10px', f: 12 },
+		md: { h: 34, p: '0 14px', f: 13 },
 		lg: { h: 38, p: '0 18px', f: 14 }
 	} as const;
 

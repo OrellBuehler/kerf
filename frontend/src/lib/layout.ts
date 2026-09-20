@@ -45,28 +45,24 @@ function leaf(id: string, views: PanelId[], size: number): Node {
 	return { type: 'leaf', data: { id, views, activeView: views[0] }, size };
 }
 
-/** Today's arrangement: bin | preview over timeline | inspector | agent, the
- *  transcript tabbed behind the bin. Sizes are ratios — dockview rescales them
- *  to the real window. */
+/** Editing first: a full-width timeline below the media bin, preview and a
+ * shared Inspector/Agent group. Custom saved layouts are left intact. */
 export const DEFAULT_LAYOUT: SerializedDockview = {
 	grid: {
 		root: {
-			type: 'branch',
-			size: 796,
+			type: 'branch', size: 1440,
 			data: [
-				leaf('left', ['media', 'transcript'], 248),
-				{
-					type: 'branch',
-					size: 900,
-					data: [leaf('preview', ['preview'], 500), leaf('timeline', ['timeline'], 296)]
-				},
-				leaf('inspector', ['inspector'], 268),
-				leaf('agent', ['agent'], 340)
+				{ type: 'branch', size: 490, data: [
+					leaf('left', ['media', 'transcript'], 240),
+					leaf('preview', ['preview'], 860),
+					leaf('inspector', ['inspector', 'agent'], 340)
+				]},
+				leaf('timeline', ['timeline'], 304)
 			]
 		},
-		width: 1656,
-		height: 796,
-		orientation: 'HORIZONTAL' as Orientation
+		width: 1440,
+		height: 794,
+		orientation: 'VERTICAL' as Orientation
 	},
 	panels: Object.fromEntries(PANEL_IDS.map((id) => [id, panelState(id)])),
 	activeGroup: 'preview'

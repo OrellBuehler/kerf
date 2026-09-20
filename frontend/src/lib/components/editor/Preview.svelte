@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import { formatTimecode } from '$lib/timecode';
 	import Badge from './Badge.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -55,11 +56,7 @@
 	});
 
 	function tc(s: number): string {
-		const total = Math.max(0, s);
-		const m = Math.floor(total / 60);
-		const sec = Math.floor(total % 60);
-		const frames = Math.floor((total % 1) * 24);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}:${frames.toString().padStart(2, '0')}`;
+		return formatTimecode(s, editor.fps);
 	}
 
 	let frameUrl = $state<string | null>(null);

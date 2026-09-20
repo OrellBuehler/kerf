@@ -3,8 +3,8 @@
 .dockview-theme-kerf {
 	--dv-group-view-background-color: var(--surface-panel);
 	--dv-tabs-and-actions-container-background-color: var(--surface-app);
-	--dv-tabs-and-actions-container-height: 30px;
-	--dv-tabs-and-actions-container-font-size: 12px;
+	--dv-tabs-and-actions-container-height: 34px;
+	--dv-tabs-and-actions-container-font-size: 13px;
 	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
 	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
 	--dv-inactivegroup-visiblepanel-tab-background-color: var(--surface-panel);
@@ -27,7 +27,7 @@
 	--dv-floating-box-shadow: var(--shadow-lg);
 	--dv-floating-border: 1px solid var(--border-strong);
 	--dv-overlay-z-index: 45;
-	--dv-tab-font-size: 12px;
+	--dv-tab-font-size: 13px;
 	--dv-border-radius: 0px;
 	--dv-tab-border-radius: 0px;
 	--dv-sash-border-radius: 0px;

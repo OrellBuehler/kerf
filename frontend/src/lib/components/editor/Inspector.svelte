@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import InspectorSection from './InspectorSection.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
@@ -344,28 +345,19 @@
 	const selectCss =
 		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
 	const fxNum =
-		'width:58px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:4px 5px;text-align:right';
+		'width:58px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 5px;text-align:right';
 	const fxTxt =
-		'width:70px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:11px;padding:4px 5px';
+		'width:70px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:4px 5px';
 	const xBtn =
-		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;padding:0 2px';
+		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
+	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 	const chip = (active: boolean) =>
-		`padding:4px 9px;font-size:11px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid ${
+		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
 			active ? 'var(--text-primary)' : 'var(--text-secondary)'
 		}`;
 </script>
-
-{#snippet secHead(label: string)}
-	<div style="display:flex;align-items:center;gap:8px;margin:14px 0 9px">
-		<span
-			style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-			>{label}</span
-		>
-		<div style="flex:1;height:1px;background:var(--border-subtle)"></div>
-	</div>
-{/snippet}
 
 {#snippet readRow(label: string, value: string)}
 	<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
@@ -402,7 +394,7 @@
 	onCommit: (v: number) => void
 )}
 	<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
-		<span style="font-size:12px;color:var(--text-muted);width:64px;flex:none">{label}</span>
+		<span style="font-size:12px;color:var(--text-secondary);width:72px;flex:none">{label}</span>
 		<input
 			type="range"
 			{min}
@@ -436,7 +428,7 @@
 	onParam: (i: number, key: string, value: unknown) => void,
 	onRemove: (i: number) => void
 )}
-	{@render secHead(title)}
+	<InspectorSection title={title} summary={count(items.length, 'effect')}>
 	{#each items as e, i (i)}
 		<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:3px 0">
 			<span
@@ -485,17 +477,19 @@
 			<option value={k}>{k.replace('_', ' ')}</option>
 		{/each}
 	</select>
+	</InspectorSection>
+
 {/snippet}
 
 {#snippet overlaysSection()}
-	{@render secHead('Text overlays')}
+	<InspectorSection title="Titles & captions" summary={count((editor.timeline.overlays ?? []).length, 'overlay')} open>
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 		{#each TEXT_STYLES as s (s.id)}
 			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
 		{/each}
 	</div>
 	<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px">
-		<span style="font-size:11px;color:var(--text-muted)">Caption style</span>
+		<span style="font-size:12px;color:var(--text-muted)">Caption style</span>
 		{#each CAPTION_LOOKS as c (c.id)}
 			<button style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (captionStyle = c.id)}>
 				{c.label}
@@ -512,7 +506,7 @@
 		{/if}
 	</div>
 	{#if overlays.length === 0}
-		<div style="font-size:11px;color:var(--text-muted);line-height:1.4">
+		<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
 			No titles or captions yet. Add text, or caption the whole cut from the transcripts of the clips on
 			the timeline — captions land on the words that survived your edit.
 		</div>
@@ -526,7 +520,7 @@
 				<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>{o.text || '(empty)'}</span
 				>
-				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{tc(o.start)}</span>
+				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
 			</button>
 			<button onclick={() => run(() => editor.removeOverlay(o.id))} disabled={editor.busy} title="Remove" style={xBtn}
 				>×</button
@@ -595,12 +589,14 @@
 						checked={o.bold}
 						disabled={editor.busy}
 						onchange={(e) => run(() => editor.updateOverlay(o.id, { bold: e.currentTarget.checked }))}
-						style="accent-color:var(--kerf-500);width:15px;height:15px"
+						style="accent-color:var(--kerf-500);width:18px;height:18px"
 					/>
 				</label>
 			</div>
 		{/if}
 	{/each}
+	</InspectorSection>
+
 {/snippet}
 
 <div
@@ -632,11 +628,11 @@
 				</div>
 			</div>
 
-			{@render secHead('Position')}
+			<InspectorSection title="Timing" summary={`${tc(clip.timeline_start)} · ${tc(clipDuration(clip))}`} open>
 			{@render readRow('Start', tc(clip.timeline_start))}
 			{@render readRow('Duration', tc(clipDuration(clip)))}
 
-			{@render secHead('Trim (source)')}
+			<div style="font-size:12px;color:var(--text-muted);margin:8px 0">Trim source</div>
 			{@render readRow('Source range', `${tc(clip.source_in)} – ${tc(clip.source_out)}`)}
 			{@render numRow('In', clip.source_in, 0.1, (v) =>
 				run(() => editor.trim(clip.id, v, undefined))
@@ -644,9 +640,10 @@
 			{@render numRow('Out', clip.source_out, 0.1, (v) =>
 				run(() => editor.trim(clip.id, undefined, v))
 			)}
+			</InspectorSection>
 
 			{#if hasAudio}
-				{@render secHead('Volume')}
+				<InspectorSection title="Volume" summary={`${Math.round(clip.volume * 100)}%`} open>
 				<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
 					<input
 						type="range"
@@ -671,17 +668,20 @@
 						>{Math.round(shown('Volume', clip.volume) * 100)}%</span
 					>
 				</label>
+				</InspectorSection>
+
 			{/if}
 
-			{@render secHead('Fades')}
+			<InspectorSection title="Fades" summary={`${clip.fade_in}s in · ${clip.fade_out}s out`}>
 			{@render numRow('Fade in', clip.fade_in, 0.1, (v) =>
 				run(() => editor.setFade(clip.id, Math.max(0, v), undefined))
 			)}
 			{@render numRow('Fade out', clip.fade_out, 0.1, (v) =>
 				run(() => editor.setFade(clip.id, undefined, Math.max(0, v)))
 			)}
+			</InspectorSection>
 
-			{@render secHead('Speed')}
+			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), 0.25, 4, 0.25, (v) => `${v.toFixed(2)}×`, (v) =>
 				run(() => editor.setSpeed(clip.id, speed < 0 ? -v : v))
 			)}
@@ -692,12 +692,13 @@
 					checked={speed < 0}
 					disabled={editor.busy}
 					onchange={() => run(() => editor.setSpeed(clip.id, -speed))}
-					style="accent-color:var(--kerf-500);width:15px;height:15px"
+					style="accent-color:var(--kerf-500);width:18px;height:18px"
 				/>
 			</label>
+			</InspectorSection>
 
 			{#if kind === 'video'}
-				{@render secHead(reframeKeys.length ? '360 reframe · keyframing @ playhead' : '360 reframe')}
+				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
 						setCam({ yaw: v })
@@ -715,7 +716,7 @@
 						{@render rangeRow('Lens FOV', cam.lens_fov, 170, 220, 1, (v) => `${Math.round(v)}°`, (v) =>
 							run(() => editor.setReframe(clip.id, { lens_fov: v }))
 						)}
-						<p style="font-size:11px;color:var(--text-muted);margin:4px 0 0;line-height:1.4">
+						<p style="font-size:12px;color:var(--text-muted);margin:4px 0 0;line-height:1.4">
 							Approximate stitch — the seam is a hard blend, not Insta360's optical-flow
 							one. Tune Lens FOV to move it, or use a Studio equirect export for a clean
 							join.
@@ -746,7 +747,7 @@
 						>
 					</div>
 				{:else if sourceProjection}
-					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
+					<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
 						360 source ({sourceProjection === 'dual_fisheye' ? 'dual fisheye' : sourceProjection}),
 						shown raw.
 					</p>
@@ -757,7 +758,7 @@
 						>Reframe to flat</Btn
 					>
 				{:else}
-					<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
+					<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
 						Not detected as 360. If this really is spherical footage, pick how the source is
 						packed — the whole asset is marked, so every clip cut from it reframes.
 					</p>
@@ -784,10 +785,12 @@
 							})}>Mark as 360 &amp; reframe</Btn
 					>
 				{/if}
+				</InspectorSection>
+
 			{/if}
 
 			{#if kind === 'video'}
-				{@render secHead(keyframes.length ? 'Transform · keyframing @ playhead' : 'Transform')}
+				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					setTf({ scale: v })
 				)}
@@ -803,7 +806,9 @@
 				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					setTf({ opacity: v })
 				)}
-				{@render secHead('Framing')}
+				</InspectorSection>
+
+				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : 'Full frame'}>
 				<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 					<button
 						style={chip(false)}
@@ -847,8 +852,9 @@
 				{@render rangeRow('Crop B', tf.crop_bottom, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setTransform(clip.id, { crop_bottom: v }))
 				)}
+				</InspectorSection>
 
-				{@render secHead('Color')}
+				<InspectorSection title="Color" summary={activeLook(col)?.label ?? 'Custom'}>
 				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 					{#each COLOR_LOOKS as look (look.id)}
 						<button
@@ -879,9 +885,11 @@
 				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) =>
 					run(() => editor.setColor(clip.id, { gamma: v }))
 				)}
+				</InspectorSection>
+
 			{/if}
 
-			{@render secHead('Mask')}
+			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<button
 					style={chip(!mask)}
@@ -928,8 +936,9 @@
 					face: duplicate the shot onto the track above, blur the copy, mask the copy.
 				</div>
 			{/if}
+			</InspectorSection>
 
-			{@render secHead('Transition (in)')}
+			<InspectorSection title="Transition (in)" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 				<span style="font-size:12px;color:var(--text-muted)">Type</span>
 				<select
@@ -957,6 +966,7 @@
 					run(() => editor.setTransition(clip.id, { kind: transition.kind, duration: Math.max(0.05, v) }))
 				)}
 			{/if}
+			</InspectorSection>
 
 			{#if hasAudio}
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
@@ -965,7 +975,7 @@
 				{#if kind === 'video'}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
 
-					{@render secHead('Animation')}
+					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
 					<div style="display:flex;gap:7px;margin-bottom:4px">
 						<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addKeyframeHere}
 							>+ Keyframe @ playhead</Btn
@@ -982,7 +992,7 @@
 					{#if keyframes.length}
 						{#each keyframes as k, i (i)}
 							<div
-								style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary)"
+								style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 							>
 								<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
 								<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
@@ -993,10 +1003,12 @@
 								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
 							</div>
 						{/each}
-						<div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4">
+						<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
 							Move the playhead and adjust Transform above to keyframe scale / position / rotation / opacity over time.
 						</div>
 					{/if}
+					</InspectorSection>
+
 				{/if}
 
 				<div style="margin-top:18px;display:flex;flex-direction:column;gap:7px">

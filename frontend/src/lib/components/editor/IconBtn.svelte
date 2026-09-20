@@ -4,7 +4,7 @@
 	let {
 		active = false,
 		title = undefined,
-		size = 30,
+		size = 32,
 		style = '',
 		children,
 		...rest
@@ -20,6 +20,7 @@
 
 <button
 	{title}
+	aria-label={title}
 	aria-pressed={active}
 	style="display:inline-flex;align-items:center;justify-content:center;width:{size}px;height:{size}px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {active
 		? 'var(--border-strong)'
