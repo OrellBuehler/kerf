@@ -34,7 +34,7 @@ uuid.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
-dirs = "6"
+dirs = "7"
 fontdb.workspace = true
 # Speech model downloads (see engine::whisper). Blocking + rustls, so it needs
 # no async runtime and no system OpenSSL.
