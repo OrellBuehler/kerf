@@ -2080,6 +2080,57 @@ fn video_tunes(vc: &str) -> &'static [&'static str] {
     }
 }
 
+/// `-pix_fmt` / filtergraph `format=` values the graph builders will emit. A
+/// closed set, unlike a colour: `pix_fmt`/`scaler`/`gif_dither` reach the graph
+/// unquoted (see `ExportFormat::scale_flags`, `export_format`, the gif
+/// `paletteuse` chain), so an out-of-list value is dropped rather than passed
+/// through — a `.kerf` file or an MCP call is untrusted the same as anything
+/// else, and this must hold even when `validate_export` was never run.
+const PIX_FMTS: &[&str] = &[
+    "yuv420p",
+    "yuv422p",
+    "yuv444p",
+    "yuva420p",
+    "yuva422p",
+    "yuva444p",
+    "yuv420p10le",
+    "yuv422p10le",
+    "yuv444p10le",
+    "yuva420p10le",
+    "yuva422p10le",
+    "yuva444p10le",
+    "yuv420p12le",
+    "yuv422p12le",
+    "yuv444p12le",
+    "yuvj420p",
+    "yuvj422p",
+    "yuvj444p",
+    "nv12",
+    "nv21",
+    "p010le",
+    "rgb24",
+    "bgr24",
+    "rgba",
+    "bgra",
+    "gray",
+];
+
+/// `scale=…:flags=` scalers `swscale` accepts, matching the export dialog's choices.
+const SCALERS: &[&str] = &["bicubic", "bilinear", "lanczos", "neighbor", "spline"];
+
+/// `paletteuse=dither=` modes for the gif pipeline.
+const GIF_DITHERS: &[&str] = &[
+    "bayer",
+    "heckbert",
+    "floyd_steinberg",
+    "sierra2",
+    "sierra2_4a",
+    "sierra3",
+    "burkes",
+    "atkinson",
+    "none",
+];
+
 /// The hardware-encoder family a `-c:v` value belongs to, read from its ffmpeg
 /// suffix. Software encoders (libx264 / libx265 / libsvtav1 / libvpx-vp9) and
 /// the prores / gif pipelines are [`EncFamily::Software`]. The family decides how
@@ -2183,6 +2234,21 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
             }
         }
     }
+    if let Some(pf) = opts.pix_fmt.as_deref() {
+        if !PIX_FMTS.contains(&pf) {
+            issues.push(format!("Unsupported pixel format \"{pf}\"."));
+        }
+    }
+    if let Some(s) = opts.scaler.as_deref() {
+        if !SCALERS.contains(&s) {
+            issues.push(format!("Unsupported scaler \"{s}\"."));
+        }
+    }
+    if let Some(d) = opts.gif_dither.as_deref() {
+        if !GIF_DITHERS.contains(&d) {
+            issues.push(format!("Unsupported gif dither \"{d}\"."));
+        }
+    }
     if want_audio {
         if let Some(ac) = opts.audio_codec.as_deref() {
             if !c.audio_ok(ac) {
@@ -2241,11 +2307,13 @@ impl ExportFormat {
             "stereo"
         }
     }
-    /// The `:flags=…` suffix to append to a `scale` filter, or empty.
+    /// The `:flags=…` suffix to append to a `scale` filter, or empty. An
+    /// out-of-list value (a stale `.kerf` file, a hand-crafted MCP call) is
+    /// dropped rather than spliced in unquoted — see [`SCALERS`].
     fn scale_flags(&self) -> String {
-        match &self.scaler {
-            Some(s) => format!(":flags={s}"),
-            None => String::new(),
+        match self.scaler.as_deref() {
+            Some(s) if SCALERS.contains(&s) => format!(":flags={s}"),
+            _ => String::new(),
         }
     }
 }
@@ -2327,8 +2395,11 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
     // source-derived and custom sizes before they reach `scale=`/`color=s=`.
     fmt.width = (fmt.width & !1).max(2);
     fmt.height = (fmt.height & !1).max(2);
-    if let Some(pf) = opts.pix_fmt.clone() {
-        fmt.pix_fmt = pf;
+    // An out-of-list `pix_fmt` (see [`PIX_FMTS`]) is treated as if none were
+    // given, falling through to the same ProRes default a bare `None` gets —
+    // never spliced into the graph terminal `format=` unchecked.
+    if let Some(pf) = opts.pix_fmt.as_deref().filter(|pf| PIX_FMTS.contains(pf)) {
+        fmt.pix_fmt = pf.to_string();
     } else if opts.video_codec.as_deref() == Some("prores_ks") {
         // ProRes cannot encode 4:2:0; default a None pix_fmt to 10-bit 4:2:2 (or
         // 4:4:4 for the 4444 profiles) so the graph terminal doesn't silently
@@ -3749,7 +3820,13 @@ fn build_filter_complex(
         if gif {
             // A two-stream palette gives far better color than the default 216-color
             // web palette: generate an optimized palette, then map onto it.
-            let dither = opts.gif_dither.as_deref().unwrap_or("bayer");
+            // An out-of-list dither (see [`GIF_DITHERS`]) falls back to the
+            // default rather than reaching `paletteuse=` unchecked.
+            let dither = opts
+                .gif_dither
+                .as_deref()
+                .filter(|d| GIF_DITHERS.contains(d))
+                .unwrap_or("bayer");
             chains.push("[vcomp]split[gpsrc][gpuse]".to_string());
             chains.push("[gpsrc]palettegen=stats_mode=diff[gpal]".to_string());
             chains.push(format!("[gpuse][gpal]paletteuse=dither={dither}[outv]"));
@@ -4166,6 +4243,39 @@ fn video_effect_filter(e: &VideoEffect) -> Option<String> {
     })
 }
 
+/// Whether `s` is a safe ffmpeg colour spec to splice unquoted into a filter
+/// value: a bare name (letters only), `#RRGGBB[AA]` hex or `0xRRGGBB[AA]` hex,
+/// each with an optional `@alpha` suffix (a decimal in 0..1). `color`/`bg` reach
+/// `fontcolor=`/`bordercolor=`/`boxcolor=`/`chromakey=` unquoted — like every
+/// other free-form string spliced into this graph, a comma or colon here would
+/// start a new filter node or option instead of naming a colour.
+fn valid_color(s: &str) -> bool {
+    let (base, alpha) = s.split_once('@').map_or((s, None), |(b, a)| (b, Some(a)));
+    if let Some(a) = alpha {
+        if a.is_empty() || a.matches('.').count() > 1 || !a.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return false;
+        }
+    }
+    if let Some(hex) = base.strip_prefix('#') {
+        return matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some(hex) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X")) {
+        return matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    !base.is_empty() && base.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// `s` if [`valid_color`], else `fallback` — the safe way to splice a
+/// caller-controlled colour into a filter value; rendering must never fail or
+/// inject over a bad one.
+fn safe_color<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+    if valid_color(s) {
+        s
+    } else {
+        fallback
+    }
+}
+
 /// The `chromakey` filter for a chroma-key effect, or `None` for any other.
 fn chroma_filter(e: &VideoEffect) -> Option<String> {
     match e {
@@ -4173,7 +4283,12 @@ fn chroma_filter(e: &VideoEffect) -> Option<String> {
             color,
             similarity,
             blend,
-        } => Some(format!("chromakey={color}:{}:{}", fnum(*similarity), fnum(*blend))),
+        } => Some(format!(
+            "chromakey={}:{}:{}",
+            safe_color(color, "green"),
+            fnum(*similarity),
+            fnum(*blend)
+        )),
         _ => None,
     }
 }
@@ -4220,12 +4335,32 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
     }
 }
 
-/// Escape user text for a single-quoted `drawtext` value inside a filtergraph
-/// passed as one argv argument: backslashes (drawtext layer), then apostrophes
-/// (filtergraph single-quote layer). Newlines collapse to spaces — drawtext here
-/// is single-line.
+/// Escape a value for a single-quoted `drawtext` option inside a filtergraph
+/// passed as one argv argument: backslashes, then apostrophes (the filtergraph's
+/// own value parser un-escapes a backslash-doubled pair down to one backslash
+/// even inside single quotes, so a literal backslash needs doubling to survive
+/// it). Newlines collapse to spaces — drawtext here is single-line. Shared by
+/// the `text=` and `fontfile=` escapers below, which differ only in whether `%`
+/// also needs escaping.
 fn escape_drawtext(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', " ").replace('\'', "'\\''")
+}
+
+/// [`escape_drawtext`] for `text=`. `drawtext` expands `%{...}` at
+/// configuration time, and a bare `%` is a configuration error that silently
+/// blanks the whole overlay — ffmpeg still exits 0, so nothing reports it.
+/// drawtext's own escape for a literal `%` is `\%` — but that backslash goes
+/// through the same filtergraph value parser [`escape_drawtext`] doubles
+/// backslashes against, so it needs the same doubling to arrive as one.
+fn escape_drawtext_text(s: &str) -> String {
+    escape_drawtext(s).replace('%', "\\\\%")
+}
+
+/// [`escape_drawtext`] for `fontfile=`, a raw filesystem path rather than
+/// drawtext-expanded text — escaping `%` there would corrupt a path that
+/// legitimately contains one.
+fn escape_drawtext_path(s: &str) -> String {
+    escape_drawtext(s)
 }
 
 /// `drawtext` options shared by the export and still paths (text, size, color,
@@ -4234,10 +4369,11 @@ fn escape_drawtext(s: &str) -> String {
 /// still's height).
 fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
     let fontsize = (frame_h * o.size).round().max(1.0);
+    let color = safe_color(&o.color, "white");
     let mut parts = vec![
-        format!("text='{}'", escape_drawtext(&o.text)),
+        format!("text='{}'", escape_drawtext_text(&o.text)),
         format!("fontsize={}", fnum(fontsize)),
-        format!("fontcolor={}", o.color),
+        format!("fontcolor={color}"),
     ];
     // Resolve a chosen system font to its file on disk; falls through to
     // FFmpeg's drawtext default if unset or no longer installed.
@@ -4246,15 +4382,18 @@ fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
         .as_deref()
         .and_then(|family| crate::fonts::resolve_font_file(family, o.bold))
         .map(|(path, matched_bold)| {
-            parts.push(format!("fontfile='{}'", escape_drawtext(&path.to_string_lossy())));
+            parts.push(format!("fontfile='{}'", escape_drawtext_path(&path.to_string_lossy())));
             matched_bold
         });
     if o.bold && resolved_bold != Some(true) {
         // No real bold face available: a same-color border thickens the glyphs.
         parts.push("borderw=2".to_string());
-        parts.push(format!("bordercolor={}", o.color));
+        parts.push(format!("bordercolor={color}"));
     }
-    if let Some(bg) = &o.bg {
+    // An invalid box colour drops the box entirely rather than falling back to
+    // a visible default — a caller that asked for no readable box colour gets
+    // no box, not a random one.
+    if let Some(bg) = o.bg.as_deref().filter(|bg| valid_color(bg)) {
         parts.push("box=1".to_string());
         parts.push(format!("boxcolor={bg}"));
         parts.push("boxborderw=12".to_string());
@@ -6134,6 +6273,119 @@ mod tests {
     fn drawtext_escapes_apostrophes() {
         // close-quote, escaped quote, reopen — the ffmpeg-safe single-quote escape.
         assert_eq!(escape_drawtext("a'b"), "a'\\''b");
+    }
+
+    #[test]
+    fn drawtext_text_escapes_percent_but_path_does_not() {
+        // A bare `%` is a drawtext configuration error that silently blanks the
+        // whole overlay. drawtext's own literal-`%` escape is `\%`, doubled to
+        // `\\%` to survive the filtergraph value parser the same way a literal
+        // backslash does. `fontfile=` is a path, not drawtext-expanded text, so
+        // it must not be touched.
+        assert_eq!(escape_drawtext_text("50% OFF"), "50\\\\% OFF");
+        assert_eq!(
+            escape_drawtext_path("C:\\fonts\\100% Arial.ttf"),
+            "C:\\\\fonts\\\\100% Arial.ttf"
+        );
+    }
+
+    #[test]
+    fn drawtext_export_escapes_percent_in_text() {
+        let o = TextOverlay::new("Battery: 82%", 0.0, 1.0);
+        let f = drawtext_export(&o, &ExportFormat::default());
+        assert!(f.contains("text='Battery: 82\\\\%'"), "{f}");
+    }
+
+    #[test]
+    fn valid_color_accepts_names_hex_and_alpha() {
+        for ok in [
+            "white",
+            "AliceBlue",
+            "#fff000",
+            "#FFAA00CC",
+            "0x000000",
+            "0XAABBCCDD",
+            "white@0.5",
+            "black@1",
+            "black@.5",
+        ] {
+            assert!(valid_color(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn valid_color_rejects_injection_and_malformed_input() {
+        for bad in [
+            "white,drawtext=textfile='/etc/passwd'",
+            "white:x=1",
+            "",
+            "#ff",
+            "0xZZZZZZ",
+            "white@",
+            "white@1.2.3",
+            "white@nan",
+        ] {
+            assert!(!valid_color(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn malicious_colour_never_reaches_the_graph() {
+        let mut overlay = TextOverlay::new("Hello", 0.0, 1.0);
+        let injection = "white,drawtext=textfile='/etc/passwd'";
+        overlay.color = injection.to_string();
+        overlay.bg = Some(injection.to_string());
+        let drawn = drawtext_export(&overlay, &ExportFormat::default());
+        assert!(!drawn.contains("/etc/passwd") && !drawn.contains("textfile"), "{drawn}");
+        assert!(drawn.contains("fontcolor=white"), "invalid colour falls back: {drawn}");
+        assert!(!drawn.contains("box=1"), "invalid box colour drops the box: {drawn}");
+
+        let chroma = chroma_filter(&VideoEffect::ChromaKey {
+            color: injection.to_string(),
+            similarity: 0.1,
+            blend: 0.0,
+        })
+        .unwrap();
+        assert!(!chroma.contains("/etc/passwd"), "{chroma}");
+        assert_eq!(chroma, "chromakey=green:0.1:0", "invalid colour falls back: {chroma}");
+    }
+
+    #[test]
+    fn malicious_pix_fmt_scaler_and_gif_dither_never_reach_the_graph() {
+        let opts = ExportOptions {
+            video_codec: Some("libx264".into()),
+            pix_fmt: Some("yuv420p,drawtext=textfile='/etc/passwd'".into()),
+            scaler: Some("bilinear:x=1".into()),
+            ..Default::default()
+        };
+        let args = args_of(&opts);
+        let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(!filter.contains("/etc/passwd") && !filter.contains(":x=1"), "{filter}");
+        // Invalid pix_fmt is dropped, never passed through raw.
+        assert_eq!(flag_val(&args, "-pix_fmt"), Some("yuv420p"));
+
+        let gif_opts = ExportOptions {
+            container: Container::Gif,
+            video_codec: Some("gif".into()),
+            include_audio: false,
+            gif_dither: Some("bayer,drawtext=textfile='/etc/passwd'".into()),
+            ..Default::default()
+        };
+        let gif_filter = flag_val(&args_of(&gif_opts), "-filter_complex").unwrap().to_string();
+        assert!(gif_filter.contains("paletteuse=dither=bayer["), "{gif_filter}");
+        assert!(!gif_filter.contains("/etc/passwd"), "{gif_filter}");
+    }
+
+    #[test]
+    fn validate_export_flags_unsupported_pix_fmt_scaler_and_dither() {
+        let opts = ExportOptions {
+            pix_fmt: Some("nope".into()),
+            scaler: Some("nope".into()),
+            gif_dither: Some("nope".into()),
+            ..Default::default()
+        };
+        let issues = validate_export(&opts, true, true);
+        assert_eq!(issues.len(), 3, "{issues:?}");
     }
 
     #[test]
@@ -8846,6 +9098,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(middle < 60.0, "inside the mask the upper clip is kept, got {middle}");
         assert!(corner > 180.0, "outside it the lower track shows through, got {corner}");
+    }
+
+    /// A bare `%` used to be a drawtext configuration error that silently
+    /// blanked the whole overlay — ffmpeg still exits 0, so nothing above can
+    /// tell a rendered "50% OFF" from a plain black frame. Render both and
+    /// compare mean luma.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored percent_overlay`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn percent_overlay_is_not_silently_blanked() {
+        let dir = std::env::temp_dir().join(format!("kerf-percent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=1"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 1.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(640, 360, 30.0)];
+
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 1.0, 0.0)]);
+        let mut overlay = TextOverlay::new("50% OFF", 0.0, 1.0);
+        overlay.size = 0.3;
+        timeline.overlays = vec![overlay];
+
+        let out = dir.join("percent.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        render_with(&timeline, &[asset], &out, &opts).expect("export");
+
+        // Mean luma of the first frame.
+        let mean_luma = |path: &Path| -> f64 {
+            let raw = dir.join("frame.raw");
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .arg("-i")
+                .arg(path)
+                .args(["-frames:v", "1"])
+                .args(["-f", "rawvideo", "-pix_fmt", "gray"])
+                .arg(&raw)
+                .status()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+        let (blank, text) = (mean_luma(&media), mean_luma(&out));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(blank < 2.0, "control should be plain black, got {blank}");
+        assert!(
+            text > blank + 5.0,
+            "\"50% OFF\" should be visible over black: {text} vs blank {blank}"
+        );
     }
 
     /// A slide and a push look identical in the graph builder's assertions —

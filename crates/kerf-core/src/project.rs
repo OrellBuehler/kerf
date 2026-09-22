@@ -801,10 +801,17 @@ impl Project {
     // ---- timeline ---------------------------------------------------------
 
     pub fn timeline(&self) -> Result<Timeline> {
-        let data: String = self
+        Ok(serde_json::from_str(&self.timeline_json()?)?)
+    }
+
+    /// The live timeline's raw stored JSON, byte-for-byte as last written by
+    /// [`Self::save_timeline_str`] — used to compare content against a staged
+    /// row's `base` (itself the same raw string, see [`Self::begin_staging`])
+    /// without round-tripping either through `Timeline` first.
+    fn timeline_json(&self) -> Result<String> {
+        Ok(self
             .conn
-            .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?;
-        Ok(serde_json::from_str(&data)?)
+            .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?)
     }
 
     pub fn save_timeline(&self, timeline: &Timeline) -> Result<()> {
@@ -922,7 +929,7 @@ impl Project {
         if self.staged_row()?.is_some() {
             return Err(Error::StagedEditPending);
         }
-        let snapshot = serde_json::to_string(&self.timeline()?)?;
+        let snapshot = self.timeline_json()?;
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO staged (id, base_seq, base, timeline, edits, task_id, note, created_at, updated_at)
@@ -947,7 +954,10 @@ impl Project {
             edits: row.edits,
             created_at: row.created_at,
             updated_at: row.updated_at,
-            stale: self.head()? != row.base_seq,
+            // Compared by content, not `base_seq` against the current head: an
+            // undo followed by a new edit reinserts a *different* revision at
+            // the same seq, which a seq comparison alone would miss.
+            stale: self.timeline_json()? != row.base,
             diff: base.diff(&proposed),
         }))
     }
@@ -967,7 +977,12 @@ impl Project {
     /// user has since edited would silently replace that newer work.
     pub fn apply_staged(&self, force: bool) -> Result<Timeline> {
         let row = self.staged_row()?.ok_or(Error::NoStagedEdit)?;
-        if self.head()? != row.base_seq && !force {
+        // Content, not `base_seq`: `seq` is recycled by `record_revision` once
+        // an undo branches off an earlier point, so a plain seq comparison
+        // would miss "undo, then make an unrelated edit" landing right back on
+        // the seq the proposal was staged from with completely different
+        // content underneath it.
+        if self.timeline_json()? != row.base && !force {
             return Err(Error::StagedEditStale);
         }
         let base: Timeline = serde_json::from_str(&row.base)?;
@@ -2401,19 +2416,39 @@ impl Project {
                 |r| r.get(0),
             )
             .optional()?;
-        match next {
-            Some(id) => {
-                let id = parse_uuid(&id)?;
-                // Claiming a task opens a staging session for it, so the work an
-                // agent does on the user's behalf is a proposal by default and
-                // never rewrites the open cut unasked.
-                if self.staged_row()?.is_none() {
-                    self.begin_staging(Some(id), None)?;
+        let Some(id) = next else { return Ok(None) };
+        let id = parse_uuid(&id)?;
+        // Claiming a task opens a staging session for it, so the work an agent
+        // does on the user's behalf is a proposal by default and never
+        // rewrites the open cut unasked. A session already open for a
+        // *different* task (or for none) must not silently absorb this one's
+        // edits too — that folds two tasks' work into a single proposal and
+        // leaves the second task with no review of its own — so refuse before
+        // touching this task's state at all. The one exception is a session
+        // whose owning task has already gone terminal: `fail_task` used to
+        // leave one behind with nothing to ever clean it up, which wedged the
+        // queue for good, so a claim is also the chance to clear it out.
+        match self.staged_row()? {
+            Some(row) if row.task_id == Some(id) => {}
+            Some(row) => {
+                let terminal = match row.task_id {
+                    Some(owner) => self
+                        .get_task(owner)?
+                        .map(|t| matches!(t.status, TaskStatus::Done | TaskStatus::Failed))
+                        .unwrap_or(true),
+                    None => false,
+                };
+                if !terminal {
+                    return Err(Error::StagedEditPending);
                 }
-                Ok(Some(self.set_task_state(id, TaskStatus::Working, None)?))
+                self.discard_staged()?;
+                self.begin_staging(Some(id), None)?;
             }
-            None => Ok(None),
+            None => {
+                self.begin_staging(Some(id), None)?;
+            }
         }
+        Ok(Some(self.set_task_state(id, TaskStatus::Working, None)?))
     }
 
     /// Mark a task `ready` for review, recording the agent's summary.
@@ -2421,8 +2456,13 @@ impl Project {
         self.set_task_state(id, TaskStatus::Ready, Some(result))
     }
 
-    /// Mark a task `failed`, recording the error.
+    /// Mark a task `failed`, recording the error, and drop any proposal staged
+    /// under it — like `remove_task`, a task that will never be resolved must
+    /// not leave its session behind to wedge the queue.
     pub fn fail_task(&self, id: Uuid, error: &str) -> Result<Task> {
+        if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
+            self.discard_staged()?;
+        }
         self.set_task_state(id, TaskStatus::Failed, Some(Some(error.to_string())))
     }
 
@@ -4473,6 +4513,110 @@ mod tests {
         project.remove_task(task.id).unwrap();
         assert!(project.staged().unwrap().is_none());
         assert_eq!(project.timeline().unwrap().tracks.len(), 2);
+    }
+
+    #[test]
+    fn claiming_a_second_task_refuses_while_the_first_is_still_staged() {
+        let mut project = Project::open_in_memory().unwrap();
+        let first = project.add_task("tighten the intro").unwrap();
+        let second = project.add_task("caption the cut").unwrap();
+        project.set_actor(EditSource::Agent);
+
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+
+        // The second task must not fold its edits into the first task's
+        // session — it stays queued rather than sharing another task's proposal.
+        assert!(matches!(project.claim_next_task(), Err(Error::StagedEditPending)));
+        assert_eq!(project.require_task(second.id).unwrap().status, TaskStatus::Queued);
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.task_id, Some(first.id));
+    }
+
+    #[test]
+    fn failing_a_task_discards_its_staged_edits_and_frees_the_queue() {
+        let mut project = Project::open_in_memory().unwrap();
+        let first = project.add_task("tighten the intro").unwrap();
+        let second = project.add_task("caption the cut").unwrap();
+        project.set_actor(EditSource::Agent);
+
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+        project.add_track(StreamKind::Video, Some("B-roll".to_string())).unwrap();
+
+        project.fail_task(first.id, "could not find a good cut").unwrap();
+        assert!(project.staged().unwrap().is_none(), "the orphaned session is cleaned up");
+        assert_eq!(project.timeline().unwrap().tracks.len(), 2, "its staged edit never landed");
+
+        // The queue is not wedged: the next claim opens its own session.
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        assert_eq!(claimed.id, second.id);
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.task_id, Some(second.id));
+    }
+
+    #[test]
+    fn claim_next_task_clears_a_session_orphaned_by_an_already_terminal_task() {
+        // A session left behind by a task that somehow went terminal without
+        // going through `fail_task`/`remove_task` (or one from a build predating
+        // that cleanup) must not wedge the queue forever.
+        let mut project = Project::open_in_memory().unwrap();
+        let first = project.add_task("tighten the intro").unwrap();
+        let second = project.add_task("caption the cut").unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(Some(first.id), None).unwrap();
+        project.complete_task(first.id, Some("done".to_string())).unwrap();
+        project.resolve_task(first.id).unwrap();
+        // `resolve_task` already applies/clears its own session; stage a fresh
+        // one directly against the now-`Done` task to simulate the orphan.
+        project.begin_staging(Some(first.id), None).unwrap();
+
+        let claimed = project.claim_next_task().unwrap().unwrap();
+        assert_eq!(claimed.id, second.id);
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.task_id, Some(second.id));
+    }
+
+    #[test]
+    fn a_recycled_seq_from_undo_then_edit_is_still_caught_as_stale() {
+        let mut project = Project::sample().unwrap();
+        let clips: Vec<Clip> = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.clone())
+            .collect();
+
+        // Advance the head once so there is somewhere for undo to land.
+        project.set_volume(clips[0].id, 0.5).unwrap();
+        let base_seq = project.history().unwrap().last().unwrap().seq;
+
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project.set_volume(clips[0].id, 0.3).unwrap();
+        assert_eq!(project.staged().unwrap().unwrap().base_seq, base_seq);
+
+        // The user undoes underneath the proposal, then makes an unrelated
+        // edit — `record_revision` prunes the undone row and reinserts a
+        // *different* one at the same seq the proposal was staged from.
+        project.set_actor(EditSource::User);
+        project.undo().unwrap();
+        project.set_volume(clips[1].id, 0.9).unwrap();
+        project.set_actor(EditSource::Agent);
+
+        assert_eq!(
+            project.history().unwrap().last().unwrap().seq,
+            base_seq,
+            "the seq was recycled"
+        );
+        assert!(project.staged().unwrap().unwrap().stale);
+        assert!(matches!(project.apply_staged(false), Err(Error::StagedEditStale)));
+
+        // Forcing it still works, same as any other staleness.
+        let applied = project.apply_staged(true).unwrap();
+        assert_eq!(applied.clip(clips[0].id).unwrap().volume, 0.3);
+        assert_eq!(applied.clip(clips[1].id).unwrap().volume, 1.0);
     }
 
     #[test]
