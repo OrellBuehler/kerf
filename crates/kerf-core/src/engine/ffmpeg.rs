@@ -385,15 +385,12 @@ mod render_impl {
     }
 
     /// Drain pending packets from an encoder, rescale timestamps, and mux them.
-    fn flush_encoder<E>(
-        encoder: &mut E,
+    fn flush_encoder(
+        encoder: &mut ff::codec::encoder::Encoder,
         octx: &mut ff::format::context::Output,
         stream_index: usize,
         stream_tb: ff::Rational,
-    ) -> Result<()>
-    where
-        E: std::ops::DerefMut<Target = ff::codec::encoder::Encoder>,
-    {
+    ) -> Result<()> {
         let enc_tb = encoder.time_base();
         let mut packet = ff::Packet::empty();
         while encoder.receive_packet(&mut packet).is_ok() {
