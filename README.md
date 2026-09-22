@@ -88,9 +88,12 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 The [**Kerf site**](https://orellbuehler.github.io/kerf/#get) has a direct download
 button for your platform, or grab the installer from the
 [**latest release**](https://github.com/OrellBuehler/kerf/releases/latest) — `.dmg`
-(macOS, Apple silicon + Intel), `.AppImage`/`.deb`/`.rpm` (Linux), or `.exe`/`.msi`
-(Windows). macOS and Linux builds expect a system FFmpeg on `PATH`; the Windows build
-bundles it. The macOS build is unsigned, so open it once with right-click → **Open**.
+(macOS, Apple silicon + Intel), `.AppImage`/`.deb`/`.rpm` (Linux, x86_64 + arm64), or
+`.exe`/`.msi` (Windows). macOS and Linux builds expect a system FFmpeg on `PATH`; the
+Windows build bundles it. The macOS build is unsigned: on macOS 15 and later clear the
+quarantine flag once with `xattr -dr com.apple.quarantine /Applications/Kerf.app`
+(Windows SmartScreen asks once too — **More info → Run anyway**). Every installer
+carries a build-provenance attestation: `gh attestation verify <file> --repo OrellBuehler/kerf`.
 Once installed, Kerf updates itself from its own releases.
 
 ### Or build from source
