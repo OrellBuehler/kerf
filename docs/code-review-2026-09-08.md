@@ -16,6 +16,11 @@ before being written up.
 0 failed, 10 ignored. `bun test` → 103 passed across 14 files. `bun run check` →
 0 errors, 0 warnings across 4865 files.
 
+> **Status (2026-09-22):** C1–C3 and H1–H8 are fixed (H5 in PR #69, the rest on
+> `fix/review-findings`). One correction to H3's suggested fix: `%%` does *not* work —
+> drawtext's escape for a literal `%` is `\%`, written `\\%` so it survives the graph
+> parser's backslash layer; a real-ffmpeg test pins it. The Medium and Low lists are open.
+
 ---
 
 ## Overall assessment

@@ -143,7 +143,11 @@ so the feature is **only** activated through these forwards — which is what ma
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
   x/y made every animated clip and every animated overlay abort the render with
   `No such filter`, invisibly, because the graph *string* looked right and every
-  unit test asserted on the string. **Text overlays** (`Timeline.overlays`) are
+  unit test asserted on the string. Free-form strings get the same care: overlay /
+  box / chroma-key colours pass `valid_color` (else a safe default — a `.kerf` file
+  never goes through `validate_export`), `pix_fmt` / `scaler` / `gif_dither` are
+  allow-listed, and overlay text escapes `%` as `\\%` (a bare `%` makes
+  `drawtext` render nothing while ffmpeg exits 0). **Text overlays** (`Timeline.overlays`) are
   `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
   still / preview path samples `Clip::transform_at` and draws overlays statically.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
