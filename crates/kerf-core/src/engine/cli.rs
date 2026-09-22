@@ -2946,6 +2946,33 @@ pub fn stream_preview(
     fps: f64,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    let hw = decode_hwaccel().is_some();
+    // `None` until ffmpeg is running: a timeline with nothing to play fails
+    // before that, and says nothing about the hardware.
+    let mut sent = None;
+    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent) {
+        // A hardware decode that dies before the first frame is `-hwaccel`
+        // being unusable here, not the graph: a static ffmpeg aborts outright
+        // when `auto` probes a VAAPI whose libva isn't installed. Once frames
+        // have been shown, restarting would replay them, so only then is the
+        // failure reported as it is.
+        Err(e) if hw && sent == Some(0) => {
+            HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
+            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent)
+        }
+        r => r,
+    }
+}
+
+fn stream_preview_once(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+    sent: &mut Option<u64>,
+) -> Result<()> {
     use std::io::Read;
 
     let fps = fps.clamp(1.0, 60.0);
@@ -2965,6 +2992,7 @@ pub fn stream_preview(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
+    *sent = Some(0);
 
     // Drain stderr on a side thread so a warning flood can't deadlock the frame
     // read, keeping only the tail for a failure message.
@@ -2999,6 +3027,7 @@ pub fn stream_preview(
                 jpeg,
             };
             index += 1;
+            *sent = Some(index);
             if !on_frame(frame) {
                 stopped = true;
                 break 'read;

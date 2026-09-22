@@ -260,7 +260,7 @@ FFmpeg is a `--disable-whisper` build and a release with no in-process backend w
 have no transcription at all there. `.github/actions/whisper-toolchain` installs and
 *verifies* that toolchain (a missing libclang is not an error to whisper-rs-sys — it
 silently falls back to its bundled Linux-generated bindings), and CI's `whisper` job
-compiles the feature on all three runners, plus the x86_64 macOS cross-compile the
+compiles the feature on every release runner (arm64 Linux included), plus the x86_64 macOS cross-compile the
 release does, so it can't break for the first time during a release. On macOS it
 also sets `MACOSX_DEPLOYMENT_TARGET` to `bundle.macOS.minimumSystemVersion`
 (**10.15**, raised from Tauri's 10.13 default): ggml reaches for
@@ -743,6 +743,20 @@ success — the matrix is `fail-fast: false`, and one platform failing must not
 leave the release with no manifest at all, which would 404 the feed for
 *everyone*. Prereleases are skipped, so they never become the update everyone is
 offered.
+A published manifest is then **read back** from `releases/latest/download/`
+and the run fails if any of the five platform keys is missing — a partial
+manifest still ships (better than none), but no longer silently. Nothing is
+built until `ci-green` has seen a successful CI run on the tagged commit (it
+polls, because a release is usually published while CI on the merge commit is
+still running), and `attest` adds a build-provenance attestation to every
+installer. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
+the release PR's edits: the three version fields, `cargo update --workspace`,
+and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
+upstream builds and rewrites the script's digests. CI's `engine` job runs the
+`#[ignore]`d binary tests against both the distro FFmpeg and the **pinned**
+one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
+up before a release needs it; a `libav` job compiles the `ffmpeg` /
+`libav-render` features against the Ubuntu dev libraries.
 
 **Publishing a release would open a gap in the feed**, so the workflow closes it:
 the new tag becomes `releases/latest` the moment it is published, but its

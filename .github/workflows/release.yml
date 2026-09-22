@@ -10,6 +10,13 @@ on:
 # key, so its blast radius is worth keeping small.
 permissions: {}
 
+# A re-run while an earlier run is still uploading would race on the same
+# assets (and on latest.json). Queue it instead, and never cancel a release
+# half-way through its uploads.
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,6 +40,7 @@ jobs:
     name: hold releases/latest
     if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
@@ -43,7 +51,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: gh release edit "$TAG" --prerelease
 
-  # Fail before four platform builds burn if the tag and the versions baked into
+  # Fail before five platform builds burn if the tag and the versions baked into
   # the artifacts disagree. `latest.json` takes its `version` from the tag while
   # the installed app compares that against `tauri.conf.json`'s version — if the
   # two diverge, every user is offered an update that installs the version they
@@ -51,6 +59,7 @@ jobs:
   version-check:
     name: version consistency
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -72,12 +81,57 @@ jobs:
             [ "$got" = "$want" ] || { echo "::error::version mismatch: tag '$want' vs '$got'"; exit 1; }
           done
 
+  # This workflow runs no tests of its own, so what it ships is only as good as
+  # the CI run on the tagged commit. A release is usually published straight
+  # after its PR merges, while CI on main is still running, so wait for it
+  # rather than read a missing run as a failure.
+  ci-green:
+    name: CI passed on the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for CI on ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 110); do
+            runs=$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=50" \
+              --jq '[.workflow_runs[] | {status, conclusion, url: .html_url}]')
+            if echo "$runs" | jq -e 'any(.[]; .conclusion == "success")' >/dev/null; then
+              echo "CI passed: $(echo "$runs" | jq -r 'map(select(.conclusion == "success"))[0].url')"
+              exit 0
+            fi
+            pending=$(echo "$runs" | jq 'map(select(.status != "completed")) | length')
+            total=$(echo "$runs" | jq 'length')
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              echo "$runs" | jq -r '.[] | "  \(.conclusion)  \(.url)"'
+              echo "::error::CI did not pass on $SHA — fix or re-run it, then re-run this release"
+              exit 1
+            fi
+            # No run at all after ~10 minutes: the tag is on a commit CI never
+            # saw (e.g. not on main). `gh workflow run ci.yml --ref <tag>` gives it one.
+            if [ "$total" -eq 0 ] && [ "$i" -gt 20 ]; then
+              echo "::error::no CI run exists for $SHA — dispatch ci.yml on the tag, then re-run this release"
+              exit 1
+            fi
+            echo "waiting for CI ($pending of $total run(s) in progress)"
+            sleep 30
+          done
+          echo "::error::timed out waiting for CI on $SHA"
+          exit 1
+
   # Desktop app installers (.deb/.AppImage/.rpm, .dmg/.app, .msi/.exe) per OS.
   app-bundles:
     name: app (${{ matrix.platform }} / ${{ matrix.arch }})
-    needs: version-check
+    needs: [version-check, ci-green]
     permissions:
       contents: write
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -92,6 +146,12 @@ jobs:
             config: '{"build":{"beforeBuildCommand":""}}'
           - platform: ubuntu-22.04
             arch: x86_64
+            args: ''
+            config: '{"build":{"beforeBuildCommand":""}}'
+          # Free for public repos. The updater already maps `linux-aarch64`
+          # from an AppImage with `aarch64` in its name.
+          - platform: ubuntu-22.04-arm
+            arch: aarch64
             args: ''
             config: '{"build":{"beforeBuildCommand":""}}'
           # Windows has no system FFmpeg, so bundle ffmpeg/ffprobe as externalBin
@@ -110,7 +170,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Linux dependencies (Tauri)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -169,6 +229,37 @@ jobs:
           # dependency versions in the committed Cargo.lock.
           args: "${{ matrix.args }} --config '${{ matrix.config }}' -- --no-default-features --features whisper --locked"
 
+  # A verifiable link from every installer back to the commit and workflow run
+  # that built it (`gh attestation verify <file> --repo OrellBuehler/kerf`). The
+  # updater itself only trusts the minisign key, which is a repo secret; this is
+  # the check a user or packager can run without trusting that secret.
+  # `!cancelled()` for the same reason as the manifest: attest what did build.
+  attest:
+    name: build provenance
+    needs: app-bundles
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release bundles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir bundles --clobber \
+            --pattern '*.dmg' --pattern '*.app.tar.gz' --pattern '*.AppImage' \
+            --pattern '*.deb' --pattern '*.rpm' --pattern '*.msi' --pattern '*.exe'
+          ls -l bundles
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: bundles/*
+
   # The update feed the app polls (`plugins.updater.endpoints` in tauri.conf.json
   # points at this release asset). Built after every bundle is uploaded, from the
   # `.sig` files tauri-action attached, so all platforms land in one manifest —
@@ -189,6 +280,7 @@ jobs:
     needs: [hold-release, app-bundles]
     if: ${{ !cancelled() && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -257,3 +349,30 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name }}
         run: gh release edit "$TAG" --prerelease=false --latest
+      # Read the feed back the way an installed app does. A partial manifest is
+      # still published (better than none), but it must not ship *silently*:
+      # a missing platform turns this run red, and re-running the failed bundle
+      # job then re-runs this one.
+      - name: Verify the published feed
+        env:
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/$GH_REPO/releases/latest/download/latest.json"
+          for i in $(seq 1 10); do
+            if curl -fsSL "$url" -o feed.json \
+              && [ "$(jq -r .version feed.json)" = "${TAG#v}" ]; then
+              break
+            fi
+            echo "feed not serving ${TAG#v} yet, retrying"; sleep 15
+          done
+          jq -r '"version \(.version)", (.platforms | keys[])' feed.json
+          missing=$(jq -r --arg v "${TAG#v}" '
+            if .version != $v then "version (\(.version))" else
+            ["darwin-aarch64","darwin-x86_64","linux-aarch64","linux-x86_64","windows-x86_64"]
+              - (.platforms | keys) | join(", ") end' feed.json)
+          if [ -n "$missing" ]; then
+            echo "::error::latest.json is missing: $missing"
+            exit 1
+          fi
