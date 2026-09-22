@@ -14,6 +14,7 @@
 import { getAudio } from './api';
 import type { Clip, Timeline } from './types';
 import { panGains } from './mixer';
+import { toast } from './notifications.svelte';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
  *  wire while staying honest enough to judge a cut. */
@@ -39,6 +40,10 @@ class AudioEngine {
 	#ctx: AudioContext | null = null;
 	#cache = new Map<string, AudioBuffer | Promise<AudioBuffer | null>>();
 	#session: Session | null = null;
+	/** Cache keys that already reported a decode failure this session — a
+	 *  clip's window is retried on every resync, and nobody needs to hear about
+	 *  the same broken clip twice. */
+	#warned = new Set<string>();
 
 	/** Current timeline time by the audio clock, or `null` when not playing. */
 	clock(): number | null {
@@ -68,10 +73,16 @@ class AudioEngine {
 				const dur = (clip.source_out - clip.source_in) / speedMag(clip);
 				if (clip.timeline_start + dur <= t) continue;
 				const mix = { volume: track.volume ?? 1, pan: track.pan ?? 0 };
-				void this.#buffer(clip).then((buf) => {
-					// Buffers resolve async; only schedule into the session that asked.
-					if (buf && this.#session === session) this.#schedule(clip, buf, session, mix);
-				});
+				void this.#buffer(clip)
+					.then((buf) => {
+						// Buffers resolve async; only schedule into the session that asked.
+						if (buf && this.#session === session) this.#schedule(clip, buf, session, mix);
+					})
+					.catch(() => {
+						// #buffer() already evicted the cache entry and reported the
+						// failure once; this just keeps the rejection from going
+						// unhandled (start()/resync() fire on every edit while playing).
+					});
 			}
 		}
 	}
@@ -186,14 +197,28 @@ class AudioEngine {
 			return buf;
 		})();
 		this.#cache.set(key, pending);
-		const buf = await pending;
-		if (buf) {
-			this.#cache.set(key, buf);
-			this.#evict();
-		} else {
+		try {
+			const buf = await pending;
+			if (buf) {
+				this.#cache.set(key, buf);
+				this.#evict();
+			} else {
+				this.#cache.delete(key);
+			}
+			return buf;
+		} catch (e) {
+			// A rejected decode must not squat on the cache forever — a moved
+			// file or a transient ffmpeg error would otherwise leave this clip
+			// silently muted for the rest of the session. Delete it so the next
+			// resync retries, and say so once (this fires on every resync while
+			// playing, and nobody needs to hear about the same broken clip twice).
 			this.#cache.delete(key);
+			if (!this.#warned.has(key)) {
+				this.#warned.add(key);
+				toast.error(`Couldn't decode preview audio for a clip — ${e instanceof Error ? e.message : String(e)}`);
+			}
+			throw e;
 		}
-		return buf;
 	}
 
 	#evict() {
