@@ -180,6 +180,29 @@ pub struct Asset {
     /// for an ordinary asset, whose `path` *is* its source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_paths: Vec<String>,
+    /// The script and voice this audio was synthesized from, when Kerf generated
+    /// it rather than the user importing it. `None` for ordinary media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voiceover: Option<Voiceover>,
+}
+
+/// What a generated voiceover was made from — enough to regenerate it, and the
+/// sentence timings the synthesizer measured.
+///
+/// The timings are why this rides on the asset rather than living only in its
+/// analysis: they are exact (each sentence is synthesized on its own, so its
+/// start and end are sample counts, not a speech model's estimate), and an
+/// analysis pass would otherwise replace them with whisper's guess at audio it
+/// could only get wrong. Analysis reads its transcript from here instead.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Voiceover {
+    pub text: String,
+    /// Kokoro voice id, e.g. `af_heart`.
+    pub voice: String,
+    /// Speaking rate multiplier; 1.0 is the voice's natural pace.
+    pub speed: f64,
+    /// One entry per sentence, in the audio's own (source) time.
+    pub segments: Vec<TranscriptSegment>,
 }
 
 impl Asset {
@@ -243,7 +266,7 @@ pub struct TimeRange {
 }
 
 /// A transcript line with timecodes (seconds).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,

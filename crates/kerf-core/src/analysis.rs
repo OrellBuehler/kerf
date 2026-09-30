@@ -401,6 +401,17 @@ pub fn transcription_status() -> TranscriptionStatus {
     }
 }
 
+/// The transcript of a voiceover Kerf generated: its script, with the sentence
+/// timings the synthesizer measured. Never a speech model's guess at audio whose
+/// words are already known exactly.
+struct VoiceoverScript;
+
+impl Transcriber for VoiceoverScript {
+    fn transcribe(&self, asset: &Asset, _progress: ProgressFn, _cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
+        Ok(asset.voiceover.as_ref().map(|v| v.segments.clone()).unwrap_or_default())
+    }
+}
+
 /// A no-op provider returning empty results. Useful as a default and for tests.
 pub struct NullAnalyzer;
 
@@ -519,7 +530,11 @@ pub fn analyze_asset_media_cancellable(asset: &Asset, progress: ProgressFn, canc
     let rhythm = FfmpegRhythmAnalyzer::default();
     let null = NullAnalyzer;
 
-    let transcriber = transcription_enabled().then(default_transcriber).flatten();
+    let transcriber = if asset.voiceover.is_some() {
+        Some(Box::new(VoiceoverScript) as Box<dyn Transcriber>)
+    } else {
+        transcription_enabled().then(default_transcriber).flatten()
+    };
     let transcriber: &dyn Transcriber = transcriber.as_deref().unwrap_or(&null);
 
     let providers = AnalysisProviders {

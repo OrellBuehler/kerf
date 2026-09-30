@@ -19,13 +19,14 @@
 //! Neither piece needs the FFmpeg *dev* libraries, so both live in the
 //! always-compiled CLI half of the engine.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 
 use super::cli::{bg_command, command, ffmpeg_bin, launch_err};
 use super::cpu;
+use super::download::{fetch, Download};
 use crate::error::{Error, Result};
 use crate::model::TranscriptSegment;
 
@@ -190,21 +191,7 @@ pub fn ready_model() -> Option<PathBuf> {
     }
 }
 
-/// How far a model download has got.
-#[derive(Debug, Clone, Copy)]
-pub struct DownloadProgress {
-    pub downloaded: u64,
-    /// The full size, when the server declared one.
-    pub total: Option<u64>,
-}
-
-impl DownloadProgress {
-    pub fn fraction(&self) -> Option<f64> {
-        self.total
-            .filter(|t| *t > 0)
-            .map(|t| (self.downloaded as f64 / t as f64).clamp(0.0, 1.0))
-    }
-}
+pub use super::download::DownloadProgress;
 
 /// The model file to transcribe with, downloading it first if it isn't cached.
 ///
@@ -254,126 +241,18 @@ pub fn download_model_cancellable(
         )));
     }
     let dst = model_path(name).ok_or_else(|| Error::Engine("no cache directory available for speech models".to_string()))?;
-    if dst.is_file() {
-        return Ok(dst);
-    }
-    let parent = dst
-        .parent()
-        .ok_or_else(|| Error::Engine("speech model cache path has no parent".to_string()))?;
-    std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create model cache dir: {e}")))?;
-
-    let tmp = dst.with_extension(format!("{}.part", std::process::id()));
     let url = model_url(name);
-    tracing::info!(model = name, %url, "downloading speech model");
-    // A cancel keeps the `.part` file: it is a valid prefix of the model, and
-    // the next attempt resumes it with a range request. Any other failure is a
-    // file we can't trust, so it goes.
-    stream_to_file(&url, &tmp, progress, cancel).inspect_err(|e| {
-        if !matches!(e, Error::Cancelled) {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    })?;
-
     // A model that isn't one (an HTML error page, a truncated CDN response)
     // would otherwise only fail much later, inside whisper, as an unreadable
     // error about tensors.
-    verify_ggml(&tmp)?;
-
-    // Another process may have finished the same download meanwhile.
-    if dst.is_file() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(dst);
-    }
-    std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize speech model download: {e}")))?;
-    tracing::info!(model = name, path = %dst.display(), "speech model ready");
-    Ok(dst)
-}
-
-/// Stream `url` into `tmp`, resuming a partial file when one is there.
-fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<()> {
-    let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-    // A connect timeout but no global one: reaching the host should fail fast
-    // (a firewalled or DNS-blackholed mirror otherwise stalls for minutes before
-    // admitting it), while the transfer itself is legitimately allowed to run for
-    // as long as a gigabyte takes.
-    let mut request = ureq::get(url)
-        .config()
-        .timeout_connect(Some(std::time::Duration::from_secs(15)))
-        .build();
-    if have > 0 {
-        request = request.header("Range", &format!("bytes={have}-"));
-    }
-    // Name the URL: the fetch is redirected to a CDN host, so which lookup or
-    // connect failed is otherwise invisible — and a resolver that works for the
-    // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
-    let mut response = request.call().map_err(|e| {
-        Error::Engine(format!(
-            "could not download speech model from {url}: {e} (Kerf resolves names through the OS resolver and \
-             honours HTTPS_PROXY, not the browser's DNS or proxy settings; KERF_WHISPER_MODEL_URL points it at a mirror)"
-        ))
-    })?;
-
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(Error::Engine(format!("could not download speech model: HTTP {status}")));
-    }
-    // 206 means the server honoured the range and we append; anything else (a
-    // plain 200) restarts the file from scratch.
-    let resuming = have > 0 && status == 206;
-    let offset = if resuming { have } else { 0 };
-    let total = response.body().content_length().map(|len| len + offset);
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(resuming)
-        .truncate(!resuming)
-        .open(tmp)
-        .map_err(|e| Error::Engine(format!("could not open model download file: {e}")))?;
-
-    let mut reader = response.body_mut().as_reader();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut downloaded = offset;
-    progress(DownloadProgress { downloaded, total });
-    let mut last_report = downloaded;
-    loop {
-        if cancel() {
-            // Flush what we have so the `.part` file is a usable prefix to
-            // resume from rather than however much happened to reach the OS.
-            let _ = file.flush();
-            return Err(Error::Cancelled);
-        }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Error::Engine(format!("speech model download failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
-            .map_err(|e| Error::Engine(format!("could not write speech model: {e}")))?;
-        downloaded += n as u64;
-        // Report about every megabyte — one event per 256 KB read would flood
-        // the IPC channel to the webview for no extra information.
-        if downloaded - last_report >= MB {
-            last_report = downloaded;
-            progress(DownloadProgress { downloaded, total });
-        }
-    }
-    file.flush()
-        .map_err(|e| Error::Engine(format!("could not write speech model: {e}")))?;
-    progress(DownloadProgress {
-        downloaded,
-        total: total.or(Some(downloaded)),
-    });
-
-    if let Some(total) = total {
-        if downloaded != total {
-            return Err(Error::Engine(format!(
-                "speech model download is incomplete ({downloaded} of {total} bytes)"
-            )));
-        }
-    }
-    Ok(())
+    let download = Download {
+        url: &url,
+        dst: &dst,
+        what: "speech model",
+        mirror_env: "KERF_WHISPER_MODEL_URL",
+        verify: &verify_ggml,
+    };
+    fetch(&download, progress, cancel)
 }
 
 /// Check `path` starts with the ggml container magic, so an error page saved
@@ -798,6 +677,18 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// The shared streamer, called the way these tests always called whisper's own.
+    fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<()> {
+        let download = Download {
+            url,
+            dst: tmp,
+            what: "speech model",
+            mirror_env: "KERF_WHISPER_MODEL_URL",
+            verify: &verify_ggml,
+        };
+        super::super::download::stream_to_file(&download, tmp, progress, cancel)
     }
 
     /// A body big enough to cross the progress-reporting threshold twice.
