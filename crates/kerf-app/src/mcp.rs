@@ -628,8 +628,12 @@ struct OverlayKeyframesParams {
 struct ExportSrtParams {
     #[schemars(description = "UUID of the asset whose transcript to export")]
     asset_id: String,
-    #[schemars(description = "Output .srt file path to write")]
+    #[schemars(description = "Absolute local .srt file path to write — no URLs or ffmpeg protocol sinks")]
     output_path: String,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -646,7 +650,10 @@ struct RevertParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportParams {
-    #[schemars(description = "Output file path for the rendered result. Its extension should match the chosen container.")]
+    #[schemars(
+        description = "Absolute local output file path for the rendered result — no URLs or ffmpeg protocol \
+                       sinks. Its extension should match the chosen container."
+    )]
     output_path: String,
     #[schemars(description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
                        Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
@@ -661,13 +668,18 @@ struct ExportParams {
                        render only that span).")]
     #[serde(default)]
     options: Option<ExportOptions>,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportVariantsParams {
     #[schemars(
-        description = "Base output path; each delivery lands beside it with its shape in the name — \
-                              `/renders/cut.mp4` at 9:16 and 1:1 writes `cut-9x16.mp4` and `cut-1x1.mp4`."
+        description = "Absolute local base output path (no URLs or ffmpeg protocol sinks); each delivery lands \
+                              beside it with its shape in the name — `/renders/cut.mp4` at 9:16 and 1:1 writes \
+                              `cut-9x16.mp4` and `cut-1x1.mp4`."
     )]
     output_path: String,
     #[schemars(
@@ -687,6 +699,11 @@ struct ExportVariantsParams {
                               resolution and fit are replaced per variant by the delivery frame.")]
     #[serde(default)]
     options: Option<ExportOptions>,
+    #[schemars(
+        description = "Overwrite any variant file that already exists (default false — the call fails naming the \
+                              first existing path so you can pick a new base path or opt in)"
+    )]
+    overwrite: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -816,8 +833,15 @@ struct TimelineFrameParams {
 struct CoverParams {
     #[schemars(description = "Timeline position to capture (seconds)")]
     time_secs: f64,
-    #[schemars(description = "Output image path. A .png extension writes PNG, anything else JPEG.")]
+    #[schemars(
+        description = "Absolute local output image path (no URLs or ffmpeg protocol sinks). A .png \
+                       extension writes PNG, anything else JPEG."
+    )]
     output_path: String,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1581,14 +1605,20 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first)")]
+    #[tool(
+        description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first). \
+                       Refuses to overwrite an existing file unless overwrite is true."
+    )]
     fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::Path::new(&p.output_path);
+        refuse_overwrite(path, p.overwrite.unwrap_or(false))?;
         let srt = {
             let project = self.lock();
             project.transcript_srt(id).map_err(core_err)?
         };
-        std::fs::write(&p.output_path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        std::fs::write(path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(format!("wrote {}", p.output_path))
     }
 
@@ -1762,13 +1792,16 @@ impl KerfMcp {
                        safe H.264/AAC MP4 default. A render takes minutes: send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
-                       rather than leaving a broken one behind."
+                       rather than leaving a broken one behind. Refuses to overwrite an existing file unless \
+                       overwrite is true."
     )]
     async fn export(
         &self,
         Parameters(p): Parameters<ExportParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
         let opts = p.options.unwrap_or_default();
         let project = self.project.clone();
         let output_path = p.output_path;
@@ -1854,7 +1887,7 @@ impl KerfMcp {
                        (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
                        there is no need to run platform_check per variant afterwards. Progress and cancellation \
                        work as in `export`; cancelling keeps the files already finished and deletes the one in \
-                       flight."
+                       flight. Refuses to overwrite any existing variant file unless overwrite is true."
     )]
     async fn export_variants(
         &self,
@@ -1867,6 +1900,7 @@ impl KerfMcp {
                 None,
             ));
         }
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
         let mut deliveries: Vec<Delivery> = Vec::new();
         for name in &p.formats {
             let d = Delivery::parse(name).ok_or_else(|| {
@@ -1885,6 +1919,10 @@ impl KerfMcp {
             .iter()
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
+        let overwrite = p.overwrite.unwrap_or(false);
+        for variant in &variants {
+            refuse_overwrite(&variant.output, overwrite)?;
+        }
         let project = self.project.clone();
 
         // Same protocol plumbing as `export`: progress on the client's token,
@@ -2022,9 +2060,12 @@ impl KerfMcp {
     #[tool(
         description = "Write the composited timeline at a given time to an image file as a cover / thumbnail — full \
                        delivery resolution, rendered through the export graph, so it is a real frame of the finished \
-                       video at the shape the project is cut for."
+                       video at the shape the project is cut for. Refuses to overwrite an existing file unless \
+                       overwrite is true."
     )]
     async fn export_cover(&self, Parameters(p): Parameters<CoverParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
         let project = self.project.clone();
         let (time_secs, output_path) = (p.time_secs, p.output_path);
         let written = blocking(move || {
@@ -2490,7 +2531,10 @@ impl ServerHandler for KerfMcp {
              where it is going, including the reach limits a platform enforces \
              silently (a Reel over 3 minutes uploads fine and then reaches only \
              existing followers). Call export to render, and export_cover to \
-             write the thumbnail the platform shows before anyone presses play."
+             write the thumbnail the platform shows before anyone presses play. \
+             export / export_srt / export_cover / export_variants all take an \
+             absolute local output path and refuse to overwrite a file that's \
+             already there unless you pass overwrite=true."
                 .to_string(),
         );
         info
@@ -2660,6 +2704,22 @@ fn track_gaps(track: &kerf_core::Track) -> Vec<Gap> {
     gaps
 }
 
+/// Refuse to silently clobber an existing file. A model that hallucinates or
+/// mis-remembers a path would otherwise destroy whatever is already there with
+/// no recourse — this is the write side of `require_local_output_path`.
+fn refuse_overwrite(path: &std::path::Path, overwrite: bool) -> Result<(), McpError> {
+    if !overwrite && path.exists() {
+        return Err(McpError::invalid_params(
+            format!(
+                "{} already exists; pass overwrite=true to replace it or choose a new path",
+                path.display()
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
 /// Rounds to milliseconds *before* splitting so a value just under a minute
 /// carries into the minute (59.9999 → `01:00.000`, not `00:60.000`).
@@ -2676,7 +2736,27 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, core_err, fmt_ts, image_result, router, server_identity, track_gaps};
+    use super::{allowed_hosts, core_err, fmt_ts, image_result, refuse_overwrite, router, server_identity, track_gaps};
+
+    #[test]
+    fn refuse_overwrite_blocks_an_existing_file_unless_opted_in() {
+        let path = std::env::temp_dir().join(format!("kerf-refuse-overwrite-test-{}.tmp", std::process::id()));
+        std::fs::write(&path, b"existing").unwrap();
+
+        let err = refuse_overwrite(&path, false).expect_err("must refuse an existing file by default");
+        assert!(err.message.contains("overwrite=true"), "{}", err.message);
+
+        assert!(refuse_overwrite(&path, true).is_ok(), "overwrite=true must let it through");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn refuse_overwrite_allows_a_path_that_does_not_exist() {
+        let path = std::env::temp_dir().join(format!("kerf-refuse-overwrite-missing-{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(refuse_overwrite(&path, false).is_ok());
+    }
 
     #[test]
     fn fmt_ts_carries_at_minute_boundaries() {
@@ -2916,7 +2996,8 @@ mod tests {
             .expect("input schema has properties");
         assert!(properties.contains_key("output_path"), "{properties:?}");
         assert!(properties.contains_key("options"), "{properties:?}");
-        assert_eq!(properties.len(), 2, "only the declared params belong here: {properties:?}");
+        assert!(properties.contains_key("overwrite"), "{properties:?}");
+        assert_eq!(properties.len(), 3, "only the declared params belong here: {properties:?}");
 
         let required: Vec<&str> = export
             .input_schema
@@ -2924,7 +3005,7 @@ mod tests {
             .and_then(|r| r.as_array())
             .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        assert_eq!(required, ["output_path"], "options is optional");
+        assert_eq!(required, ["output_path"], "options and overwrite are optional");
     }
 
     /// An agent with no way to load media can only rearrange what it was handed.

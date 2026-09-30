@@ -106,6 +106,7 @@ import type {
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
+import { Generation } from './generation';
 
 class EditorState {
 	get fps(): number { return timelineFps(this.timeline, this.assets); }
@@ -127,7 +128,14 @@ class EditorState {
 	previewingStaged = $state(false);
 	currentPath = $state<string | null>(null);
 	loading = $state(false);
-	busy = $state(false);
+	/** Count of edits/exports currently in flight, not a flag — two overlapping
+	 *  operations (an edit fired while an export streams, or two edits in quick
+	 *  succession) must not have the first to finish turn this off while the
+	 *  other is still running. */
+	#busyCount = $state(0);
+	get busy(): boolean {
+		return this.#busyCount > 0;
+	}
 	/** Whether media is currently being imported (drives the bin spinner). */
 	importing = $state(false);
 	/**
@@ -140,6 +148,19 @@ class EditorState {
 	#waveforms = new Map<string, number[] | Promise<number[]>>();
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline: Timeline | null = null;
+	/** Snapshot guard over `timeline` — every writer bumps it (via `#setTimeline`)
+	 *  so a `refreshTimeline()` fetch that started earlier can tell a newer write
+	 *  already landed while it was waiting and skip clobbering it. */
+	#timelineGen = new Generation();
+	/** The single place `timeline` is assigned, so every writer bumps the
+	 *  generation above. */
+	#setTimeline(tl: Timeline) {
+		this.timeline = tl;
+		this.#timelineGen.advance();
+	}
+	/** Sequence guard over `select()` — a slow metadata fetch for an earlier
+	 *  click must not overwrite a faster, newer one. */
+	#selectGen = new Generation();
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
@@ -278,12 +299,16 @@ class EditorState {
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
-			[this.assets, this.timeline, this.history, this.currentPath] = await Promise.all([
+			const [assets, timeline, history, currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
 				getHistory(),
 				projectPath()
 			]);
+			this.assets = assets;
+			this.#setTimeline(timeline);
+			this.history = history;
+			this.currentPath = currentPath;
 			await this.refreshStaged();
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
@@ -328,21 +353,32 @@ class EditorState {
 
 	async select(assetId: string) {
 		this.selectedAssetId = assetId;
+		const seq = this.#selectGen.advance();
 		try {
-			this.selectedMetadata = await getAssetMetadata(assetId);
-			if (this.selectedMetadata.analysis) this.analyses[assetId] = this.selectedMetadata.analysis;
+			const metadata = await getAssetMetadata(assetId);
+			if (!this.#selectGen.isCurrent(seq)) return; // a newer select() has since started
+			this.selectedMetadata = metadata;
+			if (metadata.analysis) this.analyses[assetId] = metadata.analysis;
 		} catch {
+			if (!this.#selectGen.isCurrent(seq)) return;
 			this.selectedMetadata = null;
 		}
 	}
 
 	async refreshTimeline() {
+		const snapshot = this.#timelineGen.read();
 		const live = await getTimeline();
 		// While the proposal is on screen the live cut is parked, not shown —
 		// an agent edit landing mid-review must not yank the view out from
 		// under the person reading it.
-		if (this.previewingStaged) this.#liveTimeline = live;
-		else this.timeline = live;
+		if (this.previewingStaged) {
+			this.#liveTimeline = live;
+		} else if (this.#timelineGen.isCurrent(snapshot)) {
+			// Nothing else assigned `timeline` while this fetch was in flight. If a
+			// local edit committed meanwhile, it bumped the generation, so this
+			// stale snapshot loses and is dropped instead of clobbering it.
+			this.#setTimeline(live);
+		}
 		await this.refreshStaged();
 	}
 
@@ -358,7 +394,7 @@ class EditorState {
 		else if (this.staged && this.previewingStaged) {
 			// The agent staged more while we were looking at it.
 			const proposed = await getStagedTimeline();
-			if (proposed) this.timeline = proposed;
+			if (proposed) this.#setTimeline(proposed);
 		}
 	}
 
@@ -367,7 +403,7 @@ class EditorState {
 		const proposed = await getStagedTimeline();
 		if (!proposed) return;
 		if (!this.previewingStaged) this.#liveTimeline = this.timeline;
-		this.timeline = proposed;
+		this.#setTimeline(proposed);
 		this.previewingStaged = true;
 		this.clearSelection();
 	}
@@ -375,7 +411,7 @@ class EditorState {
 	async exitStagedPreview() {
 		if (!this.previewingStaged) return;
 		this.previewingStaged = false;
-		this.timeline = this.#liveTimeline ?? (await getTimeline());
+		this.#setTimeline(this.#liveTimeline ?? (await getTimeline()));
 		this.#liveTimeline = null;
 		this.clearSelection();
 	}
@@ -475,19 +511,19 @@ class EditorState {
 	// ---- editing actions (apply backend result to local timeline) -----------
 
 	async #apply(op: Promise<Timeline>) {
-		this.busy = true;
+		this.#busyCount++;
 		this.error = null;
 		// Any real edit is an edit to the live cut, so reviewing is over.
 		this.previewingStaged = false;
 		this.#liveTimeline = null;
 		try {
-			this.timeline = await op;
+			this.#setTimeline(await op);
 			await this.refreshHistory();
 		} catch (e) {
 			this.error = this.#msg(e);
 			throw e;
 		} finally {
-			this.busy = false;
+			this.#busyCount--;
 		}
 	}
 
@@ -728,11 +764,11 @@ class EditorState {
 	}
 
 	async export(outputPath: string, options: ExportOptions): Promise<string> {
-		this.busy = true;
+		this.#busyCount++;
 		try {
 			return await exportTimeline(outputPath, options);
 		} finally {
-			this.busy = false;
+			this.#busyCount--;
 		}
 	}
 
@@ -742,11 +778,11 @@ class EditorState {
 		smartCrop: boolean,
 		options: ExportOptions
 	): Promise<string[]> {
-		this.busy = true;
+		this.#busyCount++;
 		try {
 			return await exportVariants(outputPath, formats, smartCrop, options);
 		} finally {
-			this.busy = false;
+			this.#busyCount--;
 			// The framing pass wrote onto the clips; the history has a revision
 			// the panel has not seen.
 			await this.refreshTimeline().catch(() => {});

@@ -247,6 +247,7 @@
 			pos: edge === 'l' ? start : end,
 			moved: false
 		};
+		capturePointer(e);
 	}
 
 	function onTrimMove(e: PointerEvent) {
@@ -346,6 +347,7 @@
 			trackId: t.id,
 			moved: false
 		};
+		capturePointer(e);
 	}
 
 	function laneUnder(clientX: number, clientY: number): HTMLElement | null {
@@ -382,7 +384,69 @@
 		return best;
 	}
 
+	// A lost pointerup (released outside the window, over a native dialog, an
+	// OS-level drag-cancel, or a mid-drag right-click) must never let the next
+	// unrelated pointerup — a click somewhere else entirely — be mistaken for
+	// the end of a still-open drag and commit it at the wrong position.
+	// `setPointerCapture` (below, at each pointerdown) keeps move/up events
+	// routed here even once the pointer leaves the dragged element or the
+	// window; `pointercancel` and a window `blur` are the remaining escapes,
+	// and the `buttons` check below is the last-resort net if even those are
+	// missed.
+
+	let capturedEl: Element | null = null;
+	let capturedPointerId: number | null = null;
+
+	function capturePointer(e: PointerEvent) {
+		const el = e.currentTarget as Element;
+		try {
+			el.setPointerCapture(e.pointerId);
+			capturedEl = el;
+			capturedPointerId = e.pointerId;
+		} catch {
+			// Best-effort — a capture that fails leaves the window-level
+			// listeners as the fallback, same as before this fix.
+		}
+	}
+
+	function releaseCapture() {
+		if (capturedEl && capturedPointerId !== null) {
+			try {
+				capturedEl.releasePointerCapture(capturedPointerId);
+			} catch {
+				// already released
+			}
+		}
+		capturedEl = null;
+		capturedPointerId = null;
+	}
+
+	/** Clear every drag/scrub state WITHOUT committing anything — the pointer
+	 *  is gone and whatever position it last reported is not trustworthy. */
+	function resetDragState() {
+		drag = null;
+		trimDrag = null;
+		scrubbing = false;
+		markDrag = null;
+		markerDrag = null;
+		releaseCapture();
+	}
+
+	function onPointerCancel() {
+		resetDragState();
+	}
+
+	function onWindowBlur() {
+		resetDragState();
+	}
+
 	function onPointerMove(e: PointerEvent) {
+		// The primary button is up but we never saw pointerup for it — treat
+		// exactly like a cancel rather than trust a move that outran its release.
+		if ((drag || trimDrag || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
+			resetDragState();
+			return;
+		}
 		if (scrubbing) {
 			ui.seek(rulerTime(e.clientX));
 			return;
@@ -420,6 +484,7 @@
 	}
 
 	function onPointerUp() {
+		releaseCapture();
 		if (scrubbing) {
 			scrubbing = false;
 			return;
@@ -748,6 +813,7 @@
 	function onRulerPointerDown(e: PointerEvent) {
 		if (e.button !== 0) return;
 		scrubbing = true;
+		capturePointer(e);
 		ui.seek(rulerTime(e.clientX));
 	}
 
@@ -755,6 +821,7 @@
 		if (e.button !== 0) return;
 		e.stopPropagation();
 		markDrag = which;
+		capturePointer(e);
 	}
 
 	// ---- markers --------------------------------------------------------------
@@ -769,6 +836,7 @@
 		if (e.button !== 0 || renaming === m.id) return;
 		e.stopPropagation();
 		markerDrag = { id: m.id, time: m.time };
+		capturePointer(e);
 	}
 
 	function commitRename(m: Marker, value: string) {
@@ -823,7 +891,12 @@
 	}
 </script>
 
-<svelte:window onpointermove={onPointerMove} onpointerup={onPointerUp} />
+<svelte:window
+	onpointermove={onPointerMove}
+	onpointerup={onPointerUp}
+	onpointercancel={onPointerCancel}
+	onblur={onWindowBlur}
+/>
 
 <div
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"

