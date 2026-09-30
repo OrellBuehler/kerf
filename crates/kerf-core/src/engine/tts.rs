@@ -844,28 +844,27 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 
 /// A step of generating a voiceover, reported as it runs: `download_runtime`,
 /// `download_model`, `download_voice`, `synthesize`.
-pub type ProgressFn<'a> = &'a mut Report;
+pub type ProgressFn<'a> = &'a mut Report<'a>;
 
 /// `(stage, fraction, detail)`.
-pub type Report = dyn FnMut(&str, Option<f64>, Option<String>);
+pub type Report<'a> = dyn FnMut(&str, Option<f64>, Option<String>) + 'a;
 
 /// A finished voiceover.
 #[derive(Debug, Clone)]
 pub struct Synthesis {
     pub path: PathBuf,
-    pub duration: f64,
     pub segments: Vec<TranscriptSegment>,
 }
 
-fn download_progress<'a>(stage: &'a str, progress: &'a mut Report) -> impl FnMut(DownloadProgress) + 'a {
-    move |p: DownloadProgress| {
+fn download_progress<'a, 'b: 'a>(stage: &'a str, progress: &'a mut Report<'b>) -> Box<dyn FnMut(DownloadProgress) + 'a> {
+    Box::new(move |p: DownloadProgress| {
         let mb = |b: u64| format!("{:.0} MB", b as f64 / MB as f64);
         let detail = match p.total {
             Some(total) => format!("{} / {}", mb(p.downloaded), mb(total)),
             None => mb(p.downloaded),
         };
         progress(stage, p.fraction(), Some(detail));
-    }
+    })
 }
 
 /// Download whatever the voice model still needs, so a later voiceover starts
@@ -889,10 +888,8 @@ fn cached(path: &Path) -> Option<Synthesis> {
         return None;
     }
     let segments: Vec<TranscriptSegment> = serde_json::from_slice(&std::fs::read(timings_path(path)).ok()?).ok()?;
-    let data = std::fs::metadata(path).ok()?.len().checked_sub(44)?;
-    Some(Synthesis {
+        Some(Synthesis {
         path: path.to_path_buf(),
-        duration: data as f64 / 2.0 / SAMPLE_RATE as f64,
         segments,
     })
 }
@@ -964,7 +961,6 @@ pub fn synthesize(text: &str, voice: &str, speed: f64, progress: ProgressFn, can
         .map_err(|e| Error::Engine(format!("could not write voiceover: {e}")))?;
     Ok(Synthesis {
         path,
-        duration: samples.len() as f64 / SAMPLE_RATE as f64,
         segments,
     })
 }
@@ -1205,7 +1201,7 @@ mod tests {
         let result = synthesize(text, DEFAULT_VOICE, 1.0, &mut |stage, f, d| eprintln!("{stage} {f:?} {d:?}"), &|| false)
             .expect("synthesis");
         assert_eq!(result.segments.len(), 2);
-        assert!(result.duration > 1.5, "two sentences should take more than 1.5 s, got {}", result.duration);
+        assert!(result.segments[1].end > 1.5, "two sentences should take more than 1.5 s, got {}", result.segments[1].end);
         let bytes = std::fs::read(&result.path).unwrap();
         let peak = bytes[44..]
             .chunks_exact(2)

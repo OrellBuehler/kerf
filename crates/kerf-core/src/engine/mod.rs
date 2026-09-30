@@ -103,7 +103,10 @@ pub use whisper::{
     DEFAULT_MODEL as DEFAULT_SPEECH_MODEL,
 };
 
-pub use tts::{status as voiceover_status, VoiceInfo, VoiceoverStatus};
+pub use tts::{
+    prepare as prepare_voiceover, status as voiceover_status, VoiceInfo, VoiceoverStatus, DEFAULT_VOICE, MAX_SPEED as MAX_VOICE_SPEED,
+    MIN_SPEED as MIN_VOICE_SPEED,
+};
 
 /// The names of every speech model Kerf can download, smallest first.
 pub fn speech_model_names() -> Vec<&'static str> {

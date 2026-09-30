@@ -89,6 +89,26 @@ struct AssetIdParams {
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct VoiceoverParams {
+    #[schemars(description = "The script to read aloud, in English. Sentences are read one at a time; a blank line is a longer pause (a paragraph break).")]
+    text: String,
+    #[schemars(
+        description = "Kokoro voice id (default af_heart). American: af_heart, af_bella, af_nicole, af_sarah, af_sky, af_nova, am_michael, am_fenrir, am_puck, am_adam, am_eric, am_liam, am_onyx; British: bf_emma, bf_isabella, bf_alice, bf_lily, bm_george, bm_fable, bm_lewis, bm_daniel. voiceover_status lists them all."
+    )]
+    voice: Option<String>,
+    #[schemars(description = "Speaking rate, 0.5–2.0 (default 1.0)")]
+    speed: Option<f64>,
+    #[schemars(description = "Audio track to place it on; omitted, it goes on the `VO` track (created on first use)")]
+    track_id: Option<String>,
+    #[schemars(description = "Timeline time to start at, in seconds; omitted, it is appended after what the track already holds")]
+    timeline_start: Option<f64>,
+    #[schemars(
+        description = "Caption the cut afterwards in this style (`lines` or `word_punch`), the same as generate_captions. Omit to leave captions alone."
+    )]
+    caption_style: Option<CaptionStyle>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct CaptionParams {
     #[schemars(
         description = "Look: `lines` (default) holds a few words as a subtitle line; `word_punch` puts one large word on screen at a time, the social-video style. Everything below is an override on top of the style — omit them to get the whole look."
@@ -1596,6 +1616,82 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Whether voiceovers can be generated on this machine, whether the voice model is downloaded yet (the first voiceover fetches ~100 MB), and the voices on offer with their accent and gender."
+    )]
+    fn voiceover_status(&self) -> Result<String, McpError> {
+        json(&kerf_core::voiceover_status())
+    }
+
+    #[tool(
+        description = "Read a script aloud with the Kokoro text-to-speech model and put the narration on the timeline: on the `VO` audio track unless track_id names another, appended after what is already there unless timeline_start says where. The audio is English only. The first call downloads the voice model (~100 MB) and each voice is fetched on first use; synthesis then takes a few seconds per sentence — send a `progressToken` for progress and cancel the request to stop it. Each sentence is synthesized on its own, so the voiceover's transcript is its script with exact timings: pass caption_style to caption the cut straight away (or run generate_captions later), and never analyze_asset it for a transcript. The generated audio lands for the user immediately like an import; placing it on the timeline (and the captions) is an ordinary staged edit. Returns the asset and the clip."
+    )]
+    async fn generate_voiceover(
+        &self,
+        Parameters(p): Parameters<VoiceoverParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let track = p.track_id.as_deref().map(parse_id).transpose()?;
+        let voice = p.voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
+        let project = self.project.clone();
+        let app = self.app.clone();
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<f64>, String)>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            tauri::async_runtime::spawn(async move {
+                while let Some((fraction, message)) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let param = ProgressNotificationParam::new(token, fraction.unwrap_or(0.0)).with_total(1.0);
+                    let _ = peer.notify_progress(param.with_message(message)).await;
+                }
+            })
+        };
+        let placed = blocking(move || {
+            let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+                let message = match &detail {
+                    Some(d) => format!("{stage}: {d}"),
+                    None => stage.to_string(),
+                };
+                let _ = tx.send((fraction, message));
+                // The GUI shows the same progress it shows for its own voiceovers.
+                let _ = app.emit(
+                    "voiceover-progress",
+                    crate::VoiceoverProgressEvent {
+                        stage: stage.to_string(),
+                        fraction,
+                        detail,
+                    },
+                );
+            };
+            let asset = Project::synthesize_voiceover(&p.text, &voice, p.speed.unwrap_or(1.0), &mut on_progress, &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(core_err)?;
+            let project = lock_agent(&project);
+            let (asset, clip) = project.place_voiceover(&asset, track, p.timeline_start).map_err(core_err)?;
+            let captions = match p.caption_style {
+                Some(style) => Some(
+                    project
+                        .generate_captions(CaptionOptions {
+                            style,
+                            ..CaptionOptions::default()
+                        })
+                        .map_err(core_err)?
+                        .len(),
+                ),
+                None => None,
+            };
+            Ok((asset, clip, captions))
+        })
+        .await;
+        let _ = forward.await;
+        let (asset, clip, captions) = placed?;
+        self.changed();
+        json(&serde_json::json!({ "asset": asset, "clip": clip, "captions": captions }))
+    }
+
+    #[tool(
         description = "Remove the captions generate_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
     )]
     fn clear_captions(&self) -> Result<String, McpError> {
@@ -2509,6 +2605,9 @@ impl ServerHandler for KerfMcp {
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
              alone. export_srt writes a subtitle file. \
+             To narrate a cut, write the script and generate_voiceover it (English; \
+             it lands on its own VO track with a transcript that is its script, \
+             exactly timed), cut the picture to the narration, then caption last. \
              When the cut is going somewhere vertical, set_delivery_format sets \
              the frame it is being made for and smart_crop then frames each shot \
              for it — reshaping 16:9 footage to 9:16 throws away most of the \

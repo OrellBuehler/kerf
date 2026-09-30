@@ -39,6 +39,8 @@ struct AppState {
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
     analysis_cancel: Arc<AtomicBool>,
+    /// Same, for a voiceover being synthesized (or its model downloading).
+    voiceover_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +494,104 @@ async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+// ---- voiceover ---------------------------------------------------------------
+
+/// Whether voiceovers can be generated here, what the first one has to
+/// download, and the voices on offer.
+#[tauri::command(async)]
+fn voiceover_status() -> CmdResult<kerf_core::VoiceoverStatus> {
+    Ok(kerf_core::voiceover_status())
+}
+
+/// One step of generating a voiceover: a download (`download_runtime`,
+/// `download_model`, `download_voice`) or `synthesize`.
+#[derive(Serialize, Clone)]
+pub(crate) struct VoiceoverProgressEvent {
+    pub(crate) stage: String,
+    pub(crate) fraction: Option<f64>,
+    pub(crate) detail: Option<String>,
+}
+
+/// The error an abandoned voiceover returns, for the webview to stay quiet on.
+const VOICEOVER_CANCELLED: &str = "voiceover cancelled";
+
+fn voiceover_err(e: kerf_core::Error) -> String {
+    match e {
+        kerf_core::Error::Cancelled => VOICEOVER_CANCELLED.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Download the voice runtime, model and `voice` ahead of time, streaming
+/// `voiceover-progress`, so the first voiceover starts synthesizing at once.
+#[tauri::command]
+async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: String) -> CmdResult<kerf_core::VoiceoverStatus> {
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit("voiceover-progress", VoiceoverProgressEvent { stage: stage.to_string(), fraction, detail });
+        };
+        kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(voiceover_err)?;
+        Ok(kerf_core::voiceover_status())
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct VoiceoverResult {
+    asset: Asset,
+    timeline: Timeline,
+}
+
+/// Read `text` aloud and put it on the timeline — on the `VO` track unless
+/// `track_id` names another audio track, at `timeline_start` or after what is
+/// already there — then caption the cut when `captions` is given.
+///
+/// Synthesis (and a first-use model download) runs with the project lock
+/// released, like an import; only landing the result takes it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn generate_voiceover(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+    voice: Option<String>,
+    speed: Option<f64>,
+    track_id: Option<String>,
+    timeline_start: Option<f64>,
+    captions: Option<CaptionOptions>,
+) -> CmdResult<VoiceoverResult> {
+    let track = track_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let voice = voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit("voiceover-progress", VoiceoverProgressEvent { stage: stage.to_string(), fraction, detail });
+        };
+        let asset = Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(voiceover_err)?;
+        let project = lock_user(&shared);
+        let (asset, _) = project.place_voiceover(&asset, track, timeline_start).map_err(|e| e.to_string())?;
+        if let Some(options) = captions {
+            project.generate_captions(options).map_err(|e| e.to_string())?;
+        }
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(VoiceoverResult { asset, timeline })
+    })
+    .await
+}
+
+/// Request cancellation of the voiceover being generated (or its download).
+#[tauri::command(async)]
+fn cancel_voiceover(state: State<'_, AppState>) {
+    state.voiceover_cancel.store(true, Ordering::SeqCst);
 }
 
 // ---- timeline editing (each returns the refreshed timeline) ----------------
@@ -1876,6 +1976,7 @@ pub fn run() {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            voiceover_cancel: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
             // Logging needs the resolved platform log directory, so set it up here
@@ -1917,6 +2018,10 @@ pub fn run() {
             transcription_status,
             set_speech_model,
             download_speech_model,
+            voiceover_status,
+            prepare_voiceover,
+            generate_voiceover,
+            cancel_voiceover,
             cut_clip,
             add_clip,
             split_clip,
