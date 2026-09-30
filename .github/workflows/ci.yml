@@ -43,6 +43,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # The prek commit stage (`.pre-commit-config.yaml`) — file hygiene, typos,
+  # actionlint. The hooks that duplicate a job of their own (rustfmt,
+  # svelte-check, bun test, zizmor) are skipped here rather than run twice.
+  lint:
+    name: lint (prek)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        env:
+          SKIP: cargo-fmt,svelte-check,bun-test,zizmor
+        with:
+          # Pinned for the same reason zizmor is: a new release can add checks.
+          prek-version: "0.3.5"
+
   clippy:
     name: clippy
     runs-on: ubuntu-22.04
@@ -332,3 +350,19 @@ jobs:
           rustup target add x86_64-apple-darwin
           cargo check -p kerf-core --no-default-features --features whisper --locked \
             --target x86_64-apple-darwin
+
+  # One status that is green only when every job above is — a single required
+  # check for the ruleset instead of a list that has to track the matrix.
+  ci-ok:
+    name: ci ok
+    if: always()
+    needs: [fmt, lint, clippy, msrv, frontend, test, engine, libav, build, whisper]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done

@@ -1711,9 +1711,8 @@ pub fn stitch_insta360(
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create stitch cache dir: {e}")))?;
     }
-    let (front_str, rear_str) = match (front.to_str(), rear.to_str()) {
-        (Some(f), Some(r)) => (f, r),
-        _ => return Err(Error::Engine("lens file path is not valid UTF-8".to_string())),
+    let (Some(front_str), Some(rear_str)) = (front.to_str(), rear.to_str()) else {
+        return Err(Error::Engine("lens file path is not valid UTF-8".to_string()));
     };
     let tmp = dst.with_extension(format!("{}.part", std::process::id()));
     let tmp_str = tmp
@@ -5262,7 +5261,7 @@ mod tests {
         let mut b = a.clone();
         block(&mut b, w - 16, w - 8, 0);
         block(&mut b, w - 20, w - 12, 200);
-        let mut raw = a.clone();
+        let mut raw = a;
         raw.extend_from_slice(&b);
         let map = score_salience(&raw);
         let crop = map.crop_for(1920, 1080, 1080.0 / 1920.0).expect("crops");
@@ -5331,7 +5330,7 @@ mod tests {
         assert_eq!(out.len(), buckets);
         assert!(out.iter().all(|&v| (0.0..=1.0).contains(&v)));
         // The clipping spike survives the downsample, clamped into range.
-        let max = out.iter().cloned().fold(0.0_f32, f32::max);
+        let max = out.iter().copied().fold(0.0_f32, f32::max);
         assert!((max - 1.0).abs() < 1e-6, "peak should be preserved, got {max}");
     }
 
@@ -5343,7 +5342,7 @@ mod tests {
         }
         let out = down.finish();
         assert_eq!(out.len(), 16);
-        let max = out.iter().cloned().fold(0.0_f32, f32::max);
+        let max = out.iter().copied().fold(0.0_f32, f32::max);
         assert!((max - 0.9).abs() < 1e-6, "got {max}");
     }
 
@@ -6437,7 +6436,7 @@ mod tests {
             source_paths: Vec::new(),
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
-        let assets = vec![a1, a2.clone()];
+        let assets = vec![a1, a2];
         let opts = ExportOptions::default();
 
         let args = build_export_args(&timeline, &assets, "/out/out.mp4", &opts).unwrap();
@@ -7055,7 +7054,7 @@ mod tests {
         assert!(g.contains("clip((1-hypot"), "feathered edge: {g}");
 
         // A rectangle is the same expression with max instead of hypot…
-        let mut rect = clip.clone();
+        let mut rect = clip;
         rect.mask = Some(crate::model::Mask {
             shape: crate::model::MaskShape::Rect,
             feather: 0.0,

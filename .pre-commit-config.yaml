@@ -1,0 +1,115 @@
+# Local checks, run by prek (https://prek.j178.dev) — `pre-commit` reads the
+# same file. Install once per clone:
+#
+#   prek install --install-hooks          # pre-commit, pre-push and commit-msg
+#
+# The commit hook stays fast (hygiene, formatting, lints over the staged
+# files); the slow half — clippy and the test suites — runs on push. Run
+# everything by hand with:
+#
+#   prek run --all-files                          # what a commit runs
+#   prek run --all-files --hook-stage pre-push    # what a push runs
+#
+# CI runs the commit stage in the `lint` job (see ci.yml); the push stage is
+# covered there by the clippy / test / frontend jobs.
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+default_stages: [pre-commit]
+
+exclude: |
+  (?x)^(
+    Cargo\.lock|
+    frontend/bun\.lock|
+    crates/kerf-app/icons/.*|
+    crates/kerf-app/gen/.*|
+    docs/img/.*|
+    site/static/.*
+  )$
+
+repos:
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+        # tsconfig and the VS Code files are JSONC.
+        exclude: ^(frontend/tsconfig\.json|\.vscode/.*)$
+      # Demo footage lives in the repo root; this is the last line of defence
+      # if the .gitignore entry ever stops matching it.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.50.3
+    hooks:
+      - id: typos
+        # Report only: its default autocorrect rewrites domain words and
+        # identifiers (`seeked`, `acount`). Allowlist in `_typos.toml`.
+        args: [--force-exclude]
+
+  # Workflow syntax, expressions and embedded shell (via shellcheck when it is
+  # installed) — the class of mistake that otherwise surfaces as a red release.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  # The release workflow holds the updater's signing key; the same audit as
+  # the `workflow audit (zizmor)` CI job, but before the push.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
+        args: [--persona=regular, --min-severity=medium]
+
+  - repo: local
+    hooks:
+      - id: commit-msg
+        name: commit message style
+        entry: scripts/hooks/commit-msg.sh
+        language: script
+        stages: [commit-msg]
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: svelte-check
+        name: svelte-check
+        entry: bash -c 'cd frontend && bun run check'
+        language: system
+        files: ^frontend/(src/|tsconfig\.json|vite\.config\.ts|package\.json)
+        pass_filenames: false
+
+      - id: bun-test
+        name: bun test
+        entry: bash -c 'cd frontend && bun run test'
+        language: system
+        files: ^frontend/src/.*\.ts$
+        pass_filenames: false
+
+      - id: clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-test
+        name: cargo test (kerf-core)
+        entry: cargo test -p kerf-core --no-default-features --locked
+        language: system
+        files: ^(crates/kerf-core/|Cargo\.(toml|lock)$)
+        pass_filenames: false
+        stages: [pre-push]

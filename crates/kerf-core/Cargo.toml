@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "Kerf domain model, .kerf project persistence, and FFmpeg media engine"
 
+[lints]
+workspace = true
+
 [features]
 default = ["ffmpeg"]
 # In-process libav probing via ffmpeg-next. Requires the system FFmpeg dev

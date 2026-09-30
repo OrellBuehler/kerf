@@ -10,7 +10,7 @@ welcome.
   bridge over the `Project` API.
 - **Keep the types in sync across the boundary:** `kerf-core` serde structs ↔
   `frontend/src/lib/types.ts`. Field names are `snake_case` in JSON on both Tauri and MCP.
-- Match the surrounding style; `cargo fmt` and `cargo clippy` must be clean.
+- Match the surrounding style; `cargo fmt`, `cargo clippy` and `prek run --all-files` must be clean.
 - License is **PolyForm Noncommercial 1.0.0**. New files inherit it via
   `license.workspace = true` — don't add other license headers.
 
@@ -32,6 +32,16 @@ bun run check     # svelte-check
 # Full desktop app (needs FFmpeg dev libs for the default feature)
 cargo run -p kerf-app
 ```
+
+Install the git hooks once per clone with [prek](https://prek.j178.dev):
+
+```bash
+prek install --install-hooks   # formatting, typos and lints on commit; clippy + tests on push
+prek run --all-files           # run the commit checks by hand
+```
+
+Commit subjects are lowercase and imperative (`fix trim clamping`), under 100
+characters, no trailing period — the `commit-msg` hook checks it.
 
 See [`README.md`](./README.md#building) for per-platform FFmpeg setup and
 [`CLAUDE.md`](./CLAUDE.md) for a deep tour of the architecture.

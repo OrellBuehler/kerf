@@ -11,6 +11,27 @@ authors = ["Orell Bühler <me@orellbuehler.ch>"]
 repository = "https://github.com/orellbuehler/kerf"
 homepage = "https://github.com/orellbuehler/kerf"
 
+# Checked by `cargo clippy` (CI runs it with `-D warnings`, prek on push).
+# Beyond clippy's defaults: no debugging leftovers or unfinished stubs, no
+# stray console output (use `tracing`), and every `unsafe` block justified.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+undocumented_unsafe_blocks = "warn"
+large_futures = "warn"
+cloned_instead_of_copied = "warn"
+implicit_clone = "warn"
+manual_let_else = "warn"
+redundant_clone = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+
 [workspace.dependencies]
 # Shared crates — ffmpeg is opt-in; consumers forward it via their own feature
 kerf-core = { path = "crates/kerf-core", default-features = false }

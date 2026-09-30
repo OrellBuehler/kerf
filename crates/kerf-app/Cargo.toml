@@ -17,6 +17,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "kerf-app"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [features]
 default = ["ffmpeg"]
 # Forward in-process FFmpeg support to kerf-core (probe / export).
