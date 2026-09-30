@@ -360,7 +360,7 @@ jobs:
         run: |
           set -euo pipefail
           url="https://github.com/$GH_REPO/releases/latest/download/latest.json"
-          for i in $(seq 1 10); do
+          for _ in $(seq 1 10); do
             if curl -fsSL "$url" -o feed.json \
               && [ "$(jq -r .version feed.json)" = "${TAG#v}" ]; then
               break

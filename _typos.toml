@@ -1,0 +1,18 @@
+# crate-ci/typos (run by prek and the CI `lint` job). Domain words and short
+# identifiers it would otherwise "correct".
+[default]
+extend-ignore-re = [
+    # hex digests, base64 blobs
+    "[0-9a-fA-F]{32,}",
+]
+
+[default.extend-words]
+# ffmpeg vocabulary: a seeked input, fast-seeked windows
+seeked = "seeked"
+# per-input audio/video counters and fade in/out locals
+acount = "acount"
+fo = "fo"
+# "mis-remembers", "mis-animates"
+mis = "mis"
+# "PNGs" splits as PN + Gs
+PN = "PN"

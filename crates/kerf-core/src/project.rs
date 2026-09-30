@@ -2168,7 +2168,7 @@ impl Project {
             .get_analysis(asset_id)?
             .ok_or_else(|| Error::InvalidArgument("no analysis available for asset; run analysis first".to_string()))?;
 
-        let mut silence: Vec<TimeRange> = analysis.silence_segments.clone();
+        let mut silence: Vec<TimeRange> = analysis.silence_segments;
         silence.sort_by(|a, b| a.start.total_cmp(&b.start));
 
         let mut keep: Vec<(f64, f64)> = Vec::new();

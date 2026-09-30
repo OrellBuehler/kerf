@@ -42,3 +42,9 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 *.log
+
+# Claude Code: per-user settings and session state (settings.json, agents/ and
+# hooks/ are shared and committed)
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
