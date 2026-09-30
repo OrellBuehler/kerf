@@ -82,6 +82,79 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     Ok(dst.to_path_buf())
 }
 
+/// The host in `url`'s redirect chain that a DNS filter has sinkholed, with the
+/// address it answered — asked only once a download has already failed.
+///
+/// A blocklist answers a blocked name with `0.0.0.0` / `::` (or loopback), so
+/// the connection is simply refused and the error names neither the cause nor
+/// the host. And the blocked host is usually not the one in the URL: the model
+/// hosts redirect to a CDN, whose name only appears in the `Location` header —
+/// so the chain is walked by hand, a few hops at most.
+fn blocked_host(url: &str) -> Option<(String, std::net::IpAddr)> {
+    let mut url = url.to_string();
+    for _ in 0..5 {
+        let (host, port) = host_of(&url)?;
+        if let Some(addr) = sinkholed(&host, port) {
+            return Some((host, addr));
+        }
+        let response = ureq::get(&url)
+            .config()
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .http_status_as_error(false)
+            .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            .build()
+            .call()
+            .ok()?;
+        if !response.status().is_redirection() {
+            return None;
+        }
+        url = response.headers().get("location")?.to_str().ok()?.to_string();
+    }
+    None
+}
+
+/// The address `host` resolves to when every answer is a sinkhole.
+fn sinkholed(host: &str, port: u16) -> Option<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    // A literal address was never looked up, so no filter answered it — a
+    // local mirror at 127.0.0.1 that is down is just down.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let addrs: Vec<std::net::IpAddr> = (host, port).to_socket_addrs().ok()?.map(|a| a.ip()).collect();
+    all_sinkholed(&addrs).then(|| addrs[0])
+}
+
+/// Whether a lookup answered only with addresses nothing can be downloaded
+/// from — the unspecified address or loopback — for a name that is not itself
+/// local.
+fn all_sinkholed(addrs: &[std::net::IpAddr]) -> bool {
+    !addrs.is_empty() && addrs.iter().all(|a| a.is_unspecified() || a.is_loopback())
+}
+
+/// Host and port of an absolute `http(s)://` URL.
+fn host_of(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = match scheme {
+        "https" => 443,
+        "http" => 80,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if let Some(v6) = authority.strip_prefix('[') {
+        let (host, after) = v6.split_once(']')?;
+        let port = after.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(default);
+        return Some((host.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
+        None => Some((authority.to_string(), default)),
+    }
+    .filter(|(host, _)| !host.is_empty() && host != "localhost")
+}
+
 /// Stream `download.url` into `tmp`, resuming a partial file when one is there.
 pub(super) fn stream_to_file(
     download: &Download,
@@ -108,6 +181,13 @@ pub(super) fn stream_to_file(
     // connect failed is otherwise invisible — and a resolver that works for the
     // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
     let mut response = request.call().map_err(|e| {
+        if let Some((host, addr)) = blocked_host(url) {
+            return Error::Engine(format!(
+                "could not download {what}: {host} resolves to {addr}, which is how a DNS filter (Pi-hole, \
+                 AdGuard, NextDNS, a router or VPN blocklist) blocks a domain. Allow {host} in that filter, \
+                 or point {mirror_env} at a mirror"
+            ));
+        }
         Error::Engine(format!(
             "could not download {what} from {url}: {e} (Kerf resolves names through the OS resolver and \
              honours HTTPS_PROXY, not the browser's DNS or proxy settings; {mirror_env} points it at a mirror)"
@@ -175,4 +255,41 @@ pub(super) fn stream_to_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn urls_split_into_host_and_port() {
+        assert_eq!(
+            host_of("https://us.aws.cdn.hf.co/xet/abc?sig=1"),
+            Some(("us.aws.cdn.hf.co".into(), 443))
+        );
+        assert_eq!(host_of("http://mirror.lan:8080/m.bin"), Some(("mirror.lan".into(), 8080)));
+        assert_eq!(host_of("https://[::1]:9/x"), Some(("::1".into(), 9)));
+        assert_eq!(host_of("https://user@host.example"), Some(("host.example".into(), 443)));
+        assert_eq!(host_of("ftp://host/x"), None);
+        assert_eq!(host_of("http://localhost:1/x"), None);
+    }
+
+    #[test]
+    fn only_an_all_sinkhole_answer_counts_as_blocked() {
+        let zero: IpAddr = "0.0.0.0".parse().unwrap();
+        let unspec6: IpAddr = "::".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let real: IpAddr = "13.36.183.231".parse().unwrap();
+        assert!(all_sinkholed(&[zero, unspec6]));
+        assert!(all_sinkholed(&[loopback]));
+        assert!(!all_sinkholed(&[zero, real]));
+        assert!(!all_sinkholed(&[]));
+    }
+
+    #[test]
+    fn a_literal_address_is_never_blamed_on_dns() {
+        assert_eq!(sinkholed("0.0.0.0", 443), None);
+        assert_eq!(sinkholed("127.0.0.1", 80), None);
+    }
 }
