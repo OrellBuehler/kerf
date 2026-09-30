@@ -1,4 +1,4 @@
-import type { Icon as LucideIcon } from '@lucide/svelte';
+import type { LucideIcon } from '@lucide/svelte';
 import {
 	MousePointer2,
 	Scissors,
@@ -61,7 +61,7 @@ import {
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
-export const icons: Record<string, typeof LucideIcon> = {
+export const icons: Record<string, LucideIcon> = {
 	'MousePointer2': MousePointer2,
 	'Scissors': Scissors,
 	'bookmark': Bookmark,
