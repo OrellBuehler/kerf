@@ -125,7 +125,11 @@ pub fn voices() -> Vec<VoiceInfo> {
             id,
             name,
             accent: if is_british(id) { "gb" } else { "us" },
-            gender: if id.as_bytes().get(1) == Some(&b'm') { "male" } else { "female" },
+            gender: if id.as_bytes().get(1) == Some(&b'm') {
+                "male"
+            } else {
+                "female"
+            },
             downloaded: voice_path(id).is_some_and(|p| p.is_file()),
         })
         .collect()
@@ -264,7 +268,9 @@ fn runtime_spec() -> Option<RuntimeSpec> {
 /// A runtime library the user pointed Kerf at (`ORT_DYLIB_PATH`, the variable
 /// `ort` itself honours), used instead of downloading one.
 fn runtime_override() -> Option<PathBuf> {
-    std::env::var_os("ORT_DYLIB_PATH").filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os("ORT_DYLIB_PATH")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn runtime_path(spec: &RuntimeSpec) -> Option<PathBuf> {
@@ -290,7 +296,10 @@ fn ensure_runtime(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() 
         return if path.is_file() {
             Ok(path)
         } else {
-            Err(Error::Engine(format!("ORT_DYLIB_PATH points at {}, which does not exist", path.display())))
+            Err(Error::Engine(format!(
+                "ORT_DYLIB_PATH points at {}, which does not exist",
+                path.display()
+            )))
         };
     }
     let spec = runtime_spec().ok_or_else(unsupported_platform)?;
@@ -342,7 +351,9 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| Error::Engine(format!("could not read download: {e}")))?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| Error::Engine(format!("could not read download: {e}")))?;
         if n == 0 {
             break;
         }
@@ -417,11 +428,7 @@ fn ensure_model(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() ->
 fn verify_onnx(path: &Path) -> Result<()> {
     let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut head = [0u8; 1];
-    let ok = len > MB
-        && std::fs::File::open(path)
-            .and_then(|mut f| f.read_exact(&mut head))
-            .is_ok()
-        && head[0] == 0x08;
+    let ok = len > MB && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head[0] == 0x08;
     if ok {
         Ok(())
     } else {
@@ -439,7 +446,9 @@ fn ensure_voice(voice: &str, progress: &mut dyn FnMut(DownloadProgress), cancel:
         if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == VOICE_BYTES as u64 {
             Ok(())
         } else {
-            Err(Error::Engine(format!("downloaded voice '{voice}' is not a Kokoro voice pack")))
+            Err(Error::Engine(format!(
+                "downloaded voice '{voice}' is not a Kokoro voice pack"
+            )))
         }
     };
     fetch(
@@ -523,8 +532,7 @@ pub struct Sentence {
 
 /// Abbreviations whose period does not end a sentence.
 const ABBREVIATIONS: &[&str] = &[
-    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "approx", "no", "fig", "inc", "ltd",
-    "co", "mt",
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "approx", "no", "fig", "inc", "ltd", "co", "mt",
 ];
 
 /// Split a script into sentences at `.` `!` `?` `…` (with any closing quotes or
@@ -545,7 +553,8 @@ pub fn split_sentences(text: &str) -> Vec<Sentence> {
         while i < chars.len() {
             if matches!(chars[i], '.' | '!' | '?' | '…') {
                 let mut end = i + 1;
-                while end < chars.len() && matches!(chars[end], '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']') {
+                while end < chars.len() && matches!(chars[end], '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']')
+                {
                     end += 1;
                 }
                 let at_break = end >= chars.len() || chars[end].is_whitespace();
@@ -567,7 +576,12 @@ pub fn split_sentences(text: &str) -> Vec<Sentence> {
 }
 
 fn push_sentence(out: &mut Vec<Sentence>, chars: &[char]) {
-    let text: String = chars.iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let text: String = chars
+        .iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if !text.is_empty() {
         out.push(Sentence {
             text,
@@ -806,7 +820,11 @@ pub fn build_transcript(sentences: &[Sentence], durations: &[f64]) -> Vec<Transc
     let mut out = Vec::with_capacity(sentences.len());
     for (i, (sentence, &duration)) in sentences.iter().zip(durations).enumerate() {
         if i > 0 {
-            at += if sentences[i - 1].paragraph_end { PARAGRAPH_GAP } else { SENTENCE_GAP };
+            at += if sentences[i - 1].paragraph_end {
+                PARAGRAPH_GAP
+            } else {
+                SENTENCE_GAP
+            };
         }
         out.push(TranscriptSegment {
             start: at,
@@ -888,7 +906,7 @@ fn cached(path: &Path) -> Option<Synthesis> {
         return None;
     }
     let segments: Vec<TranscriptSegment> = serde_json::from_slice(&std::fs::read(timings_path(path)).ok()?).ok()?;
-        Some(Synthesis {
+    Some(Synthesis {
         path: path.to_path_buf(),
         segments,
     })
@@ -928,7 +946,11 @@ pub fn synthesize(text: &str, voice: &str, speed: f64, progress: ProgressFn, can
             return Err(Error::Cancelled);
         }
         if i > 0 {
-            let gap = if sentences[i - 1].paragraph_end { PARAGRAPH_GAP } else { SENTENCE_GAP };
+            let gap = if sentences[i - 1].paragraph_end {
+                PARAGRAPH_GAP
+            } else {
+                SENTENCE_GAP
+            };
             samples.extend(std::iter::repeat_n(0.0, (gap * SAMPLE_RATE as f64).round() as usize));
         }
         let (ipa, _) = g2p
@@ -959,10 +981,7 @@ pub fn synthesize(text: &str, voice: &str, speed: f64, progress: ProgressFn, can
         .and_then(|_| std::fs::write(&tmp, wav_bytes(&samples, SAMPLE_RATE)))
         .and_then(|_| std::fs::rename(&tmp, &path))
         .map_err(|e| Error::Engine(format!("could not write voiceover: {e}")))?;
-    Ok(Synthesis {
-        path,
-        segments,
-    })
+    Ok(Synthesis { path, segments })
 }
 
 /// misaki's lexicons take a moment to parse, so each accent's G2P is built once
@@ -1037,7 +1056,10 @@ fn infer(runtime: &Path, model: &Path, threads: usize, tokens: &[i64], style: Ve
     let outputs = session
         .run(ort::inputs!["input_ids" => input_ids, "style" => style, "speed" => speed])
         .map_err(ort_err)?;
-    let waveform = outputs.values().next().ok_or_else(|| ort_err("the model returned no audio"))?;
+    let waveform = outputs
+        .values()
+        .next()
+        .ok_or_else(|| ort_err("the model returned no audio"))?;
     let (_, audio) = waveform.try_extract_tensor::<f32>().map_err(ort_err)?;
     Ok(audio.to_vec())
 }
@@ -1174,7 +1196,10 @@ mod tests {
             "./onnxruntime-osx-x86_64-1.20.0/lib/libonnxruntime.1.20.0.dylib",
             "lib/libonnxruntime.1.20.0.dylib"
         ));
-        assert!(is_member("onnxruntime-win-x64-1.30.0/lib/onnxruntime.dll", "lib/onnxruntime.dll"));
+        assert!(is_member(
+            "onnxruntime-win-x64-1.30.0/lib/onnxruntime.dll",
+            "lib/onnxruntime.dll"
+        ));
         assert!(!is_member(
             "onnxruntime-osx-x86_64-1.20.0/lib/libonnxruntime.1.20.0.dylib.dSYM/Contents/Resources/DWARF/libonnxruntime.1.20.0.dylib",
             "lib/libonnxruntime.1.20.0.dylib"
@@ -1198,10 +1223,20 @@ mod tests {
     #[ignore]
     fn synthesizes_a_script_end_to_end() {
         let text = "Hello from Kerf. This is the second sentence.";
-        let result = synthesize(text, DEFAULT_VOICE, 1.0, &mut |stage, f, d| eprintln!("{stage} {f:?} {d:?}"), &|| false)
-            .expect("synthesis");
+        let result = synthesize(
+            text,
+            DEFAULT_VOICE,
+            1.0,
+            &mut |stage, f, d| eprintln!("{stage} {f:?} {d:?}"),
+            &|| false,
+        )
+        .expect("synthesis");
         assert_eq!(result.segments.len(), 2);
-        assert!(result.segments[1].end > 1.5, "two sentences should take more than 1.5 s, got {}", result.segments[1].end);
+        assert!(
+            result.segments[1].end > 1.5,
+            "two sentences should take more than 1.5 s, got {}",
+            result.segments[1].end
+        );
         let bytes = std::fs::read(&result.path).unwrap();
         let peak = bytes[44..]
             .chunks_exact(2)

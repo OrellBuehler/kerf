@@ -680,7 +680,12 @@ mod tests {
     }
 
     /// The shared streamer, called the way these tests always called whisper's own.
-    fn stream_to_file(url: &str, tmp: &Path, progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<()> {
+    fn stream_to_file(
+        url: &str,
+        tmp: &Path,
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let download = Download {
             url,
             dst: tmp,

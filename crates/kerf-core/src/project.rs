@@ -3221,7 +3221,11 @@ impl Project {
                 .map(|t| t.max(0.0))
                 .unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
             let clip = Clip::for_asset(&asset, 0.0, asset.duration, start);
-            timeline.track_mut(tid).expect("track resolved above").clips.push(clip.clone());
+            timeline
+                .track_mut(tid)
+                .expect("track resolved above")
+                .clips
+                .push(clip.clone());
             Ok(clip)
         })?;
         Ok((asset, clip))
@@ -3566,7 +3570,9 @@ mod tests {
     #[test]
     fn a_voiceover_lands_on_its_own_track_and_captions_from_its_script() {
         let project = Project::open_in_memory().unwrap();
-        let (asset, clip) = project.place_voiceover(&voiceover_asset("/vo/a.wav"), None, Some(2.0)).unwrap();
+        let (asset, clip) = project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), None, Some(2.0))
+            .unwrap();
         let timeline = project.timeline().unwrap();
         let vo = timeline.tracks.iter().find(|t| t.name == VOICEOVER_TRACK).expect("VO track");
         assert_eq!(vo.kind, StreamKind::Audio);
@@ -3577,7 +3583,10 @@ mod tests {
 
         let captions = project.generate_captions(CaptionOptions::default()).unwrap();
         assert!(!captions.is_empty());
-        assert!((captions[0].start - 2.0).abs() < 1e-9, "captions follow the clip onto the timeline");
+        assert!(
+            (captions[0].start - 2.0).abs() < 1e-9,
+            "captions follow the clip onto the timeline"
+        );
         assert!(captions.iter().all(|c| c.end <= 6.0 + 1e-9));
 
         // A second voiceover joins the same lane, after the first.
@@ -3591,7 +3600,9 @@ mod tests {
     fn a_voiceover_refuses_a_video_track() {
         let project = Project::open_in_memory().unwrap();
         let v1 = project.timeline().unwrap().first_track_of(StreamKind::Video).unwrap();
-        assert!(project.place_voiceover(&voiceover_asset("/vo/a.wav"), Some(v1), None).is_err());
+        assert!(project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), Some(v1), None)
+            .is_err());
     }
 
     #[test]

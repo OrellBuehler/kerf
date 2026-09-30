@@ -104,8 +104,8 @@ pub use whisper::{
 };
 
 pub use tts::{
-    prepare as prepare_voiceover, status as voiceover_status, VoiceInfo, VoiceoverStatus, DEFAULT_VOICE, MAX_SPEED as MAX_VOICE_SPEED,
-    MIN_SPEED as MIN_VOICE_SPEED,
+    prepare as prepare_voiceover, status as voiceover_status, VoiceInfo, VoiceoverStatus, DEFAULT_VOICE,
+    MAX_SPEED as MAX_VOICE_SPEED, MIN_SPEED as MIN_VOICE_SPEED,
 };
 
 /// The names of every speech model Kerf can download, smallest first.

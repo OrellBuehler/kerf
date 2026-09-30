@@ -90,7 +90,9 @@ struct AssetIdParams {
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct VoiceoverParams {
-    #[schemars(description = "The script to read aloud, in English. Sentences are read one at a time; a blank line is a longer pause (a paragraph break).")]
+    #[schemars(
+        description = "The script to read aloud, in English. Sentences are read one at a time; a blank line is a longer pause (a paragraph break)."
+    )]
     text: String,
     #[schemars(
         description = "Kokoro voice id (default af_heart). American: af_heart, af_bella, af_nicole, af_sarah, af_sky, af_nova, am_michael, am_fenrir, am_puck, am_adam, am_eric, am_liam, am_onyx; British: bf_emma, bf_isabella, bf_alice, bf_lily, bm_george, bm_fable, bm_lewis, bm_daniel. voiceover_status lists them all."
@@ -100,7 +102,9 @@ struct VoiceoverParams {
     speed: Option<f64>,
     #[schemars(description = "Audio track to place it on; omitted, it goes on the `VO` track (created on first use)")]
     track_id: Option<String>,
-    #[schemars(description = "Timeline time to start at, in seconds; omitted, it is appended after what the track already holds")]
+    #[schemars(
+        description = "Timeline time to start at, in seconds; omitted, it is appended after what the track already holds"
+    )]
     timeline_start: Option<f64>,
     #[schemars(
         description = "Caption the cut afterwards in this style (`lines` or `word_punch`), the same as generate_captions. Omit to leave captions alone."

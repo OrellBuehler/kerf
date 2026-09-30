@@ -532,7 +532,14 @@ async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: St
     cancel.store(false, Ordering::SeqCst);
     blocking(move || {
         let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
-            let _ = app.emit("voiceover-progress", VoiceoverProgressEvent { stage: stage.to_string(), fraction, detail });
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
         };
         kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(voiceover_err)?;
         Ok(kerf_core::voiceover_status())
@@ -571,14 +578,23 @@ async fn generate_voiceover(
     blocking(move || {
         let voice = voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
         let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
-            let _ = app.emit("voiceover-progress", VoiceoverProgressEvent { stage: stage.to_string(), fraction, detail });
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
         };
         let asset = Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &|| {
             cancel.load(Ordering::SeqCst)
         })
         .map_err(voiceover_err)?;
         let project = lock_user(&shared);
-        let (asset, _) = project.place_voiceover(&asset, track, timeline_start).map_err(|e| e.to_string())?;
+        let (asset, _) = project
+            .place_voiceover(&asset, track, timeline_start)
+            .map_err(|e| e.to_string())?;
         if let Some(options) = captions {
             project.generate_captions(options).map_err(|e| e.to_string())?;
         }
