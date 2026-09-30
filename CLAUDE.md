@@ -286,6 +286,10 @@ cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # si
 # engine or the export graph:
 cargo test -p kerf-core --no-default-features -- --ignored
 
+# Everything a commit / a push checks (prek, see below)
+prek run --all-files
+prek run --all-files --hook-stage pre-push
+
 # MCP server — the desktop app hosts it (streamable HTTP on 127.0.0.1:7777/mcp).
 # Run the app (below), then point an MCP client at the URL, e.g.:
 #   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
@@ -304,7 +308,26 @@ bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 ```
 
-There is no Rust lint config beyond defaults; `cargo clippy --workspace --no-default-features` is fine.
+### Local checks (prek) and the agent harness
+
+`.pre-commit-config.yaml` is the single definition of "the checks", run by
+[prek](https://prek.j178.dev) (`prek install --install-hooks` once per clone):
+the **commit** stage is hygiene, `typos` (allowlist in `_typos.toml`),
+`actionlint`, `zizmor`, `cargo fmt`, `svelte-check` (fails on warnings) and
+`bun test`; the **push** stage adds clippy `-D warnings` and the kerf-core tests;
+`commit-msg` enforces the lowercase-imperative subject and rejects AI
+attribution trailers. `prek run --all-files [--hook-stage pre-push]` runs them by
+hand. CI's `lint (prek)` job runs the commit stage (skipping the hooks that have
+their own job), and `ci ok` is one status that is green only when every CI job is.
+Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
+`println!`, justified `unsafe`, a few style lints) — every crate opts in with
+`[lints] workspace = true`.
+
+`.claude/` carries the shared agent setup: `settings.json` (an allowlist for the
+check commands, and a PostToolUse hook that rustfmt's every `.rs` file an agent
+writes, reporting parse errors back) and project subagents in `.claude/agents/`
+— `engine` (kerf-core), `frontend`, `surface` (wire a core op into the Tauri
+command + MCP tool + api.ts), and the read-only `reviewer` and `verifier`.
 
 ## Architecture
 
