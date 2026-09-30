@@ -78,6 +78,7 @@ import {
 	setVolume,
 	splitClip,
 	trimClip,
+	generateVoiceover,
 	undo as apiUndo
 } from './api';
 import type {
@@ -105,7 +106,8 @@ import type {
 	Timeline,
 	Transform,
 	Transition,
-	VideoEffect
+	VideoEffect,
+	VoiceoverRequest
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
@@ -495,6 +497,15 @@ class EditorState {
 		}
 	}
 
+	/** Re-read the asset list, for assets an agent brought in behind our back
+	 *  (a voiceover it generated). Left alone when nothing is new, so the bin
+	 *  does not re-render on every agent edit. */
+	async refreshAssets() {
+		const assets = await listAssets();
+		const known = new Set(this.assets.map((a) => a.id));
+		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
+	}
+
 	/** Run analysis on an asset and merge the result into local caches. */
 	async analyze(assetId: string): Promise<AssetAnalysis> {
 		const analysis = await analyzeAsset(assetId);
@@ -730,6 +741,29 @@ class EditorState {
 	}
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
 		return this.#apply(setOverlayKeyframes(overlayId, keyframes));
+	}
+	/**
+	 * Synthesize a script onto the VO track. The asset carries its script as its
+	 * transcript, so unlike an import it is never queued for analysis. Nothing
+	 * is reported through `error` — the dialog says what happened, and a
+	 * cancelled run is not an error at all.
+	 */
+	async generateVoiceover(req: VoiceoverRequest): Promise<Asset> {
+		this.#busyCount++;
+		this.previewingStaged = false;
+		this.#liveTimeline = null;
+		try {
+			const { asset, timeline } = await generateVoiceover(req);
+			this.assets = this.assets.some((a) => a.id === asset.id)
+				? this.assets.map((a) => (a.id === asset.id ? asset : a))
+				: [...this.assets, asset];
+			this.#setTimeline(timeline);
+			await this.refreshHistory();
+			await this.select(asset.id);
+			return asset;
+		} finally {
+			this.#busyCount--;
+		}
 	}
 	generateCaptions(options?: CaptionOptions) {
 		return this.#apply(generateCaptions(options));

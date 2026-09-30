@@ -43,6 +43,17 @@ export interface Asset {
 	imported_at: string;
 	/** Original capture files a derived asset was built from (an Insta360 lens pair). */
 	source_paths?: string[];
+	/** Set on a synthesized voiceover: the script and settings it was made from. */
+	voiceover?: Voiceover;
+}
+
+/** What a generated voiceover was made from, kept on its asset so it can be
+ *  regenerated. `segments` are the script's sentences in asset time. */
+export interface Voiceover {
+	text: string;
+	voice: string;
+	speed: number;
+	segments: TranscriptSegment[];
 }
 
 export interface TimeRange {
@@ -582,6 +593,52 @@ export interface TranscriptionStatus {
 	approx_download_bytes?: number | null;
 	models: SpeechModelInfo[];
 	reason?: string | null;
+}
+
+/** One Kokoro voice. `downloaded` is whether its style file is already cached. */
+export interface VoiceInfo {
+	id: string;
+	name: string;
+	accent: 'us' | 'gb';
+	gender: 'female' | 'male';
+	downloaded: boolean;
+}
+
+/** Whether voiceover can run, and what the first use still has to fetch. */
+export interface VoiceoverStatus {
+	available: boolean;
+	/** The runtime and model are cached; only a new voice may still download. */
+	ready: boolean;
+	approx_download_bytes: number;
+	default_voice: string;
+	voices: VoiceInfo[];
+	reason: string | null;
+}
+
+/** Payload of the `voiceover-progress` event, from the GUI or an agent. */
+export interface VoiceoverProgress {
+	stage: 'download_runtime' | 'download_model' | 'download_voice' | 'synthesize';
+	fraction: number | null;
+	/** A short note, e.g. `42 MB / 88 MB` or `3 of 7 sentences`. */
+	detail: string | null;
+}
+
+/** The arguments `generate_voiceover` takes; all but the script are optional. */
+export interface VoiceoverRequest {
+	text: string;
+	voice?: string;
+	speed?: number;
+	/** The audio track to land on; omitted, the "VO" track (made on first use). */
+	trackId?: string;
+	/** Where it starts; omitted, it is appended to the track's end. */
+	timelineStart?: number;
+	/** Caption the cut from the script once it is placed. */
+	captions?: CaptionOptions;
+}
+
+export interface VoiceoverResult {
+	asset: Asset;
+	timeline: Timeline;
 }
 
 /** A newer signed release found on GitHub by the updater. */
