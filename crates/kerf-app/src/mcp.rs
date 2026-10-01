@@ -20,7 +20,7 @@ use kerf_core::{
     Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -2426,7 +2426,7 @@ fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp>
     ROUTER.get_or_init(KerfMcp::tool_router)
 }
 
-/// How the server introduces itself to clients. `ServerInfo::default()` fills
+/// How the server introduces itself to clients. `ServerConfig::default()` fills
 /// `server_info` in from *rmcp's* own build env, so an untouched default has
 /// every client listing this server as "rmcp".
 fn server_identity() -> Implementation {
@@ -2435,11 +2435,11 @@ fn server_identity() -> Implementation {
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // `initialize` is the one moment we know an agent is on the other end
         // of the socket, so it counts as being seen even before it calls a tool.
         note_agent_activity();
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.server_info = server_identity();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
