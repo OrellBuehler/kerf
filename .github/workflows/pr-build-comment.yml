@@ -1,0 +1,89 @@
+name: PR build comment
+
+# Posts (and keeps updating) one comment on the PR with links to the installers
+# `pr-build.yml` uploaded. A separate workflow because a fork's `pull_request`
+# run only ever holds a read-only token; `workflow_run` runs in this repo's
+# context with the write token commenting needs.
+#
+# That token is why this job never checks out, downloads or runs anything from
+# the PR: it reads the run's artifact *list* through the API and writes a comment.
+# The one value it takes from the PR's run — the `pr-number` artifact — is
+# validated as a number and accepted only if that PR's head is the commit the
+# run built, so a fork cannot aim the comment at someone else's PR.
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] no PR code is checked out or executed; see above
+    workflows: [PR build]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  comment:
+    if: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Comment the download links
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          gh run download "$RUN_ID" --name pr-number --dir "$tmp"
+          pr=$(head -c 16 "$tmp/number" | tr -d '[:space:]')
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr-number artifact is not a number"
+            exit 1
+          fi
+          head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$HEAD_SHA" ]; then
+            echo "PR #$pr is now at $head, not the built $HEAD_SHA; a newer run will comment"
+            exit 0
+          fi
+
+          rows=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" --paginate --jq '
+            .artifacts[]
+            | select(.name | startswith("kerf-"))
+            | "| \(.name | ltrimstr("kerf-")) | [download](https://github.com/'"$GH_REPO"'/actions/runs/'"$RUN_ID"'/artifacts/\(.id)) | \(.size_in_bytes / 1048576 | floor) MB |"')
+
+          marker='<!-- kerf-pr-build -->'
+          {
+            echo "$marker"
+            echo "### Test builds for ${HEAD_SHA:0:7}"
+            echo
+            if [ "$CONCLUSION" != "success" ]; then
+              echo "> [!WARNING]"
+              echo "> Not every platform built — see [the run]($RUN_URL)."
+              echo
+            fi
+            if [ -n "$rows" ]; then
+              echo "| Platform | Installer | Size |"
+              echo "| --- | --- | --- |"
+              echo "$rows"
+            else
+              echo "No installers were produced."
+            fi
+            echo
+            echo "Unsigned builds of this PR's code, kept for 14 days; downloading needs a GitHub login."
+            echo "Only run builds from PRs you trust. Windows SmartScreen: *More info → Run anyway*."
+            echo "macOS: \`xattr -dr com.apple.quarantine /Applications/Kerf.app\` after copying it over."
+            echo "They don't auto-update; install a release to get back onto the update feed."
+          } > "$tmp/body.md"
+
+          existing=$(gh api "repos/$GH_REPO/issues/$pr/comments" --paginate \
+            --jq "map(select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\")))) | .[0].id // empty" \
+            | head -n1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$existing" -F body=@"$tmp/body.md" >/dev/null
+          else
+            gh pr comment "$pr" --body-file "$tmp/body.md"
+          fi

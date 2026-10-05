@@ -65,3 +65,7 @@ The site auto-deploys to GitHub Pages on any push to `main` that touches `site/*
 - If you touch the export graph or timeline math, add or update the unit tests in
   `kerf-core` — those paths are pure and tested on purpose.
 - Good first areas: new video/audio effects, MCP tool ergonomics, timeline UX, docs.
+- Every non-draft PR gets installers for Windows, macOS (Apple silicon) and Linux,
+  linked from a bot comment on the PR once they finish building (about 30 minutes).
+  Use them to try the change as an app, or to let a reviewer try it. They are
+  unsigned test builds, kept for 14 days, and don't auto-update.

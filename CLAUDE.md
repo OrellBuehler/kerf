@@ -860,6 +860,15 @@ edit cannot change — a release cut as a genuine prerelease is skipped by both 
 never becomes `releases/latest`. A release that fails outright just stays the
 prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
 plugin's error into an explanation (`describeFeedFailure`) as a backstop.
+**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR for
+Windows x64 / macOS arm64 / Linux x64 like the release does (bundled FFmpeg,
+`--features whisper`) but unsigned, with no updater artifacts and the cargo
+cache on, and upload them as 14-day artifacts. `pr-build-comment.yml` keeps one
+comment on the PR linking them: it runs on `workflow_run` because a fork's run
+only holds a read-only token, so it never checks out PR code, and it accepts the
+`pr-number` artifact only when that PR's head is the commit the run built.
+`workflow_run` fires only for workflows on the default branch, so a PR that adds
+or changes the commenter is not commented on by its own version.
 In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a
