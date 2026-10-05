@@ -156,6 +156,9 @@ const HW_ENCODER_CANDIDATES: [&str; 10] = [
 /// one-frame test encode and only the ones that succeed are reported. Ordered
 /// by [`HW_ENCODER_CANDIDATES`]. `KERF_HW_ENCODE=none` reports none.
 pub fn hw_encoders() -> &'static [String] {
+    /// How long one candidate gets to encode a single frame.
+    const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
     static ENCODERS: OnceLock<Vec<String>> = OnceLock::new();
     ENCODERS.get_or_init(|| {
         if !hw_encode_enabled() {
@@ -179,7 +182,8 @@ pub fn hw_encoders() -> &'static [String] {
             .filter(|enc| {
                 // 256x256 clears every family's minimum-dimension floor; nv12 is
                 // the input format they all accept.
-                command(&bin)
+                let mut probe = command(&bin);
+                probe
                     .args([
                         "-hide_banner",
                         "-v",
@@ -191,16 +195,42 @@ pub fn hw_encoders() -> &'static [String] {
                     ])
                     .args(["-frames:v", "1", "-pix_fmt", "nv12", "-c:v", enc, "-f", "null", "-"])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+                    .stderr(Stdio::null());
+                // A one-frame encode finishes in well under a second where the
+                // encoder works; a driver that hangs instead of failing must not
+                // take every later caller of this `OnceLock` with it.
+                status_within(&mut probe, HW_PROBE_TIMEOUT)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.success())
             })
             .map(|s| s.to_string())
             .collect();
         tracing::info!(encoders = ?found, "hardware video encoders detected");
         found
     })
+}
+
+/// Run `cmd` to completion, but give up on it after `limit`: the child is killed
+/// and `None` returned. stdin is closed so nothing can wait on a keypress.
+///
+/// For probes whose *only* job is to answer "does this work here", where a
+/// driver that wedges instead of failing would otherwise take the caller with it
+/// (the encoder probe runs inside a `OnceLock` every other thread waits on).
+pub(super) fn status_within(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.stdin(Stdio::null()).spawn()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
@@ -582,7 +612,11 @@ fn zscale_available() -> bool {
                 let has = |name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
                 has("zscale") && has("tonemap")
             })
-            .unwrap_or(false);
+            // A binary that will not even run renders nothing either way; only one
+            // that runs and lacks the filters gets the fallback. It also keeps the
+            // graph builders' output from depending on whether a test machine has
+            // ffmpeg installed.
+            .unwrap_or(true);
         tracing::debug!(available = ok, "probed ffmpeg for zscale + tonemap");
         ok
     })
@@ -3276,6 +3310,25 @@ pub fn stream_preview(
     }
 }
 
+/// How long a playback stream may go without producing a frame before it is
+/// declared dead. A stalled ffmpeg (a hardware decoder that opens and then never
+/// delivers, a driver stuck in teardown) is otherwise indistinguishable from a
+/// slow one, and the read below would wait for it forever — the webview then
+/// shows a frozen frame while the stream is "playing". `first` covers startup
+/// (graph setup, hardware probing, the first decode of a long source); `stall`
+/// covers the gap between frames once running, which a healthy stream paced to
+/// real time keeps well under a second.
+#[derive(Clone, Copy)]
+struct PreviewTimeouts {
+    first: std::time::Duration,
+    stall: std::time::Duration,
+}
+
+const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
+    first: std::time::Duration::from_secs(30),
+    stall: std::time::Duration::from_secs(15),
+};
+
 fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
@@ -3284,8 +3337,6 @@ fn stream_preview_once(
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
 ) -> Result<()> {
-    use std::io::Read;
-
     let fps = fps.clamp(1.0, 60.0);
     let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
@@ -3296,7 +3347,7 @@ fn stream_preview_once(
 
     let bin = ffmpeg_bin();
     tracing::debug!(start, fps, "starting preview stream");
-    let mut child = command(&bin)
+    let child = command(&bin)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3304,6 +3355,24 @@ fn stream_preview_once(
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
     *sent = Some(0);
+    pump_preview(child, start, fps, PREVIEW_TIMEOUTS, on_frame, sent)
+}
+
+/// Read JPEG frames off a running ffmpeg's stdout, pace them to `fps` against
+/// the wall clock and hand them to `on_frame`, until the stream ends, the
+/// callback declines a frame, or ffmpeg stops producing for longer than
+/// `timeouts` allows (it is then killed and the call fails). Always reaps the
+/// child.
+fn pump_preview(
+    mut child: std::process::Child,
+    start: f64,
+    fps: f64,
+    timeouts: PreviewTimeouts,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+    sent: &mut Option<u64>,
+) -> Result<()> {
+    use std::io::Read;
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 
     // Drain stderr on a side thread so a warning flood can't deadlock the frame
     // read, keeping only the tail for a failure message.
@@ -3314,12 +3383,33 @@ fn stream_preview_once(
         buf
     });
 
+    // stdout is read on its own thread so the loop below can give up on a
+    // silent ffmpeg (`recv_timeout`) instead of blocking in `read`. The bounded
+    // channel keeps the old backpressure: once a few chunks are queued the reader
+    // stops reading, the pipe fills and ffmpeg is throttled to the pacing.
     let mut stdout = child.stdout.take().expect("stdout piped");
+    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
+    // Detached: after the kill it ends on EOF (or on the dropped receiver).
+    std::thread::spawn(move || {
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let msg = match stdout.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => Ok(chunk[..n].to_vec()),
+                Err(e) => Err(e),
+            };
+            let failed = msg.is_err();
+            if tx.send(msg).is_err() || failed {
+                return;
+            }
+        }
+    });
+
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
-    let mut chunk = vec![0u8; 64 * 1024];
     let mut index: u64 = 0;
     let mut origin: Option<std::time::Instant> = None;
     let mut stopped = false;
+    let mut failure: Option<String> = None;
 
     'read: loop {
         while let Some((s, e)) = next_jpeg(&buf) {
@@ -3344,24 +3434,41 @@ fn stream_preview_once(
                 break 'read;
             }
         }
-        let n = stdout
-            .read(&mut chunk)
-            .map_err(|e| Error::Engine(format!("preview stream read failed: {e}")))?;
-        if n == 0 {
-            break;
+        let wait = if index == 0 { timeouts.first } else { timeouts.stall };
+        match rx.recv_timeout(wait) {
+            Ok(Ok(bytes)) => buf.extend_from_slice(&bytes),
+            Ok(Err(e)) => {
+                failure = Some(format!("preview stream read failed: {e}"));
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                failure = Some(format!(
+                    "preview stream stalled: ffmpeg produced no {} for {}s",
+                    if index == 0 { "first frame" } else { "frame" },
+                    wait.as_secs_f32()
+                ));
+                break;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
 
-    if stopped {
+    if stopped || failure.is_some() {
         let _ = child.kill();
     }
+    drop(rx);
     let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
-    if !stopped && !status.success() {
+    let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
         tail.reverse();
-        return Err(Error::Engine(format!("preview stream failed: {}", tail.join("\n").trim())));
+        tail.join("\n").trim().to_string()
+    };
+    if let Some(reason) = failure {
+        return Err(Error::Engine(format!("{reason}\n{}", tail()).trim().to_string()));
+    }
+    if !stopped && !status.success() {
+        return Err(Error::Engine(format!("preview stream failed: {}", tail())));
     }
     Ok(())
 }
@@ -3707,7 +3814,12 @@ fn spill_graph(args: &mut [String], tag: &str, flag: &str) -> Result<GraphScript
     let Some(i) = oversized_graph_index(args) else {
         return Ok(GraphScript(None));
     };
-    let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}.txt", std::process::id()));
+    // Unique per call: two renders in one process (the GUI previewing while an
+    // agent exports, two playback streams) share a pid and a tag, and the
+    // second to finish used to delete the script the other was still reading.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}-{seq}.txt", std::process::id()));
     std::fs::write(&path, &args[i]).map_err(|e| Error::Engine(format!("could not write the filtergraph script: {e}")))?;
     args[i] = path.to_string_lossy().into_owned();
     args[i - 1] = flag.to_string();
@@ -3725,6 +3837,16 @@ struct Bar {
     width: f64,
     start: std::time::Instant,
 }
+
+/// How often a running export checks whether it has been cancelled when ffmpeg
+/// has said nothing in the meantime.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long an export may go without a single `-progress` line before it is
+/// treated as hung. ffmpeg reports every half second while it is working, even
+/// through a slow filter, so this is a deadlock, not a heavy render — the bound
+/// is generous because killing a render that was merely slow is the worse error.
+const EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Spawn the `ffmpeg` binary with `args`, streaming `-progress` from stdout to
 /// map elapsed render time onto `bar`, and polling `cancel` between updates
@@ -3774,9 +3896,41 @@ fn run_ffmpeg_progress(
 
     let total = bar.total.max(1e-9);
     let mut cancelled = false;
+    let mut stalled = false;
     let stdout = child.stdout.take().expect("stdout piped");
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
+    // Progress lines are read on a side thread so the loop below keeps polling
+    // `cancel` (and watching for a silent ffmpeg) even when none arrive: a
+    // blocking `lines()` read meant a render that stopped reporting could neither
+    // be cancelled nor ever be given up on.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut last_output = Instant::now();
+    loop {
+        let line = match rx.recv_timeout(CANCEL_POLL) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel() {
+                    let _ = child.kill();
+                    cancelled = true;
+                    break;
+                }
+                if last_output.elapsed() > EXPORT_STALL {
+                    let _ = child.kill();
+                    stalled = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        last_output = Instant::now();
         if line == "progress=end" {
             break;
         }
@@ -3806,6 +3960,15 @@ fn run_ffmpeg_progress(
     if cancelled {
         tracing::info!(output = %output.display(), "export cancelled");
         return Ok(RenderStatus::Cancelled);
+    }
+    if stalled {
+        let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
+        tail.reverse();
+        return Err(Error::Engine(format!(
+            "ffmpeg stopped reporting progress for {}s and was stopped: {}",
+            EXPORT_STALL.as_secs(),
+            tail.join("\n").trim()
+        )));
     }
     if !status.success() {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
@@ -5579,6 +5742,7 @@ fn atempo_chain(speed: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::test_support::StatusBounded;
     use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
 
     /// A track mix that changes nothing — what every test that is not about the
@@ -5910,7 +6074,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -8830,6 +8994,110 @@ mod tests {
         assert_eq!(&noisy[s..e], &a[..]);
     }
 
+    /// A stand-in for ffmpeg: `script` run by `sh` with piped stdout / stderr.
+    /// `exec` in the script so a kill reaches the process holding the pipes.
+    #[cfg(unix)]
+    fn fake_stream(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[cfg(unix)]
+    fn short_timeouts() -> PreviewTimeouts {
+        PreviewTimeouts {
+            first: std::time::Duration::from_millis(400),
+            stall: std::time::Duration::from_millis(400),
+        }
+    }
+
+    /// An ffmpeg that opens and then never produces a frame must fail the
+    /// stream, not freeze it: the read used to wait on it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_that_never_produces_a_frame_times_out() {
+        let started = std::time::Instant::now();
+        let mut sent = Some(0);
+        let result = pump_preview(
+            fake_stream("echo no frames today >&2; exec sleep 60"),
+            0.0,
+            24.0,
+            short_timeouts(),
+            &mut |_| true,
+            &mut sent,
+        );
+        let err = result.expect_err("a silent stream must fail").to_string();
+        assert!(err.contains("stalled") && err.contains("first frame"), "{err}");
+        assert!(err.contains("no frames today"), "stderr tail is surfaced: {err}");
+        assert_eq!(sent, Some(0), "nothing was shown, so a software retry is safe");
+        assert!(started.elapsed().as_secs() < 10, "killed promptly: {:?}", started.elapsed());
+    }
+
+    /// Frames that did arrive are delivered, then a stall fails the stream with
+    /// the count intact (so the caller knows replaying would repeat them).
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_that_stalls_midway_delivers_what_it_had_then_fails() {
+        let mut frames = 0;
+        let mut sent = Some(0);
+        let result = pump_preview(
+            fake_stream(r"printf '\377\330one\377\331\377\330two\377\331'; exec sleep 60"),
+            1.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                assert_eq!(&f.jpeg[..2], &[0xFF, 0xD8]);
+                frames += 1;
+                true
+            },
+            &mut sent,
+        );
+        let err = result.expect_err("stall").to_string();
+        assert!(err.contains("stalled") && !err.contains("first frame"), "{err}");
+        assert_eq!((frames, sent), (2, Some(2)));
+    }
+
+    /// A callback that declines a frame still stops playback cleanly, and a
+    /// stream that simply ends is not an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_stops_on_request_and_ends_cleanly() {
+        let mut sent = Some(0);
+        let mut frames = 0;
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331\377\330b\377\331'; exec sleep 60"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |_| {
+                frames += 1;
+                false
+            },
+            &mut sent,
+        )
+        .expect("a requested stop is not a failure");
+        assert_eq!(frames, 1);
+
+        let mut frames = 0;
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331'"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |_| {
+                frames += 1;
+                true
+            },
+            &mut sent,
+        )
+        .expect("a stream that finishes is not a failure");
+        assert_eq!(frames, 1);
+    }
+
     #[test]
     fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
         let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
@@ -8933,7 +9201,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -8986,7 +9254,7 @@ mod tests {
             .args(["-filter_complex", "[1][0]overlay=x=80:y=240"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -9019,7 +9287,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=6"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -9069,7 +9337,7 @@ mod tests {
         let media = dir.join("src.mp4");
         let still = dir.join("card.png");
         let run = |args: Vec<String>| {
-            let ok = command(&ffmpeg_bin()).args(&args).status().expect("run ffmpeg");
+            let ok = command(&ffmpeg_bin()).args(&args).status_bounded().expect("run ffmpeg");
             assert!(ok.success(), "ffmpeg failed for {args:?}");
         };
         let s = |v: &str| v.to_string();
@@ -9161,7 +9429,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9189,7 +9457,7 @@ mod tests {
                     "gray",
                 ])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9237,7 +9505,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9315,7 +9583,7 @@ mod tests {
                 .args(["-f", "lavfi", "-i", &format!("color=c={color}:s=320x180:r=30:d=2")])
                 .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
                 .arg(&out)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             out
@@ -9362,7 +9630,7 @@ mod tests {
                 .args(["-vf", &format!("crop=20:20:{x}:{y}"), "-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9391,7 +9659,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=1"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9423,7 +9691,7 @@ mod tests {
                 .args(["-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9470,7 +9738,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "color=c=gray:s=320x180:r=25:d=10"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9501,7 +9769,7 @@ mod tests {
                 .arg(&out)
                 .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9543,7 +9811,7 @@ mod tests {
             .args(["-vf", "drawbox=x=0:y=0:w=64:h=360:color=white:t=fill"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&striped)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
         let plain = dir.join("gray.mp4");
@@ -9552,7 +9820,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=30:d=4"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&plain)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9575,7 +9843,7 @@ mod tests {
                 .args(["-vf", "crop=32:360:0:0", "-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9624,7 +9892,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9894,7 +10162,7 @@ mod tests {
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .args(args)
             .stdin(Stdio::null())
-            .status()
+            .status_bounded()
             .map(|s| s.success())
             .unwrap_or(false)
     }
@@ -10190,7 +10458,9 @@ mod tests {
     fn compare_frames(a: &[u8], b: &[u8]) -> (f64, f64, f64) {
         let mad = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / a.len() as f64;
         let colourful = |f: &[u8]| {
-            f.chunks_exact(3)
+            f.as_chunks::<3>()
+                .0
+                .iter()
                 .map(|p| (p.iter().max().unwrap() - p.iter().min().unwrap()) as f64)
                 .sum::<f64>()
                 / (f.len() / 3) as f64
@@ -10343,7 +10613,8 @@ mod tests {
         assert!(asset
             .streams
             .iter()
-            .any(|s| s.kind == StreamKind::Audio && s.codec == "pcm_s24le"));
+            // FFmpeg 6 reads the MP4 `ipcm` box back as 32-bit; any PCM is the point.
+            .any(|s| s.kind == StreamKind::Audio && s.codec.starts_with("pcm_s")));
 
         let timeline = single(vec![make_clip(asset.id, 0.0, 3.0, 0.0)]);
         // `vaapi` is a hardware decode that is requested by name: where it cannot
@@ -10384,8 +10655,13 @@ mod tests {
 
         // The other audio readers: preview PCM, waveform, loudness analysis.
         let pcm = audio_pcm(&media, 0.5, 0.5, 8_000, None).expect("preview audio");
-        assert_eq!(pcm.len(), 8_000 * 2 / 2, "half a second of mono s16le");
-        assert!(pcm.chunks_exact(2).any(|b| i16::from_le_bytes([b[0], b[1]]).abs() > 1000));
+        // FFmpeg 6 seeks PCM-in-MP4 to the nearest packet, so allow a short read.
+        assert!(
+            (5_000..=8_000).contains(&pcm.len()),
+            "about half a second of mono s16le: {}",
+            pcm.len()
+        );
+        assert!(pcm.as_chunks::<2>().0.iter().any(|b| i16::from_le_bytes(*b).abs() > 1000));
         let wave = waveform(&media, 50, 8_000).expect("waveform");
         assert!(wave.iter().copied().fold(0.0, f32::max) > 0.1);
         let loud = super::super::audio::measure_loudness(&media).expect("loudness");
@@ -10495,7 +10771,7 @@ mod tests {
             times
         };
         let flashes = onsets(luma.iter().map(|l| *l > 128).collect());
-        let samples: Vec<f64> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f64).collect();
+        let samples: Vec<f64> = pcm.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f64).collect();
         let beeps = onsets(
             samples
                 .chunks(80)

@@ -4941,6 +4941,7 @@ mod tests {
     #[ignore = "needs the ffmpeg binary"]
     #[allow(clippy::print_stderr)]
     fn hdr_asset_previews_through_a_tonemapped_proxy_exactly_once() {
+        use crate::engine::test_support::StatusBounded;
         let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
         let ffprobe = std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string());
         let dir = std::env::temp_dir().join(format!("kerf-hdr-proxy-{}", std::process::id()));
@@ -4962,7 +4963,7 @@ mod tests {
                 "tv",
             ])
             .arg(&sdr)
-            .status();
+            .status_bounded();
         assert!(tagged.unwrap().success());
         // FFmpeg 9 wants the card's colourspace stated in the graph, FFmpeg 4
         // wants it on a file: one of the two starts `zscale` from a known place.
@@ -4984,7 +4985,7 @@ mod tests {
                     "bt2020nc",
                 ])
                 .arg(&media)
-                .status()
+                .status_bounded()
                 .map(|s| s.success())
                 .unwrap_or(false)
         };

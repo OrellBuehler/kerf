@@ -221,7 +221,13 @@ so the feature is **only** activated through these forwards — which is what ma
   solo-shadowed track is as absent from playback as from the file. Only the ends
   differ: proxy paths in (the caller passes
   `timeline_frame_inputs`' proxy-swapped assets), `-c:v mjpeg -f image2pipe pipe:1`
-  out. Frames are **paced to the requested fps against the wall clock**, which
+  out. **Nothing waits on ffmpeg forever**: the stream reads stdout on a side
+  thread and gives up (killing the child, so the hwaccel retry falls back to
+  software) after 30 s with no first frame or 15 s between frames; an export
+  polls cancel every 250 ms rather than per progress line and is killed after
+  300 s with no `-progress` at all; each `hw_encoders` probe is capped at 20 s;
+  and a spilled graph file is unique per call, since two renders sharing a tag
+  used to delete each other's script. Frames are **paced to the requested fps against the wall clock**, which
   throttles ffmpeg through pipe backpressure instead of letting it race ahead and
   buffer the whole timeline, and each carries its timeline time so the webview can
   drop one the audio clock has already passed.
