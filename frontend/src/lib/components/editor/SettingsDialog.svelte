@@ -4,16 +4,12 @@
 	// what colors the editor is drawn in. A section list on the left, panels on
 	// the right, so the next one is a row in a list.
 	import Icon from './Icon.svelte';
+	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS } from '$lib/theme';
 
 	let { onClose }: { onClose: () => void } = $props();
-
-	let dialogEl = $state<HTMLDivElement | null>(null);
-	$effect(() => {
-		dialogEl?.focus();
-	});
 
 	// Sections are a list rather than markup so adding one is a data change.
 	const SECTIONS = [
@@ -46,7 +42,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	bind:this={dialogEl}
+	use:trapFocus
 	role="dialog"
 	aria-modal="true"
 	aria-label="Settings"

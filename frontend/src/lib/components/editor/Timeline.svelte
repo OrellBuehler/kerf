@@ -840,6 +840,9 @@
 	}
 
 	function commitRename(m: Marker, value: string) {
+		// Escape clears `renaming` first, and unmounting the focused input then
+		// fires its blur — which must not apply the text that was just abandoned.
+		if (renaming !== m.id) return;
 		renaming = null;
 		const name = value.trim();
 		if (name && name !== m.name) void editor.updateMarker(m.id, { name }).catch(err);

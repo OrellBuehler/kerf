@@ -53,7 +53,17 @@ export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+/** Whether `v` holds a NaN / Infinity anywhere. JSON turns those into `null`,
+ *  which the backend then rejects with a deserialize error that says nothing
+ *  about which field — and an emptied `<input type=number>` is a NaN. */
+function hasNonFinite(v: unknown, depth = 0): boolean {
+	if (typeof v === 'number') return !Number.isFinite(v);
+	if (depth > 6 || v === null || typeof v !== 'object' || ArrayBuffer.isView(v)) return false;
+	return Object.values(v).some((x) => hasNonFinite(x, depth + 1));
+}
+
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	if (hasNonFinite(args)) throw new Error('That value is not a number.');
 	const { invoke } = await import('@tauri-apps/api/core');
 	return invoke<T>(cmd, args);
 }
@@ -296,6 +306,39 @@ export async function projectPath(): Promise<string | null> {
 	return (await invoke<string | null>('project_path')) ?? null;
 }
 
+/** Ask a yes/no question before something irreversible. `window.confirm` is
+ *  replaced by the dialog plugin in the desktop app and returns a promise
+ *  there, so it can't be used synchronously — hence this. */
+export async function confirmAction(message: string, title = 'Kerf'): Promise<boolean> {
+	if (!inTauri()) return window.confirm(message);
+	const { ask } = await import('@tauri-apps/plugin-dialog');
+	return ask(message, { title, kind: 'warning' });
+}
+
+/** When the window is asked to close and `needsConfirm()` says there is
+ *  something to lose, hold it open and close only if `confirm` resolves true.
+ *  Otherwise the close goes through untouched. Returns an unlisten fn. */
+export async function onWindowCloseRequested(
+	needsConfirm: () => boolean,
+	confirm: () => Promise<boolean>
+): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	const win = getCurrentWindow();
+	return win.onCloseRequested(async (e) => {
+		if (!needsConfirm()) return;
+		e.preventDefault();
+		let close = false;
+		try {
+			close = await confirm();
+		} catch {
+			// A dialog that fails to show must not make the window unclosable.
+			close = true;
+		}
+		if (close) await win.destroy();
+	});
+}
+
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */
 export async function newProject(): Promise<boolean> {
 	if (!inTauri()) return false;
@@ -411,7 +454,8 @@ let playbackSeq = 0;
 export function startPlayback(
 	start: number,
 	fps: number,
-	onFrame: (f: PlaybackFrame) => void
+	onFrame: (f: PlaybackFrame) => void,
+	onError?: (message: string) => void
 ): () => void {
 	if (!inTauri()) return samplePlayback(start, fps, onFrame);
 	// The backend cancels *by id* rather than by a generation counter: start and
@@ -427,12 +471,17 @@ export function startPlayback(
 			if (!stopped) onFrame(f);
 		};
 		// Resolves only when playback ends; nothing waits on it.
-		void invoke('start_playback', { playbackId, start, fps, onFrame: channel }).catch(() => {});
+		// The backend only rejects for a real failure (ffmpeg died, inputs
+		// would not resolve), never for a stop or a supersede — but a stream
+		// already stopped on this side has no one left to tell.
+		void invoke('start_playback', { playbackId, start, fps, onFrame: channel }).catch((e) => {
+			if (!stopped) onError?.(e instanceof Error ? e.message : String(e));
+		});
 	})();
 	return () => {
 		if (stopped) return;
 		stopped = true;
-		void invoke('stop_playback', { playbackId }).catch(() => {});
+		void invoke('stop_playback', { playbackId }).catch((e) => console.warn('stop_playback failed', e));
 	};
 }
 

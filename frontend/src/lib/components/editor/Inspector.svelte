@@ -25,6 +25,9 @@
 	} from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 
+	/** Shortest a title may be made by typing its Start / End; a span that ends
+	 *  before it starts is never on screen and reads as the title vanishing. */
+	const MIN_OVERLAY = 0.1;
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
@@ -377,7 +380,11 @@
 			disabled={editor.busy}
 			onchange={(e) => {
 				const v = parseFloat(e.currentTarget.value);
-				if (Number.isFinite(v)) onCommit(v);
+				// Put the field back to what the clip has first: an emptied, negative
+				// or clamped entry then doesn't sit there showing something that
+				// was ignored, while an accepted one re-renders over this.
+				e.currentTarget.value = String(value);
+				if (Number.isFinite(v) && v >= 0) onCommit(v);
 			}}
 			style={inputCss}
 		/>
@@ -538,8 +545,12 @@
 						style={inputCss + ';flex:1;width:auto;text-align:left'}
 					/>
 				</label>
-				{@render numRow('Start', o.start, 0.1, (v) => run(() => editor.updateOverlay(o.id, { start: Math.max(0, v) })))}
-				{@render numRow('End', o.end, 0.1, (v) => run(() => editor.updateOverlay(o.id, { end: v })))}
+				{@render numRow('Start', o.start, 0.1, (v) =>
+					run(() => editor.updateOverlay(o.id, { start: Math.min(v, Math.max(0, o.end - MIN_OVERLAY)) }))
+				)}
+				{@render numRow('End', o.end, 0.1, (v) =>
+					run(() => editor.updateOverlay(o.id, { end: Math.max(v, o.start + MIN_OVERLAY) }))
+				)}
 				{@render rangeRow('Pos X', o.pos_x, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
 					run(() => editor.updateOverlay(o.id, { pos_x: v }))
 				)}
@@ -674,10 +685,10 @@
 
 			<InspectorSection title="Fades" summary={`${clip.fade_in}s in · ${clip.fade_out}s out`}>
 			{@render numRow('Fade in', clip.fade_in, 0.1, (v) =>
-				run(() => editor.setFade(clip.id, Math.max(0, v), undefined))
+				run(() => editor.setFade(clip.id, Math.min(v, clipDuration(clip)), undefined))
 			)}
 			{@render numRow('Fade out', clip.fade_out, 0.1, (v) =>
-				run(() => editor.setFade(clip.id, undefined, Math.max(0, v)))
+				run(() => editor.setFade(clip.id, undefined, Math.min(v, clipDuration(clip))))
 			)}
 			</InspectorSection>
 

@@ -1846,6 +1846,7 @@ impl KerfMcp {
             let mut on_progress = |progress: kerf_core::ExportProgress| {
                 let _ = tx.send(progress);
             };
+            let before = crate::file_mtime(std::path::Path::new(&render_path));
             let status = kerf_core::render_with_progress(
                 &timeline,
                 &assets,
@@ -1854,7 +1855,12 @@ impl KerfMcp {
                 &mut on_progress,
                 &|| cancel.is_cancelled(),
             )
-            .map_err(core_err)?;
+            .map_err(|e| {
+                // A failed render must not leave a truncated file that reads
+                // as a finished one.
+                crate::discard_partial(std::path::Path::new(&render_path), before);
+                core_err(e)
+            })?;
             if status == kerf_core::RenderStatus::Cancelled {
                 // Mirrors the GUI: a cancelled export leaves no debris, and in
                 // particular no truncated file that reads as a finished render.

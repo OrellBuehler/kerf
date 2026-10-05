@@ -1269,13 +1269,23 @@ async fn start_playback(
             elapsed_ms = began.elapsed().as_millis() as u64,
             "playback stream ended"
         );
-        // Running out of timeline, or being superseded, is not an error; only a
-        // genuine ffmpeg failure is worth surfacing.
-        if let Err(e) = result {
-            tracing::debug!(error = %e, "preview stream ended");
-        }
+        // Running out of timeline, or being superseded or stopped, is not an
+        // error; only a genuine ffmpeg failure on a stream someone is still
+        // watching is reported — the preview would otherwise just go black.
+        let current =
+            ACTIVE_PLAYBACK.load(Ordering::SeqCst) == playback_id && STOPPED_PLAYBACK.load(Ordering::SeqCst) != playback_id;
         let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
-        Ok(())
+        match result {
+            Err(e) if current => {
+                tracing::warn!(error = %e, "preview stream failed");
+                Err(e.to_string())
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "preview stream ended");
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+        }
     })
     .await
 }
@@ -1393,6 +1403,19 @@ async fn hw_encoders() -> CmdResult<Vec<String>> {
     blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await
 }
 
+pub(crate) fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Remove what a failed render left at `path` — but only if this run touched
+/// it. A failure before ffmpeg opened the output (bad options, an empty cut)
+/// must not delete the earlier export still sitting at that path.
+pub(crate) fn discard_partial(path: &std::path::Path, before: Option<std::time::SystemTime>) {
+    if file_mtime(path) != before {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[tauri::command]
 async fn export_timeline(
     app: AppHandle,
@@ -1423,15 +1446,21 @@ async fn export_timeline(
         let mut on_progress = |p: kerf_core::ExportProgress| {
             let _ = app.emit("export-progress", p);
         };
-        let status = kerf_core::render_with_progress(
+        let before = file_mtime(std::path::Path::new(&output_path));
+        let status = match kerf_core::render_with_progress(
             &timeline,
             &assets,
             std::path::Path::new(&output_path),
             &options,
             &mut on_progress,
             &|| cancel.load(Ordering::SeqCst),
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            Ok(status) => status,
+            Err(e) => {
+                discard_partial(std::path::Path::new(&output_path), before);
+                return Err(e.to_string());
+            }
+        };
 
         match status {
             kerf_core::RenderStatus::Completed => Ok(output_path),
@@ -1500,18 +1529,44 @@ async fn export_variants(
                 project.list_assets().map_err(|e| e.to_string())?,
             )
         };
-        let mut on_progress = |p: kerf_core::VariantProgress| {
-            let _ = app.emit("export-progress", p);
-        };
-        let (status, _) = kerf_core::render_variants(&timeline, &assets, &variants, &options, &mut on_progress, &|| {
-            cancel.load(Ordering::SeqCst)
-        })
-        .map_err(|e| e.to_string())?;
-        match status {
-            kerf_core::RenderStatus::Completed => Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect()),
-            // The variant in flight is already gone; the finished ones stay.
-            kerf_core::RenderStatus::Cancelled => Err("export cancelled".to_string()),
+        // One variant at a time through `render_variants`, so a failure names
+        // the file in flight: that one is removed, the finished ones stay.
+        let total = variants.len();
+        let started = std::time::Instant::now();
+        for (i, variant) in variants.iter().enumerate() {
+            let mut on_progress = |p: kerf_core::VariantProgress| {
+                let fraction = (i as f64 + p.fraction.clamp(0.0, 1.0)) / total as f64;
+                let elapsed_secs = started.elapsed().as_secs_f64();
+                let _ = app.emit(
+                    "export-progress",
+                    kerf_core::VariantProgress {
+                        variant: i,
+                        total,
+                        fraction,
+                        elapsed_secs,
+                        eta_secs: (fraction > 0.0).then(|| elapsed_secs / fraction - elapsed_secs),
+                    },
+                );
+            };
+            let before = file_mtime(&variant.output);
+            match kerf_core::render_variants(
+                &timeline,
+                &assets,
+                std::slice::from_ref(variant),
+                &options,
+                &mut on_progress,
+                &|| cancel.load(Ordering::SeqCst),
+            ) {
+                Ok((kerf_core::RenderStatus::Completed, _)) => {}
+                // `render_variants` already removed the cancelled file.
+                Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
+                Err(e) => {
+                    discard_partial(&variant.output, before);
+                    return Err(e.to_string());
+                }
+            }
         }
+        Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect())
     })
     .await
 }

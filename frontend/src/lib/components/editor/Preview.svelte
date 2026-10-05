@@ -99,6 +99,16 @@
 	 *  restarting it from where playback has actually got to. */
 	let resyncs = $state(0);
 
+	// Every seek or edit restarts the stream, so a timeline that cannot render
+	// would raise the same failure on each restart; say it once per spell.
+	let lastPlaybackError = { message: '', at: 0 };
+	function reportPlaybackError(message: string) {
+		const now = Date.now();
+		if (message === lastPlaybackError.message && now - lastPlaybackError.at < 15_000) return;
+		lastPlaybackError = { message, at: now };
+		toast.error(`Playback preview failed: ${message}`);
+	}
+
 	function endStream() {
 		stopStream?.();
 		stopStream = null;
@@ -143,7 +153,7 @@
 				case 'show':
 					frameUrl = f.jpeg;
 			}
-		});
+		}, reportPlaybackError);
 		stopStream = stop;
 		return () => {
 			live = false;

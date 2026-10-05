@@ -17,10 +17,13 @@
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
-	import { inTauri, isMediaPath } from '$lib/api';
+	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	let exportOpen = $state(false);
+	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
+	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
+	const modalOpen = $derived(exportOpen || settings.open || updater.dialogOpen);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
 
@@ -39,7 +42,14 @@
 		void settings.load();
 		// Ask GitHub whether a newer signed release exists (silently — offline is
 		// not worth an interruption) and offer it in the title bar / dialog.
+		const unlisteners: Array<() => void> = [];
 		const stopUpdater = updater.init();
+		// A project that was never saved lives only in memory: closing the window
+		// would drop it without a word, so ask first.
+		void onWindowCloseRequested(
+			() => editor.hasUnsavedWork,
+			() => confirmAction('This project has never been saved. Close Kerf and lose it?', 'Close Kerf')
+		).then((un) => unlisteners.push(un));
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -66,7 +76,6 @@
 				refreshing = false;
 			}
 		}
-		const unlisteners: Array<() => void> = [];
 		if (inTauri()) {
 			// Files dropped onto the window import the same way the picker does —
 			// which is what the media bin's "Drop media to start" has been
@@ -77,7 +86,7 @@
 						// A clip being dragged out of the media bin is an HTML5 drag
 						// inside the webview, not files arriving from the OS; it must
 						// not raise the import overlay over the lane it is aiming at.
-						if (ui.dndAsset) return;
+						if (ui.dndAsset || modalOpen) return;
 						if (e.payload.type === 'enter' || e.payload.type === 'over') dropHover = true;
 						else if (e.payload.type === 'leave') dropHover = false;
 						else if (e.payload.type === 'drop') {
@@ -119,11 +128,20 @@
 		};
 	});
 
+	/** New / Open replace the project; one that was never saved would be gone. */
+	async function okToReplace(): Promise<boolean> {
+		return (
+			!editor.hasUnsavedWork ||
+			confirmAction('This project has never been saved and will be lost. Continue?', 'Unsaved project')
+		);
+	}
+
 	async function onNew() {
 		if (!inTauri()) {
 			toast.info('Creating a project is available in the desktop app.');
 			return;
 		}
+		if (!(await okToReplace())) return;
 		try {
 			if (await editor.newProject()) {
 				await agent.load();
@@ -139,6 +157,7 @@
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
 		}
+		if (!(await okToReplace())) return;
 		try {
 			if (await editor.openProject()) {
 				await agent.load();
@@ -233,7 +252,7 @@
 	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
 
 	function onKey(e: KeyboardEvent) {
-		if (e.defaultPrevented) return;
+		if (e.defaultPrevented || modalOpen) return;
 		const target = e.target instanceof Element ? e.target : null;
 		// Typing goes to the field. A range / checkbox only needs the keys that
 		// operate it, so J/K/L still shuttle after a fader was clicked.
@@ -362,7 +381,10 @@
 
 <svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} />
 
-<div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)">
+<div
+	inert={modalOpen}
+	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
+>
 	<TitleBar />
 	<Toolbar {onNew} {onExport} {onOpen} {onSave} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
