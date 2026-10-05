@@ -54,6 +54,9 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             channels: None,
             image: false,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         };
 
         match medium {
@@ -61,16 +64,22 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                 if let Ok(video) = codec.decoder().video() {
                     info.width = Some(video.width());
                     info.height = Some(video.height());
+                    info.color_transfer = transfer_name(video.color_transfer_characteristic());
+                    info.color_primaries = primaries_name(video.color_primaries());
                 }
                 // Mirror the ffprobe path's two projection signals (see
                 // `super::cli::detect_projection`): the container's declared
                 // spherical mapping first, then the Insta360 dual-fisheye shape.
+                // Both judge the *coded* frame, so they run before the swap below.
                 info.projection = spherical_projection(&stream)
                     .or_else(|| super::cli::projection_from_shape(Some(path), info.width, info.height));
-                let rate = stream.rate();
-                if rate.denominator() != 0 {
-                    info.fps = Some(rate.numerator() as f64 / rate.denominator() as f64);
-                }
+                // Report the displayed size, as the ffprobe path does: a phone clip
+                // is a landscape frame with a display matrix, and every decode
+                // autorotates it.
+                info.rotation = display_rotation(&stream);
+                (info.width, info.height) = super::cli::displayed_size(info.width, info.height, info.rotation);
+                let fps = |r: ff::Rational| (r.denominator() != 0).then(|| r.numerator() as f64 / r.denominator() as f64);
+                info.fps = super::cli::nominal_fps(fps(stream.rate()), fps(stream.avg_frame_rate()));
             }
             ff::media::Type::Audio => {
                 if let Ok(audio) = codec.decoder().audio() {
@@ -101,6 +110,45 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     }
 
     Ok(ProbeResult { duration, streams })
+}
+
+/// How far the stream is turned for display — the libav twin of the ffprobe
+/// path's `Display Matrix` parse. The side data is the 3x3 matrix of 16.16
+/// fixed-point `int32`s; [`super::cli::matrix_rotation`] reads the angle out.
+fn display_rotation(stream: &ff::format::stream::Stream) -> i16 {
+    let Some(sd) = stream
+        .side_data()
+        .find(|d| d.kind() == ff::codec::packet::side_data::Type::DisplayMatrix)
+    else {
+        return 0;
+    };
+    let mut matrix = [0i32; 9];
+    for (slot, bytes) in matrix.iter_mut().zip(sd.data().chunks_exact(4)) {
+        *slot = i32::from_ne_bytes(bytes.try_into().expect("chunks of four"));
+    }
+    super::cli::matrix_rotation(&matrix)
+}
+
+/// The transfer characteristics the engine acts on, under ffprobe's names.
+fn transfer_name(t: ff::color::TransferCharacteristic) -> Option<String> {
+    use ff::color::TransferCharacteristic as T;
+    let name = match t {
+        T::ARIB_STD_B67 => Some("arib-std-b67"),
+        T::SMPTE2084 => Some("smpte2084"),
+        T::BT709 => Some("bt709"),
+        _ => None,
+    };
+    name.map(str::to_string)
+}
+
+fn primaries_name(p: ff::color::Primaries) -> Option<String> {
+    use ff::color::Primaries as P;
+    let name = match p {
+        P::BT2020 => Some("bt2020"),
+        P::BT709 => Some("bt709"),
+        _ => None,
+    };
+    name.map(str::to_string)
 }
 
 /// The stream's declared spherical mapping, if it has one — the libav twin of the

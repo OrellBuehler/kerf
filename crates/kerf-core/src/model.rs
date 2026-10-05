@@ -102,6 +102,65 @@ pub struct StreamInfo {
     /// why 360 support needs no schema migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<Projection>,
+    /// How far a player turns this video to show it upright, in degrees
+    /// counter-clockwise as ffprobe's `Display Matrix` reports it (a portrait
+    /// iPhone clip is a landscape sensor frame with 90 or -90 here). `width` /
+    /// `height` are already the **displayed** size — every FFmpeg decode
+    /// autorotates, so the pixels the engine sees are the rotated ones — and
+    /// this only records that the file's coded frame is turned. Defaulted (and
+    /// omitted at 0) so older `.kerf` JSON still deserializes.
+    #[serde(default, skip_serializing_if = "is_zero_rotation")]
+    pub rotation: i16,
+    /// The video's transfer characteristic as ffprobe names it
+    /// (`arib-std-b67` for HLG, `smpte2084` for PQ, `bt709`, …). Together with
+    /// [`StreamInfo::hdr`] this is what decides whether the engine tone-maps the
+    /// stream to SDR. Defaulted so older `.kerf` JSON (probed before it was
+    /// read) still deserializes, as SDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_transfer: Option<String>,
+    /// The video's colour primaries as ffprobe names them (`bt2020`, `bt709`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_primaries: Option<String>,
+}
+
+fn is_zero_rotation(r: &i16) -> bool {
+    *r == 0
+}
+
+/// The high-dynamic-range transfer functions the engine knows how to bring down
+/// to SDR. Dolby Vision profile 8.4 (an iPhone's) carries an HLG-compatible base
+/// layer, so it probes as `Hlg` and needs nothing of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hdr {
+    /// Hybrid log-gamma (`arib-std-b67`) — what an iPhone records.
+    Hlg,
+    /// SMPTE ST 2084 perceptual quantizer (`smpte2084`) — HDR10.
+    Pq,
+}
+
+impl Hdr {
+    /// The zimg / `zscale` name of the transfer function.
+    pub fn zscale_name(self) -> &'static str {
+        match self {
+            Hdr::Hlg => "arib-std-b67",
+            Hdr::Pq => "smpte2084",
+        }
+    }
+}
+
+impl StreamInfo {
+    /// The HDR transfer this video stream is encoded in, or `None` for SDR and
+    /// for anything that is not video.
+    pub fn hdr(&self) -> Option<Hdr> {
+        if self.kind != StreamKind::Video {
+            return None;
+        }
+        match self.color_transfer.as_deref() {
+            Some("arib-std-b67") => Some(Hdr::Hlg),
+            Some("smpte2084") => Some(Hdr::Pq),
+            _ => None,
+        }
+    }
 }
 
 /// An imported media file plus the structured metadata probed from it.
@@ -150,6 +209,25 @@ impl Asset {
     /// Clips cut from such an asset are reframed to flat by default.
     pub fn projection(&self) -> Option<Projection> {
         self.streams.iter().find_map(|s| s.projection).filter(|p| p.is_spherical())
+    }
+
+    /// The HDR transfer of this asset's video, if it is HDR footage that must be
+    /// tone-mapped to SDR wherever it is decoded.
+    pub fn hdr(&self) -> Option<Hdr> {
+        self.streams.iter().find_map(|s| s.hdr())
+    }
+
+    /// This asset as seen through its generated preview proxy: same metadata
+    /// (so the composite geometry matches the export) but SDR, because the
+    /// proxy was tone-mapped when it was encoded and must not be converted a
+    /// second time.
+    pub(crate) fn as_sdr_proxy(&self) -> Asset {
+        let mut asset = self.clone();
+        for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            s.color_transfer = None;
+            s.color_primaries = None;
+        }
+        asset
     }
 }
 
@@ -3367,6 +3445,61 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_saved_before_rotation_and_colour_were_probed_still_loads_as_sdr() {
+        let old = r#"{"index":0,"kind":"video","codec":"hevc","width":1920,"height":1080,"fps":30.0}"#;
+        let s: StreamInfo = serde_json::from_str(old).unwrap();
+        assert_eq!((s.rotation, s.color_transfer.clone(), s.hdr()), (0, None, None));
+        // And an ordinary stream serializes exactly as it did.
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"index":0,"kind":"video","codec":"hevc","width":1920,"height":1080,"fps":30.0}"#
+        );
+    }
+
+    #[test]
+    fn hdr_is_a_property_of_video_streams_with_an_hdr_transfer() {
+        let mut s: StreamInfo = serde_json::from_str(r#"{"index":0,"kind":"video","codec":"hevc"}"#).unwrap();
+        for (tag, want) in [
+            ("arib-std-b67", Some(Hdr::Hlg)),
+            ("smpte2084", Some(Hdr::Pq)),
+            ("bt709", None),
+            ("smpte170m", None),
+        ] {
+            s.color_transfer = Some(tag.into());
+            assert_eq!(s.hdr(), want, "{tag}");
+        }
+        s.color_transfer = Some("arib-std-b67".into());
+        s.kind = StreamKind::Audio;
+        assert_eq!(s.hdr(), None);
+    }
+
+    #[test]
+    fn a_proxied_asset_is_sdr_and_keeps_the_rest_of_its_metadata() {
+        let streams = r#"[{"index":0,"kind":"video","codec":"hevc","width":1080,"height":1920,"rotation":-90,"color_transfer":"arib-std-b67","color_primaries":"bt2020"}]"#;
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "/a.mov".into(),
+            name: "a.mov".into(),
+            duration: 3.0,
+            streams: serde_json::from_str(streams).unwrap(),
+            imported_at: Utc::now(),
+            source_paths: Vec::new(),
+        };
+        assert_eq!(asset.hdr(), Some(Hdr::Hlg));
+        let proxied = asset.as_sdr_proxy();
+        assert_eq!(proxied.hdr(), None);
+        assert_eq!(
+            (
+                proxied.streams[0].width,
+                proxied.streams[0].height,
+                proxied.streams[0].rotation
+            ),
+            (Some(1080), Some(1920), -90)
+        );
+        assert_eq!(asset.hdr(), Some(Hdr::Hlg), "the original is untouched");
+    }
 
     fn clip_at(start: f64, dur: f64) -> Clip {
         Clip::new(Uuid::new_v4(), 0.0, dur, start)

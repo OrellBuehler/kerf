@@ -15,6 +15,16 @@ export interface StreamInfo {
 	image?: boolean;
 	/** Set when the stream is 360 footage, detected at probe time. */
 	projection?: Projection | null;
+	/**
+	 * Degrees counter-clockwise the file's coded frame is turned for display (a
+	 * portrait phone clip is 90 or -90). `width`/`height` are already the
+	 * displayed size; absent when 0.
+	 */
+	rotation?: number;
+	/** Transfer characteristic as ffprobe names it: `arib-std-b67` (HLG), `smpte2084` (PQ), `bt709`, … */
+	color_transfer?: string | null;
+	/** Colour primaries as ffprobe names them: `bt2020`, `bt709`, … */
+	color_primaries?: string | null;
 }
 
 /**
