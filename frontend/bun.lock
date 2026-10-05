@@ -228,7 +228,7 @@
 
     "detect-libc": ["detect-libc@2.1.2", "", {}, "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="],
 
-    "devalue": ["devalue@5.9.1", "", {}, "sha512-+17vil3EVQRzvtDJSFuTWEb8XJRvXqAiV3qZyQWD398QeXUa6CxsUyMdD1fxzEhUrd4FojitFz7lhIHBTlV4fw=="],
+    "devalue": ["devalue@5.9.3", "", {}, "sha512-xRumYOCUZN/EesqHEU3WOXanOZNvfZFZ/o1AHVFDX1yI0UAkZkOgDXt341CzKoBVIkgQba55/+DjGBKrIoKcHw=="],
 
     "dockview": ["dockview@8.3.1", "", { "dependencies": { "dockview-core": "^8.3.1" } }, "sha512-2odBC9cDKcVCVx8Db86vq9s9JZKzbgvdkxDzcfsrD9nORLc5UqhLgLvVcJguorBv7CyEpKDzFO1JVLYWJCYrJA=="],
 
