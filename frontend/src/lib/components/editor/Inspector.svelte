@@ -8,6 +8,8 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
+	import type { TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
 	import { needsCrop } from '$lib/smart-crop';
@@ -25,9 +27,6 @@
 	} from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 
-	/** Shortest a title may be made by typing its Start / End; a span that ends
-	 *  before it starts is never on screen and reads as the title vanishing. */
-	const MIN_OVERLAY = 0.1;
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
@@ -143,6 +142,7 @@
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlays = $derived(editor.overlays);
+	const overlay = $derived(editor.selectedOverlay);
 
 	const VIDEO_FX: Record<string, VideoEffect> = {
 		blur: { type: 'blur', sigma: 6 },
@@ -203,11 +203,21 @@
 	}
 	function addOverlayHere() {
 		const at = Math.max(0, ui.time);
-		void run(async () => {
-			await editor.addOverlay('Text', at, at + 3);
-			const created = editor.overlays[editor.overlays.length - 1];
-			if (created) editor.selectedOverlayId = created.id;
-		});
+		void run(() => editor.addTitle('Text', at, at + 3));
+	}
+	/** Pick a title from the lane's list, and bring the playhead into its span so
+	 *  the preview has it on screen to move and resize. */
+	function pickOverlay(o: TextOverlay) {
+		if (editor.selectedOverlayId === o.id) {
+			editor.selectOverlay(null);
+			return;
+		}
+		editor.selectOverlay(o.id);
+		if (ui.time < o.start || ui.time > o.end) ui.seek(o.start);
+	}
+	function removeOverlayKeyframe(o: TextOverlay, i: number) {
+		const left = (o.keyframes ?? []).filter((_, j) => j !== i).map((k) => ({ ...k }));
+		void run(() => editor.setOverlayKeyframes(o.id, left));
 	}
 	/** Add a preset-styled overlay at the playhead: create, style, then (for
 	 *  faded styles) keyframe the opacity in and out. */
@@ -228,7 +238,7 @@
 					kf(s.duration, 0)
 				]);
 			}
-			editor.selectedOverlayId = created.id;
+			editor.selectOverlay(created.id);
 		});
 	}
 	/** Captions are placed in timeline time, so they follow the cut — which also
@@ -488,8 +498,150 @@
 
 {/snippet}
 
+{#snippet overlayEditor(o: TextOverlay)}
+	{@const pose = sampleOverlay(o, ui.time)}
+	{@const keys = o.keyframes ?? []}
+	<div style="display:flex;gap:9px;align-items:center">
+		<div
+			style="width:40px;height:28px;border-radius:3px;flex:none;background:{o.generated
+				? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))'
+				: 'var(--track-text)'};border:1px solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
+		>
+			<Icon n="captions" s={14} />
+		</div>
+		<div style="flex:1;min-width:0">
+			<div
+				style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				title={o.text}
+			>
+				{o.text || '(empty)'}
+			</div>
+			<div style="margin-top:3px"><Badge tone="neutral">{o.generated ? 'Caption' : 'Title'} · titles lane</Badge></div>
+		</div>
+	</div>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-top:8px">
+		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
+	</div>
+
+	<InspectorSection title="Text" summary={`${tc(o.start)} – ${tc(o.end)}`} open>
+		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
+			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Text</span>
+			<input
+				type="text"
+				value={o.text}
+				disabled={editor.busy}
+				onchange={(e) => run(() => editor.updateOverlay(o.id, { text: e.currentTarget.value }))}
+				style={inputCss + ';flex:1;width:auto;text-align:left'}
+			/>
+		</label>
+		{@render numRow('Start', o.start, 0.1, (v) =>
+			run(() => editor.updateOverlay(o.id, { start: Math.min(v, Math.max(0, o.end - MIN_TITLE)) }))
+		)}
+		{@render numRow('End', o.end, 0.1, (v) =>
+			run(() => editor.updateOverlay(o.id, { end: Math.max(v, o.start + MIN_TITLE) }))
+		)}
+		{@render rangeRow('Pos X', pose.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
+			run(() => editor.moveOverlay(o.id, v, pose.y, ui.time))
+		)}
+		{@render rangeRow('Pos Y', pose.y, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
+			run(() => editor.moveOverlay(o.id, pose.x, v, ui.time))
+		)}
+		{@render rangeRow('Size', o.size, TITLE_SIZE_MIN, Math.max(0.2, TITLE_SIZE_MAX, o.size), 0.005, (v) => `${Math.round(v * 100)}%`, (v) =>
+			run(() => editor.updateOverlay(o.id, { size: v }))
+		)}
+		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
+			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Color</span>
+			<input
+				type="text"
+				value={o.color}
+				disabled={editor.busy}
+				onchange={(e) => run(() => editor.updateOverlay(o.id, { color: e.currentTarget.value }))}
+				style={fxTxt}
+			/>
+			<span style="font-size:12px;color:var(--text-muted)">Box</span>
+			<input
+				type="text"
+				value={o.bg ?? ''}
+				placeholder="none"
+				disabled={editor.busy}
+				onchange={(e) => run(() => editor.updateOverlay(o.id, { bg: e.currentTarget.value }))}
+				style={fxTxt}
+			/>
+		</label>
+		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
+			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Font</span>
+			<select
+				value={o.font ?? ''}
+				disabled={editor.busy}
+				onchange={(e) => run(() => editor.updateOverlay(o.id, { font: e.currentTarget.value }))}
+				style={selectCss + ';flex:1'}
+			>
+				<option value="">Default</option>
+				{#each ui.availableFonts as f (f)}
+					<option value={f}>{f}</option>
+				{/each}
+			</select>
+		</label>
+		<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
+			<span style="font-size:12px;color:var(--text-muted)">Bold</span>
+			<input
+				type="checkbox"
+				checked={o.bold}
+				disabled={editor.busy}
+				onchange={(e) => run(() => editor.updateOverlay(o.id, { bold: e.currentTarget.checked }))}
+				style="accent-color:var(--kerf-500);width:18px;height:18px"
+			/>
+		</label>
+		</InspectorSection>
+
+	<InspectorSection title="Animation" summary={count(keys.length, 'keyframe')}>
+		{#if keys.length}
+			{#each keys as k, i (i)}
+				<div
+					style="display:flex;align-items:center;gap:8px;padding:2px 0;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+				>
+					<span style="color:var(--text-muted);width:46px;flex:none">{k.time.toFixed(2)}s</span>
+					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
+					>
+					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
+				</div>
+			{/each}
+			<Btn
+				size="sm"
+				variant="ghost"
+				style="margin-top:4px"
+				disabled={editor.busy}
+				onclick={() => run(() => editor.setOverlayKeyframes(o.id, []))}>Clear keyframes</Btn
+			>
+			<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
+				This title is animated: moving it in the preview or with Pos X / Pos Y keyframes the position at the playhead.
+			</div>
+		{:else}
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+				Still title. Fade presets add opacity keyframes; once there are keyframes, moving the title at the playhead adds position keyframes.
+			</div>
+		{/if}
+	</InspectorSection>
+
+	<div style="margin-top:18px">
+		<Btn
+			variant="destructive"
+			size="sm"
+			icon="trash"
+			iconSize={13}
+			style="width:100%"
+			disabled={editor.busy}
+			onclick={() => run(() => editor.removeOverlay(o.id))}>Remove {o.generated ? 'caption' : 'title'}</Btn
+		>
+	</div>
+{/snippet}
+
 {#snippet overlaysSection()}
-	<InspectorSection title="Titles & captions" summary={count((editor.timeline.overlays ?? []).length, 'overlay')} open>
+	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length, 'item')} open>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-bottom:6px">
+		Titles sit on their own lane in the timeline, apart from the clips.
+	</div>
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 		{#each TEXT_STYLES as s (s.id)}
 			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
@@ -521,8 +673,8 @@
 	{#each overlays as o (o.id)}
 		<div style="display:flex;align-items:center;gap:6px;padding:3px 0">
 			<button
-				onclick={() => (editor.selectedOverlayId = editor.selectedOverlayId === o.id ? null : o.id)}
-				style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:var(--text-secondary);padding:0"
+				onclick={() => pickOverlay(o)}
+				style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:{editor.selectedOverlayId === o.id ? 'var(--kerf-300)' : 'var(--text-secondary)'};padding:0"
 			>
 				<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>{o.text || '(empty)'}</span
@@ -533,78 +685,6 @@
 				>×</button
 			>
 		</div>
-		{#if editor.selectedOverlayId === o.id}
-			<div style="padding:2px 0 8px;border-left:2px solid var(--border-subtle);margin-left:2px;padding-left:10px">
-				<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-					<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Text</span>
-					<input
-						type="text"
-						value={o.text}
-						disabled={editor.busy}
-						onchange={(e) => run(() => editor.updateOverlay(o.id, { text: e.currentTarget.value }))}
-						style={inputCss + ';flex:1;width:auto;text-align:left'}
-					/>
-				</label>
-				{@render numRow('Start', o.start, 0.1, (v) =>
-					run(() => editor.updateOverlay(o.id, { start: Math.min(v, Math.max(0, o.end - MIN_OVERLAY)) }))
-				)}
-				{@render numRow('End', o.end, 0.1, (v) =>
-					run(() => editor.updateOverlay(o.id, { end: Math.max(v, o.start + MIN_OVERLAY) }))
-				)}
-				{@render rangeRow('Pos X', o.pos_x, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.updateOverlay(o.id, { pos_x: v }))
-				)}
-				{@render rangeRow('Pos Y', o.pos_y, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.updateOverlay(o.id, { pos_y: v }))
-				)}
-				{@render rangeRow('Size', o.size, 0.02, 0.2, 0.005, (v) => `${Math.round(v * 100)}%`, (v) =>
-					run(() => editor.updateOverlay(o.id, { size: v }))
-				)}
-				<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-					<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Color</span>
-					<input
-						type="text"
-						value={o.color}
-						disabled={editor.busy}
-						onchange={(e) => run(() => editor.updateOverlay(o.id, { color: e.currentTarget.value }))}
-						style={fxTxt}
-					/>
-					<span style="font-size:12px;color:var(--text-muted)">Box</span>
-					<input
-						type="text"
-						value={o.bg ?? ''}
-						placeholder="none"
-						disabled={editor.busy}
-						onchange={(e) => run(() => editor.updateOverlay(o.id, { bg: e.currentTarget.value }))}
-						style={fxTxt}
-					/>
-				</label>
-				<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-					<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Font</span>
-					<select
-						value={o.font ?? ''}
-						disabled={editor.busy}
-						onchange={(e) => run(() => editor.updateOverlay(o.id, { font: e.currentTarget.value }))}
-						style={selectCss + ';flex:1'}
-					>
-						<option value="">Default</option>
-						{#each ui.availableFonts as f (f)}
-							<option value={f}>{f}</option>
-						{/each}
-					</select>
-				</label>
-				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-					<span style="font-size:12px;color:var(--text-muted)">Bold</span>
-					<input
-						type="checkbox"
-						checked={o.bold}
-						disabled={editor.busy}
-						onchange={(e) => run(() => editor.updateOverlay(o.id, { bold: e.currentTarget.checked }))}
-						style="accent-color:var(--kerf-500);width:18px;height:18px"
-					/>
-				</label>
-			</div>
-		{/if}
 	{/each}
 	</InspectorSection>
 
@@ -617,7 +697,9 @@
 >
 
 	<div style="flex:1;overflow-y:auto;padding:12px">
-		{#if clip}
+		{#if overlay}
+			{@render overlayEditor(overlay)}
+		{:else if clip}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
 					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
@@ -1046,7 +1128,7 @@
 				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-disabled);text-align:center"
 			>
 				<Icon n="sliders-horizontal" s={22} />
-				<span style="font-size:12px">Select a clip to inspect it</span>
+				<span style="font-size:12px">Select a clip or a title to inspect it</span>
 			</div>
 		{/if}
 

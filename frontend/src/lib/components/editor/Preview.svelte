@@ -11,6 +11,8 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
 	import { clipDuration } from '$lib/types';
+	import type { TextOverlay } from '$lib/types';
+	import { LINE_HEIGHT, boxPadding, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -205,6 +207,169 @@
 	const CHROME = { top: 0.08, bottom: 0.2, right: 0.14 };
 	const showGuides = $derived(settings.safeAreas && !!delivery && aspect < 1.2);
 
+
+	// ---- titles: move and resize them where they are drawn -----------------------
+	//
+	// A title is centred on (pos_x, pos_y), both fractions of the frame, and its
+	// font is `size` of the frame's height — so the box is laid out in the same
+	// units: `cqh` against this layer (a size container, exactly the frame the
+	// engine draws into), with the browser's own text metrics standing in for
+	// drawtext's. The layer covers the picture rather than the pane, because a
+	// source that is not the frame's shape is letterboxed inside it and the
+	// fractions are of what is drawn.
+
+	let imgAspect = $state<number | null>(null);
+	const layerBox = $derived.by(() => {
+		if (!frameUrl || !imgAspect) return 'inset:0';
+		if (imgAspect > aspect) {
+			const h = (aspect / imgAspect) * 100;
+			return `left:0;width:100%;top:${(100 - h) / 2}%;height:${h}%`;
+		}
+		const w = (imgAspect / aspect) * 100;
+		return `top:0;height:100%;left:${(100 - w) / 2}%;width:${w}%`;
+	});
+
+	const titlesHere = $derived.by(() => {
+		if (ui.playing || empty) return [];
+		const here = editor.overlays.filter((o) => isVisibleAt(o, ui.time));
+		return here.sort((a, b) => Number(a.id === editor.selectedOverlayId) - Number(b.id === editor.selectedOverlayId));
+	});
+
+	type TitleDrag = {
+		id: string;
+		mode: 'move' | 'resize';
+		at: number;
+		startX: number;
+		startY: number;
+		w: number;
+		h: number;
+		from: { x: number; y: number };
+		startSize: number;
+		cx: number;
+		cy: number;
+		startDist: number;
+		x: number;
+		y: number;
+		size: number;
+		moved: boolean;
+		committing: boolean;
+	};
+	let tdrag = $state<TitleDrag | null>(null);
+	let layerEl = $state<HTMLElement | null>(null);
+	let capture: { el: Element; id: number } | null = null;
+
+	function releaseTitleCapture() {
+		if (capture) {
+			try {
+				capture.el.releasePointerCapture(capture.id);
+			} catch {
+				// already released
+			}
+		}
+		capture = null;
+	}
+
+	/** Abandon the gesture without writing anything: the pointer is gone (cancel,
+	 *  Escape, a window blur) and wherever it last reported is not to be trusted. */
+	function cancelTitleDrag() {
+		if (!tdrag || tdrag.committing) return;
+		tdrag = null;
+		releaseTitleCapture();
+	}
+
+	function onTitleDown(e: PointerEvent, o: TextOverlay, mode: 'move' | 'resize') {
+		if (e.button !== 0 || tdrag || !layerEl) return;
+		e.stopPropagation();
+		e.preventDefault();
+		editor.selectOverlay(o.id);
+		ui.pause();
+		const rect = layerEl.getBoundingClientRect();
+		const box = (e.currentTarget as HTMLElement).closest('[data-title-box]')!.getBoundingClientRect();
+		const cx = box.left + box.width / 2;
+		const cy = box.top + box.height / 2;
+		const pose = sampleOverlay(o, ui.time);
+		tdrag = {
+			id: o.id,
+			mode,
+			at: ui.time,
+			startX: e.clientX,
+			startY: e.clientY,
+			w: rect.width,
+			h: rect.height,
+			from: { x: pose.x, y: pose.y },
+			startSize: o.size,
+			cx,
+			cy,
+			startDist: Math.hypot(e.clientX - cx, e.clientY - cy),
+			x: pose.x,
+			y: pose.y,
+			size: o.size,
+			moved: false,
+			committing: false
+		};
+		try {
+			(e.currentTarget as Element).setPointerCapture(e.pointerId);
+			capture = { el: e.currentTarget as Element, id: e.pointerId };
+		} catch {
+			// best-effort: the window blur and buttons checks below are the fallback
+		}
+	}
+
+	function onTitleMove(e: PointerEvent) {
+		const d = tdrag;
+		if (!d || d.committing) return;
+		if ((e.buttons & 1) === 0) {
+			cancelTitleDrag();
+			return;
+		}
+		if (d.mode === 'move') {
+			const p = dragPosition(d.from, e.clientX - d.startX, e.clientY - d.startY, d.w, d.h);
+			tdrag = { ...d, ...p, moved: d.moved || Math.hypot(e.clientX - d.startX, e.clientY - d.startY) >= 3 };
+		} else {
+			const dist = Math.hypot(e.clientX - d.cx, e.clientY - d.cy);
+			tdrag = { ...d, size: scaledSize(d.startSize, d.startDist, dist), moved: d.moved || Math.abs(dist - d.startDist) >= 2 };
+		}
+	}
+
+	const round4 = (v: number) => Math.round(v * 10000) / 10000;
+
+	/** One backend edit per gesture, so undo steps over the whole drag. The local
+	 *  pose is kept until the edit has landed so the box never snaps back first. */
+	async function onTitleUp() {
+		const d = tdrag;
+		if (!d || d.committing) return;
+		releaseTitleCapture();
+		if (!d.moved) {
+			tdrag = null;
+			return;
+		}
+		tdrag = { ...d, committing: true };
+		try {
+			if (d.mode === 'move') await editor.moveOverlay(d.id, round4(d.x), round4(d.y), d.at);
+			else await editor.updateOverlay(d.id, { size: round4(d.size) });
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			tdrag = null;
+		}
+	}
+
+	function onTitleLostCapture() {
+		if (tdrag && !tdrag.committing) cancelTitleDrag();
+	}
+
+	/** An ffmpeg colour is not always a CSS one (`yellow@0.9`); the drag ghost
+	 *  falls back to white rather than to invisible. */
+	const ghostColor = (c: string) =>
+		typeof CSS !== 'undefined' && CSS.supports('color', c) ? c : 'var(--text-on-video)';
+
+	const HANDLES = [
+		{ at: 'left:0;top:0', cursor: 'nwse-resize' },
+		{ at: 'left:100%;top:0', cursor: 'nesw-resize' },
+		{ at: 'left:0;top:100%', cursor: 'nesw-resize' },
+		{ at: 'left:100%;top:100%', cursor: 'nwse-resize' }
+	];
+
 	/** Write the frame under the playhead as a cover image — the thumbnail a
 	 *  platform shows before anyone presses play. Rendered at the full delivery
 	 *  frame from the original media, so it is the picture people actually see,
@@ -262,6 +427,13 @@
 	}
 </script>
 
+<svelte:window
+	onkeydown={(e) => {
+		if (e.key === 'Escape' && tdrag && !tdrag.committing) cancelTitleDrag();
+	}}
+	onblur={cancelTitleDrag}
+/>
+
 <div style="flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-void)">
 	<div
 		role="presentation"
@@ -277,7 +449,12 @@
 				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if frameUrl}
-					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)" />
+					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"
+						onload={(e) => {
+							const im = e.currentTarget as HTMLImageElement;
+							if (im.naturalWidth && im.naturalHeight) imgAspect = im.naturalWidth / im.naturalHeight;
+						}}
+					/>
 				{:else}
 					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, color-mix(in srgb,var(--kerf-500) 6%,transparent) 60%)"></div>
 					<div style="position:absolute;inset:0;display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 22%,transparent)">
@@ -297,6 +474,44 @@
 						<div
 							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:1px solid color-mix(in srgb,var(--text-on-video) 14%,transparent);border-radius:2px"
 						></div>
+					</div>
+				{/if}
+				<!-- Titles under the playhead, as boxes over where the engine draws them.
+				     The text is transparent (the picture already has it) except while
+				     it is being dragged, when the box carries a ghost of it. -->
+				{#if titlesHere.length}
+					<div
+						bind:this={layerEl}
+						style="position:absolute;{layerBox};container-type:size;pointer-events:none"
+					>
+						{#each titlesHere as o (o.id)}
+							{@const live = tdrag?.id === o.id ? tdrag : null}
+							{@const pose = sampleOverlay(o, ui.time)}
+							{@const selected = editor.selectedOverlayId === o.id}
+							{@const pad = boxPadding(o, delivery?.height) * 100}
+							<div
+								role="presentation"
+								data-title-box
+								title={selected ? undefined : `Select “${o.text}”`}
+								onpointerdown={(e) => onTitleDown(e, o, 'move')}
+								onpointermove={onTitleMove}
+								onpointerup={onTitleUp}
+								onpointercancel={cancelTitleDrag}
+								onlostpointercapture={onTitleLostCapture}
+								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{LINE_HEIGHT};font-weight:{o.bold ? 700 : 400};font-family:{o.font ? `'${o.font.replace(/['\\]/g, '')}', ` : ''}sans-serif;white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
+							>
+								{o.text}
+								{#if selected}
+									{#each HANDLES as h (h.at)}
+										<span
+											role="presentation"
+											onpointerdown={(e) => onTitleDown(e, o, 'resize')}
+											style="position:absolute;{h.at};width:10px;height:10px;transform:translate(-50%,-50%);background:var(--kerf-400);border:1.5px solid var(--surface-app);border-radius:2px;cursor:{h.cursor};touch-action:none;font-size:0"
+										></span>
+									{/each}
+								{/if}
+							</div>
+						{/each}
 					</div>
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">

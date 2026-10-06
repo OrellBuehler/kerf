@@ -110,6 +110,7 @@ import type {
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { Generation } from './generation';
+import { withKeyframeAt } from './titles';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -120,6 +121,8 @@ class EditorState {
 	/** The whole selection. Always contains `selectedClipId` when that is set;
 	 *  most edits act on the primary, but delete acts on all of these. */
 	selectedClipIds = $state<string[]>([]);
+	/** The title being edited. Exclusive with the clip selection: a title is its
+	 *  own item on the titles lane, not a property of whichever clip is selected. */
 	selectedOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
@@ -158,6 +161,9 @@ class EditorState {
 	 *  generation above. */
 	#setTimeline(tl: Timeline) {
 		this.timeline = tl;
+		if (this.selectedOverlayId && !(tl.overlays ?? []).some((o) => o.id === this.selectedOverlayId)) {
+			this.selectedOverlayId = null;
+		}
 		this.#timelineGen.advance();
 	}
 	/** Sequence guard over `select()` — a slow metadata fetch for an earlier
@@ -194,6 +200,7 @@ class EditorState {
 	 * everything between the primary and this clip on the same track.
 	 */
 	selectClip(clipId: string, mode: 'replace' | 'toggle' | 'range' = 'replace') {
+		this.selectedOverlayId = null;
 		if (mode === 'toggle') {
 			const has = this.selectedClipIds.includes(clipId);
 			this.selectedClipIds = has
@@ -222,6 +229,7 @@ class EditorState {
 	/** Select every clip on every unlocked track. */
 	selectAll() {
 		const ids = this.timeline.tracks.filter((t) => !t.locked).flatMap((t) => t.clips.map((c) => c.id));
+		this.selectedOverlayId = null;
 		this.selectedClipIds = ids;
 		this.selectedClipId = ids.at(-1) ?? null;
 	}
@@ -229,6 +237,16 @@ class EditorState {
 	clearSelection() {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+	}
+
+	/** Select a title, dropping the clip selection so the Inspector shows one thing. */
+	selectOverlay(overlayId: string | null) {
+		this.selectedOverlayId = overlayId;
+		if (overlayId) {
+			this.selectedClipId = null;
+			this.selectedClipIds = [];
+		}
 	}
 
 	/** Delete every selected clip as one user gesture. Ripple deletes run
@@ -347,6 +365,7 @@ class EditorState {
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -358,6 +377,7 @@ class EditorState {
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -721,8 +741,24 @@ class EditorState {
 	addOverlay(text: string, start: number, end: number) {
 		return this.#apply(addOverlay(text, start, end));
 	}
+	/** Add a title at `start..end` and select it. */
+	async addTitle(text: string, start: number, end: number) {
+		const known = new Set(this.overlays.map((o) => o.id));
+		await this.addOverlay(text, start, end);
+		const created = this.overlays.find((o) => !known.has(o.id));
+		if (created) this.selectOverlay(created.id);
+		return created;
+	}
 	updateOverlay(overlayId: string, patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
 		return this.#apply(updateOverlay(overlayId, patch));
+	}
+	/** Put a title's centre at `(x, y)`. A still title takes it as its position;
+	 *  an animated one gets a keyframe at timeline time `at`, since its static
+	 *  position is not what the render reads. */
+	moveOverlay(overlayId: string, x: number, y: number, at: number) {
+		const o = this.overlays.find((o) => o.id === overlayId);
+		if (o?.keyframes?.length) return this.setOverlayKeyframes(overlayId, withKeyframeAt(o, at, x, y));
+		return this.updateOverlay(overlayId, { pos_x: x, pos_y: y });
 	}
 	removeOverlay(overlayId: string) {
 		if (this.selectedOverlayId === overlayId) this.selectedOverlayId = null;
