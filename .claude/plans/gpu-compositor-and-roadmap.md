@@ -4,7 +4,7 @@ Status: **approved direction, not started** (2026-10-07).
 Owner: one long-running **orchestrator** session that manages subagents, reviews and merges, step by step, until every phase below is done.
 
 > **Work autonomously. Do not ask the user questions and do not wait for approval.** When something is unclear, investigate (code, docs, experiments, context7), pick the option that best fits this plan and `CLAUDE.md`, record the decision and its reason in the progress log, and keep going. Where this plan mentions a gate, the orchestrator evaluates it itself against the stated criteria. The user reads the progress log and the PRs; that is how they follow and correct course.
-Progress log: `docs/plans/2026-10-07-progress.md` (the orchestrator creates and maintains it — see §8).
+Progress log: `.claude/plans/progress.md` (the orchestrator creates and maintains it — see §8).
 
 This plan has two parts that run as one programme:
 
@@ -258,7 +258,7 @@ CI changes to make along the way: a `parity` job (Linux lavapipe; add Windows WA
 
 ## 8. Progress log and resuming
 
-The orchestrator keeps `docs/plans/2026-10-07-progress.md` (committed with each merged WP, via the WP's own PR) with one row per WP:
+The orchestrator keeps `.claude/plans/progress.md` (committed with each merged WP, via the WP's own PR) with one row per WP:
 
 ```
 | WP | branch | PR | status (todo/in-progress/review/merged/blocked) | notes (gate results, thresholds, numbers, follow-ups) |

@@ -21,7 +21,7 @@ exclude: |
     frontend/bun\.lock|
     crates/kerf-app/icons/.*|
     crates/kerf-app/gen/.*|
-    docs/img/.*|
+    assets/img/.*|
     site/static/.*
   )$
 

@@ -49,7 +49,7 @@ See [`README.md`](./README.md#building) for per-platform FFmpeg setup and
 ## The landing site
 
 The marketing site lives in [`site/`](./site) (Hugo). Screenshots and brand assets are in
-[`docs/img/`](./docs/img) — a single source of truth shared by the README and the site.
+[`assets/img/`](./assets/img) — a single source of truth shared by the README and the site.
 To preview locally:
 
 ```bash
@@ -57,7 +57,7 @@ cd site && hugo server
 ```
 
 The site auto-deploys to GitHub Pages on any push to `main` that touches `site/**` or
-`docs/img/**`.
+`assets/img/**`.
 
 ## Pull requests
 

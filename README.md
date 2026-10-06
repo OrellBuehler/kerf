@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/kerf-mark.svg" alt="Kerf" height="72" />
+<img src="assets/img/kerf-mark.svg" alt="Kerf" height="72" />
 
 # Kerf
 

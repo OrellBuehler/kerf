@@ -44,8 +44,8 @@ that size. It lives one level up so the Pages build, which mounts *this* folder 
 
 ```bash
 google-chrome --headless=new --disable-gpu --hide-scrollbars \
-  --screenshot=docs/img/og.png --window-size=1200,630 \
-  --virtual-time-budget=6000 "file://$PWD/docs/og-source.html"
+  --screenshot=assets/img/og.png --window-size=1200,630 \
+  --virtual-time-budget=6000 "file://$PWD/assets/og-source.html"
 ```
 
 The budget matters: the page pulls Space Grotesk / Inter / JetBrains Mono from Google
