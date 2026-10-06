@@ -55,10 +55,10 @@
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
-		style="width:460px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
+		style="width:460px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
 	>
 		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border-default)"
+			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
 		>
 			<Icon n="download" s={15} color="var(--text-secondary)" />
 			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">{title}</span>
@@ -125,7 +125,7 @@
 			{/if}
 		</div>
 
-		<div style="flex:none;border-top:1px solid var(--border-default);display:flex;align-items:center;gap:8px;padding:12px 16px">
+		<div style="flex:none;border-top:var(--line-width) solid var(--border-default);display:flex;align-items:center;gap:8px;padding:12px 16px">
 			<Btn variant="ghost" size="sm" icon="external-link" onclick={() => u.openReleasePage()}>Release page</Btn>
 			<div style="flex:1"></div>
 			{#if u.phase === 'ready'}

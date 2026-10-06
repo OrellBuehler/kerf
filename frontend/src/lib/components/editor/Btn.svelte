@@ -27,12 +27,12 @@
 	} as const;
 
 	const variants = {
-		primary: 'background:var(--kerf-500);color:var(--text-on-accent);border:1px solid var(--kerf-500);',
-		agent: 'background:var(--agent-500);color:var(--agent-fg);border:1px solid var(--agent-500);',
+		primary: 'background:var(--kerf-500);color:var(--text-on-accent);border:var(--line-width) solid var(--kerf-500);',
+		agent: 'background:var(--agent-500);color:var(--agent-fg);border:var(--line-width) solid var(--agent-500);',
 		secondary:
-			'background:var(--surface-hover);color:var(--text-primary);border:1px solid var(--border-strong);',
-		ghost: 'background:transparent;color:var(--text-secondary);border:1px solid transparent;',
-		destructive: 'background:transparent;color:var(--red-400);border:1px solid var(--red-600);'
+			'background:var(--surface-hover);color:var(--text-primary);border:var(--line-width) solid var(--border-strong);',
+		ghost: 'background:transparent;color:var(--text-secondary);border:var(--line-width) solid transparent;',
+		destructive: 'background:transparent;color:var(--red-400);border:var(--line-width) solid var(--red-600);'
 	} as const;
 
 	const sz = $derived(sizes[size]);

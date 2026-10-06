@@ -12,7 +12,7 @@
 import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
-import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, type ColorToken, type PresetId, type Theme } from './theme';
+import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import type { AppSettings, SettingsView } from './types';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -184,6 +184,23 @@ class SettingsStore {
 			name: custom ? 'Custom' : this.theme.name,
 			colors: { ...this.theme.colors, [token]: hex }
 		});
+	}
+
+	/** Change one shape value (clamped to its range); custom like a color. */
+	setShape(token: ShapeToken, value: number) {
+		const v = clampShape(token, value);
+		if (this.theme.shape[token] === v) return;
+		this.editShape({ ...this.theme.shape, [token]: v });
+	}
+
+	setThumbStyle(style: ThumbStyle) {
+		if (this.theme.shape['slider-thumb-style'] === style) return;
+		this.editShape({ ...this.theme.shape, 'slider-thumb-style': style });
+	}
+
+	private editShape(shape: Theme['shape']) {
+		const custom = this.themePreset !== 'custom';
+		this.setTheme({ ...this.theme, name: custom ? 'Custom' : this.theme.name, shape });
 	}
 
 	setThemeName(name: string) {

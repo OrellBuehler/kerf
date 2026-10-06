@@ -442,7 +442,7 @@
 			</div>
 		{:else}
 			<div
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:var(--line-width) solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"
@@ -468,7 +468,7 @@
 							style="position:absolute;right:0;top:{CHROME.top * 100}%;bottom:{CHROME.bottom * 100}%;width:{CHROME.right * 100}%;background:color-mix(in srgb,var(--scrim) 24%,transparent);border-left:1px dashed color-mix(in srgb,var(--text-on-video) 20%,transparent)"
 						></div>
 						<div
-							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:1px solid color-mix(in srgb,var(--text-on-video) 14%,transparent);border-radius:2px"
+							style="position:absolute;left:5%;right:5%;top:5%;bottom:5%;border:var(--line-width) solid color-mix(in srgb,var(--text-on-video) 14%,transparent);border-radius:2px"
 						></div>
 					</div>
 				{/if}
@@ -528,7 +528,7 @@
 		{/if}
 	</div>
 	<div
-		style="height:40px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;border-top:1px solid var(--border-default);background:var(--surface-app)"
+		style="height:40px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
 			title={ui.playing ? 'Pause' : 'Play'}

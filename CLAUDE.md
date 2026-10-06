@@ -939,7 +939,18 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   theme is a flat list of hex colors an `<input type=color>` can edit, and the
   editor components carry no color literals (`--scrim`, `--text-on-video`,
   `--drag-ghost`, `--frame-matte` exist for the few places that used to).
-  `app.html` still paints dark before hydration. That file is also the
+  A theme also carries a **shape** (`SHAPE_TOKENS`: `line-width`
+  hairline borders / dividers / clip edges / ruler ticks, `line-emphasis` the
+  selected-clip outline, `playhead-width`, and the slider's `slider-track`,
+  `slider-track-radius`, `slider-thumb` plus a `round` / `bar` thumb style) —
+  numbers clamped and snapped to their range by `parseTheme`, which fills a
+  missing shape (an older theme file) from the scheme's preset; `shapeProps`
+  turns it into the custom properties `applyTheme` writes, and the Dark preset's
+  shape is bun-tested equal to the stylesheet like its colors. Every
+  `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
+  pseudo-elements) from those variables, with `--slider-accent` as the one
+  per-slider choice; changing a shape value makes the theme `Custom`, and
+  High contrast ships thicker lines. `app.html` still paints dark before hydration. That file is also the
   `tailwind.css` in `components.json`. Run `bunx shadcn-svelte add <name>` to
   add primitives.
 

@@ -69,7 +69,7 @@
 {/snippet}
 
 <div
-	style="height:var(--toolbar-h);display:flex;align-items:center;gap:6px;padding:0 12px;background:var(--surface-panel);border-bottom:1px solid var(--border-default);flex:none"
+	style="height:var(--toolbar-h);display:flex;align-items:center;gap:6px;padding:0 12px;background:var(--surface-panel);border-bottom:var(--line-width) solid var(--border-default);flex:none"
 >
 	{#each tools as [id, ic, t] (id)}
 		<IconBtn title={t} active={ui.tool === id} onclick={() => (ui.tool = id)}>

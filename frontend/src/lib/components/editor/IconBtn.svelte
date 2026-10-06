@@ -22,7 +22,7 @@
 	{title}
 	aria-label={title}
 	aria-pressed={active}
-	style="display:inline-flex;align-items:center;justify-content:center;width:{size}px;height:{size}px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {active
+	style="display:inline-flex;align-items:center;justify-content:center;width:{size}px;height:{size}px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {active
 		? 'var(--border-strong)'
 		: 'transparent'};background:{active
 		? 'var(--surface-active)'

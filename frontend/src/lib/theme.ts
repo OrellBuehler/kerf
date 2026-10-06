@@ -92,12 +92,36 @@ export const COLOR_GROUPS = [
 export type ColorToken = (typeof COLOR_GROUPS)[number]['tokens'][number]['name'];
 export const COLOR_TOKENS: readonly ColorToken[] = COLOR_GROUPS.flatMap((g) => g.tokens.map((t) => t.name));
 
+export const SHAPE_TOKENS = [
+	{ name: 'line-width', label: 'Line thickness', hint: 'Panel dividers, borders, clip edges, ruler ticks', min: 0.5, max: 3, step: 0.5, def: 1 },
+	{ name: 'line-emphasis', label: 'Selection thickness', hint: 'The selected clip outline', min: 1, max: 4, step: 0.5, def: 1.5 },
+	{ name: 'playhead-width', label: 'Playhead thickness', hint: 'The cut line', min: 1, max: 6, step: 1, def: 2 },
+	{ name: 'slider-track', label: 'Slider track', hint: 'Thickness of every slider track', min: 1, max: 10, step: 1, def: 4 },
+	{ name: 'slider-track-radius', label: 'Track corners', hint: 'Rounding of the track ends', min: 0, max: 5, step: 1, def: 2 },
+	{ name: 'slider-thumb', label: 'Slider thumb', hint: 'Size of the slider handle', min: 8, max: 24, step: 1, def: 14 }
+] as const;
+
+export type ShapeToken = (typeof SHAPE_TOKENS)[number]['name'];
+export const SHAPE_NAMES: readonly ShapeToken[] = SHAPE_TOKENS.map((t) => t.name);
+
+export type ThumbStyle = 'round' | 'bar';
+export const THUMB_STYLES: readonly { id: ThumbStyle; label: string }[] = [
+	{ id: 'round', label: 'Round' },
+	{ id: 'bar', label: 'Bar' }
+];
+
+export type Shape = Record<ShapeToken, number> & { 'slider-thumb-style': ThumbStyle };
+
 export interface Theme {
 	name: string;
 	version: 1;
 	scheme: Scheme;
 	colors: Record<ColorToken, string>;
+	shape: Shape;
 }
+
+const SHAPE_DEFAULT = Object.fromEntries(SHAPE_TOKENS.map((t) => [t.name, t.def])) as Record<ShapeToken, number>;
+const DEFAULT_SHAPE: Shape = { ...SHAPE_DEFAULT, 'slider-thumb-style': 'round' };
 
 export type PresetId = 'kerf-dark' | 'kerf-light' | 'high-contrast';
 
@@ -156,7 +180,8 @@ export const PRESETS: Record<PresetId, Theme> = {
 			waveform: '#6fcfa8',
 			'drag-ghost': '#788cff',
 			'frame-matte': '#000000'
-		}
+		},
+		shape: { ...DEFAULT_SHAPE }
 	},
 	'kerf-light': {
 		name: 'Kerf Light',
@@ -212,7 +237,8 @@ export const PRESETS: Record<PresetId, Theme> = {
 			waveform: '#1f8f60',
 			'drag-ghost': '#4a5fd6',
 			'frame-matte': '#000000'
-		}
+		},
+		shape: { ...DEFAULT_SHAPE }
 	},
 	'high-contrast': {
 		name: 'High contrast',
@@ -268,6 +294,14 @@ export const PRESETS: Record<PresetId, Theme> = {
 			waveform: '#8ef5c2',
 			'drag-ghost': '#9aa8ff',
 			'frame-matte': '#000000'
+		},
+		shape: {
+			...DEFAULT_SHAPE,
+			'line-width': 1.5,
+			'line-emphasis': 3,
+			'playhead-width': 3,
+			'slider-track': 6,
+			'slider-thumb': 16
 		}
 	}
 };
@@ -276,12 +310,27 @@ export const PRESET_IDS = Object.keys(PRESETS) as PresetId[];
 
 const HEX = /^#[0-9a-f]{6}$/i;
 
-/** The preset a theme's colors are, or `custom`. The name is not consulted:
+function shapeEqual(a: Shape, b: Shape): boolean {
+	return SHAPE_NAMES.every((t) => a[t] === b[t]) && a['slider-thumb-style'] === b['slider-thumb-style'];
+}
+
+/** A shape value pulled into its token's range and onto its step. */
+export function clampShape(token: ShapeToken, v: number): number {
+	const t = SHAPE_TOKENS.find((x) => x.name === token)!;
+	const stepped = Math.round(v / t.step) * t.step;
+	return Math.min(t.max, Math.max(t.min, stepped));
+}
+
+/** The preset a theme's colors and shape are, or `custom`. The name is not consulted:
  *  a renamed copy of Kerf Dark is still Kerf Dark. */
 export function presetIdFor(theme: Theme): PresetId | 'custom' {
 	for (const id of PRESET_IDS) {
 		const p = PRESETS[id].colors;
-		if (COLOR_TOKENS.every((t) => p[t].toLowerCase() === theme.colors[t].toLowerCase())) return id;
+		if (
+			COLOR_TOKENS.every((t) => p[t].toLowerCase() === theme.colors[t].toLowerCase()) &&
+			shapeEqual(PRESETS[id].shape, theme.shape)
+		)
+			return id;
 	}
 	return 'custom';
 }
@@ -308,7 +357,29 @@ export function parseTheme(raw: unknown): Theme | null {
 		if (typeof v !== 'string' || !HEX.test(v)) return null;
 		colors[t] = v.toLowerCase();
 	}
-	return { name: r.name.trim(), version: 1, scheme: r.scheme, colors };
+	const baseShape = PRESETS[r.scheme === 'light' ? 'kerf-light' : 'kerf-dark'].shape;
+	const gs = typeof r.shape === 'object' && r.shape !== null && !Array.isArray(r.shape) ? (r.shape as Record<string, unknown>) : {};
+	const shape = { ...baseShape };
+	for (const t of SHAPE_NAMES) {
+		const v = gs[t];
+		if (typeof v === 'number' && Number.isFinite(v)) shape[t] = clampShape(t, v);
+	}
+	const ts = gs['slider-thumb-style'];
+	if (ts === 'round' || ts === 'bar') shape['slider-thumb-style'] = ts;
+	return { name: r.name.trim(), version: 1, scheme: r.scheme, colors, shape };
+}
+
+/** The custom properties a shape sets. The thumb is a circle (or square at
+ *  size) when round, and a narrow upright bar when not; the stylesheet
+ *  defaults are the round case. */
+export function shapeProps(shape: Shape): Record<string, string> {
+	const size = shape['slider-thumb'];
+	const bar = shape['slider-thumb-style'] === 'bar';
+	const props: Record<string, string> = {};
+	for (const t of SHAPE_NAMES) props[`--${t}`] = `${shape[t]}px`;
+	props['--slider-thumb-w'] = `${bar ? Math.max(4, Math.round(size * 0.4)) : size}px`;
+	props['--slider-thumb-radius'] = bar ? '2px' : '999px';
+	return props;
 }
 
 export function themeJson(theme: Theme): string {
@@ -320,6 +391,7 @@ export function themeJson(theme: Theme): string {
  *  that keys off them, and the pre-hydration background `app.html` painted. */
 export function applyTheme(theme: Theme, root: HTMLElement = document.documentElement) {
 	for (const t of COLOR_TOKENS) root.style.setProperty(`--${t}`, theme.colors[t]);
+	for (const [k, v] of Object.entries(shapeProps(theme.shape))) root.style.setProperty(k, v);
 	root.classList.toggle('dark', theme.scheme === 'dark');
 	root.style.colorScheme = theme.scheme;
 	root.style.background = theme.colors['surface-app'];

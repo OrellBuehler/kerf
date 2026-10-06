@@ -25,7 +25,7 @@
 	--dv-icon-hover-background-color: var(--surface-hover);
 	--dv-tabs-container-scrollbar-color: var(--scrollbar-thumb);
 	--dv-floating-box-shadow: var(--shadow-lg);
-	--dv-floating-border: 1px solid var(--border-strong);
+	--dv-floating-border: var(--line-width) solid var(--border-strong);
 	--dv-overlay-z-index: 45;
 	--dv-tab-font-size: 13px;
 	--dv-border-radius: 0px;

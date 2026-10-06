@@ -145,3 +145,64 @@ button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-v
 	outline-offset: 2px;
 }
 button:disabled { opacity: .5; cursor: not-allowed !important; }
+
+/* Every slider in the editor. Thickness, thumb size / style and the track's
+   rounding are theme shape tokens (`lib/theme.ts`); `--slider-accent` is the
+   one per-slider choice. */
+input[type='range'] {
+	-webkit-appearance: none;
+	appearance: none;
+	background: transparent;
+	cursor: pointer;
+	--slider-accent: var(--kerf-500);
+}
+input[type='range']:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+input[type='range']::-webkit-slider-runnable-track {
+	height: var(--slider-track);
+	border-radius: var(--slider-track-radius);
+	background: linear-gradient(
+		to right,
+		var(--slider-accent) var(--slider-fill, 0%),
+		var(--surface-active) var(--slider-fill, 0%)
+	);
+}
+input[type='range']::-moz-range-track {
+	height: var(--slider-track);
+	border-radius: var(--slider-track-radius);
+	background: var(--surface-active);
+}
+input[type='range']::-moz-range-progress {
+	height: var(--slider-track);
+	border-radius: var(--slider-track-radius);
+	background: var(--slider-accent);
+}
+input[type='range']::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: var(--slider-thumb-w);
+	height: var(--slider-thumb);
+	margin-top: calc((var(--slider-track) - var(--slider-thumb)) / 2);
+	border: 0;
+	border-radius: var(--slider-thumb-radius);
+	background: var(--slider-accent);
+}
+input[type='range']::-moz-range-thumb {
+	box-sizing: border-box;
+	width: var(--slider-thumb-w);
+	height: var(--slider-thumb);
+	border: 0;
+	border-radius: var(--slider-thumb-radius);
+	background: var(--slider-accent);
+}
+input[type='range']:focus-visible {
+	outline: none;
+}
+input[type='range']:focus-visible::-webkit-slider-thumb {
+	box-shadow: var(--focus-ring);
+}
+input[type='range']:focus-visible::-moz-range-thumb {
+	box-shadow: var(--focus-ring);
+}
