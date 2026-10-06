@@ -371,6 +371,12 @@
 		} else if (e.key === '-') {
 			e.preventDefault();
 			ui.zoom = Math.max(8, ui.zoom - 8);
+		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedOverlayId) {
+			e.preventDefault();
+			void editor
+				.removeOverlay(editor.selectedOverlayId)
+				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipIds.length > 0) {
 			e.preventDefault();
 			// Shift+Delete ripples (closes the gap); plain Delete leaves a gap.

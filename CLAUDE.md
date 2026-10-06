@@ -1015,7 +1015,33 @@ fade-in/out opacity keyframes; the caption style matches what
 captions look alike (`CAPTION_LOOKS` in the same file is only the two
 generate-time labels; their numbers live in `captions.ts`).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
-utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
+utilities. **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
+been timeline-level, and the UI now says so: the Timeline has a **titles lane**
+(`T`, above V1; `data-title-lane`) where every title / lower-third / caption is a
+block from `start` to `end` (generated captions dashed and dimmer; overlapping
+items stack into rows via `packRows`). Click selects (`editor.selectOverlay`,
+exclusive with the clip selection; click also seeks into the title), the body
+drags in time, the 6px edges trim, with the clip drag's snapping (0 / playhead /
+beats / every clip edge / other titles), Delete removes it, and one
+`update_overlay` is written per gesture. A selected title makes the Inspector show
+**that title's editor** (text, timing, position, size, colour, box, font, bold,
+keyframes) *instead of* the clip sections; the add / caption controls live in a
+"Titles lane" section below. The **Preview** draws an interactive box over each
+title visible at the playhead (hidden while playing): drag to move, corner
+handles to resize (scales `size` by the pointer's distance from the box centre),
+Escape / pointercancel / blur abandon it, pointer capture holds it, local state
+updates live and **one** backend edit lands on release. The box is laid out in
+the engine's units: `cqh` against a size container covering the drawn picture,
+centred on `(pos_x, pos_y)`, font `size` of the height, browser text metrics
+standing in for drawtext's, `boxborderw` as padding, so it is aligned to within
+font-metric differences. A **keyframed** title follows the Transform convention:
+moving it keyframes the position at the playhead (`editor.moveOverlay`, updating
+an existing keyframe within 20 ms, else inserting one carrying the opacity in
+force), because the static `pos_x/pos_y` is not what an animated render reads;
+resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
+row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
+
+The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
 of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from
