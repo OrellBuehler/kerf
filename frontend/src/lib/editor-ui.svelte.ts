@@ -8,6 +8,7 @@ import { cancelAnalysis, downloadSpeechModel, listFonts, setSpeechModel, transcr
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
 import type { AnalysisProgress, TranscriptionStatus } from './types';
+import type { VoiceoverPrefill } from './voiceover';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -37,6 +38,8 @@ class EditorUi {
 	analysisQueued = $state(0);
 	/** Set while a stop has been asked for but the pass hasn't given up yet. */
 	stoppingAnalysis = $state(false);
+	/** The voiceover dialog: `null` while closed, else what it opens with. */
+	voiceoverDialog = $state<{ prefill: VoiceoverPrefill | null } | null>(null);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
@@ -55,6 +58,14 @@ class EditorUi {
 	availableFonts = $state<string[]>([]);
 
 	#raf: number | null = null;
+
+	openVoiceover(prefill: VoiceoverPrefill | null = null) {
+		this.voiceoverDialog = { prefill };
+	}
+
+	closeVoiceover() {
+		this.voiceoverDialog = null;
+	}
 
 	/** Fetch the installed system fonts once at startup. */
 	async loadFonts() {

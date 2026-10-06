@@ -15,6 +15,7 @@
  * not the edit the notice was about. */
 
 import { toast as sonner, type ExternalToast } from 'svelte-sonner';
+import { logFrontend } from './log';
 
 export type NoticeKind = 'success' | 'error' | 'warning' | 'info' | 'note';
 
@@ -87,6 +88,10 @@ type Opts = ExternalToast;
 
 function show(kind: NoticeKind, message: string, opts?: Opts) {
 	notifications.record(kind, message);
+	if (kind === 'error' || kind === 'warning') {
+		const detail = typeof opts?.description === 'string' ? ` — ${opts.description}` : '';
+		logFrontend(kind === 'error' ? 'error' : 'warn', `${message}${detail}`, 'toast');
+	}
 	const linger = kind === 'error' ? ERROR_MS : kind === 'warning' ? WARNING_MS : undefined;
 	const o = linger !== undefined && opts?.duration === undefined ? { ...opts, duration: linger } : opts;
 	switch (kind) {

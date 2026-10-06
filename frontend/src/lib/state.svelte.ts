@@ -78,6 +78,7 @@ import {
 	setVolume,
 	splitClip,
 	trimClip,
+	generateVoiceover,
 	undo as apiUndo
 } from './api';
 import type {
@@ -105,11 +106,13 @@ import type {
 	Timeline,
 	Transform,
 	Transition,
-	VideoEffect
+	VideoEffect,
+	VoiceoverRequest
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { Generation } from './generation';
+import { retimeKeyframes, withKeyframeAt } from './titles';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -120,6 +123,8 @@ class EditorState {
 	/** The whole selection. Always contains `selectedClipId` when that is set;
 	 *  most edits act on the primary, but delete acts on all of these. */
 	selectedClipIds = $state<string[]>([]);
+	/** The title being edited. Exclusive with the clip selection: a title is its
+	 *  own item on the titles lane, not a property of whichever clip is selected. */
 	selectedOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
@@ -158,6 +163,9 @@ class EditorState {
 	 *  generation above. */
 	#setTimeline(tl: Timeline) {
 		this.timeline = tl;
+		if (this.selectedOverlayId && !(tl.overlays ?? []).some((o) => o.id === this.selectedOverlayId)) {
+			this.selectedOverlayId = null;
+		}
 		this.#timelineGen.advance();
 	}
 	/** Sequence guard over `select()` — a slow metadata fetch for an earlier
@@ -194,6 +202,7 @@ class EditorState {
 	 * everything between the primary and this clip on the same track.
 	 */
 	selectClip(clipId: string, mode: 'replace' | 'toggle' | 'range' = 'replace') {
+		this.selectedOverlayId = null;
 		if (mode === 'toggle') {
 			const has = this.selectedClipIds.includes(clipId);
 			this.selectedClipIds = has
@@ -222,6 +231,7 @@ class EditorState {
 	/** Select every clip on every unlocked track. */
 	selectAll() {
 		const ids = this.timeline.tracks.filter((t) => !t.locked).flatMap((t) => t.clips.map((c) => c.id));
+		this.selectedOverlayId = null;
 		this.selectedClipIds = ids;
 		this.selectedClipId = ids.at(-1) ?? null;
 	}
@@ -229,6 +239,16 @@ class EditorState {
 	clearSelection() {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+	}
+
+	/** Select a title, dropping the clip selection so the Inspector shows one thing. */
+	selectOverlay(overlayId: string | null) {
+		this.selectedOverlayId = overlayId;
+		if (overlayId) {
+			this.selectedClipId = null;
+			this.selectedClipIds = [];
+		}
 	}
 
 	/** Delete every selected clip as one user gesture. Ripple deletes run
@@ -347,6 +367,7 @@ class EditorState {
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -358,6 +379,7 @@ class EditorState {
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -493,6 +515,15 @@ class EditorState {
 			this.importing = false;
 			this.importProgress = null;
 		}
+	}
+
+	/** Re-read the asset list, for assets an agent brought in behind our back
+	 *  (a voiceover it generated). Left alone when nothing is new, so the bin
+	 *  does not re-render on every agent edit. */
+	async refreshAssets() {
+		const assets = await listAssets();
+		const known = new Set(this.assets.map((a) => a.id));
+		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
 	}
 
 	/** Run analysis on an asset and merge the result into local caches. */
@@ -721,8 +752,37 @@ class EditorState {
 	addOverlay(text: string, start: number, end: number) {
 		return this.#apply(addOverlay(text, start, end));
 	}
+	/** Add a title at `start..end` and select it. */
+	async addTitle(text: string, start: number, end: number) {
+		const known = new Set(this.overlays.map((o) => o.id));
+		await this.addOverlay(text, start, end);
+		const created = this.overlays.find((o) => !known.has(o.id));
+		if (created) this.selectOverlay(created.id);
+		return created;
+	}
 	updateOverlay(overlayId: string, patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
 		return this.#apply(updateOverlay(overlayId, patch));
+	}
+	/** Set a title's span. Its keyframes are relative to the start, so a length
+	 *  change re-times them (fade-out stays on the end) as a second edit. */
+	async retimeOverlay(overlayId: string, start: number, end: number) {
+		const o = this.overlays.find((o) => o.id === overlayId);
+		if (!o) return this.timeline;
+		const keys = o.keyframes ? o.keyframes.map((k) => ({ ...k })) : [];
+		const oldDur = o.end - o.start;
+		const tl = await this.updateOverlay(overlayId, { start, end });
+		if (keys.length && Math.abs(end - start - oldDur) > 1e-9) {
+			return this.setOverlayKeyframes(overlayId, retimeKeyframes(keys, oldDur, end - start));
+		}
+		return tl;
+	}
+	/** Put a title's centre at `(x, y)`. A still title takes it as its position;
+	 *  an animated one gets a keyframe at timeline time `at`, since its static
+	 *  position is not what the render reads. */
+	moveOverlay(overlayId: string, x: number, y: number, at: number) {
+		const o = this.overlays.find((o) => o.id === overlayId);
+		if (o?.keyframes?.length) return this.setOverlayKeyframes(overlayId, withKeyframeAt(o, at, x, y));
+		return this.updateOverlay(overlayId, { pos_x: x, pos_y: y });
 	}
 	removeOverlay(overlayId: string) {
 		if (this.selectedOverlayId === overlayId) this.selectedOverlayId = null;
@@ -730,6 +790,29 @@ class EditorState {
 	}
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
 		return this.#apply(setOverlayKeyframes(overlayId, keyframes));
+	}
+	/**
+	 * Synthesize a script onto the VO track. The asset carries its script as its
+	 * transcript, so unlike an import it is never queued for analysis. Nothing
+	 * is reported through `error` — the dialog says what happened, and a
+	 * cancelled run is not an error at all.
+	 */
+	async generateVoiceover(req: VoiceoverRequest): Promise<Asset> {
+		this.#busyCount++;
+		this.previewingStaged = false;
+		this.#liveTimeline = null;
+		try {
+			const { asset, timeline } = await generateVoiceover(req);
+			this.assets = this.assets.some((a) => a.id === asset.id)
+				? this.assets.map((a) => (a.id === asset.id ? asset : a))
+				: [...this.assets, asset];
+			this.#setTimeline(timeline);
+			await this.refreshHistory();
+			await this.select(asset.id);
+			return asset;
+		} finally {
+			this.#busyCount--;
+		}
 	}
 	generateCaptions(options?: CaptionOptions) {
 		return this.#apply(generateCaptions(options));

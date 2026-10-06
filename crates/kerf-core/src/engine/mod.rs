@@ -74,6 +74,12 @@ pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
 // transcript surface works in the `--no-default-features` build too.
 pub mod whisper;
 
+// Resumable, cancellable downloads of the optional models and runtimes.
+mod download;
+
+// Voiceover: Kokoro text-to-speech on a downloaded ONNX Runtime.
+pub mod tts;
+
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
@@ -95,6 +101,11 @@ pub(crate) use cli::insta360_pair_name;
 pub use whisper::{
     download_model as download_speech_model, set_model as set_speech_model, DownloadProgress, ModelInfo as SpeechModelInfo,
     DEFAULT_MODEL as DEFAULT_SPEECH_MODEL,
+};
+
+pub use tts::{
+    prepare as prepare_voiceover, status as voiceover_status, VoiceInfo, VoiceoverStatus, DEFAULT_VOICE,
+    MAX_SPEED as MAX_VOICE_SPEED, MIN_SPEED as MIN_VOICE_SPEED,
 };
 
 /// The names of every speech model Kerf can download, smallest first.

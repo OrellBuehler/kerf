@@ -162,7 +162,7 @@ jobs:
           - platform: windows-latest
             arch: x86_64
             args: ''
-            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/misaki-rs-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
             bundleFfmpeg: true
     runs-on: ${{ matrix.platform }}
     steps:

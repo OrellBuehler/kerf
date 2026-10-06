@@ -39,6 +39,8 @@ struct AppState {
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
     analysis_cancel: Arc<AtomicBool>,
+    /// Same, for a voiceover being synthesized (or its model downloading).
+    voiceover_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +494,120 @@ async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+// ---- voiceover ---------------------------------------------------------------
+
+/// Whether voiceovers can be generated here, what the first one has to
+/// download, and the voices on offer.
+#[tauri::command(async)]
+fn voiceover_status() -> CmdResult<kerf_core::VoiceoverStatus> {
+    Ok(kerf_core::voiceover_status())
+}
+
+/// One step of generating a voiceover: a download (`download_runtime`,
+/// `download_model`, `download_voice`) or `synthesize`.
+#[derive(Serialize, Clone)]
+pub(crate) struct VoiceoverProgressEvent {
+    pub(crate) stage: String,
+    pub(crate) fraction: Option<f64>,
+    pub(crate) detail: Option<String>,
+}
+
+/// The error an abandoned voiceover returns, for the webview to stay quiet on.
+const VOICEOVER_CANCELLED: &str = "voiceover cancelled";
+
+fn voiceover_err(e: kerf_core::Error) -> String {
+    match e {
+        kerf_core::Error::Cancelled => VOICEOVER_CANCELLED.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Download the voice runtime, model and `voice` ahead of time, streaming
+/// `voiceover-progress`, so the first voiceover starts synthesizing at once.
+#[tauri::command]
+async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: String) -> CmdResult<kerf_core::VoiceoverStatus> {
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(voiceover_err)?;
+        Ok(kerf_core::voiceover_status())
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct VoiceoverResult {
+    asset: Asset,
+    timeline: Timeline,
+}
+
+/// Read `text` aloud and put it on the timeline — on the `VO` track unless
+/// `track_id` names another audio track, at `timeline_start` or after what is
+/// already there — then caption the cut when `captions` is given.
+///
+/// Synthesis (and a first-use model download) runs with the project lock
+/// released, like an import; only landing the result takes it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn generate_voiceover(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+    voice: Option<String>,
+    speed: Option<f64>,
+    track_id: Option<String>,
+    timeline_start: Option<f64>,
+    captions: Option<CaptionOptions>,
+) -> CmdResult<VoiceoverResult> {
+    let track = track_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let voice = voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        let asset = Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(voiceover_err)?;
+        let project = lock_user(&shared);
+        let (asset, _) = project
+            .place_voiceover(&asset, track, timeline_start)
+            .map_err(|e| e.to_string())?;
+        if let Some(options) = captions {
+            project.generate_captions(options).map_err(|e| e.to_string())?;
+        }
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(VoiceoverResult { asset, timeline })
+    })
+    .await
+}
+
+/// Request cancellation of the voiceover being generated (or its download).
+#[tauri::command(async)]
+fn cancel_voiceover(state: State<'_, AppState>) {
+    state.voiceover_cancel.store(true, Ordering::SeqCst);
 }
 
 // ---- timeline editing (each returns the refreshed timeline) ----------------
@@ -1783,10 +1899,15 @@ async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
 
 // ---- diagnostics (logs) ----------------------------------------------------
 
+/// Where the logfiles live: `<app data dir>/logs`. The one place this is
+/// decided, so `init_logging`, `log_dir` and `reveal_logs` cannot disagree.
+fn log_dir_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
+    app.path().app_data_dir().map(|dir| dir.join("logs"))
+}
+
 #[tauri::command(async)]
 fn log_dir(app: AppHandle) -> CmdResult<String> {
-    app.path()
-        .app_log_dir()
+    log_dir_path(&app)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| e.to_string())
 }
@@ -1795,10 +1916,85 @@ fn log_dir(app: AppHandle) -> CmdResult<String> {
 #[tauri::command(async)]
 fn reveal_logs(app: AppHandle) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let dir = log_dir_path(&app).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     app.opener()
         .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+/// The longest message the webview may write to the log; the rest is cut so a
+/// runaway loop (or an error carrying a whole payload) cannot fill the disk.
+const FRONTEND_LOG_MAX: usize = 8 * 1024;
+const FRONTEND_CONTEXT_MAX: usize = 512;
+/// Webview lines let through per second; the rest are counted and reported.
+const FRONTEND_LOG_PER_SEC: u32 = 30;
+
+fn truncate_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// A fixed one-second window: `admit` says whether this line may be written and,
+/// when a new window opens, how many the last one turned away.
+#[derive(Default)]
+struct LogBudget {
+    window: u64,
+    used: u32,
+    dropped: u32,
+}
+
+impl LogBudget {
+    fn admit(&mut self, now_ms: u64) -> (bool, u32) {
+        let window = now_ms / 1000;
+        let mut dropped = 0;
+        if window != self.window {
+            dropped = std::mem::take(&mut self.dropped);
+            self.window = window;
+            self.used = 0;
+        }
+        if self.used < FRONTEND_LOG_PER_SEC {
+            self.used += 1;
+            (true, dropped)
+        } else {
+            self.dropped += 1;
+            (false, dropped)
+        }
+    }
+}
+
+/// Write a line from the webview — a failed command, an error toast, an
+/// unhandled rejection — to the logfile, marked with the `webview` target.
+#[tauri::command(async)]
+fn log_frontend(level: String, message: String, context: Option<String>) {
+    static BUDGET: Mutex<Option<LogBudget>> = Mutex::new(None);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let (allowed, dropped) = BUDGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(LogBudget::default)
+        .admit(now_ms);
+    if dropped > 0 {
+        tracing::warn!(target: "webview", dropped, "webview log lines dropped (rate limit)");
+    }
+    if !allowed {
+        return;
+    }
+    let message = truncate_log(&message, FRONTEND_LOG_MAX);
+    let context = truncate_log(context.as_deref().unwrap_or(""), FRONTEND_CONTEXT_MAX);
+    match level.as_str() {
+        "error" => tracing::error!(target: "webview", context = %context, "{message}"),
+        "warn" | "warning" => tracing::warn!(target: "webview", context = %context, "{message}"),
+        _ => tracing::info!(target: "webview", context = %context, "{message}"),
+    }
 }
 
 /// Packaged builds ship `ffmpeg`/`ffprobe` next to the executable as Tauri
@@ -1824,8 +2020,8 @@ fn use_bundled_ffmpeg() {
 }
 
 /// Install the global tracing subscriber: always to stdout, and — when the
-/// platform log directory is writable — to a daily-rolling `kerf.<date>.log`
-/// there (the last 14 days are kept) so users hitting an issue can attach it.
+/// log directory (`<app data dir>/logs`) is writable — to a daily-rolling
+/// `kerf.<date>.log` there (the last 14 days are kept) so users hitting an issue can attach it.
 /// Level is `info` by default; override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
 fn init_logging(app: &AppHandle) {
     use tracing_subscriber::prelude::*;
@@ -1834,7 +2030,7 @@ fn init_logging(app: &AppHandle) {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
 
-    let file = app.path().app_log_dir().ok().and_then(|dir| {
+    let file = log_dir_path(app).ok().and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -1939,9 +2135,10 @@ pub fn run() {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            voiceover_cancel: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
-            // Logging needs the resolved platform log directory, so set it up here
+            // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
@@ -1952,6 +2149,10 @@ pub fn run() {
                 version = env!("CARGO_PKG_VERSION"),
                 os = std::env::consts::OS,
                 arch = std::env::consts::ARCH,
+                ffmpeg = %std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()),
+                ffprobe = %std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string()),
+                log_dir = %log_dir_path(app.handle()).map(|p| p.display().to_string()).unwrap_or_default(),
+                data_dir = %app.path().app_data_dir().map(|p| p.display().to_string()).unwrap_or_default(),
                 "kerf starting"
             );
 
@@ -1980,6 +2181,10 @@ pub fn run() {
             transcription_status,
             set_speech_model,
             download_speech_model,
+            voiceover_status,
+            prepare_voiceover,
+            generate_voiceover,
+            cancel_voiceover,
             cut_clip,
             add_clip,
             split_clip,
@@ -2069,7 +2274,8 @@ pub fn run() {
             read_text_file,
             write_text_file,
             log_dir,
-            reveal_logs
+            reveal_logs,
+            log_frontend
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerf");
@@ -2077,7 +2283,26 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_arg, require_json_path, require_local_output_path};
+    use super::{require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
+
+    #[test]
+    fn truncate_log_keeps_short_and_cuts_on_a_char_boundary() {
+        assert_eq!(truncate_log("short", 10), "short");
+        let cut = truncate_log("aéééé", 4);
+        assert!(cut.starts_with("aé…"), "{cut}");
+        assert!(cut.contains("truncated"));
+    }
+
+    #[test]
+    fn log_budget_caps_a_second_and_reports_the_drops_next_window() {
+        let mut b = LogBudget::default();
+        for _ in 0..FRONTEND_LOG_PER_SEC {
+            assert_eq!(b.admit(5_000), (true, 0));
+        }
+        assert_eq!(b.admit(5_500), (false, 0));
+        assert_eq!(b.admit(5_900), (false, 0));
+        assert_eq!(b.admit(6_100), (true, 2));
+    }
 
     #[test]
     fn accepts_absolute_local_paths() {

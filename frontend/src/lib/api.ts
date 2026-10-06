@@ -40,7 +40,11 @@ import type {
 	TranscriptionStatus,
 	TranscriptSegment,
 	UpdateInfo,
-	VideoEffect
+	VideoEffect,
+	VoiceoverProgress,
+	VoiceoverRequest,
+	VoiceoverResult,
+	VoiceoverStatus
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
@@ -48,6 +52,8 @@ import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { describeError, logFrontend } from './log';
+import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -65,7 +71,13 @@ function hasNonFinite(v: unknown, depth = 0): boolean {
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	if (hasNonFinite(args)) throw new Error('That value is not a number.');
 	const { invoke } = await import('@tauri-apps/api/core');
-	return invoke<T>(cmd, args);
+	try {
+		return await invoke<T>(cmd, args);
+	} catch (e) {
+		const message = describeError(e);
+		logFrontend(/cancel/i.test(message) ? 'info' : 'error', `${cmd} failed: ${message}`, `command ${cmd}`);
+		throw e;
+	}
 }
 
 // ---- sample fallback (browser dev) ----------------------------------------
@@ -561,6 +573,153 @@ export async function setSpeechModel(name: string | null): Promise<Transcription
 export async function downloadSpeechModel(name: string): Promise<string> {
 	if (!inTauri()) throw new Error('speech models are only available in the desktop app');
 	return invoke<string>('download_speech_model', { name });
+}
+
+// ---- voiceover (text-to-speech) ---------------------------------------------
+
+// The browser harness has no synthesizer, so it fakes one: a few progress ticks,
+// then an audio-only asset timed from the script. What stays real is everything
+// the editor does with the result — the VO track, the transcript, the captions.
+const devVoiceoverListeners = new Set<(p: VoiceoverProgress) => void>();
+const devVoices = new Set<string>();
+let devVoiceoverReady = false;
+let devVoiceoverCancelled = false;
+const DEV_VOICEOVER_BYTES = 104857600;
+
+function devVoiceoverStatus(): VoiceoverStatus {
+	return {
+		available: true,
+		ready: devVoiceoverReady,
+		approx_download_bytes: DEV_VOICEOVER_BYTES,
+		default_voice: DEFAULT_VOICE,
+		voices: VOICE_IDS.map((id) => voiceInfo(id, devVoices.has(id))),
+		reason: null
+	};
+}
+
+function devVoiceoverEmit(p: VoiceoverProgress) {
+	for (const cb of devVoiceoverListeners) cb(p);
+}
+
+/** One stage's worth of synthetic ticks; stops with the real error on a cancel. */
+async function devVoiceoverStage(stage: VoiceoverProgress['stage'], steps: number, detail: (i: number) => string) {
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 220));
+		if (devVoiceoverCancelled) throw new Error('voiceover cancelled');
+		devVoiceoverEmit({ stage, fraction: i / steps, detail: detail(i) });
+	}
+}
+
+async function devVoiceoverDownload(voice: string) {
+	if (!devVoiceoverReady) {
+		await devVoiceoverStage('download_runtime', 3, (i) => `${Math.round((i / 3) * 12)} MB / 12 MB`);
+		await devVoiceoverStage('download_model', 4, (i) => `${Math.round((i / 4) * 88)} MB / 88 MB`);
+	}
+	if (!devVoices.has(voice)) await devVoiceoverStage('download_voice', 2, (i) => `${i / 2} MB / 1 MB`);
+	devVoiceoverReady = true;
+	devVoices.add(voice);
+}
+
+/** Whether voiceover can run here, which voices there are and whether the first
+ *  use still has to download the model. */
+export async function voiceoverStatus(): Promise<VoiceoverStatus> {
+	if (!inTauri()) return devVoiceoverStatus();
+	return invoke<VoiceoverStatus>('voiceover_status');
+}
+
+/** Download the runtime, the model and one voice ahead of the first voiceover,
+ *  streaming `voiceover-progress`. */
+export async function prepareVoiceover(voice: string): Promise<VoiceoverStatus> {
+	if (!inTauri()) {
+		devVoiceoverCancelled = false;
+		await devVoiceoverDownload(voice);
+		return devVoiceoverStatus();
+	}
+	return invoke<VoiceoverStatus>('prepare_voiceover', { voice });
+}
+
+/** Synthesize a script, import it as an asset on the "VO" track and, when asked,
+ *  caption the cut from it. Rejects with `voiceover cancelled` if stopped. */
+export async function generateVoiceover(opts: VoiceoverRequest): Promise<VoiceoverResult> {
+	if (!inTauri()) {
+		devVoiceoverCancelled = false;
+		const voice = opts.voice ?? DEFAULT_VOICE;
+		const speed = clampSpeed(opts.speed ?? DEFAULT_SPEED);
+		await devVoiceoverDownload(voice);
+		const segments = scriptSegments(opts.text, speed);
+		await devVoiceoverStage('synthesize', Math.min(segments.length, 6) || 1, (i) => {
+			const done = Math.ceil((i / (Math.min(segments.length, 6) || 1)) * segments.length);
+			return `${done} of ${segments.length} sentences`;
+		});
+		const id = uid();
+		const words = opts.text.trim().split(/\s+/).slice(0, 4).join(' ');
+		const asset: Asset = {
+			id,
+			path: `/voiceover/${id}.wav`,
+			name: `Voiceover - ${words}.wav`,
+			duration: estimateSeconds(opts.text, speed),
+			streams: [{ index: 0, kind: 'audio', codec: 'pcm_s16le', sample_rate: 24000, channels: 1 }],
+			imported_at: new Date().toISOString(),
+			voiceover: { text: opts.text, voice, speed, segments }
+		};
+		sampleAssets.push(asset);
+		sampleAnalysis[id] = {
+			asset_id: id,
+			silence_segments: [],
+			scene_changes: [],
+			transcript: segments,
+			loudness: null,
+			onsets: [],
+			tempo: null,
+			audio_class: { class: 'speech', confidence: 1 }
+		};
+		let track = opts.trackId ? devTimeline.tracks.find((t) => t.id === opts.trackId) : undefined;
+		track ??= devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'VO');
+		if (!track) {
+			track = { id: uid(), kind: 'audio', name: 'VO', clips: [] };
+			devTimeline.tracks.push(track);
+		}
+		track.clips.push({
+			id: uid(),
+			asset_id: id,
+			source_in: 0,
+			source_out: asset.duration,
+			timeline_start: opts.timelineStart ?? trackEnd(track),
+			volume: 1,
+			fade_in: 0,
+			fade_out: 0
+		});
+		recordDev('Add voiceover');
+		const timeline = opts.captions ? await generateCaptions(opts.captions) : snapshot();
+		return { asset: structuredClone(asset), timeline };
+	}
+	return invoke<VoiceoverResult>('generate_voiceover', {
+		text: opts.text,
+		voice: opts.voice,
+		speed: opts.speed,
+		trackId: opts.trackId,
+		timelineStart: opts.timelineStart,
+		captions: opts.captions
+	});
+}
+
+/** Stop the download or synthesis in flight; it then rejects with `voiceover cancelled`. */
+export async function cancelVoiceover(): Promise<void> {
+	if (!inTauri()) {
+		devVoiceoverCancelled = true;
+		return;
+	}
+	return invoke<void>('cancel_voiceover');
+}
+
+/** Subscribe to `voiceover-progress` events — the GUI's own and an agent's. Returns an unlisten fn. */
+export async function onVoiceoverProgress(cb: (p: VoiceoverProgress) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devVoiceoverListeners.add(cb);
+		return () => void devVoiceoverListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<VoiceoverProgress>('voiceover-progress', (e) => cb(e.payload));
 }
 
 // ---- timeline editing (each resolves to the refreshed timeline) ------------
