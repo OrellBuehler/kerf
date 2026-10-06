@@ -2283,7 +2283,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
+    use super::{project_arg, require_json_path, require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
 
     #[test]
     fn truncate_log_keeps_short_and_cuts_on_a_char_boundary() {

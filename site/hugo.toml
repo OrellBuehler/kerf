@@ -46,7 +46,7 @@ disableKinds = ["taxonomy", "term", "RSS"]
   minifyOutput = true
 
 # Redeclaring mounts replaces the defaults, so list them all. The last mount
-# serves the canonical screenshots in ../docs/img at /img/ — one source of truth
+# serves the canonical screenshots in ../assets/img at /img/ — one source of truth
 # shared with the repository README.
 [module]
   [[module.mounts]]
@@ -62,5 +62,5 @@ disableKinds = ["taxonomy", "term", "RSS"]
     source = "static"
     target = "static"
   [[module.mounts]]
-    source = "../docs/img"
+    source = "../assets/img"
     target = "static/img"

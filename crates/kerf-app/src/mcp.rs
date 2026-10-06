@@ -2904,6 +2904,17 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite, router,
+        server_identity, track_gaps,
+    };
+
+    #[test]
+    fn log_tool_error_handles_both_kinds() {
+        log_tool_error("t", &rmcp::ErrorData::invalid_params("bad id", None));
+        log_tool_error("t", &rmcp::ErrorData::internal_error("boom", None));
+    }
+
     #[test]
     fn a_taken_port_is_named_as_such() {
         let taken = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::AddrInUse));
@@ -2916,11 +2927,6 @@ mod tests {
             "The agent endpoint could not start on 127.0.0.1:7777: boom"
         );
     }
-
-    use super::{
-        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, refuse_overwrite, router, server_identity,
-        track_gaps,
-    };
 
     #[test]
     fn refuse_overwrite_blocks_an_existing_file_unless_opted_in() {

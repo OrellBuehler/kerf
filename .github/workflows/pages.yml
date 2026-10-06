@@ -7,7 +7,7 @@ on:
     branches: [main]
     paths:
       - "site/**"
-      - "docs/img/**"
+      - "assets/img/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

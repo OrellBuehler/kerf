@@ -48,3 +48,6 @@ Thumbs.db
 .claude/settings.local.json
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+
+# Local notes, reviews and plans (not part of the repo)
+/docs/
