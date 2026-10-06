@@ -3,6 +3,7 @@
 // and the two surfaces cannot drift apart.
 
 import type { Asset, AssetAnalysis, StreamInfo, Timeline } from './types';
+import { fmtSpeed, voiceName } from './voiceover';
 
 export interface MediaInfo {
 	/** `video` / `audio` / `image` — what the thumbnail and badge lead with. */
@@ -25,6 +26,8 @@ export interface MediaInfo {
 	duration: string;
 	/** True when this is a derived file (a stitched Insta360 pair). */
 	stitched: boolean;
+	/** `Heart · 1.0×` for a synthesized voiceover, else `null`. */
+	voiceover: string | null;
 }
 
 export function videoStream(a: Pick<Asset, 'streams'>): StreamInfo | undefined {
@@ -99,7 +102,8 @@ export function mediaInfo(a: Asset, timeline: Pick<Timeline, 'tracks'>): MediaIn
 		aspect: v?.width && v?.height ? fmtAspect(v.width, v.height) : null,
 		uses: usesOf(a.id, timeline),
 		duration: fmtDuration(a.duration),
-		stitched: (a.source_paths?.length ?? 0) > 0
+		stitched: (a.source_paths?.length ?? 0) > 0,
+		voiceover: a.voiceover ? `${voiceName(a.voiceover.voice)} · ${fmtSpeed(a.voiceover.speed)}` : null
 	};
 }
 

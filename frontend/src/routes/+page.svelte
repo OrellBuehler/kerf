@@ -8,6 +8,7 @@
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
+	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
 	import Icon from '$lib/components/editor/Icon.svelte';
@@ -70,7 +71,13 @@
 			try {
 				do {
 					dirty = false;
-					await Promise.all([editor.refreshTimeline(), editor.refreshHistory(), agent.load()]).catch(() => {});
+					await Promise.all([
+						editor.refreshTimeline(),
+						// An agent's voiceover is an asset the bin has not heard of.
+						editor.refreshAssets(),
+						editor.refreshHistory(),
+						agent.load()
+					]).catch(() => {});
 				} while (dirty);
 			} finally {
 				refreshing = false;
@@ -450,6 +457,10 @@
 
 {#if settings.open}
 	<SettingsDialog onClose={() => settings.close()} />
+{/if}
+
+{#if ui.voiceoverDialog}
+	<VoiceoverDialog prefill={ui.voiceoverDialog.prefill} onClose={() => ui.closeVoiceover()} />
 {/if}
 
 {#if updater.dialogOpen}

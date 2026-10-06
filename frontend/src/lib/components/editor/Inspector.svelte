@@ -503,7 +503,7 @@
 			</button>
 		{/each}
 	</div>
-	<div style="display:flex;gap:7px;margin-bottom:6px">
+	<div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:6px">
 		<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addOverlayHere}>+ Text</Btn>
 		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={makeCaptions}>
 			{hasCaptions ? 'Recaption' : 'Captions'}
@@ -511,6 +511,9 @@
 		{#if hasCaptions}
 			<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={dropCaptions}>Clear</Btn>
 		{/if}
+		<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
+			>Voiceover…</Btn
+		>
 	</div>
 	{#if overlays.length === 0}
 		<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
