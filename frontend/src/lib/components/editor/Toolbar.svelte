@@ -8,6 +8,7 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { PANEL_IDS, PANELS } from '$lib/layout';
+	import { workspaceSpec } from '$lib/workspaces';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
 	import { toast } from '$lib/notifications.svelte';
 
@@ -55,7 +56,11 @@
 				action: () => workspace.toggle(id)
 			})),
 			{ type: 'separator' as const },
-			{ label: 'Reset layout', icon: 'rotate-ccw', action: () => workspace.reset() }
+			{
+				label: `Reset ${workspaceSpec(workspace.active).label} workspace`,
+				icon: 'rotate-ccw',
+				action: () => workspace.reset()
+			}
 		]);
 	}
 
@@ -144,7 +149,7 @@
 		variant="ghost"
 		size="sm"
 		icon="layout-panel-left"
-		title="Show or hide panels — drag a panel's tab to move it"
+		title="Show or hide panels, or reset this workspace — drag a panel's tab to move it"
 		onclick={pickPanels}>Panels</Btn
 	>
 	{@render divider()}

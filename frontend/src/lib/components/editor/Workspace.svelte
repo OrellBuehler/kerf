@@ -1,26 +1,27 @@
 <script lang="ts">
 	// The editor's movable middle: dockview hosts one Svelte component per
-	// panel, and the arrangement is saved through the app settings so it
-	// survives a restart. TitleBar, Toolbar and StatusBar stay fixed around it.
+	// panel. Which arrangement it opens in, switching between them and saving
+	// them are `workspace`'s job (the title bar's tabs drive it); this builds the
+	// dock and mounts the panels. TitleBar, Toolbar and StatusBar stay fixed
+	// around it.
 	import { onMount, mount, unmount, type Component } from 'svelte';
 	import { createDockview, type CreateComponentOptions, type IContentRenderer } from 'dockview';
-	import MediaBin from './MediaBin.svelte';
-	import TranscriptPanel from './TranscriptPanel.svelte';
+	import LibraryPanel from './LibraryPanel.svelte';
 	import Preview from './Preview.svelte';
 	import Timeline from './Timeline.svelte';
 	import Inspector from './Inspector.svelte';
 	import AgentPanel from './AgentPanel.svelte';
-	import { DEFAULT_LAYOUT, sanitizeLayout, type PanelId } from '$lib/layout';
+	import DeliverPanel from './DeliverPanel.svelte';
+	import type { PanelId } from '$lib/layout';
 	import { workspace } from '$lib/workspace.svelte';
-	import { settings } from '$lib/settings.svelte';
 
-	const COMPONENTS: Record<PanelId, Component> = {
-		media: MediaBin,
-		transcript: TranscriptPanel,
+	const COMPONENTS: Record<PanelId, Component<any>> = {
+		library: LibraryPanel,
 		preview: Preview,
 		timeline: Timeline,
 		inspector: Inspector,
-		agent: AgentPanel
+		agent: AgentPanel,
+		deliver: DeliverPanel
 	};
 
 	let el = $state<HTMLDivElement | null>(null);
@@ -31,9 +32,16 @@
 		let instance: Record<string, unknown> | null = null;
 		return {
 			element,
-			init() {
+			init(params) {
 				const C = COMPONENTS[o.name as PanelId];
-				if (C) instance = mount(C, { target: element });
+				// The library sizes its own group (folded, it is just its rail) and
+				// hands the space on to its neighbour, so it is given the panel it
+				// lives in and the dock around it.
+				if (C)
+					instance = mount(C, {
+						target: element,
+						props: o.name === 'library' ? { panelApi: params.api, dock: params.containerApi } : {}
+					});
 			},
 			dispose() {
 				if (instance) void unmount(instance);
@@ -57,32 +65,8 @@
 			theme: { name: 'kerf', className: 'dockview-theme-kerf' },
 			disableFloatingGroups: true
 		});
-		let restoring = true;
-		try {
-			api.fromJSON(sanitizeLayout(settings.layout) ?? structuredClone(DEFAULT_LAYOUT));
-		} catch (e) {
-			console.error('could not restore the layout', e);
-			api.fromJSON(structuredClone(DEFAULT_LAYOUT));
-		}
-		restoring = false;
-		workspace.attach(api);
-
-		let timer: ReturnType<typeof setTimeout> | null = null;
-		const save = () => {
-			timer = null;
-			void settings.setLayout(api.toJSON());
-		};
-		const sub = api.onDidLayoutChange(() => {
-			if (restoring) return;
-			if (timer) clearTimeout(timer);
-			timer = setTimeout(save, 500);
-		});
+		workspace.attach(api, el!);
 		return () => {
-			if (timer) {
-				clearTimeout(timer);
-				save();
-			}
-			sub.dispose();
 			workspace.detach();
 			api.dispose();
 		};

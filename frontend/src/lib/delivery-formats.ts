@@ -24,6 +24,16 @@ export const DELIVERY_PRESETS: DeliveryPreset[] = [
 	{ id: 'portrait', label: '4:5', hint: '1080×1350 — Instagram portrait', format: { width: 1080, height: 1350, fit: 'cover' } }
 ];
 
+/** The shapes a multi-format export can write a file for — every preset that
+ *  is a frame (so not "Source"), in picker order. */
+export const VARIANT_PRESETS: DeliveryPreset[] = DELIVERY_PRESETS.filter((p) => p.format !== null);
+
+/** The frames for the ticked shape ids, in picker order whatever order they
+ *  were ticked in; an id that is not a shape is ignored. */
+export function formatsFor(ids: readonly string[]): Delivery[] {
+	return VARIANT_PRESETS.filter((p) => ids.includes(p.id)).map((p) => p.format as Delivery);
+}
+
 /** The preset matching a timeline's format, falling back to a custom entry. */
 export function presetFor(format: Delivery | null | undefined): DeliveryPreset {
 	if (!format) return DELIVERY_PRESETS[0];

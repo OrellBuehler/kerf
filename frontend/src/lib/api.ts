@@ -54,7 +54,6 @@ import { centeredCrop } from './smart-crop';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
-import { describeError, logFrontend } from './log';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -2065,7 +2064,8 @@ export async function getSettings(): Promise<SettingsView> {
 			transcribe: readBrowserTranscribe(),
 			safe_areas: readBrowserSafeAreas(),
 			layout: readBrowserJson(LAYOUT_KEY),
-			theme: readBrowserJson(THEME_KEY)
+			theme: readBrowserJson(THEME_KEY),
+			workspaces: readBrowserJson(WORKSPACES_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -2074,7 +2074,7 @@ export async function getSettings(): Promise<SettingsView> {
 /**
  * Persist the fields that changed and put them into force; returns the resolved
  * view. Only the fields in `patch` are written — the backend merges them into
- * the stored file, so a layout write cannot carry a stale copy of the theme.
+ * the stored file, so a workspaces write cannot carry a stale copy of the theme.
  */
 export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
 	if (!inTauri()) {
@@ -2087,6 +2087,7 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
+			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -2100,6 +2101,7 @@ const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
+const WORKSPACES_KEY = 'kerf.settings.workspaces';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 

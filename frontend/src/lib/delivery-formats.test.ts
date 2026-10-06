@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DELIVERY_PRESETS, fitLabel, presetFor, ratioLabel, variantPath } from './delivery-formats';
+import { DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, presetFor, ratioLabel, variantPath } from './delivery-formats';
 
 describe('variantPath', () => {
 	test('splices the shape into the file name beside the base', () => {
@@ -57,5 +57,22 @@ describe('fitLabel', () => {
 	test('says what the fit does, not what it is called', () => {
 		expect(fitLabel('cover')).toBe('fill & crop');
 		expect(fitLabel('contain')).toBe('fit & letterbox');
+	});
+});
+
+describe('the shapes a multi-format export offers', () => {
+	test('are every preset that is a frame', () => {
+		expect(VARIANT_PRESETS.map((p) => p.id)).toEqual(['landscape', 'vertical', 'square', 'portrait']);
+		expect(VARIANT_PRESETS.every((p) => p.format !== null)).toBe(true);
+	});
+
+	test('formatsFor gives the frames in picker order, whatever order they were ticked', () => {
+		expect(formatsFor(['square', 'vertical']).map((f) => `${f.width}x${f.height}`)).toEqual(['1080x1920', '1080x1080']);
+		expect(formatsFor([])).toEqual([]);
+	});
+
+	test('formatsFor ignores ids that are not shapes — Source is not a file to write', () => {
+		expect(formatsFor(['source', 'nonsense'])).toEqual([]);
+		expect(formatsFor(['source', 'portrait'])).toHaveLength(1);
 	});
 });

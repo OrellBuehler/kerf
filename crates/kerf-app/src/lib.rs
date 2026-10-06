@@ -1832,7 +1832,7 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
     settings::SettingsView::current(&settings::load(&app))
 }
 
-/// Merge a patch — only the fields that changed (`{layout}`, `{theme}`,
+/// Merge a patch — only the fields that changed (`{workspaces}`, `{theme}`,
 /// `{cpu_percent}`, …) — into the stored preferences and put them into force.
 /// Patching rather than replacing means two call sites writing at once cannot
 /// overwrite each other's field with a stale copy. Returns the resolved view, so

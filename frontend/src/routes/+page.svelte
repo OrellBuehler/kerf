@@ -21,10 +21,9 @@
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
-	let exportOpen = $state(false);
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
-	const modalOpen = $derived(exportOpen || settings.open || updater.dialogOpen);
+	const modalOpen = $derived(ui.exportDialog || settings.open || updater.dialogOpen);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
 
@@ -195,7 +194,7 @@
 	}
 
 	function onExport() {
-		exportOpen = true;
+		ui.openExport();
 	}
 
 	async function onImport() {
@@ -464,8 +463,8 @@
 	</div>
 {/if}
 
-{#if exportOpen}
-	<ExportDialog onClose={() => (exportOpen = false)} />
+{#if ui.exportDialog}
+	<ExportDialog onClose={() => ui.closeExport()} />
 {/if}
 
 {#if settings.open}

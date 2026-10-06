@@ -2,12 +2,15 @@
 	import Icon from './Icon.svelte';
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
+	import SectionHead from './SectionHead.svelte';
+	import DeliverTo from './DeliverTo.svelte';
+	import Readiness from './Readiness.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, hwEncoders, platformCheck, revealPath } from '$lib/api';
+	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import { DELIVERY_PRESETS, ratioLabel, variantPath } from '$lib/delivery-formats';
-	import type { Container, Delivery, DeliveryCheck, ExportOptions, Fit, RateControl } from '$lib/types';
+	import { formatsFor } from '$lib/delivery-formats';
+	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
 		CONTAINERS,
@@ -65,76 +68,11 @@
 	let useRange = $state(false);
 
 	// One cut, every platform: the delivery frames to render as separate files
-	// beside the chosen path, each named by shape. Empty means the ordinary
+	// beside the chosen path, each named by shape (`DeliverTo`). The choice is
+	// `ui.deliverShapes`, shared with the Deliver panel. Empty means the ordinary
 	// single export at the resolution below. Every shot is framed for every
 	// shape first unless the toggle is off — reshaping without looking keeps
 	// whatever was in the middle.
-	let variantIds = $state<string[]>([]);
-	let smartCropVariants = $state(true);
-	const variantPresets = DELIVERY_PRESETS.filter((p) => p.format !== null);
-	const variantFormats = $derived(
-		variantPresets.filter((p) => variantIds.includes(p.id)).map((p) => p.format as Delivery)
-	);
-	function toggleVariant(id: string) {
-		variantIds = variantIds.includes(id) ? variantIds.filter((v) => v !== id) : [...variantIds, id];
-	}
-	// Each variant judged at its own frame: a 9:16 file is a Reel whatever the
-	// project is cut in.
-	let variantChecks = $state<Record<string, DeliveryCheck[]>>({});
-	$effect(() => {
-		const wanted = variantPresets.filter((p) => variantIds.includes(p.id));
-		for (const p of wanted) {
-			if (variantChecks[p.id]) continue;
-			const f = p.format as Delivery;
-			platformCheck([f.width, f.height])
-				.then((c) => (variantChecks = { ...variantChecks, [p.id]: c }))
-				.catch(() => {});
-		}
-	});
-	function readyLabels(checks: DeliveryCheck[] | undefined): string {
-		if (!checks) return '';
-		const ready = checks.filter((c) => !c.issues.some((i) => i.severity !== 'tip')).map((c) => c.label);
-		return ready.length ? `Ready for ${ready.join(' · ')}` : 'Not ready for any target';
-	}
-
-	// Where this cut is going: the platform limits it meets or misses. Judged at
-	// the resolution *this render* will produce, which is not always the project
-	// frame — a 9:16 project exported at 1920x1080 is a landscape file, and the
-	// panel has to say so.
-	let checks = $state<DeliveryCheck[]>([]);
-	$effect(() => {
-		const frame = opts.resolution ?? null;
-		platformCheck(frame)
-			.then((c) => (checks = c))
-			.catch(() => (checks = []));
-	});
-
-	/** Targets with nothing but tips against them. */
-	const readyFor = $derived(checks.filter((c) => !c.issues.some((i) => i.severity !== 'tip')));
-	/** Everything specific enough to be worth its own line — which is everything
-	 *  except the shape complaint, since a landscape cut earns one of those from
-	 *  every vertical feed and four near-identical lines say nothing four times. */
-	const notes = $derived(
-		checks.flatMap((c) =>
-			c.issues.filter((i) => i.severity !== 'tip' && i.kind !== 'shape').map((i) => ({ label: c.label, ...i }))
-		)
-	);
-	/** The targets this frame would be letterboxed on, collapsed to one line. */
-	const wrongShape = $derived(checks.filter((c) => c.issues.some((i) => i.kind === 'shape')).map((c) => c.label));
-	/** The frame this render will actually produce, as a ratio. */
-	const cutRatio = $derived.by(() => {
-		const r = opts.resolution ?? (editor.timeline.format ? [editor.timeline.format.width, editor.timeline.format.height] : null);
-		return r ? ratioLabel(r[0], r[1]) : null;
-	});
-	/** The tips, deduplicated — the same advice lands on every target. */
-	const tips = $derived([
-		...new Set(checks.flatMap((c) => c.issues.filter((i) => i.severity === 'tip').map((i) => i.message)))
-	]);
-
-	function listLabels(labels: string[]): string {
-		if (labels.length < 2) return labels.join('');
-		return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
-	}
 
 	// GPU encoders the backend verified usable on this machine; merged into the
 	// codec choices once known (empty in the browser harness).
@@ -186,6 +124,9 @@
 	const summary = $derived(buildSummary(opts, hasVideo, hasAudio));
 	const command = $derived(buildCommandPreview(opts, hasVideo, hasAudio, outputPath || undefined));
 	const showVideo = $derived(!info.audioOnly && hasVideo);
+	// Shapes only mean something for a picture: an audio-only render ignores
+	// whatever the Deliver panel had ticked.
+	const variantFormats = $derived(showVideo ? formatsFor(ui.deliverShapes) : []);
 	const showAudio = $derived(!info.videoOnly && hasAudio);
 	const canExport = $derived(!editor.busy && !rendering && issues.length === 0 && (hasVideo || hasAudio));
 
@@ -268,7 +209,7 @@
 		try {
 			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;
 			if (variantFormats.length) {
-				const outs = await editor.exportVariants(outputPath, variantFormats, smartCropVariants, finalOpts);
+				const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
 				const first = outs[0];
 				toast.success(`Exported ${outs.length} files → ${outs.map((o) => o.split(/[\\/]/).pop()).join(', ')}`, {
 					action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
@@ -293,13 +234,7 @@
 </script>
 
 {#snippet secHead(label: string)}
-	<div style="display:flex;align-items:center;gap:8px;margin:16px 0 9px">
-		<span
-			style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-			>{label}</span
-		>
-		<div style="flex:1;height:1px;background:var(--border-subtle)"></div>
-	</div>
+	<SectionHead {label} />
 {/snippet}
 
 {#snippet selectRow(label: string, value: string, items: { value: string; label: string }[], onChange: (v: string) => void, disabled = false)}
@@ -515,95 +450,12 @@
 			<!-- one cut, every platform -->
 			{#if showVideo}
 				{@render secHead('Deliver to')}
-				<div style="display:flex;flex-wrap:wrap;gap:6px;padding:2px 0">
-					{#each variantPresets as p (p.id)}
-						{@const on = variantIds.includes(p.id)}
-						<button
-							title={p.hint}
-							onclick={() => toggleVariant(p.id)}
-							style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid {on
-								? 'var(--kerf-500)'
-								: 'var(--border-strong)'};background:{on
-								? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
-								: 'var(--surface-inset)'};color:{on ? 'var(--text-primary)' : 'var(--text-secondary)'}"
-							>{p.label}</button
-						>
-					{/each}
-				</div>
-				{#if variantFormats.length}
-					<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
-						One file per shape, each shot framed for each — beside the file above as
-						{#each variantFormats as f, i (f.width + 'x' + f.height)}{i ? ', ' : ''}<span
-								style="font-family:var(--font-mono);color:var(--text-secondary)"
-								>{variantPath(outputPath || 'cut.' + info.ext, f).split(/[\\/]/).pop()}</span
-							>{/each}.
-					</div>
-					{@render toggleRow('Smart crop each shot for every shape', smartCropVariants, (v) => (smartCropVariants = v))}
-					<div style="display:flex;flex-direction:column;gap:3px;padding:2px 0 4px">
-						{#each variantPresets.filter((p) => variantIds.includes(p.id)) as p (p.id)}
-							<div style="display:flex;align-items:center;gap:6px;font-size:12px">
-								<span style="font-family:var(--font-mono);color:var(--text-secondary);width:36px">{p.label}</span>
-								<span style="color:{readyLabels(variantChecks[p.id]).startsWith('Ready') ? 'var(--success)' : 'var(--warning)'}"
-									>{readyLabels(variantChecks[p.id])}</span
-								>
-							</div>
-						{/each}
-					</div>
-				{:else}
-					<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
-						Pick shapes to write one file each — a Reel, a feed post and a YouTube upload from this one cut.
-					</div>
-				{/if}
+				<DeliverTo {outputPath} ext={info.ext} />
 			{/if}
 
 			<!-- where this is going (per file when several are being written) -->
-			{#if checks.length && !variantFormats.length}
-				{@render secHead('Where it is going')}
-				<div
-					style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
-				>
-					{#if readyFor.length}
-						<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--success)">
-							<Icon n="check" s={13} color="var(--success)" />
-							<span>Ready for {readyFor.map((c) => c.label).join(' · ')}</span>
-						</div>
-					{/if}
-					{#each notes as note, i (i)}
-						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-							<span style="flex:none;margin-top:1px">
-								<Icon
-									n={note.severity === 'error' ? 'x' : 'alert-triangle'}
-									s={13}
-									color={note.severity === 'error' ? 'var(--danger)' : 'var(--warning)'}
-								/>
-							</span>
-							<span style="color:var(--text-secondary)">
-								<span style="color:var(--text-primary);font-weight:600">{note.label}</span>
-								— {note.message}
-							</span>
-						</div>
-					{/each}
-					{#if wrongShape.length}
-						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-							<span style="flex:none;margin-top:1px"><Icon n="alert-triangle" s={13} color="var(--warning)" /></span>
-							<span style="color:var(--text-secondary)">
-								{#if cutRatio}A {cutRatio} cut is letterboxed on{:else}This frame is letterboxed on{/if}
-								{listLabels(wrongShape)}. Pick a delivery frame in the toolbar to cut for one of them.
-							</span>
-						</div>
-					{/if}
-					{#if tips.length}
-						<details>
-							<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)">{tips.length} tip{tips.length === 1 ? '' : 's'}</summary>
-							{#each tips as tip (tip)}
-								<div style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)">
-									<span style="flex:none;margin-top:1px"><Icon n="lightbulb" s={13} color="var(--text-muted)" /></span>
-									<span>{tip}</span>
-								</div>
-							{/each}
-						</details>
-					{/if}
-				</div>
+			{#if !variantFormats.length}
+				<Readiness frame={opts.resolution ?? null} />
 			{/if}
 
 			<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">
