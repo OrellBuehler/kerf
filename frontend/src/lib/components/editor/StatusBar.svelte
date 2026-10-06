@@ -35,7 +35,7 @@
 </script>
 
 <div
-	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:1px solid var(--border-default)"
+	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default)"
 >
 	{#if meta}
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{meta}</span>
@@ -61,7 +61,7 @@
 			disabled={editor.exportRun.cancelling}
 			title="Stop the export and delete the partial file"
 			onclick={() => void editor.stopExport()}
-			style="background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
 		</button>
@@ -78,7 +78,7 @@
 			disabled={ui.stoppingAnalysis}
 			title="Stop analyzing — it gives up between steps, and within about a second during transcription"
 			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
 		>
 			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
 		</button>

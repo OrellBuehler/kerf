@@ -28,8 +28,8 @@
 <span
 	style="display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:var(--radius-sm);font-family:var(--font-sans);font-size:10px;font-weight:600;letter-spacing:0.02em;line-height:1;color:{t.fg};background:{t.bg};border:{tone ===
 	'neutral'
-		? '1px solid var(--border-strong)'
-		: '1px solid transparent'};{style}"
+		? 'var(--line-width) solid var(--border-strong)'
+		: 'var(--line-width) solid transparent'};{style}"
 >
 	{#if dot}<span style="width:5px;height:5px;border-radius:50%;background:{t.fg}"></span>{/if}
 	{@render children?.()}

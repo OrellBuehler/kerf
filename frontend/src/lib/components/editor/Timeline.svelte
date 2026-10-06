@@ -57,7 +57,7 @@
 	/** Shared look for the one-letter S / L track flags. */
 	const flagBtn = (on: boolean, accent: string) =>
 		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
-		`border:1px solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-disabled)'}`;
+		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-disabled)'}`;
 
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
@@ -907,7 +907,7 @@
 
 	<!-- timeline toolbar -->
 	<div
-		style="height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-subtle);flex:none"
+		style="height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:var(--line-width) solid var(--border-subtle);flex:none"
 	>
 		<span
 			style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
@@ -925,7 +925,7 @@
 			<button
 				title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
 				onclick={toggleFadeIn}
-				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{sc.fade_in >
+				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_in >
 				0
 					? 'var(--surface-hover)'
 					: 'transparent'};color:{sc.fade_in > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">in</button
@@ -933,7 +933,7 @@
 			<button
 				title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
 				onclick={toggleFadeOut}
-				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{sc.fade_out >
+				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_out >
 				0
 					? 'var(--surface-hover)'
 					: 'transparent'};color:{sc.fade_out > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">out</button
@@ -955,7 +955,7 @@
 			bind:value={ui.zoom}
 			title="Zoom — {ui.zoom} px/s (⌘/Ctrl + wheel zooms at the cursor)"
 			aria-label="Timeline zoom"
-			style="width:90px;height:24px;accent-color:var(--kerf-500);cursor:pointer"
+			style="width:90px;height:24px;"
 		/>
 		<button
 			title="Zoom in"
@@ -968,7 +968,7 @@
 			title={ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable'}
 			aria-pressed={ui.snap}
 			onclick={() => (ui.snap = !ui.snap)}
-			style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:{ui.snap
+			style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{ui.snap
 				? 'var(--surface-hover)'
 				: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
 			>{ui.snap ? 'snap on' : 'snap off'}</button
@@ -977,13 +977,13 @@
 		<button
 			title="Add a video track"
 			onclick={() => onAddTrack('video')}
-			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:transparent;color:var(--text-muted)"
+			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
 			>+ V</button
 		>
 		<button
 			title="Add an audio track"
 			onclick={() => onAddTrack('audio')}
-			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:1px solid var(--border-strong);background:transparent;color:var(--text-muted)"
+			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
 			>+ A</button
 		>
 	</div>
@@ -1003,16 +1003,16 @@
 		<!-- track headers -->
 		<div
 			bind:this={headersEl}
-			style="width:var(--track-header-w);flex:none;min-height:100%;position:sticky;left:0;z-index:40;border-right:1px solid var(--border-default);background:var(--surface-app)"
+			style="width:var(--track-header-w);flex:none;min-height:100%;position:sticky;left:0;z-index:40;border-right:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 		>
 			<div
-				style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:sticky;top:0;z-index:50;background:var(--surface-app)"
+				style="height:var(--ruler-h);border-bottom:var(--line-width) solid var(--border-subtle);position:sticky;top:0;z-index:50;background:var(--surface-app)"
 			></div>
 			{#each editor.timeline.tracks as t (t.id)}
 				<div
 					role="presentation"
 					oncontextmenu={(e) => onTrackHeaderContextMenu(e, t)}
-					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);display:flex;flex-direction:column;justify-content:center;gap:4px;padding:0 8px;overflow:hidden"
+					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;justify-content:center;gap:4px;padding:0 8px;overflow:hidden"
 				>
 				<div style="display:flex;align-items:center;gap:6px">
 					<span
@@ -1030,7 +1030,7 @@
 								: 'Duck this track under the rest of the mix on export'}
 							aria-label="Toggle ducking"
 							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
-							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:1px solid {t.duck
+							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:var(--line-width) solid {t.duck
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
 								? 'var(--text-on-accent)'
@@ -1093,7 +1093,7 @@
 								title="Level {gainLabel(t.volume ?? 1)} — double-click for unity"
 								onchange={(e) => void editor.setTrackVolume(t.id, +e.currentTarget.value).catch(err)}
 								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
-								style="flex:1;min-width:0;height:20px;accent-color:var(--kerf-400);cursor:pointer"
+								style="flex:1;min-width:0;height:20px;--slider-accent:var(--kerf-400);cursor:pointer"
 							/>
 							<input
 								type="range"
@@ -1106,7 +1106,7 @@
 								title="Pan {panLabel(t.pan ?? 0)} — double-click to centre"
 								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
 								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
-								style="width:48px;flex:none;height:20px;accent-color:var(--text-muted);cursor:pointer"
+								style="width:48px;flex:none;height:20px;--slider-accent:var(--text-muted);cursor:pointer"
 							/>
 						</div>
 					{/if}
@@ -1125,7 +1125,7 @@
 				bind:this={rulerEl}
 				role="presentation"
 				onpointerdown={onRulerPointerDown}
-				style="height:var(--ruler-h);border-bottom:1px solid var(--border-subtle);position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
+				style="height:var(--ruler-h);border-bottom:var(--line-width) solid var(--border-subtle);position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
 			>
 				{#each ticks as t (t)}
 					<span
@@ -1142,7 +1142,7 @@
 				{#each beatTimes as b (b)}
 					<span
 						title="Beat"
-						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:1px;height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
+						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:var(--line-width);height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
 					></span>
 				{/each}
 				<!-- user markers: click seeks, drag moves, double-click renames -->
@@ -1170,7 +1170,7 @@
 									else if (e.key === 'Escape') renaming = null;
 									e.stopPropagation();
 								}}
-								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:9px;padding:1px 3px;border-radius:3px;border:1px solid {accent};background:var(--surface-inset);color:var(--text-primary)"
+								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:9px;padding:1px 3px;border-radius:3px;border:var(--line-width) solid {accent};background:var(--surface-inset);color:var(--text-primary)"
 							/>
 						{:else}
 							<span
@@ -1220,7 +1220,7 @@
 			{#if hasClips}
 				{#each ticks as t, i (t)}
 					<span
-						style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:1px;background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
+						style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:var(--line-width);background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
 					></span>
 				{/each}
 			{/if}
@@ -1245,7 +1245,7 @@
 					ondragover={(e) => onLaneDragOver(e, t)}
 					ondragleave={(e) => onLaneDragLeave(e, t)}
 					ondrop={(e) => onLaneDrop(e, t)}
-					style="height:{trackHeight(t)};border-bottom:1px solid var(--border-subtle);position:relative"
+					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);position:relative"
 				>
 					{#each t.clips as c (c.id)}
 						{@const left = c.timeline_start * pxPerSec}
@@ -1266,7 +1266,7 @@
 									? 'crosshair'
 									: drag
 										? 'grabbing'
-										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
+										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
 								? '0 0 0 1px var(--kerf-500)'
 								: selected
 									? '0 0 0 1px var(--kerf-600)'
@@ -1288,7 +1288,7 @@
 								{#each silenceRegions(c) as r (r.left)}
 									<span
 										title="Detected silence"
-										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:1px solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
+										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
 							{/if}
@@ -1374,7 +1374,7 @@
 
 			<!-- playhead -->
 			<div
-				style="position:absolute;left:{ui.time * pxPerSec}px;top:0;bottom:0;width:2px;background:var(--playhead);box-shadow:0 0 10px 1px var(--playhead-glow);z-index:30;pointer-events:none"
+				style="position:absolute;left:{ui.time * pxPerSec}px;top:0;bottom:0;width:var(--playhead-width);background:var(--playhead);box-shadow:0 0 10px 1px var(--playhead-glow);z-index:30;pointer-events:none"
 			>
 				<span
 					style="position:absolute;top:-1px;left:-5px;width:12px;height:9px;background:var(--playhead);clip-path:polygon(0 0,100% 0,50% 100%)"

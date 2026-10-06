@@ -94,7 +94,7 @@
 						value={ui.transcription?.model ?? ''}
 						onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
 						disabled={!!ui.downloadingModel}
-						style="background:var(--surface-inset);color:var(--text-secondary);border:1px solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
+						style="background:var(--surface-inset);color:var(--text-secondary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
 					>
 						{#each ui.transcription?.models ?? [] as m (m.name)}
 							<option value={m.name}

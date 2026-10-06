@@ -65,7 +65,7 @@
 		role="menu"
 		tabindex="-1"
 		oncontextmenu={(e) => e.preventDefault()}
-		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
+		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
 	>
 		{#each contextMenu.items as item, i (i)}
 			{#if item.type === 'separator'}

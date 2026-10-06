@@ -288,7 +288,7 @@
 						onclick={() => onSelect(a.asset.id)}
 						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
 						title="{a.asset.path}&#10;Drag onto a timeline track to add a clip · right-click for details"
-						style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:1px solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
+						style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div
 							style="width:56px;height:36px;border-radius:3px;flex:none;overflow:hidden;background:{a.info

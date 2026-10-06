@@ -344,18 +344,18 @@
 	}
 
 	const inputCss =
-		'width:90px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:5px 7px;text-align:right';
+		'width:90px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:5px 7px;text-align:right';
 	const selectCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
+		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
 	const fxNum =
-		'width:58px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 5px;text-align:right';
+		'width:58px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 5px;text-align:right';
 	const fxTxt =
-		'width:70px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:4px 5px';
+		'width:70px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:4px 5px';
 	const xBtn =
 		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
 	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 	const chip = (active: boolean) =>
-		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid ${
+		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
 			active ? 'var(--text-primary)' : 'var(--text-secondary)'
@@ -418,7 +418,7 @@
 				liveDrag = null;
 				if (Number.isFinite(v)) onCommit(v);
 			}}
-			style="flex:1;accent-color:var(--kerf-500)"
+			style="flex:1"
 		/>
 		<span
 			style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
@@ -672,7 +672,7 @@
 							liveDrag = null;
 							if (Number.isFinite(v)) void run(() => editor.setVolume(clip.id, v));
 						}}
-						style="flex:1;accent-color:var(--kerf-500)"
+						style="flex:1"
 					/>
 					<span
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"

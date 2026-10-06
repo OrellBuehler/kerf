@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { COLOR_TOKENS, PRESETS, PRESET_IDS, parseTheme, presetIdFor, type Theme } from './theme';
+import { COLOR_TOKENS, SHAPE_NAMES, shapeProps, PRESETS, PRESET_IDS, parseTheme, presetIdFor, type Theme } from './theme';
 
 /** `--name: value` pairs from the token stylesheet, `var()` aliases resolved. */
 async function cssTokens(): Promise<Map<string, string>> {
@@ -23,6 +23,15 @@ describe('PRESETS', () => {
 			expect(css.get(t), `--${t} is missing from kerf-tokens.css`).toBeDefined();
 			expect(css.get(t)!.toLowerCase(), `--${t}`).toBe(PRESETS['kerf-dark'].colors[t]);
 		}
+	});
+
+	test('Kerf Dark shape is exactly what the stylesheet ships', async () => {
+		const css = await cssTokens();
+		const props = shapeProps(PRESETS['kerf-dark'].shape);
+		for (const [k, v] of Object.entries(props)) {
+			expect(css.get(k.slice(2)), k).toBe(v);
+		}
+		expect(Object.keys(props).length).toBe(SHAPE_NAMES.length + 2);
 	});
 
 	test('every preset defines every token as opaque hex', () => {
@@ -64,6 +73,44 @@ describe('parseTheme', () => {
 		const out = parseTheme({ ...PRESETS['kerf-dark'], colors: { ...PRESETS['kerf-dark'].colors, 'kerf-500': '#E29D2E' } });
 		expect(out!.colors['kerf-500']).toBe('#e29d2e');
 		expect(presetIdFor(out!)).toBe('kerf-dark');
+	});
+});
+
+describe('shape', () => {
+	const base = PRESETS['kerf-dark'];
+
+	test('an old theme with no shape takes the scheme preset', () => {
+		const { shape: _s, ...old } = base;
+		expect(parseTheme(old)!.shape).toEqual(base.shape);
+		expect(parseTheme({ ...old, scheme: 'light' })!.shape).toEqual(PRESETS['kerf-light'].shape);
+	});
+
+	test('clamps, snaps, ignores junk and drops unknown keys', () => {
+		const out = parseTheme({
+			...base,
+			shape: { 'line-width': 99, 'slider-thumb': 2, 'playhead-width': 2.6, 'slider-track': 'x', 'slider-thumb-style': 'bar', bogus: 1 }
+		})!;
+		expect(out.shape['line-width']).toBe(3);
+		expect(out.shape['slider-thumb']).toBe(8);
+		expect(out.shape['playhead-width']).toBe(3);
+		expect(out.shape['slider-track']).toBe(base.shape['slider-track']);
+		expect(out.shape['slider-thumb-style']).toBe('bar');
+		expect('bogus' in out.shape).toBe(false);
+	});
+
+	test('a bad thumb style falls back to the preset', () => {
+		expect(parseTheme({ ...base, shape: { 'slider-thumb-style': 'star' } })!.shape['slider-thumb-style']).toBe('round');
+	});
+
+	test('a bar thumb is narrower than it is tall', () => {
+		const p = shapeProps({ ...base.shape, 'slider-thumb-style': 'bar' });
+		expect(p['--slider-thumb-w']).toBe('6px');
+		expect(p['--slider-thumb-radius']).toBe('2px');
+	});
+
+	test('one changed shape value makes a theme custom', () => {
+		expect(presetIdFor({ ...base, shape: { ...base.shape, 'slider-thumb': 20 } })).toBe('custom');
+		expect(presetIdFor({ ...base, shape: { ...base.shape, 'slider-thumb-style': 'bar' } })).toBe('custom');
 	});
 });
 

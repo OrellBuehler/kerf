@@ -317,7 +317,7 @@
 
 {#snippet copyRow(value: string, key: string)}
 	<div
-		style="display:flex;align-items:center;gap:6px;background:var(--surface-inset);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:6px 6px 6px 9px"
+		style="display:flex;align-items:center;gap:6px;background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);padding:6px 6px 6px 9px"
 	>
 		<code
 			data-selectable
@@ -327,7 +327,7 @@
 		<button
 			title="Copy to clipboard"
 			onclick={() => copy(value, key)}
-			style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:var(--surface-raised);color:{copied ===
+			style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{copied ===
 			key
 				? 'var(--green-400)'
 				: 'var(--text-secondary)'};cursor:pointer"
@@ -341,10 +341,10 @@
 	{@const s = STATUS_MAP[t.status]}
 	{@const meta = metaFor(t)}
 	<div
-		style="border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);border-left:{t.status ===
+		style="border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);border-left:{t.status ===
 		'ready'
 			? '2px solid var(--agent-500)'
-			: '1px solid var(--border-default)'};padding:10px 11px"
+			: 'var(--line-width) solid var(--border-default)'};padding:10px 11px"
 	>
 		<div style="display:flex;align-items:center;gap:8px">
 			<Icon n={s.icon} s={13} color={iconColor(t.status)} />
@@ -356,7 +356,7 @@
 				<button
 					title="Remove from queue"
 					onclick={() => agent.remove(t.id)}
-					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
+					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
 				>
 					<Icon n="plus" s={13} style="transform:rotate(45deg)" />
 				</button>
@@ -373,7 +373,7 @@
 		{#if t.status === 'working'}
 			<div style="margin-top:9px;padding-left:21px">
 				<div
-					style="position:relative;height:5px;border-radius:999px;background:var(--surface-inset);overflow:hidden;border:1px solid var(--border-subtle)"
+					style="position:relative;height:5px;border-radius:999px;background:var(--surface-inset);overflow:hidden;border:var(--line-width) solid var(--border-subtle)"
 				>
 					<div
 						class="kerf-sweep"
@@ -391,12 +391,12 @@
 			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
 				<button
 					onclick={() => agent.resolve(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
 					>Apply</button
 				>
 				<button
 					onclick={() => agent.remove(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
 					>Dismiss</button
 				>
 			</div>
@@ -410,10 +410,10 @@
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
 	<div
-		style="height:40px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-default)"
+		style="height:40px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:var(--line-width) solid var(--border-default)"
 	>
 		<span
-			style="width:22px;height:22px;border-radius:var(--radius-sm);background:var(--agent-surface);border:1px solid var(--agent-border);display:grid;place-items:center;color:var(--agent-300)"
+			style="width:22px;height:22px;border-radius:var(--radius-sm);background:var(--agent-surface);border:var(--line-width) solid var(--agent-border);display:grid;place-items:center;color:var(--agent-300)"
 			><Icon n="plug" s={13} /></span
 		>
 		<span style="font:var(--type-title);font-size:14px">Agent queue</span>
@@ -430,7 +430,7 @@
 		<!-- the agent's pending proposal -->
 		{#if staged}
 			<div
-				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--agent-border);border-left:2px solid var(--agent-500);overflow:hidden"
+				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--agent-border);border-left:2px solid var(--agent-500);overflow:hidden"
 			>
 				<div style="display:flex;align-items:center;gap:8px;padding:10px 11px 0">
 					<Icon n="git-pull-request-arrow" s={14} color="var(--agent-300)" />
@@ -449,7 +449,7 @@
 
 				{#if staged.stale}
 					<div
-						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:1px solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.45"
+						style="margin:9px 11px 0;padding:7px 9px;border-radius:var(--radius-sm);background:var(--diff-remove-surface);border:var(--line-width) solid var(--diff-remove);font-size:12px;color:var(--text-secondary);line-height:1.45"
 					>
 						You have edited the timeline since these were staged — applying replaces your newer cut.
 					</div>
@@ -494,13 +494,13 @@
 					<button
 						onclick={applyProposal}
 						disabled={applying}
-						style="flex:1;height:30px;border-radius:var(--radius-sm);border:1px solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
 						>{applying ? 'Applying…' : 'Apply'}</button
 					>
 					<button
 						onclick={togglePreview}
 						title="Show the proposed cut in the editor"
-						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:1px solid {editor.previewingStaged
+						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:var(--line-width) solid {editor.previewingStaged
 							? 'var(--agent-500)'
 							: 'var(--border-strong)'};background:{editor.previewingStaged
 							? 'var(--agent-surface)'
@@ -513,7 +513,7 @@
 					</button>
 					<button
 						onclick={discardProposal}
-						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:1px solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
 						>Discard</button
 					>
 				</div>
@@ -544,7 +544,7 @@
 
 		<!-- how to connect an agent -->
 		<div
-			style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border-default);overflow:hidden"
+			style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);overflow:hidden"
 		>
 			<button
 				aria-expanded={showConnect}
@@ -584,7 +584,7 @@
 
 		<!-- One-click edits. Open by default: for most cuts these chips are the
 		     whole reason to open the panel, and an agent is optional. -->
-		<details open style="flex:none;border-top:1px solid var(--border-default);padding-top:4px">
+		<details open style="flex:none;border-top:var(--line-width) solid var(--border-default);padding-top:4px">
 			<summary style="cursor:pointer;font-size:13px;font-weight:600;padding:8px 0;color:var(--text-secondary)">Quick edits</summary>
 			{#each [true, false] as local (local)}
 				<p style="font-size:12px;color:var(--text-muted);margin:8px 0 6px">
@@ -596,7 +596,7 @@
 							{disabled}
 							onclick={() => runPreset(p)}
 							title={local ? `Run now: ${p}` : `Queue for agent: ${p}`}
-							style="display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:5px 10px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:var(--text-secondary);font-size:12px;cursor:pointer;text-align:left"
+							style="display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:5px 10px;border-radius:var(--radius-full);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);color:var(--text-secondary);font-size:12px;cursor:pointer;text-align:left"
 						>
 							<Icon n={local ? 'play' : 'list-plus'} s={12} />{p}
 						</button>
@@ -640,7 +640,7 @@
 							<button
 								title="Revert the timeline to this point"
 								onclick={() => editor.revertTo(rev.seq)}
-								style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:var(--radius-full);background:var(--surface-inset);border:1px solid var(--border-strong);color:var(--text-secondary);font-size:10px;cursor:pointer"
+								style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:var(--radius-full);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);color:var(--text-secondary);font-size:10px;cursor:pointer"
 							>
 								<Icon n="rotate-ccw" s={11} />Revert
 							</button>
@@ -683,10 +683,10 @@
 
 	<!-- add task -->
 	<div
-		style="flex:none;padding:12px;border-top:1px solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:9px"
+		style="flex:none;padding:12px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:9px"
 	>
 		<div
-			style="display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;background:var(--surface-inset);border:1px solid var(--input);border-radius:var(--radius-sm);opacity:{disabled
+			style="display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;background:var(--surface-inset);border:var(--line-width) solid var(--input);border-radius:var(--radius-sm);opacity:{disabled
 				? 0.5
 				: 1}"
 		>
@@ -704,7 +704,7 @@
 				aria-label="Queue task for agent"
 				disabled={disabled || !draft.trim()}
 				onclick={submit}
-				style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--radius-sm);border:1px solid transparent;background:transparent;color:{draft.trim()
+				style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:{draft.trim()
 					? 'var(--kerf-300)'
 					: 'var(--text-secondary)'};cursor:{disabled || !draft.trim() ? 'not-allowed' : 'pointer'}"
 			>
