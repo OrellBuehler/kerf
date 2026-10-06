@@ -11,11 +11,14 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { formatsFor, presetFor, ratioLabel } from '$lib/delivery-formats';
+	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
 	import { formatTimecode } from '$lib/timecode';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
-	const shapes = $derived(formatsFor(ui.deliverShapes));
+	// Shapes are for a picture: the dialog ignores them for an audio-only cut, so
+	// the panel does not offer them, and the button never promises several files.
+	const picture = $derived(hasPicture(editor.timeline));
+	const shapes = $derived(picture ? formatsFor(ui.deliverShapes) : []);
 	const frame = $derived(presetFor(editor.timeline.format));
 	const rendering = $derived(editor.exportRun !== null);
 	const progress = $derived(editor.exportRun?.progress ?? null);
@@ -50,8 +53,10 @@
 			</div>
 		{/if}
 
-		<SectionHead label="Deliver to" />
-		<DeliverTo where="named by shape beside the file you choose when you export, as" />
+		{#if picture}
+			<SectionHead label="Deliver to" />
+			<DeliverTo where="named by shape beside the file you choose when you export, as" />
+		{/if}
 
 		{#if !shapes.length}
 			<Readiness />

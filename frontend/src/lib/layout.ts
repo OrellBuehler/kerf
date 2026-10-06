@@ -330,6 +330,52 @@ export function sanitizeLayout(raw: unknown): SerializedDockview | null {
 	return layout;
 }
 
+// ---- comparing arrangements ------------------------------------------------
+
+/** How far a group's share of its branch may drift (as a fraction of the branch)
+ *  before two layouts count as arranged differently: a window resize rescales
+ *  every size by a pixel or two of rounding, which is not a rearrangement. */
+export const ARRANGEMENT_TOLERANCE = 0.015;
+
+/** The share each child takes of its branch; equal shares when sizes are absent. */
+function shares(nodes: Node[]): number[] {
+	const total = nodes.reduce((sum, n) => sum + (typeof n.size === 'number' && n.size > 0 ? n.size : 0), 0);
+	const sized = nodes.every((n) => typeof n.size === 'number' && n.size > 0);
+	return nodes.map((n) => (sized && total > 0 ? (n.size as number) / total : 1 / nodes.length));
+}
+
+function sameNode(a: unknown, b: unknown, tolerance: number): boolean {
+	if (!isObj(a) || !isObj(b) || a.type !== b.type) return false;
+	if ((a.visible === false) !== (b.visible === false)) return false;
+	if (a.type === 'leaf') {
+		const x = a.data;
+		const y = b.data;
+		if (!isObj(x) || !isObj(y) || x.id !== y.id) return false;
+		const xv = x.views;
+		const yv = y.views;
+		if (!Array.isArray(xv) || !Array.isArray(yv) || xv.length !== yv.length) return false;
+		return xv.every((v, i) => v === yv[i]);
+	}
+	const ad = a.data;
+	const bd = b.data;
+	if (a.type !== 'branch' || !Array.isArray(ad) || !Array.isArray(bd) || ad.length !== bd.length) return false;
+	const sa = shares(ad as Node[]);
+	const sb = shares(bd as Node[]);
+	return ad.every((child, i) => Math.abs(sa[i] - sb[i]) <= tolerance && sameNode(child, bd[i], tolerance));
+}
+
+/** Whether two layouts arrange the panels the same way: the same groups holding
+ *  the same panels in the same order, split the same way, at the same shares of
+ *  their branches (within `tolerance`). Pixel sizes, which move with the window,
+ *  the active group and the active tab (which a click changes) do not count. */
+export function sameArrangement(
+	a: SerializedDockview,
+	b: SerializedDockview,
+	tolerance = ARRANGEMENT_TOLERANCE
+): boolean {
+	return a.grid.orientation === b.grid.orientation && sameNode(a.grid.root, b.grid.root, tolerance);
+}
+
 /** The panels a layout shows. */
 export function openPanelIds(layout: SerializedDockview): PanelId[] {
 	return Object.keys(layout.panels).filter(isPanelId);

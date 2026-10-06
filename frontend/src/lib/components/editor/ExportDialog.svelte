@@ -9,7 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import { formatsFor } from '$lib/delivery-formats';
+	import { formatsFor, hasPicture } from '$lib/delivery-formats';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
@@ -103,7 +103,7 @@
 	}
 
 	const assets = $derived(editor.assets);
-	const hasVideo = $derived(editor.timeline.tracks.some((t) => t.kind === 'video' && t.clips.length > 0));
+	const hasVideo = $derived(hasPicture(editor.timeline));
 	const hasAudio = $derived(
 		editor.timeline.tracks.some((t) =>
 			t.clips.some((c) => assets.find((a) => a.id === c.asset_id)?.streams.some((s) => s.kind === 'audio'))

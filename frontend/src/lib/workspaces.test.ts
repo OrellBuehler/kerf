@@ -8,8 +8,11 @@ import {
 	defaultWorkspaces,
 	isLibraryTab,
 	layoutFor,
+	libraryTabFor,
 	parseWorkspaces,
+	shouldPersistLayout,
 	stepTab,
+	withLibraryTab,
 	workspaceSpec
 } from './workspaces';
 
@@ -48,11 +51,15 @@ describe('the workspace and tab lists', () => {
 		for (const t of LIBRARY_TAB_SPECS) expect(registry).toContain(`'${t.icon}':`);
 	});
 
-	test('the specialised workspaces open a tab that exists; Edit and Deliver leave it be', () => {
-		for (const w of WORKSPACE_SPECS) if (w.libraryTab) expect(isLibraryTab(w.libraryTab)).toBe(true);
-		expect(workspaceSpec('audio').libraryTab).toBe('audio');
-		expect(workspaceSpec('edit').libraryTab).toBeUndefined();
-		expect(workspaceSpec('deliver').libraryTab).toBeUndefined();
+	test('every workspace has a library tab of its own, the tool it is about', () => {
+		for (const w of WORKSPACE_SPECS) expect(isLibraryTab(w.libraryTab)).toBe(true);
+		expect(WORKSPACE_SPECS.map((w) => [w.id, w.libraryTab])).toEqual([
+			['edit', 'media'],
+			['color', 'effects'],
+			['audio', 'audio'],
+			['motion', 'transitions'],
+			['deliver', 'media']
+		]);
 	});
 
 	test('stepTab walks the rail and wraps at both ends', () => {
@@ -64,9 +71,9 @@ describe('the workspace and tab lists', () => {
 });
 
 describe('parseWorkspaces', () => {
-	test('nothing stored is Edit, on the media tab, expanded, with no arrangements', () => {
+	test('nothing stored is Edit, expanded, with no arrangements and no tab picked', () => {
 		expect(parseWorkspaces(undefined)).toEqual(defaultWorkspaces());
-		expect(parseWorkspaces(null)).toEqual({ active: 'edit', layouts: {}, library: { tab: 'media', collapsed: false } });
+		expect(parseWorkspaces(null)).toEqual({ active: 'edit', layouts: {}, library: { tabs: {}, collapsed: false } });
 	});
 
 	test('garbage anywhere is the default', () => {
@@ -81,7 +88,7 @@ describe('parseWorkspaces', () => {
 		const stored = {
 			active: 'audio',
 			layouts: { edit: clone(PRESET_LAYOUTS.edit), color: clone(PRESET_LAYOUTS.color) },
-			library: { tab: 'transitions', collapsed: true }
+			library: { tabs: { edit: 'transcript', audio: 'transitions' }, collapsed: true }
 		};
 		const parsed = parseWorkspaces(clone(stored));
 		expect(parsed).toEqual(stored as never);
@@ -90,17 +97,36 @@ describe('parseWorkspaces', () => {
 
 	test('a partial value fills in the rest', () => {
 		expect(parseWorkspaces({ active: 'motion' })).toEqual({ ...defaultWorkspaces(), active: 'motion' });
-		expect(parseWorkspaces({ library: { tab: 'effects' } }).library).toEqual({ tab: 'effects', collapsed: false });
-		expect(parseWorkspaces({ library: { collapsed: true } }).library).toEqual({ tab: 'media', collapsed: true });
+		expect(parseWorkspaces({ library: { tabs: { color: 'titles' } } }).library).toEqual({
+			tabs: { color: 'titles' },
+			collapsed: false
+		});
+		expect(parseWorkspaces({ library: { collapsed: true } }).library).toEqual({ tabs: {}, collapsed: true });
 	});
 
 	test('an unknown workspace or tab falls back, field by field', () => {
 		const parsed = parseWorkspaces({
 			active: 'compositing',
-			library: { tab: 'plugins', collapsed: 'yes' }
+			library: { tabs: { edit: 'plugins', color: 'effects', compositing: 'media', audio: 7 }, collapsed: 'yes' }
 		});
 		expect(parsed.active).toBe('edit');
-		expect(parsed.library).toEqual({ tab: 'media', collapsed: false });
+		expect(parsed.library).toEqual({ tabs: { color: 'effects' }, collapsed: false });
+		expect(parseWorkspaces({ library: { tabs: 'x' } }).library).toEqual({ tabs: {}, collapsed: false });
+	});
+
+	test('the one tab every workspace used to share becomes the active workspace’s own', () => {
+		const old = { active: 'color', layouts: {}, library: { tab: 'transcript', collapsed: true } };
+		const parsed = parseWorkspaces(old);
+		expect(parsed.library).toEqual({ tabs: { color: 'transcript' }, collapsed: true });
+		// The others are what they would be had nothing been picked.
+		expect(libraryTabFor(parsed, 'color')).toBe('transcript');
+		expect(libraryTabFor(parsed, 'edit')).toBe('media');
+		expect(libraryTabFor(parsed, 'audio')).toBe('audio');
+		// An unusable old tab is no tab; a per-workspace value, once there, wins.
+		expect(parseWorkspaces({ library: { tab: 'plugins' } }).library.tabs).toEqual({});
+		expect(parseWorkspaces({ active: 'audio', library: { tab: 'titles', tabs: { audio: 'media' } } }).library.tabs).toEqual({
+			audio: 'media'
+		});
 	});
 
 	test('one bad layout costs that workspace its arrangement, not the others', () => {
@@ -197,5 +223,115 @@ describe('layoutFor', () => {
 		const a = layoutFor(defaultWorkspaces(), 'edit');
 		(a.grid.root as any).data = [];
 		expect(layoutFor(defaultWorkspaces(), 'edit')).toEqual(PRESET_LAYOUTS.edit);
+	});
+});
+
+describe('the library tab per workspace', () => {
+	test('is the workspace’s own until one is picked there', () => {
+		const state = defaultWorkspaces();
+		expect(libraryTabFor(state, 'edit')).toBe('media');
+		expect(libraryTabFor(state, 'color')).toBe('effects');
+		expect(libraryTabFor(state, 'motion')).toBe('transitions');
+	});
+
+	test('a pick sticks to its workspace and moves no other', () => {
+		let state = defaultWorkspaces();
+		state = withLibraryTab(state, 'edit', 'transcript');
+		expect(libraryTabFor(state, 'edit')).toBe('transcript');
+		expect(libraryTabFor(state, 'color')).toBe('effects');
+		expect(libraryTabFor(state, 'audio')).toBe('audio');
+		state = withLibraryTab(state, 'color', 'titles');
+		expect(libraryTabFor(state, 'edit')).toBe('transcript');
+		expect(libraryTabFor(state, 'color')).toBe('titles');
+	});
+
+	test('picking does not touch the other fields or mutate the old state', () => {
+		const before = defaultWorkspaces();
+		const after = withLibraryTab(before, 'audio', 'media');
+		expect(before.library.tabs).toEqual({});
+		expect(after.active).toBe(before.active);
+		expect(after.layouts).toBe(before.layouts);
+		expect(after.library.collapsed).toBe(before.library.collapsed);
+	});
+});
+
+describe('shouldPersistLayout', () => {
+	// What the dock reports: sizes in the window's pixels (here 1200 wide, not the
+	// presets' 1440), group ids and views as built.
+	const scaled = (id: (typeof WORKSPACE_IDS)[number], k = 1200 / 1440) => {
+		const l = clone(PRESET_LAYOUTS[id]);
+		const scale = (n: any) => {
+			if (typeof n.size === 'number') n.size = Math.round(n.size * k);
+			if (n.type === 'branch') n.data.forEach(scale);
+		};
+		scale(l.grid.root);
+		l.grid.width = 1200;
+		return l;
+	};
+	const preset = PRESET_LAYOUTS.edit;
+	const dragged = () => {
+		const l = scaled('edit');
+		const row = l.grid.root.data[0].data;
+		row[0].size += 150;
+		row[1].size -= 150;
+		return l;
+	};
+
+	test('nothing is written while the layout is still settling', () => {
+		expect(shouldPersistLayout(dragged(), null, preset, false)).toBe(false);
+	});
+
+	test('the layout as it settled is not a change, whatever the window size', () => {
+		const settled = scaled('edit');
+		expect(shouldPersistLayout(scaled('edit'), settled, preset, false)).toBe(false);
+		// A resize rescales every pixel size, and rounding moves each by a pixel or two.
+		const resized = scaled('edit', 1000 / 1440);
+		resized.grid.root.data[0].data[1].size += 1;
+		expect(shouldPersistLayout(resized, settled, preset, false)).toBe(false);
+	});
+
+	test('a click that only changes the active group or tab is not a change', () => {
+		const settled = scaled('edit');
+		const clicked = scaled('edit');
+		clicked.activeGroup = 'timeline';
+		clicked.grid.root.data[0].data[2].data.activeView = 'agent';
+		expect(shouldPersistLayout(clicked, settled, preset, false)).toBe(false);
+	});
+
+	test('a sash dragged is a change, and is written', () => {
+		expect(shouldPersistLayout(dragged(), scaled('edit'), preset, false)).toBe(true);
+		expect(shouldPersistLayout(dragged(), scaled('edit'), preset, true)).toBe(true);
+	});
+
+	test('a panel closed, or moved to another group, is a change', () => {
+		const settled = scaled('edit');
+		const closed = scaled('edit');
+		closed.grid.root.data[0].data[2].data.views = ['inspector'];
+		delete closed.panels.agent;
+		expect(shouldPersistLayout(closed, settled, preset, false)).toBe(true);
+		const moved = scaled('edit');
+		const [first, ...rest] = moved.grid.root.data[0].data;
+		moved.grid.root.data[0].data = [...rest, first];
+		expect(shouldPersistLayout(moved, settled, preset, false)).toBe(true);
+	});
+
+	test('after a write, what was written is the reference: unchanged again is not written twice', () => {
+		const written = dragged();
+		expect(shouldPersistLayout(dragged(), written, preset, true)).toBe(false);
+	});
+
+	test('with no entry yet, a layout that merely equals the preset needs none', () => {
+		// The settled layout drifted from the preset (the library folded) and then
+		// came back to it: still nothing worth keeping.
+		const settled = scaled('edit');
+		settled.grid.root.data[0].data[0].size = 40;
+		expect(shouldPersistLayout(scaled('edit'), settled, preset, false)).toBe(false);
+		// With an entry, the same layout is a real change from it and is written.
+		expect(shouldPersistLayout(scaled('edit'), settled, preset, true)).toBe(true);
+	});
+
+	test('a different panel set is never the preset', () => {
+		const settled = scaled('deliver');
+		expect(shouldPersistLayout(scaled('edit'), settled, PRESET_LAYOUTS.deliver, false)).toBe(true);
 	});
 });

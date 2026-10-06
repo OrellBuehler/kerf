@@ -4,14 +4,22 @@
 // What is stored is one opaque value in the app settings (`Settings.workspaces`
 // on the Rust side — the backend never looks inside it):
 //
-//   { active, layouts: { <workspace>: <dockview layout> }, library: { tab, collapsed } }
+//   { active, layouts: { <workspace>: <dockview layout> },
+//     library: { tabs: { <workspace>: <tab> }, collapsed } }
 //
 // The frontend owns that shape and validates it on the way back in, so a file
 // from an older or newer build, a hand edit, or a truncated write degrades to
 // the presets instead of leaving the editor without a timeline.
 
 import type { SerializedDockview } from 'dockview';
-import { WORKSPACE_IDS, isWorkspaceId, presetLayout, sanitizeLayout, type WorkspaceId } from './layout';
+import {
+	WORKSPACE_IDS,
+	isWorkspaceId,
+	presetLayout,
+	sameArrangement,
+	sanitizeLayout,
+	type WorkspaceId
+} from './layout';
 
 export { WORKSPACE_IDS, isWorkspaceId, type WorkspaceId };
 
@@ -55,18 +63,17 @@ export interface WorkspaceSpec {
 	id: WorkspaceId;
 	label: string;
 	hint: string;
-	/** The library tab this workspace opens on when it is switched to, for the
-	 *  ones that are about one kind of tool. Edit has none: it keeps whatever
-	 *  the library was showing. */
-	libraryTab?: LibraryTab;
+	/** The library tab this workspace shows until the user picks another in it:
+	 *  the tool it is about. Each workspace remembers its own choice. */
+	libraryTab: LibraryTab;
 }
 
 export const WORKSPACE_SPECS: WorkspaceSpec[] = [
-	{ id: 'edit', label: 'Edit', hint: 'Cut and arrange — library, preview, inspector and a full-width timeline' },
+	{ id: 'edit', label: 'Edit', hint: 'Cut and arrange — library, preview, inspector and a full-width timeline', libraryTab: 'media' },
 	{ id: 'color', label: 'Color', hint: 'Grade the picture — the preview as large as it gets, controls beside it', libraryTab: 'effects' },
 	{ id: 'audio', label: 'Audio', hint: 'Work on sound — a tall timeline for the waveforms', libraryTab: 'audio' },
 	{ id: 'motion', label: 'Motion', hint: 'Titles, transitions and keyframes — preview, a wide inspector and the timeline', libraryTab: 'transitions' },
-	{ id: 'deliver', label: 'Deliver', hint: 'Check where the cut is going and export it' }
+	{ id: 'deliver', label: 'Deliver', hint: 'Check where the cut is going and export it', libraryTab: 'media' }
 ];
 
 export function workspaceSpec(id: WorkspaceId): WorkspaceSpec {
@@ -74,15 +81,28 @@ export function workspaceSpec(id: WorkspaceId): WorkspaceSpec {
 }
 
 /** What is remembered about the workspaces. `layouts` holds only the ones that
- *  have been arranged; a missing entry is the preset. */
+ *  have been arranged; a missing entry is the preset. The library's `tabs` hold
+ *  only the choices made; a missing one is the workspace's own tab. `collapsed`
+ *  is the rail's, shared by every workspace. */
 export interface WorkspacesState {
 	active: WorkspaceId;
 	layouts: Partial<Record<WorkspaceId, SerializedDockview>>;
-	library: { tab: LibraryTab; collapsed: boolean };
+	library: { tabs: Partial<Record<WorkspaceId, LibraryTab>>; collapsed: boolean };
 }
 
 export function defaultWorkspaces(): WorkspacesState {
-	return { active: 'edit', layouts: {}, library: { tab: 'media', collapsed: false } };
+	return { active: 'edit', layouts: {}, library: { tabs: {}, collapsed: false } };
+}
+
+/** The tab the library shows in `workspace`: the one picked there, else the one
+ *  that workspace is about. */
+export function libraryTabFor(state: WorkspacesState, workspace: WorkspaceId): LibraryTab {
+	return state.library.tabs[workspace] ?? workspaceSpec(workspace).libraryTab;
+}
+
+/** `state` with `tab` picked for `workspace` and no other workspace's tab moved. */
+export function withLibraryTab(state: WorkspacesState, workspace: WorkspaceId, tab: LibraryTab): WorkspacesState {
+	return { ...state, library: { ...state.library, tabs: { ...state.library.tabs, [workspace]: tab } } };
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -112,7 +132,16 @@ export function parseWorkspaces(raw: unknown, legacyLayout: unknown = null): Wor
 		}
 	}
 	if (isObj(raw.library)) {
-		if (isLibraryTab(raw.library.tab)) out.library.tab = raw.library.tab;
+		if (isObj(raw.library.tabs)) {
+			for (const id of WORKSPACE_IDS) {
+				const tab = raw.library.tabs[id];
+				if (isLibraryTab(tab)) out.library.tabs[id] = tab;
+			}
+		} else if (isLibraryTab(raw.library.tab)) {
+			// Saved when one tab was shared by every workspace: it is the tab the
+			// user was last looking at, in the workspace the app was left on.
+			out.library.tabs[out.active] = raw.library.tab;
+		}
 		if (typeof raw.library.collapsed === 'boolean') out.library.collapsed = raw.library.collapsed;
 	}
 	return out;
@@ -122,4 +151,27 @@ export function parseWorkspaces(raw: unknown, legacyLayout: unknown = null): Wor
  *  the preset. */
 export function layoutFor(state: WorkspacesState, id: WorkspaceId): SerializedDockview {
 	return sanitizeLayout(state.layouts[id]) ?? presetLayout(id);
+}
+
+/** Whether the dock's layout is worth writing down. Every change event is not:
+ *  restoring a workspace, the library folding to its rail, a click that only
+ *  moves the active group and a window resize all fire one, and writing each
+ *  would mark every workspace the user merely visited as arranged (and bring a
+ *  just-reset one straight back).
+ *
+ *  `reference` is what restoring would give back — the layout as it settled
+ *  after the workspace was built, or the one last written — and `null` while
+ *  that is still settling, when nothing is written. A layout is only worth
+ *  keeping if it is arranged differently from that, and, when there is no entry
+ *  yet, from the preset (which needs none). */
+export function shouldPersistLayout(
+	current: SerializedDockview,
+	reference: SerializedDockview | null,
+	preset: SerializedDockview,
+	hasEntry: boolean
+): boolean {
+	if (!reference) return false;
+	if (sameArrangement(current, reference)) return false;
+	if (!hasEntry && sameArrangement(current, preset)) return false;
+	return true;
 }

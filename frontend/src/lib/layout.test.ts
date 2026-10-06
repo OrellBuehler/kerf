@@ -9,6 +9,7 @@ import {
 	openPanelIds,
 	panelState,
 	presetLayout,
+	sameArrangement,
 	sanitizeLayout
 } from './layout';
 
@@ -381,5 +382,115 @@ describe('migrating a layout saved with the media bin and the transcript', () =>
 	test('a migrated layout is stable: sanitizing it again changes nothing', () => {
 		const once = sanitizeLayout(legacyDefault())!;
 		expect(sanitizeLayout(clone(once))).toEqual(once);
+	});
+});
+
+describe('sameArrangement', () => {
+	test('a layout is the same arrangement as itself and as a copy', () => {
+		for (const id of WORKSPACE_IDS) expect(sameArrangement(PRESET_LAYOUTS[id], clone(PRESET_LAYOUTS[id]))).toBe(true);
+	});
+
+	test('different workspaces are different arrangements', () => {
+		expect(sameArrangement(PRESET_LAYOUTS.edit, PRESET_LAYOUTS.deliver)).toBe(false);
+		// Same panels, different split.
+		expect(sameArrangement(PRESET_LAYOUTS.edit, PRESET_LAYOUTS.color)).toBe(false);
+	});
+
+	test('window size does not matter: every pixel size scaled is the same arrangement', () => {
+		const small = clone(PRESET_LAYOUTS.edit);
+		const scale = (n: any) => {
+			n.size = Math.round(n.size * 0.5);
+			if (n.type === 'branch') n.data.forEach(scale);
+		};
+		scale(small.grid.root);
+		small.grid.width = 720;
+		small.grid.height = 397;
+		expect(sameArrangement(small, PRESET_LAYOUTS.edit)).toBe(true);
+	});
+
+	test('a sash moved by more than the tolerance is a different arrangement', () => {
+		const moved = clone(PRESET_LAYOUTS.edit);
+		moved.grid.root.data[0].data[0].size += 60; // 60 of 1440 px
+		moved.grid.root.data[0].data[1].size -= 60;
+		expect(sameArrangement(moved, PRESET_LAYOUTS.edit)).toBe(false);
+		// A pixel or two is rounding, not a drag.
+		const nudged = clone(PRESET_LAYOUTS.edit);
+		nudged.grid.root.data[0].data[0].size += 2;
+		nudged.grid.root.data[0].data[1].size -= 2;
+		expect(sameArrangement(nudged, PRESET_LAYOUTS.edit)).toBe(true);
+	});
+
+	test('the tolerance is a share of the branch, so the vertical split counts too', () => {
+		const moved = clone(PRESET_LAYOUTS.edit);
+		moved.grid.root.data[0].size += 100;
+		moved.grid.root.data[1].size -= 100;
+		expect(sameArrangement(moved, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+
+	test('which panels, in which groups and which order, is part of it', () => {
+		const closed = clone(PRESET_LAYOUTS.edit);
+		group(closed, 'inspector').views = ['inspector'];
+		expect(sameArrangement(closed, PRESET_LAYOUTS.edit)).toBe(false);
+		const reordered = clone(PRESET_LAYOUTS.edit);
+		group(reordered, 'inspector').views = ['agent', 'inspector'];
+		expect(sameArrangement(reordered, PRESET_LAYOUTS.edit)).toBe(false);
+		const renamed = clone(PRESET_LAYOUTS.edit);
+		group(renamed, 'inspector').id = 'right';
+		expect(sameArrangement(renamed, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+
+	test('the active group and the active tab are not part of it', () => {
+		const clicked = clone(PRESET_LAYOUTS.edit);
+		clicked.activeGroup = 'timeline';
+		group(clicked, 'inspector').activeView = 'agent';
+		expect(sameArrangement(clicked, PRESET_LAYOUTS.edit)).toBe(true);
+	});
+
+	test('the orientation, a hidden group and a different shape are not the same', () => {
+		const flipped = clone(PRESET_LAYOUTS.edit);
+		flipped.grid.orientation = 'HORIZONTAL';
+		expect(sameArrangement(flipped, PRESET_LAYOUTS.edit)).toBe(false);
+		const hidden = clone(PRESET_LAYOUTS.edit);
+		hidden.grid.root.data[0].data[0].visible = false;
+		expect(sameArrangement(hidden, PRESET_LAYOUTS.edit)).toBe(false);
+		const leafForBranch = clone(PRESET_LAYOUTS.edit);
+		leafForBranch.grid.root.data[0] = leafForBranch.grid.root.data[1];
+		expect(sameArrangement(leafForBranch, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+
+	test('sizes that are missing fall back to equal shares rather than throwing', () => {
+		const bare = clone(PRESET_LAYOUTS.edit);
+		const strip = (n: any) => {
+			delete n.size;
+			if (n.type === 'branch') n.data.forEach(strip);
+		};
+		strip(bare.grid.root);
+		expect(sameArrangement(bare, bare)).toBe(true);
+		expect(sameArrangement(bare, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+});
+
+// What dockview itself serializes for a pristine workspace at 1440×754 (captured
+// from `api.toJSON()`), as opposed to what `PRESET_LAYOUTS` says: the same
+// shape at the window's pixel sizes, the key order dockview writes, and group
+// data in a different order.
+const REAL = {"edit":{"grid":{"root":{"type":"branch","data":[{"type":"branch","data":[{"type":"leaf","data":{"views":["library"],"activeView":"library","id":"library"},"size":300},{"type":"leaf","data":{"views":["preview"],"activeView":"preview","id":"preview"},"size":800},{"type":"leaf","data":{"views":["inspector","agent"],"activeView":"inspector","id":"inspector"},"size":340}],"size":465},{"type":"leaf","data":{"views":["timeline"],"activeView":"timeline","id":"timeline"},"size":289}],"size":1440},"width":1440,"height":754,"orientation":"VERTICAL"}},"deliver":{"grid":{"root":{"type":"branch","data":[{"type":"branch","data":[{"type":"leaf","data":{"views":["preview"],"activeView":"preview","id":"preview"},"size":880},{"type":"leaf","data":{"views":["deliver","agent"],"activeView":"deliver","id":"deliver"},"size":560}],"size":494},{"type":"leaf","data":{"views":["timeline"],"activeView":"timeline","id":"timeline"},"size":260}],"size":1440},"width":1440,"height":754,"orientation":"VERTICAL"}}};
+
+describe('sameArrangement against what the dock really reports', () => {
+	test('a pristine workspace is its preset, whatever the pixels', () => {
+		expect(sameArrangement(REAL.edit as never, PRESET_LAYOUTS.edit)).toBe(true);
+		expect(sameArrangement(REAL.deliver as never, PRESET_LAYOUTS.deliver)).toBe(true);
+	});
+
+	test('and is not another workspace’s', () => {
+		expect(sameArrangement(REAL.edit as never, PRESET_LAYOUTS.deliver)).toBe(false);
+		expect(sameArrangement(REAL.deliver as never, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+
+	test('a sash dragged 150 px in the real layout is no longer the preset', () => {
+		const dragged = clone(REAL.edit);
+		dragged.grid.root.data[0].data[0].size += 150;
+		dragged.grid.root.data[0].data[1].size -= 150;
+		expect(sameArrangement(dragged, PRESET_LAYOUTS.edit)).toBe(false);
 	});
 });

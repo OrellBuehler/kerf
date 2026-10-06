@@ -17,6 +17,7 @@
 	import AudioTab from './AudioTab.svelte';
 	import TranscriptPanel from './TranscriptPanel.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { workspace } from '$lib/workspace.svelte';
 	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '$lib/layout';
 	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '$lib/workspaces';
 
@@ -38,8 +39,12 @@
 	let focusTab = $state<LibraryTab>(untrack(() => settings.libraryTab));
 	let rail = $state<HTMLElement | null>(null);
 
-	function pick(id: LibraryTab) {
+	function pick(id: LibraryTab, e?: MouseEvent) {
 		focusTab = id;
+		// A pointer click should not leave focus on the rail: a focused button
+		// swallows Space, so the transport shortcut would stop working. Enter /
+		// Space (whose click has `detail` 0) keep it, to be navigated on.
+		if (e && e.detail > 0) (e.currentTarget as HTMLElement | null)?.blur();
 		if (collapsed) {
 			settings.setLibraryTab(id);
 			settings.setLibraryCollapsed(false);
@@ -48,6 +53,14 @@
 		} else {
 			settings.setLibraryTab(id);
 		}
+	}
+
+	/** The header's collapse button unmounts with the content it sits in, which
+	 *  would drop keyboard focus on the page; hand it to the rail's active tab,
+	 *  which is what is left. (A click leaves it nowhere, as every click does.) */
+	function foldFromHeader(e: MouseEvent) {
+		settings.setLibraryCollapsed(true);
+		if (e.detail === 0) rail?.querySelector<HTMLElement>(`[data-library-tab="${tab}"]`)?.focus();
 	}
 
 	function onRailKey(e: KeyboardEvent) {
@@ -98,6 +111,8 @@
 		// the layout already carries one, and the constraints below clamp it.
 		const moved = wasCollapsed !== null && wasCollapsed !== fold;
 		wasCollapsed = fold;
+		// Whatever the user changed before this is still on the workspace's debounce.
+		if (moved) workspace.beforeLibraryMove();
 		const next = neighbour();
 		const nextWidth = next?.api.width ?? 0;
 		const before = panelApi.width;
@@ -124,6 +139,9 @@
 			const delta = before - width;
 			if (delta !== 0) next.api.setSize({ width: nextWidth + delta });
 		}
+		// Folding is the `collapsed` setting at work, not the user rearranging the
+		// workspace: do not let it be written down as one.
+		if (moved) workspace.afterLibraryMove();
 	}
 
 	$effect(() => {
@@ -173,7 +191,7 @@
 				aria-label={t.label}
 				title={open && solo ? `${t.label} — click to collapse` : `${t.label} — ${t.hint}`}
 				tabindex={t.id === focusTab ? 0 : -1}
-				onclick={() => pick(t.id)}
+				onclick={(e) => pick(t.id, e)}
 				onfocus={() => (focusTab = t.id)}
 				style="position:relative;width:36px;height:36px;flex:none;display:inline-flex;align-items:center;justify-content:center;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {open
 					? 'var(--border-strong)'
@@ -204,7 +222,7 @@
 					>{spec.label}</span
 				>
 				{#if solo}
-					<IconBtn title="Collapse the library to its rail" size={24} onclick={() => settings.setLibraryCollapsed(true)}>
+					<IconBtn title="Collapse the library to its rail" size={24} onclick={foldFromHeader}>
 						<Icon n="chevron-left" s={14} />
 					</IconBtn>
 				{/if}

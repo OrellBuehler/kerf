@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, presetFor, ratioLabel, variantPath } from './delivery-formats';
+import { DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, hasPicture, presetFor, ratioLabel, variantPath } from './delivery-formats';
 
 describe('variantPath', () => {
 	test('splices the shape into the file name beside the base', () => {
@@ -74,5 +74,21 @@ describe('the shapes a multi-format export offers', () => {
 	test('formatsFor ignores ids that are not shapes — Source is not a file to write', () => {
 		expect(formatsFor(['source', 'nonsense'])).toEqual([]);
 		expect(formatsFor(['source', 'portrait'])).toHaveLength(1);
+	});
+});
+
+describe('hasPicture', () => {
+	const clip = { id: 'c', asset_id: 'a', source_in: 0, source_out: 1, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 };
+	const track = (kind: 'video' | 'audio', clips: unknown[]) => ({ id: kind, name: kind, kind, clips }) as never;
+
+	test('is a clip on a video track', () => {
+		expect(hasPicture({ tracks: [track('video', [clip])] } as never)).toBe(true);
+		expect(hasPicture({ tracks: [track('audio', [clip]), track('video', [clip])] } as never)).toBe(true);
+	});
+
+	test('an audio-only cut, an empty video track and an empty timeline have none', () => {
+		expect(hasPicture({ tracks: [track('audio', [clip])] } as never)).toBe(false);
+		expect(hasPicture({ tracks: [track('video', [])] } as never)).toBe(false);
+		expect(hasPicture({ tracks: [] } as never)).toBe(false);
 	});
 });

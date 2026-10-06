@@ -10,7 +10,8 @@
 
 import type { DockviewApi } from 'dockview';
 import { LIBRARY_RAIL_WIDTH, PANELS, presetLayout, type PanelId } from './layout';
-import { layoutFor, workspaceSpec, type WorkspaceId } from './workspaces';
+import type { SerializedDockview } from 'dockview';
+import { layoutFor, shouldPersistLayout, type WorkspaceId } from './workspaces';
 import { settings } from './settings.svelte';
 
 /** Where a panel opens when it is brought back from the Panels menu: the
@@ -35,6 +36,14 @@ class WorkspaceState {
 	/** True while the dock is being rebuilt from a layout: the events that
 	 *  produces are not the user rearranging anything. */
 	#restoring = false;
+	/** What restoring the active workspace would give back: the layout as it
+	 *  settled once the workspace was built, or the one last written. `null`
+	 *  while it is still settling. A change is only written if it differs from
+	 *  this (see `shouldPersistLayout`) — dockview reports layout changes for a
+	 *  great deal that is not a rearrangement, and writing each would mark every
+	 *  workspace merely visited as customised. */
+	#reference: SerializedDockview | null = null;
+	#settle = 0;
 	#subs: Array<{ dispose(): void }> = [];
 
 	/** Take over a freshly created dock (built in `host`): build the active
@@ -51,7 +60,7 @@ class WorkspaceState {
 			api.onDidAddPanel(sync),
 			api.onDidRemovePanel(sync),
 			api.onDidLayoutChange(() => {
-				if (this.#restoring) return;
+				if (this.#restoring || !this.#reference) return;
 				if (this.#timer) clearTimeout(this.#timer);
 				this.#timer = setTimeout(() => this.#save(), SAVE_DELAY_MS);
 			})
@@ -98,12 +107,55 @@ class WorkspaceState {
 			this.#restoring = false;
 		}
 		this.open = api.panels.map((p) => p.id as PanelId);
+		this.#takeReference();
 	}
 
-	/** Remember how the active workspace is arranged now. */
+	/** Wait for the layout to stop moving, then call it the baseline. The panels
+	 *  that size their own group (the library, folded or unfolded) do it a
+	 *  microtask after they mount, and dockview reports layout changes through a
+	 *  microtask-buffered event; two frames covers both. */
+	#takeReference() {
+		this.#reference = null;
+		const settle = ++this.#settle;
+		requestAnimationFrame(() =>
+			requestAnimationFrame(() => {
+				if (settle === this.#settle && this.#api) this.#reference = this.#api.toJSON();
+			})
+		);
+	}
+
+	/** The library is about to fold or unfold. Whatever the user changed before
+	 *  that is still on the debounce; write it now, while the layout still shows
+	 *  it and nothing of the fold does. */
+	beforeLibraryMove() {
+		this.#flush();
+	}
+
+	/** The library folded or unfolded: widths moved, but that is what the
+	 *  `collapsed` setting already records, not a rearrangement to write down.
+	 *  The layout events the move caused are dropped and the new geometry becomes
+	 *  the reference. */
+	afterLibraryMove() {
+		if (!this.#api) return;
+		if (this.#timer) {
+			clearTimeout(this.#timer);
+			this.#timer = null;
+		}
+		this.#takeReference();
+	}
+
+	/** Remember how the active workspace is arranged now — if it is arranged any
+	 *  differently from how it came back. */
 	#save() {
 		this.#timer = null;
-		if (this.#api) settings.saveWorkspaceLayout(this.active, this.#api.toJSON());
+		const api = this.#api;
+		if (!api) return;
+		const layout = api.toJSON();
+		const id = this.active;
+		const hasEntry = id in settings.workspaces.layouts;
+		if (!shouldPersistLayout(layout, this.#reference, presetLayout(id), hasEntry)) return;
+		this.#reference = layout;
+		settings.saveWorkspaceLayout(id, layout);
 	}
 
 	/** Write out a change still waiting on the debounce. */
@@ -113,13 +165,13 @@ class WorkspaceState {
 		this.#save();
 	}
 
-	/** Swap to another workspace. The arrangement being left is kept first, and
-	 *  a workspace that is about one kind of tool opens the library on it. */
+	/** Swap to another workspace. The arrangement being left is kept first if it
+	 *  was changed; the library shows the tab that workspace last had. */
 	switchTo(id: WorkspaceId) {
 		if (!this.#api || id === this.active) return;
 		this.#flush();
 		this.active = id;
-		settings.setActiveWorkspace(id, workspaceSpec(id).libraryTab);
+		settings.setActiveWorkspace(id);
 		this.#restore(id);
 	}
 
@@ -173,6 +225,8 @@ class WorkspaceState {
 			clearTimeout(this.#timer);
 			this.#timer = null;
 		}
+		// No entry, and none written back: what settles is the preset, which is
+		// what the baseline will be.
 		settings.clearWorkspaceLayout(this.active);
 		this.#restore(this.active);
 	}

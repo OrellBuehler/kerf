@@ -7,7 +7,7 @@
  * Sizes match the corresponding export presets so picking "Reels / Shorts"
  * here and exporting with that preset render the identical frame. */
 
-import type { Delivery, Fit } from './types';
+import type { Delivery, Fit, Timeline } from './types';
 
 export interface DeliveryPreset {
 	id: string;
@@ -23,6 +23,13 @@ export const DELIVERY_PRESETS: DeliveryPreset[] = [
 	{ id: 'square', label: '1:1', hint: '1080×1080 — feed post', format: { width: 1080, height: 1080, fit: 'cover' } },
 	{ id: 'portrait', label: '4:5', hint: '1080×1350 — Instagram portrait', format: { width: 1080, height: 1350, fit: 'cover' } }
 ];
+
+/** Whether the cut has a picture: a clip on a video track. Delivery shapes only
+ *  mean something for one — an audio-only cut is a single file whatever was
+ *  ticked. The export dialog and the Deliver panel gate on this together. */
+export function hasPicture(timeline: Timeline): boolean {
+	return timeline.tracks.some((t) => t.kind === 'video' && t.clips.length > 0);
+}
 
 /** The shapes a multi-format export can write a file for — every preset that
  *  is a frame (so not "Source"), in picker order. */
