@@ -10,6 +10,14 @@
 
 	installErrorLogging();
 	onMount(() => installSliderFill());
+
+	let { children } = $props();
+	onMount(() => installSliderFill());
+	import { installErrorLogging } from '$lib/log';
+
+	let { children } = $props();
+
+	installErrorLogging();
 </script>
 
 <svelte:head>

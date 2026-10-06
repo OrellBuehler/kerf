@@ -52,6 +52,7 @@ import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { describeError, logFrontend } from './log';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 import { describeError, logFrontend } from './log';
 

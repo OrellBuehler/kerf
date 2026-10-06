@@ -7,6 +7,7 @@
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
+	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
