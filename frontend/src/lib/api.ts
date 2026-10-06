@@ -358,14 +358,19 @@ export async function newProject(): Promise<boolean> {
 	return true;
 }
 
-/** Pick a `.kerf` file and open it; resolves to its path, or `null` if cancelled. */
-export async function openProject(): Promise<string | null> {
+/** Open a `.kerf` file — the one at `path` when given (a second launch hands
+ *  one over), else one picked natively; resolves to its path, or `null` if
+ *  cancelled. */
+export async function openProject(path?: string): Promise<string | null> {
 	if (!inTauri()) return null;
-	const { open } = await import('@tauri-apps/plugin-dialog');
-	const selected = await open({
-		multiple: false,
-		filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
-	});
+	let selected: string | string[] | null = path ?? null;
+	if (selected === null) {
+		const { open } = await import('@tauri-apps/plugin-dialog');
+		selected = await open({
+			multiple: false,
+			filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
+		});
+	}
 	if (typeof selected !== 'string') return null;
 	return (await invoke<string | null>('open_project', { path: selected })) ?? null;
 }
@@ -2040,9 +2045,9 @@ export async function mcpEndpoint(): Promise<string> {
  *  none ever has. A streamable-HTTP client holds no connection between calls,
  *  so there is no socket to report as open; the panel judges from the age. In
  *  the browser harness there is no server at all, hence `null`. */
-export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null }> {
-	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null };
-	return invoke<{ endpoint: string; last_seen_secs: number | null }>('agent_status');
+export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
+	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
+	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
 }
 
 // ---- app settings ----------------------------------------------------------
@@ -2065,22 +2070,28 @@ export async function getSettings(): Promise<SettingsView> {
 	return invoke<SettingsView>('get_settings');
 }
 
-/** Persist the preferences and put them into force; returns the resolved view. */
-export async function setSettings(settings: AppSettings): Promise<SettingsView> {
+/**
+ * Persist the fields that changed and put them into force; returns the resolved
+ * view. Only the fields in `patch` are written — the backend merges them into
+ * the stored file, so a layout write cannot carry a stale copy of the theme.
+ */
+export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
 	if (!inTauri()) {
-		const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, settings.cpu_percent)));
 		try {
-			localStorage.setItem(CPU_KEY, String(percent));
-			localStorage.setItem(TRANSCRIBE_KEY, settings.transcribe ? '1' : '0');
-			localStorage.setItem(SAFE_AREAS_KEY, settings.safe_areas ? '1' : '0');
-			writeBrowserJson(LAYOUT_KEY, settings.layout);
-			writeBrowserJson(THEME_KEY, settings.theme);
+			if (patch.cpu_percent !== undefined) {
+				const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, patch.cpu_percent)));
+				localStorage.setItem(CPU_KEY, String(percent));
+			}
+			if (patch.transcribe !== undefined) localStorage.setItem(TRANSCRIBE_KEY, patch.transcribe ? '1' : '0');
+			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
+			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
+			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
-		return browserSettings({ ...settings, cpu_percent: percent });
+		return getSettings();
 	}
-	return invoke<SettingsView>('set_settings', { settings });
+	return invoke<SettingsView>('set_settings', { patch });
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';

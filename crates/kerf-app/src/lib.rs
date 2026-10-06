@@ -1809,6 +1809,9 @@ fn mcp_endpoint() -> String {
 struct AgentStatus {
     endpoint: String,
     last_seen_secs: Option<i64>,
+    /// Set when the server could not start (the port is taken), so the panel
+    /// can say that instead of showing an endpoint nothing answers on.
+    error: Option<String>,
 }
 
 #[tauri::command(async)]
@@ -1816,6 +1819,7 @@ fn agent_status() -> AgentStatus {
     AgentStatus {
         endpoint: mcp::endpoint_url(),
         last_seen_secs: mcp::agent_last_seen_secs(),
+        error: mcp::server_error(),
     }
 }
 
@@ -1828,23 +1832,15 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
     settings::SettingsView::current(&settings::load(&app))
 }
 
-/// Write the preferences and put them into force. Returns the resolved view, so
+/// Merge a patch — only the fields that changed (`{layout}`, `{theme}`,
+/// `{cpu_percent}`, …) — into the stored preferences and put them into force.
+/// Patching rather than replacing means two call sites writing at once cannot
+/// overwrite each other's field with a stale copy. Returns the resolved view, so
 /// the dialog can show the clamped percentage and the cores it works out to
 /// without a second round-trip.
 #[tauri::command(async)]
-fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
-    // Clamp through the engine first, then persist what was actually applied —
-    // storing an out-of-range value would keep re-clamping on every launch.
-    kerf_core::set_transcription_enabled(settings.transcribe);
-    settings::set_safe_areas(settings.safe_areas);
-    let stored = settings::Settings {
-        cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
-        transcribe: settings.transcribe,
-        safe_areas: settings.safe_areas,
-        layout: settings.layout,
-        theme: settings.theme,
-    };
-    settings::save(&app, &stored)?;
+fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings::SettingsView> {
+    let stored = settings::update(&app, &patch)?;
     Ok(settings::SettingsView::current(&stored))
 }
 
@@ -1854,12 +1850,29 @@ fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<setti
 /// path comes from a file picker the user could point at anything.
 const TEXT_FILE_MAX: u64 = 1 << 20;
 
+/// These two commands take a path the webview chose, so they only touch `.json`
+/// files — a theme — and never anything that is not a plain file.
+fn require_json_path(path: &str) -> CmdResult<()> {
+    let is_json = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .json file"))
+    }
+}
+
 /// A small text file picked by the user (a theme to import).
 #[tauri::command]
 async fn read_text_file(path: String) -> CmdResult<String> {
     blocking(move || {
-        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if len > TEXT_FILE_MAX {
+        require_json_path(&path)?;
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        if meta.len() > TEXT_FILE_MAX {
             return Err(format!("{path} is larger than 1 MiB — not a theme file"));
         }
         std::fs::read_to_string(&path).map_err(|e| e.to_string())
@@ -1871,6 +1884,13 @@ async fn read_text_file(path: String) -> CmdResult<String> {
 #[tauri::command]
 async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
     blocking(move || {
+        require_json_path(&path)?;
+        if contents.len() as u64 > TEXT_FILE_MAX {
+            return Err("contents are larger than 1 MiB — not a theme file".to_string());
+        }
+        if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{path} is not a regular file"));
+        }
         std::fs::write(&path, contents).map_err(|e| e.to_string())?;
         Ok(path)
     })
@@ -2052,9 +2072,47 @@ fn install_panic_hook() {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "panic".to_string());
-        tracing::error!(location = %location, "panic: {message}");
+        // Captured regardless of RUST_BACKTRACE: a user's panic has no env var set,
+        // and the logfile is the only copy. Release builds keep their symbol
+        // table (`strip = "debuginfo"`), so the frames have function names.
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(location = %location, "panic: {message}\n{backtrace}");
         default(info);
     }));
+}
+
+/// Emitted to the webview when a second launch carried a `.kerf` path. The
+/// frontend owns the "replace the open project?" question, so it does the open.
+const OPEN_PROJECT_EVENT: &str = "open-project-file";
+
+/// The `.kerf` path in a launch's arguments, resolved against that launch's
+/// working directory (a second launch's relative path is relative to *its* cwd,
+/// not to ours).
+fn project_arg(argv: &[String], cwd: &str) -> Option<String> {
+    let arg = argv.iter().skip(1).find(|a| {
+        std::path::Path::new(a)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("kerf"))
+    })?;
+    let path = std::path::Path::new(arg);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(path)
+    };
+    Some(full.display().to_string())
+}
+
+fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
+    tracing::info!(?argv, "second launch; focusing the running window");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(path) = project_arg(&argv, &cwd) {
+        let _ = app.emit(OPEN_PROJECT_EVENT, path);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2064,6 +2122,11 @@ pub fn run() {
     let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
 
     tauri::Builder::default()
+        // Must be the first plugin. A second launch (a `.kerf` double-clicked
+        // while Kerf is open, or the binary run again) lands here instead of
+        // starting another app that would fight the first for the MCP port and
+        // the settings file.
+        .plugin(tauri_plugin_single_instance::init(on_second_launch))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -2220,7 +2283,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
+    use super::{project_arg, require_json_path, require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
 
     #[test]
     fn truncate_log_keeps_short_and_cuts_on_a_char_boundary() {
@@ -2282,5 +2345,30 @@ mod tests {
         // mistaken for a scheme — this is the whole reason the check isn't
         // just "contains a colon".
         assert!(require_local_output_path("D:\\video\\clip.mov").is_ok());
+    }
+
+    #[test]
+    fn a_second_launch_forwards_only_a_kerf_path() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(project_arg(&argv(&["kerf"]), "/home/u"), None);
+        assert_eq!(project_arg(&argv(&["kerf", "--flag", "notes.txt"]), "/home/u"), None);
+        assert_eq!(
+            project_arg(&argv(&["kerf", "/data/cut.kerf"]), "/home/u").as_deref(),
+            Some("/data/cut.kerf")
+        );
+        assert_eq!(
+            project_arg(&argv(&["kerf", "CUT.KERF"]), "/home/u").map(|p| p.replace('\\', "/")),
+            Some("/home/u/CUT.KERF".to_string())
+        );
+        // argv[0] is the binary, never a project.
+        assert_eq!(project_arg(&argv(&["/opt/x.kerf"]), "/home/u"), None);
+    }
+
+    #[test]
+    fn text_file_commands_only_take_json() {
+        assert!(require_json_path("/t/dark.kerf-theme.json").is_ok());
+        assert!(require_json_path("C:\\t\\THEME.JSON").is_ok());
+        assert!(require_json_path("/home/u/.bashrc").is_err());
+        assert!(require_json_path("/t/theme.json.exe").is_err());
     }
 }
