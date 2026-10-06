@@ -87,4 +87,4 @@ tauri-plugin-process = "2.3"
 [profile.release]
 opt-level = 3
 lto = "thin"
-strip = true
+strip = "debuginfo"

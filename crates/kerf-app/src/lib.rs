@@ -1876,7 +1876,11 @@ fn install_panic_hook() {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "panic".to_string());
-        tracing::error!(location = %location, "panic: {message}");
+        // Captured regardless of RUST_BACKTRACE: a user's panic has no env var set,
+        // and the logfile is the only copy. Release builds keep their symbol
+        // table (`strip = "debuginfo"`), so the frames have function names.
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(location = %location, "panic: {message}\n{backtrace}");
         default(info);
     }));
 }
