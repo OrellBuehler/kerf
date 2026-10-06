@@ -110,7 +110,7 @@ import type {
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { Generation } from './generation';
-import { withKeyframeAt } from './titles';
+import { retimeKeyframes, withKeyframeAt } from './titles';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -751,6 +751,19 @@ class EditorState {
 	}
 	updateOverlay(overlayId: string, patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
 		return this.#apply(updateOverlay(overlayId, patch));
+	}
+	/** Set a title's span. Its keyframes are relative to the start, so a length
+	 *  change re-times them (fade-out stays on the end) as a second edit. */
+	async retimeOverlay(overlayId: string, start: number, end: number) {
+		const o = this.overlays.find((o) => o.id === overlayId);
+		if (!o) return this.timeline;
+		const keys = o.keyframes ? o.keyframes.map((k) => ({ ...k })) : [];
+		const oldDur = o.end - o.start;
+		const tl = await this.updateOverlay(overlayId, { start, end });
+		if (keys.length && Math.abs(end - start - oldDur) > 1e-9) {
+			return this.setOverlayKeyframes(overlayId, retimeKeyframes(keys, oldDur, end - start));
+		}
+		return tl;
 	}
 	/** Put a title's centre at `(x, y)`. A still title takes it as its position;
 	 *  an animated one gets a keyframe at timeline time `at`, since its static

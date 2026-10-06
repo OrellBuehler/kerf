@@ -897,7 +897,7 @@
 			if (d.mode === 'move') ui.seek(d.origStart + d.grabSec); // a plain click seeks there, into the title
 			return;
 		}
-		void editor.updateOverlay(d.id, { start: d.start, end: d.end }).catch(err);
+		void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
 	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + 3).catch(err);

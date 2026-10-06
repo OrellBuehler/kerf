@@ -12,7 +12,7 @@
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
-	import { LINE_HEIGHT, boxPadding, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
+	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -221,12 +221,8 @@
 	let imgAspect = $state<number | null>(null);
 	const layerBox = $derived.by(() => {
 		if (!frameUrl || !imgAspect) return 'inset:0';
-		if (imgAspect > aspect) {
-			const h = (aspect / imgAspect) * 100;
-			return `left:0;width:100%;top:${(100 - h) / 2}%;height:${h}%`;
-		}
-		const w = (imgAspect / aspect) * 100;
-		return `top:0;height:100%;left:${(100 - w) / 2}%;width:${w}%`;
+		const r = containRect(imgAspect, aspect);
+		return `left:${r.left}%;top:${r.top}%;width:${r.width}%;height:${r.height}%`;
 	});
 
 	const titlesHere = $derived.by(() => {
@@ -446,7 +442,7 @@
 			</div>
 		{:else}
 			<div
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;overflow:hidden;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:1px solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"

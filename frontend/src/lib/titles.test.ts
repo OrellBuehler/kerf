@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	boxPadding,
+	containRect,
+	retimeKeyframes,
 	dragPosition,
 	packRows,
 	sampleOverlay,
@@ -125,5 +127,52 @@ describe('boxPadding', () => {
 	test('only a title with a box colour is padded', () => {
 		expect(boxPadding(overlay(), 1080)).toBe(0);
 		expect(boxPadding(overlay({ bg: 'black@0.5' }), 1200)).toBeCloseTo(0.01);
+	});
+});
+
+describe('containRect', () => {
+	test('a wide picture in a tall frame is letterboxed top and bottom', () => {
+		const r = containRect(16 / 9, 9 / 16);
+		expect(r.width).toBe(100);
+		expect(r.height).toBeCloseTo(31.64, 1);
+		expect(r.top).toBeCloseTo((100 - r.height) / 2);
+	});
+
+	test('a matching picture fills the frame', () => {
+		expect(containRect(1, 1)).toEqual({ left: 0, top: 0, width: 100, height: 100 });
+	});
+
+	test('a tall picture in a wide frame is pillarboxed', () => {
+		const r = containRect(9 / 16, 16 / 9);
+		expect(r.height).toBe(100);
+		expect(r.left).toBeCloseTo((100 - r.width) / 2);
+	});
+});
+
+describe('retimeKeyframes', () => {
+	const fade = [
+		{ time: 0, pos_x: 0.5, pos_y: 0.4, opacity: 0 },
+		{ time: 0.5, pos_x: 0.5, pos_y: 0.4, opacity: 1 },
+		{ time: 2.5, pos_x: 0.5, pos_y: 0.4, opacity: 1 },
+		{ time: 3, pos_x: 0.5, pos_y: 0.4, opacity: 0 }
+	];
+
+	test('shortening keeps the fade-out on the new end', () => {
+		expect(retimeKeyframes(fade, 3, 2).map((k) => k.time)).toEqual([0, 0.5, 1.5, 2]);
+	});
+
+	test('lengthening moves the fade-out out with the end', () => {
+		expect(retimeKeyframes(fade, 3, 5).map((k) => k.time)).toEqual([0, 0.5, 4.5, 5]);
+	});
+
+	test('an unchanged length is left alone', () => {
+		expect(retimeKeyframes(fade, 3, 3)).toEqual(fade);
+	});
+
+	test('a title cut shorter than its fades keeps the keyframes in order inside it', () => {
+		const times = retimeKeyframes(fade, 3, 0.4).map((k) => k.time);
+		expect(times).toEqual([...times].sort((a, b) => a - b));
+		expect(Math.max(...times)).toBeLessThanOrEqual(0.5);
+		expect(times.at(-1)).toBeCloseTo(0.4);
 	});
 });

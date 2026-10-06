@@ -122,3 +122,35 @@ export function trimSpan(
 	if (edge === 'l') return { start: clamp(to, 0, end - MIN_TITLE), end };
 	return { start, end: Math.max(to, start + MIN_TITLE) };
 }
+
+/** Where a picture of `imgAspect` lands, as percentages of a frame of `frameAspect`, when it is
+ *  fitted with `object-fit: contain` — the area title fractions are measured against. */
+export function containRect(imgAspect: number, frameAspect: number): { left: number; top: number; width: number; height: number } {
+	if (!(imgAspect > 0) || !(frameAspect > 0)) return { left: 0, top: 0, width: 100, height: 100 };
+	if (imgAspect > frameAspect) {
+		const h = (frameAspect / imgAspect) * 100;
+		return { left: 0, top: (100 - h) / 2, width: 100, height: h };
+	}
+	const w = (imgAspect / frameAspect) * 100;
+	return { left: (100 - w) / 2, top: 0, width: w, height: 100 };
+}
+
+/** Keep an animation's fade-in and fade-out when the title's length changes. Keyframe times are
+ *  relative to `start`: those in the first half stay anchored to the start, those in the second
+ *  half move with the end, so a preset title still fades in and out at any length. */
+export function retimeKeyframes(
+	keyframes: TextKeyframe[],
+	oldDur: number,
+	newDur: number
+): TextKeyframe[] {
+	if (keyframes.length === 0 || Math.abs(newDur - oldDur) < 1e-9) return keyframes.map((k) => ({ ...k }));
+	const delta = newDur - oldDur;
+	const sorted = [...keyframes].sort((a, b) => a.time - b.time);
+	let floor = 0;
+	return sorted.map((k) => {
+		const tail = k.time > oldDur / 2;
+		const time = round3(clamp(tail ? k.time + delta : k.time, floor, Math.max(newDur, floor)));
+		floor = time;
+		return { ...k, time };
+	});
+}

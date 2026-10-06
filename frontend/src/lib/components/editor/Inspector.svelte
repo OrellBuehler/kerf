@@ -535,10 +535,10 @@
 			/>
 		</label>
 		{@render numRow('Start', o.start, 0.1, (v) =>
-			run(() => editor.updateOverlay(o.id, { start: Math.min(v, Math.max(0, o.end - MIN_TITLE)) }))
+			run(() => editor.retimeOverlay(o.id, Math.min(v, Math.max(0, o.end - MIN_TITLE)), o.end))
 		)}
 		{@render numRow('End', o.end, 0.1, (v) =>
-			run(() => editor.updateOverlay(o.id, { end: Math.max(v, o.start + MIN_TITLE) }))
+			run(() => editor.retimeOverlay(o.id, o.start, Math.max(v, o.start + MIN_TITLE)))
 		)}
 		{@render rangeRow('Pos X', pose.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
 			run(() => editor.moveOverlay(o.id, v, pose.y, ui.time))
