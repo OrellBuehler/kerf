@@ -17,7 +17,7 @@ use super::cpu;
 use super::ProbeResult;
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
+    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
     SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 
@@ -156,6 +156,9 @@ const HW_ENCODER_CANDIDATES: [&str; 10] = [
 /// one-frame test encode and only the ones that succeed are reported. Ordered
 /// by [`HW_ENCODER_CANDIDATES`]. `KERF_HW_ENCODE=none` reports none.
 pub fn hw_encoders() -> &'static [String] {
+    /// How long one candidate gets to encode a single frame.
+    const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
     static ENCODERS: OnceLock<Vec<String>> = OnceLock::new();
     ENCODERS.get_or_init(|| {
         if !hw_encode_enabled() {
@@ -179,7 +182,8 @@ pub fn hw_encoders() -> &'static [String] {
             .filter(|enc| {
                 // 256x256 clears every family's minimum-dimension floor; nv12 is
                 // the input format they all accept.
-                command(&bin)
+                let mut probe = command(&bin);
+                probe
                     .args([
                         "-hide_banner",
                         "-v",
@@ -191,16 +195,42 @@ pub fn hw_encoders() -> &'static [String] {
                     ])
                     .args(["-frames:v", "1", "-pix_fmt", "nv12", "-c:v", enc, "-f", "null", "-"])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+                    .stderr(Stdio::null());
+                // A one-frame encode finishes in well under a second where the
+                // encoder works; a driver that hangs instead of failing must not
+                // take every later caller of this `OnceLock` with it.
+                status_within(&mut probe, HW_PROBE_TIMEOUT)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.success())
             })
             .map(|s| s.to_string())
             .collect();
         tracing::info!(encoders = ?found, "hardware video encoders detected");
         found
     })
+}
+
+/// Run `cmd` to completion, but give up on it after `limit`: the child is killed
+/// and `None` returned. stdin is closed so nothing can wait on a keypress.
+///
+/// For probes whose *only* job is to answer "does this work here", where a
+/// driver that wedges instead of failing would otherwise take the caller with it
+/// (the encoder probe runs inside a `OnceLock` every other thread waits on).
+pub(super) fn status_within(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.stdin(Stdio::null()).spawn()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 pub(super) fn launch_err(bin: &str, e: std::io::Error) -> Error {
@@ -257,9 +287,17 @@ struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
     r_frame_rate: Option<String>,
+    avg_frame_rate: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u16>,
     duration: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+    /// Container-level stream tags. Only `rotate` matters: FFmpeg before 6.0
+    /// reported a phone's turn as this tag (clockwise) as well as in the
+    /// `Display Matrix` side data (counter-clockwise).
+    #[serde(default)]
+    tags: Option<std::collections::HashMap<String, String>>,
     /// Stream-level side data, which is where a spherical mapping surfaces. The
     /// mov demuxer fills this from the `sv3d` box (and the legacy Google
     /// spatial-media `uuid` blob), and `-show_streams` already prints it — no
@@ -273,6 +311,7 @@ struct ProbeStream {
 struct ProbeSideData {
     side_data_type: Option<String>,
     projection: Option<String>,
+    rotation: Option<f64>,
 }
 
 /// Probe a media file via `ffprobe -of json`.
@@ -335,18 +374,31 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
         if let Some(d) = s.duration.as_deref().and_then(|d| d.parse::<f64>().ok()) {
             max_stream_dur = max_stream_dur.max(d);
         }
+        let is_video = kind == StreamKind::Video;
+        let rotation = if is_video { display_rotation(s) } else { 0 };
+        let (width, height) = displayed_size(s.width, s.height, rotation);
         streams.push(StreamInfo {
             index: s.index,
             kind,
             codec: s.codec_name.clone().unwrap_or_default(),
-            width: s.width,
-            height: s.height,
-            fps: s.r_frame_rate.as_deref().and_then(parse_rational),
+            width,
+            height,
+            fps: nominal_fps(
+                s.r_frame_rate.as_deref().and_then(parse_rational),
+                s.avg_frame_rate.as_deref().and_then(parse_rational),
+            ),
             sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse().ok()),
             channels: s.channels,
             image: still && kind == StreamKind::Video,
-            projection: if kind == StreamKind::Video {
-                detect_projection(path, s)
+            projection: if is_video { detect_projection(path, s) } else { None },
+            rotation,
+            color_transfer: if is_video {
+                known_color(s.color_transfer.as_deref())
+            } else {
+                None
+            },
+            color_primaries: if is_video {
+                known_color(s.color_primaries.as_deref())
             } else {
                 None
             },
@@ -354,6 +406,88 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
     }
     let duration = format_dur.unwrap_or(max_stream_dur).max(0.0);
     ProbeResult { duration, streams }
+}
+
+/// How far a video stream is turned for display, in whole degrees
+/// counter-clockwise in `(-180, 180]`, from its `Display Matrix` side data (or,
+/// on an FFmpeg old enough to lack that, the clockwise `rotate` tag). 0 for an
+/// unturned stream.
+fn display_rotation(s: &ProbeStream) -> i16 {
+    let raw = s.side_data_list.iter().flatten().find_map(|sd| sd.rotation).or_else(|| {
+        let tag: f64 = s.tags.as_ref()?.get("rotate")?.trim().parse().ok()?;
+        Some(-tag)
+    });
+    let Some(raw) = raw.filter(|r| r.is_finite()) else {
+        return 0;
+    };
+    let mut deg = raw.round().rem_euclid(360.0) as i16;
+    if deg > 180 {
+        deg -= 360;
+    }
+    deg
+}
+
+/// The rotation a 3x3 display matrix (nine 16.16 fixed-point values in file
+/// order, as libav hands them over) describes, in whole degrees counter-clockwise
+/// in `(-180, 180]` — `av_display_rotation_get`, for the libav probe, which gets
+/// the raw matrix where ffprobe gets the angle.
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+pub(crate) fn matrix_rotation(m: &[i32; 9]) -> i16 {
+    let f = |i: usize| m[i] as f64 / 65536.0;
+    let (s0, s1) = (f(0).hypot(f(3)), f(1).hypot(f(4)));
+    if s0 == 0.0 || s1 == 0.0 {
+        return 0;
+    }
+    let deg = -(f(1) / s1).atan2(f(0) / s0).to_degrees();
+    let mut deg = deg.round().rem_euclid(360.0) as i16;
+    if deg > 180 {
+        deg -= 360;
+    }
+    deg
+}
+
+/// The size a stream is *shown* at: the coded size, swapped when the stream is
+/// turned a quarter. Every FFmpeg decode autorotates, so this is the size of the
+/// pixels the engine actually receives — the one every piece of frame geometry
+/// (the project frame, fit, crop, smart crop) has to be done against.
+pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: i16) -> (Option<u32>, Option<u32>) {
+    if rotation.rem_euclid(180) == 90 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+/// A colour tag as the engine stores it: `None` when the file does not say,
+/// rather than ffprobe's literal `"unknown"`.
+pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
+    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+        .map(str::to_string)
+}
+
+/// The frame rate to build a project around. `r_frame_rate` is "the lowest rate
+/// all timestamps are a multiple of", which for a variable-frame-rate phone clip
+/// can be a multiple of the real one (a ~30 fps clip with jittery timestamps
+/// probes as 120) and would turn the whole export into a 4x-duplicated render.
+/// When it runs far past the stream's average the average, snapped to the
+/// nearest standard rate, is the nominal rate; otherwise `r_frame_rate` stands,
+/// since a clip that merely dropped a few frames still belongs to its nominal rate.
+pub(crate) fn nominal_fps(r_frame_rate: Option<f64>, avg_frame_rate: Option<f64>) -> Option<f64> {
+    const STANDARD: [f64; 12] = [23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 100.0, 119.88, 120.0];
+    let r = r_frame_rate.filter(|r| *r > 0.0);
+    let avg = avg_frame_rate.filter(|a| *a > 0.0);
+    match (r, avg) {
+        (Some(r), Some(avg)) if r > avg * 1.5 => Some(
+            STANDARD
+                .iter()
+                .copied()
+                .filter(|s| (s - avg).abs() / s < 0.03)
+                .min_by(|a, b| (a - avg).abs().total_cmp(&(b - avg).abs()))
+                .unwrap_or(avg),
+        ),
+        (Some(r), _) => Some(r),
+        (None, avg) => avg,
+    }
 }
 
 /// FFmpeg `codec_name`s for single-frame still images. Animated containers
@@ -458,6 +592,110 @@ fn parse_rational(s: &str) -> Option<f64> {
     } else {
         Some(num / den)
     }
+}
+
+// ---- HDR → SDR -------------------------------------------------------------
+
+/// Whether this ffmpeg can tone-map with `zscale` + `tonemap`, probed once per
+/// process. `zscale` needs libzimg, which a minimal or hand-built ffmpeg often
+/// lacks; `tonemap` itself is part of every build.
+fn zscale_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let bin = ffmpeg_bin();
+        let ok = command(&bin)
+            .args(["-hide_banner", "-loglevel", "quiet", "-filters"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| {
+                let list = String::from_utf8_lossy(&o.stdout);
+                let has = |name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
+                has("zscale") && has("tonemap")
+            })
+            // A binary that will not even run renders nothing either way; only one
+            // that runs and lacks the filters gets the fallback. It also keeps the
+            // graph builders' output from depending on whether a test machine has
+            // ffmpeg installed.
+            .unwrap_or(true);
+        tracing::debug!(available = ok, "probed ffmpeg for zscale + tonemap");
+        ok
+    })
+}
+
+/// The filter chain that turns decoded HDR frames into 8-bit SDR BT.709 —
+/// pure, so it is unit-tested, with the filter probe's answer passed in.
+///
+/// The `zscale` path is the standard one: light-linear float RGB in the BT.709
+/// gamut, a **mobius** roll-off (linear up to 70% so the midtones — most of a
+/// picture — are left alone, then a smooth shoulder rather than `clip`'s hard
+/// edge or `hable`'s global contrast change), and back to BT.709 with error
+/// diffusion so a sky does not band. The input's transfer, primaries and matrix
+/// are stated rather than read from the frame, because a phone file with its
+/// colour tags stripped would otherwise abort the whole graph with "no path
+/// between colorspaces". `npl=100` makes light-linear 1.0 an SDR white. The
+/// output frames are tagged BT.709, so an encoder downstream writes an honest
+/// SDR file.
+///
+/// Without `zscale` the fallback is `colorspace`, which moves the BT.2020
+/// primaries and matrix into BT.709 but cannot know either HDR curve. That is
+/// near-right for HLG — designed to read acceptably on an SDR display — and
+/// only approximate for PQ, which is why it is the fallback.
+pub(crate) fn tonemap_chain(hdr: Hdr, zscale: bool) -> String {
+    if zscale {
+        format!(
+            "zscale=tin={}:pin=bt2020:min=bt2020nc:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+             tonemap=tonemap=mobius:param=0.7:desat=0,\
+             zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,format=yuv420p",
+            hdr.zscale_name()
+        )
+    } else {
+        "colorspace=all=bt709:iall=bt2020:fast=1,format=yuv420p".to_string()
+    }
+}
+
+/// [`tonemap_chain`] for this machine's ffmpeg.
+fn tonemap_filter(hdr: Hdr) -> String {
+    tonemap_chain(hdr, zscale_available())
+}
+
+/// The HDR transfer of the first video stream of the file at `path`, for the
+/// decodes that are handed a bare path rather than an [`Asset`] (a scrubbed
+/// frame, a contact sheet, a proxy). Probed once per file and cached against the
+/// file's size and modified time. A generated proxy answers `None` — it was
+/// tone-mapped when it was encoded, which is the point.
+pub(crate) fn source_hdr(path: &Path) -> Option<Hdr> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Hdr>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = source_key(path);
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
+        return hit;
+    }
+    let output = command(&ffprobe_bin())
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_transfer",
+        ])
+        // `default` rather than `csv`: a file with side data (a phone's display
+        // matrix) makes the csv writer append a stray empty field to the value.
+        .args(["-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let hdr = match String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("").trim() {
+        "arib-std-b67" => Some(Hdr::Hlg),
+        "smpte2084" => Some(Hdr::Pq),
+        _ => None,
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, hdr);
+    }
+    hdr
 }
 
 // ---- silence / scene analysis ---------------------------------------------
@@ -845,6 +1083,16 @@ fn region_frame_filter(region: Region, max_width: u32) -> String {
 /// hardware-accelerated per [`hwaccel`].
 fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>, accurate: bool) -> Result<Vec<u8>> {
     let time_secs = time_secs.max(0.0);
+    // HDR footage is tone-mapped after the caller's own scale/crop, so the
+    // expensive float stage runs on the small frame rather than the 4K one.
+    let tonemapped;
+    let vf = match source_hdr(path) {
+        Some(hdr) => {
+            tonemapped = format!("{vf},{}", tonemap_filter(hdr));
+            tonemapped.as_str()
+        }
+        None => vf,
+    };
     // Cache key captures everything that determines the bytes (path, time,
     // filter — which includes the target width — codec, quality and whether the
     // seek was exact or keyframe-snapped).
@@ -947,7 +1195,8 @@ pub fn contact_sheet(
     let path = path
         .to_str()
         .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
-    let (mut args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality);
+    let tonemap = source_hdr(Path::new(path)).map(tonemap_filter);
+    let (mut args, times) = build_contact_sheet_args(path, start, end, columns, rows, cell_width, quality, tonemap.as_deref());
     let bin = ffmpeg_bin();
     // Deliberately ungated: this is how an agent *looks* at the footage, and
     // making it wait out a ten-minute render would read as a hung server. It
@@ -983,6 +1232,7 @@ pub fn contact_sheet_times(start: f64, end: f64, columns: u32, rows: u32) -> Vec
 /// argument list and the row-major per-cell timestamps. Frames are sampled at
 /// the start of each of `columns*rows` equal slices of the window via the `fps`
 /// filter over an `-ss`/`-t` window, then `tile`d into the single output frame.
+#[allow(clippy::too_many_arguments)]
 fn build_contact_sheet_args(
     path: &str,
     start: f64,
@@ -991,6 +1241,7 @@ fn build_contact_sheet_args(
     rows: u32,
     cell_width: u32,
     quality: u8,
+    tonemap: Option<&str>,
 ) -> (Vec<String>, Vec<f64>) {
     let columns = columns.max(1);
     let rows = rows.max(1);
@@ -1001,7 +1252,9 @@ fn build_contact_sheet_args(
     // `fps` = one frame per slice over the seeked window; `tile` packs them and
     // `-frames:v 1` emits the single sheet. A degenerate window falls back to 1.
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
-    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,tile={columns}x{rows}");
+    // HDR sources are tone-mapped per cell, after the downscale, before the tile.
+    let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
+    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
     let args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -1317,9 +1570,14 @@ fn source_key(src: &Path) -> String {
 /// The width is part of the key, so an asset that is later marked as 360 (or
 /// stops being one) looks up a different file and regenerates instead of
 /// silently reusing a proxy rendered at the wrong size.
+///
+/// An HDR source also keys on the fact that its proxy is **tone-mapped**: a
+/// proxy cached before the engine did that is an untouched HDR picture squeezed
+/// into BT.709, and must be rebuilt rather than trusted. SDR keys are unchanged.
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    Some(dir.join(format!("{:016x}.mp4", fnv1a(&format!("{}|{width}", source_key(src))))))
+    let tone = if source_hdr(src).is_some() { "|sdr" } else { "" };
+    Some(dir.join(format!("{:016x}.mp4", fnv1a(&format!("{}|{width}{tone}", source_key(src))))))
 }
 
 /// The proxy for `src` at `width` **if it has already been generated** (the file
@@ -1394,8 +1652,21 @@ fn proxy_hw_encoder() -> Option<&'static str> {
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
-/// always reads the original) would.
-fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32, encoder: &str, hw_decode: Option<&str>) -> Vec<String> {
+/// always reads the original) would. `tonemap`, for an HDR source, is the chain
+/// that brings it down to SDR BT.709 after the downscale: the **proxy is where
+/// that conversion happens**, so everything that decodes it afterwards — the
+/// preview stream, scrubbed stills, the composited frame — sees ordinary SDR and
+/// converts nothing a second time. (Upright rotation is the decoder's: ffmpeg
+/// autorotates and writes the proxy without a matrix.)
+fn build_proxy_args(
+    src: &str,
+    dst: &str,
+    threads: usize,
+    width: u32,
+    encoder: &str,
+    hw_decode: Option<&str>,
+    tonemap: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -1411,7 +1682,10 @@ fn build_proxy_args(src: &str, dst: &str, threads: usize, width: u32, encoder: &
         src.to_string(),
         "-an".to_string(),
         "-vf".to_string(),
-        format!("scale='min({width},iw)':-2:flags=bilinear"),
+        match tonemap {
+            Some(t) => format!("scale='min({width},iw)':-2:flags=bilinear,{t}"),
+            None => format!("scale='min({width},iw)':-2:flags=bilinear"),
+        },
         "-c:v".to_string(),
         encoder.to_string(),
     ]);
@@ -1461,8 +1735,9 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
     // rather than starting one per file at once.
     let cpu = cpu::lease();
     let threads = proxy_threads(cpu.threads());
+    let tonemap = source_hdr(src).map(tonemap_filter);
     let run = |encoder: &str, hw_decode: Option<&str>| -> Result<std::process::Output> {
-        let mut args = build_proxy_args(src_str, tmp_str, threads, width, encoder, hw_decode);
+        let mut args = build_proxy_args(src_str, tmp_str, threads, width, encoder, hw_decode, tonemap.as_deref());
         cpu::limit_args(&mut args, threads);
         bg_command(&bin)
             .args(&args)
@@ -3035,6 +3310,25 @@ pub fn stream_preview(
     }
 }
 
+/// How long a playback stream may go without producing a frame before it is
+/// declared dead. A stalled ffmpeg (a hardware decoder that opens and then never
+/// delivers, a driver stuck in teardown) is otherwise indistinguishable from a
+/// slow one, and the read below would wait for it forever — the webview then
+/// shows a frozen frame while the stream is "playing". `first` covers startup
+/// (graph setup, hardware probing, the first decode of a long source); `stall`
+/// covers the gap between frames once running, which a healthy stream paced to
+/// real time keeps well under a second.
+#[derive(Clone, Copy)]
+struct PreviewTimeouts {
+    first: std::time::Duration,
+    stall: std::time::Duration,
+}
+
+const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
+    first: std::time::Duration::from_secs(30),
+    stall: std::time::Duration::from_secs(15),
+};
+
 fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
@@ -3043,8 +3337,6 @@ fn stream_preview_once(
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
 ) -> Result<()> {
-    use std::io::Read;
-
     let fps = fps.clamp(1.0, 60.0);
     let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
@@ -3055,7 +3347,7 @@ fn stream_preview_once(
 
     let bin = ffmpeg_bin();
     tracing::debug!(start, fps, "starting preview stream");
-    let mut child = command(&bin)
+    let child = command(&bin)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3063,6 +3355,24 @@ fn stream_preview_once(
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
     *sent = Some(0);
+    pump_preview(child, start, fps, PREVIEW_TIMEOUTS, on_frame, sent)
+}
+
+/// Read JPEG frames off a running ffmpeg's stdout, pace them to `fps` against
+/// the wall clock and hand them to `on_frame`, until the stream ends, the
+/// callback declines a frame, or ffmpeg stops producing for longer than
+/// `timeouts` allows (it is then killed and the call fails). Always reaps the
+/// child.
+fn pump_preview(
+    mut child: std::process::Child,
+    start: f64,
+    fps: f64,
+    timeouts: PreviewTimeouts,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+    sent: &mut Option<u64>,
+) -> Result<()> {
+    use std::io::Read;
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 
     // Drain stderr on a side thread so a warning flood can't deadlock the frame
     // read, keeping only the tail for a failure message.
@@ -3073,12 +3383,33 @@ fn stream_preview_once(
         buf
     });
 
+    // stdout is read on its own thread so the loop below can give up on a
+    // silent ffmpeg (`recv_timeout`) instead of blocking in `read`. The bounded
+    // channel keeps the old backpressure: once a few chunks are queued the reader
+    // stops reading, the pipe fills and ffmpeg is throttled to the pacing.
     let mut stdout = child.stdout.take().expect("stdout piped");
+    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
+    // Detached: after the kill it ends on EOF (or on the dropped receiver).
+    std::thread::spawn(move || {
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let msg = match stdout.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => Ok(chunk[..n].to_vec()),
+                Err(e) => Err(e),
+            };
+            let failed = msg.is_err();
+            if tx.send(msg).is_err() || failed {
+                return;
+            }
+        }
+    });
+
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
-    let mut chunk = vec![0u8; 64 * 1024];
     let mut index: u64 = 0;
     let mut origin: Option<std::time::Instant> = None;
     let mut stopped = false;
+    let mut failure: Option<String> = None;
 
     'read: loop {
         while let Some((s, e)) = next_jpeg(&buf) {
@@ -3103,24 +3434,41 @@ fn stream_preview_once(
                 break 'read;
             }
         }
-        let n = stdout
-            .read(&mut chunk)
-            .map_err(|e| Error::Engine(format!("preview stream read failed: {e}")))?;
-        if n == 0 {
-            break;
+        let wait = if index == 0 { timeouts.first } else { timeouts.stall };
+        match rx.recv_timeout(wait) {
+            Ok(Ok(bytes)) => buf.extend_from_slice(&bytes),
+            Ok(Err(e)) => {
+                failure = Some(format!("preview stream read failed: {e}"));
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                failure = Some(format!(
+                    "preview stream stalled: ffmpeg produced no {} for {}s",
+                    if index == 0 { "first frame" } else { "frame" },
+                    wait.as_secs_f32()
+                ));
+                break;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
 
-    if stopped {
+    if stopped || failure.is_some() {
         let _ = child.kill();
     }
+    drop(rx);
     let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
-    if !stopped && !status.success() {
+    let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
         tail.reverse();
-        return Err(Error::Engine(format!("preview stream failed: {}", tail.join("\n").trim())));
+        tail.join("\n").trim().to_string()
+    };
+    if let Some(reason) = failure {
+        return Err(Error::Engine(format!("{reason}\n{}", tail()).trim().to_string()));
+    }
+    if !stopped && !status.success() {
+        return Err(Error::Engine(format!("preview stream failed: {}", tail())));
     }
     Ok(())
 }
@@ -3466,7 +3814,12 @@ fn spill_graph(args: &mut [String], tag: &str, flag: &str) -> Result<GraphScript
     let Some(i) = oversized_graph_index(args) else {
         return Ok(GraphScript(None));
     };
-    let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}.txt", std::process::id()));
+    // Unique per call: two renders in one process (the GUI previewing while an
+    // agent exports, two playback streams) share a pid and a tag, and the
+    // second to finish used to delete the script the other was still reading.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("kerf-graph-{}-{tag}-{seq}.txt", std::process::id()));
     std::fs::write(&path, &args[i]).map_err(|e| Error::Engine(format!("could not write the filtergraph script: {e}")))?;
     args[i] = path.to_string_lossy().into_owned();
     args[i - 1] = flag.to_string();
@@ -3484,6 +3837,16 @@ struct Bar {
     width: f64,
     start: std::time::Instant,
 }
+
+/// How often a running export checks whether it has been cancelled when ffmpeg
+/// has said nothing in the meantime.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long an export may go without a single `-progress` line before it is
+/// treated as hung. ffmpeg reports every half second while it is working, even
+/// through a slow filter, so this is a deadlock, not a heavy render — the bound
+/// is generous because killing a render that was merely slow is the worse error.
+const EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Spawn the `ffmpeg` binary with `args`, streaming `-progress` from stdout to
 /// map elapsed render time onto `bar`, and polling `cancel` between updates
@@ -3533,9 +3896,41 @@ fn run_ffmpeg_progress(
 
     let total = bar.total.max(1e-9);
     let mut cancelled = false;
+    let mut stalled = false;
     let stdout = child.stdout.take().expect("stdout piped");
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
+    // Progress lines are read on a side thread so the loop below keeps polling
+    // `cancel` (and watching for a silent ffmpeg) even when none arrive: a
+    // blocking `lines()` read meant a render that stopped reporting could neither
+    // be cancelled nor ever be given up on.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut last_output = Instant::now();
+    loop {
+        let line = match rx.recv_timeout(CANCEL_POLL) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel() {
+                    let _ = child.kill();
+                    cancelled = true;
+                    break;
+                }
+                if last_output.elapsed() > EXPORT_STALL {
+                    let _ = child.kill();
+                    stalled = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        last_output = Instant::now();
         if line == "progress=end" {
             break;
         }
@@ -3565,6 +3960,15 @@ fn run_ffmpeg_progress(
     if cancelled {
         tracing::info!(output = %output.display(), "export cancelled");
         return Ok(RenderStatus::Cancelled);
+    }
+    if stalled {
+        let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
+        tail.reverse();
+        return Err(Error::Engine(format!(
+            "ffmpeg stopped reporting progress for {}s and was stopped: {}",
+            EXPORT_STALL.as_secs(),
+            tail.join("\n").trim()
+        )));
     }
     if !status.success() {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
@@ -3930,6 +4334,10 @@ struct ClipFx {
     /// carried to over its tail (a push only — a slide covers it where it sits).
     move_in: Option<(f64, f64, f64)>,
     move_out: Option<(f64, f64, f64)>,
+    /// The clip's source is HDR and its picture is tone-mapped to SDR in the
+    /// chain. `None` for SDR — and for a preview asset swapped to its proxy,
+    /// which was converted when it was encoded.
+    hdr: Option<Hdr>,
 }
 
 /// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
@@ -3938,6 +4346,9 @@ struct ClipFx {
 fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let mut fx = vec![ClipFx::default(); total_clips];
+    for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+        fx[flat].hdr = assets.iter().find(|a| a.id == clip.asset_id).and_then(|a| a.hdr());
+    }
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
     let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
 
@@ -4680,6 +5091,14 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if reframe.is_none() {
         p.push(format!("fps={}", fmt.fps));
     }
+    // HDR → SDR, once per clip, as late as the geometry allows: after the fit
+    // scale has cut a 4K frame to the delivery size and `fps` has dropped the
+    // frames that will never be shown, because the float RGB stage is by far the
+    // most expensive step in the chain — and before any colour work, which is
+    // meant to act on the SDR picture.
+    if let Some(hdr) = fx.hdr {
+        p.push(tonemap_filter(hdr));
+    }
     // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`
     // has no alpha-capable input format, so the graph would otherwise auto-insert a
     // conversion that drops the alpha (silently disabling opacity / rotation).
@@ -4746,29 +5165,34 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         let rad = t.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
+    // `fade` reads the frame's pts, which `setpts` above already moved onto
+    // the timeline, so a fade starts at the clip's timeline position and not
+    // at 0 — clip-local times blacked out a later clip's fade-out entirely and
+    // made its fade-in / dip / dissolve land before the clip existed.
+    let t0 = clip.timeline_start;
     let fi = clip.fade_in + fx.black_in;
     let fo = clip.fade_out + fx.black_out;
     if fi > 0.0 {
-        p.push(format!("fade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+        p.push(format!("fade=t=in:st={}:d={}", t0, fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        p.push(format!("fade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+        p.push(format!("fade=t=out:st={}:d={}", t0 + (dur - fo).max(0.0), fo.clamp(0.0, dur)));
     }
     // A dip through white is the same fade with a colour: it lands on the frame
     // itself rather than on the alpha plane, so it needs no `format=yuva420p`.
     if fx.white_in > 0.0 {
-        p.push(format!("fade=t=in:st=0:d={}:c=white", fx.white_in.clamp(0.0, dur)));
+        p.push(format!("fade=t=in:st={}:d={}:c=white", t0, fx.white_in.clamp(0.0, dur)));
     }
     if fx.white_out > 0.0 {
         p.push(format!(
             "fade=t=out:st={}:d={}:c=white",
-            (dur - fx.white_out).max(0.0),
+            t0 + (dur - fx.white_out).max(0.0),
             fx.white_out.clamp(0.0, dur)
         ));
     }
     if fx.xfade_in > 0.0 {
         // The alpha plane is already established above (xfade implies needs_alpha).
-        p.push(format!("fade=t=in:st=0:d={}:alpha=1", fx.xfade_in.clamp(0.0, dur)));
+        p.push(format!("fade=t=in:st={}:d={}:alpha=1", t0, fx.xfade_in.clamp(0.0, dur)));
     }
     if !needs_alpha {
         // Terminal pixel format — kept equal to argv `-pix_fmt` so a 10-bit /
@@ -5098,8 +5522,10 @@ fn build_still_args(
         let local = (t - clip.timeline_start).max(0.0);
         let tf = clip.transform_at(local);
         let rf = clip.reframe_at(local);
+        let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
+        let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
         chains.push(format!(
-            "[{n}:v]{chain}[v{n}]",
+            "[{n}:v]{tone}{chain}[v{n}]",
             chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas, clip.mask.as_ref())
         ));
         let out = format!("ov{n}");
@@ -5316,6 +5742,7 @@ fn atempo_chain(speed: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::test_support::StatusBounded;
     use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
 
     /// A track mix that changes nothing — what every test that is not about the
@@ -5487,7 +5914,7 @@ mod tests {
 
     #[test]
     fn proxy_args_are_all_intra_audioless_and_keep_timing() {
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "libx264", None);
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "libx264", None, None);
         // All-intra: every frame a keyframe, so a preview seek decodes one frame.
         let gop = args.iter().position(|a| a == "-g").expect("-g present");
         assert_eq!(args[gop + 1], "1");
@@ -5520,7 +5947,7 @@ mod tests {
     fn proxy_args_with_hw_encoder_spell_quality_per_family_and_stay_all_intra() {
         // NVENC: CRF intent becomes -rc vbr -cq, input format nv12, and the
         // all-intra / no-retime invariants hold exactly as in software.
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "h264_nvenc", Some("auto"));
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "h264_nvenc", Some("auto"), None);
         assert!(args.windows(2).any(|w| w[0] == "-hwaccel" && w[1] == "auto"));
         assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "h264_nvenc"));
         assert!(args.windows(2).any(|w| w[0] == "-cq" && w[1] == "24"));
@@ -5647,7 +6074,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -5793,7 +6220,7 @@ mod tests {
         assert_eq!(proxy_width(Some(Projection::Equirect)), PROXY_MAX_WIDTH_SPHERICAL);
         assert_eq!(proxy_width(Some(Projection::DualFisheye)), PROXY_MAX_WIDTH_SPHERICAL);
         assert!(
-            build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None)
+            build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None, None)
                 .iter()
                 .any(|a| a.contains("scale='min(3072,iw)':-2"))
         );
@@ -5831,6 +6258,9 @@ mod tests {
             channels: None,
             image: false,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         }
     }
 
@@ -5846,6 +6276,9 @@ mod tests {
             channels: Some(channels),
             image: false,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         }
     }
 
@@ -5861,6 +6294,9 @@ mod tests {
             channels: None,
             image: true,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         }
     }
 
@@ -6456,7 +6892,7 @@ mod tests {
 
     #[test]
     fn contact_sheet_samples_evenly_and_tiles() {
-        let (args, times) = build_contact_sheet_args("/media/clip.mp4", 0.0, 40.0, 4, 4, 240, 5);
+        let (args, times) = build_contact_sheet_args("/media/clip.mp4", 0.0, 40.0, 4, 4, 240, 5, None);
         let joined = args.join(" ");
         // 16 cells across 40s -> one frame every 2.5s, row-major.
         assert_eq!(times.len(), 16);
@@ -6554,13 +6990,13 @@ mod tests {
 
     #[test]
     fn contact_sheet_times_match_the_sheet() {
-        let (_, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3);
+        let (_, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3, None);
         assert_eq!(times, contact_sheet_times(10.0, 20.0, 2, 2));
     }
 
     #[test]
     fn contact_sheet_respects_a_subrange() {
-        let (args, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3);
+        let (args, times) = build_contact_sheet_args("/x.mp4", 10.0, 20.0, 2, 2, 160, 3, None);
         let joined = args.join(" ");
         assert_eq!(times.len(), 4);
         assert!((times[0] - 10.0).abs() < 1e-9); // window starts at `start`
@@ -7475,8 +7911,8 @@ mod tests {
         let g = graph_of(&single(vec![a, b]), &[asset]);
         // Outgoing clip A renders one extra second of source under the dissolve.
         assert!(g.contains("trim=start=0:end=11"), "{g}");
-        // Incoming clip B fades up via alpha.
-        assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "{g}");
+        // Incoming clip B fades up via alpha, from where it sits on the timeline.
+        assert!(g.contains("fade=t=in:st=10:d=1:alpha=1"), "{g}");
     }
 
     #[test]
@@ -7528,7 +7964,10 @@ mod tests {
             g.contains("trim=start=0:end=10"),
             "outgoing clip must not bleed across the gap: {g}"
         );
-        assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "incoming dissolves from black: {g}");
+        assert!(
+            g.contains("fade=t=in:st=15:d=1:alpha=1"),
+            "incoming dissolves from black: {g}"
+        );
     }
 
     #[test]
@@ -7671,7 +8110,7 @@ mod tests {
         });
         let g = graph_of(&single(vec![a, b]), &[asset]);
         assert!(g.contains("fade=t=out:st=9.5:d=0.5:c=white"), "{g}");
-        assert!(g.contains("fade=t=in:st=0:d=0.5:c=white"), "{g}");
+        assert!(g.contains("fade=t=in:st=10:d=0.5:c=white"), "{g}");
         // A dip never borrows a handle: neither clip is extended.
         assert!(g.contains("trim=start=0:end=10"), "{g}");
         assert!(!g.contains(":alpha=1"), "a dip is not a dissolve: {g}");
@@ -8555,6 +8994,110 @@ mod tests {
         assert_eq!(&noisy[s..e], &a[..]);
     }
 
+    /// A stand-in for ffmpeg: `script` run by `sh` with piped stdout / stderr.
+    /// `exec` in the script so a kill reaches the process holding the pipes.
+    #[cfg(unix)]
+    fn fake_stream(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[cfg(unix)]
+    fn short_timeouts() -> PreviewTimeouts {
+        PreviewTimeouts {
+            first: std::time::Duration::from_millis(400),
+            stall: std::time::Duration::from_millis(400),
+        }
+    }
+
+    /// An ffmpeg that opens and then never produces a frame must fail the
+    /// stream, not freeze it: the read used to wait on it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_that_never_produces_a_frame_times_out() {
+        let started = std::time::Instant::now();
+        let mut sent = Some(0);
+        let result = pump_preview(
+            fake_stream("echo no frames today >&2; exec sleep 60"),
+            0.0,
+            24.0,
+            short_timeouts(),
+            &mut |_| true,
+            &mut sent,
+        );
+        let err = result.expect_err("a silent stream must fail").to_string();
+        assert!(err.contains("stalled") && err.contains("first frame"), "{err}");
+        assert!(err.contains("no frames today"), "stderr tail is surfaced: {err}");
+        assert_eq!(sent, Some(0), "nothing was shown, so a software retry is safe");
+        assert!(started.elapsed().as_secs() < 10, "killed promptly: {:?}", started.elapsed());
+    }
+
+    /// Frames that did arrive are delivered, then a stall fails the stream with
+    /// the count intact (so the caller knows replaying would repeat them).
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_that_stalls_midway_delivers_what_it_had_then_fails() {
+        let mut frames = 0;
+        let mut sent = Some(0);
+        let result = pump_preview(
+            fake_stream(r"printf '\377\330one\377\331\377\330two\377\331'; exec sleep 60"),
+            1.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                assert_eq!(&f.jpeg[..2], &[0xFF, 0xD8]);
+                frames += 1;
+                true
+            },
+            &mut sent,
+        );
+        let err = result.expect_err("stall").to_string();
+        assert!(err.contains("stalled") && !err.contains("first frame"), "{err}");
+        assert_eq!((frames, sent), (2, Some(2)));
+    }
+
+    /// A callback that declines a frame still stops playback cleanly, and a
+    /// stream that simply ends is not an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_stream_stops_on_request_and_ends_cleanly() {
+        let mut sent = Some(0);
+        let mut frames = 0;
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331\377\330b\377\331'; exec sleep 60"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |_| {
+                frames += 1;
+                false
+            },
+            &mut sent,
+        )
+        .expect("a requested stop is not a failure");
+        assert_eq!(frames, 1);
+
+        let mut frames = 0;
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331'"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |_| {
+                frames += 1;
+                true
+            },
+            &mut sent,
+        )
+        .expect("a stream that finishes is not a failure");
+        assert_eq!(frames, 1);
+    }
+
     #[test]
     fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
         let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
@@ -8658,7 +9201,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -8711,7 +9254,7 @@ mod tests {
             .args(["-filter_complex", "[1][0]overlay=x=80:y=240"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -8744,7 +9287,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=6"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
@@ -8794,7 +9337,7 @@ mod tests {
         let media = dir.join("src.mp4");
         let still = dir.join("card.png");
         let run = |args: Vec<String>| {
-            let ok = command(&ffmpeg_bin()).args(&args).status().expect("run ffmpeg");
+            let ok = command(&ffmpeg_bin()).args(&args).status_bounded().expect("run ffmpeg");
             assert!(ok.success(), "ffmpeg failed for {args:?}");
         };
         let s = |v: &str| v.to_string();
@@ -8886,7 +9429,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -8914,7 +9457,7 @@ mod tests {
                     "gray",
                 ])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -8962,7 +9505,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9040,7 +9583,7 @@ mod tests {
                 .args(["-f", "lavfi", "-i", &format!("color=c={color}:s=320x180:r=30:d=2")])
                 .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
                 .arg(&out)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             out
@@ -9087,7 +9630,7 @@ mod tests {
                 .args(["-vf", &format!("crop=20:20:{x}:{y}"), "-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9116,7 +9659,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=1"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9148,7 +9691,7 @@ mod tests {
                 .args(["-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9161,6 +9704,86 @@ mod tests {
             text > blank + 5.0,
             "\"50% OFF\" should be visible over black: {text} vs blank {blank}"
         );
+    }
+
+    /// A fade on a clip that does not start the timeline. The chain's `setpts`
+    /// has already put the frames on the timeline, so a fade timed from 0
+    /// blacked out the whole of a later clip that had a fade-out and played a
+    /// later clip's fade-in before the clip existed.
+    #[test]
+    fn a_later_clips_fades_are_timed_from_where_it_sits() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let a = make_clip(asset.id, 0.0, 5.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 4.0, 5.0);
+        b.fade_in = 0.5;
+        b.fade_out = 1.0;
+        let g = graph_of(&single(vec![a, b]), &[asset]);
+        assert!(g.contains("fade=t=in:st=5:d=0.5,fade=t=out:st=8:d=1,"), "{g}");
+        // Audio is re-based to the clip before `adelay` moves it, so its fades stay clip-local.
+        assert!(g.contains("afade=t=in:st=0:d=0.5,afade=t=out:st=3:d=1,"), "{g}");
+    }
+
+    /// The same, rendered: the middle of a later clip with a fade-out must be
+    /// picture, not black.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored later_clip_fade`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_later_clip_fade_out_does_not_black_out_the_clip() {
+        let dir = std::env::temp_dir().join(format!("kerf-fade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("gray.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=gray:s=320x180:r=25:d=10"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        let mut asset = av_asset(Uuid::new_v4(), 10.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(320, 180, 25.0)];
+        let a = make_clip(asset.id, 0.0, 3.0, 0.0);
+        let mut b = make_clip(asset.id, 3.0, 7.0, 3.0);
+        b.fade_in = 0.5;
+        b.fade_out = 1.0;
+        let timeline = single(vec![a, b]);
+
+        let out = dir.join("faded.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        render_with(&timeline, &[asset], &out, &opts).expect("export");
+
+        let luma_at = |t: f64| -> f64 {
+            let raw = dir.join(format!("frame-{t}.raw"));
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-ss", &t.to_string()])
+                .arg("-i")
+                .arg(&out)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray"])
+                .arg(&raw)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let bytes = std::fs::read(&raw).expect("raw");
+            bytes.iter().map(|b| *b as f64).sum::<f64>() / bytes.len() as f64
+        };
+        let (first, fading_in, middle, tail) = (luma_at(1.0), luma_at(3.1), luma_at(4.5), luma_at(6.9));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(first > 100.0, "first clip is plain gray: {first}");
+        assert!(middle > 100.0, "a later clip's fade-out must not black it out: {middle}");
+        assert!(
+            fading_in < middle - 30.0,
+            "the fade-in starts dark at the cut: {fading_in} vs {middle}"
+        );
+        assert!(tail < middle - 30.0, "the fade-out darkens the tail: {tail} vs {middle}");
     }
 
     /// A slide and a push look identical in the graph builder's assertions —
@@ -9188,7 +9811,7 @@ mod tests {
             .args(["-vf", "drawbox=x=0:y=0:w=64:h=360:color=white:t=fill"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&striped)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
         let plain = dir.join("gray.mp4");
@@ -9197,7 +9820,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=30:d=4"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&plain)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9220,7 +9843,7 @@ mod tests {
                 .args(["-vf", "crop=32:360:0:0", "-frames:v", "1"])
                 .args(["-f", "rawvideo", "-pix_fmt", "gray"])
                 .arg(&raw)
-                .status()
+                .status_bounded()
                 .expect("run ffmpeg");
             assert!(ok.success());
             let bytes = std::fs::read(&raw).expect("raw");
@@ -9269,7 +9892,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=2"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&media)
-            .status()
+            .status_bounded()
             .expect("run ffmpeg");
         assert!(ok.success());
 
@@ -9299,5 +9922,871 @@ mod tests {
         let dims = String::from_utf8_lossy(&probed.stdout).trim().to_string();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(dims, "1080,1920", "the project frame decides the file's shape");
+    }
+
+    // ---- rotation, colour and frame rate at probe time ----------------------
+
+    fn probe_json(video: &str) -> ProbeResult {
+        let json = format!(
+            r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"hevc",{video}}}],"format":{{"duration":"10.0"}}}}"#
+        );
+        probe_from_json(serde_json::from_str(&json).expect("json"), None)
+    }
+
+    #[test]
+    fn a_turned_phone_clip_probes_at_its_displayed_size() {
+        for rotation in [90, -90, 270] {
+            let probed = probe_json(&format!(
+                r#""width":1920,"height":1080,"side_data_list":[{{"side_data_type":"Display Matrix","rotation":{rotation}}}]"#
+            ));
+            let v = &probed.streams[0];
+            assert_eq!((v.width, v.height), (Some(1080), Some(1920)), "rotation {rotation}");
+            assert_eq!(v.rotation, if rotation == 270 { -90 } else { rotation as i16 });
+        }
+        // Upside-down is still landscape; no rotation is no rotation.
+        let flipped =
+            probe_json(r#""width":1920,"height":1080,"side_data_list":[{"side_data_type":"Display Matrix","rotation":180}]"#);
+        assert_eq!(
+            (flipped.streams[0].width, flipped.streams[0].height),
+            (Some(1920), Some(1080))
+        );
+        assert_eq!(flipped.streams[0].rotation, 180);
+        let plain = probe_json(r#""width":1920,"height":1080"#);
+        assert_eq!((plain.streams[0].width, plain.streams[0].height), (Some(1920), Some(1080)));
+        assert_eq!(plain.streams[0].rotation, 0);
+    }
+
+    #[test]
+    fn an_old_ffprobe_reports_the_turn_as_a_clockwise_tag() {
+        let probed = probe_json(r#""width":1920,"height":1080,"tags":{"rotate":"90"}"#);
+        let v = &probed.streams[0];
+        assert_eq!((v.width, v.height), (Some(1080), Some(1920)));
+        assert_eq!(v.rotation, -90, "clockwise 90 is -90 in the counter-clockwise convention");
+        // The side data wins when both are present.
+        let both = probe_json(
+            r#""width":1920,"height":1080,"tags":{"rotate":"90"},"side_data_list":[{"side_data_type":"Display Matrix","rotation":90}]"#,
+        );
+        assert_eq!(both.streams[0].rotation, 90);
+    }
+
+    #[test]
+    fn a_display_matrix_reads_back_as_the_angle_ffprobe_reports() {
+        const ONE: i32 = 65536;
+        let w = 1 << 30;
+        // The matrix of a real phone clip, which ffprobe reports as rotation 90.
+        assert_eq!(matrix_rotation(&[0, -ONE, 0, ONE, 0, 0, 0, 0, w]), 90);
+        assert_eq!(matrix_rotation(&[0, ONE, 0, -ONE, 0, 0, 0, 0, w]), -90);
+        assert_eq!(matrix_rotation(&[ONE, 0, 0, 0, ONE, 0, 0, 0, w]), 0);
+        assert_eq!(matrix_rotation(&[-ONE, 0, 0, 0, -ONE, 0, 0, 0, w]), 180);
+        assert_eq!(matrix_rotation(&[0; 9]), 0, "a degenerate matrix is no rotation");
+    }
+
+    #[test]
+    fn displayed_size_swaps_only_for_quarter_turns() {
+        assert_eq!(displayed_size(Some(4), Some(3), 90), (Some(3), Some(4)));
+        assert_eq!(displayed_size(Some(4), Some(3), -90), (Some(3), Some(4)));
+        assert_eq!(displayed_size(Some(4), Some(3), 180), (Some(4), Some(3)));
+        assert_eq!(displayed_size(Some(4), Some(3), 0), (Some(4), Some(3)));
+        assert_eq!(displayed_size(None, Some(3), 90), (Some(3), None));
+    }
+
+    #[test]
+    fn probe_records_the_hdr_transfer_and_ignores_unknown_tags() {
+        let hlg = probe_json(r#""width":3840,"height":2160,"color_transfer":"arib-std-b67","color_primaries":"bt2020""#);
+        let v = &hlg.streams[0];
+        assert_eq!(v.color_transfer.as_deref(), Some("arib-std-b67"));
+        assert_eq!(v.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(v.hdr(), Some(crate::model::Hdr::Hlg));
+        let pq = probe_json(r#""width":3840,"height":2160,"color_transfer":"smpte2084","color_primaries":"bt2020""#);
+        assert_eq!(pq.streams[0].hdr(), Some(crate::model::Hdr::Pq));
+        let sdr = probe_json(r#""width":1920,"height":1080,"color_transfer":"bt709","color_primaries":"bt709""#);
+        assert_eq!(sdr.streams[0].hdr(), None);
+        let untagged = probe_json(r#""width":1920,"height":1080,"color_transfer":"unknown""#);
+        assert_eq!(untagged.streams[0].color_transfer, None);
+        assert_eq!(untagged.streams[0].hdr(), None);
+    }
+
+    #[test]
+    fn a_jittery_vfr_clip_keeps_its_nominal_frame_rate() {
+        // A phone clip that dropped frames keeps its nominal rate...
+        assert_eq!(nominal_fps(Some(30.0), Some(25.75)), Some(30.0));
+        assert_eq!(nominal_fps(Some(30000.0 / 1001.0), Some(29.9)), Some(30000.0 / 1001.0));
+        // ...but a timestamp grid far finer than the footage does not become the
+        // project's frame rate.
+        assert_eq!(nominal_fps(Some(120.0), Some(30.07)), Some(30.0));
+        assert_eq!(nominal_fps(Some(600.0), Some(29.97)), Some(29.97));
+        assert_eq!(nominal_fps(Some(600.0), Some(41.3)), Some(41.3));
+        assert_eq!(nominal_fps(Some(25.0), None), Some(25.0));
+        assert_eq!(nominal_fps(None, Some(24.0)), Some(24.0));
+        assert_eq!(nominal_fps(None, None), None);
+        assert_eq!(nominal_fps(Some(0.0), Some(0.0)), None);
+    }
+
+    // ---- HDR → SDR -----------------------------------------------------------
+
+    fn hlg_asset() -> Asset {
+        let mut asset = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        asset.path = "/media/hdr.mov".into();
+        asset.streams[0].color_transfer = Some("arib-std-b67".into());
+        asset.streams[0].color_primaries = Some("bt2020".into());
+        asset
+    }
+
+    #[test]
+    fn the_tonemap_chain_names_the_input_transfer_and_ends_in_sdr() {
+        let hlg = tonemap_chain(Hdr::Hlg, true);
+        assert!(
+            hlg.starts_with("zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:t=linear:npl=100,"),
+            "{hlg}"
+        );
+        assert!(hlg.contains("tonemap=tonemap=mobius"), "{hlg}");
+        assert!(
+            hlg.ends_with("zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,format=yuv420p"),
+            "{hlg}"
+        );
+        assert!(tonemap_chain(Hdr::Pq, true).starts_with("zscale=tin=smpte2084:"));
+        // No libzimg: still leaves BT.2020 and lands on 8-bit 4:2:0.
+        let fallback = tonemap_chain(Hdr::Hlg, false);
+        assert!(
+            !fallback.contains("zscale") && fallback.contains("colorspace=all=bt709:iall=bt2020"),
+            "{fallback}"
+        );
+        assert!(fallback.ends_with("format=yuv420p"));
+    }
+
+    #[test]
+    fn an_hdr_clip_is_tonemapped_once_after_fps_and_before_colour() {
+        let asset = hlg_asset();
+        let mut clip = make_clip(asset.id, 0.0, 5.0, 0.0);
+        clip.color.saturation = 1.3;
+        let timeline = single(vec![clip.clone()]);
+        let fx = transition_fx(&timeline, std::slice::from_ref(&asset));
+        assert_eq!(fx[0].hdr, Some(Hdr::Hlg));
+        let chain = video_clip_chain(&clip, &fmt_1080p(), &fx[0], false, "c0");
+        assert_eq!(chain.matches("tonemap=tonemap").count(), 1, "{chain}");
+        let (fps, tone, eq) = (
+            chain.find("fps=").unwrap(),
+            chain.find("zscale=tin=").unwrap(),
+            chain.find("eq=").unwrap(),
+        );
+        assert!(
+            chain.find("scale=1920").unwrap() < tone,
+            "geometry first, on the cheap pixels: {chain}"
+        );
+        assert!(fps < tone && tone < eq, "{chain}");
+        // SDR is untouched.
+        let sdr = video_clip_chain(&clip, &fmt_1080p(), &ClipFx::default(), false, "c0");
+        assert!(
+            !sdr.contains("zscale") && !sdr.contains("tonemap") && !sdr.contains("colorspace"),
+            "{sdr}"
+        );
+    }
+
+    #[test]
+    fn hdr_reaches_export_preview_stream_and_still_graphs_but_sdr_never_does() {
+        let hdr = hlg_asset();
+        let sdr = Asset {
+            id: Uuid::new_v4(),
+            path: "/media/sdr.mp4".into(),
+            ..test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)])
+        };
+        let assets = vec![hdr.clone(), sdr.clone()];
+        let timeline = single(vec![make_clip(hdr.id, 0.0, 5.0, 0.0), make_clip(sdr.id, 0.0, 5.0, 5.0)]);
+        let count = |args: &[String]| args.join(" ").matches("tonemap=tonemap").count();
+
+        let export = build_export_args(&timeline, &assets, "out.mp4", &ExportOptions::default()).unwrap();
+        assert_eq!(count(&export), 1, "only the HDR clip: {export:?}");
+        let stream = build_preview_args(&timeline, &assets, 1.0, 24.0, 960, 6).unwrap();
+        assert_eq!(count(&stream), 1);
+        let still = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 2.0, 640, 4).unwrap();
+        assert_eq!(count(&still), 1);
+        let sdr_still = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 7.0, 640, 4).unwrap();
+        assert_eq!(count(&sdr_still), 0);
+
+        // Through a proxy the asset is SDR, and nothing converts a second time.
+        let proxied = vec![hdr.as_sdr_proxy(), sdr];
+        let export = build_export_args(&timeline, &proxied, "out.mp4", &ExportOptions::default()).unwrap();
+        assert_eq!(count(&export), 0);
+    }
+
+    #[test]
+    fn single_frame_contact_sheet_and_proxy_decodes_tonemap_after_the_downscale() {
+        let (args, _) = build_contact_sheet_args("/m/a.mov", 0.0, 8.0, 2, 2, 240, 5, Some("TONEMAP"));
+        assert!(
+            args.join(" ").contains("scale=240:-2:flags=bilinear,TONEMAP,tile=2x2"),
+            "{args:?}"
+        );
+        let proxy = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, Some("TONEMAP")).join(" ");
+        assert!(
+            proxy.contains("scale='min(1280,iw)':-2:flags=bilinear,TONEMAP -c:v libx264"),
+            "{proxy}"
+        );
+        // SDR stays byte-identical.
+        let plain = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None).join(" ");
+        assert!(plain.contains("flags=bilinear -c:v libx264"), "{plain}");
+    }
+
+    // ---- phone / mirrorless footage, end to end ------------------------------
+
+    /// Say why an end-to-end test has nothing to check on this ffmpeg.
+    #[allow(clippy::print_stderr)]
+    fn skip(why: &str) {
+        eprintln!("{why}");
+    }
+
+    /// A scratch directory that is removed when the test ends, pass or fail.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("kerf-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Scratch(dir)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run `ffmpeg` with `args` (after the usual quiet flags); true when it exits 0.
+    fn try_ffmpeg(args: &[&str]) -> bool {
+        command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(args)
+            .stdin(Stdio::null())
+            .status_bounded()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn run_ffmpeg(args: &[&str]) {
+        assert!(try_ffmpeg(args), "ffmpeg {args:?} failed");
+    }
+
+    /// The first frame of `path` (optionally through `vf`) as `(width, height, rgb24)`,
+    /// decoded by ffmpeg with autorotation on — the ground truth for "upright".
+    fn rgb_frame(path: &Path, vf: Option<&str>) -> (usize, usize, Vec<u8>) {
+        let mut cmd = command(&ffmpeg_bin());
+        cmd.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(path);
+        if let Some(vf) = vf {
+            cmd.args(["-vf", vf]);
+        }
+        let out = cmd
+            .args([
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "pipe:1",
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let b = &out.stdout;
+        let mut fields = Vec::new();
+        let mut at = 0;
+        while fields.len() < 4 {
+            while b[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            let start = at;
+            while !b[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            fields.push(String::from_utf8_lossy(&b[start..at]).into_owned());
+        }
+        let (w, h): (usize, usize) = (fields[1].parse().unwrap(), fields[2].parse().unwrap());
+        (w, h, b[at + 1..].to_vec())
+    }
+
+    /// Which edge of the picture the pure-red bar sits on (`top` / `bottom` /
+    /// `left` / `right`), judged by where the red pixels' centroid falls.
+    fn red_bar_edge(w: usize, h: usize, rgb: &[u8]) -> &'static str {
+        let (mut n, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for y in 0..h {
+            for x in 0..w {
+                let p = &rgb[(y * w + x) * 3..][..3];
+                if p[0] > 180 && p[1] < 90 && p[2] < 90 {
+                    n += 1.0;
+                    sx += x as f64;
+                    sy += y as f64;
+                }
+            }
+        }
+        if n == 0.0 {
+            return "none";
+        }
+        let (cx, cy) = (sx / n / w as f64 - 0.5, sy / n / h as f64 - 0.5);
+        if cx.abs() > cy.abs() {
+            if cx > 0.0 {
+                "right"
+            } else {
+                "left"
+            }
+        } else if cy > 0.0 {
+            "bottom"
+        } else {
+            "top"
+        }
+    }
+
+    /// The probed asset for a file, as the import path would build it.
+    fn probed_asset(path: &Path) -> Asset {
+        let probed = probe(path).expect("probe");
+        let mut asset = av_asset(Uuid::new_v4(), probed.duration);
+        asset.path = path.to_string_lossy().into_owned();
+        asset.streams = probed.streams;
+        asset
+    }
+
+    fn ffprobe_field(path: &Path, stream: &str, entries: &str) -> String {
+        let out = command(&ffprobe_bin())
+            .args(["-v", "error", "-select_streams", stream, "-show_entries", entries])
+            .args(["-of", "default=nw=1:nk=1"])
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        String::from_utf8_lossy(&out.stdout).lines().collect::<Vec<_>>().join(",")
+    }
+
+    fn mp4_export_opts() -> ExportOptions {
+        ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            ..Default::default()
+        }
+    }
+
+    /// `src` remuxed with a display matrix turning it by `rotation` degrees, the
+    /// way a phone marks a portrait recording. `None` when this ffmpeg can not
+    /// write a display matrix at all (the test then has nothing to say).
+    fn turned(dir: &Scratch, src: &Path, rotation: i32, name: &str) -> Option<PathBuf> {
+        let out = dir.join(name);
+        let (src, outs) = (src.to_str().unwrap(), out.to_str().unwrap());
+        let rot = rotation.to_string();
+        // FFmpeg 6+ takes the angle as an input option; older builds write the
+        // matrix from a `rotate` tag (clockwise, the opposite sign).
+        let neg = (-rotation).to_string();
+        let wrote = try_ffmpeg(&["-display_rotation", &rot, "-i", src, "-c", "copy", outs])
+            || try_ffmpeg(&["-i", src, "-c", "copy", "-metadata:s:v:0", &format!("rotate={neg}"), outs]);
+        let dump = command(&ffprobe_bin())
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&out)
+            .output()
+            .expect("run ffprobe");
+        let dump = String::from_utf8_lossy(&dump.stdout);
+        (wrote && (dump.contains("\"rotation\"") || dump.contains("\"rotate\""))).then_some(out)
+    }
+
+    /// A landscape clip with a red bar along the top of its coded frame, turned
+    /// by [`turned`].
+    fn rotated_clip(dir: &Scratch, rotation: i32) -> Option<PathBuf> {
+        let base = dir.join("landscape.mp4");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=640x360:r=30:d=2,drawbox=x=0:y=0:w=640:h=60:color=red:t=fill",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            base.to_str().unwrap(),
+        ]);
+        turned(dir, &base, rotation, "portrait.mp4")
+    }
+
+    /// A phone clip is a landscape sensor frame plus a rotation. Every ffmpeg
+    /// decode turns it upright, so the probe must report the *displayed* size or
+    /// the project frame, the fit and the crop maths all describe a picture that
+    /// is not the one being rendered.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored rotated_phone_clip`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn rotated_phone_clip_probes_display_dims_and_exports_upright() {
+        let dir = Scratch::new("rotated");
+        let Some(media) = rotated_clip(&dir, -90) else {
+            skip("skipped: this ffmpeg cannot write a display matrix");
+            return;
+        };
+        let (rw, rh, ref_rgb) = rgb_frame(&media, None);
+        assert_eq!((rw, rh), (360, 640), "the reference decode is upright");
+        let want_edge = red_bar_edge(rw, rh, &ref_rgb);
+        assert_ne!(want_edge, "top", "the rotation moved the bar off the top");
+
+        let asset = probed_asset(&media);
+        let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        assert_eq!(
+            (video.width, video.height),
+            (Some(360), Some(640)),
+            "probe reports display dims"
+        );
+        assert_ne!(video.rotation, 0);
+
+        let timeline = single(vec![make_clip(asset.id, 0.0, 2.0, 0.0)]);
+        assert_eq!(delivery_frame(&timeline, std::slice::from_ref(&asset)), (360, 640));
+
+        let out = dir.join("export.mp4");
+        render_with(&timeline, std::slice::from_ref(&asset), &out, &mp4_export_opts()).expect("export");
+        let (w, h, rgb) = rgb_frame(&out, None);
+        assert_eq!((w, h), (360, 640), "the file is portrait, not a letterboxed landscape");
+        assert_eq!(red_bar_edge(w, h, &rgb), want_edge, "and upright");
+
+        let jpeg = timeline_frame(
+            &timeline,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            0.5,
+            360,
+            3,
+        )
+        .expect("composited still");
+        let still = dir.join("still.jpg");
+        std::fs::write(&still, jpeg).unwrap();
+        let (w, h, rgb) = rgb_frame(&still, None);
+        assert_eq!((w, h), (360, 640));
+        assert_eq!(red_bar_edge(w, h, &rgb), want_edge);
+
+        let jpeg = frame_jpeg(&media, 0.5, 360, 3, true).expect("frame");
+        std::fs::write(&still, jpeg).unwrap();
+        let (w, h, rgb) = rgb_frame(&still, None);
+        assert_eq!((w, h), (360, 640));
+        assert_eq!(red_bar_edge(w, h, &rgb), want_edge);
+    }
+
+    /// The proxy is what the preview actually decodes; it must come out upright
+    /// and carry no matrix of its own that would turn it a second time.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored rotated_proxy`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn rotated_proxy_is_upright_and_carries_no_matrix() {
+        let dir = Scratch::new("rotated-proxy");
+        let Some(media) = rotated_clip(&dir, -90) else {
+            skip("skipped: this ffmpeg cannot write a display matrix");
+            return;
+        };
+        let (rw, rh, ref_rgb) = rgb_frame(&media, None);
+        let proxy = generate_proxy(&media, PROXY_MAX_WIDTH).expect("proxy");
+        let dump = command(&ffprobe_bin())
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&proxy)
+            .output()
+            .expect("run ffprobe");
+        let dump = String::from_utf8_lossy(&dump.stdout).into_owned();
+        let (w, h, rgb) = rgb_frame(&proxy, None);
+        let _ = std::fs::remove_file(&proxy);
+        assert!(!dump.contains("Display Matrix") && !dump.contains("\"rotate\""), "{dump}");
+        assert_eq!((w, h), (rw, rh));
+        assert_eq!(red_bar_edge(w, h, &rgb), red_bar_edge(rw, rh, &ref_rgb));
+    }
+
+    /// 10-bit HLG BT.2020 footage, made by re-encoding a tagged SDR test card, so
+    /// the SDR original is the answer key. (The tags matter: an untagged source
+    /// has no colourspace for `zscale` to start from on older FFmpegs.) `None`
+    /// without libx265 / zscale.
+    fn hlg_clip(dir: &Scratch) -> Option<(PathBuf, PathBuf)> {
+        let sdr = dir.join("sdr.mp4");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            sdr.to_str().unwrap(),
+        ]);
+        let hlg = dir.join("hlg.mp4");
+        let convert = |input: &[&str]| {
+            let mut args: Vec<&str> = input.to_vec();
+            args.extend([
+                "-vf",
+                "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv,format=yuv420p10le",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "arib-std-b67",
+                "-colorspace",
+                "bt2020nc",
+                hlg.to_str().unwrap(),
+            ]);
+            try_ffmpeg(&args)
+        };
+        // FFmpeg 9 wants the card's colourspace stated in the graph, FFmpeg 4
+        // wants it on a file: one of the two starts `zscale` from a known place.
+        let ok = convert(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2,format=yuv420p,\
+             setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
+        ]) || convert(&["-i", sdr.to_str().unwrap()]);
+        ok.then_some((sdr, hlg))
+    }
+
+    /// Mean absolute difference and mean colourfulness (`max-min` over RGB) of two
+    /// same-sized frames.
+    fn compare_frames(a: &[u8], b: &[u8]) -> (f64, f64, f64) {
+        let mad = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / a.len() as f64;
+        let colourful = |f: &[u8]| {
+            f.as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| (p.iter().max().unwrap() - p.iter().min().unwrap()) as f64)
+                .sum::<f64>()
+                / (f.len() / 3) as f64
+        };
+        (mad, colourful(a), colourful(b))
+    }
+
+    /// An iPhone's HLG BT.2020 footage squeezed into BT.709 untouched is washed
+    /// out and mis-tagged. Exported next to its SDR original it must come back
+    /// as the same picture, in an SDR file.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored hlg_footage`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn hlg_footage_exports_as_sdr_with_matching_colour() {
+        let dir = Scratch::new("hlg");
+        let Some((sdr, hlg)) = hlg_clip(&dir) else {
+            skip("skipped: this ffmpeg cannot make the HLG test clip");
+            return;
+        };
+        let hlg_asset = probed_asset(&hlg);
+        assert_eq!(hlg_asset.hdr(), Some(Hdr::Hlg), "probe reads the transfer");
+        assert_eq!(probed_asset(&sdr).hdr(), None);
+
+        let export = |asset: &Asset, name: &str, opts: &ExportOptions| {
+            let timeline = single(vec![make_clip(asset.id, 0.0, 2.0, 0.0)]);
+            let out = dir.join(name);
+            render_with(&timeline, std::slice::from_ref(asset), &out, opts).expect("export");
+            out
+        };
+        let reference = export(&probed_asset(&sdr), "ref.mp4", &mp4_export_opts());
+        let (rw, rh, ref_rgb) = rgb_frame(&reference, None);
+        // Both the plain export and the GUI default (hardware decode if any).
+        for (name, opts) in [
+            ("plain.mp4", mp4_export_opts()),
+            (
+                "hw.mp4",
+                ExportOptions {
+                    hwaccel: Some("auto".into()),
+                    ..mp4_export_opts()
+                },
+            ),
+        ] {
+            let out = export(&hlg_asset, name, &opts);
+            let (w, h, rgb) = rgb_frame(&out, None);
+            assert_eq!((w, h), (rw, rh));
+            let (mad, colour, ref_colour) = compare_frames(&rgb, &ref_rgb);
+            let trc = ffprobe_field(&out, "v:0", "stream=color_transfer");
+            assert!(
+                !matches!(trc.as_str(), "arib-std-b67" | "smpte2084"),
+                "{name} is still tagged {trc}"
+            );
+            assert!(
+                (0.8..1.25).contains(&(colour / ref_colour)),
+                "{name}: colourfulness {colour:.1} vs the SDR original's {ref_colour:.1}"
+            );
+            assert!(
+                mad < 25.0,
+                "{name}: differs from the SDR original by {mad:.1} levels on average"
+            );
+        }
+
+        // A phone clip is both at once. The side data in the file must not hide
+        // the colour tags from the probe, the proxy has to be converted *and*
+        // upright, and the export portrait and SDR.
+        if let Some(rotated) = turned(&dir, &hlg, -90, "hlg-portrait.mp4") {
+            assert_eq!(source_hdr(&rotated), Some(Hdr::Hlg));
+            let asset = probed_asset(&rotated);
+            assert_eq!(
+                (asset.hdr(), asset.streams[0].width, asset.streams[0].height),
+                (Some(Hdr::Hlg), Some(360), Some(640))
+            );
+            let proxy = generate_proxy(&rotated, PROXY_MAX_WIDTH).expect("proxy");
+            let tags = ffprobe_field(&proxy, "v:0", "stream=width,height,pix_fmt,color_transfer");
+            let _ = std::fs::remove_file(&proxy);
+            assert_eq!(tags, "360,640,yuv420p,bt709", "the proxy is upright SDR");
+            let out = export(&asset, "portrait.mp4", &mp4_export_opts());
+            assert_eq!(ffprobe_field(&out, "v:0", "stream=width,height"), "360,640");
+            let (_, _, rgb) = rgb_frame(&out, None);
+            let (_, colour, ref_colour) = compare_frames(&rgb, &ref_rgb);
+            assert!(
+                (0.8..1.25).contains(&(colour / ref_colour)),
+                "colourfulness {colour:.1} vs the SDR original's {ref_colour:.1}"
+            );
+        }
+
+        // The single-frame decodes tone-map too: a scrubbed frame and a contact
+        // sheet cell look like the SDR original, not like a washed-out copy.
+        let jpeg_rgb = |name: &str, bytes: Vec<u8>| {
+            let file = dir.join(name);
+            std::fs::write(&file, bytes).unwrap();
+            rgb_frame(&file, Some("scale=640:360"))
+        };
+        let (.., sdr_frame) = jpeg_rgb("sdr-frame.jpg", frame_jpeg(&sdr, 0.5, 640, 2, true).unwrap());
+        let (.., hlg_frame) = jpeg_rgb("hlg-frame.jpg", frame_jpeg(&hlg, 0.5, 640, 2, true).unwrap());
+        let (.., hlg_sheet) = jpeg_rgb("hlg-sheet.jpg", contact_sheet(&hlg, 0.5, 1.5, 1, 1, 640, 2).unwrap().0);
+        for (what, rgb) in [("frame", &hlg_frame), ("contact sheet", &hlg_sheet)] {
+            let (mad, colour, ref_colour) = compare_frames(rgb, &sdr_frame);
+            assert!(
+                (0.8..1.25).contains(&(colour / ref_colour)),
+                "{what}: colourfulness {colour:.1} vs {ref_colour:.1}"
+            );
+            // Looser than the export: the sheet cell is a neighbouring frame of a
+            // moving test card, bilinear-scaled. A washed-out copy is ~70 off.
+            assert!(mad < 35.0, "{what}: differs from the SDR original by {mad:.1}");
+        }
+    }
+
+    /// A Canon R5 II records 10-bit 4:2:2 HEVC with 24-bit PCM audio in an MP4.
+    /// Hardware decoders often cannot do 4:2:2, so the GUI's `auto` hwaccel has
+    /// to fall back rather than fail, and the PCM must survive every audio path.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored mirrorless_422`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn mirrorless_422_10bit_hevc_with_24bit_pcm_exports_with_audio() {
+        let dir = Scratch::new("r5");
+        // PCM in an MP4 is what the camera writes; older FFmpegs refuse it there
+        // and take it in a MOV, which is the same audio for every reader below.
+        let make = |name: &str| {
+            let media = dir.join(name);
+            try_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=25:duration=3,format=yuv422p10le",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=3",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error",
+                "-pix_fmt",
+                "yuv422p10le",
+                "-c:a",
+                "pcm_s24le",
+                "-ac",
+                "2",
+                media.to_str().unwrap(),
+            ])
+            .then_some(media)
+        };
+        let Some(media) = make("r5.mp4").or_else(|| make("r5.mov")) else {
+            skip("skipped: this ffmpeg cannot make the 4:2:2 test clip");
+            return;
+        };
+        let asset = probed_asset(&media);
+        assert!(asset
+            .streams
+            .iter()
+            // FFmpeg 6 reads the MP4 `ipcm` box back as 32-bit; any PCM is the point.
+            .any(|s| s.kind == StreamKind::Audio && s.codec.starts_with("pcm_s")));
+
+        let timeline = single(vec![make_clip(asset.id, 0.0, 3.0, 0.0)]);
+        // `vaapi` is a hardware decode that is requested by name: where it cannot
+        // do 4:2:2 (or is not there at all) the export has to retry in software
+        // rather than fail.
+        for (name, hw) in [
+            ("plain.mp4", None),
+            ("hw.mp4", Some("auto".to_string())),
+            ("named.mp4", Some("vaapi".to_string())),
+        ] {
+            let out = dir.join(name);
+            let opts = ExportOptions {
+                hwaccel: hw,
+                ..mp4_export_opts()
+            };
+            render_with(&timeline, std::slice::from_ref(&asset), &out, &opts).expect("export");
+            assert_eq!(
+                ffprobe_field(&out, "a:0", "stream=codec_type"),
+                "audio",
+                "{name} lost its audio"
+            );
+            let probe = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-i"])
+                .arg(&out)
+                .args(["-af", "volumedetect", "-vn", "-f", "null", "-"])
+                .output()
+                .expect("run ffmpeg");
+            let log = String::from_utf8_lossy(&probe.stderr);
+            let mean: f64 = log
+                .lines()
+                .find_map(|l| l.split("mean_volume:").nth(1))
+                .and_then(|v| v.trim().trim_end_matches(" dB").parse().ok())
+                .unwrap_or(-91.0);
+            assert!(mean > -40.0, "{name}: exported audio is silent ({mean} dB)\n{log}");
+            let (w, h, _) = rgb_frame(&out, None);
+            assert_eq!((w, h), (640, 360));
+        }
+
+        // The other audio readers: preview PCM, waveform, loudness analysis.
+        let pcm = audio_pcm(&media, 0.5, 0.5, 8_000, None).expect("preview audio");
+        // FFmpeg 6 seeks PCM-in-MP4 to the nearest packet, so allow a short read.
+        assert!(
+            (5_000..=8_000).contains(&pcm.len()),
+            "about half a second of mono s16le: {}",
+            pcm.len()
+        );
+        assert!(pcm.as_chunks::<2>().0.iter().any(|b| i16::from_le_bytes(*b).abs() > 1000));
+        let wave = waveform(&media, 50, 8_000).expect("waveform");
+        assert!(wave.iter().copied().fold(0.0, f32::max) > 0.1);
+        let loud = super::super::audio::measure_loudness(&media).expect("loudness");
+        assert!(loud.integrated_lufs > -40.0, "{loud:?}");
+
+        // Preview frames decode (with hardware decode attempted first).
+        assert!(!frame_jpeg(&media, 1.0, 320, 4, true).expect("frame").is_empty());
+        assert!(!frame_at(&media, 1.0, 320).expect("png frame").is_empty());
+    }
+
+    /// Cut 3.5s..8.5s out of a variable-frame-rate phone clip (every seventh
+    /// frame missing) and butt a constant-rate clip against it. A white flash and
+    /// a beep land together at every whole second of the source, so after the cut
+    /// they must still land together, on the right half-seconds.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored vfr_cut`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn vfr_cut_keeps_duration_and_av_sync() {
+        let dir = Scratch::new("vfr");
+        let vfr = dir.join("vfr.mp4");
+        let video = "color=c=black:s=640x360:r=30:d=12,\
+                     drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='lt(mod(t,1),0.1)',\
+                     select='mod(n,7)'";
+        let beeps = "aevalsrc='sin(2*PI*1000*t)*lt(mod(t,1),0.1)':s=48000:d=12";
+        let made = ["-fps_mode", "-vsync"].iter().any(|flag| {
+            try_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                video,
+                "-f",
+                "lavfi",
+                "-i",
+                beeps,
+                flag,
+                "vfr",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                vfr.to_str().unwrap(),
+            ])
+        });
+        assert!(made, "could not make the VFR clip");
+        let tail = dir.join("tail.mp4");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=640x360:r=25:d=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=220:sample_rate=48000:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            tail.to_str().unwrap(),
+        ]);
+
+        let (a, b) = (probed_asset(&vfr), probed_asset(&tail));
+        let timeline = single(vec![make_clip(a.id, 3.5, 8.5, 0.0), make_clip(b.id, 0.0, 3.0, 5.0)]);
+        let out = dir.join("cut.mp4");
+        render_with(&timeline, &[a, b], &out, &mp4_export_opts()).expect("export");
+
+        let total: f64 = {
+            let o = command(&ffprobe_bin())
+                .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+                .arg(&out)
+                .output()
+                .expect("run ffprobe");
+            String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
+        };
+        assert!((total - 8.0).abs() < 0.15, "expected an 8s file, got {total}");
+
+        // Flash times: per-frame mean luma of the picture sampled at 100 Hz.
+        let luma = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-an", "-vf", "fps=100,scale=1:1,format=gray", "-f", "rawvideo", "pipe:1"])
+            .output()
+            .expect("run ffmpeg")
+            .stdout;
+        // Beep times: RMS of the mono audio in 10 ms windows.
+        let pcm = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+            .output()
+            .expect("run ffmpeg")
+            .stdout;
+        let onsets = |active: Vec<bool>| -> Vec<f64> {
+            let mut times = Vec::new();
+            let mut prev = false;
+            for (i, on) in active.into_iter().enumerate() {
+                if on && !prev {
+                    times.push(i as f64 / 100.0);
+                }
+                prev = on;
+            }
+            times
+        };
+        let flashes = onsets(luma.iter().map(|l| *l > 128).collect());
+        let samples: Vec<f64> = pcm.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f64).collect();
+        let beeps = onsets(
+            samples
+                .chunks(80)
+                .map(|w| (w.iter().map(|s| s * s).sum::<f64>() / w.len() as f64).sqrt() > 12000.0)
+                .collect(),
+        );
+        // Source seconds 4..8 land at output 0.5, 1.5, 2.5, 3.5 — the clip's own
+        // 3.5 s head start is gone, the 1-second beat is not.
+        let want = [0.5, 1.5, 2.5, 3.5, 4.5];
+        let near = |times: &[f64]| want.iter().filter(|w| times.iter().any(|t| (*t - **w).abs() < 0.08)).count();
+        assert!(near(&flashes) >= 4, "flashes at {flashes:?}, wanted {want:?}");
+        assert!(near(&beeps) >= 4, "beeps at {beeps:?}, wanted {want:?}");
+        for f in flashes.iter().filter(|f| **f < 4.9) {
+            let nearest = beeps.iter().map(|b| (b - f).abs()).fold(f64::MAX, f64::min);
+            assert!(nearest < 0.08, "flash at {f} has no beep within 80ms (beeps {beeps:?})");
+        }
     }
 }

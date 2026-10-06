@@ -49,6 +49,22 @@
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--text-muted);border-top-color:transparent;border-radius:50%"></span>
 			Loading project…
 		</span>
+	{:else if editor.exportRun}
+		<!-- A render keeps going after its dialog is closed; this is where it stays
+		     visible and stoppable. -->
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--kerf-300)">
+			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			Exporting {Math.round((editor.exportRun.progress?.fraction ?? 0) * 100)}%
+		</span>
+		<button
+			type="button"
+			disabled={editor.exportRun.cancelling}
+			title="Stop the export and delete the partial file"
+			onclick={() => void editor.stopExport()}
+			style="background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+		>
+			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
+		</button>
 	{:else if ui.analyzing}
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is

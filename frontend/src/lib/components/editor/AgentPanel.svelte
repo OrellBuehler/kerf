@@ -5,7 +5,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
-	import { agentStatus } from '$lib/api';
+	import { agentStatus, confirmAction } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
@@ -127,7 +127,13 @@
 
 	async function applyProposal() {
 		if (!staged) return;
-		if (staged.stale && !confirm('You have edited the timeline since these changes were staged. Applying replaces your newer cut. Continue?'))
+		if (
+			staged.stale &&
+			!(await confirmAction(
+				'You have edited the timeline since these changes were staged. Applying replaces your newer cut. Continue?',
+				'Apply stale changes'
+			))
+		)
 			return;
 		applying = true;
 		try {
@@ -216,8 +222,9 @@
 			toast.error('Import media first');
 			return;
 		}
+		let task: Task | null = null;
 		try {
-			const task = await agent.add(p);
+			task = await agent.add(p);
 			// Some presets map to a local op we can run now; the rest wait for the agent.
 			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
 				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
@@ -266,6 +273,11 @@
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
+			// `add` made the row before the precondition ran; a local preset that
+			// failed must not leave it in the queue looking real (a connected
+			// agent could claim it and redo the work).
+			const id = task?.id;
+			if (id && agent.tasks.find((t) => t.id === id)?.status !== 'done') await agent.remove(id).catch(() => {});
 		}
 	}
 

@@ -765,7 +765,13 @@ impl Project {
     fn preview_assets(&self) -> Result<Vec<Asset>> {
         let mut assets = self.list_assets()?;
         for asset in &mut assets {
-            asset.path = Self::preview_source(asset).to_string_lossy().into_owned();
+            let source = Self::preview_source(asset);
+            if source != Path::new(&asset.path) {
+                // The proxy was tone-mapped when it was encoded, so the graph
+                // must not convert it again.
+                *asset = asset.as_sdr_proxy();
+                asset.path = source.to_string_lossy().into_owned();
+            }
         }
         Ok(assets)
     }
@@ -2525,6 +2531,9 @@ impl Project {
                     channels: None,
                     image: false,
                     projection: None,
+                    rotation: 0,
+                    color_transfer: None,
+                    color_primaries: None,
                 },
                 StreamInfo {
                     index: 1,
@@ -2537,6 +2546,9 @@ impl Project {
                     channels: Some(2),
                     image: false,
                     projection: None,
+                    rotation: 0,
+                    color_transfer: None,
+                    color_primaries: None,
                 },
             ],
             imported_at: Utc::now(),
@@ -2559,6 +2571,9 @@ impl Project {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -3462,6 +3477,9 @@ mod tests {
             channels: None,
             image,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         }
     }
 
@@ -3477,6 +3495,9 @@ mod tests {
             channels: Some(2),
             image: false,
             projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
         }
     }
 
@@ -3752,6 +3773,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4007,6 +4031,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4047,6 +4074,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4094,6 +4124,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4196,6 +4229,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4253,6 +4289,9 @@ mod tests {
                 channels: None,
                 image: false,
                 projection: None,
+                rotation: 0,
+                color_transfer: None,
+                color_primaries: None,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -4890,5 +4929,132 @@ mod tests {
         let project = Project::open_in_memory().unwrap();
         let err = project.generate_captions(CaptionOptions::default()).unwrap_err();
         assert!(err.to_string().contains("run analysis first"), "{err}");
+    }
+
+    /// A phone's HLG footage reaches the preview two ways — straight from the
+    /// original (tone-mapped in the graph) until its proxy lands, then from the
+    /// proxy (tone-mapped when it was encoded). Both must convert exactly once,
+    /// so the same moment looks the same either side of the swap.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored hdr_asset_previews`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    #[allow(clippy::print_stderr)]
+    fn hdr_asset_previews_through_a_tonemapped_proxy_exactly_once() {
+        use crate::engine::test_support::StatusBounded;
+        let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+        let ffprobe = std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string());
+        let dir = std::env::temp_dir().join(format!("kerf-hdr-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("hlg.mp4");
+        let sdr = dir.join("sdr.mp4");
+        let tagged = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=640x360:rate=30:duration=2,format=yuv420p")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .args([
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-color_range",
+                "tv",
+            ])
+            .arg(&sdr)
+            .status_bounded();
+        assert!(tagged.unwrap().success());
+        // FFmpeg 9 wants the card's colourspace stated in the graph, FFmpeg 4
+        // wants it on a file: one of the two starts `zscale` from a known place.
+        let convert = |input: &[&str]| {
+            std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(input)
+                .args([
+                    "-vf",
+                    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv,format=yuv420p10le",
+                ])
+                .args(["-c:v", "libx265", "-x265-params", "log-level=error"])
+                .args([
+                    "-color_primaries",
+                    "bt2020",
+                    "-color_trc",
+                    "arib-std-b67",
+                    "-colorspace",
+                    "bt2020nc",
+                ])
+                .arg(&media)
+                .status_bounded()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let card = "testsrc2=size=640x360:rate=30:duration=2,format=yuv420p,\
+                    setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
+        let made = convert(&["-f", "lavfi", "-i", card]) || convert(&["-i", sdr.to_str().unwrap()]);
+        if !made {
+            eprintln!("skipped: this ffmpeg cannot make the HLG test clip");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let rgb = |jpeg: &[u8]| -> Vec<u8> {
+            let file = dir.join("frame.jpg");
+            std::fs::write(&file, jpeg).unwrap();
+            let out = std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-i"])
+                .arg(&file)
+                .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+                .output()
+                .unwrap();
+            out.stdout
+        };
+
+        let project = Project::open_in_memory().unwrap();
+        let asset = project.import_asset(&media).unwrap();
+        assert_eq!(asset.hdr(), Some(crate::model::Hdr::Hlg));
+        project.add_clip_to_timeline(asset.id, None, 0.0, 2.0, Some(0.0)).unwrap();
+        let (timeline, originals) = (project.timeline().unwrap(), project.list_assets().unwrap());
+        let before = project.preview_assets().unwrap();
+        assert_eq!(before[0].path, asset.path, "no proxy yet, so the original is decoded");
+        assert!(before[0].hdr().is_some(), "and the graph tone-maps it");
+
+        let from_original = rgb(&Project::composite_timeline_frame(&timeline, &originals, 1.0, 640, 2).unwrap());
+
+        let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
+        let tags = std::process::Command::new(&ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_transfer,pix_fmt",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&proxy)
+            .output()
+            .unwrap();
+        let tags = String::from_utf8_lossy(&tags.stdout).trim().to_string();
+        let after = project.preview_assets().unwrap();
+        let (timeline, _) = project.timeline_frame_inputs().unwrap();
+        let from_proxy = rgb(&Project::composite_timeline_frame(&timeline, &after, 1.0, 640, 2).unwrap());
+        let _ = std::fs::remove_file(&proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(tags, "yuv420p,bt709", "the proxy is SDR");
+        assert_eq!(after[0].path, proxy.to_string_lossy());
+        assert!(after[0].hdr().is_none(), "so the graph leaves it alone");
+        assert_eq!(from_original.len(), from_proxy.len());
+        let mad = from_original
+            .iter()
+            .zip(&from_proxy)
+            .map(|(a, b)| (*a as f64 - *b as f64).abs())
+            .sum::<f64>()
+            / from_original.len() as f64;
+        assert!(
+            mad < 8.0,
+            "proxy and original previews differ by {mad:.1} levels: converted twice or not at all"
+        );
     }
 }

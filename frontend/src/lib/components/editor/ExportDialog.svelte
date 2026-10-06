@@ -1,12 +1,13 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, cancelExport, onExportProgress, hwEncoders, platformCheck, revealPath } from '$lib/api';
+	import { inTauri, pickExportPath, hwEncoders, platformCheck, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { DELIVERY_PRESETS, ratioLabel, variantPath } from '$lib/delivery-formats';
-	import type { Container, Delivery, DeliveryCheck, ExportOptions, ExportProgress, Fit, RateControl } from '$lib/types';
+	import type { Container, Delivery, DeliveryCheck, ExportOptions, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
 		CONTAINERS,
@@ -54,9 +55,11 @@
 	let outputPath = $state('');
 	let activePreset = $state(initial.id);
 	let customRes = $state(false);
-	let rendering = $state(false);
-	let progress = $state<ExportProgress | null>(null);
-	let cancelling = $state(false);
+	// The render outlives this dialog (see `editor.exportRun`), so reopening it
+	// mid-render shows the progress and a Stop rather than a dead Export button.
+	const rendering = $derived(editor.exportRun !== null);
+	const progress = $derived(editor.exportRun?.progress ?? null);
+	const cancelling = $derived(editor.exportRun?.cancelling ?? false);
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
 	let useRange = $state(false);
@@ -161,13 +164,6 @@
 		return r >= 60 ? `${Math.floor(r / 60)}m ${String(r % 60).padStart(2, '0')}s` : `${r}s`;
 	}
 
-	// Focus the dialog on open so its Escape handler (and the focus trap) actually
-	// receive keys — otherwise focus stays on whatever triggered Export.
-	let dialogEl = $state<HTMLDivElement | null>(null);
-	$effect(() => {
-		dialogEl?.focus();
-	});
-
 	const assets = $derived(editor.assets);
 	const hasVideo = $derived(editor.timeline.tracks.some((t) => t.kind === 'video' && t.clips.length > 0));
 	const hasAudio = $derived(
@@ -269,12 +265,6 @@
 			await browse();
 			if (!outputPath) return;
 		}
-		rendering = true;
-		cancelling = false;
-		progress = null;
-		const unlisten = await onExportProgress((p) => {
-			progress = p;
-		});
 		try {
 			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;
 			if (variantFormats.length) {
@@ -297,17 +287,9 @@
 			// A user-requested stop is not a failure — keep the dialog open quietly.
 			if (m === 'export cancelled') toast.info('Export cancelled');
 			else toast.error(m);
-		} finally {
-			unlisten();
-			rendering = false;
-			cancelling = false;
-			progress = null;
 		}
 	}
-	async function stop() {
-		cancelling = true;
-		await cancelExport();
-	}
+	const stop = () => editor.stopExport();
 </script>
 
 {#snippet secHead(label: string)}
@@ -375,7 +357,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	bind:this={dialogEl}
+	use:trapFocus
 	role="dialog"
 	aria-modal="true"
 	aria-label="Export video"

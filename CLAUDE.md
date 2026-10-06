@@ -132,6 +132,11 @@ so the feature is **only** activated through these forwards — which is what ma
   shapes, each axis scaled so the edge is at distance 1, `max` for a rectangle
   and `hypot` for an ellipse. `geq` is per-pixel and slow, the cost keyframed
   opacity already pays.
+  **Video fades are timed on the timeline**: `video_clip_chain`'s `setpts` has
+  already moved the frames to `timeline_start`, so every `fade` (in / out, dip,
+  dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
+  later clip with a fade-out and dropped its fade-in and transitions. Audio is
+  re-based to the clip before `adelay`, so its `afade`s stay clip-local.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
@@ -216,12 +221,61 @@ so the feature is **only** activated through these forwards — which is what ma
   solo-shadowed track is as absent from playback as from the file. Only the ends
   differ: proxy paths in (the caller passes
   `timeline_frame_inputs`' proxy-swapped assets), `-c:v mjpeg -f image2pipe pipe:1`
-  out. Frames are **paced to the requested fps against the wall clock**, which
+  out. **Nothing waits on ffmpeg forever**: the stream reads stdout on a side
+  thread and gives up (killing the child, so the hwaccel retry falls back to
+  software) after 30 s with no first frame or 15 s between frames; an export
+  polls cancel every 250 ms rather than per progress line and is killed after
+  300 s with no `-progress` at all; each `hw_encoders` probe is capped at 20 s;
+  and a spilled graph file is unique per call, since two renders sharing a tag
+  used to delete each other's script. Frames are **paced to the requested fps against the wall clock**, which
   throttles ffmpeg through pipe backpressure instead of letting it race ahead and
   buffer the whole timeline, and each carries its timeline time so the webview can
   drop one the audio clock has already passed.
+  **Phone and camera footage** needs two things the container says rather than
+  the pixels. *Rotation*: an iPhone portrait clip is a landscape frame plus a
+  `Display Matrix`, and every FFmpeg decode autorotates it (nothing here passes
+  `-noautorotate`; a proxy is written upright with no matrix of its own). The probe
+  (`display_rotation`, the `Display Matrix` side data, or the clockwise `rotate`
+  tag on an FFmpeg old enough to lack it) therefore reports the **displayed**
+  size in `StreamInfo.width/height` — what `export_format`, fit/crop, smart crop
+  and the bin's spec line all do their geometry against — and keeps the angle in
+  `StreamInfo.rotation`. `fps` goes through `nominal_fps`: `r_frame_rate` on a
+  jittery variable-frame-rate clip can be a multiple of the real rate (a ~30 fps
+  clip probing as 120), so past 1.5x the average the average, snapped to a
+  standard rate, is used instead. *HDR*: `StreamInfo.color_transfer` /
+  `color_primaries` are recorded at probe and `StreamInfo::hdr()` names HLG
+  (`arib-std-b67`; a Dolby Vision profile 8.4 iPhone file's base layer is HLG) or
+  PQ (`smpte2084`). Squeezing those into `yuv420p` untouched is washed-out,
+  mis-tagged picture, so every decode tone-maps to 8-bit SDR BT.709 **exactly
+  once** (`tonemap_chain`, pure + unit-tested): `zscale` to light-linear float,
+  BT.709 primaries, `tonemap=mobius` (linear to 70%, then a shoulder, so midtones
+  are not re-graded), `zscale` back to BT.709 with error diffusion — or, when
+  `zscale_available()` (probed once per process, like `graph_script_flag`) finds
+  no libzimg, a `colorspace` primaries/matrix move, near-right for HLG. The
+  *graph* paths get it from `ClipFx.hdr` (set in `transition_fx` from the asset),
+  placed in `video_clip_chain` after the fit scale and `fps` — so the float stage
+  runs on delivery-sized, kept frames — and before any colour work; the composited
+  still prefixes it per clip. The *single-input* decodes (`decode_frame`,
+  `contact_sheet`, `generate_proxy`) have only a path, so they ask `source_hdr`
+  (one cached ffprobe per file) and append the chain after their own downscale.
+  Salience and scene detection are analysis, not picture, and read the raw
+  frames. **The proxy is where preview footage is converted**: `generate_proxy`
+  tone-maps while it downsizes, `Project::preview_assets` hands the graph the
+  proxy-swapped asset as `Asset::as_sdr_proxy` (same geometry, no HDR tags), and
+  a file's proxy key gains `|sdr` when it is HDR, so a proxy cached before this
+  existed (an untouched HDR picture) is rebuilt rather than trusted. Until the
+  proxy lands the preview tone-maps the original in the graph, which is the same
+  conversion; export always reads the original. Both go through plain software
+  filters after the decode, so `-hwaccel` (frames come back to system memory, and
+  a 4:2:2 or otherwise unsupported stream falls back to software inside
+  `auto`, or via the one-shot retry for a named accelerator) is unaffected.
+  SDR sources produce byte-identical argv and graphs. The input's transfer,
+  primaries and matrix are stated to `zscale` rather than read from the frame, so
+  a stripped-tag phone file does not abort the graph with "no path between
+  colorspaces". Assets saved before these fields existed deserialize as SDR with
+  the coded size; re-importing the file re-probes it.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
-  `probe` and, behind the extra `libav-render` feature, an **experimental** in-process
+  `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
   the ffmpeg-next 8.1 API). The default export path is the CLI one even in full builds.
 
@@ -719,7 +773,15 @@ many seconds ago an agent last spoke to it, or `null` if none ever has —
 `initialize` is the one moment an agent is known to be there; a
 streamable-HTTP client holds no connection between calls, so there is no socket
 to report and the panel judges from the age instead of the green dot it used to
-show unconditionally). **No command runs on the main thread** (a plain sync
+show unconditionally). A **failed render deletes what it wrote** (`discard_partial`, in both
+`export_timeline` and the MCP `export`): only if this run touched the file
+(mtime differs from before), so a failure before ffmpeg opened the output cannot
+delete the earlier export sitting at that path. `export_variants` renders its
+files one `render_variants` call at a time so a failure names the file in flight —
+that one is removed, the finished ones stay. The error carries ffmpeg's stderr
+tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
+ffmpeg error when a stream someone is still watching dies, so the preview can say
+why it went black. **No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
@@ -744,7 +806,9 @@ import rfd (via `tauri-plugin-dialog`) contributes — before a single test ran.
 Whether the linker pulls that object in at all shifts with unrelated dependency
 bumps, which is how an rmcp upgrade broke `cargo test -p kerf-app` on Windows.
 `capabilities/default.json` grants `core:default` + `dialog:default` +
-`updater:default` + `process:allow-restart` + `opener:allow-open-url`. That last
+`updater:default` + `process:allow-restart` + `core:window:allow-destroy` (the
+unsaved-project close guard holds the window open, then destroys it once the user
+confirms) + `opener:allow-open-url`. That last
 one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
@@ -802,6 +866,15 @@ edit cannot change — a release cut as a genuine prerelease is skipped by both 
 never becomes `releases/latest`. A release that fails outright just stays the
 prerelease it was parked as, which is the safe state; `api.ts` still rewrites the
 plugin's error into an explanation (`describeFeedFailure`) as a backstop.
+**PR builds** (`pr-build.yml`) bundle every non-draft, non-Dependabot PR for
+Windows x64 / macOS arm64 / Linux x64 like the release does (bundled FFmpeg,
+`--features whisper`) but unsigned, with no updater artifacts and the cargo
+cache on, and upload them as 14-day artifacts. `pr-build-comment.yml` keeps one
+comment on the PR linking them: it runs on `workflow_run` because a fork's run
+only holds a read-only token, so it never checks out PR code, and it accepts the
+`pr-number` artifact only when that PR's head is the commit the run built.
+`workflow_run` fires only for workflows on the default branch, so a PR that adds
+or changes the commenter is not commented on by its own version.
 In-place update is per-platform: macOS and Windows
 (NSIS, `installMode: passive`) always; on Linux **only the AppImage** — a
 `.deb`/`.rpm` install fails the install step, which the dialog reports with a
@@ -1048,6 +1121,26 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
+`trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
+close), and `+page.svelte` makes the app behind them `inert` and returns early from
+its global key handler while any is open — Space / Delete / J-K-L / ⌘Z would
+otherwise edit the live project under a dialog; a file drop is ignored then too.
+Bare-key shortcuts already stand down inside any text input / textarea / select /
+contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
+SQLite file and every edit is committed as it happens, so only a never-saved,
+non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
+close request (`onWindowCloseRequested`) and the updater's *Restart now* all
+confirm first through `confirmAction` (the dialog plugin's `ask`; the plugin
+replaces `window.confirm` with an async one, so it cannot be used as a guard). A
+render is `editor.exportRun` (progress + cancelling), not dialog state: closing
+the export dialog mid-render leaves it running, the status bar shows it with a
+**Stop**, and reopening the dialog shows the same bar. The `invoke` wrapper
+rejects any argument holding NaN / Infinity (an emptied `<input type=number>`),
+which JSON would turn into `null` and the backend into an opaque deserialize
+error; the Inspector's number fields also snap back to the clip's value when
+the entry is empty, negative or clamped, and keep a title's End after its Start.
 
 Every toast is also a **notification log** entry (`src/lib/notifications.svelte.ts`,
 a fourth runes singleton). Components import `toast` from *there* rather than from

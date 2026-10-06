@@ -23,6 +23,43 @@ pub struct ProbeResult {
 
 mod cli;
 
+/// Test-only: run the ffmpeg commands that synthesize media under a deadline, so
+/// a wedged binary fails the test with its command line instead of holding the
+/// suite until the CI job's own timeout cancels it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Generous: synthesizing a few seconds of test video takes well under a
+    /// second, so anything near this is a hang, not a slow machine.
+    const LIMIT: Duration = Duration::from_secs(180);
+
+    pub(crate) trait StatusBounded {
+        /// Like [`Command::status`], with stdin closed, and a panic naming the
+        /// command if it has not finished within [`LIMIT`].
+        fn status_bounded(&mut self) -> std::io::Result<ExitStatus>;
+    }
+
+    impl StatusBounded for Command {
+        fn status_bounded(&mut self) -> std::io::Result<ExitStatus> {
+            let mut child = self.stdin(Stdio::null()).spawn()?;
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("`{self:?}` still running after {}s; killed it", LIMIT.as_secs());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 // How much of the machine the engine may take: the one-heavy-job-at-a-time gate
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;

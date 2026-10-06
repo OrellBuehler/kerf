@@ -20,6 +20,12 @@ before being written up.
 > `fix/review-findings`). One correction to H3's suggested fix: `%%` does *not* work —
 > drawtext's escape for a literal `%` is `\%`, written `\\%` so it survives the graph
 > parser's backslash layer; a real-ffmpeg test pins it. The Medium and Low lists are open.
+>
+> **Status (2026-10-05):** from the Medium list, fixed on `fix/vacation-readiness`: the
+> unsaved-restart gate (and the same for close / New / Open), the orphaned failed-preset task,
+> marker-rename Escape, modal focus trap + `inert` + shortcut guard, the orphaned export, the
+> half-written export file, the `fps` memoization and the NaN setters; of the Low list, swallowed
+> playback errors.
 
 ---
 

@@ -1,8 +1,10 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { confirmAction } from '$lib/api';
 
 	const u = updater;
 
@@ -16,7 +18,13 @@
 	const pct = $derived(u.fraction === null ? null : Math.round(u.fraction * 100));
 
 	// Restarting throws away an unsaved project, so say so before offering it.
-	const unsaved = $derived(!editor.saved);
+	const unsaved = $derived(editor.hasUnsavedWork);
+
+	async function restart() {
+		if (unsaved && !(await confirmAction('This project has never been saved and will be lost on restart. Restart anyway?', 'Restart Kerf')))
+			return;
+		await u.restart();
+	}
 
 	const title = $derived(
 		u.phase === 'downloading'
@@ -34,6 +42,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
+	use:trapFocus
 	role="dialog"
 	aria-modal="true"
 	tabindex="-1"
@@ -121,7 +130,7 @@
 			<div style="flex:1"></div>
 			{#if u.phase === 'ready'}
 				<Btn variant="ghost" size="md" onclick={() => u.close()}>Later</Btn>
-				<Btn variant="primary" size="md" icon="refresh-cw" onclick={() => u.restart()}>Restart now</Btn>
+				<Btn variant="primary" size="md" icon="refresh-cw" onclick={restart}>Restart now</Btn>
 			{:else if u.phase === 'downloading'}
 				<span style="font-size:12px;color:var(--text-muted)">Kerf will keep running until you restart.</span>
 			{:else if u.update}

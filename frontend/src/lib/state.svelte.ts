@@ -15,6 +15,8 @@ import {
 	cutClip,
 	exportSrt,
 	exportTimeline,
+	cancelExport,
+	onExportProgress,
 	exportVariants,
 	extractAudio,
 	getAssetMetadata,
@@ -79,6 +81,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	ExportProgress,
 	Asset,
 	AssetAnalysis,
 	AssetMetadata,
@@ -109,7 +112,6 @@ import { timelineFps } from './timecode';
 import { Generation } from './generation';
 
 class EditorState {
-	get fps(): number { return timelineFps(this.timeline, this.assets); }
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
 	selectedAssetId = $state<string | null>(null);
@@ -263,9 +265,26 @@ class EditorState {
 		return max;
 	});
 
+	/** Source frame rate of the cut. Memoized: playback reads it every animation
+	 *  frame and `timelineFps` scans every track and clip. */
+	fps = $derived.by(() => timelineFps(this.timeline, this.assets));
+
 	/** Whether the project is backed by a file on disk (vs the in-memory sample). */
 	get saved(): boolean {
 		return this.currentPath !== null;
+	}
+
+	/** Work that exists only in memory: a never-saved project that has media or
+	 *  a cut in it. Once saved, a project is a SQLite file and every edit is
+	 *  committed as it happens, so only this state can be lost by closing,
+	 *  relaunching or replacing the project. */
+	get hasUnsavedWork(): boolean {
+		if (this.saved) return false;
+		return (
+			this.assets.length > 0 ||
+			(this.timeline.overlays?.length ?? 0) > 0 ||
+			this.timeline.tracks.some((t) => t.clips.length > 0)
+		);
 	}
 
 	/** File name of the open project, or a placeholder when unsaved. */
@@ -763,13 +782,35 @@ class EditorState {
 		return apiRevisionDiff(seq);
 	}
 
-	async export(outputPath: string, options: ExportOptions): Promise<string> {
+	/** The render in flight, or null. It lives here rather than in the export
+	 *  dialog so closing the dialog mid-render doesn't orphan it: reopening the
+	 *  dialog (or glancing at the status bar) still shows progress and a Stop. */
+	exportRun = $state<{ progress: ExportProgress | null; cancelling: boolean } | null>(null);
+
+	async #render<T>(run: () => Promise<T>): Promise<T> {
 		this.#busyCount++;
+		this.exportRun = { progress: null, cancelling: false };
+		let unlisten: (() => void) | undefined;
 		try {
-			return await exportTimeline(outputPath, options);
+			unlisten = await onExportProgress((p) => {
+				if (this.exportRun) this.exportRun.progress = p;
+			});
+			return await run();
 		} finally {
+			unlisten?.();
+			this.exportRun = null;
 			this.#busyCount--;
 		}
+	}
+
+	async stopExport() {
+		if (!this.exportRun || this.exportRun.cancelling) return;
+		this.exportRun.cancelling = true;
+		await cancelExport();
+	}
+
+	export(outputPath: string, options: ExportOptions): Promise<string> {
+		return this.#render(() => exportTimeline(outputPath, options));
 	}
 
 	async exportVariants(
@@ -778,11 +819,9 @@ class EditorState {
 		smartCrop: boolean,
 		options: ExportOptions
 	): Promise<string[]> {
-		this.#busyCount++;
 		try {
-			return await exportVariants(outputPath, formats, smartCrop, options);
+			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options));
 		} finally {
-			this.#busyCount--;
 			// The framing pass wrote onto the clips; the history has a revision
 			// the panel has not seen.
 			await this.refreshTimeline().catch(() => {});
