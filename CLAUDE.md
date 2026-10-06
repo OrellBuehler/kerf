@@ -376,6 +376,10 @@ cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # si
 # engine or the export graph:
 cargo test -p kerf-core --no-default-features -- --ignored
 
+# The GPU compositor against FFmpeg's still (needs ffmpeg and an adapter — Mesa
+# lavapipe is enough; `mesa-vulkan-drivers` on Debian / Ubuntu):
+cargo test -p kerf-gpu --no-default-features -- --ignored
+
 # Everything a commit / a push checks (prek, see below)
 prek run --all-files
 prek run --all-files --hook-stage pre-push
@@ -430,7 +434,8 @@ Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 check commands, and a PostToolUse hook that rustfmt's every `.rs` file an agent
 writes, reporting parse errors back) and project subagents in `.claude/agents/`
 — `engine` (kerf-core), `frontend`, `surface` (wire a core op into the Tauri
-command + MCP tool + api.ts), and the read-only `reviewer` and `verifier`.
+command + MCP tool + api.ts), `gpu` (kerf-gpu and its parity harness), and the
+read-only `reviewer` and `verifier`.
 
 ## Architecture
 
@@ -546,6 +551,21 @@ no editing logic in the adapter.
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
   a render resizes away from the project frame.
+- `render_plan.rs` — **what one frame is made of**, shared by every renderer.
+  `RenderPlan::at(timeline, assets, opts, t)` is the canvas (the same
+  `export_format` the still uses, through `render_geometry`) plus the ordered video
+  layers visible at `t`: asset path, resolved source time (speed / reverse /
+  clamped), the `Transform` sampled at clip-local time, `Color`, the stream's
+  displayed size / rotation / transfer. It is built on `active_video_clips`, the very
+  function `build_still_args` takes its inputs from, so the FFmpeg still and the GPU
+  compositor cannot disagree about which clip is where in its source (a `cli.rs` test
+  pins the argv against the plan); `still_size` is the preview-size rule both use.
+  **`gpu_supported()` is the per-frame fallback switch** and answers *no, with
+  reasons* for anything the compositor does not render exactly: video effects,
+  masks, 360 reframe, HDR, a live text overlay, a fade or transition in progress,
+  a non-bicubic scaler, a layer with no known picture size. Pure + unit-tested like
+  the rest of the timeline math; `PlanCanvas.matrix` records which YUV matrix the
+  composite is converted with (see `kerf-gpu`).
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -642,6 +662,78 @@ no editing logic in the adapter.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
+
+### kerf-gpu (`crates/kerf-gpu/`)
+
+The wgpu compositor — work package A0 of `.claude/plans/gpu-compositor-and-roadmap.md`,
+a feasibility spike **not linked into kerf-app yet**. It draws a `RenderPlan` headless
+(`Gpu::new(GpuOptions)`: instance / adapter / device, an `Err` rather than a panic
+when there is no adapter, `force_fallback_adapter` for the software one) and reads
+RGBA back. wgpu is built with the Vulkan / Metal / DX12 backends only — no GLES, no
+WebGL — so the CI target is a software adapter (Mesa **lavapipe** on Linux, WARP on
+Windows) and nothing may depend on an optional wgpu feature. FFmpeg stays the
+decoder: `source::decode_layer` pipes one raw `yuv420p` frame from the binary (the
+same `-ss` as the still graph; a still image goes through `yuva420p` so transparency
+is *seen* and refused rather than flattened), spawned through kerf-core's
+`ffmpeg_command()` (no console flash on Windows) with `limit_ffmpeg_args` applying the
+CPU budget's thread cap at spawn time — a moment read, so ungated. No cache, no proxy,
+one spawn per layer (the layers of a frame in parallel): that is A1.
+
+What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
+
+- **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and
+  the still converts the *result* to RGB. The canvas texture holds Y, U, V, A and the
+  blend acts per channel; an RGB-first design clamps each layer before blending and
+  composites out-of-gamut-but-legal footage (saturated patterns, super-whites)
+  differently. Chroma is replicated 2x2 at the final conversion, as swscale's unscaled
+  path does.
+- **The matrix is BT.601 limited, not the stream's** (`PlanCanvas.matrix`). The
+  composited frame is untagged, swscale reads that as BT.601, and bt709-tagged,
+  bt601-tagged and untagged sources convert identically in FFmpeg's still (measured).
+  Matching FFmpeg is the point of parity, so the GPU does too. The consequence to know
+  about: an *export* is untagged `yuv420p` that a player shows as BT.709 for HD, so the
+  FFmpeg preview already disagrees with the file by a few levels on saturated colour.
+  Fixing that is a decision for when the GPU path replaces the FFmpeg preview.
+- **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
+  tables (the integer `process_c` path when gamma is 1, the `pow` table otherwise, its
+  `float` clamping, truncation) and the test suite checks them byte for byte against
+  FFmpeg. Kerf's "temperature" is a power function on the chroma planes.
+- **Scaler: swscale's bicubic** (B = 0, C = 0.6) as two separable passes per plane, the
+  kernel stretched when shrinking, planes scaled independently at their own size and
+  rounded to 8 bits between stages (the fit scale and the transform's scale are two
+  scalers in cascade, as in FFmpeg). Checked against `ffmpeg -vf scale` to within one
+  level, odd sizes included.
+- **The decode asks for limited range explicitly** (`scale=out_range=tv`): FFmpeg 6.1
+  converts a full-range JPEG for `-pix_fmt yuva420p` alone, FFmpeg 9 hands the raw
+  full-range bytes back untouched — the first thing the pinned build found.
+- **Geometry is FFmpeg's integer geometry** (`geometry.rs`, pure): `crop` rounds with
+  `lrint` and clears the low bit, the fit uses `av_rescale`, `pad` / `overlay` truncate
+  and round down to even, `pad` drops the last odd row / column of the picture, `rotate`
+  rounds its box half-up and samples bilinear about the pixel-index centres.
+
+**`tests/parity.rs`** (`#[ignore]`d; CI job `parity`) renders each case at several times
+through `export_still` (a PNG at the full canvas) and through the GPU and compares them:
+**PSNR >= 40 dB and max per-channel error <= 8/255 outside the edge band**, where the
+band is every pixel within 2 px of a >12-level step in the *reference*, plus a
+whole-image PSNR floor (40 dB, 30 dB for a case with a rotated layer) that catches a
+layer a row off. Thresholds live as named constants at the top of the file with the
+reason for each; a case never relaxes them silently, and a new visual feature gets a
+case. Cases: single clip (three sources), a gap, contain / cover into 9:16 / 16:9 and
+up / down scaling, picture-in-picture, scale + rotate + crop, odd-sized and off-canvas
+layers, opacity, colour (all four knobs, contrast + saturation only, warm / cool), PNG
+and JPEG stills, speed / reverse / keyframes, and 10-bit / 4:4:4 / full-range /
+odd-sized / metadata-rotated sources — 55 renders, which also pass against the pinned
+FFmpeg 9.0.2 the Windows and macOS bundles ship. A failing case writes the reference,
+GPU and diff images to `target/parity/` (`KERF_PARITY_KEEP=1` keeps them for passing
+ones); every run writes `target/parity/report.txt`. `tests/bench.rs` times a still on
+the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6 layers, decode apart from composite
+(`KERF_BENCH=1`).
+
+```bash
+cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter
+KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
+KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
+```
 
 ### embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 

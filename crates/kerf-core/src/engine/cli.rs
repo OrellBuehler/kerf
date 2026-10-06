@@ -20,6 +20,7 @@ use crate::model::{
     Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
     SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
+use crate::render_plan::{active_video_clips, still_size};
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
 /// pure function of (source path, time, filter, codec, quality), so caching is
@@ -81,6 +82,28 @@ fn frame_cache() -> &'static Mutex<FrameCache> {
 
 pub(super) fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+/// The `ffmpeg` binary Kerf drives (`KERF_FFMPEG`, else `ffmpeg` on `PATH`) — for
+/// callers outside the engine that run it themselves, like the GPU compositor's
+/// frame decoder, so they resolve it the way every other run here does.
+pub fn ffmpeg_path() -> String {
+    ffmpeg_bin()
+}
+
+/// A `Command` for the `ffmpeg` binary, set up like every run inside the engine
+/// (on Windows `CREATE_NO_WINDOW`, so a GUI app spawning it does not flash a
+/// console). Normal priority: it is for interactive reads, which should land now.
+pub fn ffmpeg_command() -> Command {
+    command(&ffmpeg_bin())
+}
+
+/// Apply the CPU budget's thread cap to an `ffmpeg` argv about to be spawned —
+/// at spawn time, never in a builder, so the builders keep describing exactly
+/// what ffmpeg is handed. A no-op at the default 100%, which is what keeps every
+/// run byte-identical to the ones Kerf always issued.
+pub fn limit_ffmpeg_args(args: &mut Vec<String>) {
+    cpu::limit_args(args, cpu::budget_threads());
 }
 
 fn ffprobe_bin() -> String {
@@ -2603,6 +2626,30 @@ pub fn delivery_frame(timeline: &Timeline, assets: &[Asset]) -> (u32, u32) {
     (f.width, f.height)
 }
 
+/// The slice of [`ExportFormat`] a renderer of one *frame* needs — the canvas
+/// and how footage meets it — taken from the same `export_format` the still and
+/// the export use, so a second renderer (the GPU compositor, through
+/// [`crate::render_plan::RenderPlan`]) cannot drift from them on what the frame
+/// is.
+#[derive(Debug, Clone)]
+pub(crate) struct RenderGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub fit: Fit,
+    /// The export's `scaler` as chosen (`None` is swscale's bicubic default).
+    pub scaler: Option<String>,
+}
+
+pub(crate) fn render_geometry(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> RenderGeometry {
+    let f = export_format(timeline, assets, opts);
+    RenderGeometry {
+        width: f.width,
+        height: f.height,
+        fit: f.fit,
+        scaler: f.scaler,
+    }
+}
+
 fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> ExportFormat {
     let stream_of = |clip: &crate::model::Clip, kind: StreamKind| {
         assets
@@ -4631,9 +4678,8 @@ fn eq_filter(c: &Color) -> String {
         "eq=brightness={}:contrast={}:saturation={}:gamma={}",
         c.brightness, c.contrast, c.saturation, c.gamma
     );
-    if c.temperature != 0.0 {
-        let t = c.temperature.clamp(-1.0, 1.0);
-        f.push_str(&format!(":gamma_r={}:gamma_b={}", fnum(1.0 + 0.3 * t), fnum(1.0 - 0.3 * t)));
+    if let Some((gamma_r, gamma_b)) = c.temperature_gammas() {
+        f.push_str(&format!(":gamma_r={}:gamma_b={}", fnum(gamma_r), fnum(gamma_b)));
     }
     f
 }
@@ -5453,38 +5499,18 @@ fn build_still_args(
         None => max_width,
     };
     // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
-    let ow = (canvas_width.min(fmt.width).max(2)) & !1;
-    let oh = ((((ow as u64) * (fmt.height as u64)) / (fmt.width.max(1) as u64)) as u32).max(2) & !1;
+    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
     let t = t.max(0.0);
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
-    // within a track in timeline order), paired with their source time.
-    let mut active: Vec<(&Clip, f64)> = Vec::new();
-    for track in &timeline.tracks {
-        if track.kind != StreamKind::Video {
-            continue;
-        }
-        let mut order: Vec<usize> = (0..track.clips.len()).collect();
-        order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
-        for &ci in &order {
-            let clip = &track.clips[ci];
-            if t < clip.timeline_start || t >= clip.timeline_end() {
-                continue;
-            }
-            let off = (t - clip.timeline_start) * clip.speed_mag();
-            let raw = if clip.is_reversed() {
-                clip.source_out - off
-            } else {
-                clip.source_in + off
-            };
-            let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
-            active.push((clip, raw.clamp(0.0, dur.max(0.0))));
-        }
-    }
+    // within a track in timeline order), paired with their source time. The GPU
+    // compositor's `RenderPlan` is built from the same list.
+    let active = active_video_clips(timeline, assets, t);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
-    for (clip, src) in &active {
+    for ac in &active {
+        let (clip, src) = (ac.clip, ac.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
         // it up); seeking into it decodes nothing, so skip the `-ss` (and any
@@ -5518,10 +5544,10 @@ fn build_still_args(
     };
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
-    for (n, (clip, _)) in active.iter().enumerate() {
-        let local = (t - clip.timeline_start).max(0.0);
-        let tf = clip.transform_at(local);
-        let rf = clip.reframe_at(local);
+    for (n, ac) in active.iter().enumerate() {
+        let clip = ac.clip;
+        let tf = ac.transform();
+        let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
         chains.push(format!(
@@ -7061,6 +7087,63 @@ mod tests {
         assert!(joined.contains("[base][v0]overlay=(W-w)/2:(H-h)/2[ov0]"));
         assert!(joined.contains("[v1]overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H[ov1]"));
         assert!(joined.contains("[ov1]null[outv]"));
+    }
+
+    /// The FFmpeg still and the GPU's `RenderPlan` are built from one active-clip
+    /// list, but the argv is still the thing that decides what FFmpeg decodes —
+    /// so pin that the two describe the same frame: same inputs in the same
+    /// order at the same source times, same canvas size.
+    #[test]
+    fn the_render_plan_and_the_still_args_agree_on_layers_timing_and_canvas() {
+        use crate::render_plan::RenderPlan;
+        let mk = |path: &str| {
+            let mut a = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+            a.path = path.into();
+            a
+        };
+        let (a, b, c) = (mk("/m/a.mp4"), mk("/m/b.mp4"), mk("/m/c.mp4"));
+        let mut fast = make_clip(a.id, 10.0, 30.0, 0.0);
+        fast.speed = 2.0;
+        let mut reversed = make_clip(b.id, 0.0, 20.0, 1.0);
+        reversed.speed = -1.0;
+        let mut late = make_clip(c.id, 0.0, 5.0, 40.0);
+        late.transform.scale = 0.5;
+        let timeline = timeline_of(vec![
+            video_track(vec![fast, late]),
+            video_track(vec![reversed]),
+            // A muted track appears in neither.
+            Track {
+                muted: true,
+                ..video_track(vec![make_clip(c.id, 0.0, 9.0, 0.0)])
+            },
+        ]);
+        let assets = vec![a, b, c];
+        let opts = ExportOptions::default();
+        for (t, max_width) in [(2.5, 640), (0.5, 640), (6.0, 1920), (45.0, 320)] {
+            let args = build_timeline_frame_args(&timeline, &assets, &opts, t, max_width, 4).unwrap();
+            let plan = RenderPlan::at(&timeline, &assets, &opts, t).unwrap();
+
+            // `-ss <t> -i <path>` pairs, in input order.
+            let mut from_args = Vec::new();
+            let mut ss: Option<String> = None;
+            for w in args.windows(2) {
+                match w[0].as_str() {
+                    "-ss" => ss = Some(w[1].clone()),
+                    "-i" => from_args.push((w[1].clone(), ss.take().unwrap_or_default())),
+                    _ => {}
+                }
+            }
+            let from_plan: Vec<(String, String)> = plan
+                .layers
+                .iter()
+                .map(|l| (l.path.clone(), format!("{:.3}", l.source_time)))
+                .collect();
+            assert_eq!(from_args, from_plan, "t={t}");
+
+            let (w, h) = plan.size(max_width);
+            let canvas = format!("color=c=black:s={w}x{h}:d=0.1[base]");
+            assert!(args.iter().any(|a| a.starts_with(&canvas)), "t={t}: {canvas} not in {args:?}");
+        }
     }
 
     #[test]

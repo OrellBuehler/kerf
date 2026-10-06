@@ -472,6 +472,21 @@ impl Color {
     pub fn is_identity(&self) -> bool {
         *self == Color::default()
     }
+
+    /// The `(gamma_r, gamma_b)` the `eq` filter is given for the warm / cool
+    /// shift, or `None` at 0 (so a temperature-free clip's graph is unchanged).
+    ///
+    /// `eq` has no white-balance knob, but opposing per-channel gammas warm / cool
+    /// convincingly: ±1.0 maps to a ±30% split. Kept here, not in the graph
+    /// builder, because every renderer of a [`Color`] — the FFmpeg `eq` filter
+    /// and the GPU compositor's port of it — has to start from the same two
+    /// numbers.
+    pub fn temperature_gammas(&self) -> Option<(f64, f64)> {
+        (self.temperature != 0.0).then(|| {
+            let t = self.temperature.clamp(-1.0, 1.0);
+            (1.0 + 0.3 * t, 1.0 - 0.3 * t)
+        })
+    }
 }
 
 /// How a clip blends with the preceding clip on its track.
