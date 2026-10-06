@@ -29,8 +29,11 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: rustfmt
+  # The prek commit stage (`.pre-commit-config.yaml`) — file hygiene, typos,
+  # actionlint, rustfmt. The hooks that duplicate a job of their own
+  # (svelte-check, bun test, zizmor) are skipped here rather than run twice.
+  lint:
+    name: lint (prek)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -40,23 +43,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-  # The prek commit stage (`.pre-commit-config.yaml`) — file hygiene, typos,
-  # actionlint. The hooks that duplicate a job of their own (rustfmt,
-  # svelte-check, bun test, zizmor) are skipped here rather than run twice.
-  lint:
-    name: lint (prek)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
       - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
         env:
-          SKIP: cargo-fmt,svelte-check,bun-test,zizmor
+          SKIP: svelte-check,bun-test,zizmor
         with:
           # Pinned for the same reason zizmor is: a new release can add checks.
           prek-version: "0.3.5"
@@ -147,31 +136,11 @@ jobs:
         working-directory: frontend
         run: bun run build
 
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # Unit + integration + doc tests. kerf-app is excluded (it needs the Tauri
-      # toolchain + a built frontend); it is tested in the `build` job instead.
-      # --no-default-features keeps the FFmpeg dev libraries out of CI.
-      - name: Run tests
-        run: cargo test --workspace --exclude kerf-app --no-default-features --locked
-
   # The `#[ignore]`d tests: they synthesize media with lavfi and run the real
   # binary, so they check that the filter graphs ffmpeg is actually handed
   # *run* — playback streaming, a timeline with a still/crossfade/grade/
   # drawtext on it, and the cover-fit and project-frame export geometry. The
-  # pure unit tests above can only assert on argv. `downloads_a_real_model`
+  # unit tests in `build` can only assert on argv. `downloads_a_real_model`
   # stays out: it pulls a whisper model over the network.
   #
   # Two kinds of FFmpeg. `system` is the distro package (6.1 on ubuntu-latest) —
@@ -304,23 +273,29 @@ jobs:
       # app embeds the MCP server, so there is no separate binary to build.
       - name: Build workspace
         run: cargo build --workspace --no-default-features --locked
-      # kerf-app is excluded from the `test` job because it needs exactly the
-      # toolchain + built frontend this job already has. Its tests run here so
-      # the adapter/MCP layer isn't a permanent blind spot.
-      - name: Test kerf-app
-        run: cargo test -p kerf-app --no-default-features --locked
+      # Unit + integration + doc tests for every crate. They used to be a job
+      # of their own, but kerf-app needs exactly the toolchain + built frontend
+      # this job already has, and a separate job per OS was mostly time spent
+      # queueing for a runner — macOS ones above all.
+      - name: Run tests
+        run: cargo test --workspace --no-default-features --locked
 
   # Release bundles are built with `--features whisper` (in-process speech-to-text,
   # so transcription doesn't depend on how the user's ffmpeg was configured). Every
   # job above builds `--no-default-features`, so nothing else here compiles
   # whisper-rs — without this job, a break in it, or a runner image that dropped
   # cmake/libclang, would surface for the first time during a release.
+  #
+  # On a pull request `pr-build.yml` already compiles whisper into the Linux x64,
+  # Windows and macOS arm64 bundles, so only the arm64 Linux runner it has no
+  # bundle for runs here. Everywhere the bundles skip — Dependabot, drafts — and
+  # on main (which also covers the x86_64 macOS cross-compile) it is all four.
   whisper:
     name: whisper feature (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
+        platform: ${{ fromJSON((github.event_name != 'pull_request' || github.actor == 'dependabot[bot]' || github.event.pull_request.draft) && '["ubuntu-22.04", "ubuntu-22.04-arm", "macos-latest", "windows-latest"]' || '["ubuntu-22.04-arm"]') }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
     env:
@@ -357,7 +332,7 @@ jobs:
   ci-ok:
     name: ci ok
     if: always()
-    needs: [fmt, lint, clippy, msrv, frontend, test, engine, libav, build, whisper]
+    needs: [lint, clippy, msrv, frontend, engine, libav, build, whisper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

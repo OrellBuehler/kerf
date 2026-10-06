@@ -1248,3 +1248,7 @@ that would not open opened as silence.
   `license.workspace = true`; don't add other license headers.
 - Versions were pinned against the crates.io sparse index / npm; check there (not the
   blocked crates.io JSON API) before bumping.
+- **Push a PR branch only when it is ready to test.** Every push to a non-draft PR
+  rebuilds three installers (`pr-build.yml`, ~7–13 min each) on top of CI, and they
+  share the account's few runners — macOS above all. Commit locally as often as you
+  like; batch the work and push once, when there is something worth installing.
