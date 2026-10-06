@@ -398,6 +398,19 @@ bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 ```
 
+**Debug builds have their own identity.** `tauri.dev.conf.json` (next to
+`tauri.conf.json`) sets `identifier` to `ch.orellbuehler.kerf.dev`, which names the
+app's config and log directories and the single-instance lock — so a dev run
+neither rewrites an installed Kerf's `settings.json` nor refuses to start while
+that one is open. Tauri resolves its config at compile time (`tauri_build` and
+`generate_context!` both merge the `TAURI_CONFIG` JSON env var over the file), and
+`cargo run` has no CLI to set it, so `crates/kerf-app/build.rs` does: when cargo's
+`PROFILE` is `debug` it merges `tauri.dev.conf.json` into `TAURI_CONFIG` (keys the
+CLI already set win) and passes the result to rustc via `cargo:rustc-env`. That
+covers `cargo run`, `cargo test` and `tauri dev` alike with no extra flag;
+release builds never see it. A debug-profile build is therefore *not* the
+shipping identifier — to test that, build `--release`.
+
 ### Local checks (prek) and the agent harness
 
 `.pre-commit-config.yaml` is the single definition of "the checks", run by
@@ -751,7 +764,7 @@ the user has not got.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
@@ -803,10 +816,17 @@ of *this* computer Kerf may use is not something that should travel inside a
 The file also carries the **workspace layout** and the **color theme** as two
 opaque `serde_json::Value`s — the frontend owns their shape and validates them
 on the way back in, so `get_settings` re-reads the file for those where the
-engine-held values are read live), `read_text_file` / `write_text_file`
+engine-held values are read live). **`set_settings` takes a patch**, not the
+whole object — only the fields that changed (`{layout}`, `{theme}`,
+`{cpu_percent}`), merged into the file under a mutex, and only those fields are
+pushed into the engine (so a layout write never re-applies the stored CPU share
+over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
+directory, fsync, rename over), and a file that does not parse is moved aside to
+`settings.corrupt-<unix-ms>.json` before defaults load, so the next save cannot
+destroy an imported theme), `read_text_file` / `write_text_file`
 (a theme file the user picked, imported or exported — the only commands that
-read a caller-chosen path, so the read is capped at 1 MiB)
-and `agent_status` (the MCP endpoint plus how
+read a caller-chosen path, so both take only `.json` paths, refuse a non-regular file, and cap read and write at 1 MiB)
+and `agent_status` (the MCP endpoint, an `error` when the server could not bind — the agent panel then says the port is taken instead of showing a dead endpoint — plus how
 many seconds ago an agent last spoke to it, or `null` if none ever has —
 `mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
 `initialize` is the one moment an agent is known to be there; a

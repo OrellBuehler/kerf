@@ -107,6 +107,8 @@
 				unlisteners.push(
 					await listen('project-changed', () => void onProjectChanged()),
 					await listen('proxy-ready', () => ui.refreshPreview()),
+					// A second launch with a `.kerf` argument: the running app opens it.
+					await listen<string>('open-project-file', (e) => void openProjectAt(e.payload)),
 					// An agent can pick the speech model over MCP; the status is
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
@@ -159,20 +161,25 @@
 		}
 	}
 
-	async function onOpen() {
+	/** Open a project file — `path` when a second launch handed one over, else the picker. */
+	async function openProjectAt(path?: string) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
 		}
 		if (!(await okToReplace())) return;
 		try {
-			if (await editor.openProject()) {
+			if (await editor.openProject(path)) {
 				await agent.load();
 				toast.success(`Opened ${editor.projectName}`);
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
+	}
+
+	function onOpen() {
+		void openProjectAt();
 	}
 
 	async function onSave() {
@@ -285,7 +292,7 @@
 				void onSave();
 			} else if (k === 'o') {
 				e.preventDefault();
-				void onOpen();
+				void openProjectAt();
 			} else if (k === 'n') {
 				e.preventDefault();
 				void onNew();
