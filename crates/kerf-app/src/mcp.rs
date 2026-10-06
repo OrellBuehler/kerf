@@ -2441,6 +2441,22 @@ fn server_identity() -> Implementation {
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
+    /// The `#[tool_handler]` default, plus the one place every failing tool
+    /// call — whichever helper built the error — reaches the logfile.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = router().call(tcc).await;
+        if let Err(e) = &result {
+            log_tool_error(&tool, e);
+        }
+        result
+    }
+
     fn get_info(&self) -> ServerConfig {
         // `initialize` is the one moment we know an agent is on the other end
         // of the socket, so it counts as being seen even before it calls a tool.
@@ -2679,6 +2695,19 @@ fn core_err(e: kerf_core::Error) -> McpError {
     }
 }
 
+/// A caller's mistake (a stale id, a bad argument) is a `warn`; anything else
+/// is ours, and an `error`.
+fn log_tool_error(tool: &str, e: &McpError) {
+    if matches!(
+        e.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS | rmcp::model::ErrorCode::METHOD_NOT_FOUND
+    ) {
+        tracing::warn!(target: "mcp", tool, "tool call rejected: {}", e.message);
+    } else {
+        tracing::error!(target: "mcp", tool, code = e.code.0, "tool call failed: {}", e.message);
+    }
+}
+
 /// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
 /// block followed by an image content block (rmcp expects bare base64 + MIME,
 /// not a `data:` URL).
@@ -2742,7 +2771,15 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, core_err, fmt_ts, image_result, refuse_overwrite, router, server_identity, track_gaps};
+    use super::{
+        allowed_hosts, core_err, fmt_ts, image_result, log_tool_error, refuse_overwrite, router, server_identity, track_gaps,
+    };
+
+    #[test]
+    fn log_tool_error_handles_both_kinds() {
+        log_tool_error("t", &rmcp::ErrorData::invalid_params("bad id", None));
+        log_tool_error("t", &rmcp::ErrorData::internal_error("boom", None));
+    }
 
     #[test]
     fn refuse_overwrite_blocks_an_existing_file_unless_opted_in() {

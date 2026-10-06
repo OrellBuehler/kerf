@@ -2,8 +2,11 @@
 	import './layout.css';
 	import favicon from '$lib/assets/favicon.svg';
 	import { Toaster } from '$lib/components/ui/sonner';
+	import { installErrorLogging } from '$lib/log';
 
 	let { children } = $props();
+
+	installErrorLogging();
 </script>
 
 <svelte:head>
