@@ -346,14 +346,19 @@ export async function newProject(): Promise<boolean> {
 	return true;
 }
 
-/** Pick a `.kerf` file and open it; resolves to its path, or `null` if cancelled. */
-export async function openProject(): Promise<string | null> {
+/** Open a `.kerf` file — the one at `path` when given (a second launch hands
+ *  one over), else one picked natively; resolves to its path, or `null` if
+ *  cancelled. */
+export async function openProject(path?: string): Promise<string | null> {
 	if (!inTauri()) return null;
-	const { open } = await import('@tauri-apps/plugin-dialog');
-	const selected = await open({
-		multiple: false,
-		filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
-	});
+	let selected: string | string[] | null = path ?? null;
+	if (selected === null) {
+		const { open } = await import('@tauri-apps/plugin-dialog');
+		selected = await open({
+			multiple: false,
+			filters: [{ name: 'Kerf project', extensions: ['kerf'] }]
+		});
+	}
 	if (typeof selected !== 'string') return null;
 	return (await invoke<string | null>('open_project', { path: selected })) ?? null;
 }
@@ -1881,9 +1886,9 @@ export async function mcpEndpoint(): Promise<string> {
  *  none ever has. A streamable-HTTP client holds no connection between calls,
  *  so there is no socket to report as open; the panel judges from the age. In
  *  the browser harness there is no server at all, hence `null`. */
-export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null }> {
-	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null };
-	return invoke<{ endpoint: string; last_seen_secs: number | null }>('agent_status');
+export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
+	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
+	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
 }
 
 // ---- app settings ----------------------------------------------------------

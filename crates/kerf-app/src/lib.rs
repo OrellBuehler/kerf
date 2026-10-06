@@ -1693,6 +1693,9 @@ fn mcp_endpoint() -> String {
 struct AgentStatus {
     endpoint: String,
     last_seen_secs: Option<i64>,
+    /// Set when the server could not start (the port is taken), so the panel
+    /// can say that instead of showing an endpoint nothing answers on.
+    error: Option<String>,
 }
 
 #[tauri::command(async)]
@@ -1700,6 +1703,7 @@ fn agent_status() -> AgentStatus {
     AgentStatus {
         endpoint: mcp::endpoint_url(),
         last_seen_secs: mcp::agent_last_seen_secs(),
+        error: mcp::server_error(),
     }
 }
 
@@ -1853,6 +1857,40 @@ fn install_panic_hook() {
     }));
 }
 
+/// Emitted to the webview when a second launch carried a `.kerf` path. The
+/// frontend owns the "replace the open project?" question, so it does the open.
+const OPEN_PROJECT_EVENT: &str = "open-project-file";
+
+/// The `.kerf` path in a launch's arguments, resolved against that launch's
+/// working directory (a second launch's relative path is relative to *its* cwd,
+/// not to ours).
+fn project_arg(argv: &[String], cwd: &str) -> Option<String> {
+    let arg = argv.iter().skip(1).find(|a| {
+        std::path::Path::new(a)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("kerf"))
+    })?;
+    let path = std::path::Path::new(arg);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(path)
+    };
+    Some(full.display().to_string())
+}
+
+fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
+    tracing::info!(?argv, "second launch; focusing the running window");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(path) = project_arg(&argv, &cwd) {
+        let _ = app.emit(OPEN_PROJECT_EVENT, path);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Start on a fresh, empty in-memory project; the user opens an existing
@@ -1860,6 +1898,11 @@ pub fn run() {
     let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
 
     tauri::Builder::default()
+        // Must be the first plugin. A second launch (a `.kerf` double-clicked
+        // while Kerf is open, or the binary run again) lands here instead of
+        // starting another app that would fight the first for the MCP port and
+        // the settings file.
+        .plugin(tauri_plugin_single_instance::init(on_second_launch))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -2006,7 +2049,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::require_local_output_path;
+    use super::{project_arg, require_local_output_path};
 
     #[test]
     fn accepts_absolute_local_paths() {
@@ -2049,5 +2092,22 @@ mod tests {
         // mistaken for a scheme — this is the whole reason the check isn't
         // just "contains a colon".
         assert!(require_local_output_path("D:\\video\\clip.mov").is_ok());
+    }
+
+    #[test]
+    fn a_second_launch_forwards_only_a_kerf_path() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(project_arg(&argv(&["kerf"]), "/home/u"), None);
+        assert_eq!(project_arg(&argv(&["kerf", "--flag", "notes.txt"]), "/home/u"), None);
+        assert_eq!(
+            project_arg(&argv(&["kerf", "/data/cut.kerf"]), "/home/u").as_deref(),
+            Some("/data/cut.kerf")
+        );
+        assert_eq!(
+            project_arg(&argv(&["kerf", "CUT.KERF"]), "/home/u").map(|p| p.replace('\\', "/")),
+            Some("/home/u/CUT.KERF".to_string())
+        );
+        // argv[0] is the binary, never a project.
+        assert_eq!(project_arg(&argv(&["/opt/x.kerf"]), "/home/u"), None);
     }
 }

@@ -351,9 +351,9 @@ class EditorState {
 		return true;
 	}
 
-	/** Open a `.kerf` file (native picker) and reload; resolves true if opened. */
-	async openProject(): Promise<boolean> {
-		const path = await apiOpenProject();
+	/** Open a `.kerf` file (`path`, else the native picker) and reload; resolves true if opened. */
+	async openProject(file?: string): Promise<boolean> {
+		const path = await apiOpenProject(file);
 		if (path === null) return false; // cancelled, or running in the browser
 		this.selectedAssetId = null;
 		this.selectedClipId = null;

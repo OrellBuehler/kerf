@@ -77,6 +77,8 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# A second launch hands its argv to the running app instead of starting another.
+tauri-plugin-single-instance = "2.5"
 # Auto-update: checks the GitHub release feed and installs a signed bundle;
 # `process` supplies the relaunch after the install.
 tauri-plugin-updater = "2.10"

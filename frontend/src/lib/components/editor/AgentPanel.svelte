@@ -31,6 +31,8 @@
 	// or not anything was on the other end, which is the one thing it must not
 	// say. Polled, because an agent arriving is not an event the app hears.
 	let lastSeen = $state<number | null>(null);
+	/** Why the endpoint is not listening (port taken), or null while it is. */
+	let serverError = $state<string | null>(null);
 	$effect(() => {
 		let stop = false;
 		const poll = async () => {
@@ -39,6 +41,7 @@
 				if (stop) return;
 				endpoint = s.endpoint;
 				lastSeen = s.last_seen_secs;
+				serverError = s.error;
 			} catch {
 				/* the endpoint is part of the app; a failed read is not worth a toast */
 			}
@@ -422,10 +425,20 @@
 	</div>
 
 	<div style="flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px">
-		<div style="display:flex;align-items:center;gap:8px;flex:none;font-size:12px;color:var(--text-secondary)">
-			<Icon n="plug" s={16} color={connected ? 'var(--agent-300)' : 'var(--text-muted)'} />
-			<span style="flex:1">{connected ? 'Agent connected' : lastSeen === null ? 'No agent connected' : `Last seen ${ago(lastSeen)}`}</span>
-		</div>
+		{#if serverError}
+			<div
+				role="alert"
+				style="display:flex;align-items:flex-start;gap:8px;flex:none;padding:9px 11px;border-radius:var(--radius-md);background:var(--danger-surface);border:1px solid var(--danger);font-size:12px;line-height:1.5;color:var(--text-primary)"
+			>
+				<Icon n="plug" s={16} color="var(--danger)" />
+				<span style="flex:1">{serverError}</span>
+			</div>
+		{:else}
+			<div style="display:flex;align-items:center;gap:8px;flex:none;font-size:12px;color:var(--text-secondary)">
+				<Icon n="plug" s={16} color={connected ? 'var(--agent-300)' : 'var(--text-muted)'} />
+				<span style="flex:1">{connected ? 'Agent connected' : lastSeen === null ? 'No agent connected' : `Last seen ${ago(lastSeen)}`}</span>
+			</div>
+		{/if}
 
 		<!-- the agent's pending proposal -->
 		{#if staged}

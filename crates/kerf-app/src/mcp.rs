@@ -2602,6 +2602,36 @@ fn host_of(addr: &str) -> Option<String> {
 /// Serve the MCP tools over streamable HTTP at `/mcp`, sharing `project` with
 /// the Tauri commands. Runs until the process exits.
 pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
+    let result = run_server(project, app).await;
+    if let Err(e) = &result {
+        *SERVER_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = Some(describe_server_error(&bind_addr(), e));
+    }
+    result
+}
+
+/// Why the server is not listening, if it is not. Set once by [`serve`] when it
+/// returns an error (the usual one: the port is taken by another Kerf or by
+/// something else), so `agent_status` can say so instead of showing an endpoint
+/// nothing answers on.
+static SERVER_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn server_error() -> Option<String> {
+    SERVER_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// The sentence the agent panel shows for a server that did not start.
+fn describe_server_error(addr: &str, error: &anyhow::Error) -> String {
+    let in_use = error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse);
+    if in_use {
+        format!("The agent endpoint could not start: {addr} is already in use, most likely by another Kerf. Close it, or set KERF_MCP_ADDR to a free address and restart.")
+    } else {
+        format!("The agent endpoint could not start on {addr}: {error}")
+    }
+}
+
+async fn run_server(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
     let addr = bind_addr();
 
     let service = StreamableHttpService::new(
@@ -2742,7 +2772,23 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_hosts, core_err, fmt_ts, image_result, refuse_overwrite, router, server_identity, track_gaps};
+    #[test]
+    fn a_taken_port_is_named_as_such() {
+        let taken = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::AddrInUse));
+        let said = describe_server_error("127.0.0.1:7777", &taken);
+        assert!(said.contains("127.0.0.1:7777 is already in use"), "{said}");
+        assert!(said.contains("KERF_MCP_ADDR"), "{said}");
+        let other = anyhow::anyhow!("boom");
+        assert_eq!(
+            describe_server_error("127.0.0.1:7777", &other),
+            "The agent endpoint could not start on 127.0.0.1:7777: boom"
+        );
+    }
+
+    use super::{
+        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, refuse_overwrite, router, server_identity,
+        track_gaps,
+    };
 
     #[test]
     fn refuse_overwrite_blocks_an_existing_file_unless_opted_in() {
