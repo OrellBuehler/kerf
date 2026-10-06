@@ -3509,6 +3509,7 @@ mod tests {
             streams: serde_json::from_str(streams).unwrap(),
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         assert_eq!(asset.hdr(), Some(Hdr::Hlg));
         let proxied = asset.as_sdr_proxy();

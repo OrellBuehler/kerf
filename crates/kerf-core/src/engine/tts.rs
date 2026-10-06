@@ -1221,6 +1221,7 @@ mod tests {
     /// for real. Run with `-- --ignored` when touching the voice pipeline.
     #[test]
     #[ignore]
+    #[allow(clippy::print_stderr)]
     fn synthesizes_a_script_end_to_end() {
         let text = "Hello from Kerf. This is the second sentence.";
         let result = synthesize(
