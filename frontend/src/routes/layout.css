@@ -7,7 +7,6 @@
 @import '$lib/styles/dockview-kerf.css';
 
 @custom-variant dark (&:is(.dark *));
-@plugin '@tailwindcss/typography';
 
 /* Map the shadcn-svelte semantic variables onto the Kerf token system so any
 			shadcn primitive (toasts, inputs) inherits the editor theme. The bespoke
