@@ -15,8 +15,8 @@ use crate::model::default_beat_tolerance;
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Framing, Keyframe,
     Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
-    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, MAX_FOV,
-    MIN_FOV,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover,
+    MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -69,7 +69,10 @@ CREATE TABLE IF NOT EXISTS assets (
     -- JSON array of the capture files a derived asset was built from (an
     -- Insta360 lens pair); NULL/absent for an ordinary asset. Older files get
     -- this column added by the migration in `init`.
-    source_paths TEXT
+    source_paths TEXT,
+    -- JSON `Voiceover` for audio Kerf synthesized from a script; NULL for
+    -- media the user brought. Migrated onto older files like `source_paths`.
+    voiceover    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS analysis (
@@ -120,6 +123,20 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks (status, created_at
 CREATE INDEX IF NOT EXISTS idx_tasks_created       ON tasks (created_at);
 CREATE INDEX IF NOT EXISTS idx_assets_imported     ON assets (imported_at);
 "#;
+
+/// The audio track [`Project::place_voiceover`] puts narration on by default.
+pub const VOICEOVER_TRACK: &str = "VO";
+
+/// An asset name for a voiceover: its script's opening words.
+fn voiceover_name(text: &str) -> String {
+    const WORDS: usize = 6;
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut name = words.iter().take(WORDS).copied().collect::<Vec<_>>().join(" ");
+    if words.len() > WORDS {
+        name.push('…');
+    }
+    format!("Voiceover: {name}")
+}
 
 /// `meta` key holding the seq of the currently-applied revision.
 const HISTORY_HEAD: &str = "history_head";
@@ -219,6 +236,10 @@ impl Project {
         let has_source_paths = self.conn.prepare("SELECT source_paths FROM assets LIMIT 1").is_ok();
         if !has_source_paths {
             self.conn.execute("ALTER TABLE assets ADD COLUMN source_paths TEXT", [])?;
+        }
+        let has_voiceover = self.conn.prepare("SELECT voiceover FROM assets LIMIT 1").is_ok();
+        if !has_voiceover {
+            self.conn.execute("ALTER TABLE assets ADD COLUMN voiceover TEXT", [])?;
         }
 
         let has_timeline: bool = self
@@ -342,14 +363,15 @@ impl Project {
             streams: probe.streams,
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         })
     }
 
     /// Insert (or replace) an asset record directly.
     pub fn insert_asset(&self, asset: &Asset) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO assets (id, path, name, duration, streams, imported_at, source_paths)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 asset.id.to_string(),
                 asset.path,
@@ -362,6 +384,7 @@ impl Project {
                 } else {
                     Some(serde_json::to_string(&asset.source_paths)?)
                 },
+                asset.voiceover.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -384,43 +407,25 @@ impl Project {
 
     /// The asset backed by `path`, if the project already has one.
     pub fn asset_by_path(&self, path: &str) -> Result<Option<Asset>> {
-        let mut stmt = self
+        let row = self
             .conn
-            .prepare("SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE path = ?1 LIMIT 1")?;
-        let mut rows = stmt.query(params![path])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_asset(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            )?)),
-            None => Ok(None),
-        }
+            .query_row(
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE path = ?1 LIMIT 1"),
+                params![path],
+                read_asset_row,
+            )
+            .optional()?;
+        row.map(row_to_asset).transpose()
     }
 
     pub fn list_assets(&self) -> Result<Vec<Asset>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets ORDER BY imported_at")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })?;
+            .prepare(&format!("SELECT {ASSET_COLUMNS} FROM assets ORDER BY imported_at"))?;
+        let rows = stmt.query_map([], read_asset_row)?;
         let mut assets = Vec::new();
         for row in rows {
-            let (id, path, name, duration, streams, imported_at, source_paths) = row?;
-            assets.push(row_to_asset(id, path, name, duration, streams, imported_at, source_paths)?);
+            assets.push(row_to_asset(row?)?);
         }
         Ok(assets)
     }
@@ -429,33 +434,12 @@ impl Project {
         let row = self
             .conn
             .query_row(
-                "SELECT id, path, name, duration, streams, imported_at, source_paths FROM assets WHERE id = ?1",
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE id = ?1"),
                 params![id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                },
+                read_asset_row,
             )
             .optional()?;
-        match row {
-            Some((id, path, name, duration, streams, imported_at, source_paths)) => Ok(Some(row_to_asset(
-                id,
-                path,
-                name,
-                duration,
-                streams,
-                imported_at,
-                source_paths,
-            )?)),
-            None => Ok(None),
-        }
+        row.map(row_to_asset).transpose()
     }
 
     pub fn require_asset(&self, id: Uuid) -> Result<Asset> {
@@ -2553,6 +2537,7 @@ impl Project {
             ],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
 
         let broll = Asset {
@@ -2577,6 +2562,7 @@ impl Project {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
 
         self.insert_asset(&interview)?;
@@ -3161,6 +3147,90 @@ impl Project {
         Ok(created)
     }
 
+    /// Read `text` aloud and describe the result as an importable [`Asset`],
+    /// *without* `&self` — synthesis runs for seconds to minutes (and may first
+    /// download the voice model), so like [`Project::probe_import`] it happens
+    /// with the project lock released; [`Project::place_voiceover`] then takes
+    /// it only to land the result.
+    ///
+    /// The asset carries its [`Voiceover`], script and exact sentence timings
+    /// included, which is what lets it be captioned without transcribing it.
+    pub fn synthesize_voiceover(
+        text: &str,
+        voice: &str,
+        speed: f64,
+        progress: engine::tts::ProgressFn,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Asset> {
+        let synthesis = engine::tts::synthesize(text, voice, speed, progress, cancel)?;
+        let mut asset = Self::probe_asset(&synthesis.path)?;
+        asset.name = voiceover_name(text);
+        asset.voiceover = Some(Voiceover {
+            text: text.trim().to_string(),
+            voice: voice.to_string(),
+            speed: speed.clamp(engine::tts::MIN_SPEED, engine::tts::MAX_SPEED),
+            segments: synthesis.segments,
+        });
+        Ok(asset)
+    }
+
+    /// Land a synthesized voiceover: store the asset (reusing it when the same
+    /// script was generated before), record its script as the asset's
+    /// transcript, and put it on the timeline as one edit.
+    ///
+    /// With no `track_id` it goes on the audio track named [`VOICEOVER_TRACK`],
+    /// which is created on first use — narration kept on its own lane, never
+    /// dropped on top of the dialogue or the music bed on `A1`. With no
+    /// `timeline_start` it is appended after whatever that track already holds.
+    pub fn place_voiceover(&self, asset: &Asset, track_id: Option<Uuid>, timeline_start: Option<f64>) -> Result<(Asset, Clip)> {
+        let asset = self.insert_or_get_asset(asset)?;
+        if let Some(voiceover) = &asset.voiceover {
+            // Keep whatever an earlier analysis measured; only the transcript is
+            // ours to write.
+            let mut analysis = self.get_analysis(asset.id)?.unwrap_or_else(|| AssetAnalysis {
+                asset_id: asset.id,
+                ..AssetAnalysis::default()
+            });
+            analysis.transcript = voiceover.segments.clone();
+            self.set_analysis(&analysis)?;
+        }
+        let clip = self.edit_timeline("Add voiceover", |timeline| {
+            let tid = match track_id {
+                Some(t) => {
+                    let track = timeline.track(t).ok_or(Error::TrackNotFound(t))?;
+                    if track.kind != StreamKind::Audio {
+                        return Err(Error::InvalidArgument("a voiceover goes on an audio track".to_string()));
+                    }
+                    t
+                }
+                None => match timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.kind == StreamKind::Audio && t.name == VOICEOVER_TRACK)
+                {
+                    Some(track) => track.id,
+                    None => {
+                        let track = Track::new(StreamKind::Audio, VOICEOVER_TRACK.to_string());
+                        let id = track.id;
+                        timeline.tracks.push(track);
+                        id
+                    }
+                },
+            };
+            let start = timeline_start
+                .map(|t| t.max(0.0))
+                .unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
+            let clip = Clip::for_asset(&asset, 0.0, asset.duration, start);
+            timeline
+                .track_mut(tid)
+                .expect("track resolved above")
+                .clips
+                .push(clip.clone());
+            Ok(clip)
+        })?;
+        Ok((asset, clip))
+    }
+
     /// Remove the captions [`Project::generate_captions`] wrote, leaving titles
     /// and lower-thirds alone.
     pub fn clear_captions(&self) -> Result<usize> {
@@ -3324,7 +3394,11 @@ fn row_to_task(
     })
 }
 
-fn row_to_asset(
+/// The `assets` columns every asset read selects, in [`read_asset_row`]'s order.
+const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover";
+
+/// An `assets` row as stored, JSON columns still serialized.
+struct AssetRow {
     id: String,
     path: String,
     name: String,
@@ -3332,18 +3406,35 @@ fn row_to_asset(
     streams: String,
     imported_at: String,
     source_paths: Option<String>,
-) -> Result<Asset> {
+    voiceover: Option<String>,
+}
+
+fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
+    Ok(AssetRow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        name: row.get(2)?,
+        duration: row.get(3)?,
+        streams: row.get(4)?,
+        imported_at: row.get(5)?,
+        source_paths: row.get(6)?,
+        voiceover: row.get(7)?,
+    })
+}
+
+fn row_to_asset(row: AssetRow) -> Result<Asset> {
     Ok(Asset {
-        id: parse_uuid(&id)?,
-        path,
-        name,
-        duration,
-        streams: serde_json::from_str(&streams)?,
-        imported_at: parse_dt(&imported_at)?,
-        source_paths: match source_paths {
+        id: parse_uuid(&row.id)?,
+        path: row.path,
+        name: row.name,
+        duration: row.duration,
+        streams: serde_json::from_str(&row.streams)?,
+        imported_at: parse_dt(&row.imported_at)?,
+        source_paths: match row.source_paths {
             Some(json) => serde_json::from_str(&json)?,
             None => Vec::new(),
         },
+        voiceover: row.voiceover.map(|json| serde_json::from_str(&json)).transpose()?,
     })
 }
 
@@ -3453,6 +3544,104 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
+    fn voiceover_asset(path: &str) -> Asset {
+        let mut asset = asset_with(path, vec![aud_stream()]);
+        asset.duration = 4.0;
+        asset.voiceover = Some(Voiceover {
+            text: "Welcome to the shop. We open at nine.".into(),
+            voice: "af_heart".into(),
+            speed: 1.0,
+            segments: vec![
+                TranscriptSegment {
+                    start: 0.0,
+                    end: 1.6,
+                    text: "Welcome to the shop.".into(),
+                },
+                TranscriptSegment {
+                    start: 1.85,
+                    end: 4.0,
+                    text: "We open at nine.".into(),
+                },
+            ],
+        });
+        asset
+    }
+
+    #[test]
+    fn a_voiceover_lands_on_its_own_track_and_captions_from_its_script() {
+        let project = Project::open_in_memory().unwrap();
+        let (asset, clip) = project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), None, Some(2.0))
+            .unwrap();
+        let timeline = project.timeline().unwrap();
+        let vo = timeline.tracks.iter().find(|t| t.name == VOICEOVER_TRACK).expect("VO track");
+        assert_eq!(vo.kind, StreamKind::Audio);
+        assert_eq!(vo.clips.len(), 1);
+        assert_eq!((clip.timeline_start, clip.duration()), (2.0, 4.0));
+        // The script is the transcript: no analysis pass, no speech model.
+        assert_eq!(project.get_analysis(asset.id).unwrap().unwrap().transcript.len(), 2);
+
+        let captions = project.generate_captions(CaptionOptions::default()).unwrap();
+        assert!(!captions.is_empty());
+        assert!(
+            (captions[0].start - 2.0).abs() < 1e-9,
+            "captions follow the clip onto the timeline"
+        );
+        assert!(captions.iter().all(|c| c.end <= 6.0 + 1e-9));
+
+        // A second voiceover joins the same lane, after the first.
+        let (_, second) = project.place_voiceover(&voiceover_asset("/vo/b.wav"), None, None).unwrap();
+        let timeline = project.timeline().unwrap();
+        assert_eq!(timeline.tracks.iter().filter(|t| t.name == VOICEOVER_TRACK).count(), 1);
+        assert_eq!(second.timeline_start, 6.0);
+    }
+
+    #[test]
+    fn a_voiceover_refuses_a_video_track() {
+        let project = Project::open_in_memory().unwrap();
+        let v1 = project.timeline().unwrap().first_track_of(StreamKind::Video).unwrap();
+        assert!(project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), Some(v1), None)
+            .is_err());
+    }
+
+    #[test]
+    fn voiceover_provenance_survives_a_save_and_reopen() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = voiceover_asset("/vo/a.wav");
+        project.insert_asset(&asset).unwrap();
+        let path = std::env::temp_dir().join(format!("kerf-voiceover-{}.kerf", Uuid::new_v4()));
+        project.save_as(&path).unwrap();
+        let loaded = Project::open(&path).unwrap().require_asset(asset.id).unwrap();
+        let voiceover = loaded.voiceover.expect("voiceover survives");
+        assert_eq!(voiceover.voice, "af_heart");
+        assert_eq!(voiceover.segments.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_older_file_gains_the_voiceover_column() {
+        let path = std::env::temp_dir().join(format!("kerf-pre-voiceover-{}.kerf", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE assets (id TEXT PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL,
+                 duration REAL NOT NULL, streams TEXT NOT NULL, imported_at TEXT NOT NULL, source_paths TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO assets VALUES (?1, '/m.mp4', 'm', 1.0, '[]', ?2, NULL)",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let project = Project::open(&path).unwrap();
+        let assets = project.list_assets().unwrap();
+        assert_eq!(assets.len(), 1);
+        assert!(assets[0].voiceover.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn asset_with(path: &str, streams: Vec<StreamInfo>) -> Asset {
         Asset {
             id: Uuid::new_v4(),
@@ -3462,6 +3651,7 @@ mod tests {
             streams,
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         }
     }
 
@@ -3779,6 +3969,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -4037,6 +4228,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -4080,6 +4272,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
@@ -4130,6 +4323,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let id = asset.id;
         project.insert_asset(&asset).unwrap();
@@ -4235,6 +4429,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -4295,6 +4490,7 @@ mod tests {
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         project.insert_asset(&asset).unwrap();
 

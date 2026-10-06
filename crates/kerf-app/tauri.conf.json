@@ -37,7 +37,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["licenses/whisper.cpp-NOTICE.md"],
+    "resources": ["licenses/whisper.cpp-NOTICE.md", "licenses/misaki-rs-NOTICE.md"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     }

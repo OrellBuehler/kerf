@@ -7,6 +7,10 @@
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
+	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
+	import { toast } from '$lib/notifications.svelte';
+	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
+	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS } from '$lib/theme';
 
 	let { onClose }: { onClose: () => void } = $props();
@@ -30,6 +34,57 @@
 	const spare = $derived(Math.max(0, cores - threads));
 
 	const themePreset = $derived(settings.themePreset);
+
+	// Voiceover: whether its model is on disk, and a way to fetch it before the
+	// first script rather than in the middle of it.
+	let voStatus = $state<VoiceoverStatus | null>(null);
+	let voError = $state<string | null>(null);
+	let voPreparing = $state(false);
+	let voCancelling = $state(false);
+	let voProgress = $state<VoiceoverProgress | null>(null);
+	$effect(() => {
+		voiceoverStatus().then(
+			(s) => (voStatus = s),
+			(e) => (voError = e instanceof Error ? e.message : String(e))
+		);
+	});
+	const voLine = $derived(
+		voStatus
+			? !voStatus.available
+				? (voStatus.reason ?? 'Voiceover is not available.')
+				: voStatus.ready
+					? 'Voice model ready'
+					: `Not downloaded yet (${approxMB(voStatus.approx_download_bytes)})`
+			: (voError ?? 'Checking…')
+	);
+	const voPct = $derived(voProgress?.fraction == null ? null : Math.round(voProgress.fraction * 100));
+
+	async function downloadVoiceover() {
+		if (!voStatus) return;
+		// The voice last used, so the download is the one that will be wanted.
+		const last = loadPrefs().voice;
+		const voice = voStatus.voices.some((v) => v.id === last) ? last : voStatus.default_voice;
+		voPreparing = true;
+		voCancelling = false;
+		voProgress = null;
+		const unlisten = await onVoiceoverProgress((p) => (voProgress = p));
+		try {
+			voStatus = await prepareVoiceover(voice);
+			toast.success('Voice model ready');
+		} catch (e) {
+			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			unlisten();
+			voPreparing = false;
+			voCancelling = false;
+			voProgress = null;
+		}
+	}
+
+	async function stopVoiceover() {
+		voCancelling = true;
+		await cancelVoiceover();
+	}
 
 	const chip = (active: boolean) =>
 		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid ${
@@ -174,6 +229,48 @@
 					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
 						Off, analysis still detects silence, scenes, loudness and the beat; the Transcript tab and captions
 						have nothing to work from until it is turned back on and the clip re-analyzed.
+					</p>
+
+					<div
+						style="margin-top:24px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
+						Voiceover
+					</div>
+					<div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+						<span
+							style="flex:1;min-width:0;font-size:12px;color:{voStatus && !voStatus.available
+								? 'var(--red-400)'
+								: 'var(--text-primary)'}">{voLine}</span
+						>
+						{#if voPreparing}
+							<Btn variant="destructive" size="sm" disabled={voCancelling} onclick={stopVoiceover}>
+								{voCancelling ? 'Stopping…' : 'Cancel'}
+							</Btn>
+						{:else if voStatus?.available && !voStatus.ready}
+							<Btn variant="secondary" size="sm" icon="download" onclick={downloadVoiceover}>Download now</Btn>
+						{/if}
+					</div>
+					{#if voPreparing}
+						<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+							<div style="display:flex;align-items:baseline;gap:8px;font-size:12px">
+								<span style="color:var(--text-secondary)"
+									>{voProgress ? stageLabel(voProgress.stage) : 'Starting…'}</span
+								>
+								<span
+									style="flex:1;font-family:var(--font-mono);font-size:11px;color:var(--text-muted);text-align:right"
+									>{voProgress?.detail ?? ''}{voPct !== null ? ` · ${voPct}%` : ''}</span
+								>
+							</div>
+							<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
+								<div
+									style="height:100%;width:{voPct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
+								></div>
+							</div>
+						</div>
+					{/if}
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.
+						Without this it downloads the first time you generate one.
 					</p>
 				{:else if section === 'preview'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
