@@ -4,8 +4,11 @@
 	import { Toaster } from '$lib/components/ui/sonner';
 	import { onMount } from 'svelte';
 	import { installSliderFill } from '$lib/slider-fill';
+	import { installErrorLogging } from '$lib/log';
 
 	let { children } = $props();
+
+	installErrorLogging();
 	onMount(() => installSliderFill());
 </script>
 

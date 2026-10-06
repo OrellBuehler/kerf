@@ -53,6 +53,7 @@ import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
+import { describeError, logFrontend } from './log';
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -70,7 +71,13 @@ function hasNonFinite(v: unknown, depth = 0): boolean {
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	if (hasNonFinite(args)) throw new Error('That value is not a number.');
 	const { invoke } = await import('@tauri-apps/api/core');
-	return invoke<T>(cmd, args);
+	try {
+		return await invoke<T>(cmd, args);
+	} catch (e) {
+		const message = describeError(e);
+		logFrontend(/cancel/i.test(message) ? 'info' : 'error', `${cmd} failed: ${message}`, `command ${cmd}`);
+		throw e;
+	}
 }
 
 // ---- sample fallback (browser dev) ----------------------------------------

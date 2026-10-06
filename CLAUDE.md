@@ -820,7 +820,21 @@ files one `render_variants` call at a time so a failure names the file in flight
 that one is removed, the finished ones stay. The error carries ffmpeg's stderr
 tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
 ffmpeg error when a stream someone is still watching dies, so the preview can say
-why it went black. **No command runs on the main thread** (a plain sync
+why it went black. **Logging** (`init_logging`): stdout plus a daily-rolling `kerf.<date>.log` (14 kept) in
+`<app data dir>/logs` — `log_dir_path` is the one place that is decided, shared by
+`init_logging`, `log_dir` and `reveal_logs`; if it is not writable the app logs to stdout
+only. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
+directories (never env dumps or args). Failures reach the file from three places:
+Tauri commands return plain `String` errors that Tauri offers no hook to observe, so the
+single `invoke` wrapper in `api.ts` forwards every rejection (command name + message,
+`info` for a cancellation) to the **`log_frontend`** command, which also takes error /
+warning toasts (`notifications.svelte.ts`) and `window.onerror` / `unhandledrejection`
+(`log.ts`, installed in `+layout.svelte`); it writes with target `webview`, caps a message
+at 8 KiB and admits 30 lines per second. MCP tool errors are logged once, in the
+`call_tool` override beside `#[tool_handler]` (target `mcp`: `warn` for invalid_params,
+`error` otherwise), whichever helper built the error. All of it is a no-op in the browser
+harness.
+**No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
