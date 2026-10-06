@@ -85,6 +85,18 @@ describe('mediaInfo', () => {
 	});
 });
 
+describe('voiceover assets', () => {
+	const vo = {
+		...music,
+		id: 'v',
+		voiceover: { text: 'Hello there.', voice: 'bf_emma', speed: 1.25, segments: [{ start: 0, end: 1, text: 'Hello there.' }] }
+	} as Asset;
+	test('name the voice and speed; an ordinary asset names neither', () => {
+		expect(mediaInfo(vo, timeline).voiceover).toBe('Emma · 1.25×');
+		expect(mediaInfo(music, timeline).voiceover).toBeNull();
+	});
+});
+
 describe('analysisFacts', () => {
 	const analysis: AssetAnalysis = {
 		asset_id: 'a',

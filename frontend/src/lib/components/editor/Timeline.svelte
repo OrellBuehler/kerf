@@ -6,7 +6,8 @@
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import type { Clip, Marker, StreamKind, Track } from '$lib/types';
+	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
+	import { packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
 	import { gainLabel, panLabel } from '$lib/mixer';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
@@ -426,6 +427,7 @@
 	function resetDragState() {
 		drag = null;
 		trimDrag = null;
+		titleDrag = null;
 		scrubbing = false;
 		markDrag = null;
 		markerDrag = null;
@@ -443,7 +445,7 @@
 	function onPointerMove(e: PointerEvent) {
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
-		if ((drag || trimDrag || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
+		if ((drag || trimDrag || titleDrag || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
 			resetDragState();
 			return;
 		}
@@ -460,6 +462,10 @@
 			// The pair stays ordered, matching how I/O set them from the keyboard.
 			if (markDrag === 'in') ui.markIn = Math.min(t, ui.markOut ?? Infinity);
 			else ui.markOut = Math.max(t, ui.markIn ?? 0);
+			return;
+		}
+		if (titleDrag) {
+			onTitleDragMove(e);
 			return;
 		}
 		if (trimDrag) {
@@ -498,6 +504,10 @@
 		}
 		if (markDrag) {
 			markDrag = null;
+			return;
+		}
+		if (titleDrag) {
+			onTitleDragUp();
 			return;
 		}
 		if (trimDrag) {
@@ -802,6 +812,117 @@
 		ui.zoom = next;
 	}
 
+	// ---- titles lane: titles / lower-thirds / captions are their own items -----
+	//
+	// They live on the timeline (`Timeline.overlays`), not on any clip, so they
+	// get a lane of their own rather than a section in the clip inspector.
+	// Overlapping items (a title over a run of captions) stack into rows.
+
+	const TITLE_ROW_H = 22;
+	const TITLE_LANE_PAD = 4;
+	const titleRows = $derived(packRows(editor.overlays));
+	const titleLaneH = $derived(
+		Math.max(1, ...[...titleRows.values()].map((r) => r + 1)) * TITLE_ROW_H + TITLE_LANE_PAD * 2
+	);
+
+	type TitleDrag = {
+		id: string;
+		mode: 'move' | 'l' | 'r';
+		grabSec: number;
+		origStart: number;
+		origEnd: number;
+		start: number;
+		end: number;
+		moved: boolean;
+	};
+	let titleDrag = $state<TitleDrag | null>(null);
+	let titleLaneEl = $state<HTMLElement | null>(null);
+
+	/** Where a title's edges snap to: 0, the playhead, beats, every clip edge and the other titles'. */
+	function titleSnapPoints(id: string): number[] {
+		const pts = [0, ui.time, ...beatTimes];
+		for (const t of editor.timeline.tracks)
+			for (const c of t.clips) pts.push(c.timeline_start, c.timeline_start + clipDuration(c));
+		for (const o of editor.overlays) if (o.id !== id) pts.push(o.start, o.end);
+		return pts;
+	}
+
+	function onTitlePointerDown(e: PointerEvent, o: TextOverlay, mode: 'move' | 'l' | 'r') {
+		if (e.button !== 0) return;
+		e.stopPropagation();
+		editor.selectOverlay(o.id);
+		const left = titleLaneEl?.getBoundingClientRect().left ?? 0;
+		titleDrag = {
+			id: o.id,
+			mode,
+			grabSec: laneTime(e.clientX, left) - o.start,
+			origStart: o.start,
+			origEnd: o.end,
+			start: o.start,
+			end: o.end,
+			moved: false
+		};
+		capturePointer(e);
+	}
+
+	function onTitleDragMove(e: PointerEvent) {
+		const d = titleDrag;
+		if (!d) return;
+		const t = laneTime(e.clientX, titleLaneEl?.getBoundingClientRect().left ?? 0);
+		const pts = titleSnapPoints(d.id);
+		const threshold = 8 / pxPerSec;
+		let start: number;
+		let end: number;
+		if (d.mode === 'move') {
+			const dur = d.origEnd - d.origStart;
+			start = ui.snap ? snapSpanStart(t - d.grabSec, dur, pts, threshold) : Math.max(0, t - d.grabSec);
+			end = start + dur;
+		} else {
+			({ start, end } = trimSpan(d.origStart, d.origEnd, d.mode, ui.snap ? snapTime(t, pts, threshold) : t));
+		}
+		const eps = 2 / pxPerSec;
+		titleDrag = {
+			...d,
+			start,
+			end,
+			moved: d.moved || Math.abs(start - d.origStart) >= eps || Math.abs(end - d.origEnd) >= eps
+		};
+	}
+
+	function onTitleDragUp() {
+		const d = titleDrag;
+		titleDrag = null;
+		if (!d) return;
+		if (!d.moved) {
+			if (d.mode === 'move') ui.seek(d.origStart + d.grabSec); // a plain click seeks there, into the title
+			return;
+		}
+		void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
+	}
+
+	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + 3).catch(err);
+
+	function onTitleContextMenu(e: MouseEvent, o: TextOverlay) {
+		e.stopPropagation();
+		editor.selectOverlay(o.id);
+		contextMenu.show(e, [
+			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start) },
+			{ type: 'separator' },
+			{
+				label: o.generated ? 'Remove caption' : 'Remove title',
+				icon: 'trash',
+				danger: true,
+				shortcut: 'Del',
+				action: () => void editor.removeOverlay(o.id).catch(err)
+			}
+		]);
+	}
+
+	function onTitleLaneContextMenu(e: MouseEvent) {
+		e.stopPropagation();
+		contextMenu.show(e, [{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere }]);
+	}
+
 	// ---- ruler scrub + draggable in/out marks ---------------------------------
 
 	let scrubbing = false;
@@ -899,6 +1020,9 @@
 	onpointerup={onPointerUp}
 	onpointercancel={onPointerCancel}
 	onblur={onWindowBlur}
+	onkeydown={(e) => {
+		if (e.key === 'Escape' && titleDrag) resetDragState();
+	}}
 />
 
 <div
@@ -1008,6 +1132,22 @@
 			<div
 				style="height:var(--ruler-h);border-bottom:var(--line-width) solid var(--border-subtle);position:sticky;top:0;z-index:50;background:var(--surface-app)"
 			></div>
+			<div
+				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
+			>
+				<span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary);flex:none">T</span>
+				<span style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+					>Titles · {editor.overlays.length}</span
+				>
+				<button
+					title="Add a title at the playhead"
+					aria-label="Add a title"
+					disabled={editor.busy}
+					onclick={addTitleHere}
+					style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:var(--text-disabled)"
+					><Icon n="plus" s={12} /></button
+				>
+			</div>
 			{#each editor.timeline.tracks as t (t.id)}
 				<div
 					role="presentation"
@@ -1232,6 +1372,62 @@
 					Timeline empty — import media and queue a cut
 				</div>
 			{/if}
+
+			<!-- titles lane: every title, lower-third and caption, in its own row of
+			     items rather than a section of whichever clip is selected -->
+			<div
+				bind:this={titleLaneEl}
+				role="presentation"
+				data-title-lane
+				onclick={onLaneSeek}
+				oncontextmenu={onTitleLaneContextMenu}
+				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);position:relative"
+			>
+				{#if editor.overlays.length === 0}
+					<span
+						style="position:absolute;left:8px;top:0;bottom:0;display:flex;align-items:center;font-size:11px;color:var(--text-disabled);pointer-events:none;white-space:nowrap"
+						>Titles and captions appear here</span
+					>
+				{/if}
+				{#each editor.overlays as o (o.id)}
+					{@const live = titleDrag?.moved && titleDrag.id === o.id ? titleDrag : null}
+					{@const row = titleRows.get(o.id) ?? 0}
+					{@const width = Math.max(6, (o.end - o.start) * pxPerSec)}
+					{@const selected = editor.selectedOverlayId === o.id}
+					<button
+						onpointerdown={(e) => onTitlePointerDown(e, o, 'move')}
+						oncontextmenu={(e) => onTitleContextMenu(e, o)}
+						onclick={(e) => e.stopPropagation()}
+						title="{o.generated ? 'Caption' : 'Title'}: {o.text}"
+						style="position:absolute;left:{o.start * pxPerSec}px;top:{TITLE_LANE_PAD + row * TITLE_ROW_H}px;height:{TITLE_ROW_H - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))' : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+					>
+						<span
+							style="position:relative;font-size:10px;font-weight:{o.generated ? 500 : 600};color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							>{o.text}</span
+						>
+						{#if width > 24}
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'l')}
+								style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'r')}
+								style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+						{/if}
+					</button>
+					{#if live}
+						<div
+							style="position:absolute;left:{live.start * pxPerSec}px;top:{TITLE_LANE_PAD + row * TITLE_ROW_H}px;height:{TITLE_ROW_H - 3}px;width:{Math.max(
+								6,
+								(live.end - live.start) * pxPerSec
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
+						></div>
+					{/if}
+				{/each}
+			</div>
 
 			<!-- tracks -->
 			{#each editor.timeline.tracks as t (t.id)}

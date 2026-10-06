@@ -39,6 +39,8 @@ struct AppState {
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
     analysis_cancel: Arc<AtomicBool>,
+    /// Same, for a voiceover being synthesized (or its model downloading).
+    voiceover_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +494,120 @@ async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+// ---- voiceover ---------------------------------------------------------------
+
+/// Whether voiceovers can be generated here, what the first one has to
+/// download, and the voices on offer.
+#[tauri::command(async)]
+fn voiceover_status() -> CmdResult<kerf_core::VoiceoverStatus> {
+    Ok(kerf_core::voiceover_status())
+}
+
+/// One step of generating a voiceover: a download (`download_runtime`,
+/// `download_model`, `download_voice`) or `synthesize`.
+#[derive(Serialize, Clone)]
+pub(crate) struct VoiceoverProgressEvent {
+    pub(crate) stage: String,
+    pub(crate) fraction: Option<f64>,
+    pub(crate) detail: Option<String>,
+}
+
+/// The error an abandoned voiceover returns, for the webview to stay quiet on.
+const VOICEOVER_CANCELLED: &str = "voiceover cancelled";
+
+fn voiceover_err(e: kerf_core::Error) -> String {
+    match e {
+        kerf_core::Error::Cancelled => VOICEOVER_CANCELLED.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Download the voice runtime, model and `voice` ahead of time, streaming
+/// `voiceover-progress`, so the first voiceover starts synthesizing at once.
+#[tauri::command]
+async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: String) -> CmdResult<kerf_core::VoiceoverStatus> {
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(voiceover_err)?;
+        Ok(kerf_core::voiceover_status())
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct VoiceoverResult {
+    asset: Asset,
+    timeline: Timeline,
+}
+
+/// Read `text` aloud and put it on the timeline — on the `VO` track unless
+/// `track_id` names another audio track, at `timeline_start` or after what is
+/// already there — then caption the cut when `captions` is given.
+///
+/// Synthesis (and a first-use model download) runs with the project lock
+/// released, like an import; only landing the result takes it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn generate_voiceover(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+    voice: Option<String>,
+    speed: Option<f64>,
+    track_id: Option<String>,
+    timeline_start: Option<f64>,
+    captions: Option<CaptionOptions>,
+) -> CmdResult<VoiceoverResult> {
+    let track = track_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    let cancel = state.voiceover_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let voice = voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "voiceover-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        let asset = Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(voiceover_err)?;
+        let project = lock_user(&shared);
+        let (asset, _) = project
+            .place_voiceover(&asset, track, timeline_start)
+            .map_err(|e| e.to_string())?;
+        if let Some(options) = captions {
+            project.generate_captions(options).map_err(|e| e.to_string())?;
+        }
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(VoiceoverResult { asset, timeline })
+    })
+    .await
+}
+
+/// Request cancellation of the voiceover being generated (or its download).
+#[tauri::command(async)]
+fn cancel_voiceover(state: State<'_, AppState>) {
+    state.voiceover_cancel.store(true, Ordering::SeqCst);
 }
 
 // ---- timeline editing (each returns the refreshed timeline) ----------------
@@ -1693,6 +1809,9 @@ fn mcp_endpoint() -> String {
 struct AgentStatus {
     endpoint: String,
     last_seen_secs: Option<i64>,
+    /// Set when the server could not start (the port is taken), so the panel
+    /// can say that instead of showing an endpoint nothing answers on.
+    error: Option<String>,
 }
 
 #[tauri::command(async)]
@@ -1700,6 +1819,7 @@ fn agent_status() -> AgentStatus {
     AgentStatus {
         endpoint: mcp::endpoint_url(),
         last_seen_secs: mcp::agent_last_seen_secs(),
+        error: mcp::server_error(),
     }
 }
 
@@ -1712,23 +1832,15 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
     settings::SettingsView::current(&settings::load(&app))
 }
 
-/// Write the preferences and put them into force. Returns the resolved view, so
+/// Merge a patch — only the fields that changed (`{layout}`, `{theme}`,
+/// `{cpu_percent}`, …) — into the stored preferences and put them into force.
+/// Patching rather than replacing means two call sites writing at once cannot
+/// overwrite each other's field with a stale copy. Returns the resolved view, so
 /// the dialog can show the clamped percentage and the cores it works out to
 /// without a second round-trip.
 #[tauri::command(async)]
-fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
-    // Clamp through the engine first, then persist what was actually applied —
-    // storing an out-of-range value would keep re-clamping on every launch.
-    kerf_core::set_transcription_enabled(settings.transcribe);
-    settings::set_safe_areas(settings.safe_areas);
-    let stored = settings::Settings {
-        cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
-        transcribe: settings.transcribe,
-        safe_areas: settings.safe_areas,
-        layout: settings.layout,
-        theme: settings.theme,
-    };
-    settings::save(&app, &stored)?;
+fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings::SettingsView> {
+    let stored = settings::update(&app, &patch)?;
     Ok(settings::SettingsView::current(&stored))
 }
 
@@ -1738,12 +1850,29 @@ fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<setti
 /// path comes from a file picker the user could point at anything.
 const TEXT_FILE_MAX: u64 = 1 << 20;
 
+/// These two commands take a path the webview chose, so they only touch `.json`
+/// files — a theme — and never anything that is not a plain file.
+fn require_json_path(path: &str) -> CmdResult<()> {
+    let is_json = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .json file"))
+    }
+}
+
 /// A small text file picked by the user (a theme to import).
 #[tauri::command]
 async fn read_text_file(path: String) -> CmdResult<String> {
     blocking(move || {
-        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if len > TEXT_FILE_MAX {
+        require_json_path(&path)?;
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        if meta.len() > TEXT_FILE_MAX {
             return Err(format!("{path} is larger than 1 MiB — not a theme file"));
         }
         std::fs::read_to_string(&path).map_err(|e| e.to_string())
@@ -1755,6 +1884,13 @@ async fn read_text_file(path: String) -> CmdResult<String> {
 #[tauri::command]
 async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
     blocking(move || {
+        require_json_path(&path)?;
+        if contents.len() as u64 > TEXT_FILE_MAX {
+            return Err("contents are larger than 1 MiB — not a theme file".to_string());
+        }
+        if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{path} is not a regular file"));
+        }
         std::fs::write(&path, contents).map_err(|e| e.to_string())?;
         Ok(path)
     })
@@ -1763,10 +1899,15 @@ async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
 
 // ---- diagnostics (logs) ----------------------------------------------------
 
+/// Where the logfiles live: `<app data dir>/logs`. The one place this is
+/// decided, so `init_logging`, `log_dir` and `reveal_logs` cannot disagree.
+fn log_dir_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
+    app.path().app_data_dir().map(|dir| dir.join("logs"))
+}
+
 #[tauri::command(async)]
 fn log_dir(app: AppHandle) -> CmdResult<String> {
-    app.path()
-        .app_log_dir()
+    log_dir_path(&app)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| e.to_string())
 }
@@ -1775,10 +1916,85 @@ fn log_dir(app: AppHandle) -> CmdResult<String> {
 #[tauri::command(async)]
 fn reveal_logs(app: AppHandle) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let dir = log_dir_path(&app).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     app.opener()
         .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+/// The longest message the webview may write to the log; the rest is cut so a
+/// runaway loop (or an error carrying a whole payload) cannot fill the disk.
+const FRONTEND_LOG_MAX: usize = 8 * 1024;
+const FRONTEND_CONTEXT_MAX: usize = 512;
+/// Webview lines let through per second; the rest are counted and reported.
+const FRONTEND_LOG_PER_SEC: u32 = 30;
+
+fn truncate_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// A fixed one-second window: `admit` says whether this line may be written and,
+/// when a new window opens, how many the last one turned away.
+#[derive(Default)]
+struct LogBudget {
+    window: u64,
+    used: u32,
+    dropped: u32,
+}
+
+impl LogBudget {
+    fn admit(&mut self, now_ms: u64) -> (bool, u32) {
+        let window = now_ms / 1000;
+        let mut dropped = 0;
+        if window != self.window {
+            dropped = std::mem::take(&mut self.dropped);
+            self.window = window;
+            self.used = 0;
+        }
+        if self.used < FRONTEND_LOG_PER_SEC {
+            self.used += 1;
+            (true, dropped)
+        } else {
+            self.dropped += 1;
+            (false, dropped)
+        }
+    }
+}
+
+/// Write a line from the webview — a failed command, an error toast, an
+/// unhandled rejection — to the logfile, marked with the `webview` target.
+#[tauri::command(async)]
+fn log_frontend(level: String, message: String, context: Option<String>) {
+    static BUDGET: Mutex<Option<LogBudget>> = Mutex::new(None);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let (allowed, dropped) = BUDGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(LogBudget::default)
+        .admit(now_ms);
+    if dropped > 0 {
+        tracing::warn!(target: "webview", dropped, "webview log lines dropped (rate limit)");
+    }
+    if !allowed {
+        return;
+    }
+    let message = truncate_log(&message, FRONTEND_LOG_MAX);
+    let context = truncate_log(context.as_deref().unwrap_or(""), FRONTEND_CONTEXT_MAX);
+    match level.as_str() {
+        "error" => tracing::error!(target: "webview", context = %context, "{message}"),
+        "warn" | "warning" => tracing::warn!(target: "webview", context = %context, "{message}"),
+        _ => tracing::info!(target: "webview", context = %context, "{message}"),
+    }
 }
 
 /// Packaged builds ship `ffmpeg`/`ffprobe` next to the executable as Tauri
@@ -1804,8 +2020,8 @@ fn use_bundled_ffmpeg() {
 }
 
 /// Install the global tracing subscriber: always to stdout, and — when the
-/// platform log directory is writable — to a daily-rolling `kerf.<date>.log`
-/// there (the last 14 days are kept) so users hitting an issue can attach it.
+/// log directory (`<app data dir>/logs`) is writable — to a daily-rolling
+/// `kerf.<date>.log` there (the last 14 days are kept) so users hitting an issue can attach it.
 /// Level is `info` by default; override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
 fn init_logging(app: &AppHandle) {
     use tracing_subscriber::prelude::*;
@@ -1814,7 +2030,7 @@ fn init_logging(app: &AppHandle) {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
 
-    let file = app.path().app_log_dir().ok().and_then(|dir| {
+    let file = log_dir_path(app).ok().and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -1856,9 +2072,47 @@ fn install_panic_hook() {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "panic".to_string());
-        tracing::error!(location = %location, "panic: {message}");
+        // Captured regardless of RUST_BACKTRACE: a user's panic has no env var set,
+        // and the logfile is the only copy. Release builds keep their symbol
+        // table (`strip = "debuginfo"`), so the frames have function names.
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(location = %location, "panic: {message}\n{backtrace}");
         default(info);
     }));
+}
+
+/// Emitted to the webview when a second launch carried a `.kerf` path. The
+/// frontend owns the "replace the open project?" question, so it does the open.
+const OPEN_PROJECT_EVENT: &str = "open-project-file";
+
+/// The `.kerf` path in a launch's arguments, resolved against that launch's
+/// working directory (a second launch's relative path is relative to *its* cwd,
+/// not to ours).
+fn project_arg(argv: &[String], cwd: &str) -> Option<String> {
+    let arg = argv.iter().skip(1).find(|a| {
+        std::path::Path::new(a)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("kerf"))
+    })?;
+    let path = std::path::Path::new(arg);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(path)
+    };
+    Some(full.display().to_string())
+}
+
+fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
+    tracing::info!(?argv, "second launch; focusing the running window");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(path) = project_arg(&argv, &cwd) {
+        let _ = app.emit(OPEN_PROJECT_EVENT, path);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1868,6 +2122,11 @@ pub fn run() {
     let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
 
     tauri::Builder::default()
+        // Must be the first plugin. A second launch (a `.kerf` double-clicked
+        // while Kerf is open, or the binary run again) lands here instead of
+        // starting another app that would fight the first for the MCP port and
+        // the settings file.
+        .plugin(tauri_plugin_single_instance::init(on_second_launch))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1876,9 +2135,10 @@ pub fn run() {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            voiceover_cancel: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
-            // Logging needs the resolved platform log directory, so set it up here
+            // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
@@ -1889,6 +2149,10 @@ pub fn run() {
                 version = env!("CARGO_PKG_VERSION"),
                 os = std::env::consts::OS,
                 arch = std::env::consts::ARCH,
+                ffmpeg = %std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()),
+                ffprobe = %std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string()),
+                log_dir = %log_dir_path(app.handle()).map(|p| p.display().to_string()).unwrap_or_default(),
+                data_dir = %app.path().app_data_dir().map(|p| p.display().to_string()).unwrap_or_default(),
                 "kerf starting"
             );
 
@@ -1917,6 +2181,10 @@ pub fn run() {
             transcription_status,
             set_speech_model,
             download_speech_model,
+            voiceover_status,
+            prepare_voiceover,
+            generate_voiceover,
+            cancel_voiceover,
             cut_clip,
             add_clip,
             split_clip,
@@ -2006,7 +2274,8 @@ pub fn run() {
             read_text_file,
             write_text_file,
             log_dir,
-            reveal_logs
+            reveal_logs,
+            log_frontend
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerf");
@@ -2014,7 +2283,26 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::require_local_output_path;
+    use super::{require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
+
+    #[test]
+    fn truncate_log_keeps_short_and_cuts_on_a_char_boundary() {
+        assert_eq!(truncate_log("short", 10), "short");
+        let cut = truncate_log("aéééé", 4);
+        assert!(cut.starts_with("aé…"), "{cut}");
+        assert!(cut.contains("truncated"));
+    }
+
+    #[test]
+    fn log_budget_caps_a_second_and_reports_the_drops_next_window() {
+        let mut b = LogBudget::default();
+        for _ in 0..FRONTEND_LOG_PER_SEC {
+            assert_eq!(b.admit(5_000), (true, 0));
+        }
+        assert_eq!(b.admit(5_500), (false, 0));
+        assert_eq!(b.admit(5_900), (false, 0));
+        assert_eq!(b.admit(6_100), (true, 2));
+    }
 
     #[test]
     fn accepts_absolute_local_paths() {
@@ -2057,5 +2345,30 @@ mod tests {
         // mistaken for a scheme — this is the whole reason the check isn't
         // just "contains a colon".
         assert!(require_local_output_path("D:\\video\\clip.mov").is_ok());
+    }
+
+    #[test]
+    fn a_second_launch_forwards_only_a_kerf_path() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(project_arg(&argv(&["kerf"]), "/home/u"), None);
+        assert_eq!(project_arg(&argv(&["kerf", "--flag", "notes.txt"]), "/home/u"), None);
+        assert_eq!(
+            project_arg(&argv(&["kerf", "/data/cut.kerf"]), "/home/u").as_deref(),
+            Some("/data/cut.kerf")
+        );
+        assert_eq!(
+            project_arg(&argv(&["kerf", "CUT.KERF"]), "/home/u").map(|p| p.replace('\\', "/")),
+            Some("/home/u/CUT.KERF".to_string())
+        );
+        // argv[0] is the binary, never a project.
+        assert_eq!(project_arg(&argv(&["/opt/x.kerf"]), "/home/u"), None);
+    }
+
+    #[test]
+    fn text_file_commands_only_take_json() {
+        assert!(require_json_path("/t/dark.kerf-theme.json").is_ok());
+        assert!(require_json_path("C:\\t\\THEME.JSON").is_ok());
+        assert!(require_json_path("/home/u/.bashrc").is_err());
+        assert!(require_json_path("/t/theme.json.exe").is_err());
     }
 }

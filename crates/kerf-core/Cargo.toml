@@ -42,6 +42,15 @@ fontdb.workspace = true
 # Speech model downloads (see engine::whisper). Blocking + rustls, so it needs
 # no async runtime and no system OpenSSL.
 ureq = "3.4"
+# Voiceover (see engine::tts): Kokoro runs on ONNX Runtime, loaded at runtime
+# from a library downloaded on first use (`load-dynamic`), so nothing native is
+# linked at build time. misaki-rs without its GPL espeak-ng fallback.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+misaki-rs = { version = "0.6", default-features = false }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
 

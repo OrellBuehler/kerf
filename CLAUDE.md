@@ -310,6 +310,38 @@ keeping the `.part` file so the next attempt resumes rather than re-fetching 148
 A cancelled pass returns `Error::Cancelled` and caches **nothing**: a half-analyzed
 asset would read as analyzed, and its missing transcript as "no speech".
 
+**Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
+feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
+ships — `ort` is built `load-dynamic`, and the runtime library (Microsoft's release
+archive for the platform, **pinned by SHA-256** in `runtime_spec`; Intel Macs stay
+on 1.20, the last build Microsoft made for them; `ORT_DYLIB_PATH` supplies one
+instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
+~88 MB; `KERF_KOKORO_MODEL_URL` a mirror) and each voice pack (~0.5 MB) are fetched
+on first use through **`engine/download.rs`** — the resumable, cancellable `.part` +
+verify + rename fetch lifted out of whisper, which both now share. Static linking
+was ruled out: pyke's prebuilt runtime needs glibc 2.38 and the Linux bundles build
+on Ubuntu 22.04. Phonemes come from **`misaki-rs` without its espeak-ng fallback**
+(espeak-ng is GPL-3), so unknown words are spelled out and only the English (`a*` /
+`b*`) voices are offered; misaki-rs writes espeak-flavoured IPA (ZWJ-joined
+diphthongs, length marks), which `to_kokoro_phonemes` (pure + unit-tested) maps onto
+Kokoro's own single-symbol set. **Each sentence is synthesized on its own**
+(`split_sentences`, abbreviation- and decimal-aware; blank line = paragraph pause),
+which keeps every call inside the 510-token window (`chunk_tokens` splits a longer
+one at a clause) and makes the timings exact — sample counts, not a speech model's
+estimate. So a generated asset carries **`Asset.voiceover`** (`Voiceover`: script,
+voice, speed, per-sentence `segments`; a `voiceover` JSON column migrated like
+`source_paths`), `place_voiceover` writes those segments as its transcript, and
+`generate_captions` subtitles it with no new caption code; `analyze_asset_media_*`
+reads a voiceover's transcript from its script (`VoiceoverScript`) instead of
+running whisper over audio whose words are known. The WAV lands in the **data**
+dir (`<data>/kerf/voiceovers/voiceover-<hash>.wav` — the only copy, unlike a proxy)
+with a `.json` timings sidecar, named by a hash of model/voice/speed/text so the
+same script is a cache hit and the same asset. `Project::synthesize_voiceover`
+(static, lock released, `cpu::lease` held, ORT intra-op threads = the budget, no
+spinning) + `place_voiceover` (under the lock: the asset, its transcript, and one
+`Add voiceover` edit onto the `VO` audio track, created on first use) is the
+lock-free split again.
+
 Two more optional features: `libav-render` (above) and `whisper` (in-process
 `whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time). Both are
 off by default, so `--no-default-features` CI exercises neither — but **release
@@ -365,6 +397,19 @@ bunx @tauri-apps/cli@2 dev   --config crates/kerf-app/tauri.conf.json
 bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 ```
+
+**Debug builds have their own identity.** `tauri.dev.conf.json` (next to
+`tauri.conf.json`) sets `identifier` to `ch.orellbuehler.kerf.dev`, which names the
+app's config and log directories and the single-instance lock — so a dev run
+neither rewrites an installed Kerf's `settings.json` nor refuses to start while
+that one is open. Tauri resolves its config at compile time (`tauri_build` and
+`generate_context!` both merge the `TAURI_CONFIG` JSON env var over the file), and
+`cargo run` has no CLI to set it, so `crates/kerf-app/build.rs` does: when cargo's
+`PROFILE` is `debug` it merges `tauri.dev.conf.json` into `TAURI_CONFIG` (keys the
+CLI already set win) and passes the result to rustc via `cargo:rustc-env`. That
+covers `cargo run`, `cargo test` and `tauri dev` alike with no extra flag;
+release builds never see it. A debug-profile build is therefore *not* the
+shipping identifier — to test that, build `--release`.
 
 ### Local checks (prek) and the agent harness
 
@@ -691,6 +736,11 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
+`generate_voiceover` narrates a script onto the `VO` track (optionally captioning the
+cut in the same call), forwarding synthesis progress to the client's token and
+re-emitting `voiceover-progress` so the GUI shows an agent's voiceover too; like an
+import, the generated asset lands for the user at once, while its placement and
+captions stage. `voiceover_status` is its read side.
 `import_asset` is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
 them immediately, reporting on the same `import-progress` event a lens-pair
@@ -714,12 +764,14 @@ the user has not got.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
 `analysis-progress` per step), speech-to-text (`transcription_status`,
-`set_speech_model`, `download_speech_model` → emits `model-progress`), every editing
+`set_speech_model`, `download_speech_model` → emits `model-progress`), voiceover
+(`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
+`voiceover-progress`, `cancel_voiceover`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
@@ -764,10 +816,17 @@ of *this* computer Kerf may use is not something that should travel inside a
 The file also carries the **workspace layout** and the **color theme** as two
 opaque `serde_json::Value`s — the frontend owns their shape and validates them
 on the way back in, so `get_settings` re-reads the file for those where the
-engine-held values are read live), `read_text_file` / `write_text_file`
+engine-held values are read live). **`set_settings` takes a patch**, not the
+whole object — only the fields that changed (`{layout}`, `{theme}`,
+`{cpu_percent}`), merged into the file under a mutex, and only those fields are
+pushed into the engine (so a layout write never re-applies the stored CPU share
+over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
+directory, fsync, rename over), and a file that does not parse is moved aside to
+`settings.corrupt-<unix-ms>.json` before defaults load, so the next save cannot
+destroy an imported theme), `read_text_file` / `write_text_file`
 (a theme file the user picked, imported or exported — the only commands that
-read a caller-chosen path, so the read is capped at 1 MiB)
-and `agent_status` (the MCP endpoint plus how
+read a caller-chosen path, so both take only `.json` paths, refuse a non-regular file, and cap read and write at 1 MiB)
+and `agent_status` (the MCP endpoint, an `error` when the server could not bind — the agent panel then says the port is taken instead of showing a dead endpoint — plus how
 many seconds ago an agent last spoke to it, or `null` if none ever has —
 `mcp::LAST_AGENT_ACTIVITY`, stamped in `lock_agent` and in `get_info`, since
 `initialize` is the one moment an agent is known to be there; a
@@ -781,7 +840,21 @@ files one `render_variants` call at a time so a failure names the file in flight
 that one is removed, the finished ones stay. The error carries ffmpeg's stderr
 tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
 ffmpeg error when a stream someone is still watching dies, so the preview can say
-why it went black. **No command runs on the main thread** (a plain sync
+why it went black. **Logging** (`init_logging`): stdout plus a daily-rolling `kerf.<date>.log` (14 kept) in
+`<app data dir>/logs` — `log_dir_path` is the one place that is decided, shared by
+`init_logging`, `log_dir` and `reveal_logs`; if it is not writable the app logs to stdout
+only. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
+directories (never env dumps or args). Failures reach the file from three places:
+Tauri commands return plain `String` errors that Tauri offers no hook to observe, so the
+single `invoke` wrapper in `api.ts` forwards every rejection (command name + message,
+`info` for a cancellation) to the **`log_frontend`** command, which also takes error /
+warning toasts (`notifications.svelte.ts`) and `window.onerror` / `unhandledrejection`
+(`log.ts`, installed in `+layout.svelte`); it writes with target `webview`, caps a message
+at 8 KiB and admits 30 lines per second. MCP tool errors are logged once, in the
+`call_tool` override beside `#[tool_handler]` (target `mcp`: `warn` for invalid_params,
+`error` otherwise), whichever helper built the error. All of it is a no-op in the browser
+harness.
+**No command runs on the main thread** (a plain sync
 command would freeze the window in Tauri v2): quick ops are
 `#[tauri::command(async)]`, and every heavy one (ffmpeg decode / analysis /
 export, disk-bound open/save) is an `async fn` that pushes its work onto the
@@ -987,7 +1060,33 @@ fade-in/out opacity keyframes; the caption style matches what
 captions look alike (`CAPTION_LOOKS` in the same file is only the two
 generate-time labels; their numbers live in `captions.ts`).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
-utilities. The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
+utilities. **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
+been timeline-level, and the UI now says so: the Timeline has a **titles lane**
+(`T`, above V1; `data-title-lane`) where every title / lower-third / caption is a
+block from `start` to `end` (generated captions dashed and dimmer; overlapping
+items stack into rows via `packRows`). Click selects (`editor.selectOverlay`,
+exclusive with the clip selection; click also seeks into the title), the body
+drags in time, the 6px edges trim, with the clip drag's snapping (0 / playhead /
+beats / every clip edge / other titles), Delete removes it, and one
+`update_overlay` is written per gesture. A selected title makes the Inspector show
+**that title's editor** (text, timing, position, size, colour, box, font, bold,
+keyframes) *instead of* the clip sections; the add / caption controls live in a
+"Titles lane" section below. The **Preview** draws an interactive box over each
+title visible at the playhead (hidden while playing): drag to move, corner
+handles to resize (scales `size` by the pointer's distance from the box centre),
+Escape / pointercancel / blur abandon it, pointer capture holds it, local state
+updates live and **one** backend edit lands on release. The box is laid out in
+the engine's units: `cqh` against a size container covering the drawn picture,
+centred on `(pos_x, pos_y)`, font `size` of the height, browser text metrics
+standing in for drawtext's, `boxborderw` as padding, so it is aligned to within
+font-metric differences. A **keyframed** title follows the Transform convention:
+moving it keyframes the position at the playhead (`editor.moveOverlay`, updating
+an existing keyframe within 20 ms, else inserting one carrying the opacity in
+force), because the static `pos_x/pos_y` is not what an animated render reads;
+resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
+row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
+
+The **timeline is a bespoke NLE timeline** that renders **real `editor.timeline`
 state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.zoom`
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
 of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from

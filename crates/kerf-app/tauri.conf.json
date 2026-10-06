@@ -21,7 +21,27 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src": "'self' data: https://fonts.gstatic.com",
+        "img-src": "'self' data:",
+        "connect-src": "ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src": "'self' data: https://fonts.gstatic.com",
+        "img-src": "'self' data:",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
+        "object-src": "'none'",
+        "base-uri": "'none'"
+      }
     }
   },
   "bundle": {
@@ -37,7 +57,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["licenses/whisper.cpp-NOTICE.md"],
+    "resources": ["licenses/whisper.cpp-NOTICE.md", "licenses/misaki-rs-NOTICE.md"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     }

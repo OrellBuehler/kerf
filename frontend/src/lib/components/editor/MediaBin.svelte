@@ -114,6 +114,7 @@
 		if (info.codec) items.push({ type: 'info', label: 'Codec', value: info.codec });
 		if (info.audio) items.push({ type: 'info', label: 'Audio', value: info.audio });
 		if (info.projection) items.push({ type: 'info', label: 'Projection', value: info.projection });
+		if (info.voiceover) items.push({ type: 'info', label: 'Voiceover', value: info.voiceover });
 		if (info.stitched)
 			items.push({
 				type: 'info',
@@ -166,12 +167,22 @@
 		});
 
 		items.push({ type: 'separator' });
+		if (asset.voiceover) {
+			const vo = asset.voiceover;
+			items.push({
+				label: 'Regenerate voiceover…',
+				icon: 'mic',
+				action: () => ui.openVoiceover({ text: vo.text, voice: vo.voice, speed: vo.speed })
+			});
+		}
 		items.push(
 			analyzing
 				? { label: 'Stop analysis', icon: 'x', action: () => ui.stopAnalysis() }
 				: {
 						label: analysis ? 'Re-analyze' : 'Analyze',
 						icon: 'scan-line',
+						// Its transcript is the script it was read from; whisper would only replace it.
+						disabled: !!asset.voiceover,
 						action: () => void ui.runAnalysis(asset.id).catch(err)
 					}
 		);
@@ -251,6 +262,9 @@
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
 				</div>
+				<div style="display:flex;justify-content:center;margin-top:8px">
+					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>Or write a voiceover</Btn>
+				</div>
 			{/if}
 		{:else}
 			<!-- asset grid -->
@@ -272,7 +286,12 @@
 							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
 						</span>
 					{:else}
-						<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+						<span style="display:inline-flex;gap:2px">
+							<IconBtn title="Voiceover — speak a script onto the timeline" size={30} onclick={() => ui.openVoiceover()}
+								><Icon n="mic" s={14} /></IconBtn
+							>
+							<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
+						</span>
 					{/if}
 				</div>
 				{#each assets as a (a.asset.id)}
@@ -330,6 +349,9 @@
 								>
 								{#if a.info.projection}
 									<Badge tone="kerf">360</Badge>
+								{/if}
+								{#if a.info.voiceover}
+									<Badge tone="kerf">voiceover</Badge>
 								{/if}
 								{#if a.info.kind === 'image'}
 									<Badge tone="neutral">still</Badge>

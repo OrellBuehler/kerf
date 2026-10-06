@@ -6243,6 +6243,7 @@ mod tests {
             streams,
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         }
     }
 
@@ -7072,6 +7073,7 @@ mod tests {
             streams: vec![video_stream(1280, 720, 25.0), audio_stream(44_100, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -7113,6 +7115,7 @@ mod tests {
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let a2 = Asset {
             id: Uuid::new_v4(),
@@ -7122,6 +7125,7 @@ mod tests {
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
         let assets = vec![a1, a2];
@@ -7150,6 +7154,7 @@ mod tests {
             streams: vec![video_stream(1920, 1080, 30.0)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let timeline = single(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
         let assets = vec![video_only];
@@ -7177,6 +7182,7 @@ mod tests {
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -7207,6 +7213,7 @@ mod tests {
             streams: vec![video_stream(3840, 2160, 60.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -7241,6 +7248,7 @@ mod tests {
             streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         }
     }
 
@@ -7253,6 +7261,7 @@ mod tests {
             streams: vec![image_stream(1920, 1080)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         }
     }
 
@@ -7269,6 +7278,7 @@ mod tests {
             streams: vec![v, audio_stream(48_000, 2)],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
+            voiceover: None,
         }
     }
 
