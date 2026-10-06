@@ -64,10 +64,10 @@
 		bind:this={el}
 		role="dialog"
 		aria-label="Notifications"
-		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden;font-family:var(--font-sans)"
+		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden;font-family:var(--font-sans)"
 	>
 		<div
-			style="flex:none;display:flex;align-items:center;gap:8px;padding:9px 10px 9px 12px;border-bottom:1px solid var(--border-default)"
+			style="flex:none;display:flex;align-items:center;gap:8px;padding:9px 10px 9px 12px;border-bottom:var(--line-width) solid var(--border-default)"
 		>
 			<Icon n="bell" s={14} color="var(--text-secondary)" />
 			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary)">Notifications</span>
@@ -81,7 +81,7 @@
 				onclick={() => notifications.markAllRead()}
 				disabled={notifications.unread === 0}
 				title="Mark every notification as read"
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:1px solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
+				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
 					? 'var(--text-secondary)'
 					: 'var(--text-disabled)'};font-size:11px;cursor:{notifications.unread ? 'pointer' : 'default'}"
 				>Mark all read</button
@@ -90,7 +90,7 @@
 				onclick={() => notifications.clear()}
 				disabled={notifications.items.length === 0}
 				title="Clear the log"
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:1px solid var(--border-strong);background:var(--surface-raised);color:{notifications
+				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
 					.items.length
 					? 'var(--text-secondary)'
 					: 'var(--text-disabled)'};font-size:11px;cursor:{notifications.items.length ? 'pointer' : 'default'}"
@@ -98,11 +98,11 @@
 			>
 		</div>
 
-		<div style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:1px solid var(--border-subtle)">
+		<div style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:var(--line-width) solid var(--border-subtle)">
 			{#each [['all', 'All'], ['unread', 'Unread'], ['errors', 'Problems']] as const as [k, label] (k)}
 				<button
 					onclick={() => (filter = k)}
-					style="height:22px;padding:0 9px;border-radius:var(--radius-full);font-size:11px;cursor:pointer;border:1px solid {filter ===
+					style="height:22px;padding:0 9px;border-radius:var(--radius-full);font-size:11px;cursor:pointer;border:var(--line-width) solid {filter ===
 					k
 						? 'var(--border-strong)'
 						: 'transparent'};background:{filter === k ? 'var(--surface-active)' : 'transparent'};color:{filter === k
@@ -129,7 +129,7 @@
 			{:else}
 				{#each shown as n (n.id)}
 					<div
-						style="display:flex;gap:9px;align-items:flex-start;padding:9px 10px 9px 9px;border-bottom:1px solid var(--border-subtle);border-left:2px solid {n.read
+						style="display:flex;gap:9px;align-items:flex-start;padding:9px 10px 9px 9px;border-bottom:var(--line-width) solid var(--border-subtle);border-left:2px solid {n.read
 							? 'transparent'
 							: look[n.kind].color};background:{n.read ? 'transparent' : 'var(--surface-hover)'}"
 					>
@@ -155,7 +155,7 @@
 								: look[n.kind].color}"
 						>
 							{#if n.read}
-								<span style="width:7px;height:7px;border-radius:50%;border:1px solid currentColor"></span>
+								<span style="width:7px;height:7px;border-radius:50%;border:var(--line-width) solid currentColor"></span>
 							{:else}
 								<span style="width:7px;height:7px;border-radius:50%;background:currentColor"></span>
 							{/if}

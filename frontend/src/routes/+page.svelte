@@ -411,7 +411,7 @@
 	     the project's yet; say so where it cannot be missed. -->
 	{#if editor.previewingStaged}
 		<div
-			style="flex:none;display:flex;align-items:center;gap:9px;height:30px;padding:0 12px;background:var(--agent-surface);border-bottom:1px solid var(--agent-border);color:var(--agent-300);font-size:12px"
+			style="flex:none;display:flex;align-items:center;gap:9px;height:30px;padding:0 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
 		>
 			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
 			></span>
@@ -419,7 +419,7 @@
 			<div style="flex:1"></div>
 			<button
 				onclick={() => editor.exitStagedPreview()}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:1px solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Exit preview</button
 			>
 		</div>
@@ -429,13 +429,13 @@
 	     `editor.error` and never shown, so a corrupt file opened as silence. -->
 	{#if editor.error}
 		<div
-			style="flex:none;display:flex;align-items:center;gap:9px;min-height:30px;padding:5px 12px;background:color-mix(in srgb,var(--danger) 14%,transparent);border-bottom:1px solid color-mix(in srgb,var(--danger) 40%,transparent);color:var(--text-primary);font-size:12px"
+			style="flex:none;display:flex;align-items:center;gap:9px;min-height:30px;padding:5px 12px;background:color-mix(in srgb,var(--danger) 14%,transparent);border-bottom:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);color:var(--text-primary);font-size:12px"
 		>
 			<Icon n="alert-triangle" s={13} color="var(--danger)" />
 			<span style="flex:1;min-width:0">{editor.error}</span>
 			<button
 				onclick={() => (editor.error = null)}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:1px solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Dismiss</button
 			>
 		</div>

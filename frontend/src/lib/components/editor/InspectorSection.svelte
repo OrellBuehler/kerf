@@ -14,7 +14,7 @@
 </details>
 
 <style>
-	details { border-top: 1px solid var(--border-default); margin-top: 10px; }
+	details { border-top: var(--line-width) solid var(--border-default); margin-top: 10px; }
 	summary { cursor: pointer; min-height: 38px; padding: 10px 0; color: var(--text-secondary); font-size: 13px; }
 	summary::marker { color: var(--text-muted); font-size: 11px; }
 	summary:hover { color: var(--text-primary); }

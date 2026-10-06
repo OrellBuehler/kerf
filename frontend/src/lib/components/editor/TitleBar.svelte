@@ -13,7 +13,7 @@
 </script>
 
 <div
-	style="height:var(--titlebar-h);display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);border-bottom:1px solid var(--border-default);flex:none;-webkit-app-region:drag"
+	style="height:var(--titlebar-h);display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);border-bottom:var(--line-width) solid var(--border-default);flex:none;-webkit-app-region:drag"
 >
 	<div style="flex:1;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px">
 		<KerfMark size={15} />
@@ -28,7 +28,7 @@
 		onclick={() => settings.toggle()}
 		title="Settings — how much of this machine Kerf may use (⌘,)"
 		aria-label="Settings"
-		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {settings.open
+		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {settings.open
 			? 'var(--border-strong)'
 			: 'transparent'};background:{settings.open ? 'var(--surface-active)' : 'transparent'};color:{settings.open
 			? 'var(--text-primary)'
@@ -45,7 +45,7 @@
 			? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
 			: 'Notifications'}
 		aria-label="Notifications"
-		style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:1px solid {notifications.open
+		style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {notifications.open
 			? 'var(--border-strong)'
 			: 'transparent'};background:{notifications.open ? 'var(--surface-active)' : 'transparent'};color:{notifications.open
 			? 'var(--text-primary)'
@@ -65,7 +65,7 @@
 		title={available
 			? `Kerf ${updater.update?.version} is available — click to install`
 			: `Kerf ${updater.version} — click to check for updates`}
-		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;cursor:pointer;font-family:var(--font-mono);font-size:11px;border:1px solid {available
+		style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;cursor:pointer;font-family:var(--font-mono);font-size:11px;border:var(--line-width) solid {available
 			? 'var(--kerf-500)'
 			: 'transparent'};background:{available
 			? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'

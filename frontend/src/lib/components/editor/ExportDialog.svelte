@@ -190,9 +190,9 @@
 	const canExport = $derived(!editor.busy && !rendering && issues.length === 0 && (hasVideo || hasAudio));
 
 	const selectCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:180px;max-width:100%';
+		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:180px;max-width:100%';
 	const inputCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:13px;min-height:32px;padding:5px 7px';
+		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:13px;min-height:32px;padding:5px 7px';
 
 	function msg(e: unknown): string {
 		return e instanceof Error ? e.message : String(e);
@@ -335,7 +335,7 @@
 			{step}
 			{value}
 			oninput={(e) => onChange(parseFloat(e.currentTarget.value))}
-			style="flex:1;accent-color:var(--kerf-500)"
+			style="flex:1"
 		/>
 		<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:54px;text-align:right">{display}</span>
 	</label>
@@ -371,11 +371,11 @@
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
-		style="width:600px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
+		style="width:600px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
 	>
 		<!-- header -->
 		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border-default)"
+			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
 		>
 			<Icon n="upload" s={15} color="var(--text-secondary)" />
 			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Export</span>
@@ -521,7 +521,7 @@
 						<button
 							title={p.hint}
 							onclick={() => toggleVariant(p.id)}
-							style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid {on
+							style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid {on
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};background:{on
 								? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
@@ -560,7 +560,7 @@
 			{#if checks.length && !variantFormats.length}
 				{@render secHead('Where it is going')}
 				<div
-					style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
+					style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
 				>
 					{#if readyFor.length}
 						<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--success)">
@@ -606,12 +606,12 @@
 				</div>
 			{/if}
 
-			<details bind:open={showAdvanced} style="margin-top:12px;border-top:1px solid var(--border-default)">
+			<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">
 				<summary style="cursor:pointer;padding:12px 0;font-size:13px;font-weight:600;color:var(--text-secondary)">Advanced encoding</summary>
 			<!-- summary -->
 			<div
 				data-selectable
-					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
 			>
 				{summary}
 			</div>
@@ -652,7 +652,7 @@
 							{#each RATE_CONTROLS.filter((rc) => rc.id !== 'two_pass' || !isHwCodec(opts.video_codec)) as rc (rc.id)}
 								<button
 									onclick={() => setRate(rc.id)}
-									style="flex:1;padding:5px 4px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid {opts.rate_control ===
+									style="flex:1;padding:5px 4px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid {opts.rate_control ===
 									rc.id
 										? 'var(--kerf-500)'
 										: 'var(--border-strong)'};background:{opts.rate_control === rc.id
@@ -798,13 +798,13 @@
 			{#if showCommand}
 				<pre
 					data-selectable
-					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
+					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
 			{/if}
 			</details>
 		</div>
 
 		<!-- footer -->
-		<div style="flex:none;border-top:1px solid var(--border-default)">
+		<div style="flex:none;border-top:var(--line-width) solid var(--border-default)">
 			{#if issues.length}
 				<div style="padding:8px 16px;display:flex;flex-direction:column;gap:3px;background:color-mix(in srgb,var(--red-600) 14%,transparent)">
 					{#each issues as issue (issue)}

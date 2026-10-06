@@ -7,6 +7,7 @@
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
+	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
@@ -87,7 +88,7 @@
 	}
 
 	const chip = (active: boolean) =>
-		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:1px solid ${
+		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${
 			active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'
@@ -111,10 +112,10 @@
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
-		style="width:620px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
+		style="width:min(620px,100%);height:min(640px,100%);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
 	>
 		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border-default)"
+			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
 		>
 			<Icon n="settings" s={15} color="var(--text-secondary)" />
 			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Settings</span>
@@ -124,12 +125,12 @@
 		<div style="flex:1;display:flex;min-height:0">
 			<!-- section rail -->
 			<div
-				style="flex:none;width:150px;padding:10px 8px;border-right:1px solid var(--border-default);display:flex;flex-direction:column;gap:2px"
+				style="flex:none;width:150px;padding:10px 8px;border-right:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:2px"
 			>
 				{#each SECTIONS as s (s.id)}
 					<button
 						onclick={() => (section = s.id)}
-						style="display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--radius-sm);cursor:pointer;text-align:left;font-size:12px;border:1px solid {section ===
+						style="display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--radius-sm);cursor:pointer;text-align:left;font-size:12px;border:var(--line-width) solid {section ===
 						s.id
 							? 'var(--border-strong)'
 							: 'transparent'};background:{section === s.id
@@ -170,7 +171,7 @@
 							aria-label="CPU limit"
 							oninput={(e) => (settings.cpuPercent = Number(e.currentTarget.value))}
 							onchange={(e) => settings.setCpuPercent(Number(e.currentTarget.value))}
-							style="flex:1;accent-color:var(--kerf-500);cursor:pointer"
+							style="flex:1"
 						/>
 						<span
 							style="flex:none;width:52px;text-align:right;font-family:var(--font-mono);font-size:13px;color:var(--text-primary)"
@@ -180,7 +181,7 @@
 
 					<div
 						data-selectable
-						style="margin-top:12px;padding:9px 11px;border-radius:var(--radius-sm);background:var(--surface-inset);border:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);line-height:1.6"
+						style="margin-top:12px;padding:9px 11px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);line-height:1.6"
 					>
 						{threads} of {cores}
 						{cores === 1 ? 'core' : 'cores'} for Kerf · {spare === 0
@@ -320,7 +321,7 @@
 							value={settings.theme.name}
 							aria-label="Theme name"
 							onchange={(e) => settings.setThemeName(e.currentTarget.value)}
-							style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
+							style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
 						/>
 						<button onclick={() => settings.setScheme('dark')} style={chip(settings.theme.scheme === 'dark')}>Dark</button>
 						<button onclick={() => settings.setScheme('light')} style={chip(settings.theme.scheme === 'light')}
@@ -328,9 +329,43 @@
 						>
 					</div>
 					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
-						Every color the editor draws with. Changing one makes the theme custom; a theme exports as a
-						JSON file you can share or bring back with Import.
+						Every color and line the editor draws with. Changing one makes the theme custom; a theme exports
+						as a JSON file you can share or bring back with Import.
 					</p>
+
+					<div
+						style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
+						Lines and sliders
+					</div>
+					<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
+						{#each SHAPE_TOKENS as t (t.name)}
+							<label title={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
+								<span style="width:130px;flex:none">{t.label}</span>
+								<input
+									type="range"
+									min={t.min}
+									max={t.max}
+									step={t.step}
+									value={settings.theme.shape[t.name]}
+									aria-label={t.label}
+									oninput={(e) => settings.setShape(t.name, Number(e.currentTarget.value))}
+									style="flex:1;min-width:0"
+								/>
+								<span style="flex:none;width:44px;text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--text-primary)"
+									>{settings.theme.shape[t.name]}px</span
+								>
+							</label>
+						{/each}
+						<div style="display:flex;align-items:center;gap:10px;height:32px;font-size:12px;color:var(--text-secondary)">
+							<span style="width:130px;flex:none">Thumb style</span>
+							{#each THUMB_STYLES as ts (ts.id)}
+								<button onclick={() => settings.setThumbStyle(ts.id)} style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}
+									>{ts.label}</button
+								>
+							{/each}
+						</div>
+					</div>
 
 					{#each COLOR_GROUPS as g (g.label)}
 						<div
@@ -347,7 +382,7 @@
 										type="color"
 										value={settings.theme.colors[t.name]}
 										oninput={(e) => settings.setColor(t.name, e.currentTarget.value)}
-										style="width:26px;height:20px;padding:0;border:1px solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
+										style="width:26px;height:20px;padding:0;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
 									/>
 									<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{t.label}</span>
 									<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled)"
