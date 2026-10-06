@@ -475,8 +475,10 @@ pub fn voice_style(pack: &[u8], tokens: usize) -> Result<Vec<f32>> {
     }
     let row = tokens.min(MAX_TOKENS - 1) * STYLE_DIM * 4;
     Ok(pack[row..row + STYLE_DIM * 4]
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect())
 }
 
@@ -1177,7 +1179,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 36 + 8);
         assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), SAMPLE_RATE);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
-        let samples: Vec<i16> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let samples: Vec<i16> = wav[44..].as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
         assert_eq!(samples, [0, i16::MAX, -i16::MAX, i16::MAX]);
     }
 
@@ -1240,8 +1242,10 @@ mod tests {
         );
         let bytes = std::fs::read(&result.path).unwrap();
         let peak = bytes[44..]
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b).unsigned_abs())
             .max()
             .unwrap();
         assert!(peak > 1000, "the voiceover is silent");
