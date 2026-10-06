@@ -163,7 +163,11 @@ input[type='range']:disabled {
 input[type='range']::-webkit-slider-runnable-track {
 	height: var(--slider-track);
 	border-radius: var(--slider-track-radius);
-	background: var(--surface-active);
+	background: linear-gradient(
+		to right,
+		var(--slider-accent) var(--slider-fill, 0%),
+		var(--surface-active) var(--slider-fill, 0%)
+	);
 }
 input[type='range']::-moz-range-track {
 	height: var(--slider-track);
@@ -173,7 +177,7 @@ input[type='range']::-moz-range-track {
 input[type='range']::-moz-range-progress {
 	height: var(--slider-track);
 	border-radius: var(--slider-track-radius);
-	background: color-mix(in srgb, var(--slider-accent) 55%, transparent);
+	background: var(--slider-accent);
 }
 input[type='range']::-webkit-slider-thumb {
 	-webkit-appearance: none;
