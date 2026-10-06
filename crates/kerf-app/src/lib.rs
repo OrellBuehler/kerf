@@ -1734,12 +1734,29 @@ fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings:
 /// path comes from a file picker the user could point at anything.
 const TEXT_FILE_MAX: u64 = 1 << 20;
 
+/// These two commands take a path the webview chose, so they only touch `.json`
+/// files — a theme — and never anything that is not a plain file.
+fn require_json_path(path: &str) -> CmdResult<()> {
+    let is_json = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .json file"))
+    }
+}
+
 /// A small text file picked by the user (a theme to import).
 #[tauri::command]
 async fn read_text_file(path: String) -> CmdResult<String> {
     blocking(move || {
-        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if len > TEXT_FILE_MAX {
+        require_json_path(&path)?;
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        if meta.len() > TEXT_FILE_MAX {
             return Err(format!("{path} is larger than 1 MiB — not a theme file"));
         }
         std::fs::read_to_string(&path).map_err(|e| e.to_string())
@@ -1751,6 +1768,13 @@ async fn read_text_file(path: String) -> CmdResult<String> {
 #[tauri::command]
 async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
     blocking(move || {
+        require_json_path(&path)?;
+        if contents.len() as u64 > TEXT_FILE_MAX {
+            return Err("contents are larger than 1 MiB — not a theme file".to_string());
+        }
+        if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{path} is not a regular file"));
+        }
         std::fs::write(&path, contents).map_err(|e| e.to_string())?;
         Ok(path)
     })
@@ -2049,7 +2073,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_arg, require_local_output_path};
+    use super::{project_arg, require_json_path, require_local_output_path};
 
     #[test]
     fn accepts_absolute_local_paths() {
@@ -2109,5 +2133,13 @@ mod tests {
         );
         // argv[0] is the binary, never a project.
         assert_eq!(project_arg(&argv(&["/opt/x.kerf"]), "/home/u"), None);
+    }
+
+    #[test]
+    fn text_file_commands_only_take_json() {
+        assert!(require_json_path("/t/dark.kerf-theme.json").is_ok());
+        assert!(require_json_path("C:\\t\\THEME.JSON").is_ok());
+        assert!(require_json_path("/home/u/.bashrc").is_err());
+        assert!(require_json_path("/t/theme.json.exe").is_err());
     }
 }
