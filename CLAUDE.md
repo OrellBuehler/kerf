@@ -764,7 +764,14 @@ of *this* computer Kerf may use is not something that should travel inside a
 The file also carries the **workspace layout** and the **color theme** as two
 opaque `serde_json::Value`s — the frontend owns their shape and validates them
 on the way back in, so `get_settings` re-reads the file for those where the
-engine-held values are read live), `read_text_file` / `write_text_file`
+engine-held values are read live). **`set_settings` takes a patch**, not the
+whole object — only the fields that changed (`{layout}`, `{theme}`,
+`{cpu_percent}`), merged into the file under a mutex, and only those fields are
+pushed into the engine (so a layout write never re-applies the stored CPU share
+over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
+directory, fsync, rename over), and a file that does not parse is moved aside to
+`settings.corrupt-<unix-ms>.json` before defaults load, so the next save cannot
+destroy an imported theme), `read_text_file` / `write_text_file`
 (a theme file the user picked, imported or exported — the only commands that
 read a caller-chosen path, so the read is capped at 1 MiB)
 and `agent_status` (the MCP endpoint plus how

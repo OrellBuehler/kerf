@@ -64,16 +64,6 @@ class SettingsStore {
 	private themeDirty = false;
 	private themeTimer: ReturnType<typeof setTimeout> | null = null;
 
-	private get current(): AppSettings {
-		return {
-			cpu_percent: this.cpuPercent,
-			transcribe: this.transcribe,
-			safe_areas: this.safeAreas,
-			layout: this.layout,
-			theme: this.theme
-		};
-	}
-
 	/** The preset the current percentage *is*, or null when it sits between them. */
 	get cpuPreset() {
 		return CPU_PRESETS.find((p) => p.percent === this.cpuPercent) ?? null;
@@ -114,7 +104,7 @@ class SettingsStore {
 	private async write(patch: Partial<AppSettings>, what: string): Promise<boolean> {
 		this.saving = true;
 		try {
-			this.absorb(await setSettings({ ...this.current, ...patch }));
+			this.absorb(await setSettings(patch));
 			return true;
 		} catch (e) {
 			toast.error(`Could not save the ${what}`, { description: String(e) });

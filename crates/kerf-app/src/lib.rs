@@ -1712,23 +1712,15 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
     settings::SettingsView::current(&settings::load(&app))
 }
 
-/// Write the preferences and put them into force. Returns the resolved view, so
+/// Merge a patch — only the fields that changed (`{layout}`, `{theme}`,
+/// `{cpu_percent}`, …) — into the stored preferences and put them into force.
+/// Patching rather than replacing means two call sites writing at once cannot
+/// overwrite each other's field with a stale copy. Returns the resolved view, so
 /// the dialog can show the clamped percentage and the cores it works out to
 /// without a second round-trip.
 #[tauri::command(async)]
-fn set_settings(app: AppHandle, settings: settings::Settings) -> CmdResult<settings::SettingsView> {
-    // Clamp through the engine first, then persist what was actually applied —
-    // storing an out-of-range value would keep re-clamping on every launch.
-    kerf_core::set_transcription_enabled(settings.transcribe);
-    settings::set_safe_areas(settings.safe_areas);
-    let stored = settings::Settings {
-        cpu_percent: kerf_core::set_cpu_percent(settings.cpu_percent),
-        transcribe: settings.transcribe,
-        safe_areas: settings.safe_areas,
-        layout: settings.layout,
-        theme: settings.theme,
-    };
-    settings::save(&app, &stored)?;
+fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings::SettingsView> {
+    let stored = settings::update(&app, &patch)?;
     Ok(settings::SettingsView::current(&stored))
 }
 

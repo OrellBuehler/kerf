@@ -1906,22 +1906,28 @@ export async function getSettings(): Promise<SettingsView> {
 	return invoke<SettingsView>('get_settings');
 }
 
-/** Persist the preferences and put them into force; returns the resolved view. */
-export async function setSettings(settings: AppSettings): Promise<SettingsView> {
+/**
+ * Persist the fields that changed and put them into force; returns the resolved
+ * view. Only the fields in `patch` are written — the backend merges them into
+ * the stored file, so a layout write cannot carry a stale copy of the theme.
+ */
+export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
 	if (!inTauri()) {
-		const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, settings.cpu_percent)));
 		try {
-			localStorage.setItem(CPU_KEY, String(percent));
-			localStorage.setItem(TRANSCRIBE_KEY, settings.transcribe ? '1' : '0');
-			localStorage.setItem(SAFE_AREAS_KEY, settings.safe_areas ? '1' : '0');
-			writeBrowserJson(LAYOUT_KEY, settings.layout);
-			writeBrowserJson(THEME_KEY, settings.theme);
+			if (patch.cpu_percent !== undefined) {
+				const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, patch.cpu_percent)));
+				localStorage.setItem(CPU_KEY, String(percent));
+			}
+			if (patch.transcribe !== undefined) localStorage.setItem(TRANSCRIBE_KEY, patch.transcribe ? '1' : '0');
+			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
+			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
+			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
-		return browserSettings({ ...settings, cpu_percent: percent });
+		return getSettings();
 	}
-	return invoke<SettingsView>('set_settings', { settings });
+	return invoke<SettingsView>('set_settings', { patch });
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';
