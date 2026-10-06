@@ -2,6 +2,8 @@
 
 Status: **approved direction, not started** (2026-10-07).
 Owner: one long-running **orchestrator** session that manages subagents, reviews and merges, step by step, until every phase below is done.
+
+> **Work autonomously. Do not ask the user questions and do not wait for approval.** When something is unclear, investigate (code, docs, experiments, context7), pick the option that best fits this plan and `CLAUDE.md`, record the decision and its reason in the progress log, and keep going. Where this plan mentions a gate, the orchestrator evaluates it itself against the stated criteria. The user reads the progress log and the PRs; that is how they follow and correct course.
 Progress log: `docs/plans/2026-10-07-progress.md` (the orchestrator creates and maintains it — see §8).
 
 This plan has two parts that run as one programme:
@@ -28,11 +30,11 @@ Options considered: (A) FFmpeg only, (B) WebGPU/WebGL in the webview, (C) a Rust
 | # | Decision |
 |---|---|
 | D1 | Build a Rust **wgpu** compositor (`crates/kerf-gpu`). Keep the SvelteKit/Tauri UI. |
-| D2 | **FFmpeg stays the source of truth until parity is proven.** Every GPU path has an FFmpeg fallback; an effect not yet ported renders through FFmpeg. Export moves to the GPU only at A7, behind a gate. |
+| D2 | **FFmpeg stays the source of truth until parity is proven.** Every GPU path has an FFmpeg fallback; an effect not yet ported renders through FFmpeg. Export moves to the GPU only at A7, once the parity criteria pass. |
 | D3 | Preview/export parity is enforced by an automated **parity harness** (same timeline, same time, both renderers, image metric with a threshold), run in CI on a software adapter. |
 | D4 | FFmpeg remains the **decoder and encoder** (hardware decode/encode already exist). wgpu only composites. Audio stays FFmpeg (export) + Web Audio (preview). |
 | D5 | Keyframes stay in **seconds**; gestures snap to frames (round once per gesture, derive every field from the snapped delta). |
-| D6 | The left **library rail replaces** the Media/Transcript tab group (default; ask the user once at B1 kick-off, proceed with the default if no answer). |
+| D6 | The left **library rail replaces** the Media/Transcript tab group (decided). |
 | D7 | **Nested compositions / parenting / expressions are out of scope.** |
 | D8 | Per-track audio **buses**: decided inside B4 (needed for track-level EQ/automation). Default: per-clip automation first, buses only if B4's design review says it's cheap. |
 | D9 | During a drag the UI may show an **approximate** frame (GPU or CSS ghost) and must settle to the exact render on release. Once the GPU path covers the effect, the drag frame *is* exact. |
@@ -63,7 +65,7 @@ Options considered: (A) FFmpeg only, (B) WebGPU/WebGL in the webview, (C) a Rust
 - **Never mention Claude, Anthropic or AI** in commits, PRs, tags or merge messages; no `Co-Authored-By`, no session links. A PreToolUse hook enforces it and greps the *whole command* for "claude" — stage `CLAUDE.md` via a glob (`git add CLAUD*.md`). Commit signing (1Password) can fail transiently and leave the index staged — never chain two commits in one command; check `git status` after a failed commit.
 - Commit style: lowercase imperative, short first line.
 - Stage specific files, never `git add -A` / `git add .`.
-- Never run `sudo`; ask the user to run it.
+- On the user's own machine never run `sudo`. In a cloud environment, install whatever is missing yourself.
 - `--no-default-features` everywhere in CI and local checks (no FFmpeg dev libs needed). Workspace lints forbid `println!`/`eprintln!` (use `tracing`; `#[allow(clippy::print_stderr)]` only in tests that need it). CI's clippy can be newer than local — read CI's clippy output, not just local.
 - Keep `kerf-core` UI-agnostic; **no editing logic in `kerf-app`**. Every capability is exposed twice: Tauri command and MCP tool.
 - Keep `kerf-core` serde structs ↔ `frontend/src/lib/types.ts` in sync; JSON is snake_case.
@@ -76,14 +78,14 @@ Options considered: (A) FFmpeg only, (B) WebGPU/WebGL in the webview, (C) a Rust
 - The user's global `~/.claude/CLAUDE.md` and its commit hook are **not present** in a cloud session. The project's `.claude/settings.json` turns attribution off, but the rules in §1.3 still apply verbatim — check every commit message and PR body yourself.
 - Commits are not SSH-signed there (the 1Password signer is local-only); that is expected.
 - There is no GPU: wgpu runs on Mesa **lavapipe** (installed by the setup script); `KERF_HWACCEL=none` / `KERF_HW_ENCODE=none` keep ffmpeg in software.
-- There is no display: GUI checks go through the browser harness (`bun run dev` + headless Chrome/Playwright). Desktop-window work (A2) needs the user to run a PR build on Windows — ask.
+- There is no display: GUI checks go through the browser harness (`bun run dev` + headless Chrome/Playwright). Desktop-window work (A2/A4) can't be seen there: verify what is verifiable (headless rendering, the Linux/WSLg path if a display exists, unit tests of the surface-bounds logic), keep the feature behind its setting, and list what still needs a real Windows/macOS run under *Needs a real machine* in the progress log. Do not stop for it.
 - Worktree paths in this plan are relative (`../kerf-<wp>`); use the cloud checkout's parent directory.
 
-### 1.4 When to stop and ask the user
-- A go/no-go gate in Part A (A0, A2, A7).
-- A decision in §7 that the WP can't proceed without.
-- Anything destructive or outward-facing beyond pushing branches / merging green PRs (releases, tags, force-pushes, deleting remote branches other than merged PR branches, changing repo settings or secrets).
-- Three consecutive failed attempts at the same CI failure.
+### 1.4 Never ask — decide, record, continue
+- Do not ask the user anything and do not pause for confirmation. Decide using this plan, `CLAUDE.md`, the code and your own investigation; write the decision and the reason into the progress log (§8) and the PR description.
+- Gates (A0, A2, A7) are evaluated by the orchestrator against their criteria. If a gate fails, record why, take the fallback described there, and move on to the next WP — never idle.
+- Out of bounds entirely (don't do them, and don't ask about them): publishing releases or tags, force-pushing shared branches, deleting remote branches other than merged PR branches, changing repository settings, rulesets or secrets, or bypassing branch protection (`--admin`).
+- If the same CI failure survives three fix attempts, mark the WP `blocked` with the diagnosis in the progress log and continue with the next independent WP.
 
 ---
 
@@ -141,14 +143,14 @@ Key design rules:
 - **CPU budget**: decoding through ffmpeg still goes through `engine/cpu.rs`. Ungated (moment reads) vs gated (whole-file) rules apply unchanged.
 - **CI has no GPU**: use a software adapter — Mesa **lavapipe/llvmpipe** on Linux (`mesa-vulkan-drivers`), **WARP** on Windows (DX12), Metal on macOS runners. `wgpu::Instance` with `force_fallback_adapter` for tests. Parity thresholds must hold on the software adapter.
 
-### A0 — Feasibility spike (M) — **gate: user go/no-go**
+### A0 — Feasibility spike (M) — **gate (self-evaluated)**
 - New crate `crates/kerf-gpu` (workspace member, `license.workspace = true`), deps: `wgpu` (currently 30.x; check MSRV against the workspace `rust-version` 1.95), `pollster`, `bytemuck`. Not yet linked into kerf-app.
 - Headless device (no window). `FrameSource` v0: decode one frame of an asset at a source time via the existing ffmpeg binary path (rawvideo NV12 over a pipe, from the **proxy** when one is ready), upload, YUV→RGB shader.
 - Compositor v0: black canvas at `export_format`, layers in track order with `Transform` (scale/position/rotation/crop) + opacity + `Fit::Contain/Cover`, plus `eq` colour (brightness/contrast/saturation/gamma/temperature — port `eq_filter`'s maths).
 - `RenderPlan` v0 in kerf-core for exactly these features.
 - **Parity harness** (`crates/kerf-gpu/tests/parity.rs`, `#[ignore]` + a CI job): generate synthetic media with ffmpeg (`testsrc2`, `smptehdbars`, a gradient, a still), build timelines (single clip, two overlapping tracks, scaled/rotated/cropped clip, opacity 0.5, colour adjustments, contain vs cover into 9:16), render each at several times through `timeline_frame` (FFmpeg) and the GPU, compare with **PSNR ≥ 40 dB and max per-channel error ≤ 8/255 outside a 2-px edge band** (tune in A0 and record the final thresholds in the test). Write diff images to `target/parity/` on failure.
 - Benchmarks: time per still (GPU vs FFmpeg), 1080p and 4K canvas, 1/3/6 layers, software adapter and a real GPU if the machine has one.
-- Deliverable: PR with the crate, the plan type, the harness, numbers in the PR description, and `.claude/agents/gpu.md`. **Stop and report numbers to the user** before A1.
+- Deliverable: PR with the crate, the plan type, the harness, numbers in the PR description, and `.claude/agents/gpu.md`. Record the numbers in the progress log. **Gate:** parity thresholds hold on the software adapter for every A0 case. If they do, continue with A1. If a mismatch is fundamental (not a fixable conversion bug), record the analysis, mark Part A `blocked`, and continue with Part B (which does not depend on the GPU). Speed on the software adapter is informational; real-GPU speed is checked whenever a machine with a GPU is available.
 
 ### A1 — Frame source + render plan, production quality (M)
 - `FrameSource`: per-asset decoder that streams frames forward (one long-lived ffmpeg per active asset, like `stream_preview`), seeks by restarting at the nearest keyframe (proxies are all-intra, so seeks are cheap), LRU frame cache keyed by (asset, source frame index) with a memory cap, prefetch around the playhead. Stills (`StreamInfo.image`) decode once. Hardware decode via the existing `-hwaccel` path; frames come back through system memory (zero-copy interop is out of scope; note it as future work).
@@ -156,13 +158,13 @@ Key design rules:
 - `RenderPlan` complete for everything the compositor will eventually need (layers, keyframes sampled, transitions with both sides and progress, overlays, masks, effects list, reframe), with `gpu_supported()` reporting what A0/A5 can do.
 - Tests: plan fixtures mirroring the existing `build_filter_complex` tests (positions, gaps, track order, speed/reverse, slice/for_render, for_delivery framings).
 
-### A2 — Native preview surface in the Preview panel (M–L) — **gate: works on Windows, macOS, Linux**
+### A2 — Native preview surface in the Preview panel (M–L) — **gate (self-evaluated)**
 - Present a wgpu surface **in the Preview panel's rectangle** of the Tauri window. Two candidate techniques; spike both briefly and pick per platform:
   1. wgpu renders to the main window's surface *under* a transparent webview; the Preview panel's frame area is transparent (`background: transparent` + Tauri `transparent: true` window). Works on Windows (WebView2) and macOS (WKWebView); on Linux (WebKitGTK) transparency + GL/Vulkan surfaces are fragile.
   2. A borderless **child window** (Tauri v2 multiwebview/`WindowBuilder` with a parent, or a raw platform child via `raw-window-handle`) kept aligned to the panel's bounds (the frontend reports bounds on resize/scroll/dock moves via a command; DPI-aware).
 - The frontend keeps owning everything else in the panel (overlays, safe areas, title handles, timecode); those are drawn by the webview over/around the surface, so technique 1 is preferred where it works.
 - Fallback: if no surface can be created (or a setting is off, or the platform is unsupported), the Preview panel keeps today's JPEG path. Setting: *Settings › Preview › GPU preview (experimental)*, default **off** until A4.
-- Verify on all three OSes (CI can't — the user runs a build from the PR artifacts; ask them). **Gate: user confirms on Windows (their main machine) before A3.**
+- Verify what can be verified (WSLg/Linux when a display is available, unit tests of the bounds/DPI logic, the fallback path). Windows/macOS confirmation goes under *Needs a real machine* in the progress log. **Gate:** the surface works where it can be tested and the JPEG fallback is intact everywhere. Then continue with A3 regardless.
 
 ### A3 — Scrub + live drags on the GPU (M)
 - Scrubbing, the settled frame and shuttle use the GPU path when `gpu_supported()`; otherwise FFmpeg as today.
@@ -174,7 +176,7 @@ Key design rules:
 - A render loop paced to the timeline fps against the **audio clock** (`audio.ts` Web Audio is the master clock today; expose its current time to Rust via a command or keep the clock in Rust and drive Web Audio from it — decide in the design note).
 - Frame drop policy (never let video run behind audio; skip, don't slow down), prefetch across cuts, proxy usage as today.
 - Playback falls back to `stream_preview` for spans containing unsupported features (pre-scan the span with `RenderPlan`).
-- Turn the GPU preview setting **on by default** when A4 passes on the user's machine.
+- Keep the GPU preview setting **off by default** until it has been verified on a real GPU machine; note that in *Needs a real machine*. Everything else proceeds.
 
 ### A5 — Effect parity, one effect at a time (L, many small PRs)
 Each effect = its own PR: WGSL pass + `gpu_supported()` update + parity cases + benchmark line. Order by usage:
@@ -191,11 +193,11 @@ The parity harness is the acceptance test for every item; thresholds may be per-
 ### A6 — Headless rendering for the agent (S–M)
 - `preview_timeline`, `get_frame` (region zoom), `export_cover`, `skim_asset` (optional) render through the GPU when an adapter exists and the plan is supported; FFmpeg otherwise. Same output contract (JPEG bytes, region semantics). The MCP server must keep working on a machine with no usable GPU.
 
-### A7 — Export through the compositor (L) — **gate: user go/no-go**
+### A7 — Export through the compositor (L) — **gate (self-evaluated)**
 - GPU renders each output frame → readback (double-buffered, async) → raw frames piped into an ffmpeg **encode-only** process (existing encoders incl. verified HW encoders, `-progress`, cancel). Audio keeps the existing FFmpeg audio graph, muxed in the same process (`-f rawvideo -i pipe:0` + the audio inputs) or a second pass.
 - Range export, multi-format variants (`render_variants`, `for_delivery`), cover frames, `loudnorm` keep working.
 - Parity: render a set of reference projects both ways; frame-sampled PSNR + duration/AV-sync checks.
-- Keep the FFmpeg export selectable (*Export › Advanced › Renderer: GPU / FFmpeg*) for at least one release; GPU becomes default only after the user approves.
+- Keep the FFmpeg export selectable (*Export › Advanced › Renderer: GPU / FFmpeg*). **Gate:** frame-sampled parity and AV sync pass on every reference project. If they pass, ship GPU export as an opt-in renderer; FFmpeg stays the default until it has been verified on a real GPU machine (note it in the progress log).
 - After A7, **new visual features are implemented once, on the GPU**; until then they are implemented in both renderers with a parity case (this is why B6/B7 should, where possible, land after A5's relevant passes).
 
 ### Part A risks to watch
@@ -237,20 +239,20 @@ Every B-WP also: updates the MCP server `instructions` when agent workflow chang
 | frontend | `cd frontend && bun run check && bun run test && bun run build` |
 | UI behaviour | browser harness (Playwright/headless Chrome screenshots), plus WSLg desktop run for window/surface work |
 | everything | `prek run --all-files` (commit + push stages) via `verifier` |
-| A2/A4/A7 gates | the user runs the PR's build on Windows (their main machine) |
+| A2/A4/A7 | everything verifiable locally/in CI; anything needing real Windows/macOS hardware is listed under *Needs a real machine* in the progress log |
 
 CI changes to make along the way: a `parity` job (Linux lavapipe; add Windows WARP if stable), keep `msrv`, keep `--no-default-features`.
 
 ---
 
-## 7. Open questions (ask the user when the WP needs them; otherwise use the default)
+## 7. Decided defaults (do not ask — these are the answers)
 
-1. B1: rail **replaces** Media/Transcript tabs (default yes, D6).
+1. B1: rail **replaces** Media/Transcript tabs (D6).
 2. B4: per-track audio buses now or later (default: later, D8).
 3. B7: scopes in the GUI and MCP, or MCP only (default: both).
 4. B2: stereo waveform lanes (default: yes on tall tracks, mono otherwise).
-5. A2: acceptable for Linux to keep the JPEG preview if WebKitGTK surfaces are unreliable (default: yes, report it).
-6. A7: when to make GPU export the default (user decides after A7 parity numbers).
+5. A2: Linux keeps the JPEG preview if WebKitGTK surfaces are unreliable; record it.
+6. A7: GPU export ships opt-in; FFmpeg stays the default until real-hardware verification exists.
 
 ---
 
@@ -261,6 +263,8 @@ The orchestrator keeps `docs/plans/2026-10-07-progress.md` (committed with each 
 ```
 | WP | branch | PR | status (todo/in-progress/review/merged/blocked) | notes (gate results, thresholds, numbers, follow-ups) |
 ```
+
+Plus two running sections in the same file: **Decisions** (every decision the orchestrator made instead of asking, with the reason) and **Needs a real machine** (what could only be verified on real Windows/macOS hardware or a GPU).
 
 On (re)start: read this plan, the progress log, `gh pr list --state open`, `git worktree list`, and the memory index; resume the first non-merged WP in this order:
 
