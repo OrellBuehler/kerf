@@ -82,20 +82,26 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     Ok(dst.to_path_buf())
 }
 
-/// The host in `url`'s redirect chain that a DNS filter has sinkholed, with the
-/// address it answered — asked only once a download has already failed.
+/// The host in `url`'s redirect chain that a DNS filter has sinkholed, with
+/// what it answered — asked only once a download has already failed.
 ///
 /// A blocklist answers a blocked name with `0.0.0.0` / `::` (or loopback), so
 /// the connection is simply refused and the error names neither the cause nor
 /// the host. And the blocked host is usually not the one in the URL: the model
 /// hosts redirect to a CDN, whose name only appears in the `Location` header —
-/// so the chain is walked by hand, a few hops at most.
-fn blocked_host(url: &str) -> Option<(String, std::net::IpAddr)> {
+/// so the chain is walked by hand, a few hops at most. Windows drops a
+/// `0.0.0.0` answer and fails the lookup instead (WSANO_DATA, os error 11004),
+/// so a redirect target that does not resolve while the host that sent us there
+/// did is the same block seen through that resolver.
+fn blocked_host(url: &str) -> Option<(String, String)> {
     let mut url = url.to_string();
-    for _ in 0..5 {
+    for hop in 0..5 {
         let (host, port) = host_of(&url)?;
-        if let Some(addr) = sinkholed(&host, port) {
-            return Some((host, addr));
+        match lookup(&host, port) {
+            Lookup::Sinkholed(addr) => return Some((host, format!("resolves to {addr}"))),
+            Lookup::Failed if hop > 0 => return Some((host, "does not resolve".into())),
+            Lookup::Failed => return None,
+            Lookup::Resolved => {}
         }
         let response = ureq::get(&url)
             .config()
@@ -114,16 +120,33 @@ fn blocked_host(url: &str) -> Option<(String, std::net::IpAddr)> {
     None
 }
 
-/// The address `host` resolves to when every answer is a sinkhole.
-fn sinkholed(host: &str, port: u16) -> Option<std::net::IpAddr> {
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    Resolved,
+    Sinkholed(std::net::IpAddr),
+    Failed,
+}
+
+fn lookup(host: &str, port: u16) -> Lookup {
     use std::net::ToSocketAddrs;
     // A literal address was never looked up, so no filter answered it — a
     // local mirror at 127.0.0.1 that is down is just down.
     if host.parse::<std::net::IpAddr>().is_ok() {
-        return None;
+        return Lookup::Resolved;
     }
-    let addrs: Vec<std::net::IpAddr> = (host, port).to_socket_addrs().ok()?.map(|a| a.ip()).collect();
-    all_sinkholed(&addrs).then(|| addrs[0])
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            if addrs.is_empty() {
+                Lookup::Failed
+            } else if all_sinkholed(&addrs) {
+                Lookup::Sinkholed(addrs[0])
+            } else {
+                Lookup::Resolved
+            }
+        }
+        Err(_) => Lookup::Failed,
+    }
 }
 
 /// Whether a lookup answered only with addresses nothing can be downloaded
@@ -181,9 +204,9 @@ pub(super) fn stream_to_file(
     // connect failed is otherwise invisible — and a resolver that works for the
     // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
     let mut response = request.call().map_err(|e| {
-        if let Some((host, addr)) = blocked_host(url) {
+        if let Some((host, answer)) = blocked_host(url) {
             return Error::Engine(format!(
-                "could not download {what}: {host} resolves to {addr}, which is how a DNS filter (Pi-hole, \
+                "could not download {what}: {host} {answer}, which is how a DNS filter (Pi-hole, \
                  AdGuard, NextDNS, a router or VPN blocklist) blocks a domain. Allow {host} in that filter, \
                  or point {mirror_env} at a mirror"
             ));
@@ -289,7 +312,12 @@ mod tests {
 
     #[test]
     fn a_literal_address_is_never_blamed_on_dns() {
-        assert_eq!(sinkholed("0.0.0.0", 443), None);
-        assert_eq!(sinkholed("127.0.0.1", 80), None);
+        assert_eq!(lookup("0.0.0.0", 443), Lookup::Resolved);
+        assert_eq!(lookup("127.0.0.1", 80), Lookup::Resolved);
+    }
+
+    #[test]
+    fn a_name_with_no_address_fails_the_lookup() {
+        assert_eq!(lookup("kerf.invalid", 443), Lookup::Failed);
     }
 }
