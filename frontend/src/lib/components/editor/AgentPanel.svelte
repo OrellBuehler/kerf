@@ -9,6 +9,8 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
+	import { CAPTION_CONFIRM_TITLE } from '$lib/caption-import-ui';
+	import { confirmReplaceCaptions } from '$lib/title-actions';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
 
@@ -225,6 +227,10 @@
 			toast.error('Import media first');
 			return;
 		}
+		// The one preset that writes over something the user may care about: captions
+		// from transcripts replace a set already on the cut, an imported one included.
+		// Asked before the task is queued, so declining leaves nothing behind.
+		if (p === 'Caption the cut' && !(await confirmReplaceCaptions(CAPTION_CONFIRM_TITLE))) return;
 		let task: Task | null = null;
 		try {
 			task = await agent.add(p);

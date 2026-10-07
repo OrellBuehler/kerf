@@ -188,3 +188,54 @@ describe('captions follow the cut', () => {
 		expect('non-destructive'.length * 0.6 * long.size).toBeLessThanOrEqual(0.9 * (1080 / 1920) + 1e-9);
 	});
 });
+
+// The line timer, exactly as it was before it was made cheaper: everything
+// recomputed — and every line rebuilt — on every pass. The Rust test pins the same
+// sweep against the Rust original; this pins the mirror against the mirror.
+function referenceTimeChunks(chunks: string[], start: number, end: number, min: number) {
+	let lines = [...chunks];
+	const duration = Math.max(end - start, 0);
+	for (;;) {
+		const weights = lines.map((c) => Math.max(c.length, 1));
+		const total = weights.reduce((a, b) => a + b, 0);
+		const timed: { start: number; end: number; text: string }[] = [];
+		let at = start;
+		lines.forEach((text, i) => {
+			const share = total > 0 ? weights[i] / total : 1;
+			const to = i + 1 === lines.length ? end : at + duration * share;
+			timed.push({ start: at, end: to, text });
+			at = to;
+		});
+		if (lines.length < 2) return timed;
+		const short = timed.findIndex((t) => t.end - t.start < min);
+		if (short < 0) return timed;
+		const mergeBack = short > 0 && (short + 1 === lines.length || lines[short - 1].length <= lines[short + 1].length);
+		const into = mergeBack ? short - 1 : short;
+		lines = [...lines.slice(0, into), `${lines[into]} ${lines[into + 1]}`, ...lines.slice(into + 2)];
+	}
+}
+
+describe('the cheaper line timer', () => {
+	test('gives exactly the old answers', () => {
+		let state = 0x2545f491;
+		const next = (n: number) => {
+			state ^= state << 13;
+			state ^= state >>> 17;
+			state ^= state << 5;
+			return (state >>> 0) % n;
+		};
+		for (let c = 0; c < 3000; c++) {
+			const count = next(60);
+			const chunks = Array.from({ length: count }, () => 'x'.repeat(1 + next(next(5) === 0 ? 30 : 8)));
+			const start = next(100_000) / 100 - 50;
+			const len = [0, next(100) / 1000, next(3000) / 100, next(100_000) / 10][next(4)];
+			const min = [MIN_CAPTION, MIN_WORD_CAPTION, 0, 5][next(4)];
+			const a = referenceTimeChunks(chunks, start, start + len, min);
+			const b = timeChunks(chunks, start, start + len, min);
+			expect(b.length).toBe(a.length);
+			a.forEach((x, i) => {
+				expect(Object.is(b[i].start, x.start) && Object.is(b[i].end, x.end) && b[i].text === x.text).toBe(true);
+			});
+		}
+	});
+});

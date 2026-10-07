@@ -3,7 +3,11 @@
 // Plain values: nothing is reactive, which is all such a test needs. Import it
 // for its side effect, before importing the module under test.
 
-type Rune = ((v: unknown) => unknown) & { by?: (f: () => unknown) => unknown; snapshot?: (v: unknown) => unknown };
+type Rune = ((v: unknown) => unknown) & {
+	by?: (f: () => unknown) => unknown;
+	snapshot?: (v: unknown) => unknown;
+	raw?: (v: unknown) => unknown;
+};
 const g = globalThis as unknown as Record<string, Rune>;
-g.$state = Object.assign((v: unknown) => v, { snapshot: (v: unknown) => structuredClone(v) });
+g.$state = Object.assign((v: unknown) => v, { snapshot: (v: unknown) => structuredClone(v), raw: (v: unknown) => v });
 g.$derived = Object.assign((v: unknown) => v, { by: (f: () => unknown) => f() });

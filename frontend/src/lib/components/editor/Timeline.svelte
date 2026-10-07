@@ -14,6 +14,8 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { deleteSelection } from '$lib/ops';
+	import { importCaptionFile } from '$lib/title-actions';
+	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
 	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
@@ -1235,7 +1237,24 @@
 
 	function onTitleLaneContextMenu(e: MouseEvent) {
 		e.stopPropagation();
-		contextMenu.show(e, [{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere }]);
+		// Importing captions: timed to the cut, or to one of the clips it shows. The
+		// controls in Titles carry the same import with every clip to choose from.
+		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
+		contextMenu.show(e, [
+			{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+			{ type: 'separator' },
+			...entries.map(
+				(m): MenuItem => ({
+					label: m.label,
+					icon: 'file-text',
+					disabled: editor.busy,
+					action: () => void importCaptionFile(m.choice)
+				})
+			),
+			...(more > 0
+				? [{ type: 'info', label: `${more} more clip${more === 1 ? '' : 's'}`, value: 'in Titles' } satisfies MenuItem]
+				: [])
+		]);
 	}
 
 	// ---- ruler scrub + draggable in/out marks ---------------------------------
