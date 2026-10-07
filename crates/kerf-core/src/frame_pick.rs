@@ -23,9 +23,10 @@
 //!    **slot** of a frame. Output frame `k` is the last frame whose slot is `<= k`. There is
 //!    none before the first frame's slot, and none from the **end** on: the stream ends where
 //!    the frame `trim` dropped (the first one past the window) would have landed, retimed and
-//!    rounded the same way, or, for a window that runs to the end of the file, one frame
-//!    interval past the last frame. From there `overlay=eof_action=pass` shows nothing
-//!    under it. That end is what holds a slowed clip's last frame for its whole share of the
+//!    rounded the same way, or, for a window that runs to the end of the file, the last
+//!    frame's own **duration** past the last frame (not the gap before it: a matroska
+//!    clip's gaps alternate 33 and 34 ms and its last frame lasts 33). From there
+//!    `overlay=eof_action=pass` shows nothing under it. That end is what holds a slowed clip's last frame for its whole share of the
 //!    window, and what drops the last frame of a sped-up or reversed one whose slot lies past
 //!    it: at a clip's closing edge **the clip is drawn or not by this rule**, not by the
 //!    overlay's `enable`.
@@ -40,6 +41,15 @@
 //! output grid, NTSC rates, a seek off the grid, other time bases, a variable rate, a window
 //! to the end of the file and of a single frame.
 //!
+//! **A still image is a stream like any other**: the export reads it as `-loop 1 -framerate
+//! <fps> -t <end>`, so it is a run of frames `0, 1, 2, ...` on a `1/<fps>` time base cut off
+//! by `-t` (an automatic `trim` ahead of the chain's own, and a frame past the cut that is the
+//! one that ended it), with no seek and the chain's own `trim` absolute — a still cut from
+//! `source_in` 0.25 starts on the first frame at or after a quarter second. [`FpsPick::image`]
+//! says so, and [`fps_pick`] makes that run up itself (it needs no [`SourceFrames`]), so a
+//! still's closing edge is decided by the same rule as a video's: it is *not* always drawn on
+//! the frame its window closes on.
+//!
 //! Pure: no I/O.
 
 use crate::clip_timing::{clip_seek, parse_micros, parse_micros_text, Rational};
@@ -53,15 +63,31 @@ pub struct SourceFrames<'a> {
     /// Seconds per tick, `num / den` (`1/90000`, `1001/30000`).
     pub time_base: Rational,
     /// The container's start time in microseconds (`0` for nearly every file): `-ss` is
-    /// relative to it.
+    /// relative to it. Timestamps that are already relative to the start (`showinfo` under
+    /// `-copyts -start_at_zero`) are given with `0`.
     pub start_us: i64,
+    /// The last frame's own duration in ticks (ffprobe's frame `duration`, `showinfo`'s
+    /// `duration:`): where a window that runs to the end of the file ends. `0` when unknown,
+    /// and the last gap between frames stands in.
+    pub last_duration: i64,
+}
+
+impl SourceFrames<'static> {
+    /// No frames: what a still image's pick is given (it makes its own up).
+    pub const NONE: Self = Self {
+        pts: &[],
+        time_base: Rational { num: 1, den: 1 },
+        start_us: 0,
+        last_duration: 0,
+    };
 }
 
 /// Which frame of its decoded file a layer shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pick {
     /// The first frame at or after a source time: what `-ss` returns, and the still's pick.
-    /// Also `0.0` for a still image, which has the one frame.
+    /// Also `0.0` for a still image in a still plan, which has the one frame (a Motion plan
+    /// gives it an [`FpsPick`] with `image` set).
     AtOrAfter(f64),
     /// The last frame before a source time: the frame preceding [`Pick::AtOrAfter`]'s.
     Before(f64),
@@ -89,11 +115,17 @@ pub struct FpsPick {
     /// The input is a head-padded proxy read without a seek: its first frame is the pad's
     /// clone, which the chain drops.
     pub drop_first: bool,
+    /// A still image, read as `-loop 1 -framerate <this>`: the frames are made up (see the
+    /// [module](self)) and the chain does not seek. This is the `color=r=` parse of the
+    /// delivery rate (`PlanCanvas::fps`), which `-framerate` shares.
+    pub image: Option<Rational>,
 }
 
 impl Pick {
     /// The index in `src` of the frame this picks, or `None` for no frame (before the first,
-    /// past the last, or — for [`Pick::Fps`] — a slot the clip's stream does not fill).
+    /// past the last, or — for [`Pick::Fps`] — a slot the clip's stream does not fill). A
+    /// still image's [`FpsPick`] ignores `src` and answers `Some(0)` for every frame it draws:
+    /// the one frame its loop shows.
     pub fn select(&self, src: &SourceFrames) -> Option<usize> {
         match *self {
             Pick::AtOrAfter(t) => {
@@ -116,20 +148,83 @@ fn rescale_near(a: i128, b: i128, c: i128) -> i128 {
     }
 }
 
-/// Microseconds to ticks of `src`'s time base (`av_rescale_q` from `1/1000000`).
-fn ticks(us: i64, src: &SourceFrames) -> i64 {
-    let tb = src.time_base;
+/// Microseconds to ticks of a time base (`av_rescale_q` from `1/1000000`).
+fn ticks(us: i64, tb: Rational) -> i64 {
     rescale_near(i128::from(us), i128::from(tb.den), 1_000_000 * i128::from(tb.num)) as i64
 }
 
 /// Where a seek to `micros` leaves the file's own timestamps: the tick that becomes zero.
-fn seek_shift(micros: i64, src: &SourceFrames) -> i64 {
-    ticks(micros + src.start_us, src)
+fn seek_shift(micros: i64, tb: Rational, start_us: i64) -> i64 {
+    ticks(micros + start_us, tb)
 }
 
 /// The shift of the still's `-ss {:.6}`.
 fn still_shift(seconds: f64, src: &SourceFrames) -> i64 {
-    seek_shift(parse_micros_text(&seek_arg(seconds)), src)
+    seek_shift(parse_micros_text(&seek_arg(seconds)), src.time_base, src.start_us)
+}
+
+/// The frames a pick is made over: a file's, or the run a still image's loop makes up.
+enum Frames<'a> {
+    File(&'a SourceFrames<'a>),
+    /// `len` frames, pts `0..len`, on `time_base` — the last of them is the one `-t` cut at.
+    Still {
+        len: usize,
+        time_base: Rational,
+    },
+}
+
+impl Frames<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Frames::File(f) => f.pts.len(),
+            Frames::Still { len, .. } => *len,
+        }
+    }
+
+    fn pts(&self, i: usize) -> i64 {
+        match self {
+            Frames::File(f) => f.pts[i],
+            Frames::Still { .. } => i as i64,
+        }
+    }
+
+    fn time_base(&self) -> Rational {
+        match self {
+            Frames::File(f) => f.time_base,
+            Frames::Still { time_base, .. } => *time_base,
+        }
+    }
+
+    fn start_us(&self) -> i64 {
+        match self {
+            Frames::File(f) => f.start_us,
+            Frames::Still { .. } => 0,
+        }
+    }
+
+    /// The first index whose pts is not `before`.
+    fn partition(&self, before: impl Fn(i64) -> bool) -> usize {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if before(self.pts(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// How long the last frame lasts, in ticks: its own duration if known, else the gap
+    /// before it, else a tick.
+    fn last_duration(&self) -> i64 {
+        match self {
+            Frames::File(f) if f.last_duration > 0 => f.last_duration,
+            Frames::File(f) if f.pts.len() >= 2 => f.pts[f.pts.len() - 1] - f.pts[f.pts.len() - 2],
+            _ => 1,
+        }
+    }
 }
 
 /// What the chain does with one clip's frames, up to the `fps` filter's output.
@@ -169,44 +264,39 @@ impl Run {
     }
 }
 
-fn run(pick: &FpsPick, src: &SourceFrames) -> Option<Run> {
+fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
     if !(pick.speed > 0.0 && pick.speed.is_finite()) {
         return None;
     }
-    let tb = src.time_base;
-    let seek = clip_seek(pick.window.0);
-    let shift = seek_shift(if seek > 0.0 { parse_micros(seek) } else { 0 }, src);
+    let tb = frames.time_base();
+    // A still image is never seeked (its trim is absolute).
+    let seek = if pick.image.is_some() { 0.0 } else { clip_seek(pick.window.0) };
+    let shift = seek_shift(if seek > 0.0 { parse_micros(seek) } else { 0 }, tb, frames.start_us());
     // What the chain's `trim` keeps, in ticks relative to the seek: `[lo, hi)`.
-    let lo = ticks(parse_micros(pick.window.0 - seek), src);
-    let hi = ticks(parse_micros(pick.window.1 - seek), src);
-    let len = src.pts.len();
+    let lo = ticks(parse_micros(pick.window.0 - seek), tb);
+    let hi = ticks(parse_micros(pick.window.1 - seek), tb);
+    let len = frames.len();
     // The accurate seek drops what is left of it; the pad's clone goes next.
-    let mut from = if seek > 0.0 {
-        src.pts.partition_point(|&p| p - shift < 0)
-    } else {
-        0
-    };
+    let mut from = if seek > 0.0 { frames.partition(|p| p - shift < 0) } else { 0 };
     if pick.drop_first {
         from += 1;
     }
-    let from = from.max(src.pts.partition_point(|&p| p - shift < lo)).min(len);
-    let to = src.pts.partition_point(|&p| p - shift < hi);
+    let from = from.max(frames.partition(|p| p - shift < lo)).min(len);
+    let to = frames.partition(|p| p - shift < hi);
     if from >= to {
         return None;
     }
     // The stream ends where the frame that ended it would have been: the first frame past the
-    // trim, or one more frame interval past the last when the file ends first (the interval
-    // the file's last two frames are apart, a tick when it has one frame).
+    // trim, or, when the file ends first, the last frame's own duration past the last frame.
     let beyond = if to < len {
-        src.pts[to] - shift
+        frames.pts(to) - shift
     } else {
-        let step = if len >= 2 { src.pts[len - 1] - src.pts[len - 2] } else { 1 };
-        src.pts[len - 1] - shift + step
+        frames.pts(len - 1) - shift + frames.last_duration()
     };
     let mut run = Run {
         kept: from..to,
         shift,
-        first: src.pts[from] - shift,
+        first: frames.pts(from) - shift,
         offset: pick.start / (f64::from(tb.num) / f64::from(tb.den)),
         speed: pick.speed,
         unit: (pick.speed - 1.0).abs() < 1e-9,
@@ -225,10 +315,24 @@ fn run(pick: &FpsPick, src: &SourceFrames) -> Option<Run> {
 ///
 /// Binary searches only: `O(log n)` in the frames of the file, whatever the window.
 pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
-    let run = run(pick, src)?;
+    // A still's loop: `-t` keeps the frames before `end` (at least one), and the next one is
+    // the frame that ended the input.
+    let still = pick.image.map(|rate| {
+        let time_base = Rational {
+            num: rate.den,
+            den: rate.num,
+        };
+        let secs = pick.window.1.max(f64::from(rate.den) / f64::from(rate.num));
+        Frames::Still {
+            len: usize::try_from(ticks(parse_micros(secs), time_base)).unwrap_or(0) + 1,
+            time_base,
+        }
+    });
+    let frames = still.unwrap_or(Frames::File(src));
+    let run = run(pick, &frames)?;
     let n = run.kept.len();
     let k = i64::try_from(pick.frame).ok()?;
-    let slot = |j: usize| run.slot(src.pts[run.kept.start + j] - run.shift);
+    let slot = |j: usize| run.slot(frames.pts(run.kept.start + j) - run.shift);
     // Output order is file order, or the reverse of it carrying the forward timestamps.
     if k < slot(0) || k >= run.end {
         return None;
@@ -244,7 +348,9 @@ pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
         }
     }
     let j = lo - 1;
-    Some(run.kept.start + if pick.reverse { n - 1 - j } else { j })
+    let i = run.kept.start + if pick.reverse { n - 1 - j } else { j };
+    // A still has one picture, whichever of its copies it is.
+    Some(if pick.image.is_some() { 0 } else { i })
 }
 
 #[cfg(test)]
@@ -267,6 +373,7 @@ mod tests {
             frame: k,
             fps: Rational::new(fps.0, fps.1).unwrap(),
             drop_first: false,
+            image: None,
         }
     }
 
@@ -275,6 +382,7 @@ mod tests {
             pts,
             time_base: TB10,
             start_us: 0,
+            last_duration: 0,
         };
         (0..16).map(|k| fps_pick(&FpsPick { frame: k, ..*p }, &src)).collect()
     }
@@ -316,6 +424,7 @@ mod tests {
             pts: &pts,
             time_base: tb,
             start_us: 0,
+            last_duration: 0,
         };
         let at = |k| fps_pick(&pick((1.0, 1.0 + 8.0 / 30.0), 44.0 / 30.0, 1.0, false, (30, 1), k), &src);
         assert_eq!(at(44), Some(24));
@@ -328,12 +437,64 @@ mod tests {
     }
 
     #[test]
+    fn a_window_to_the_end_of_the_file_ends_a_last_frame_duration_after_its_last_frame() {
+        // Ticks of a tenth of a second, a frame at 0, 4, 7 and 11: the last gap is 4 but the last
+        // frame lasts 3 (a matroska file's gaps alternate 33 and 34 ms and its last frame is 33).
+        let (tb, fps) = (Rational { num: 1, den: 10 }, (10, 1));
+        let pts = [0, 4, 7, 11];
+        let held = |last_duration, k| {
+            let src = SourceFrames {
+                pts: &pts,
+                time_base: tb,
+                start_us: 0,
+                last_duration,
+            };
+            fps_pick(&pick((0.0, 100.0), 0.0, 1.0, false, fps, k), &src)
+        };
+        assert_eq!((held(3, 13), held(3, 14)), (Some(3), None));
+        // Without a duration the last gap stands in.
+        assert_eq!((held(0, 14), held(0, 15)), (Some(3), None));
+    }
+
+    #[test]
+    fn a_still_image_is_a_run_of_frames_its_window_ends() {
+        let rate = Rational::new(30, 1).unwrap();
+        let still = |window: (f64, f64), start: f64, speed: f64, k: u64| {
+            let p = FpsPick {
+                image: Some(rate),
+                ..pick(window, start, speed, false, (30, 1), k)
+            };
+            fps_pick(&p, &SourceFrames::NONE)
+        };
+        // A second of it is thirty frames, 0 to 29: the loop's next frame is the one that ended
+        // it, so the frame at the window's end — slot 30 — is not drawn.
+        let drawn = |window, start, speed| {
+            (0..120)
+                .filter(|&k| still(window, start, speed, k).is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drawn((0.0, 1.0), 0.0, 1.0), (0..30).collect::<Vec<_>>());
+        assert_eq!(drawn((0.0, 1.0), 5.0 / 30.0, 1.0), (5..35).collect::<Vec<_>>());
+        // Cut from a quarter second the first frame at or after it is 8 (7.5 rounds up), and it
+        // plays the same thirty frames.
+        assert_eq!(drawn((0.25, 1.25), 0.0, 1.0), (0..30).collect::<Vec<_>>());
+        // At twice the speed fifteen slots; at half, sixty.
+        assert_eq!(drawn((0.0, 1.0), 0.0, 2.0), (0..15).collect::<Vec<_>>());
+        assert_eq!(drawn((0.0, 1.0), 0.0, 0.5), (0..60).collect::<Vec<_>>());
+        // Every drawn frame is the one picture.
+        assert_eq!(still((0.0, 1.0), 0.0, 1.0, 7), Some(0));
+        // A window shorter than a frame period keeps no frame.
+        assert!(drawn((0.0, 0.01), 0.0, 1.0).is_empty());
+    }
+
+    #[test]
     fn a_window_to_the_end_of_the_file_ends_one_frame_interval_after_its_last_frame() {
         let pts = frames(12, 1024);
         let src = SourceFrames {
             pts: &pts,
             time_base: TB10,
             start_us: 0,
+            last_duration: 0,
         };
         // Frames 9, 10 and 11 are the last; the window is longer than the file.
         let tail = |k| fps_pick(&pick((0.9, 5.0), 0.0, 1.0, false, (10, 1), k), &src);
@@ -379,6 +540,7 @@ mod tests {
                 pts: &pts,
                 time_base: TB10,
                 start_us: 0,
+                last_duration: 0,
             };
             (0..8)
                 .map(|k| fps_pick(&pick((0.0, 0.8), tb_start, 2.0, false, (30, 1), k), &src).map(|i| i as i64))
@@ -406,6 +568,7 @@ mod tests {
             pts: &pts,
             time_base: tb,
             start_us: 0,
+            last_duration: 0,
         };
         assert_eq!(Pick::AtOrAfter(1.02).select(&src), Some(24));
         assert_eq!(Pick::AtOrAfter(1.03).select(&src), Some(25));
@@ -418,6 +581,7 @@ mod tests {
             pts: &padded,
             time_base: tb,
             start_us: 0,
+            last_duration: 0,
         };
         let p = |drop_first| FpsPick {
             drop_first,

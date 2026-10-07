@@ -94,9 +94,15 @@ so the feature is **only** activated through these forwards — which is what ma
   file's, so a replaced or half-written one reads as none. `proxy_video_info` is the reader:
   the sidecar, else **one** cached `ffprobe` (per file, size and mtime; a failure is
   remembered 60 s) written back as the sidecar — a proxy made before sidecars existed costs one
-  probe, ever, and it spawns a process, so it runs off the project lock. The sidecar's temp
-  file has its own name (`<hash>.json.<pid>.part`): the proxy's is `<hash>.<pid>.part`, and a
-  sidecar written through the same name once renamed the half-finished proxy away. Only a
+  probe, ever, and it spawns a process, so it runs off the project lock. `finalize_proxy`
+  puts the encode in place: **if `dst` is already there** (a concurrent generator got there
+  first) the new encode is dropped and **no sidecar is written** over the winner's; otherwise
+  the sidecar goes first and the rename second. Each sidecar writer has its own temp name
+  (`<hash>.json.<pid>.<n>.part`, a process-wide counter: two threads writing one sidecar must
+  not share one), distinct from the proxy's `<hash>.<pid>.part` — a sidecar written through
+  the proxy's name once renamed the half-finished proxy away. A test that generates a proxy
+  into the user's cache cleans up with `test_support::ProxyGuard` / `remove_proxy`, which
+  remove the sidecar as well (they used to leave `<hash>.json` behind). Only a
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
@@ -934,7 +940,7 @@ no editing logic in the adapter.
   (`rendered.rs` holds that to the pixels at five rates, and every drawn clip is planned).
   **Which frame of which file** (`frame_pick.rs`, `media.rs`):
   `PlanLayer.pick` is a `Pick` — `AtOrAfter(t)` (the still: the first frame `-ss {:.6}`
-  returns, so `0.0` for a still image), `Before(t)` (the frame preceding it) or
+  returns; `0.0` for a still image in a still plan, a Motion plan gives it `Fps`), `Before(t)` (the frame preceding it) or
   `Fps(FpsPick)` (a Motion plan: speed, direction, the source window *with its tail*, the
   clip's start, the output frame, the `fps=` rational, and whether a padded proxy's clone is
   dropped) — and `Pick::select(&SourceFrames { pts, time_base, start_us })` is the reference
@@ -956,9 +962,16 @@ no editing logic in the adapter.
   truncated to a tick: a frame-aligned speed-2 clip's exact tie falls on the low side), and
   so is the container's start (`start_us`: `-ss` is relative to it). The export spells its
   `-ss` and `trim` with `{}` of the `f64` (FFmpeg reads whole microseconds, truncated); only
-  the still uses `{:.6}`. `engine/cli/picked.rs` (`#[ignore]`d, both FFmpegs) renders clips
+  the still uses `{:.6}`. A window that runs to the end of the file ends the stream the last
+  frame's own **duration** (`SourceFrames.last_duration`: ffprobe's frame `duration`,
+  `showinfo`'s `duration:`) past the last frame — not the last gap: matroska's alternate 33 and
+  34 ms and its last frame lasts 33. **A still image is a stream too**: the export reads it
+  as `-loop 1 -framerate <fps> -t <end>`, so `Pick::Fps` carries `image: Some(<fps>)` and
+  `fps_pick` makes the run of frames up (no `SourceFrames` needed, `SourceFrames::NONE`); the
+  frame `-t` cuts at ends the stream, so a still is *not* drawn on the frame its window closes
+  on, and `source_in` 0.25 starts it on the first frame at or after a quarter second. `engine/cli/picked.rs` (`#[ignore]`d, both FFmpegs) renders clips
   whose frames number themselves through the real export graph and compares every output
-  frame: speed 0.5 to 4, forward and reverse, every phase of the grid at 24 / 25 / 29.97 / 30 /
+  frame (and stills, 192 of them, by whether they are drawn): speed 0.5 to 4, forward and reverse, every phase of the grid at 24 / 25 / 29.97 / 30 /
   60 / 23.976 fps (2997/100 and 2997/125 slot boundaries), a seek off the grid, matroska
   and transport-stream time bases (the latter with a container start), a variable frame rate
   (forward and reversed), windows to the end of the file and of one frame, a dissolve's
@@ -967,6 +980,16 @@ no editing logic in the adapter.
   `drop_first`'s removal makes the head case fail; so does rounding in `setpts`.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
+  **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
+  -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
+  best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
+  frame of lookahead and the first frame past the window's end (or the last frame's duration at
+  the end of the file); reverse needs every pts of the window; a non-all-intra transport stream
+  may not deliver the picked frame after an `-ss` (**both** builds — the design note's "6.1
+  only" was wrong; an all-intra one is exact). **A fade on a layer with an alpha plane goes to
+  luma 0, not 16** (`fade` on `yuva420p`; white is 235 either way): `FadeStep` /
+  `LayerFx::strength` do not know which black, and must before A5.1 draws one (design note
+  finding 19).
   **A plan describes the file that is decoded.** `PlanRequest { mode, color, media }`
   takes a `MediaResolver` (`PlanRequest::still(c).with_media(&ProxyMedia)`; the default is
   `OriginalMedia`): `SourceMedia { path, proxy, video }` is what decoding `path` yields,
@@ -976,8 +999,10 @@ no editing logic in the adapter.
   follow the file that is opened and `PlanLayer.stream` is the proxy's size and format, which
   is what `LayerGeometry` and the refusals judge) while **the delivery canvas still derives
   from the originals** (`render_geometry`). `PlanLayer.source: PlanSource { proxy }` says
-  which. Resolve off the project lock, once per `Planner`. `SourceMedia` has no `identity`
-  yet (A1b-1's `source_identity`).
+  which. Resolve off the project lock, once per `Planner`. `SourceMedia::decoded` carries the
+  original's spherical projection onto the proxy's stream (the proxy file has none of its own;
+  it is the same picture, smaller). `SourceMedia` has no `identity` yet (A1b-1's
+  `source_identity`).
   **Spans and the hand-over.** `Planner::span(a, b, size, caps)` evaluates every grid frame
   of `[a, b)` and run-length-encodes `reasons(..).is_empty()` (`SpanPlan::runs`); the lazy
   `Planner::first_unsupported(a, limit, size, caps)` stops at the first frame a compositor
@@ -991,7 +1016,10 @@ no editing logic in the adapter.
   instead of crossing it). So a clip is in the way from its start to the end of its fade-in /
   slide, and one that transitions out from `lead` before its end to its end *inclusive*;
   `stream_start` is the latest time at or before `a` that no window is open at (windows chain)
-  and the caller drops frames before `first_shown = a`. A planner test slices at the
+  and the caller drops frames before `first_shown = a`. **`Handover.frame` is the delivery
+  frame of the whole cut and the caller must pin it** (`ExportOptions::resolution` for the
+  stream): in a project with no delivery frame the canvas derives from the clips on the
+  timeline, so a slice that drops the clip that defined it is cut for another frame (tested). A planner test slices at the
   hand-over and holds every layer's fade, dissolve and tail state to the full cut's, and
   shows a slice started inside a dissolve has neither. `KERF_BENCH=1 cargo test -p kerf-core
   --no-default-features --release -- --ignored --nocapture bench_planning` prints

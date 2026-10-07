@@ -25,7 +25,6 @@ use super::picked::source_frames;
 use super::*;
 use crate::clip_timing::{clips_with_fx, ffmpeg_frame_time, ClipTiming, FadeTint};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::frame_pick::SourceFrames;
 use crate::model::{Asset, Clip, Transition, TransitionKind};
 use crate::planner::{PlanRequest, Planner};
 
@@ -187,12 +186,8 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
             let assets = [red, green];
             let frames = export_frames(&timeline, &assets, fps, &dir, &format!("boundary-{name}-{src_in}"));
             let planner = motion_planner(&timeline, &assets, fps);
-            let (pts, time_base, start_us) = source_frames(Path::new(&assets[0].path));
-            let red_frames = SourceFrames {
-                pts: &pts,
-                time_base,
-                start_us,
-            };
+            let probed = source_frames(Path::new(&assets[0].path));
+            let red_frames = probed.frames();
             for (ti, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
                 let timing = ClipTiming::new(clip, &fx);
                 let (start, end) = timing.window();
@@ -260,12 +255,8 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     let assets = [red, green];
     let frames = export_frames(&timeline, &assets, fps, &dir, "boundary-slower");
     let planner = motion_planner(&timeline, &assets, fps);
-    let (pts, time_base, start_us) = source_frames(Path::new(&assets[0].path));
-    let red_frames = SourceFrames {
-        pts: &pts,
-        time_base,
-        start_us,
-    };
+    let probed = source_frames(Path::new(&assets[0].path));
+    let red_frames = probed.frames();
     let mut at_end = 0;
     for (_, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
         let timing = ClipTiming::new(clip, &fx);

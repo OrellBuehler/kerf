@@ -2312,23 +2312,30 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    // What decoding this proxy yields, written *before* the proxy becomes visible so a
-    // reader that finds the file finds its description too (see [`ProxySidecar`]). A
-    // failed probe only costs the sidecar: the reader probes once and writes it itself.
-    if let Some(video) = probe(&tmp)
-        .ok()
-        .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
-    {
-        write_proxy_sidecar(&dst, &tmp, video);
-    }
-    // Another generator may have finished the same proxy while we encoded; if so
-    // ours is redundant — drop the temp and use the existing file.
+    // Another generator may have finished the same proxy while we encoded: theirs is in place
+    // with its own sidecar, and ours is redundant.
+    finalize_proxy(&tmp, &dst, || {
+        probe(&tmp)
+            .ok()
+            .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
+    })
+}
+
+/// Put the finished encode `tmp` in place as `dst`, with its sidecar. If `dst` is already there
+/// (a concurrent generator got there first) it is left as it is — **its sidecar stays too, no
+/// new one is written** — and `tmp` is dropped. Otherwise `probe` describes `tmp` and the
+/// sidecar is written *before* the rename, so a reader that finds the proxy finds its
+/// description; a failed probe only costs the sidecar (the reader probes once and writes it).
+fn finalize_proxy(tmp: &Path, dst: &Path, probe: impl FnOnce() -> Option<StreamInfo>) -> Result<PathBuf> {
     if dst.is_file() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(dst);
+        let _ = std::fs::remove_file(tmp);
+        return Ok(dst.to_path_buf());
     }
-    std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
-    Ok(dst)
+    if let Some(video) = probe() {
+        write_proxy_sidecar(dst, tmp, video);
+    }
+    std::fs::rename(tmp, dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
+    Ok(dst.to_path_buf())
 }
 
 /// What `generate_proxy` writes beside a proxy (`<hash>.json` next to `<hash>.mp4`, the
@@ -2350,8 +2357,17 @@ struct ProxySidecar {
 const PROXY_SIDECAR_VERSION: u32 = 1;
 
 /// Where the sidecar of `proxy` lives.
-fn proxy_sidecar_path(proxy: &Path) -> PathBuf {
+pub(crate) fn proxy_sidecar_path(proxy: &Path) -> PathBuf {
     proxy.with_extension("json")
+}
+
+/// A temp name for writing the sidecar at `dst`, **unique per writer** (the process and a
+/// counter: two threads writing the same sidecar must not share one) and not the proxy's own
+/// (`<hash>.<pid>.part`), which the write runs beside.
+fn sidecar_temp(dst: &Path) -> PathBuf {
+    static WRITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dst.with_extension(format!("json.{}.{n}.part", std::process::id()))
 }
 
 /// Write `proxy`'s sidecar, describing `file` (the proxy itself, or the temp it is being
@@ -2367,8 +2383,7 @@ fn write_proxy_sidecar(proxy: &Path, file: &Path, video: StreamInfo) {
         video,
     };
     let dst = proxy_sidecar_path(proxy);
-    // Not the proxy's own temp name (`<hash>.<pid>.part`), which this runs beside.
-    let tmp = dst.with_extension(format!("json.{}.part", std::process::id()));
+    let tmp = sidecar_temp(&dst);
     let written = serde_json::to_vec(&sidecar)
         .ok()
         .is_some_and(|bytes| std::fs::write(&tmp, bytes).is_ok())
@@ -6319,8 +6334,8 @@ mod tests {
     use super::*;
     use crate::clip_timing::is_head_padded_proxy;
     use crate::engine::test_support::{
-        audio_stream, audio_track, av_asset, image_stream, img_asset, make_clip, single, test_asset, timeline_of, video_stream,
-        video_track, StatusBounded,
+        audio_stream, audio_track, av_asset, image_stream, img_asset, make_clip, remove_proxy, single, test_asset, timeline_of,
+        video_stream, video_track, ProxyGuard, StatusBounded,
     };
     use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
 
@@ -6732,6 +6747,54 @@ mod tests {
             .filter(|n| n.ends_with(".part"))
             .collect();
         assert!(temps.is_empty(), "{temps:?}");
+    }
+
+    /// A finished encode lands with its sidecar — written before the proxy is visible — unless a
+    /// concurrent generator got there first, in which case theirs stays, untouched, and no
+    /// sidecar is written over it. Two writers never share a temp name.
+    #[test]
+    fn a_finished_proxy_lands_with_its_sidecar_unless_another_generator_got_there_first() {
+        use std::cell::Cell;
+        let dir = Scratch::new("finalize");
+        let video = |w| StreamInfo {
+            width: Some(w),
+            height: Some(w / 2),
+            pix_fmt: Some("yuv420p".into()),
+            ..crate::engine::test_support::video_stream(w, w / 2, 30.0)
+        };
+        let (tmp, dst) = (dir.join("0000000000000abc.1.part"), dir.join("0000000000000abc.mp4"));
+        std::fs::write(&tmp, b"ours").unwrap();
+        assert_eq!(finalize_proxy(&tmp, &dst, || Some(video(1280))).unwrap(), dst);
+        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ours");
+        assert_eq!(read_proxy_sidecar(&dst), Some(video(1280)));
+
+        // Another generator's proxy is in place with its sidecar: a second encode is dropped, the
+        // proxy and its sidecar stay as they are, and nobody probes.
+        let before = std::fs::read(proxy_sidecar_path(&dst)).unwrap();
+        std::fs::write(&tmp, b"a second, different encode").unwrap();
+        let probed = Cell::new(false);
+        finalize_proxy(&tmp, &dst, || {
+            probed.set(true);
+            Some(video(640))
+        })
+        .unwrap();
+        assert!(!probed.get() && !tmp.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ours");
+        assert_eq!(std::fs::read(proxy_sidecar_path(&dst)).unwrap(), before);
+
+        // A probe that fails still lands the proxy; it only has no sidecar yet.
+        let other = dir.join("0000000000000def.mp4");
+        std::fs::write(&tmp, b"third").unwrap();
+        finalize_proxy(&tmp, &other, || None).unwrap();
+        assert!(other.is_file() && !proxy_sidecar_path(&other).exists());
+
+        // The temp names of two writers of one sidecar differ, and neither is the proxy's own.
+        let sidecar = proxy_sidecar_path(&dst);
+        let (a, b) = (sidecar_temp(&sidecar), sidecar_temp(&sidecar));
+        assert_ne!(a, b);
+        let proxy_own = dst.with_extension(format!("{}.part", std::process::id()));
+        assert!(a != proxy_own && b != proxy_own && a.to_string_lossy().ends_with(".part"));
     }
 
     /// A clip read from the very start of a padded proxy (no `-ss`) opens with the
@@ -11404,16 +11467,6 @@ mod tests {
         }
     }
 
-    /// Deletes a file when dropped, pass or fail — for a proxy a test generated into
-    /// the user's own cache, which a failing assert must not leave behind.
-    struct RemoveOnDrop(PathBuf);
-
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
     /// Run `ffmpeg` with `args` (after the usual quiet flags); true when it exits 0.
     fn try_ffmpeg(args: &[&str]) -> bool {
         command(&ffmpeg_bin())
@@ -11646,7 +11699,7 @@ mod tests {
             .expect("run ffprobe");
         let dump = String::from_utf8_lossy(&dump.stdout).into_owned();
         let (w, h, rgb) = rgb_frame(&proxy, None);
-        let _ = std::fs::remove_file(&proxy);
+        remove_proxy(&proxy);
         assert!(!dump.contains("Display Matrix") && !dump.contains("\"rotate\""), "{dump}");
         assert_eq!((w, h), (rw, rh));
         assert_eq!(red_bar_edge(w, h, &rgb), red_bar_edge(rw, rh, &ref_rgb));
@@ -11770,7 +11823,7 @@ mod tests {
             }
 
             let proxy = generate_proxy(&media, PROXY_MAX_WIDTH).expect("proxy");
-            let _cleanup = RemoveOnDrop(proxy.clone());
+            let _cleanup = ProxyGuard(proxy.clone());
             assert_eq!(
                 is_head_padded_proxy(&proxy.to_string_lossy()),
                 lead > 0.0,
@@ -11816,7 +11869,7 @@ mod tests {
             let traits = source_traits(&ts).expect("probe");
             assert_eq!(traits.lead, 0.0, "a .ts is never padded");
             let proxy = generate_proxy(&ts, PROXY_MAX_WIDTH).expect("proxy");
-            let _cleanup = RemoveOnDrop(proxy.clone());
+            let _cleanup = ProxyGuard(proxy.clone());
             assert!(!is_head_padded_proxy(&proxy.to_string_lossy()));
         }
     }
@@ -11962,7 +12015,7 @@ mod tests {
             );
             let proxy = generate_proxy(&rotated, PROXY_MAX_WIDTH).expect("proxy");
             let tags = ffprobe_field(&proxy, "v:0", "stream=width,height,pix_fmt,color_transfer");
-            let _ = std::fs::remove_file(&proxy);
+            remove_proxy(&proxy);
             assert_eq!(tags, "360,640,yuv420p,bt709", "the proxy is upright SDR");
             let out = export(&asset, "portrait.mp4", &mp4_export_opts());
             assert_eq!(ffprobe_field(&out, "v:0", "stream=width,height"), "360,640");

@@ -415,6 +415,7 @@ impl Planner {
         }
         SpanPlan {
             fps: self.canvas.fps,
+            frame: (self.canvas.width, self.canvas.height),
             first: frames.start,
             runs,
             windows: self.open_windows(),
@@ -520,11 +521,10 @@ impl Planner {
                     interp: if motion { ReframeInterp::Cubic } else { ReframeInterp::Line },
                 });
                 let source_time = clip_source_time(clip, asset.duration, slot);
-                // A still image has the one frame; a still plan asks for the frame `-ss` lands on;
-                // the export asks the `fps` filter, which needs the whole window and the rate.
-                let pick = if asset.is_image {
-                    Pick::AtOrAfter(0.0)
-                } else if motion {
+                // A still plan asks for the frame `-ss` lands on (a still image has the one); the
+                // export asks the `fps` filter, which needs the whole window and the rate — of a
+                // still image too, whose `-loop` input is a run of frames like any other.
+                let pick = if motion {
                     Pick::Fps(FpsPick {
                         speed: clip.speed_mag(),
                         reverse: clip.is_reversed(),
@@ -532,8 +532,11 @@ impl Planner {
                         start: clip.timeline_start,
                         frame: u64::try_from(frame).unwrap_or(0),
                         fps: self.canvas.pick_fps,
-                        drop_first: planned.fx.head_pad && clip_seek(planned.source_window.0) == 0.0,
+                        drop_first: !asset.is_image && planned.fx.head_pad && clip_seek(planned.source_window.0) == 0.0,
+                        image: asset.is_image.then_some(self.canvas.fps),
                     })
+                } else if asset.is_image {
+                    Pick::AtOrAfter(0.0)
                 } else {
                     Pick::AtOrAfter(source_time)
                 };
@@ -652,12 +655,19 @@ pub struct Handover {
     /// The first frame to show from it, the time the compositor stopped at; the frames the
     /// stream produces before it are dropped.
     pub first_shown: f64,
+    /// The delivery frame of the **whole** cut. A stream plays a slice, and in a project with no
+    /// delivery frame set the frame derives from the footage on the timeline: a slice that drops
+    /// the clip that defined it (the first video clip) would be cut for another frame. The
+    /// caller pins it — `ExportOptions::resolution` for the stream — so the stream draws the
+    /// frame the compositor did.
+    pub frame: (u32, u32),
 }
 
 /// What a compositor draws over a stretch of the cut ([`Planner::span`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpanPlan {
     fps: Rational,
+    frame: (u32, u32),
     first: u64,
     runs: Vec<SpanRun>,
     windows: Vec<(f64, f64)>,
@@ -706,6 +716,7 @@ impl SpanPlan {
         Handover {
             stream_start: start,
             first_shown: a,
+            frame: self.frame,
         }
     }
 }
@@ -1370,9 +1381,11 @@ mod tests {
             frame: 45,
             fps: Rational::new(30, 1).unwrap(),
             drop_first: false,
+            image: None,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
-        assert_eq!(export.layers[1].pick, Pick::AtOrAfter(0.0));
+        // A still image is a run of frames made up from the delivery rate (`-loop 1 -framerate`).
+        assert!(matches!(export.layers[1].pick, Pick::Fps(p) if p.image == Some(Rational::new(30, 1).unwrap()) && !p.drop_first));
         // A transition's tail is in the pick's window, as it is in the chain's trim.
         let (out, mut inc) = (
             make_clip(assets[0].id, 0.0, 2.0, 0.0),
@@ -1597,6 +1610,32 @@ mod tests {
         tl.tracks.push(video_track(vec![over]));
         let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
         assert_eq!(span.handover(4.2).stream_start, 2.5);
+    }
+
+    #[test]
+    fn a_hand_over_carries_the_frame_of_the_whole_cut_for_a_slice_that_drops_the_clip_defining_it() {
+        // No delivery frame is set, so the frame is the footage's: the first clip's. A stream
+        // started past it plays a slice without that clip, and would be cut for the other's.
+        let mut big = asset();
+        big.streams[0] = video_stream(1920, 1080, 30.0);
+        let mut small = asset();
+        small.streams[0] = video_stream(1280, 720, 30.0);
+        let tl = single(vec![make_clip(big.id, 0.0, 2.0, 0.0), make_clip(small.id, 0.0, 2.0, 2.0)]);
+        let assets = [big, small];
+        let full = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+        let handover = full.span(0.0, 4.0, (1920, 1080), &GpuCaps::A0).handover(2.5);
+        assert_eq!(handover.frame, (1920, 1080));
+        let frame_of = |tl: &Timeline, pin: Option<(u32, u32)>| {
+            let opts = ExportOptions {
+                resolution: pin,
+                ..opts(30.0)
+            };
+            let p = Planner::new(tl, &assets, &opts, PlanRequest::motion(FIXED)).unwrap();
+            (p.canvas().width, p.canvas().height)
+        };
+        let slice = tl.slice(handover.stream_start, 4.0);
+        assert_eq!(frame_of(&slice, None), (1280, 720));
+        assert_eq!(frame_of(&slice, Some(handover.frame)), (1920, 1080));
     }
 
     /// What a layer shows of its fades, travel and tail: the plan's per-frame state. A layer on

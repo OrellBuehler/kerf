@@ -663,7 +663,7 @@ impl RenderPlan {
             if self.canvas.gif {
                 out.push(Unsupported::Gif);
             }
-            if self.canvas.fps != self.canvas.pick_fps && self.layers.iter().any(|l| !l.is_image) {
+            if self.canvas.fps != self.canvas.pick_fps && !self.layers.is_empty() {
                 out.push(Unsupported::PickRate {
                     canvas: self.canvas.fps,
                     clips: self.canvas.pick_fps,

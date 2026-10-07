@@ -50,7 +50,11 @@ impl SourceMedia {
         let mut decoded = asset.clone();
         decoded.path.clone_from(&self.path);
         if let (Some(video), Some(slot)) = (&self.video, decoded.streams.iter_mut().find(|s| s.kind == StreamKind::Video)) {
+            // A proxy file has no spherical metadata of its own (the CLI writes no `sv3d` box), but
+            // it holds the same projection, only smaller: that is the original's to say.
+            let projection = slot.projection;
             *slot = video.clone();
+            slot.projection = slot.projection.or(projection);
         }
         decoded
     }
@@ -117,6 +121,8 @@ mod tests {
         assert_eq!((same.path.as_str(), same.streams.len()), (asset.path.as_str(), 2));
 
         // A proxy: another path, another size, and the audio stream left alone.
+        let mut spherical = asset.clone();
+        spherical.streams[0].projection = Some(crate::model::Projection::Equirect);
         let mut video = asset.streams[0].clone();
         video.width = Some(1280);
         video.height = Some(720);
@@ -129,6 +135,11 @@ mod tests {
         assert_eq!(decoded.path, "/cache/kerf/proxies/0000000000000abc.mp4");
         assert_eq!((decoded.streams[0].width, decoded.streams[0].height), (Some(1280), Some(720)));
         assert_eq!(decoded.streams[1], asset.streams[1]);
+        // The proxy's own probe has no projection, the asset's still is the picture's.
+        assert_eq!(decoded.projection(), None);
+        let kept = proxy.decoded(&spherical);
+        assert_eq!(kept.projection(), Some(crate::model::Projection::Equirect));
+        assert_eq!((kept.streams[0].width, kept.streams[0].height), (Some(1280), Some(720)));
         assert_eq!((decoded.id, decoded.duration), (asset.id, asset.duration));
     }
 

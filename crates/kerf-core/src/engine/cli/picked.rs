@@ -33,14 +33,14 @@
 
 #![allow(clippy::print_stderr)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use uuid::Uuid;
 
 use super::rendered::{export_frames_sized, scratch};
 use super::*;
 use crate::clip_timing::Rational;
-use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
+use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, ProxyGuard, StatusBounded};
 use crate::frame_pick::SourceFrames;
 use crate::media::{MediaResolver, ProxyMedia};
 use crate::model::{Asset, Timeline};
@@ -121,7 +121,7 @@ fn numbered(dir: &Path, fps: &str, secs: u32, kind: Kind) -> Source {
         ]);
     }
     let rate: f64 = fps.parse().unwrap();
-    let (pts, _, _) = source_frames(&path);
+    let pts = source_frames(&path).pts;
     let numbers: Vec<u32> = if kind.vfr {
         (0..(f64::from(secs) * rate).round() as u32).filter(|n| n % 5 != 3).collect()
     } else {
@@ -187,17 +187,44 @@ fn probed_duration(path: &Path) -> f64 {
         .expect("a duration")
 }
 
-/// The presentation timestamps (ticks, ascending) of `path`'s first video stream, its time base
-/// and the container's start in microseconds, as `ffprobe` states them.
-pub(super) fn source_frames(path: &Path) -> (Vec<i64>, Rational, i64) {
-    let json = ffprobe_json(path, "frame=pts,pkt_pts:stream=time_base:format=start_time");
-    let mut pts: Vec<i64> = json["frames"]
+/// What `ffprobe` states of `path`'s first video stream's frames.
+pub(super) struct Probed {
+    /// Presentation timestamps (ticks, ascending).
+    pub pts: Vec<i64>,
+    pub time_base: Rational,
+    /// The container's start in microseconds.
+    pub start_us: i64,
+    /// The last frame's own duration in ticks (0 when ffprobe says none).
+    pub last_duration: i64,
+}
+
+impl Probed {
+    pub(super) fn frames(&self) -> SourceFrames<'_> {
+        SourceFrames {
+            pts: &self.pts,
+            time_base: self.time_base,
+            start_us: self.start_us,
+            last_duration: self.last_duration,
+        }
+    }
+}
+
+pub(super) fn source_frames(path: &Path) -> Probed {
+    let json = ffprobe_json(
+        path,
+        "frame=pts,pkt_pts,duration,pkt_duration:stream=time_base:format=start_time",
+    );
+    let mut frames: Vec<(i64, i64)> = json["frames"]
         .as_array()
         .expect("frames")
         .iter()
-        .map(|f| f["pts"].as_i64().or_else(|| f["pkt_pts"].as_i64()).expect("a frame pts"))
+        .map(|f| {
+            let pts = f["pts"].as_i64().or_else(|| f["pkt_pts"].as_i64()).expect("a frame pts");
+            let duration = f["duration"].as_i64().or_else(|| f["pkt_duration"].as_i64());
+            (pts, duration.unwrap_or(0))
+        })
         .collect();
-    pts.sort_unstable();
+    frames.sort_unstable();
     let tb = json["streams"][0]["time_base"].as_str().expect("time base");
     let (num, den) = tb.split_once('/').expect("a/b");
     let time_base = Rational::new(num.parse().unwrap(), den.parse().unwrap()).expect("time base");
@@ -205,7 +232,12 @@ pub(super) fn source_frames(path: &Path) -> (Vec<i64>, Rational, i64) {
         .as_str()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    (pts, time_base, (start * 1e6).round() as i64)
+    Probed {
+        last_duration: frames.last().map_or(0, |f| f.1),
+        pts: frames.into_iter().map(|f| f.0).collect(),
+        time_base,
+        start_us: (start * 1e6).round() as i64,
+    }
 }
 
 fn export_options(fps: f64) -> ExportOptions {
@@ -236,7 +268,9 @@ struct Found {
 /// Render `timeline` and read the clip's frame number off every output frame; plan the same
 /// frames and ask the clip's layer's pick over `decoded`'s timestamps (`numbers` says what
 /// each of its frames is). `render_assets` are what the export is rendered from, `plan_assets`
-/// what the planner is given (with `resolver` choosing the file).
+/// what the planner is given (with `resolver` choosing the file). A still image has no file
+/// timeline (`decoded` is `None`): its picture is all white, code 255, and what is compared is
+/// whether it is drawn.
 #[allow(clippy::too_many_arguments)]
 fn compare(
     timeline: &Timeline,
@@ -244,7 +278,7 @@ fn compare(
     render_assets: &[Asset],
     plan_assets: &[Asset],
     resolver: Option<&dyn MediaResolver>,
-    decoded: &Path,
+    decoded: Option<&Path>,
     numbers: &[u32],
     fps: f64,
     dir: &Path,
@@ -257,13 +291,11 @@ fn compare(
         request = request.with_media(r);
     }
     let planner = Planner::new(timeline, plan_assets, &export_options(fps), request).expect("plan");
-    let (pts, time_base, start_us) = source_frames(decoded);
-    assert_eq!(pts.len(), numbers.len(), "{tag}: the numbers of the frames");
-    let src = SourceFrames {
-        pts: &pts,
-        time_base,
-        start_us,
-    };
+    let probed = decoded.map(source_frames);
+    if let Some(probed) = &probed {
+        assert_eq!(probed.pts.len(), numbers.len(), "{tag}: the numbers of the frames");
+    }
+    let src = probed.as_ref().map_or(SourceFrames::NONE, Probed::frames);
     let mut found = Found {
         wrong: Vec::new(),
         drawn: 0,
@@ -276,7 +308,7 @@ fn compare(
             .iter()
             .find(|l| l.clip_id == clip)
             .and_then(|l| l.pick.select(&src))
-            .map_or(0, |i| numbers[i] + 1);
+            .map_or(0, |i| if decoded.is_some() { numbers[i] + 1 } else { 255 });
         found.drawn += usize::from(rendered != 0);
         if rendered != planned {
             found.wrong.push((k, rendered, planned));
@@ -313,7 +345,7 @@ fn sweep(dir: &Path, filler: &Asset, specs: Vec<Spec>) {
             &assets,
             &assets,
             None,
-            Path::new(&s.src.asset.path),
+            Some(Path::new(&s.src.asset.path)),
             &s.src.numbers,
             fps,
             dir,
@@ -478,14 +510,25 @@ fn the_fps_pick_is_the_frame_the_export_renders_from_other_containers_and_a_vari
 }
 
 /// The ends of a file and of a window: a clip that plays to the very end of its footage (the
-/// stream ends with the file, not with a frame `trim` dropped), a window of one frame and
-/// of two, forward, reversed and slowed.
+/// stream ends with the file — the last frame's own duration past it — not with a frame `trim`
+/// dropped), a window of one frame and of two, forward, reversed and slowed, in time bases whose
+/// frame gaps are not their last frame's duration.
 #[test]
 #[ignore = "needs the ffmpeg and ffprobe binaries"]
 fn the_fps_pick_is_the_frame_the_export_renders_at_the_end_of_the_file_and_in_tiny_windows() {
     let dir = scratch("pick-ends");
     let filler = filler(&dir);
-    let sources = [("10", numbered(&dir, "10", 4, MP4)), ("30", numbered(&dir, "30", 4, MP4))];
+    // Matroska counts in milliseconds: a 30 fps clip's gaps alternate 33 and 34 ticks and its last
+    // frame lasts 33, so the stream's end at the end of the file is the frame's own duration.
+    let mkv = Kind { vfr: false, ext: "mkv" };
+    let vfr_mkv = Kind { vfr: true, ext: "mkv" };
+    let sources = [
+        ("10", numbered(&dir, "10", 4, MP4)),
+        ("30", numbered(&dir, "30", 4, MP4)),
+        ("30 mkv", numbered(&dir, "30", 4, mkv)),
+        ("29.97 mkv", numbered(&dir, "29.97", 4, mkv)),
+        ("30 vfr mkv", numbered(&dir, "30", 4, vfr_mkv)),
+    ];
     let mut specs = Vec::new();
     for (name, src) in &sources {
         for export in ["30", "24"] {
@@ -560,7 +603,7 @@ fn the_fps_pick_follows_a_clip_playing_on_under_a_dissolve() {
                     &assets,
                     &assets,
                     None,
-                    Path::new(&src.asset.path),
+                    Some(Path::new(&src.asset.path)),
                     &src.numbers,
                     fps,
                     &dir,
@@ -595,6 +638,62 @@ fn the_fps_pick_follows_a_clip_playing_on_under_a_dissolve() {
         bad.len()
     );
     assert!(tails >= 30, "the clips must play on: {tails}");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A white still, `W`x`H`.
+fn still(dir: &Path) -> Asset {
+    let path = dir.join("still.png");
+    if !path.exists() {
+        let graph = format!("color=c=white:s={W}x{H},format=rgb24");
+        run(&["-f", "lavfi", "-i", &graph, "-frames:v", "1", &path.to_string_lossy()]);
+    }
+    let mut asset = test_asset(vec![crate::engine::test_support::image_stream(W, H)]);
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = crate::model::DEFAULT_IMAGE_DURATION;
+    asset
+}
+
+/// A still image is read as `-loop 1 -framerate <fps> -t <end>`, with the chain's `trim`
+/// absolute, and is drawn by the same rule as footage: its closing edge is the frame the loop's
+/// run ends on, not the frame its `enable` window closes on. Lengths from a tenth of a second to
+/// two and a half, every phase of the grid, cut from `source_in` 0 and 0.25 (which starts the
+/// still on the first frame at or after a quarter second), at six rates and three speeds.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn a_still_image_is_drawn_on_the_frames_its_loop_runs_on() {
+    let dir = scratch("pick-still");
+    let filler = filler(&dir);
+    let image = still(&dir);
+    let (mut drawn, mut bad, mut cases) = (0, Vec::new(), 0);
+    for export in ["24", "25", "29.97", "30", "60", "23.976"] {
+        let fps: f64 = export.parse().unwrap();
+        for secs in [0.1, 0.4, 1.0, 2.5] {
+            for phase in [0.0, 0.3, 0.5, 0.9] {
+                for seek in [0.0, 0.25] {
+                    let speed = [1.0, 0.5, 2.0][cases % 3];
+                    cases += 1;
+                    let start = (6.0 + phase) / fps;
+                    let (timeline, clip) = timeline_of_clip(&image, &filler, seek, secs, speed, start);
+                    let assets = [image.clone(), filler.clone()];
+                    let tag = format!("still{cases}");
+                    let found = compare(&timeline, clip, &assets, &assets, None, None, &[], fps, &dir, &tag, H / 2);
+                    drawn += found.drawn;
+                    if !found.wrong.is_empty() {
+                        bad.push(format!(
+                            "{export} fps, {secs} s at speed {speed}, phase {phase}, source_in {seek}: {} of {} frames differ, first (frame, rendered, planned) {:?}",
+                            found.wrong.len(),
+                            found.drawn,
+                            &found.wrong[..found.wrong.len().min(4)]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{cases} stills, {drawn} drawn frames compared, {} with a mismatch", bad.len());
+    assert!(drawn > cases, "the stills must be drawn");
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -649,16 +748,6 @@ fn late_numbered(dir: &Path, name: &str, lead: f64) -> Option<Source> {
     })
 }
 
-struct RemoveOnDrop(Vec<PathBuf>);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
 /// `proxy/late-video-start`. A source whose video starts late gets a proxy whose head is
 /// padded: one clone of the first frame at time zero, every timestamp kept
 /// (`generate_proxy`, `.lead.mp4`), so a seek into the proxy lands where the original's does.
@@ -682,7 +771,7 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
         };
         let original = &source.asset;
         let proxy = generate_proxy(Path::new(&original.path), PROXY_MAX_WIDTH).expect("proxy");
-        let _cleanup = RemoveOnDrop(vec![proxy.clone(), proxy.with_extension("json")]);
+        let _cleanup = ProxyGuard(proxy.clone());
         let padded = crate::clip_timing::is_head_padded_proxy(&proxy.to_string_lossy());
         assert_eq!(padded, lead > 0.0, "lead {lead}: {proxy:?}");
         padded_seen += usize::from(padded);
@@ -705,7 +794,8 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
         let mut numbers = source.numbers.clone();
         if padded {
             numbers.insert(0, 0);
-            let (pts, tb, _) = source_frames(&proxy);
+            let probed = source_frames(&proxy);
+            let (pts, tb) = (&probed.pts, probed.time_base);
             assert_eq!(pts[0], 0, "lead {lead}");
             let first = pts[1] as f64 * f64::from(tb.num) / f64::from(tb.den);
             assert!((first - lead).abs() < 0.002, "lead {lead}: the footage starts at {first}");
@@ -727,7 +817,7 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
                 &render,
                 &plan,
                 Some(&ProxyMedia),
-                &proxy,
+                Some(&proxy),
                 &numbers,
                 30.0,
                 &dir,
