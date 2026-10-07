@@ -1,0 +1,38 @@
+name: apt install
+description: >-
+  `apt-get update` + `apt-get install -y` that cannot eat a job's timeout. A
+  hung connection to the runner's Ubuntu mirror used to sit until the job was
+  cancelled (twenty minutes of nothing, reported as a cancelled job rather than
+  an error), so every request gets an inactivity timeout and apt's own retries,
+  and the whole step is bounded and tried again a couple of times.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get install
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+          'Acquire::Retries "3";' \
+          'Acquire::http::Timeout "30";' \
+          'Acquire::https::Timeout "30";' \
+          | sudo tee /etc/apt/apt.conf.d/80-ci-timeouts >/dev/null
+        read -ra pkgs <<< "$PACKAGES"
+        for attempt in 1 2 3; do
+          if timeout 240 sudo apt-get update \
+            && timeout 600 sudo apt-get install -y "${pkgs[@]}"; then
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+          sleep $((attempt * 10))
+        done
+        echo "::error::apt-get failed three times"
+        exit 1
