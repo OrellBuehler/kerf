@@ -355,6 +355,24 @@ const ACTION_LIST = [
 		hint: 'Removes the selected clips and closes the gaps behind them.'
 	},
 	{
+		id: 'edit.trimStart',
+		repeat: false,
+		label: 'Trim start to playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Q'],
+		hint: 'Removes the part of the selected clip before the playhead. Follows ripple mode: on, the later clips close the gap.'
+	},
+	{
+		id: 'edit.trimEnd',
+		repeat: false,
+		label: 'Trim end to playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['W'],
+		hint: 'Removes the part of the selected clip after the playhead. Follows ripple mode: on, the later clips close the gap.'
+	},
+	{
 		id: 'edit.clearSelection',
 		label: 'Clear selection',
 		group: 'edit',
@@ -365,6 +383,30 @@ const ACTION_LIST = [
 
 	{ id: 'tool.pointer', label: 'Select tool', group: 'tools', context: 'global', defaults: ['V'] },
 	{ id: 'tool.razor', label: 'Razor tool', group: 'tools', context: 'global', defaults: ['C'] },
+	{
+		id: 'tool.roll',
+		label: 'Roll tool',
+		group: 'tools',
+		context: 'global',
+		defaults: ['N'],
+		hint: 'Drag a cut between two touching clips to move it; nothing after the pair moves.'
+	},
+	{
+		id: 'tool.slip',
+		label: 'Slip tool',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Y'],
+		hint: 'Drag a clip to show a different part of its footage in the same place.'
+	},
+	{
+		id: 'tool.slide',
+		label: 'Slide tool',
+		group: 'tools',
+		context: 'global',
+		defaults: ['U'],
+		hint: 'Drag a clip along its track; the clips touching it give way.'
+	},
 	{
 		id: 'tool.rippleMode',
 		repeat: false,

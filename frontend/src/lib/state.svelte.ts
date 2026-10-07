@@ -67,6 +67,11 @@ import {
 	reorderClip,
 	rippleDelete,
 	cutClipRange,
+	rollEdit,
+	slipClip,
+	slideClip,
+	splitRemove,
+	splitRemoveClips,
 	revertTo as apiRevertTo,
 	revisionDiff as apiRevisionDiff,
 	applyStagedEdit,
@@ -87,7 +92,9 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	ClipCut,
 	ClipMove,
+	SplitSide,
 	ExportProgress,
 	Asset,
 	AssetAnalysis,
@@ -624,6 +631,26 @@ class EditorState {
 	 *  promise rejects, and nothing has moved, if the group does not fit. */
 	moveClips(moves: ClipMove[]) {
 		return this.#apply(moveClips(moves));
+	}
+	/** Roll the cut between two adjacent clips by `delta` seconds (positive later). */
+	roll(clipA: string, clipB: string, delta: number) {
+		return this.#apply(rollEdit(clipA, clipB, delta));
+	}
+	/** Slip a clip's footage by `delta` source seconds (positive = starts later in it). */
+	slip(clipId: string, delta: number) {
+		return this.#apply(slipClip(clipId, delta));
+	}
+	/** Slide a clip along its track by `delta` timeline seconds; touching neighbours give way. */
+	slide(clipId: string, delta: number) {
+		return this.#apply(slideClip(clipId, delta));
+	}
+	/** Split a clip at `at` and remove the `left` or `right` half; follows ripple mode. */
+	splitRemove(clipId: string, at: number, side: SplitSide) {
+		return this.#apply(splitRemove(clipId, at, side));
+	}
+	/** Split and remove on several clips as ONE edit (one revision, one undo). */
+	splitRemoveClips(cuts: ClipCut[], side: SplitSide) {
+		return this.#apply(splitRemoveClips(cuts, side));
 	}
 
 	// ---- ripple mode ----------------------------------------------------------

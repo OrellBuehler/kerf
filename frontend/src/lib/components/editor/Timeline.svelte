@@ -13,13 +13,31 @@
 	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { deleteSelection } from '$lib/ops';
+	import { deleteSelection, trimSelection } from '$lib/ops';
 	import { importCaptionFile } from '$lib/title-actions';
 	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
 	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
+	import { beginDrag } from '$lib/drag';
+	import {
+		CUT_REACH_PX,
+		cutsOf,
+		limitNotice,
+		monitorFor,
+		nearestCut,
+		previewEdit,
+		readoutFor,
+		refusalNotice,
+		slideMembers,
+		slipDelta,
+		sourceLimits,
+		subjectsPresent,
+		type EditPreview,
+		type GestureEdit,
+		type TrimTool
+	} from '$lib/trim-tools';
 	import { readPalette } from '$lib/waveform-draw';
 	import { filmstrips } from '$lib/filmstrips';
 	import {
@@ -319,7 +337,7 @@
 	});
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
-		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
+		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
 		e.stopPropagation();
 		editor.selectClip(c.id);
@@ -410,8 +428,8 @@
 	 *  playhead, a beat, a clip edge — when snapping is on, otherwise the nearest
 	 *  frame. Frames are not a magnet: they apply with snapping off too. A landing
 	 *  within a hair of a neighbour's edge is that edge exactly, magnet or not. */
-	function snapPoint(time: number, trackId: string, clipId: string): number {
-		const edges = clipEdges(trackId, clipId);
+	function snapPoint(time: number, trackId: string, except: string | ReadonlySet<string>): number {
+		const edges = clipEdges(trackId, except);
 		return quantizeTime(time, {
 			fps,
 			magnets: ui.snap ? [0, ui.time, ...beatTimes, ...edges] : [],
@@ -450,6 +468,18 @@
 			);
 			if (at === null) toast.error('That clip is too short to cut on a frame');
 			else void editor.split(c.id, at).catch(err);
+			return;
+		}
+		if (ui.tool === 'roll' || ui.tool === 'slip' || ui.tool === 'slide') {
+			// These act on one clip (or the cut beside it), so the press selects it, as
+			// a plain press does; a modifier press is a selection gesture and nothing more.
+			editor.selectClip(c.id, mode);
+			void editor.select(c.asset_id);
+			if (mode !== 'replace') {
+				e.stopPropagation();
+				return;
+			}
+			beginTrimTool(e, c, t, laneLeft);
 			return;
 		}
 		// Pressing a clip that is one of several selected keeps them all: it is the
@@ -681,6 +711,201 @@
 		if (!plan || !plan.ok || plan.noop) return;
 		// The group lands as ONE edit: one revision, one undo.
 		void editor.moveClips(plan.moves).catch(err);
+	}
+
+	// ---- roll / slip / slide: the tools that move a boundary ------------------------
+	//
+	// Roll moves the cut between two touching clips, slip moves a clip's footage under
+	// its fixed edges, slide moves a clip while the clips touching it give way. The
+	// edits and everything a drag needs of them are pure and live in `trim-tools.ts`
+	// (the range the pointer is held to, the ghost as the *outcome*, the words, the
+	// frames the Preview shows); this is the pointer plumbing. Each gesture is
+	// `beginDrag` — pointer capture, Escape / cancel / lost capture / blur abandon —
+	// takes one position from the raw pointer and rounds it once (`frames.ts`), shows
+	// the result live without writing, and writes ONE edit on release. A drag that
+	// hits a limit says so on release, and the backend is asked for what is legal
+	// *then*, as the ghost was.
+
+	type TrimGesture = {
+		tool: TrimTool;
+		trackId: string;
+		/** What it edits; null for a roll pressed away from any cut, which is only a click. */
+		edit: GestureEdit | null;
+		/** The cut's time (roll) or the clip's start (slide): what the pointer is measured from. */
+		origin: number;
+		/** The pointer's offset from `origin` at the press (seconds): the cut or the clip
+		 *  follows the pointer rather than jumping to it. */
+		grab: number;
+		/** Where the press was on the time axis — a click that never drags seeks there. */
+		pressTime: number;
+		downX: number;
+		/** The pressed clip's length and speed. */
+		dur: number;
+		speed: number;
+		/** What the pointer asks for (rounded once, not yet held to the range). */
+		requested: number;
+		preview: EditPreview | null;
+		moved: boolean;
+		/** The pointer in lane space — where the readout is written. */
+		nx: number;
+		ny: number;
+	};
+	let tg = $state<TrimGesture | null>(null);
+	let cancelTrimTool: (() => void) | null = null;
+	// The panel closing gives a gesture up (this cleanup runs once, at teardown)…
+	$effect(() => () => cancelTrimTool?.());
+	// …and so does a clip leaving the timeline under it — an agent's edit, an undo, Delete
+	// pressed mid-drag. Abandoned, nothing is written and the ghost goes; left to run, the
+	// release would ask the backend for an edit on a clip that is gone and answer with an
+	// error toast for a drag the user never finished.
+	$effect(() => {
+		const edit = tg?.edit;
+		if (edit && !subjectsPresent(editor.timeline, edit)) cancelTrimTool?.();
+	});
+
+	/** How far each asset's footage reaches: what every edit mode clamps to. */
+	const footage = $derived(sourceLimits(editor.assets));
+
+	/** The cut under the roll tool's pointer, so it can be lit and the cursor changed
+	 *  before anything is pressed. */
+	let rollHover = $state<{ trackId: string; time: number } | null>(null);
+	$effect(() => {
+		if (ui.tool !== 'roll') rollHover = null;
+	});
+
+	function onLaneHover(e: PointerEvent, t: Track) {
+		if (ui.tool !== 'roll' || tg || t.locked) {
+			if (rollHover) rollHover = null;
+			return;
+		}
+		const left = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
+		const cut = nearestCut(cutsOf(t), laneTime(e.clientX, left), CUT_REACH_PX / pxPerSec);
+		// Only a change is written: most moves of the pointer land on the same cut.
+		if (cut?.time !== rollHover?.time || (cut ? t.id : null) !== (rollHover?.trackId ?? null)) {
+			rollHover = cut ? { trackId: t.id, time: cut.time } : null;
+		}
+	}
+
+	function endTrimTool() {
+		tg = null;
+		cancelTrimTool = null;
+		ui.trimMonitor = null;
+	}
+
+	function beginTrimTool(e: PointerEvent, c: Clip, t: Track, laneLeft: number) {
+		const tool = ui.tool as TrimTool;
+		const pressTime = laneTime(e.clientX, laneLeft);
+		let edit: GestureEdit | null = null;
+		let origin = 0;
+		if (tool === 'roll') {
+			// The nearest cut to the press, within reach — either clip of it will do.
+			const cut = nearestCut(cutsOf(t), pressTime, CUT_REACH_PX / pxPerSec);
+			if (cut) {
+				edit = { tool, a: cut.a, b: cut.b };
+				origin = cut.time;
+			}
+		} else if (tool === 'slip') {
+			edit = { tool, clipId: c.id };
+		} else {
+			edit = { tool: 'slide', clipId: c.id };
+			origin = c.timeline_start;
+		}
+		tg = {
+			tool,
+			trackId: t.id,
+			edit,
+			origin,
+			grab: pressTime - origin,
+			pressTime,
+			downX: e.clientX,
+			dur: clipDuration(c),
+			speed: c.speed ?? 1,
+			requested: 0,
+			preview: null,
+			moved: false,
+			nx: 0,
+			ny: 0
+		};
+		cancelTrimTool = beginDrag(e, { move: onTrimToolMove, commit: onTrimToolUp, abandon: endTrimTool });
+	}
+
+	function onTrimToolMove(e: PointerEvent) {
+		const g = tg;
+		if (!g) return;
+		const moved = g.moved || Math.abs(e.clientX - g.downX) >= DRAG_SLOP;
+		const track = editor.timeline.tracks.find((t) => t.id === g.trackId);
+		if (!moved || !g.edit || !track) {
+			tg = { ...g, moved };
+			return;
+		}
+		const lane = document.querySelector(`[data-lane][data-track-id="${g.trackId}"]`) as HTMLElement | null;
+		const here = laneTime(e.clientX, lane?.getBoundingClientRect().left ?? 0);
+		// One rounding, from where the pointer is — never from the last frame's. A magnet
+		// within reach (the playhead, a beat, an edge not part of the edit) still wins.
+		let requested: number;
+		if (g.edit.tool === 'roll') {
+			requested = snapPoint(here - g.grab, g.trackId, new Set([g.edit.a, g.edit.b])) - g.origin;
+		} else if (g.edit.tool === 'slide') {
+			requested = snapStart(here - g.grab, g.trackId, slideMembers(track, g.edit.clipId), g.dur) - g.origin;
+		} else {
+			requested = slipDelta((e.clientX - g.downX) / pxPerSec, { speed: g.speed }, fps);
+		}
+		const preview = previewEdit(editor.timeline, g.edit, requested, footage);
+		const box = lanesEl?.getBoundingClientRect();
+		tg = { ...g, moved, requested, preview, nx: box ? e.clientX - box.left : 0, ny: box ? e.clientY - box.top : 0 };
+		ui.trimMonitor = monitorFor(preview, fps, track.kind);
+	}
+
+	function onTrimToolUp() {
+		const g = tg;
+		endTrimTool();
+		if (!g) return;
+		// A press that never became a drag is a click: the clip was selected at the press,
+		// and the playhead goes where it was pressed, as it does under Select.
+		if (!g.moved || !g.edit) {
+			ui.seek(g.pressTime);
+			return;
+		}
+		// Asked again: an agent's edit or a flipped mode may have changed what is legal
+		// since the last move, and what is written is what the backend will take now.
+		const p = previewEdit(editor.timeline, g.edit, g.requested, footage);
+		if (!p.ok) {
+			toast.error(refusalNotice(p));
+			return;
+		}
+		if (p.ghosts.length === 0) {
+			// Dragged out and back, or pinned against a limit it could not leave.
+			if (p.clamped) toast.info(limitNotice(p, fps));
+			return;
+		}
+		const edit = p.edit;
+		const run =
+			edit.tool === 'roll'
+				? editor.roll(edit.a, edit.b, p.applied)
+				: edit.tool === 'slip'
+					? editor.slip(edit.clipId, p.applied)
+					: editor.slide(edit.clipId, p.applied);
+		// The Tauri commands answer with the refreshed timeline, not the backend's
+		// `EditOutcome`, so a clamp is told from the range the ghost was held to.
+		void run.then(() => p.clamped && toast.info(limitNotice(p, fps))).catch(err);
+	}
+
+	/** What the pointer looks like over a clip — the tool's own, and the plain
+	 *  not-allowed over a locked track. A roll's cursor is only over a cut. */
+	function clipCursor(t: Track): string {
+		if (t.locked) return 'not-allowed';
+		switch (ui.tool) {
+			case 'razor':
+				return 'crosshair';
+			case 'roll':
+				return tg || rollHover?.trackId === t.id ? 'col-resize' : 'default';
+			case 'slip':
+				return 'ew-resize';
+			case 'slide':
+				return tg ? 'grabbing' : 'grab';
+			default:
+				return drag ? (dropRefused ? 'not-allowed' : 'grabbing') : 'grab';
+		}
 	}
 
 	// ---- marquee: drag on empty space to select what the rectangle touches ----
@@ -950,6 +1175,19 @@
 					else void editor.split(c.id, at).catch(err);
 				}
 			},
+			{
+				label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
+				shortcut: settings.shortcut('edit.trimStart'),
+				disabled: !within || !!t.locked,
+				action: () => void trimSelection('left')
+			},
+			{
+				label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
+				shortcut: settings.shortcut('edit.trimEnd'),
+				disabled: !within || !!t.locked,
+				action: () => void trimSelection('right')
+			},
+			{ type: 'separator' },
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
 				icon: 'copy',
@@ -1926,6 +2164,8 @@
 					data-kind={t.kind}
 					onclick={onLaneSeek}
 					onpointerdown={(e) => onCanvasPointerDown(e, 'lane')}
+					onpointermove={(e) => onLaneHover(e, t)}
+					onpointerleave={() => (rollHover = null)}
 					oncontextmenu={(e) => onLaneContextMenu(e, t)}
 					ondragover={(e) => onLaneDragOver(e, t)}
 					ondragleave={(e) => onLaneDragLeave(e, t)}
@@ -1937,7 +2177,14 @@
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
 						{@const primary = editor.selectedClipId === c.id}
-						{@const dragging = (drag?.moved && drag.members.has(c.id)) || !!trimPreview?.shifted.has(c.id)}
+						{@const sliding = !!tg?.moved && tg.edit?.tool === 'slide' && tg.edit.clipId === c.id}
+						{@const dragging = (drag?.moved && drag.members.has(c.id)) || !!trimPreview?.shifted.has(c.id) || sliding}
+						<!-- A slip shows the footage moving under the clip's edges as it is dragged:
+						     the picture and the waveform are drawn from the window it would have. -->
+						{@const shown =
+							tg?.moved && tg.edit?.tool === 'slip' && tg.edit.clipId === c.id
+								? (tg.preview?.ghosts.find((g) => g.id === c.id)?.clip ?? c)
+								: c}
 						{@const off = c.enabled === false || !renders(t)}
 						<button
 							class="kclip"
@@ -1946,15 +2193,7 @@
 							onclick={(e) => e.stopPropagation()}
 							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
 								? 'grayscale(1)'
-								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{t.locked
-								? 'not-allowed'
-								: ui.tool === 'razor'
-									? 'crosshair'
-									: drag
-										? dropRefused
-											? 'not-allowed'
-											: 'grabbing'
-										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
+								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{clipCursor(t)};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
 								? '0 0 0 1px var(--kerf-500)'
 								: selected
 									? '0 0 0 1px var(--kerf-600)'
@@ -1962,7 +2201,7 @@
 						>
 							{#if t.kind === 'audio'}
 								<ClipWaveform
-									clip={c}
+									clip={shown}
 									{width}
 									{pxPerSec}
 									{dpr}
@@ -1973,7 +2212,7 @@
 									duration={assetDuration.get(c.asset_id) ?? c.source_out}
 									{palette}
 								/>
-								{#each silenceRegions(c) as r (r.left)}
+								{#each silenceRegions(shown) as r (r.left)}
 									<span
 										title="Detected silence"
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
@@ -1981,7 +2220,7 @@
 								{/each}
 							{:else}
 								<ClipFilmstrip
-									clip={c}
+									clip={shown}
 									{width}
 									{pxPerSec}
 									{dpr}
@@ -2031,7 +2270,7 @@
 								sound={audibleAssets.has(c.asset_id)}
 								{selected}
 								locked={!!t.locked}
-								razor={ui.tool === 'razor'}
+								tooled={ui.tool !== 'pointer'}
 								trimEdge={trimDrag?.clipId === c.id ? trimDrag.edge : null}
 								onlive={(v) => (liveVolume[c.id] = v)}
 								onselect={() => {
@@ -2081,6 +2320,40 @@
 							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
 						></div>
 					{/if}
+					{#if rollHover?.trackId === t.id && !tg}
+						<!-- The cut the roll tool would take hold of. -->
+						<div
+							style="position:absolute;left:{rollHover.time * pxPerSec - 1}px;top:3px;bottom:3px;width:2px;border-radius:1px;background:var(--kerf-300);box-shadow:0 0 6px 1px var(--kerf-400);pointer-events:none;z-index:24"
+						></div>
+					{/if}
+					{#if tg?.moved && tg.preview && tg.trackId === t.id}
+						<!-- A roll, slip or slide in progress: every clip it changes, where it would
+						     stand. Amber when the drag is held at a limit, red when the backend
+						     would turn it down (letting go then writes nothing). -->
+						{@const pv = tg.preview}
+						{@const edge = !pv.ok ? 'var(--red-500)' : pv.clamped ? 'var(--warning)' : 'var(--kerf-400)'}
+						{#each pv.ghosts as g (g.id)}
+							<div
+								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									2,
+									g.dur * pxPerSec
+								)}px;border:1.5px dashed {edge};border-radius:2px;background:{!pv.ok
+									? 'var(--danger-surface)'
+									: pv.clamped
+										? 'var(--warning-surface)'
+										: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
+							></div>
+						{/each}
+						{#if tg.edit?.tool === 'roll'}
+							<!-- Where the cut was, and where it is: the distance is the roll. -->
+							<div
+								style="position:absolute;left:{tg.origin * pxPerSec}px;top:2px;bottom:2px;width:0;border-left:1px dashed var(--text-muted);pointer-events:none;z-index:25"
+							></div>
+							<div
+								style="position:absolute;left:{(tg.origin + pv.applied) * pxPerSec - 1}px;top:2px;bottom:2px;width:2px;border-radius:1px;background:{edge};box-shadow:0 0 6px 1px {edge};pointer-events:none;z-index:26"
+							></div>
+						{/if}
+					{/if}
 					{#if dropGhost && dropGhost.trackId === t.id}
 						<div
 							style="position:absolute;left:{dropGhost.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
@@ -2102,6 +2375,21 @@
 				<div
 					style="position:absolute;left:{r.x0}px;top:{r.y0}px;width:{r.x1 - r.x0}px;height:{r.y1 - r.y0}px;border:var(--line-width) solid var(--kerf-400);background:var(--selection-fill);pointer-events:none;z-index:24"
 				></div>
+			{/if}
+
+			<!-- a roll, slip or slide: how far, and what it leaves — or what is stopping it -->
+			{#if tg?.moved && tg.preview}
+				{@const ro = readoutFor(tg.preview, fps)}
+				{@const line = ro.tone === 'refused' ? 'var(--red-500)' : ro.tone === 'limit' ? 'var(--warning)' : 'var(--border-strong)'}
+				<div
+					role="status"
+					aria-live="off"
+					data-trim-readout
+					style="position:absolute;left:{Math.max(4, Math.min(tg.nx + 14, contentW - 440))}px;top:{tg.ny + 18}px;z-index:35;pointer-events:none;max-width:430px;padding:3px 8px;border-radius:var(--radius-sm);border:var(--line-width) solid {line};background:var(--surface-raised);color:var(--text-primary);font-size:11px;line-height:1.35"
+				>
+					<div style="font-family:var(--font-mono);font-weight:600;white-space:nowrap">{ro.title}</div>
+					{#if ro.detail}<div style="color:{ro.tone === 'refused' ? 'var(--red-500)' : 'var(--warning)'}">{ro.detail}</div>{/if}
+				</div>
 			{/if}
 
 			<!-- why a group drag is red, while it is still a drag -->

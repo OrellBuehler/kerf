@@ -21,7 +21,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | A6 Headless agent rendering | — | — | todo | |
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Open: edit modes, linked A/V + detach audio (verify `extract_audio` doubling), blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Open: linked A/V + detach audio (verify `extract_audio` doubling), blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -123,6 +123,14 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 - **2026-10-07 — wall-clock tests.** Performance guards assert generous limits
   (8–10 s, 5 s in bun) sized to catch the quadratic algorithm they guard, not a
   busy machine running the suite in parallel.
+
+- **2026-10-07 — keyframed zoom is a graph bug.** The export (and the preview
+  stream) never animated a scale-only keyframed zoom: a format converter in
+  front of `overlay` pins the first frame's size. Fixed in the graph
+  (`fix/keyed-zoom`, a deliberate argv change) rather than reproduced on the
+  GPU.
+- **2026-10-07 — edit modes act per track.** Roll/slip/slide don't move a
+  linked partner (no sync lock until linked A/V lands).
 
 ## Needs a real machine
 

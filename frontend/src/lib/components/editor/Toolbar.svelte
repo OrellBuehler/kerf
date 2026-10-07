@@ -13,6 +13,7 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import type { ActionId } from '$lib/keymap';
+	import { TOOL_HINT, type TrimTool } from '$lib/trim-tools';
 
 	let {
 		onNew,
@@ -27,6 +28,13 @@
 	const tools: [Tool, string, string, ActionId][] = [
 		['pointer', 'MousePointer2', 'Select', 'tool.pointer'],
 		['razor', 'Scissors', 'Razor', 'tool.razor']
+	];
+	// The tools that move a boundary rather than a clip, set apart from those two.
+	// Their tooltips say what the drag does, since the glyphs alone do not.
+	const trimTools: [TrimTool, string, string, ActionId][] = [
+		['roll', 'separator-vertical', 'Roll', 'tool.roll'],
+		['slip', 'gallery-horizontal', 'Slip', 'tool.slip'],
+		['slide', 'arrow-left-right', 'Slide', 'tool.slide']
 	];
 
 	// The frame the cut is being made for. Changing it reshapes the preview, the
@@ -85,6 +93,18 @@
 			<Icon n={ic} />
 		</IconBtn>
 	{/each}
+	{@render divider()}
+	{#each trimTools as [id, ic, name, action] (id)}
+		<IconBtn
+			title="{settings.withShortcut(`${name} tool`, action)} — {TOOL_HINT[id]}"
+			aria-label="{name} tool"
+			active={ui.tool === id}
+			onclick={() => (ui.tool = id)}
+		>
+			<Icon n={ic} />
+		</IconBtn>
+	{/each}
+	{@render divider()}
 	<IconBtn title="Snap to clips" active={ui.snap} onclick={() => (ui.snap = !ui.snap)}>
 		<Icon n="magnet" />
 	</IconBtn>
