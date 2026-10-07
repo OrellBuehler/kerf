@@ -12,7 +12,6 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
-	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 
 	let { onClose }: { onClose: () => void } = $props();
 
