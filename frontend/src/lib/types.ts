@@ -713,6 +713,11 @@ export interface VoiceoverResult {
 	timeline: Timeline;
 }
 
+/** What the app was launched asking to open (kerf-app's `LaunchProject`, externally
+ *  tagged): a `.kerf` that exists, or one named on the command line that is not
+ *  there — never created, so the page says so instead. */
+export type LaunchRequest = { open: string } | { missing: string };
+
 /** A newer signed release found on GitHub by the updater. */
 export interface UpdateInfo {
 	/** The available version, e.g. `0.18.0`. */

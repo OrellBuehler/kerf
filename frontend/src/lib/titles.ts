@@ -12,6 +12,14 @@ export const BOX_BORDER_PX = 12;
 /** Height the box padding is taken against when the project has no delivery frame. */
 export const DEFAULT_FRAME_H = 1080;
 
+/** The block fill of a *generated* caption in the titles lane and the Inspector's
+ *  swatch: the title color, dimmed toward the scrim so it reads as the quieter of
+ *  the two next to a typed title (it is also dashed). Dimmed toward darkness rather
+ *  than toward the panel, because the label on it is `--text-on-video` — light in
+ *  every theme — and a fill washed toward a light panel (Kerf Light) leaves it
+ *  unreadable. The theme guard computes this exact mix per preset. */
+export const GENERATED_TITLE_FILL = 'color-mix(in srgb,var(--track-text) 70%,var(--scrim))';
+
 const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
 const round3 = (v: number) => Math.round(v * 1000) / 1000;
 
