@@ -9,6 +9,7 @@ import { audio } from './audio';
 import { toast } from './notifications.svelte';
 import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, TranscriptionStatus } from './types';
 import type { VoiceoverPrefill } from './voiceover';
+import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import {
 	heightOf,
@@ -23,11 +24,17 @@ import {
 	type TrackHeights
 } from './track-heights';
 
-export type Tool = 'pointer' | 'razor';
+/** The timeline's tools: select and razor, then the three that move a boundary
+ *  rather than a clip (`trim-tools.ts`). */
+export type Tool = 'pointer' | 'razor' | TrimTool;
 
 class EditorUi {
 	tool = $state<Tool>('pointer');
 	snap = $state(true);
+	/** The frames either side of a roll / slip / slide while one is being dragged —
+	 *  the timeline writes it, the Preview shows it in place of the playhead's frame,
+	 *  and it is `null` the moment the gesture ends however it ends. */
+	trimMonitor = $state<TrimMonitor | null>(null);
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);

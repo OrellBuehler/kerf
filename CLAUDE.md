@@ -1908,6 +1908,36 @@ bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` mak
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
 not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
 frame.
+**Roll, slip and slide** are three more tools beside Select and Razor (toolbar buttons;
+`N` / `Y` / `U`; `Tool` is `'pointer' | 'razor' | TrimTool`) over `edit-modes.ts`.
+`src/lib/trim-tools.ts` is everything a drag needs of them, pure and bun-tested;
+`Timeline.svelte` is only pointer plumbing (`beginTrimTool` → `beginDrag`: capture,
+Escape / cancel / blur abandon, **one** `editor.roll` / `slip` / `slide` on release).
+*Roll* grabs the nearest cut within 8 px (`cutsOf` / `nearestCut` — two touching clips;
+a press away from any cut is a click), lit on hover; the cut follows the pointer by the
+offset it was grabbed at, snapped (playhead / beats / edges other than the pair's own) and
+frame-rounded once. *Slip* is `slipDelta`: the content follows the pointer (drag right =
+earlier footage = a negative backend `delta`, reversed clips included), rounded in
+timeline frames then × speed, and the clip's filmstrip / waveform redraw from the slipped
+window as you drag. *Slide* snaps the clip's start as a move does, minus the clips that
+travel with it (`slideMembers`). The pointer is **held to the range** (`holdToRange` over
+`rollRange` / `slipRange` / `slideRange`), not refused, and the ghost is the **outcome**:
+`previewEdit` runs the mirror on a plain copy of the lane (`structuredClone` throws on
+the editor's `$state` proxies) and returns the clips as they would stand. Ghost and
+readout go amber when held at a limit (the reason beside the pointer) and red when the
+backend would refuse (locked track, no longer a cut); release re-previews — the project
+can move mid-drag — and toasts "Roll stopped at … — the incoming clip has no footage
+left". `clamped` is judged client-side from that range, since the Tauri commands answer
+with the timeline, not the `EditOutcome`. Meanwhile the Preview shows the **trim monitor**
+(`ui.trimMonitor`, `TrimMonitor` / `TrimFrame`): `monitorFor` picks the frames either side
+(a roll's outgoing last + incoming first, a slip's new in + out, a slide's two changed
+neighbour edges; none on an audio track) and `getFrame` decodes them from the *source*,
+single-flight, newest wins (the harness draws its stamped stand-in frames).
+`ClipOverlays`' hit areas (`tooled`) are inert under any tool but Select; none of the
+three ripples. **Trim start / end to playhead** (`Q` / `W`, the clip menu; `ops.ts` `trimSelection`) is `split_remove` on
+every *selected* clip the playhead is inside (`planPlayheadTrim`: the razor's frame rule,
+the 0.05 s floor as a sentence, locked tracks reported) — one revision per clip, following
+ripple mode, with a toast saying why when there is nothing to cut.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -2224,7 +2254,8 @@ would not read back from its stored spelling — `ß`, macOS's no-break space fo
 stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* its
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
-stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone).
+stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
+bare keys added since (`ADDED`: N / Y / U / Q / W).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults

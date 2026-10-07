@@ -68,6 +68,7 @@ import {
 } from './edit-modes';
 import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
 import { rippleFrom } from './ripple';
+import { sourceLimits } from './trim-tools';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
@@ -1102,7 +1103,7 @@ export async function cutClipRange(clipId: string, from: number, to: number): Pr
 /** What each harness asset's footage reaches — `Project::source_limits`: its
  *  duration, or `Infinity` for a still (it loops). */
 function devSourceLimits(): SourceLimits {
-	return new Map(sampleAssets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]));
+	return sourceLimits(sampleAssets);
 }
 
 /** Roll the cut between two adjacent clips of one track by `delta` seconds
