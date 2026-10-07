@@ -4,7 +4,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 
 | WP | branch | PR | status | notes |
 |---|---|---|---|---|
-| A0 GPU feasibility spike | `feat/gpu-a0` | — | review | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 55 renders, flat PSNR 43.1–99 dB, flat max ≤ 7/255 (limit 8). Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
+| A0 GPU feasibility spike | `feat/gpu-a0` | — | review | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | in-progress | |
 | A1 Frame source + render plan | — | — | todo | |
 | A2 Native preview surface | — | — | todo | |

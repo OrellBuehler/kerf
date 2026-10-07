@@ -562,10 +562,16 @@ no editing logic in the adapter.
   pins the argv against the plan); `still_size` is the preview-size rule both use.
   **`gpu_supported()` is the per-frame fallback switch** and answers *no, with
   reasons* for anything the compositor does not render exactly: video effects,
-  masks, 360 reframe, HDR, a live text overlay, a fade or transition in progress,
-  a non-bicubic scaler, a layer with no known picture size. Pure + unit-tested like
-  the rest of the timeline math; `PlanCanvas.matrix` records which YUV matrix the
-  composite is converted with (see `kerf-gpu`).
+  masks, 360 reframe, HDR, **alpha** (from `StreamInfo.pix_fmt`, probed — `None` on an
+  asset saved before it was recorded, which the decoder then checks in the pixels),
+  opacity below 1 on a stream whose YCbCr matrix (`StreamInfo.color_space`) the
+  compositor has no coefficients for, a live text overlay, a fade or transition in
+  progress, a non-bicubic scaler, a layer with no known picture size. What only the
+  decode or the compositor can see is refused there instead (`GpuError::Unsupported`):
+  a picture that decodes at another size than probed, a translucent layer of odd size.
+  Pure + unit-tested like the rest of the timeline math; `PlanCanvas.matrix` records
+  which YUV matrix the composite is converted with (see `kerf-gpu`) and
+  `PlanStream::matrix` the one a translucent layer is taken out of YUV with.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -671,13 +677,25 @@ a feasibility spike **not linked into kerf-app yet**. It draws a `RenderPlan` he
 when there is no adapter, `force_fallback_adapter` for the software one) and reads
 RGBA back. wgpu is built with the Vulkan / Metal / DX12 backends only — no GLES, no
 WebGL — so the CI target is a software adapter (Mesa **lavapipe** on Linux, WARP on
-Windows) and nothing may depend on an optional wgpu feature. FFmpeg stays the
-decoder: `source::decode_layer` pipes one raw `yuv420p` frame from the binary (the
-same `-ss` as the still graph; a still image goes through `yuva420p` so transparency
-is *seen* and refused rather than flattened), spawned through kerf-core's
-`ffmpeg_command()` (no console flash on Windows) with `limit_ffmpeg_args` applying the
-CPU budget's thread cap at spawn time — a moment read, so ungated. No cache, no proxy,
-one spawn per layer (the layers of a frame in parallel): that is A1.
+Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is an
+error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
+internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
+`Compositor::new` and `composite` return `Result`, and a lost device is tracked — every
+later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
+`Compositor`** (the device is not recreated behind the caller's back).
+
+FFmpeg stays the decoder: `source::decode_layer` pipes one frame from the binary as
+`yuv4mpegpipe` 4:2:0 (the same `-ss` as the still graph), spawned through kerf-core's
+`ffmpeg_command()` (no console flash on Windows). **The decode states its own size**
+(the y4m header) and it is compared with the probe's: a JPEG with an EXIF orientation
+probes 480x270 and decodes 270x480, so a mismatch is `Unsupported` and that frame goes
+through FFmpeg. An alpha `pix_fmt` is refused (the plan does too); an asset with no
+recorded `pix_fmt` costs a second `yuva420p` decode that is refused if anything is
+transparent. A child is killed after 30 s or when it writes more than the probed size,
+and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still draws
+nothing for that layer, and so does the compositor. The layers of a frame decode in
+parallel, each given `budget / layers` threads even at a full CPU budget
+(`limit_ffmpeg_args(args, share)`). No cache, no proxy: that is A1.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
@@ -687,46 +705,88 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   composites out-of-gamut-but-legal footage (saturated patterns, super-whites)
   differently. Chroma is replicated 2x2 at the final conversion, as swscale's unscaled
   path does.
-- **The matrix is BT.601 limited, not the stream's** (`PlanCanvas.matrix`). The
-  composited frame is untagged, swscale reads that as BT.601, and bt709-tagged,
+- **The composite's matrix is BT.601 limited, not the stream's** (`PlanCanvas.matrix`).
+  The composited frame is untagged, swscale reads that as BT.601, and bt709-tagged,
   bt601-tagged and untagged sources convert identically in FFmpeg's still (measured).
   Matching FFmpeg is the point of parity, so the GPU does too. The consequence to know
   about: an *export* is untagged `yuv420p` that a player shows as BT.709 for HD, so the
   FFmpeg preview already disagrees with the file by a few levels on saturated colour.
-  Fixing that is a decision for when the GPU path replaces the FFmpeg preview.
+  Fixing that is a decision for when the GPU path replaces the FFmpeg preview. The
+  stream's own matrix (`PlanStream::matrix`, from the probed `color_space`) is used in
+  exactly one place: the RGB round trip below.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
   tables (the integer `process_c` path when gamma is 1, the `pow` table otherwise, its
   `float` clamping, truncation) and the test suite checks them byte for byte against
   FFmpeg. Kerf's "temperature" is a power function on the chroma planes.
-- **Scaler: swscale's bicubic** (B = 0, C = 0.6) as two separable passes per plane, the
-  kernel stretched when shrinking, planes scaled independently at their own size and
-  rounded to 8 bits between stages (the fit scale and the transform's scale are two
-  scalers in cascade, as in FFmpeg). Checked against `ffmpeg -vf scale` to within one
-  level, odd sizes included.
+- **Scaler: swscale's bicubic, ported, not imitated** (`sws.rs`, `composite.wgsl`).
+  swscale's filter *table* has quirks a formula misses — the window start truncated
+  toward zero (so at the first pixels the tap at -1 is absent, not folded into pixel 0),
+  right-edge folding, near-zero tap trimming, 14- / 12-bit weights normalized by error
+  diffusion, the 16.16 step — and the shader does its integer arithmetic (15-bit
+  horizontal intermediate clipped at the top, vertical pass rounded at bit 19). Planes
+  are scaled independently at their own size and rounded to 8 bits between stages (the
+  fit scale and the transform's scale are two scalers in cascade). The first version
+  used a bicubic *formula* and was wrong by up to 20 levels along the borders of busy
+  footage; the committed test
+  (`the_scaler_matches_ffmpegs_scale_plane_by_plane`, `Compositor::composite_yuv`)
+  compares planes with `ffmpeg -vf scale`: **every sample within one level**, noise and
+  checkerboard included, up and down, on FFmpeg 6.1 and 9.0.
+- **Opacity below 1 is FFmpeg's RGB round trip** (`roundtrip.rs` is the scalar
+  reference, `roundtrip.wgsl` the passes): `colorchannelmixer` only takes RGB, so the
+  layer goes `yuva420p -> argb -> yuva420p` before `overlay`. Out of YUV is swscale's
+  C table converter with *the layer's own matrix* (a BT.709 stream converts as BT.709;
+  exact on random pictures); back is BT.601 whatever the layer was (the RGB frame in
+  between carries no tag; luma exact, chroma — pair sums then a stretched vertical
+  bicubic — within a level); the alpha plane is `round(lrint(255 * op) * 256 / 255)`
+  (50% is 129). Colour outside the RGB gamut comes back clipped, luma a level or two
+  lower — a blend that skipped this was 34 dB / 22 levels off on saturated bars. A
+  translucent layer of **odd size is refused**: the chroma pairing reads
+  uninitialised padding past an odd picture, an odd height leaves swscale's unscaled
+  path.
+- **A letterboxed layer is the whole frame.** `pad` emits a full-canvas frame, black
+  bars included, so an identity clip that does not fill the frame covers what is below
+  it, and `eq` grades the bars too (`LayerGeometry.matte`). `pad` also drops the last
+  odd row / column of the picture.
+- **An odd layer's last chroma block reaches one pixel past it** (`overlay` blends whole
+  chroma samples): the compositor writes that pixel's U and V with a second, chroma-only
+  pass.
 - **The decode asks for limited range explicitly** (`scale=out_range=tv`): FFmpeg 6.1
   converts a full-range JPEG for `-pix_fmt yuva420p` alone, FFmpeg 9 hands the raw
   full-range bytes back untouched — the first thing the pinned build found.
 - **Geometry is FFmpeg's integer geometry** (`geometry.rs`, pure): `crop` rounds with
   `lrint` and clears the low bit, the fit uses `av_rescale`, `pad` / `overlay` truncate
-  and round down to even, `pad` drops the last odd row / column of the picture, `rotate`
-  rounds its box half-up and samples bilinear about the pixel-index centres.
+  and round down to even, `rotate` rounds its box half-up and samples bilinear about
+  the pixel-index centres, chroma outside a rotated picture is clamped to its edge (FFmpeg
+  leaves a few green pixels there; the GPU does not copy them).
 
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`) renders each case at several times
 through `export_still` (a PNG at the full canvas) and through the GPU and compares them:
 **PSNR >= 40 dB and max per-channel error <= 8/255 outside the edge band**, where the
-band is every pixel within 2 px of a >12-level step in the *reference*, plus a
-whole-image PSNR floor (40 dB, 30 dB for a case with a rotated layer) that catches a
-layer a row off. Thresholds live as named constants at the top of the file with the
-reason for each; a case never relaxes them silently, and a new visual feature gets a
-case. Cases: single clip (three sources), a gap, contain / cover into 9:16 / 16:9 and
-up / down scaling, picture-in-picture, scale + rotate + crop, odd-sized and off-canvas
-layers, opacity, colour (all four knobs, contrast + saturation only, warm / cool), PNG
-and JPEG stills, speed / reverse / keyframes, and 10-bit / 4:4:4 / full-range /
-odd-sized / metadata-rotated sources — 55 renders, which also pass against the pinned
-FFmpeg 9.0.2 the Windows and macOS bundles ship. A failing case writes the reference,
-GPU and diff images to `target/parity/` (`KERF_PARITY_KEEP=1` keeps them for passing
-ones); every run writes `target/parity/report.txt`. `tests/bench.rs` times a still on
-the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6 layers, decode apart from composite
+band is every pixel within 2 px of a >24-level step in the *reference* (>12 for a case
+with a rotated layer, whose stair-stepped edge at a reduced opacity shows less contrast),
+**at least half the frame must be outside it** (a case that is edge everywhere — noise, a
+1-px checkerboard — takes `BUSY` limits: the whole image against the same error bounds),
+plus a whole-image PSNR floor (40 dB, 30 dB for a case with a rotated layer) that catches
+a layer a row off. Thresholds live as named constants at the top of the file with the
+reason for each and the measured numbers at the bottom; a case never relaxes them
+silently, and a new visual feature gets a case. Assets are made by the same probe an
+import uses (`Project::probe_asset`), so a stream says what the app would know. Cases:
+single clip (three sources), a gap, contain / cover into 9:16 / 16:9 and up / down
+scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scale + rotate
++ crop, odd-sized and off-canvas layers, **letterboxed layers over and under others** (bars
+cover, graded bars), **opacity** (several sources and roles, a BT.2020-tagged one, a graded
+fade), colour (all four knobs, contrast + saturation only, warm / cool), PNG and JPEG
+stills, speed / reverse / keyframes, 10-bit / 4:4:4 / full-range / odd-sized /
+metadata-rotated sources, **busy sources** scaled by non-integer ratios, a clip past the
+end of its footage (nothing drawn, like FFmpeg), the scaler plane by plane, a rotated grey
+with no colour fringe, and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same
+with the pixel format unrecorded, a translucent odd layer) — each of which FFmpeg still
+renders. 77 renders in the table plus the plane-level scaler runs, which also pass, with the same
+figures, against the pinned FFmpeg 9.0.2 the Windows and macOS bundles ship. A failing
+case writes the reference, GPU and diff images to `target/parity/` (`KERF_PARITY_KEEP=1`
+keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints everything and fails nothing);
+every run writes `target/parity/report.txt`. `tests/bench.rs` times a still on the GPU
+against FFmpeg at 1080p / 4K and 1 / 3 / 6 layers, decode apart from composite
 (`KERF_BENCH=1`).
 
 ```bash

@@ -100,10 +100,13 @@ pub fn ffmpeg_command() -> Command {
 
 /// Apply the CPU budget's thread cap to an `ffmpeg` argv about to be spawned —
 /// at spawn time, never in a builder, so the builders keep describing exactly
-/// what ffmpeg is handed. A no-op at the default 100%, which is what keeps every
-/// run byte-identical to the ones Kerf always issued.
-pub fn limit_ffmpeg_args(args: &mut Vec<String>) {
-    cpu::limit_args(args, cpu::budget_threads());
+/// what ffmpeg is handed. `share` is how many such processes run side by side:
+/// the budget is the *machine's* share for one job, so each of `share` parallel
+/// decodes gets its fraction (at least one thread), even at a full budget. A lone
+/// process (`share` 1) at the default 100% is untouched, which is what keeps
+/// every run Kerf always issued byte-identical.
+pub fn limit_ffmpeg_args(args: &mut Vec<String>, share: usize) {
+    cpu::limit_args_shared(args, share);
 }
 
 fn ffprobe_bin() -> String {
@@ -316,6 +319,8 @@ struct ProbeStream {
     duration: Option<String>,
     color_transfer: Option<String>,
     color_primaries: Option<String>,
+    color_space: Option<String>,
+    pix_fmt: Option<String>,
     /// Container-level stream tags. Only `rotate` matters: FFmpeg before 6.0
     /// reported a phone's turn as this tag (clockwise) as well as in the
     /// `Display Matrix` side data (counter-clockwise).
@@ -422,6 +427,16 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
             },
             color_primaries: if is_video {
                 known_color(s.color_primaries.as_deref())
+            } else {
+                None
+            },
+            pix_fmt: if is_video {
+                s.pix_fmt.clone().filter(|p| !p.is_empty() && p != "none")
+            } else {
+                None
+            },
+            color_space: if is_video {
+                known_color(s.color_space.as_deref())
             } else {
                 None
             },
@@ -6288,6 +6303,8 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
         }
     }
 
@@ -6306,6 +6323,8 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
         }
     }
 
@@ -6324,6 +6343,8 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
         }
     }
 
@@ -10024,6 +10045,30 @@ mod tests {
             r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"hevc",{video}}}],"format":{{"duration":"10.0"}}}}"#
         );
         probe_from_json(serde_json::from_str(&json).expect("json"), None)
+    }
+
+    #[test]
+    fn the_pixel_format_is_recorded_for_video_and_tells_alpha_apart() {
+        let plain = probe_json(r#""width":1280,"height":720,"pix_fmt":"yuv420p""#);
+        assert_eq!(plain.streams[0].pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(plain.streams[0].has_alpha(), Some(false));
+        let alpha = probe_json(r#""width":1280,"height":720,"pix_fmt":"yuva420p""#);
+        assert_eq!(alpha.streams[0].has_alpha(), Some(true));
+        // Absent from the JSON (an old ffprobe, an audio-only file): not known,
+        // which is not the same as "no alpha".
+        let unknown = probe_json(r#""width":1280,"height":720"#);
+        assert_eq!(unknown.streams[0].pix_fmt, None);
+        assert_eq!(unknown.streams[0].has_alpha(), None);
+    }
+
+    #[test]
+    fn the_declared_ycbcr_matrix_is_recorded_when_there_is_one() {
+        let tagged = probe_json(r#""width":1280,"height":720,"color_space":"bt709""#);
+        assert_eq!(tagged.streams[0].color_space.as_deref(), Some("bt709"));
+        // ffprobe says "unknown" for none; that is no tag, not a tag named unknown.
+        let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
+        assert_eq!(untagged.streams[0].color_space, None);
+        assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
     }
 
     #[test]

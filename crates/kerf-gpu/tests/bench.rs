@@ -66,6 +66,10 @@ fn source(dir: &Path, w: u32, h: u32) -> Asset {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            // As a real import records it (without it every decode is followed by a
+            // second one that looks for transparency).
+            pix_fmt: Some("yuv420p".into()),
+            color_space: None,
         }],
         imported_at: Utc::now(),
         source_paths: Vec::new(),
@@ -122,7 +126,7 @@ fn bench_time_per_still_gpu_vs_ffmpeg() {
     }
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
-    let comp = Compositor::new(gpu);
+    let comp = Compositor::new(gpu).expect("compositor");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-out-{}.jpg", std::process::id()));
     let opts = ExportOptions::default();

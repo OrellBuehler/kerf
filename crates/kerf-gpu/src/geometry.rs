@@ -63,12 +63,31 @@ pub struct LayerGeometry {
     /// The picture after the stages.
     pub picture: (u32, u32),
     pub rotation: Option<Rotation>,
-    /// The layer as it is overlaid: the rotated box, else the picture.
+    /// The layer as it is overlaid: the rotated box, else the picture — except
+    /// for a letterboxed identity layer, which is the whole canvas (see
+    /// [`LayerGeometry::matte`]).
     pub layer: (u32, u32),
+    /// Where the picture sits inside the layer (nonzero only with a matte).
+    pub picture_at: (u32, u32),
+    /// The part of the picture that shows. Smaller than the picture by an odd
+    /// last row / column when a matte is added: `pad` drops those.
+    pub picture_shows: (u32, u32),
+    /// `pad` hands `overlay` a **full-canvas frame**: the letterboxed picture on
+    /// opaque black bars, and the `eq` table has already run over the bars too.
+    /// So an identity layer that does not fill the frame covers whatever is on
+    /// the tracks below with that matte — drawing only the picture lets them show
+    /// through the bars.
+    pub matte: bool,
     /// Where the layer's top-left lands on the canvas (may be off-canvas).
     pub origin: (i32, i32),
-    /// 0..1, quantised to 8 bits like an alpha plane.
+    /// The layer's alpha, 0..1, as FFmpeg's alpha plane ends up holding it (see
+    /// [`ffmpeg_alpha`]).
     pub opacity: f32,
+    /// The clip is translucent (`opacity < 1`): FFmpeg takes such a layer through
+    /// RGB (`colorchannelmixer` has no YUV mode), which the compositor reproduces.
+    /// Decided on the raw opacity, like the graph builder does: 0.999 still goes
+    /// through RGB even though its alpha plane rounds to opaque.
+    pub translucent: bool,
 }
 
 /// A layer FFmpeg would fail to build (zero-sized crop, absurd transform): the
@@ -79,6 +98,16 @@ pub struct GeometryError(pub String);
 
 fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
+}
+
+/// The alpha plane FFmpeg's still hands `overlay` for a clip of opacity `op`
+/// (below 1): `colorchannelmixer` writes `lrint(255 * op)`, and the conversion
+/// back to `yuva420p` that follows it scales alpha by 256/255, rounded and
+/// clipped at 255 — so 50% is 129, not 128. Verified for every alpha value
+/// 0..=255 on FFmpeg 6.1 and 9.0.
+pub fn ffmpeg_alpha(op: f64) -> u8 {
+    let mixed = lrint(op.clamp(0.0, 1.0) * 255.0).clamp(0, 255);
+    ((mixed * 256 + 127) / 255).min(255) as u8
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
@@ -94,7 +123,9 @@ fn even(v: i64) -> i64 {
 
 /// `overlay`'s `normalize_xy`: truncate toward zero, then round down to even.
 fn overlay_coord(d: f64) -> i32 {
-    ((d as i64) & !1) as i32
+    // Far past any canvas the position is "off it" either way; clamping first
+    // keeps the `i32` below from wrapping a huge offset back on-screen.
+    ((d.clamp(-1e9, 1e9) as i64) & !1) as i32
 }
 
 fn crop_window(iw: u32, ih: u32, tf: &Transform) -> Result<Rect, GeometryError> {
@@ -193,18 +224,32 @@ impl LayerGeometry {
             // `pad` copies the picture in at a size rounded *down* to even (it
             // hands 4:2:0 chroma whole blocks), so a scaled picture with an odd
             // side loses its last row or column to the padding — measured: a
-            // 203-row fit in a 640-row frame is 202 rows in FFmpeg's still.
-            let layer = match fit {
-                Fit::Contain => (picture.0 & !1, picture.1 & !1),
-                Fit::Cover => picture,
+            // 203-row fit in a 640-row frame is 202 rows in FFmpeg's still — and
+            // what it emits is the whole canvas, bars included.
+            let (layer, picture_at, picture_shows, matte) = match fit {
+                Fit::Contain => {
+                    let shows = (picture.0 & !1, picture.1 & !1);
+                    (
+                        (ow, oh),
+                        (origin.0.max(0) as u32, origin.1.max(0) as u32),
+                        shows,
+                        shows != (ow, oh),
+                    )
+                }
+                Fit::Cover => (picture, (0, 0), picture, false),
             };
+            let origin = if matte { (0, 0) } else { origin };
             return Ok(Self {
                 stages,
                 picture,
                 rotation: None,
                 layer,
+                picture_at,
+                picture_shows,
+                matte,
                 origin,
                 opacity: 1.0,
+                translucent: false,
             });
         }
 
@@ -233,6 +278,19 @@ impl LayerGeometry {
             picture = (w, h);
         }
 
+        // A translucent layer goes through FFmpeg's RGB round trip, whose chroma
+        // reduction pairs pixels two by two: on a picture with an odd side the
+        // last pair reaches one pixel past the line (and, for an odd height, the
+        // conversion leaves swscale's unscaled path for a generic one), reading
+        // padding the graph never initialised. That is not something to copy; the
+        // frame goes through FFmpeg, which has the same garbage to itself.
+        if tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
+            return Err(GeometryError(format!(
+                "a translucent layer of odd size {}x{} (FFmpeg's RGB round trip reads past the picture)",
+                picture.0, picture.1
+            )));
+        }
+
         // 4. rotate (clockwise radians, box grown to hold the corners).
         let rotation = (tf.rotation != 0.0).then(|| {
             let angle = tf.rotation.to_radians();
@@ -253,8 +311,16 @@ impl LayerGeometry {
             picture,
             rotation,
             layer,
+            picture_at: (0, 0),
+            picture_shows: layer,
+            matte: false,
             origin,
-            opacity: ((tf.opacity.clamp(0.0, 1.0) * 255.0).round() / 255.0) as f32,
+            opacity: if tf.opacity < 1.0 {
+                f32::from(ffmpeg_alpha(tf.opacity)) / 255.0
+            } else {
+                1.0
+            },
+            translucent: tf.opacity < 1.0,
         })
     }
 }
@@ -272,6 +338,7 @@ mod tests {
         let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture, (640, 360));
         assert_eq!(g.origin, (0, 0));
+        assert!(!g.matte, "a picture that fills the frame has no bars");
         assert_eq!(g.stages.len(), 1);
         assert_eq!(g.stages[0].scaled, (640, 360));
         assert!(g.rotation.is_none());
@@ -283,13 +350,15 @@ mod tests {
         // padded at y = 218.5 -> 218 (truncate, already even).
         let g = LayerGeometry::resolve((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture, (360, 203));
-        assert_eq!(g.origin, (0, 218));
-        // ...and `pad` keeps only an even number of the picture's rows.
-        assert_eq!(g.layer, (360, 202));
+        // The layer is the whole canvas — `pad` emits black bars — with the
+        // picture at y = 218 showing an even 202 of its rows.
+        assert!(g.matte);
+        assert_eq!((g.layer, g.origin), ((360, 640), (0, 0)));
+        assert_eq!((g.picture_at, g.picture_shows), ((0, 218), (360, 202)));
         // An odd gap rounds down to even: 1080-607 = 473 / 2 = 236.5 -> 236.
         let g = LayerGeometry::resolve((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture.1, 1080);
-        assert_eq!(g.origin.0 % 2, 0);
+        assert_eq!(g.picture_at.0 % 2, 0);
     }
 
     #[test]
@@ -368,6 +437,13 @@ mod tests {
     }
 
     #[test]
+    fn an_absurd_offset_stays_off_canvas_instead_of_wrapping() {
+        assert!(overlay_coord(1e18) > 100_000);
+        assert!(overlay_coord(-1e18) < -100_000);
+        assert_eq!(overlay_coord(f64::INFINITY) % 2, 0);
+    }
+
+    #[test]
     fn a_negative_position_truncates_toward_zero_before_rounding_down() {
         // (640-320)/2 - 0.6*640 = -224 exactly; -224.5 would truncate to -224.
         assert_eq!(overlay_coord(-224.5), -224);
@@ -390,12 +466,69 @@ mod tests {
     }
 
     #[test]
-    fn opacity_is_quantised_like_an_alpha_plane() {
+    fn opacity_is_the_alpha_ffmpegs_round_trip_leaves() {
         let tf = Transform { opacity: 0.5, ..t() };
         let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
-        // 0.5 * 255 = 127.5 -> 128.
-        assert!((g.opacity - 128.0 / 255.0).abs() < 1e-6);
+        // 0.5 * 255 = 127.5 -> lrint 128, then the conversion's 256/255: 129
+        // (measured on FFmpeg 6.1 and 9.0, for all 256 alpha values).
+        assert!((g.opacity - 129.0 / 255.0).abs() < 1e-6);
+        assert!(g.translucent);
         assert!(g.rotation.is_none() && g.stages.len() == 1);
+        // Opaque is untouched and not translucent; 0.999 is translucent (it takes
+        // the RGB round trip) with an opaque alpha plane.
+        let opaque = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
+        assert!(!opaque.translucent && opaque.opacity == 1.0);
+        let almost = Transform { opacity: 0.999, ..t() };
+        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &almost).unwrap();
+        assert!(g.translucent && g.opacity == 1.0);
+    }
+
+    #[test]
+    fn a_translucent_layer_of_odd_size_is_refused_and_an_opaque_one_is_not() {
+        // 640x360 at 0.5 scale is 320x180: fine. 0.33 is 211x118: an odd width.
+        let even = Transform {
+            scale: 0.5,
+            opacity: 0.5,
+            ..t()
+        };
+        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &even).is_ok());
+        let odd = Transform {
+            scale: 0.33,
+            opacity: 0.5,
+            ..t()
+        };
+        let err = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &odd).unwrap_err();
+        assert!(err.0.contains("odd size 211x118"), "{err}");
+        let opaque = Transform { scale: 0.33, ..t() };
+        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &opaque).is_ok());
+        // Rotation after the scale does not matter: the picture is what is checked.
+        let turned = Transform {
+            scale: 0.5,
+            rotation: 33.0,
+            opacity: 0.5,
+            ..t()
+        };
+        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &turned).is_ok());
+    }
+
+    #[test]
+    fn the_alpha_table_matches_what_ffmpeg_was_measured_to_write() {
+        // `colorchannelmixer=aa=<op>` then `yuva420p`, FFmpeg 6.1 and 9.0.
+        for (op, alpha) in [
+            (0.1, 26),
+            (0.2, 51),
+            (0.3, 76),
+            (0.5, 129),
+            (0.65, 167),
+            (0.8, 205),
+            (0.9, 231),
+            (0.99, 253),
+        ] {
+            assert_eq!(ffmpeg_alpha(op), alpha, "opacity {op}");
+        }
+        assert_eq!(ffmpeg_alpha(0.0), 0);
+        assert_eq!(ffmpeg_alpha(1.0), 255);
+        assert_eq!(ffmpeg_alpha(-3.0), 0);
     }
 
     #[test]

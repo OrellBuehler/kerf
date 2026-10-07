@@ -121,6 +121,21 @@ pub struct StreamInfo {
     /// The video's colour primaries as ffprobe names them (`bt2020`, `bt709`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_primaries: Option<String>,
+    /// The pixel format as ffprobe names it (`yuv420p`, `yuva420p`, `rgba`, ...).
+    /// What lets a renderer that draws only opaque 4:2:0 pictures tell, from the
+    /// probe alone, that a source carries an alpha channel (see
+    /// [`StreamInfo::has_alpha`]). `None` for an asset probed before it was
+    /// recorded — a renderer must then find out from the pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pix_fmt: Option<String>,
+    /// The YCbCr matrix the stream declares, as ffprobe names it (`bt709`,
+    /// `smpte170m`, `bt470bg`, `bt2020nc`, ...); `None` when it declares none.
+    /// A decode keeps the picture in its own YCbCr, so this only matters where
+    /// the pipeline converts through RGB *inside* a graph — FFmpeg then uses
+    /// the frame's matrix, and a BT.709 picture round-tripped as BT.601 loses
+    /// its saturation to the RGB gamut clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_space: Option<String>,
 }
 
 fn is_zero_rotation(r: &i16) -> bool {
@@ -148,7 +163,29 @@ impl Hdr {
     }
 }
 
+/// Whether an ffprobe pixel-format name carries an alpha channel. A name is
+/// matched, not looked up in libavutil's table (this crate needs no dev
+/// libraries): `yuva*` and `gbrap*` planar families, the packed `rgba` / `bgra` /
+/// `argb` / `abgr` (and their 64-bit forms), `ya8` / `ya16*`, and `pal8`, whose
+/// palette may hold transparent entries (a GIF) with nothing in the name to say so.
+pub fn pix_fmt_has_alpha(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("yuva")
+        || n.starts_with("gbrap")
+        || n.starts_with("ya8")
+        || n.starts_with("ya16")
+        || n == "pal8"
+        || ["rgba", "bgra", "argb", "abgr"].iter().any(|p| n.starts_with(p))
+}
+
 impl StreamInfo {
+    /// Whether the picture has an alpha channel, when the probe recorded the
+    /// pixel format. `None` is "not known" (an asset saved before
+    /// [`StreamInfo::pix_fmt`] existed), which is not the same as "no alpha".
+    pub fn has_alpha(&self) -> Option<bool> {
+        self.pix_fmt.as_deref().map(pix_fmt_has_alpha)
+    }
+
     /// The HDR transfer this video stream is encoded in, or `None` for SDR and
     /// for anything that is not video.
     pub fn hdr(&self) -> Option<Hdr> {
@@ -247,6 +284,11 @@ impl Asset {
     pub(crate) fn as_sdr_proxy(&self) -> Asset {
         let mut asset = self.clone();
         for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            // The proxy of HDR footage is tagged BT.709 when it is tone-mapped;
+            // an SDR proxy keeps the original's matrix.
+            if s.hdr().is_some() {
+                s.color_space = Some("bt709".into());
+            }
             s.color_transfer = None;
             s.color_primaries = None;
         }

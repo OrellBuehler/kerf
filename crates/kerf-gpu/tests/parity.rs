@@ -15,45 +15,61 @@
 //!
 //! # What "match" means
 //!
-//! The two renderers cannot be bit-identical: FFmpeg composites 4:2:0 YUV in its
-//! own fixed-point scaler and `rotate`, the GPU the same planes in floating point
-//! (its canvas is 4:4:4 with the chroma replicated), and a hard coloured edge is a
-//! different pixel in each — chroma is averaged over 2x2 in one's alpha blend and
-//! per pixel in the other's, a rotated edge is stepped in one and sits at a
-//! fraction of a pixel in the other. Away from edges the two agree to a level or
-//! two (the rest is swscale's YUV -> RGB conversion, which truncates and carries a
-//! mean bias of about one level that the shader does not copy: it is a property of
-//! the platform's SIMD, not of the maths). So a frame is judged in two parts:
+//! The two renderers are not bit-identical, and the harness says where. The
+//! scaler is swscale's own tables in swscale's integer arithmetic and agrees with
+//! `ffmpeg -vf scale` to one level on every plane
+//! (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
+//! opaque layer's blend is FFmpeg's in YUV. What remains is a hard coloured edge
+//! landing on a different pixel (chroma is averaged over 2x2 in one's alpha blend
+//! and per pixel in the other's, a rotated edge is stepped in one and sits at a
+//! fraction of a pixel in the other) and swscale's YUV -> RGB conversion, which
+//! truncates and carries a mean bias of up to a level that the shader does not
+//! copy. So a frame is judged in two parts:
 //!
 //! * the **edge band** — every pixel within [`BAND`] px of a strong gradient in
 //!   the *reference* (a step of more than [`EDGE_STEP`] levels in any channel
 //!   between neighbours, which is every layer boundary and every hard edge of
-//!   the test pattern) — is excluded from the strict check, and
+//!   the test pattern; [`EDGE_STEP_ROTATED`] for a case with a rotated layer) —
+//!   is excluded from the strict check, and
 //! * everywhere else (the *flat* region) the GPU must hold **PSNR >= 40 dB** and a
 //!   **max per-channel error <= 8/255**.
+//!
+//! The band must not swallow the frame: **at least [`FLAT_SHARE_MIN`] of the
+//! pixels must be judged by the strict check**, or the check is empty. A case
+//! whose picture is edge everywhere (noise, a 1-px checkerboard) says so by taking
+//! [`BUSY`] limits instead: the whole image, held to the flat region's own error
+//! bounds. Those are the cases where a cheaper scaler than swscale's bicubic
+//! (bilinear, a box filter) has no flat area to hide in.
 //!
 //! The whole-image PSNR (band included) is held to its own floor
 //! ([`PSNR_ALL_MIN`], lower for a case with a rotated layer): it exists to catch a
 //! layer in the wrong place, which the band alone would excuse.
 //!
+//! Frames the GPU path must **refuse** (`frames_the_gpu_would_draw_wrong_are_refused`)
+//! are cases too: the plan or the render says no, and FFmpeg still renders them.
+//!
 //! On failure (or always, with `KERF_PARITY_KEEP=1`) the reference, the GPU frame
-//! and an amplified diff are written to `target/parity/`.
+//! and an amplified diff are written to `target/parity/`. `KERF_PARITY_EXPLORE=1`
+//! prints every figure and fails nothing, for measuring a change case by case.
 //!
-//! # Known divergences (all inside the edge band, none hidden by a threshold)
+//! # Known divergences (none hidden by a threshold)
 //!
-//! * **Opacity below 1.** `colorchannelmixer` only takes RGB, so FFmpeg converts
-//!   the layer to RGB and back with swscale's 4:2:0 chroma resampling both ways,
-//!   which blurs chroma by up to ~4 px around a hard colour edge. The GPU keeps
-//!   the chroma sharp. (It does *not* matter for gamut: the blend itself is in YUV
-//!   on both sides.)
-//! * **An odd-sized layer.** `overlay` blends the chroma sample of the trailing
-//!   half block, so the one pixel column / row past an odd layer carries the
-//!   layer's chroma on the base's luma — a stray coloured line the GPU does not
-//!   draw (`geometry/odd-sized-layer`: whole-image max 207 at that one column).
+//! * **Opacity below 1** is reproduced, not approximated: FFmpeg takes the layer
+//!   through RGB (`colorchannelmixer` has no YUV mode) and `roundtrip.rs` /
+//!   `roundtrip.wgsl` follow it in integer arithmetic. Out of YUV is exact on
+//!   random pictures (the layer's own matrix); luma back is exact; chroma back is
+//!   within one level (x86 FFmpeg's vertical scaler is not bit-exact with the C one
+//!   this follows). Translucent layers of an **odd size are refused**: FFmpeg's
+//!   chroma pairing reads uninitialised padding past an odd picture.
 //! * **A rotated edge** is a fixed-point stair-step in FFmpeg and a float sample
-//!   here; the interior agrees to a level.
-//! * **swscale's YUV -> RGB** truncates, a mean bias of about one level (the flat
-//!   mean error column below); the shader rounds.
+//!   here; the interior agrees to a level. FFmpeg's own `rotate` also leaves a few
+//!   green pixels along the edge of a neutral layer (chroma it never wrote); the
+//!   GPU does not copy them (`a_rotated_neutral_layer_has_no_colour_fringe`).
+//! * **swscale's YUV -> RGB** truncates, a mean bias of up to a level (the flat
+//!   mean error column in the report); the shader rounds.
+//! * **A 10-bit source that is also scaled**: FFmpeg's `scale` converts and scales
+//!   in one pass (with ordered dither), the GPU path decodes to 8 bits first.
+//!   Measured unscaled only (`source/10-bit`).
 
 #![allow(clippy::print_stderr)]
 
@@ -63,25 +79,28 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chrono::Utc;
 use kerf_core::{
-    export_still, Asset, Clip, Color, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, RenderPlan, StreamInfo, StreamKind,
+    export_still, Asset, Clip, Color, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, Project, RenderPlan, StreamKind,
     Timeline, Track, Transform,
 };
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
-use uuid::Uuid;
 
 // ---- thresholds (final values; the recorded numbers are at the bottom) ------
 
 /// Pixels this close to a strong reference gradient are the edge band.
 const BAND: usize = 2;
 /// A neighbour-to-neighbour step (any channel, in 0..255) that counts as an
-/// edge. 12 levels, about 5%: at 24 the edges of a layer at 30% opacity (which
-/// shows them at 30% of their contrast) fell below it, and the chroma blur
-/// FFmpeg's RGB round trip puts around them was then judged as a mismatch in
-/// the flat region — the errors above 8 sat 3-6 px from such an edge, never
-/// farther (measured), so the threshold moved, the limits did not.
-const EDGE_STEP: i32 = 12;
+/// edge: 24 levels, about 10% of the range. It is what defines the band, so the
+/// higher it is the fewer pixels are excused — 24 is what every case without a
+/// rotated layer is judged at.
+const EDGE_STEP: i32 = 24;
+/// ...and 12 for a case with a rotated layer. `rotate` writes a stair-stepped
+/// edge from a fixed-point source position; once the layer is also faded (the
+/// keyframed case runs at ~65% opacity) the edge shows at two thirds of its
+/// contrast, under 24 levels, and the stair-step — a few levels of difference at
+/// the pixels along it, measured at 10 — would be judged as a mismatch in the
+/// flat region. At 12 the same pixels are in the band; the limits did not move.
+const EDGE_STEP_ROTATED: i32 = 12;
 /// Required PSNR over the flat region.
 const PSNR_FLAT_MIN: f64 = 40.0;
 /// Allowed max per-channel error over the flat region.
@@ -98,22 +117,68 @@ const PSNR_ALL_MIN: f64 = 40.0;
 /// holds the whole-image figure near 33 dB while the interior stays above 46.
 const PSNR_ALL_MIN_ROTATED: f64 = 30.0;
 
+/// The least share of a frame that must lie outside the edge band, so the strict
+/// flat check judges at least half of every ordinary case. The recorded cases sit
+/// between 70% and 100% flat (the busiest, a downscale of the test pattern to
+/// 320x180, 70.6%); a case below this is [`BUSY`] and says so.
+const FLAT_SHARE_MIN: f64 = 0.5;
+
+/// The scaler comparison's bounds, on the planes themselves (levels of 255): no
+/// sample differs from `ffmpeg -vf scale` by more than one level, on any source.
+/// The mean bounds are what the one-level differences add up to: smooth footage
+/// (measured <= 0.06) is almost exact; on a checkerboard — 219 levels of
+/// contrast per pixel — x86 FFmpeg's non-bit-exact vertical scaler is a level
+/// low on over half the samples (measured 0.57), the same bias at every
+/// amplitude, which is why the busy bound is the looser one.
+const SCALER_MAX: i32 = 1;
+const SCALER_SMOOTH_MEAN: f64 = 0.1;
+const SCALER_BUSY_MEAN: f64 = 0.75;
+
+/// How far from neutral (the spread of a pixel's three channels, levels of 255) a
+/// rotated mid-grey layer over black may get anywhere in the frame: rounding in
+/// 4:2:0 chroma, nothing like a green rim (spread > 100 before the fix).
+const FRINGE_MAX: u8 = 4;
+
 /// What a case may relax, and why. Every relaxation is a named constant above.
 #[derive(Clone, Copy)]
 struct Limits {
     psnr_flat: f64,
     max_flat: i32,
     psnr_all: f64,
+    /// At least this share of the frame must be judged by the strict flat check
+    /// (i.e. outside the edge band). Without it a busy picture — all edge —
+    /// would pass on an empty comparison.
+    flat_share: f64,
+    /// A bound on the worst whole-image error, for a case that has no flat
+    /// region to hold the max to.
+    max_all: Option<i32>,
+    /// What counts as an edge for this case's band.
+    edge_step: i32,
 }
 
 const STRICT: Limits = Limits {
     psnr_flat: PSNR_FLAT_MIN,
     max_flat: MAX_FLAT,
     psnr_all: PSNR_ALL_MIN,
+    flat_share: FLAT_SHARE_MIN,
+    max_all: None,
+    edge_step: EDGE_STEP,
+};
+
+/// A source that is edge everywhere (noise, a 1-px checkerboard): the band
+/// covers the picture, so the strict check is the *whole image* — held to the
+/// flat region's own error bounds, with no flat-share requirement. This is the
+/// case where a cheaper scaler than swscale's bicubic (bilinear, a box filter)
+/// cannot hide: there is no flat area to retreat into.
+const BUSY: Limits = Limits {
+    flat_share: 0.0,
+    max_all: Some(MAX_FLAT),
+    ..STRICT
 };
 
 const ROTATED: Limits = Limits {
     psnr_all: PSNR_ALL_MIN_ROTATED,
+    edge_step: EDGE_STEP_ROTATED,
     ..STRICT
 };
 
@@ -127,7 +192,7 @@ fn gpu() -> Arc<Gpu> {
 
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
-    C.get_or_init(|| Compositor::new(gpu()))
+    C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
 }
 
 fn target_dir() -> PathBuf {
@@ -170,37 +235,30 @@ struct Media {
     jpeg: Asset,
     odd: Asset,
     rotated: Asset,
+    /// A 480x270 JPEG whose EXIF orientation says "turn 90 degrees": ffprobe
+    /// reports 480x270, every decode comes out 270x480.
+    exif: Asset,
+    /// Lossless yuva420p, the left half opaque and the right half transparent.
+    alpha: Asset,
+    /// Busy sources: per-pixel noise and a 1-px checkerboard (0.2 s of video).
+    noise: Asset,
+    checker: Asset,
+    /// A 640x360 still that never ends, to sit under a clip that does.
+    still_long: Asset,
+    /// Flat mid-grey and black: neutral colour, so any chroma in a result is a bug.
+    grey: Asset,
+    black: Asset,
+    /// The colour bars tagged BT.2020 (non-constant luminance): the matrix a
+    /// translucent layer is taken out of YUV with is the stream's own.
+    bars2020: Asset,
 }
 
-fn stream(w: u32, h: u32, image: bool) -> StreamInfo {
-    StreamInfo {
-        index: 0,
-        kind: StreamKind::Video,
-        codec: if image { "png" } else { "h264" }.into(),
-        width: Some(w),
-        height: Some(h),
-        fps: (!image).then_some(30.0),
-        sample_rate: None,
-        channels: None,
-        image,
-        projection: None,
-        rotation: 0,
-        color_transfer: None,
-        color_primaries: None,
-    }
-}
-
-fn asset(name: &str, path: &Path, duration: f64, s: StreamInfo) -> Asset {
-    Asset {
-        id: Uuid::new_v4(),
-        path: path.to_string_lossy().into_owned(),
-        name: name.into(),
-        duration,
-        streams: vec![s],
-        imported_at: Utc::now(),
-        source_paths: Vec::new(),
-        voiceover: None,
-    }
+/// The asset a real import would make: the file, probed by the same code the
+/// app imports with (so a stream says what the probe says, `pix_fmt` and all —
+/// which is how the plan learns a picture has alpha, and what the decode is
+/// checked against).
+fn probed(path: &Path) -> Asset {
+    Project::probe_asset(path).unwrap_or_else(|e| panic!("probe {}: {e}", path.display()))
 }
 
 fn media() -> &'static Media {
@@ -304,20 +362,97 @@ fn media() -> &'static Media {
             "2",
             jpeg.to_str().unwrap(),
         ]);
-        let mut rotated_stream = stream(360, 640, false);
-        rotated_stream.rotation = 90;
+        // EXIF orientation 6 in an APP1 segment right after SOI: a landscape JPEG
+        // that displays as a portrait one.
+        let exif = dir.join("exif6.jpg");
+        let mut bytes = std::fs::read(&jpeg).unwrap();
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8], "a JPEG");
+        let app1: Vec<u8> = [
+            &[0xFF, 0xE1, 0x00, 0x22][..],
+            b"Exif\0\0",
+            &[b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00], // TIFF header
+            &[0x01, 0x00],                                     // one entry
+            &[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00], // Orientation = 6
+            &[0x00, 0x00, 0x00, 0x00],                         // no next IFD
+        ]
+        .concat();
+        bytes.splice(2..2, app1);
+        std::fs::write(&exif, bytes).unwrap();
+        // Left half opaque, right half transparent.
+        let alpha = ffv1(
+            "alpha.mkv",
+            "testsrc2=size=640x360:rate=30:duration=2,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(gt(X,W/2),0,255)'",
+            "yuva420p",
+            &["ffv1"],
+        );
+        // Busy footage, as video (a PNG would be converted RGB -> 4:2:0 inside
+        // FFmpeg's scaler in one step and by the decode here in another, which
+        // is a difference of the *source*, not of the compositor).
+        let noise = video(
+            "noise.mp4",
+            "nullsrc=size=640x360:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'",
+        );
+        let checker = video(
+            "checker.mp4",
+            "nullsrc=size=640x360:rate=30:duration=0.2,format=yuv420p,geq=lum='if(eq(mod(X+Y,2),0),235,16)':cb=128:cr=128",
+        );
+        let still_long = dir.join("still-long.png");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "gradients=size=640x360:rate=1:duration=1:c0=0x20a040:c1=0xc04080:nb_colors=2:seed=3:speed=0.00001",
+            "-frames:v",
+            "1",
+            // (`gradients` makes RGBA, which a plan rightly refuses as having alpha.)
+            "-pix_fmt",
+            "rgb24",
+            still_long.to_str().unwrap(),
+        ]);
+        let bars2020 = dir.join("bars2020.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "smptebars=size=640x360:rate=30:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-colorspace",
+            "bt2020nc",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "bt709",
+            bars2020.to_str().unwrap(),
+        ]);
+        let grey = video("grey.mp4", "color=c=0x808080:s=640x360:r=30:d=2");
+        let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=2");
         Media {
-            tenbit: asset("tenbit", &tenbit, 2.0, stream(640, 360, false)),
-            yuv444: asset("yuv444", &yuv444, 2.0, stream(640, 360, false)),
-            fullrange: asset("fullrange", &fullrange, 2.0, stream(640, 360, false)),
-            jpeg: asset("jpeg", &jpeg, 5.0, stream(480, 270, true)),
-            odd: asset("odd", &odd, 2.0, stream(641, 361, false)),
-            rotated: asset("rotated", &rotated_path, 2.0, rotated_stream),
-            testsrc: asset("testsrc", &testsrc, 2.0, stream(640, 360, false)),
-            bars: asset("bars", &bars, 2.0, stream(640, 360, false)),
-            gradient: asset("gradient", &gradient, 2.0, stream(640, 360, false)),
-            portrait: asset("portrait", &portrait, 2.0, stream(360, 640, false)),
-            still: asset("still", &still, 5.0, stream(480, 270, true)),
+            bars2020: probed(&bars2020),
+            grey: probed(&grey),
+            black: probed(&black),
+            tenbit: probed(&tenbit),
+            yuv444: probed(&yuv444),
+            fullrange: probed(&fullrange),
+            jpeg: probed(&jpeg),
+            odd: probed(&odd),
+            rotated: probed(&rotated_path),
+            exif: probed(&exif),
+            alpha: probed(&alpha),
+            noise: probed(&noise),
+            checker: probed(&checker),
+            still_long: probed(&still_long),
+            testsrc: probed(&testsrc),
+            bars: probed(&bars),
+            gradient: probed(&gradient),
+            portrait: probed(&portrait),
+            still: probed(&still),
         }
     })
 }
@@ -353,6 +488,12 @@ struct Metrics {
     edge_fraction: f64,
 }
 
+impl Metrics {
+    fn flat_share(&self) -> f64 {
+        1.0 - self.edge_fraction
+    }
+}
+
 fn psnr(sq_err: f64, n: usize) -> f64 {
     if sq_err == 0.0 || n == 0 {
         return 99.0;
@@ -361,7 +502,7 @@ fn psnr(sq_err: f64, n: usize) -> f64 {
 }
 
 /// The pixels within `BAND` of a strong gradient in `reference` (RGB, packed).
-fn edge_band(reference: &[u8], w: usize, h: usize) -> Vec<bool> {
+fn edge_band(reference: &[u8], w: usize, h: usize, edge_step: i32) -> Vec<bool> {
     let px = |x: usize, y: usize, c: usize| i32::from(reference[(y * w + x) * 3 + c]);
     let mut seed = vec![false; w * h];
     for y in 0..h {
@@ -375,14 +516,14 @@ fn edge_band(reference: &[u8], w: usize, h: usize) -> Vec<bool> {
                     step = step.max((px(x, y + 1, c) - px(x, y, c)).abs());
                 }
             }
-            if step > EDGE_STEP {
+            if step > edge_step {
                 // A step is between two pixels; both are on the edge.
                 seed[y * w + x] = true;
                 if x + 1 < w {
-                    seed[y * w + x + 1] |= (0..3).any(|c| (px(x + 1, y, c) - px(x, y, c)).abs() > EDGE_STEP);
+                    seed[y * w + x + 1] |= (0..3).any(|c| (px(x + 1, y, c) - px(x, y, c)).abs() > edge_step);
                 }
                 if y + 1 < h {
-                    seed[(y + 1) * w + x] |= (0..3).any(|c| (px(x, y + 1, c) - px(x, y, c)).abs() > EDGE_STEP);
+                    seed[(y + 1) * w + x] |= (0..3).any(|c| (px(x, y + 1, c) - px(x, y, c)).abs() > edge_step);
                 }
             }
         }
@@ -411,8 +552,8 @@ fn edge_band(reference: &[u8], w: usize, h: usize) -> Vec<bool> {
     band
 }
 
-fn compare(reference: &[u8], gpu_rgb: &[u8], w: usize, h: usize) -> (Metrics, Vec<bool>) {
-    let band = edge_band(reference, w, h);
+fn compare(reference: &[u8], gpu_rgb: &[u8], w: usize, h: usize, edge_step: i32) -> (Metrics, Vec<bool>) {
+    let band = edge_band(reference, w, h, edge_step);
     let (mut se_flat, mut n_flat, mut sum_flat, mut max_flat) = (0.0f64, 0usize, 0.0f64, 0i32);
     let (mut se_all, mut max_all) = (0.0f64, 0i32);
     for (i, &in_band) in band.iter().enumerate() {
@@ -521,7 +662,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
         assert_eq!((frame.width as usize, frame.height as usize), (w, h));
         let gpu_rgb = rgba_to_rgb(&frame.data);
 
-        let (m, band) = compare(&reference, &gpu_rgb, w, h);
+        let (m, band) = compare(&reference, &gpu_rgb, w, h, limits.edge_step);
         let line = format!(
             "{case:<28} t={t:<7} {w}x{h} layers={} flat: PSNR {:>5.1} dB  max {:>2}  mean {:.2} | all: PSNR {:>5.1} dB  max {:>3} | edge band {:>4.1}%  (decode {:.0} ms, composite {:.0} ms)",
             plan.layers.len(),
@@ -537,7 +678,11 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
         eprintln!("{line}");
         report().lock().unwrap().insert(format!("{case} {t:08.4}"), line);
 
-        let ok = m.psnr_flat >= limits.psnr_flat && m.max_flat <= limits.max_flat && m.psnr_all >= limits.psnr_all;
+        let ok = m.psnr_flat >= limits.psnr_flat
+            && m.max_flat <= limits.max_flat
+            && m.psnr_all >= limits.psnr_all
+            && m.flat_share() >= limits.flat_share
+            && limits.max_all.is_none_or(|bound| m.max_all <= bound);
         if !ok || std::env::var_os("KERF_PARITY_KEEP").is_some() {
             std::fs::create_dir_all(&out_dir).unwrap();
             let stem = format!("{slug}-{t}");
@@ -558,19 +703,31 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
             write_png(&out_dir.join(format!("{stem}-diff.png")), &diff, w, h);
             if !ok {
                 failures.push(format!(
-                    "{case} @ {t}s: flat PSNR {:.1} (>= {}), flat max {} (<= {}), whole PSNR {:.1} (>= {}) — images in {}",
+                    "{case} @ {t}s: flat PSNR {:.1} (>= {}), flat max {} (<= {}), whole PSNR {:.1} (>= {}), flat share {:.0}% (>= {:.0}%), whole max {} (<= {:?}) — images in {}",
                     m.psnr_flat,
                     limits.psnr_flat,
                     m.max_flat,
                     limits.max_flat,
                     m.psnr_all,
                     limits.psnr_all,
+                    m.flat_share() * 100.0,
+                    limits.flat_share * 100.0,
+                    m.max_all,
+                    limits.max_all,
                     out_dir.display()
                 ));
             }
         }
     }
     write_report();
+    // `KERF_PARITY_EXPLORE=1` prints every figure and judges nothing: for
+    // measuring a change case by case instead of stopping at the first miss.
+    if std::env::var_os("KERF_PARITY_EXPLORE").is_some() {
+        for f in &failures {
+            eprintln!("WOULD FAIL: {f}");
+        }
+        return;
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -877,12 +1034,67 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_rotated_neutral_layer_has_no_colour_fringe() {
+    let m = media();
+    // Mid-grey turned over black: every pixel of the result is a grey. FFmpeg's
+    // `rotate` leaves chroma outside the picture at zero (a deep green) under an
+    // alpha that is not quite zero there, and a few of its own pixels show it.
+    // The compositor must not copy that: reading chroma outside the picture as
+    // zero made a green rim on every rotated edge.
+    for rotation in [17.0, 33.0, 45.0, -25.0, 5.0] {
+        let mut c = clip(&m.grey, 0.0, 2.0, 0.0);
+        c.transform.rotation = rotation;
+        c.transform.scale = 0.7;
+        let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
+        let assets = [m.black.clone(), m.grey.clone()];
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5).expect("plan");
+        let size = plan.size(u32::MAX);
+        let (frame, _) = compositor().render_plan(&plan, size).expect("GPU render");
+        let spread = |rgb: &[u8]| {
+            rgb.chunks(3)
+                .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
+                .max()
+                .unwrap_or(0)
+        };
+        let gpu = spread(&rgba_to_rgb(&frame.data));
+        // FFmpeg's own, for reference (it is not perfectly neutral either).
+        let png = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref").join("fringe.png");
+        export_still(&tl, &assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0).expect("FFmpeg still");
+        let reference = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+        let _ = std::fs::remove_file(&png);
+        let ffmpeg_spread = spread(&reference);
+        eprintln!("fringe/grey-rotated-{rotation:<5} worst channel spread: GPU {gpu}, FFmpeg {ffmpeg_spread}");
+        // The input is neutral, so the output must be: that is the contract, not
+        // "as bad as FFmpeg" (its own frame has a few green pixels along the edge,
+        // spread ~100, for the very reason above — they sit in the edge band).
+        assert!(
+            gpu <= FRINGE_MAX,
+            "rotation {rotation}: the GPU frame has a colour fringe (spread {gpu}; FFmpeg's has {ffmpeg_spread})"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn opacity() {
     let m = media();
     let mut top = clip(&m.testsrc, 0.0, 2.0, 0.0);
     top.transform.opacity = 0.5;
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None);
     check("opacity/0.5", &tl, &[m.bars.clone(), m.testsrc.clone()], &[0.0, 1.0], STRICT);
+
+    // The roles swapped: saturated bars on top, whose out-of-gamut colour is
+    // clipped by the RGB round trip FFmpeg's `colorchannelmixer` forces.
+    let mut top = clip(&m.bars, 0.0, 2.0, 0.0);
+    top.transform.opacity = 0.5;
+    let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![top]], None);
+    check(
+        "opacity/bars-0.5-over-testsrc2",
+        &tl,
+        &[m.testsrc.clone(), m.bars.clone()],
+        &[0.5],
+        STRICT,
+    );
 
     let mut top = clip(&m.gradient, 0.0, 2.0, 0.0);
     top.transform = Transform {
@@ -896,6 +1108,88 @@ fn opacity() {
         "opacity/0.3+scale+rotate",
         &tl,
         &[m.bars.clone(), m.gradient.clone()],
+        &[0.5],
+        ROTATED,
+    );
+
+    // Alone, over black — the layer's own picture is what is compared.
+    for (name, a, color) in [
+        ("bars-0.65-alone", &m.bars, Color::default()),
+        (
+            "testsrc2-0.65+brightness0.2",
+            &m.testsrc,
+            Color {
+                brightness: 0.2,
+                ..Color::default()
+            },
+        ),
+        (
+            "testsrc2-0.65+saturation1.9",
+            &m.testsrc,
+            Color {
+                saturation: 1.9,
+                ..Color::default()
+            },
+        ),
+    ] {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform.opacity = 0.65;
+        c.color = color;
+        let tl = timeline(vec![vec![c]], None);
+        check(&format!("opacity/{name}"), &tl, std::slice::from_ref(a), &[0.5], STRICT);
+    }
+
+    // A BT.2020-tagged picture (saturated bars) at 0.6: out of YUV with its own
+    // matrix, back as BT.601.
+    let mut c = clip(&m.bars2020, 0.0, 2.0, 0.0);
+    c.transform.opacity = 0.6;
+    let tl = timeline(vec![vec![c]], None);
+    check(
+        "opacity/bt2020-bars-0.6",
+        &tl,
+        std::slice::from_ref(&m.bars2020),
+        &[0.5],
+        STRICT,
+    );
+
+    // A translucent clip with an odd source size and a crop.
+    let mut c = clip(&m.odd, 0.0, 2.0, 0.0);
+    c.transform = Transform {
+        opacity: 0.7,
+        crop_left: 0.1,
+        crop_bottom: 0.15,
+        ..Transform::default()
+    };
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    check(
+        "opacity/odd-source-cropped-0.7",
+        &tl,
+        &[m.bars.clone(), m.odd.clone()],
+        &[0.5],
+        STRICT,
+    );
+
+    // A fade-in keyframed on a graded clip, sampled mid-fade (opacity 0.5).
+    let mut fade = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    fade.color = Color {
+        brightness: 0.1,
+        saturation: 1.4,
+        ..Color::default()
+    };
+    let key = |time: f64, opacity: f64| Keyframe {
+        time,
+        scale: 1.0,
+        pos_x: 0.0,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity,
+    };
+    fade.keyframes = vec![key(0.0, 0.0), key(1.0, 1.0)];
+    let tl = timeline(vec![vec![fade]], None);
+    check(
+        "opacity/keyframed-fade+grade",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
         &[0.5],
         STRICT,
     );
@@ -1074,6 +1368,394 @@ fn sources_that_are_not_plain_8_bit_420() {
     }
 }
 
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_letterboxed_layer_covers_what_is_below_it() {
+    let m = media();
+    // `pad` hands `overlay` a full-canvas frame, black bars included: a portrait
+    // clip over a landscape one hides the base entirely, it does not let the
+    // base show through the sides.
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![clip(&m.portrait, 0.0, 2.0, 0.0)]],
+        None,
+    );
+    check(
+        "letterbox/portrait-over-landscape",
+        &tl,
+        &[m.bars.clone(), m.portrait.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // ...and the same in a 9:16 project: a landscape clip over a portrait one.
+    let tl = timeline(
+        vec![vec![clip(&m.portrait, 0.0, 2.0, 0.0)], vec![clip(&m.bars, 0.0, 2.0, 0.0)]],
+        Some(Delivery::new(360, 640, Fit::Contain)),
+    );
+    check(
+        "letterbox/landscape-over-portrait-9x16",
+        &tl,
+        &[m.portrait.clone(), m.bars.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // The bars are part of the frame `eq` sees: a brightened clip has brightened
+    // bars (Y 16 -> 16 + 0.15 * 219, U / V through the chroma tables).
+    let mut graded = clip(&m.portrait, 0.0, 2.0, 0.0);
+    graded.color.brightness = 0.15;
+    let tl = timeline(vec![vec![graded]], Some(Delivery::new(640, 360, Fit::Contain)));
+    check(
+        "letterbox/graded-single-clip",
+        &tl,
+        std::slice::from_ref(&m.portrait),
+        &[0.5],
+        STRICT,
+    );
+    // Graded bars on top of another track, saturation and temperature in play.
+    let mut graded = clip(&m.portrait, 0.0, 2.0, 0.0);
+    graded.color = Color {
+        saturation: 1.7,
+        temperature: 0.5,
+        contrast: 1.1,
+        ..Color::default()
+    };
+    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![graded]], None);
+    check(
+        "letterbox/graded-over-gradient",
+        &tl,
+        &[m.gradient.clone(), m.portrait.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // An odd fitted picture (203 rows, of which `pad` keeps 202).
+    let tl = timeline(
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+        Some(Delivery::new(360, 640, Fit::Contain)),
+    );
+    check(
+        "letterbox/odd-fit-over-gradient",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn an_odd_layer_in_a_frame_with_an_odd_chroma_line() {
+    let m = media();
+    // 722x640 with a half-size 640x360 clip is a 361x203 layer: both sides odd,
+    // so `overlay`'s last chroma block reaches a pixel past it on both axes. The
+    // whole-image floor used to read 38.9 dB here.
+    let mut pip = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    pip.transform = Transform {
+        scale: 0.5,
+        pos_x: 0.1,
+        ..Transform::default()
+    };
+    let tl = timeline(
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]],
+        Some(Delivery::new(722, 640, Fit::Contain)),
+    );
+    check(
+        "pip/odd-361x203-in-722x640",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
+    let m = media();
+    // Noise and a 1-px checkerboard, scaled by ratios that are not whole numbers
+    // (down 0.75 and 0.6, up 1.5): every output pixel depends on the exact kernel
+    // (taps, phase, stretch on shrink). The edge band covers these pictures, so
+    // the whole image is the evidence (`BUSY`).
+    for (name, a) in [("noise", &m.noise), ("checker", &m.checker)] {
+        for (w, h) in [(480u32, 270u32), (384, 216), (960, 540)] {
+            let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Contain)));
+            check(&format!("busy/{name}-to-{w}x{h}"), &tl, std::slice::from_ref(a), &[0.1], BUSY);
+        }
+    }
+    // The transform's own scale after the fit scale: two kernels in cascade.
+    let mut pip = clip(&m.noise, 0.0, 0.2, 0.0);
+    pip.transform = Transform {
+        scale: 0.7,
+        ..Transform::default()
+    };
+    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]], None);
+    check(
+        "busy/noise-scaled-0.7",
+        &tl,
+        &[m.gradient.clone(), m.noise.clone()],
+        &[0.1],
+        BUSY,
+    );
+}
+
+/// What a refused frame must be refused for.
+enum Refusal {
+    /// The plan itself says no (`gpu_supported()`), with this in its reasons.
+    Plan(&'static str),
+    /// The plan cannot know, the render finds out (the decode, or the layer's
+    /// geometry): `Unsupported` with this in it.
+    Render(&'static str),
+}
+
+/// FFmpeg still renders the frame (that is the fallback), and the GPU path says
+/// no — by the plan or by the decode — instead of drawing it wrong.
+fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Refusal) {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t).expect("plan");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let png = scratch.join(format!("refused-{}.png", case.replace('/', "_")));
+    export_still(tl, assets, &opts, t, &png, ImageFormat::Png, 0).expect("the FFmpeg fallback renders it");
+    let _ = std::fs::remove_file(&png);
+    match expect {
+        Refusal::Plan(reason) => {
+            assert!(!plan.gpu_supported(), "{case}: the plan should refuse");
+            let reasons = plan.unsupported_reasons().join("; ");
+            assert!(reasons.contains(reason), "{case}: {reasons:?} does not say {reason:?}");
+        }
+        Refusal::Render(reason) => {
+            assert!(plan.gpu_supported(), "{case}: {:?}", plan.unsupported_reasons());
+            let err = compositor()
+                .render_plan(&plan, plan.size(u32::MAX))
+                .expect_err("the render should refuse");
+            assert!(
+                matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains(reason)),
+                "{case}: {err}"
+            );
+        }
+    }
+    eprintln!("{case:<40} refused as expected, FFmpeg renders it");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn frames_the_gpu_would_draw_wrong_are_refused() {
+    let m = media();
+    // An EXIF-oriented JPEG: probed 480x270, decoded 270x480.
+    assert_eq!(
+        (m.exif.streams[0].width, m.exif.streams[0].height),
+        (Some(480), Some(270)),
+        "the probe does not apply the EXIF orientation"
+    );
+    let tl = timeline(vec![vec![clip(&m.exif, 0.0, 5.0, 0.0)]], None);
+    check_refused(
+        "refused/exif-orientation",
+        &tl,
+        std::slice::from_ref(&m.exif),
+        1.0,
+        Refusal::Render("probed as"),
+    );
+
+    // Video with an alpha channel: the plan knows from the probed pixel format.
+    assert_eq!(m.alpha.streams[0].pix_fmt.as_deref(), Some("yuva420p"));
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![clip(&m.alpha, 0.0, 2.0, 0.0)]],
+        None,
+    );
+    check_refused(
+        "refused/alpha-video",
+        &tl,
+        &[m.bars.clone(), m.alpha.clone()],
+        0.5,
+        Refusal::Plan("alpha"),
+    );
+    // An asset saved before the pixel format was recorded: the decode checks the
+    // alpha plane itself.
+    let mut unknown = m.alpha.clone();
+    unknown.streams[0].pix_fmt = None;
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![clip(&unknown, 0.0, 2.0, 0.0)]],
+        None,
+    );
+    check_refused(
+        "refused/alpha-video-unknown-pix-fmt",
+        &tl,
+        &[m.bars.clone(), unknown],
+        0.5,
+        Refusal::Render("transparency"),
+    );
+
+    // A translucent layer with an odd side (0.33 of a 640x360 is 211x118): FFmpeg's
+    // RGB round trip reads uninitialised padding past the picture there.
+    let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    c.transform = Transform {
+        scale: 0.33,
+        opacity: 0.6,
+        ..Transform::default()
+    };
+    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None);
+    check_refused(
+        "refused/translucent-odd-layer",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        0.5,
+        Refusal::Render("odd size"),
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
+    let m = media();
+    // A 2 s source in a 5 s clip: the source time clamps to the end, `-ss` there
+    // finds no frame, and FFmpeg's own still leaves the layer out (the still
+    // below it shows). The GPU path does the same.
+    let tl = timeline(
+        vec![
+            vec![clip(&m.still_long, 0.0, 5.0, 0.0)],
+            vec![clip(&m.testsrc, 0.0, 5.0, 0.0)],
+        ],
+        None,
+    );
+    let assets = [m.still_long.clone(), m.testsrc.clone()];
+    for t in [1.99, 3.0] {
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), t).expect("plan");
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        assert!(frames[0].is_some(), "the still has its frame at {t}");
+        assert!(
+            frames[1].is_none(),
+            "the clip's source has no frame at {t}: that is the case under test"
+        );
+    }
+    check("clamped-end/nothing-drawn", &tl, &assets, &[1.99, 3.0], STRICT);
+}
+
+// ---- the scaler, plane by plane --------------------------------------------------
+
+/// The picture scaled by FFmpeg's own `scale` (default flags: bicubic) to the
+/// canvas, as the three raw planes — no RGB conversion in between, which is what
+/// separates the scaler's error from the converter's.
+fn ffmpeg_scaled_planes(layer: &kerf_core::PlanLayer, w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let seek = format!("{}", layer.source_time);
+    let scale = format!("scale={w}:{h}");
+    let mut args = vec!["-ss", &seek, "-i", &layer.path];
+    if layer.is_image {
+        args = vec!["-i", &layer.path];
+    }
+    args.extend([
+        "-frames:v",
+        "1",
+        "-vf",
+        &scale,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "pipe:1",
+    ]);
+    let raw = ffmpeg(&args);
+    let (luma, chroma) = ((w * h) as usize, (w / 2 * (h / 2)) as usize);
+    assert_eq!(raw.len(), luma + 2 * chroma);
+    (
+        raw[..luma].to_vec(),
+        raw[luma..luma + chroma].to_vec(),
+        raw[luma + chroma..].to_vec(),
+    )
+}
+
+/// Every plane of the GPU's scale of a picture to a canvas of its own shape (so
+/// nothing is padded or cropped) against `ffmpeg -vf scale`. This is the committed
+/// evidence for "the shader's bicubic is swscale's to within a level" — measured
+/// on the planes themselves, on smooth footage (`SCALER_SMOOTH_MAX`) and on noise
+/// and a checkerboard, where every sample depends on the exact kernel
+/// (`SCALER_BUSY_MAX`, `SCALER_BUSY_MEAN`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
+    let m = media();
+    let opts = ExportOptions::default();
+    type Case<'a> = (&'a str, &'a Asset, f64, &'a [(u32, u32)], f64);
+    let cases: [Case; 5] = [
+        (
+            "testsrc2",
+            &m.testsrc,
+            0.5,
+            &[(480, 270), (320, 180), (960, 540), (1920, 1080)],
+            SCALER_SMOOTH_MEAN,
+        ),
+        ("bars", &m.bars, 0.5, &[(480, 270), (960, 540)], SCALER_SMOOTH_MEAN),
+        ("gradient", &m.gradient, 0.5, &[(480, 270), (960, 540)], SCALER_SMOOTH_MEAN),
+        (
+            "noise",
+            &m.noise,
+            0.1,
+            &[(480, 270), (384, 216), (960, 540)],
+            SCALER_BUSY_MEAN,
+        ),
+        (
+            "checker",
+            &m.checker,
+            0.1,
+            &[(480, 270), (384, 216), (960, 540)],
+            SCALER_BUSY_MEAN,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, asset, t, sizes, mean_limit) in cases {
+        for &(w, h) in sizes {
+            let tl = timeline(
+                vec![vec![clip(asset, 0.0, asset.duration, 0.0)]],
+                Some(Delivery::new(w, h, Fit::Contain)),
+            );
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t).expect("plan");
+            assert!(plan.gpu_supported(), "{:?}", plan.unsupported_reasons());
+            let gpu_planes = {
+                let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+                compositor().composite_yuv(&plan, &frames, (w, h)).expect("composite")
+            };
+            let (ry, ru, rv) = ffmpeg_scaled_planes(&plan.layers[0], w, h);
+            for (plane, got, want) in [
+                ("Y", &gpu_planes.y, &ry),
+                ("U", &gpu_planes.u, &ru),
+                ("V", &gpu_planes.v, &rv),
+            ] {
+                assert_eq!(got.len(), want.len(), "{name} {w}x{h} {plane}");
+                let (mut max, mut sum) = (0i32, 0f64);
+                for (a, b) in got.iter().zip(want.iter()) {
+                    let d = (i32::from(*a) - i32::from(*b)).abs();
+                    max = max.max(d);
+                    sum += f64::from(d);
+                }
+                let mean = sum / got.len() as f64;
+                if std::env::var_os("KERF_SCALER_DEBUG").is_some() && max > 2 {
+                    let pw = if plane == "Y" { w as usize } else { w as usize / 2 };
+                    let mut worst: Vec<(i32, usize, usize)> = got
+                        .iter()
+                        .zip(want.iter())
+                        .enumerate()
+                        .map(|(i, (a, b))| ((i32::from(*a) - i32::from(*b)).abs(), i % pw, i / pw))
+                        .filter(|(d, _, _)| *d > 2)
+                        .collect();
+                    worst.sort_unstable_by(|a, b| b.cmp(a));
+                    worst.truncate(12);
+                    eprintln!("  worst {name} {w}x{h} {plane}: {worst:?}");
+                }
+                let line = format!("scaler/{name:<9} -> {w:>4}x{h:<4} {plane}: max {max}  mean {mean:.3}");
+                eprintln!("{line}");
+                report()
+                    .lock()
+                    .unwrap()
+                    .insert(format!("scaler {name} {w:05}x{h:05} {plane}"), line);
+                if max > SCALER_MAX || mean > mean_limit {
+                    failures.push(format!(
+                        "{name} -> {w}x{h} {plane}: max {max} (<= {SCALER_MAX}), mean {mean:.3} (<= {mean_limit})"
+                    ));
+                }
+            }
+        }
+    }
+    write_report();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // ---- the FFmpeg `eq` port, byte for byte --------------------------------------
 
 /// `eq` applied by FFmpeg to a 256-level ramp in each plane equals the table the
@@ -1183,71 +1865,104 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // ---- recorded numbers -----------------------------------------------------------
 //
 // Final limits (the constants at the top; no case relaxes the flat-region ones):
-//   flat region  PSNR >= 40 dB, max per-channel error <= 8/255,
-//                outside a 2 px band around every >12-level reference step
+//   flat region  PSNR >= 40 dB, max per-channel error <= 8/255, outside a 2 px
+//                band around every >24-level reference step (>12 for a case with a
+//                rotated layer), and at least 50% of the frame in the flat region
 //   whole image  PSNR >= 40 dB (>= 30 dB for a case with a rotated layer)
+//   busy source  (noise, checkerboard) no band: whole image PSNR >= 40 dB, max <= 8
+//   scaler       every plane within 1 level of `ffmpeg -vf scale`
 //
 // One run on Mesa lavapipe (llvmpipe, LLVM 20.1.2, Vulkan) against FFmpeg 6.1.1.
-// All 55 renders also pass against the pinned FFmpeg 9.0.2 build (what the Windows
-// and macOS bundles ship) with the same figures, bar three: the two JPEG-sourced
-// cases read 53.0 / 52.9 dB flat there (FFmpeg 9 decodes a JPEG slightly
-// differently) and opacity/0.3+scale+rotate 45.0 dB. Every run rewrites
-// `target/parity/report.txt` (these columns plus the decode / composite time of
-// the GPU path).
+// The last column is the same case against the pinned FFmpeg 9.0.2 build (what the
+// Windows and macOS bundles ship): `=` is the same figures (within 0.15 dB, same
+// max), otherwise "flat PSNR / flat max" there. Both runs pass every case.
+// The smallest flat share of any non-busy case is 70.6% (`contain/downscale-
+// 320x180`, band 29.4%); the largest band among the cases judged strictly is that
+// one. Every run rewrites `target/parity/report.txt` (these columns plus the
+// decode / composite time of the GPU path and the scaler lines).
 //
-// case                                               t    canvas | flat PSNR flat max |  all PSNR  all max |  band
-// colour/brightness+contrast+saturation+gamma      0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 15.7%
-// colour/contrast+saturation-only                  0.5   640x360 |    47.9 dB        3 |    47.9 dB        3 | 10.0%
-// colour/cool+brightness                           0.5   640x360 |    47.6 dB        3 |    47.6 dB        3 | 15.6%
-// colour/on-a-transformed-clip                     0.5   640x360 |    48.8 dB        3 |    48.9 dB        6 | 16.1%
-// colour/warm                                      0.5   640x360 |    45.6 dB        3 |    45.6 dB        3 |  0.0%
-// contain/9x16                                     0.5   360x640 |    55.1 dB        3 |    53.6 dB        5 | 10.9%
-// contain/9x16                                     1.2   360x640 |    55.0 dB        3 |    53.6 dB        5 | 10.9%
-// contain/downscale-320x180                        0.5   320x180 |    48.9 dB        4 |    48.4 dB        5 | 31.5%
-// contain/portrait-in-16x9                         0.7   640x360 |    55.4 dB        2 |    53.5 dB        5 | 13.1%
-// contain/upscale-960x540                          0.5   960x540 |    48.8 dB        4 |    48.5 dB        5 | 15.4%
-// cover/9x16                                       0.5   360x640 |    46.4 dB        5 |    46.4 dB        5 |  8.1%
-// cover/9x16                                       1.2   360x640 |    46.3 dB        4 |    46.4 dB        5 |  7.1%
-// cover/portrait-in-16x9                           0.7   640x360 |    49.0 dB        5 |    48.8 dB        6 | 12.3%
-// gap                                              1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  0.0%
-// geometry/crop-then-cover                         0.5   360x640 |    48.2 dB        5 |    48.0 dB        5 | 14.6%
-// geometry/fully-off-canvas                        0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%
-// geometry/odd-rotated-box                         0.5   640x360 |    46.4 dB        3 |    37.0 dB      251 |  7.1%
-// geometry/odd-sized-layer                         0.5   640x360 |    46.3 dB        3 |    41.3 dB      207 |  5.8%
-// geometry/zoom-off-canvas                         0.5   640x360 |    48.1 dB        4 |    48.0 dB        5 | 10.3%
-// opacity/0.3+scale+rotate                         0.5   640x360 |    44.9 dB        6 |    41.5 dB      110 | 14.2%
-// opacity/0.5                                        0   640x360 |    43.1 dB        6 |    42.0 dB       19 | 23.0%
-// opacity/0.5                                        1   640x360 |    43.1 dB        6 |    41.8 dB       22 | 23.7%
-// pip/cover-then-scale                             0.5   360x640 |    45.7 dB        5 |    45.8 dB        5 |  6.6%
-// pip/scaled+offset                                  0   640x360 |    49.4 dB        2 |    49.3 dB        5 | 16.1%
-// pip/scaled+offset                                  1   640x360 |    49.4 dB        3 |    49.3 dB        5 | 16.3%
-// single/gradient                                    0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%
-// single/gradient                                    1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%
-// single/smptehdbars                                 0   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%
-// single/smptehdbars                                 1   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%
-// single/testsrc2                                    0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%
-// single/testsrc2                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.9%
-// single/testsrc2                               1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%
-// source/10-bit                                    0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.9%
-// source/4:4:4                                     0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 20.7%
-// source/full-range-jpeg                           0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.8%
-// source/odd-641x361                               0.5   640x360 |    48.8 dB        4 |    48.5 dB        8 | 20.0%
-// source/rotated-by-metadata                       0.5   360x640 |    48.9 dB        3 |    48.8 dB        3 | 15.9%
-// still/alone                                        0   480x270 |    48.4 dB        3 |    48.2 dB        3 | 19.1%
-// still/alone                                      2.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 19.1%
-// still/jpeg                                         1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 20.0%
-// still/pip-over-video                               1   640x360 |    46.5 dB        5 |    45.5 dB       15 |  9.8%
-// time/keyframes                                   0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%
-// time/keyframes                                  1.25   640x360 |    43.6 dB        7 |    32.9 dB      242 | 25.9%
-// time/keyframes                                     2   640x360 |    55.7 dB        5 |    38.5 dB      127 | 11.1%
-// time/reversed                                    0.3   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.4%
-// time/reversed                                    1.1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%
-// time/speed-2x-offset                               1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.5%
-// time/speed-2x-offset                             1.4   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.4%
-// time/speed-2x-offset                             1.7   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.6%
-// tracks/late-top-clip                             0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%
-// tracks/late-top-clip                             1.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.9%
-// transform/crop-only                              0.5   640x360 |    47.7 dB        4 |    47.5 dB        5 | 20.7%
-// transform/rotate-90                              0.5   640x360 |    47.2 dB        3 |    47.3 dB        3 |  8.3%
-// transform/scale+rotate+crop                      0.5   640x360 |    47.0 dB        6 |    33.4 dB      255 | 17.1%
-// transform/scale+rotate+crop                      1.5   640x360 |    46.9 dB        6 |    33.5 dB      255 | 17.1%
+// case                                             t    canvas | flat PSNR flat max |  all PSNR  all max |  band 9.0.2
+// busy/checker-to-384x216                        0.1   384x216 |    48.2 dB        2 |    48.2 dB        2 |  0.0%    =
+// busy/checker-to-480x270                        0.1   480x270 |    49.4 dB        2 |    49.4 dB        2 |  0.0%    =
+// busy/checker-to-960x540                        0.1   960x540 |    99.0 dB        0 |    48.8 dB        2 | 100.0%    =
+// busy/noise-scaled-0.7                          0.1   640x360 |    46.5 dB        3 |    45.9 dB        5 | 50.8%    =
+// busy/noise-to-384x216                          0.1   384x216 |    99.0 dB        0 |    45.8 dB        5 | 100.0%    =
+// busy/noise-to-480x270                          0.1   480x270 |    99.0 dB        0 |    45.8 dB        5 | 100.0%    =
+// busy/noise-to-960x540                          0.1   960x540 |    99.0 dB        0 |    46.3 dB        5 | 100.0%    =
+// clamped-end/nothing-drawn                     1.99   640x360 |    46.6 dB        3 |    46.6 dB        3 |  0.0%    =
+// clamped-end/nothing-drawn                        3   640x360 |    46.6 dB        3 |    46.6 dB        3 |  0.0%    =
+// colour/brightness+contrast+saturation+gamma     0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 15.4%    =
+// colour/contrast+saturation-only                0.5   640x360 |    47.9 dB        3 |    47.9 dB        3 |  9.9%    =
+// colour/cool+brightness                         0.5   640x360 |    47.6 dB        3 |    47.6 dB        3 | 15.5%    =
+// colour/on-a-transformed-clip                   0.5   640x360 |    48.9 dB        6 |    48.9 dB        6 | 15.4%    =
+// colour/warm                                    0.5   640x360 |    45.6 dB        3 |    45.6 dB        3 |  0.0%    =
+// contain/9x16                                   0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
+// contain/9x16                                   1.2   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
+// contain/downscale-320x180                      0.5   320x180 |    48.9 dB        4 |    48.4 dB        5 | 29.4%    =
+// contain/portrait-in-16x9                       0.7   640x360 |    55.1 dB        3 |    53.5 dB        5 | 11.6%    =
+// contain/upscale-960x540                        0.5   960x540 |    48.8 dB        5 |    48.5 dB        5 | 14.3%    =
+// cover/9x16                                     0.5   360x640 |    46.4 dB        5 |    46.5 dB        5 |  7.4%    =
+// cover/9x16                                     1.2   360x640 |    46.3 dB        4 |    46.4 dB        5 |  6.5%    =
+// cover/portrait-in-16x9                         0.7   640x360 |    49.0 dB        5 |    48.8 dB        5 | 11.5%    =
+// gap                                            1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
+// geometry/crop-then-cover                       0.5   360x640 |    48.2 dB        5 |    48.0 dB        5 | 13.0%    =
+// geometry/fully-off-canvas                      0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
+// geometry/odd-rotated-box                       0.5   640x360 |    46.4 dB        3 |    36.9 dB      254 |  7.1%    =
+// geometry/odd-sized-layer                       0.5   640x360 |    46.3 dB        3 |    46.4 dB        5 |  5.5%    =
+// geometry/zoom-off-canvas                       0.5   640x360 |    48.1 dB        4 |    48.0 dB        5 |  9.5%    =
+// letterbox/graded-over-gradient                 0.5   640x360 |    65.6 dB        3 |    59.5 dB        6 | 10.9%    =
+// letterbox/graded-single-clip                   0.5   640x360 |    54.8 dB        3 |    53.0 dB        5 | 12.1%    =
+// letterbox/landscape-over-portrait-9x16         0.5   360x640 |    55.8 dB        3 |    54.4 dB        5 |  8.3%    =
+// letterbox/odd-fit-over-gradient                0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
+// letterbox/portrait-over-landscape              0.5   640x360 |    55.2 dB        3 |    53.5 dB        5 | 12.0%    =
+// opacity/0.3+scale+rotate                       0.5   640x360 |    46.6 dB        5 |    43.5 dB       66 | 14.2%    =
+// opacity/0.5                                      0   640x360 |    43.4 dB        4 |    43.5 dB        5 | 21.8%    =
+// opacity/0.5                                      1   640x360 |    43.2 dB        5 |    43.3 dB        5 | 22.4%    =
+// opacity/bars-0.5-over-testsrc2                 0.5   640x360 |    43.9 dB        5 |    43.9 dB        5 | 22.9% 44.5 / 5
+// opacity/bars-0.65-alone                        0.5   640x360 |    45.7 dB        4 |    45.4 dB        4 |  9.8% 45.0 / 5
+// opacity/bt2020-bars-0.6                        0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 45.1 / 4
+// opacity/keyframed-fade+grade                   0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 | 14.8%    =
+// opacity/odd-source-cropped-0.7                 0.5   640x360 |    43.7 dB        6 |    43.8 dB        6 | 28.7%    =
+// opacity/testsrc2-0.65+brightness0.2            0.5   640x360 |    42.1 dB        5 |    42.1 dB        5 | 14.9%    =
+// opacity/testsrc2-0.65+saturation1.9            0.5   640x360 |    45.6 dB        5 |    45.3 dB        5 | 14.9%    =
+// pip/cover-then-scale                           0.5   360x640 |    45.7 dB        5 |    45.8 dB        5 |  6.3%    =
+// pip/odd-361x203-in-722x640                     0.5   722x640 |    48.4 dB        5 |    48.3 dB        5 |  7.7%    =
+// pip/scaled+offset                                0   640x360 |    49.4 dB        3 |    49.3 dB        5 | 15.9%    =
+// pip/scaled+offset                                1   640x360 |    49.4 dB        5 |    49.3 dB        5 | 16.0%    =
+// single/gradient                                  0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
+// single/gradient                                  1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
+// single/smptehdbars                               0   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
+// single/smptehdbars                               1   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
+// single/testsrc2                                  0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// single/testsrc2                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// single/testsrc2                             1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.8%    =
+// source/10-bit                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// source/4:4:4                                   0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
+// source/full-range-jpeg                         0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 15.6% 52.8 / 3
+// source/odd-641x361                             0.5   640x360 |    48.8 dB        4 |    48.5 dB        5 | 19.0%    =
+// source/rotated-by-metadata                     0.5   360x640 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// still/alone                                      0   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
+// still/alone                                    2.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
+// still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
+// still/pip-over-video                             1   640x360 |    46.5 dB        5 |    45.5 dB       15 |  9.4%    =
+// time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%    =
+// time/keyframes                                1.25   640x360 |    48.2 dB        5 |    34.3 dB      217 | 25.9%    =
+// time/keyframes                                   2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
+// time/reversed                                  0.3   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =
+// time/reversed                                  1.1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.1%    =
+// time/speed-2x-offset                             1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =
+// time/speed-2x-offset                           1.4   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.2%    =
+// time/speed-2x-offset                           1.7   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.4%    =
+// tracks/late-top-clip                           0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
+// tracks/late-top-clip                           1.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// transform/crop-only                            0.5   640x360 |    47.8 dB        4 |    47.5 dB        5 | 19.3%    =
+// transform/rotate-90                            0.5   640x360 |    47.2 dB        3 |    47.3 dB        3 |  8.2%    =
+// transform/scale+rotate+crop                    0.5   640x360 |    47.0 dB        6 |    33.3 dB      255 | 17.1%    =
+// transform/scale+rotate+crop                    1.5   640x360 |    46.9 dB        6 |    33.4 dB      255 | 17.1%    =
+// scaler (plane by plane vs ffmpeg -vf scale; worst plane per source, FFmpeg 6.1.1)
+//   bars       max 1  worst mean 0.014
+//   checker    max 1  worst mean 0.572
+//   gradient   max 1  worst mean 0.054
+//   noise      max 1  worst mean 0.099
+//   testsrc2   max 1  worst mean 0.033
+// ... identical on FFmpeg 9.0.2 (max 1 everywhere; same worst means).

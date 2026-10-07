@@ -104,6 +104,8 @@ pub enum YuvMatrix {
     Bt601,
     /// BT.709 (Kr 0.2126, Kb 0.0722).
     Bt709,
+    /// BT.2020 non-constant luminance (Kr 0.2627, Kb 0.0593).
+    Bt2020,
 }
 
 impl YuvMatrix {
@@ -112,6 +114,7 @@ impl YuvMatrix {
         match self {
             YuvMatrix::Bt601 => (0.299, 0.114),
             YuvMatrix::Bt709 => (0.2126, 0.0722),
+            YuvMatrix::Bt2020 => (0.2627, 0.0593),
         }
     }
 }
@@ -155,9 +158,29 @@ pub struct PlanStream {
     /// Transfer / primaries as ffprobe names them. HDR is decided from these.
     pub color_transfer: Option<String>,
     pub color_primaries: Option<String>,
+    /// ffprobe's pixel format, when the asset recorded it. A renderer that draws
+    /// only opaque pictures refuses an alpha one from this; `None` means "not
+    /// recorded" and is the decoder's to find out (see `kerf-gpu`'s `source`).
+    pub pix_fmt: Option<String>,
+    /// The YCbCr matrix the stream declares, as ffprobe names it.
+    pub color_space: Option<String>,
 }
 
 impl PlanStream {
+    /// The matrix FFmpeg converts this picture with *inside* a graph (the frame's
+    /// own, which `scale` takes from its colorspace tag): BT.709 and BT.2020 as
+    /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at
+    /// all** (swscale's default). `None` for a matrix the compositor has no
+    /// coefficients for.
+    pub fn matrix(&self) -> Option<YuvMatrix> {
+        match self.color_space.as_deref() {
+            None | Some("smpte170m") | Some("bt470bg") => Some(YuvMatrix::Bt601),
+            Some("bt709") => Some(YuvMatrix::Bt709),
+            Some("bt2020nc") => Some(YuvMatrix::Bt2020),
+            Some(_) => None,
+        }
+    }
+
     fn of(s: &StreamInfo) -> Option<Self> {
         Some(Self {
             width: s.width.filter(|w| *w > 0)?,
@@ -167,6 +190,8 @@ impl PlanStream {
             codec: s.codec.clone(),
             color_transfer: s.color_transfer.clone(),
             color_primaries: s.color_primaries.clone(),
+            pix_fmt: s.pix_fmt.clone(),
+            color_space: s.color_space.clone(),
         })
     }
 }
@@ -231,6 +256,25 @@ impl RenderPlan {
             };
             if asset.hdr().is_some() {
                 unsupported.push(format!("{label}: HDR footage needs tone mapping"));
+            }
+            // Alpha is composited by FFmpeg (a ProRes 4444 title, a VP9 or FFV1
+            // clip with transparency, a GIF); the compositor draws opaque 4:2:0
+            // and would flatten it onto black without a word.
+            if stream.pix_fmt.as_deref().is_some_and(crate::model::pix_fmt_has_alpha) {
+                unsupported.push(format!(
+                    "{label}: the picture has an alpha channel ({})",
+                    stream.pix_fmt.as_deref().unwrap_or_default()
+                ));
+            }
+            // Below full opacity FFmpeg takes the layer through RGB and back with its
+            // own matrix (the frame's tag, not the composite's), which only the
+            // matrices the compositor has coefficients for can be reproduced for.
+            let opacity = ac.transform().opacity;
+            if opacity < 1.0 && stream.matrix().is_none() {
+                unsupported.push(format!(
+                    "{label}: opacity below 1 on a {} picture",
+                    stream.color_space.as_deref().unwrap_or("untagged")
+                ));
             }
             if !clip.effects.is_empty() {
                 unsupported.push(format!("{label}: video effects"));
@@ -337,6 +381,8 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
         }
     }
 
@@ -597,11 +643,83 @@ mod tests {
                 }),
             ),
             ("no picture", Box::new(|_, a| a.streams[0].width = None)),
+            (
+                "alpha",
+                Box::new(|_, a| {
+                    a.streams[0].pix_fmt = Some("yuva420p".into());
+                }),
+            ),
         ];
         for (name, edit) in cases {
             let (ok, why) = supported_with(edit);
             assert!(!ok && !why.is_empty(), "{name} must not be drawn on the GPU");
         }
+    }
+
+    #[test]
+    fn only_a_pixel_format_that_says_alpha_is_refused() {
+        for (fmt, refused) in [
+            ("yuv420p", false),
+            ("yuv420p10le", false),
+            ("yuvj420p", false),
+            ("yuv444p", false),
+            ("gray", false),
+            ("rgb24", false),
+            ("yuva420p", true),
+            ("yuva444p10le", true),
+            ("gbrap", true),
+            ("rgba", true),
+            ("bgra", true),
+            ("argb", true),
+            ("ya8", true),
+            ("pal8", true),
+        ] {
+            let (ok, why) = supported_with(|_, a| a.streams[0].pix_fmt = Some(fmt.into()));
+            assert_eq!(!ok, refused, "{fmt}: {why:?}");
+        }
+        // An asset saved before the pixel format was recorded is not refused
+        // here — the decoder looks at the pixels.
+        let (ok, why) = supported_with(|_, a| a.streams[0].pix_fmt = None);
+        assert!(ok, "{why:?}");
+    }
+
+    #[test]
+    fn opacity_below_one_needs_a_matrix_the_compositor_has() {
+        // The round trip through RGB uses the stream's own matrix, so a tag the
+        // compositor has no coefficients for refuses *only* a translucent layer.
+        for (tag, refused) in [
+            (None, false),
+            (Some("bt709"), false),
+            (Some("smpte170m"), false),
+            (Some("bt470bg"), false),
+            (Some("bt2020nc"), false),
+            (Some("bt2020c"), true),
+            (Some("smpte240m"), true),
+            (Some("fcc"), true),
+            (Some("ycgco"), true),
+        ] {
+            let (ok, why) = supported_with(|tl, a| {
+                a.streams[0].color_space = tag.map(Into::into);
+                tl.tracks[0].clips[0].keyframes = vec![];
+                tl.tracks[0].clips[0].transform.opacity = 0.5;
+            });
+            assert_eq!(!ok, refused, "{tag:?}: {why:?}");
+            let (ok, why) = supported_with(|_, a| a.streams[0].color_space = tag.map(Into::into));
+            assert!(ok, "opaque layers do not care about the tag ({tag:?}): {why:?}");
+        }
+    }
+
+    #[test]
+    fn the_matrix_follows_the_tag_and_defaults_to_bt601_like_swscale() {
+        let of = |tag: Option<&str>| {
+            let mut s = PlanStream::of(&video(640, 360)).unwrap();
+            s.color_space = tag.map(Into::into);
+            s.matrix()
+        };
+        assert_eq!(of(None), Some(YuvMatrix::Bt601));
+        assert_eq!(of(Some("bt709")), Some(YuvMatrix::Bt709));
+        assert_eq!(of(Some("bt2020nc")), Some(YuvMatrix::Bt2020));
+        assert_eq!(of(Some("smpte240m")), None);
     }
 
     #[test]
