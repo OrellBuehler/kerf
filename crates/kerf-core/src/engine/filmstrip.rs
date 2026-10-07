@@ -21,6 +21,17 @@
 //! simply has fewer thumbnails than `duration / interval`; `frames` is what was
 //! really decoded, and a caller's clamp to the last thumbnail covers the rest.
 //!
+//! **One approximation.** From a sampling interval of 5 s up — assets of ten
+//! minutes and more — an *original* (not a proxy) is sampled by keyframes only,
+//! because decoding every frame of a long-GOP source to keep one in 150 is an
+//! order of magnitude more work (90 s of 1080p H.264: 12.2 s against 0.8 s). A
+//! thumbnail is then the last **keyframe** at or before `k * interval` instead of
+//! the frame itself: up to a GOP earlier (2 s on a phone, often 8–10 s on a
+//! camera), never later, and with a GOP longer than the interval some neighbours
+//! repeat. An all-intra proxy has a keyframe on every frame, so a strip built
+//! from one is exact; the two share a cache entry (below) and the difference is
+//! far below what a 96 px thumbnail shows.
+//!
 //! # Shape
 //!
 //! * **Fixed height** [`FILMSTRIP_HEIGHT`] (96 px: a 48 px track at DPR 2 or
@@ -63,13 +74,28 @@
 //! is the same entry the proxy would have produced, and is never rebuilt when the
 //! proxy lands.
 //!
-//! * **Ungated, but a background job** — [`cpu::lease`] is the gate for jobs
-//!   whose point is the *result of the whole file* and that nobody is looking at.
-//!   A filmstrip reads the whole file but is the picture the timeline is drawn
-//!   from, like the waveform pyramid: gated, it would sit behind the proxy encode
-//!   and the import's analysis (minutes) while the user watches empty clips. So
-//!   it runs thread-capped and niced, at most [`MAX_CONCURRENT_DECODES`] at a
-//!   time, and concurrent requests for the *same* asset share one decode.
+//! * **Ungated, but a background job held tighter than the budget** —
+//!   [`cpu::lease`] is the gate for jobs whose point is the *result of the whole
+//!   file*, wanted later. A filmstrip reads the whole file but is what the
+//!   timeline is drawn from, like the waveform pyramid: gated, it would sit
+//!   behind the proxy encode and the import's analysis (minutes) while the user
+//!   watches empty clips. But unlike a waveform it is a *video* decode, and with
+//!   no proxy yet it runs beside the encode of the very file it samples — so it
+//!   is capped at [`decode_threads`] (a quarter of the cores, one or two) and
+//!   niced **at every CPU budget, 100% included**, where `cpu::limit_args` /
+//!   `cpu::background` stand down: "at 100% nothing changes" is for the job that
+//!   owns the machine, not for the side job that must stay out of its way. At
+//!   most [`MAX_CONCURRENT_DECODES`] run at a time, and concurrent requests for
+//!   the *same* asset share one decode.
+//! * **A short decode is not trusted.** ffmpeg exits 0 on a file that goes bad
+//!   halfway, and that looks exactly like a video that is really short — and a
+//!   strip cached from it would stay truncated for good. So when fewer
+//!   thumbnails arrive than planned, the video stream's own duration (`ffprobe`,
+//!   off the lock, only on a shortfall) says how many to expect
+//!   ([`predicted_frames`]); more than [`SHORTFALL_TOLERANCE`] short and the strip
+//!   is returned and memoized for the session but **never written to disk**
+//!   ([`decode_checked`]). A keyframe pass that falls short is retried with every
+//!   frame first.
 //! * **Cached at `<cache>/kerf/filmstrips/<hash>/`**: the sheets as
 //!   `sheet-000.jpg …` plus a `manifest.json`, built in a `.part` directory and
 //!   renamed into place, so a crash never leaves half a strip. A directory that
@@ -88,7 +114,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::cli::{
-    bg_command, decode_hwaccel, disable_hwaccel, ffmpeg_bin, fnv1a, launch_err, source_hdr, source_key, tonemap_filter,
+    command, decode_hwaccel, disable_hwaccel, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_hdr, source_key, tonemap_filter,
 };
 use super::cpu;
 use super::peaks::drain_tail;
@@ -146,6 +172,24 @@ const STALL_CEILING: Duration = Duration::from_secs(30 * 60);
 /// few hundred small frames; this is a bound on a wedge, not on work.
 const SHEET_ENCODE_LIMIT: Duration = Duration::from_secs(120);
 
+/// Threads one decode may use, whatever the CPU budget says — see
+/// [`decode_threads`].
+const MAX_DECODE_THREADS: usize = 2;
+
+/// From this sampling interval up, an *original* is sampled by keyframes only
+/// (see the module docs): below it the thumbnails are close enough together that
+/// a keyframe a GOP earlier would visibly be the wrong picture.
+const KEYFRAME_MIN_INTERVAL: f64 = 5.0;
+
+/// How many thumbnails short of what the video's own length predicts a decode may
+/// fall before the strip is called incomplete (see [`predicted_frames`]). Two:
+/// the last window or two of a video can legitimately have no sample of their own
+/// (the last keyframe, or the last frame's duration, ends before them).
+const SHORTFALL_TOLERANCE: u32 = 2;
+
+/// How long the video-duration probe may take.
+const PROBE_LIMIT: Duration = Duration::from_secs(20);
+
 /// A `.part` directory older than this is a crashed build's leftover.
 const STALE_PART: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -186,7 +230,8 @@ pub struct FilmstripSheet {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Filmstrip {
     /// Seconds of source between two thumbnails: thumbnail `k` is the frame at
-    /// `k * interval`.
+    /// `k * interval` (from 5 s up, on a strip built from an original rather than
+    /// a proxy: the last keyframe at or before it — see the module docs).
     pub interval: f64,
     /// Width of one thumbnail in pixels (even).
     pub frame_width: u32,
@@ -312,6 +357,13 @@ pub fn pick_interval(duration: f64) -> f64 {
 /// Width of a thumbnail for a `width`x`height` picture: [`FILMSTRIP_HEIGHT`]'s
 /// worth of the aspect, rounded to an even number (4:2:0 chroma needs one) and
 /// kept in `2..=MAX_FRAME_WIDTH`. A picture of unknown size is taken as 16:9.
+///
+/// The aspect is the *coded* one: `StreamInfo` carries no sample aspect ratio, so
+/// an anamorphic source (1440x1080 flagged 4:3 pixels) gets 4:3 thumbnails where
+/// a player would show 16:9. That is the shape every other geometry here — the
+/// project frame, fit and crop, the preview and the export — already works in, so
+/// the strip matches what Kerf itself draws; if the probe ever records the SAR,
+/// this is the one place to apply it (and `CACHE_VERSION` to bump).
 fn thumb_width(width: Option<u32>, height: Option<u32>) -> u32 {
     let (w, h) = match (width, height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => (f64::from(w), f64::from(h)),
@@ -361,6 +413,19 @@ fn stall_for(interval: f64) -> Duration {
     Duration::from_secs_f64(secs).max(STALL_FLOOR)
 }
 
+/// Threads one filmstrip decode may use: a quarter of the cores, between one
+/// and [`MAX_DECODE_THREADS`], and never above the CPU budget. **At any budget,
+/// 100% included** (`cpu::cap_args`): a filmstrip is ungated, so it runs beside
+/// whatever holds the heavy-job lease — usually the proxy encode of the very asset
+/// it is sampling, or an export — and "a full budget leaves ffmpeg alone" is about
+/// the job that has the machine, not the side job that must stay out of its way.
+/// (Two decodes may run at once, so at most twice this in all.) The cap costs
+/// little: decoding scales poorly across threads — 90 s of 1080p H.264 took 15.6 s
+/// on one thread, 13.2 s on two, 9.5 s on four.
+fn decode_threads(cores: usize, budget: usize) -> usize {
+    budget.min((cores / 4).clamp(1, MAX_DECODE_THREADS)).max(1)
+}
+
 // ---- ffmpeg arguments (pure) -----------------------------------------------
 
 /// The `-vf` chain that turns a decoded picture into raw thumbnails: `fps`
@@ -381,12 +446,18 @@ fn thumb_filter(plan: &Plan, tonemap: Option<&str>) -> String {
 
 /// Stage one: decode `src` to raw `yuv420p` thumbnails on stdout. Pure — thread
 /// caps and priority are applied where it is spawned. `hwaccel` is the decode
-/// acceleration (never for a still: there is nothing to accelerate).
-fn build_thumb_args(src: &str, plan: &Plan, tonemap: Option<&str>, hwaccel: Option<&str>) -> Vec<String> {
+/// acceleration (never for a still: there is nothing to accelerate);
+/// `keyframes_only` is `-skip_frame nokey`, the decoder skipping every frame that
+/// is not a keyframe so the `fps` filter downstream picks, for each sample time,
+/// the last *keyframe* at or before it (see the module docs).
+fn build_thumb_args(src: &str, plan: &Plan, tonemap: Option<&str>, hwaccel: Option<&str>, keyframes_only: bool) -> Vec<String> {
     let s = |v: &str| v.to_string();
     let mut args = vec![s("-hide_banner"), s("-loglevel"), s("error"), s("-nostdin")];
     if let Some(hw) = hwaccel.filter(|_| !plan.still) {
         args.extend([s("-hwaccel"), s(hw)]);
+    }
+    if keyframes_only && !plan.still {
+        args.extend([s("-skip_frame"), s("nokey")]);
     }
     args.extend([
         s("-i"),
@@ -795,22 +866,35 @@ fn pump_raw(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &m
     Ok(())
 }
 
-/// One decode of `path` into raw thumbnails, with `hwaccel` if given.
-fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>) -> Result<Vec<u8>> {
+/// What one decode produced and where it came from.
+struct Decoded {
+    /// Raw `yuv420p` thumbnails, back to back.
+    raw: Vec<u8>,
+    /// The file that was decoded (the proxy, or the original).
+    source: PathBuf,
+    /// Whether it was sampled by keyframes only.
+    keyframes_only: bool,
+}
+
+/// One decode of `path` into raw thumbnails, with `hwaccel` and / or keyframe
+/// sampling if given.
+fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>, keyframes_only: bool) -> Result<Vec<u8>> {
     let src = path
         .to_str()
         .ok_or_else(|| Error::Engine("asset path is not valid UTF-8".to_string()))?;
     // The conversion an HDR original needs; a proxy answers `None` (it was
     // converted when it was encoded), so it is never done twice.
     let tonemap = source_hdr(path).map(tonemap_filter);
-    let mut args = build_thumb_args(src, plan, tonemap.as_deref(), hwaccel);
-    cpu::limit_args(&mut args, cpu::budget_threads());
+    let mut args = build_thumb_args(src, plan, tonemap.as_deref(), hwaccel, keyframes_only);
+    cpu::cap_args(&mut args, decode_threads(cpu::cores(), cpu::budget_threads()));
 
     let _slot = DecodeSlot::acquire();
     let bin = ffmpeg_bin();
-    // Ungated (see the module docs), but capped and niced like every other
-    // background read.
-    let child = bg_command(&bin)
+    // Ungated (see the module docs), but capped and niced at every budget: it
+    // runs beside the heavy job, not behind it.
+    let mut cmd = command(&bin);
+    cpu::background_always(&mut cmd);
+    let child = cmd
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -825,27 +909,55 @@ fn decode_once(path: &Path, plan: &Plan, hwaccel: Option<&str>) -> Result<Vec<u8
     Ok(raw)
 }
 
-/// The decodes to try, in order, for one strip: the `proxy` when there is one
-/// (and it is not the original itself) — all-intra, so a hardware decoder has
-/// nothing to win there — then the original with `hwaccel` if the machine has
-/// one, then the original in software. A still has no use for any of that: the
-/// original, plainly.
+/// One way of decoding for a strip.
+#[derive(Debug, Clone, PartialEq)]
+struct Attempt<'a> {
+    path: &'a Path,
+    hwaccel: Option<String>,
+    keyframes_only: bool,
+}
+
+/// The decodes to try, in order, for one strip.
+///
+/// * The `proxy`, when there is one (and it is not the original itself), in
+///   software and every frame: it is all-intra, so a hardware decoder has nothing
+///   to win and keyframe sampling is moot.
+/// * The original **by keyframes** when `allow_keyframes` and the sampling
+///   interval is at least [`KEYFRAME_MIN_INTERVAL`]: decoding only the keyframes of
+///   a long-GOP original is an order of magnitude less work (90 s of 1080p H.264:
+///   12.2 s against 0.8 s), at the price of each thumbnail being the last keyframe
+///   at or before its time rather than the frame itself. Software, because only a
+///   keyframe in 60 is decoded and a hardware decoder's start-up would be most of
+///   the cost.
+/// * The original with `hwaccel` if the machine has one, then in software.
+///
+/// A still has no use for any of that: the original, plainly.
 fn decode_attempts<'a>(
     original: &'a Path,
     proxy: Option<&'a Path>,
     still: bool,
+    interval: f64,
     hwaccel: Option<String>,
-) -> Vec<(&'a Path, Option<String>)> {
+    allow_keyframes: bool,
+) -> Vec<Attempt<'a>> {
+    let attempt = |path, hwaccel, keyframes_only| Attempt {
+        path,
+        hwaccel,
+        keyframes_only,
+    };
     if still {
-        return vec![(original, None)];
+        return vec![attempt(original, None, false)];
     }
     let mut attempts = Vec::new();
     if let Some(proxy) = proxy.filter(|p| *p != original) {
-        attempts.push((proxy, None));
+        attempts.push(attempt(proxy, None, false));
     }
-    attempts.push((original, hwaccel.clone()));
+    if allow_keyframes && interval >= KEYFRAME_MIN_INTERVAL {
+        attempts.push(attempt(original, None, true));
+    }
+    attempts.push(attempt(original, hwaccel.clone(), false));
     if hwaccel.is_some() {
-        attempts.push((original, None));
+        attempts.push(attempt(original, None, false));
     }
     attempts
 }
@@ -853,30 +965,163 @@ fn decode_attempts<'a>(
 /// Raw thumbnails of `asset`: from `proxy` when given, falling back to the
 /// original if that fails, with hardware decode on the original falling back to
 /// software ([`decode_attempts`]). The error is the last attempt's.
-fn decode_thumbs(asset: &Asset, plan: &Plan, proxy: Option<&Path>) -> Result<Vec<u8>> {
-    let attempts = decode_attempts(Path::new(&asset.path), proxy, plan.still, decode_hwaccel());
+fn decode_thumbs(asset: &Asset, plan: &Plan, proxy: Option<&Path>, allow_keyframes: bool) -> Result<Decoded> {
+    let attempts = decode_attempts(
+        Path::new(&asset.path),
+        proxy,
+        plan.still,
+        plan.interval,
+        decode_hwaccel(),
+        allow_keyframes,
+    );
 
     let mut last_err = None;
     let mut hw_failed = false;
-    for (path, hwaccel) in attempts {
-        match decode_once(path, plan, hwaccel.as_deref()) {
+    for attempt in attempts {
+        match decode_once(attempt.path, plan, attempt.hwaccel.as_deref(), attempt.keyframes_only) {
             Ok(raw) => {
-                if hw_failed && hwaccel.is_none() {
+                if hw_failed && attempt.hwaccel.is_none() {
                     // The accelerated decode of this very file failed and the
                     // software one did not: `-hwaccel` is the culprit here.
                     disable_hwaccel();
                     tracing::warn!("hardware decode failed for a filmstrip; using software decode from now on");
                 }
-                return Ok(raw);
+                return Ok(Decoded {
+                    raw,
+                    source: attempt.path.to_path_buf(),
+                    keyframes_only: attempt.keyframes_only,
+                });
             }
             Err(e) => {
-                tracing::debug!(path = %path.display(), error = %e, "filmstrip decode attempt failed");
-                hw_failed = hw_failed || hwaccel.is_some();
+                tracing::debug!(path = %attempt.path.display(), error = %e, "filmstrip decode attempt failed");
+                hw_failed = hw_failed || attempt.hwaccel.is_some();
                 last_err = Some(e);
             }
         }
     }
     Err(last_err.unwrap_or_else(|| Error::Engine("no way to decode the asset".to_string())))
+}
+
+// ---- did the decode get to the end? ---------------------------------------
+
+/// `ffprobe`'s `duration` line for a video stream → seconds, or `None` for `N/A`
+/// (a Matroska stream often has none), nonsense or a non-positive value.
+fn parse_duration(ffprobe_stdout: &str) -> Option<f64> {
+    let secs: f64 = ffprobe_stdout.lines().next()?.trim().parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// The first video stream's own duration, in seconds — which can be shorter than
+/// the container's (audio outlasting the picture). `None` when ffprobe cannot say.
+fn probe_video_duration(path: &Path) -> Option<f64> {
+    use std::io::Read;
+    let bin = ffprobe_bin();
+    let mut child = command(&bin)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration"])
+        .args(["-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // One line of output, far inside a pipe's buffer: read it after the exit.
+    let deadline = Instant::now() + PROBE_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    parse_duration(&out)
+}
+
+/// How many thumbnails a decode of this asset should have produced, judged from
+/// how long the *video* runs — its own stream duration when known, else the
+/// container's — and never more than the plan asked for.
+fn predicted_frames(plan: &Plan, video_secs: Option<f64>, container_secs: f64) -> u32 {
+    let usable = |s: f64| s.is_finite() && s > 0.0;
+    let secs = match video_secs {
+        Some(v) if usable(v) && usable(container_secs) => v.min(container_secs),
+        Some(v) if usable(v) => v,
+        _ => container_secs,
+    };
+    frames_for(secs, plan.interval).min(plan.frames)
+}
+
+/// Whether `got` thumbnails are too few for `predicted`: more than
+/// [`SHORTFALL_TOLERANCE`] short.
+fn is_short(got: u32, predicted: u32) -> bool {
+    got.saturating_add(SHORTFALL_TOLERANCE) < predicted
+}
+
+/// A decode, and whether it can be trusted as the whole video.
+struct Checked {
+    raw: Vec<u8>,
+    frames: u32,
+    /// False when the decode fell short of what the video's length predicts.
+    complete: bool,
+}
+
+/// Run `decode` (its argument: whether keyframe sampling is allowed) and judge
+/// the result.
+///
+/// A decode that comes up short and still exits 0 — a file that goes bad halfway,
+/// a decoder that gives up — is otherwise indistinguishable from a video that
+/// really is that short, and caching it would pin the truncated strip for good. So
+/// when fewer thumbnails arrive than were planned, the *video's own* duration
+/// (`video_secs` of the decoded file) says how many to expect: more than
+/// [`SHORTFALL_TOLERANCE`] short is `complete: false`, and the caller keeps the
+/// strip for the session but never writes it to disk. A shortfall explained by the
+/// video being shorter than its container is complete. When *keyframe sampling*
+/// is what fell short (sparse or mis-flagged keyframes), it is retried
+/// with every frame decoded before anything is judged.
+fn decode_checked(
+    plan: &Plan,
+    container_secs: f64,
+    what: &str,
+    decode: &mut dyn FnMut(bool) -> Result<Decoded>,
+    video_secs: &dyn Fn(&Path) -> Option<f64>,
+) -> Result<Checked> {
+    let count = |raw: &[u8]| (raw.len() / plan.frame_bytes()).min(plan.frames as usize) as u32;
+    let mut decoded = decode(true)?;
+    let mut frames = count(&decoded.raw);
+    let mut complete = true;
+    if frames < plan.frames {
+        let predicted = predicted_frames(plan, video_secs(&decoded.source), container_secs);
+        if decoded.keyframes_only && is_short(frames, predicted) {
+            tracing::debug!(
+                path = what,
+                frames,
+                predicted,
+                "keyframe sampling fell short; decoding every frame"
+            );
+            decoded = decode(false)?;
+            frames = count(&decoded.raw);
+        }
+        complete = !is_short(frames, predicted);
+        if !complete {
+            tracing::warn!(path = what, frames, predicted, "filmstrip decode ended early; not caching it");
+        }
+    }
+    if frames == 0 {
+        return Err(Error::Engine(format!(
+            "no frames could be read from {what} for its filmstrip"
+        )));
+    }
+    Ok(Checked {
+        raw: decoded.raw,
+        frames,
+        complete,
+    })
 }
 
 // ---- encoding: stage two ---------------------------------------------------
@@ -886,8 +1131,12 @@ fn decode_thumbs(asset: &Asset, plan: &Plan, proxy: Option<&Path>) -> Result<Vec
 fn encode_sheets(raw: &[u8], plan: &Plan, columns: u32, dir: &Path) -> Result<()> {
     let bin = ffmpeg_bin();
     let mut args = build_sheet_args(plan, columns);
-    cpu::limit_args(&mut args, cpu::budget_threads());
-    let mut child = bg_command(&bin)
+    // A few hundred tiny frames: one thread, niced, at every budget (see
+    // `decode_threads`).
+    cpu::cap_args(&mut args, 1);
+    let mut cmd = command(&bin);
+    cpu::background_always(&mut cmd);
+    let mut child = cmd
         .args(&args)
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -976,34 +1225,51 @@ fn read_sheets(dir: &Path, plan: &Plan, frames: u32, columns: u32, sheet_count: 
 
 // ---- building a strip ------------------------------------------------------
 
-/// Decode `asset`'s thumbnails and encode them as sheets inside `work`.
-fn build(asset: &Asset, plan: &Plan, proxy: Option<&Path>, work: &Path) -> Result<Filmstrip> {
-    let raw = decode_thumbs(asset, plan, proxy)?;
-    let frames = (raw.len() / plan.frame_bytes()).min(plan.frames as usize) as u32;
-    if frames == 0 {
-        return Err(Error::Engine(format!(
-            "no frames could be read from {} for its filmstrip",
-            asset.path
-        )));
-    }
-    let (columns, sheet_count) = sheet_layout(frames, plan.frame_width);
+/// Encode a checked decode as sheets inside `work`: the strip, and whether it is
+/// complete (see [`decode_checked`]).
+fn assemble(
+    plan: &Plan,
+    container_secs: f64,
+    what: &str,
+    decode: &mut dyn FnMut(bool) -> Result<Decoded>,
+    video_secs: &dyn Fn(&Path) -> Option<f64>,
+    work: &Path,
+) -> Result<(Filmstrip, bool)> {
+    let checked = decode_checked(plan, container_secs, what, decode, video_secs)?;
+    let (columns, sheet_count) = sheet_layout(checked.frames, plan.frame_width);
     std::fs::create_dir_all(work)?;
-    encode_sheets(&raw[..frames as usize * plan.frame_bytes()], plan, columns, work)?;
-    drop(raw);
-    Ok(Filmstrip {
+    encode_sheets(
+        &checked.raw[..checked.frames as usize * plan.frame_bytes()],
+        plan,
+        columns,
+        work,
+    )?;
+    let frames = checked.frames;
+    drop(checked.raw);
+    let strip = Filmstrip {
         interval: plan.interval,
         frame_width: plan.frame_width,
         frame_height: plan.frame_height,
         frames,
         columns,
         sheets: read_sheets(work, plan, frames, columns, sheet_count)?,
-    })
+    };
+    Ok((strip, checked.complete))
 }
 
 /// `asset`'s strip from the cache directory `root` when a valid one is there,
-/// otherwise built (and, if there is a root, published into it). With no root
-/// the strip is built in the system temp directory and only returned.
-fn load_or_build(root: Option<&Path>, key: &str, asset: &Asset, plan: &Plan, proxy: Option<&Path>) -> Result<Filmstrip> {
+/// otherwise built by `build_into` (given a fresh working directory; returns the
+/// strip and whether it is complete) and, if there is a root and the strip is
+/// complete, published into it. An incomplete strip is returned but never written
+/// to disk. With no root the strip is built in the system temp directory and only
+/// returned.
+fn load_or_build_with(
+    root: Option<&Path>,
+    key: &str,
+    plan: &Plan,
+    what: &str,
+    build_into: impl FnOnce(&Path) -> Result<(Filmstrip, bool)>,
+) -> Result<Filmstrip> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     if let Some(hit) = root.and_then(|r| load_entry(&r.join(key), plan)) {
@@ -1025,22 +1291,22 @@ fn load_or_build(root: Option<&Path>, key: &str, asset: &Asset, plan: &Plan, pro
     let work = base.join(format!("{key}.{}.{seq}.part", std::process::id()));
 
     let started = Instant::now();
-    let built = build(asset, plan, proxy, &work);
-    let result = match (built, root) {
-        (Ok(strip), Some(root)) => {
+    let result = match (build_into(&work), root) {
+        (Ok((strip, true)), Some(root)) => {
             if let Err(e) = publish(&work, &root.join(key), &strip) {
                 tracing::warn!(path = %root.display(), error = %e, "could not cache a filmstrip");
             }
             Ok(strip)
         }
-        (built, _) => built,
+        (built, _) => built.map(|(strip, _)| strip),
     };
     // Whatever is left of the working directory (a failed build, a failed
-    // publish, or the no-cache case); after a successful rename it is gone.
+    // publish, an incomplete strip, or the no-cache case); after a successful
+    // rename it is gone.
     let _ = std::fs::remove_dir_all(&work);
     if let Ok(strip) = &result {
         tracing::debug!(
-            path = %asset.path,
+            path = what,
             frames = strip.frames,
             sheets = strip.sheets.len(),
             took_ms = started.elapsed().as_millis() as u64,
@@ -1048,6 +1314,29 @@ fn load_or_build(root: Option<&Path>, key: &str, asset: &Asset, plan: &Plan, pro
         );
     }
     result
+}
+
+/// [`load_or_build_with`] decoding `asset` for real. `proxy` is asked for only
+/// once the cache has missed — resolving it can run an ffprobe, which a cache hit
+/// must not pay for.
+fn load_or_build(
+    root: Option<&Path>,
+    key: &str,
+    asset: &Asset,
+    plan: &Plan,
+    proxy: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Filmstrip> {
+    load_or_build_with(root, key, plan, &asset.path, |work| {
+        let proxy = proxy();
+        assemble(
+            plan,
+            asset.duration,
+            &asset.path,
+            &mut |keyframes| decode_thumbs(asset, plan, proxy.as_deref(), keyframes),
+            &probe_video_duration,
+            work,
+        )
+    })
 }
 
 // ---- the in-process memo ---------------------------------------------------
@@ -1109,7 +1398,7 @@ fn memo_get(key: &str) -> Option<Arc<Filmstrip>> {
 }
 
 /// [`filmstrip_for`] against an explicit cache root (`None`: memory only).
-fn shared_strip(root: Option<&Path>, asset: &Asset, proxy: Option<&Path>) -> Result<Arc<Filmstrip>> {
+fn shared_strip(root: Option<&Path>, asset: &Asset, proxy: impl FnOnce() -> Option<PathBuf>) -> Result<Arc<Filmstrip>> {
     static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
 
@@ -1150,13 +1439,17 @@ fn shared_strip(root: Option<&Path>, asset: &Asset, proxy: Option<&Path>) -> Res
 }
 
 /// The filmstrip of `asset`: from the memo or the disk cache when a valid one
-/// exists, else one ffmpeg decode of `proxy` (the asset's ready proxy, if it has
-/// one — pass `None` otherwise) or of the original, which is then cached.
+/// exists, else one ffmpeg decode of the asset's ready proxy or of the original,
+/// which is then cached. `proxy` resolves the asset's ready proxy (`None` when it
+/// has none); it is called only on a cache miss, because resolving it may run an
+/// ffprobe.
 ///
-/// Blocking and heavy on a miss — run it off the project lock. Concurrent calls
-/// for the same asset share one decode; a hit is cheap. An asset with no video
-/// stream is an `InvalidArgument`.
-pub fn filmstrip_for(asset: &Asset, proxy: Option<&Path>) -> Result<Arc<Filmstrip>> {
+/// Blocking and heavy on a miss — run it off the project lock, and resolve nothing
+/// that touches the media under it. Concurrent calls for the same asset share one
+/// decode; a hit is cheap. An asset with no video stream is an `InvalidArgument`.
+/// A strip whose decode ended early (see [`decode_checked`]) is returned and
+/// memoized but not written to the disk cache.
+pub fn filmstrip_for(asset: &Asset, proxy: impl FnOnce() -> Option<PathBuf>) -> Result<Arc<Filmstrip>> {
     shared_strip(cache_root().as_deref(), asset, proxy)
 }
 
@@ -1399,7 +1692,12 @@ mod tests {
         // And the public entry says so before any ffmpeg is spawned (the file
         // does not exist).
         let missing = asset("/nowhere/voice.wav", 10.0, vec![audio()]);
-        assert!(matches!(filmstrip_for(&missing, None), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            filmstrip_for(&missing, || panic!(
+                "no proxy is looked up for an asset that cannot have a strip"
+            )),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     // ---- ffmpeg arguments ---------------------------------------------------
@@ -1424,7 +1722,7 @@ mod tests {
 
     #[test]
     fn the_decode_samples_before_it_scales_and_rounds_up_from_zero() {
-        let args = build_thumb_args("/media/clip.mov", &plan_for(2.0, 5, false), None, None);
+        let args = build_thumb_args("/media/clip.mov", &plan_for(2.0, 5, false), None, None, false);
         assert_eq!(arg_after(&args, "-i"), "/media/clip.mov");
         assert_eq!(
             arg_after(&args, "-vf"),
@@ -1448,32 +1746,116 @@ mod tests {
     fn the_proxy_is_tried_first_hardware_only_on_the_original_and_software_last() {
         let (original, proxy) = (Path::new("/m/clip.mov"), Path::new("/cache/proxy.mp4"));
         let auto = || Some("auto".to_string());
-        // Everything available: proxy (software), original with the accelerator,
-        // original in software.
+        let at = |path, hwaccel, keyframes_only| Attempt {
+            path,
+            hwaccel,
+            keyframes_only,
+        };
+        // A fine sampling (under 5 s) is every frame. Everything available: proxy
+        // (software), original with the accelerator, original in software.
         assert_eq!(
-            decode_attempts(original, Some(proxy), false, auto()),
-            [(proxy, None), (original, auto()), (original, None)]
+            decode_attempts(original, Some(proxy), false, 0.5, auto(), true),
+            [at(proxy, None, false), at(original, auto(), false), at(original, None, false)]
         );
         // No proxy yet: the original is decoded rather than waited for.
         assert_eq!(
-            decode_attempts(original, None, false, auto()),
-            [(original, auto()), (original, None)]
+            decode_attempts(original, None, false, 2.0, auto(), true),
+            [at(original, auto(), false), at(original, None, false)]
         );
         // No accelerator (or it was found broken): no pointless second attempt.
-        assert_eq!(decode_attempts(original, None, false, None), [(original, None)]);
         assert_eq!(
-            decode_attempts(original, Some(proxy), false, None),
-            [(proxy, None), (original, None)]
+            decode_attempts(original, None, false, 0.5, None, true),
+            [at(original, None, false)]
+        );
+        assert_eq!(
+            decode_attempts(original, Some(proxy), false, 0.5, None, true),
+            [at(proxy, None, false), at(original, None, false)]
         );
         // A "proxy" that is the original is not tried twice.
-        assert_eq!(decode_attempts(original, Some(original), false, None), [(original, None)]);
+        assert_eq!(
+            decode_attempts(original, Some(original), false, 0.5, None, true),
+            [at(original, None, false)]
+        );
         // A still ignores all of it.
-        assert_eq!(decode_attempts(original, Some(proxy), true, auto()), [(original, None)]);
+        assert_eq!(
+            decode_attempts(original, Some(proxy), true, 5.0, auto(), true),
+            [at(original, None, false)]
+        );
+    }
+
+    #[test]
+    fn a_coarse_original_is_sampled_by_keyframes_and_a_proxy_never_is() {
+        let (original, proxy) = (Path::new("/m/clip.mov"), Path::new("/cache/proxy.mp4"));
+        let auto = || Some("auto".to_string());
+        let at = |path, hwaccel, keyframes_only| Attempt {
+            path,
+            hwaccel,
+            keyframes_only,
+        };
+        // From 5 s up the original is decoded by keyframes, in software, and the
+        // every-frame decodes stay behind it as the fallback.
+        assert_eq!(
+            decode_attempts(original, None, false, 5.0, auto(), true),
+            [
+                at(original, None, true),
+                at(original, auto(), false),
+                at(original, None, false)
+            ]
+        );
+        assert_eq!(
+            decode_attempts(original, None, false, 15.0, None, true),
+            [at(original, None, true), at(original, None, false)]
+        );
+        // Just under the threshold it is not.
+        assert!(decode_attempts(original, None, false, 2.0, None, true)
+            .iter()
+            .all(|a| !a.keyframes_only));
+        // The proxy comes first, every frame — all-intra, so a keyframe-only decode
+        // is moot there.
+        assert_eq!(
+            decode_attempts(original, Some(proxy), false, 10.0, None, true)[0],
+            at(proxy, None, false)
+        );
+        // And the caller can forbid it (a retry after keyframe sampling fell short).
+        assert!(decode_attempts(original, None, false, 30.0, auto(), false)
+            .iter()
+            .all(|a| !a.keyframes_only));
+    }
+
+    #[test]
+    fn the_keyframe_flag_goes_before_the_input_and_never_on_a_still() {
+        let args = build_thumb_args("/m/long.mov", &plan_for(10.0, 120, false), None, None, true);
+        let skip = args.iter().position(|a| a == "-skip_frame").expect("-skip_frame");
+        assert_eq!(args[skip + 1], "nokey");
+        assert!(skip < args.iter().position(|a| a == "-i").unwrap(), "a decoder option");
+        assert!(
+            !build_thumb_args("/m/long.mov", &plan_for(10.0, 120, false), None, None, false).contains(&"-skip_frame".to_string())
+        );
+        // A still has one frame: nothing to skip.
+        assert!(!build_thumb_args("a.png", &plan_for(5.0, 1, true), None, None, true).contains(&"-skip_frame".to_string()));
+    }
+
+    #[test]
+    fn a_decode_is_capped_below_the_machine_whatever_the_budget() {
+        // A quarter of the cores, one to two threads.
+        assert_eq!(decode_threads(1, 1), 1);
+        assert_eq!(decode_threads(2, 2), 1);
+        assert_eq!(decode_threads(4, 4), 1);
+        assert_eq!(decode_threads(8, 8), 2);
+        assert_eq!(decode_threads(16, 16), 2);
+        assert_eq!(decode_threads(64, 64), 2, "never above the ceiling");
+        // And never above a budget that is itself smaller.
+        assert_eq!(decode_threads(16, 1), 1);
+        assert_eq!(decode_threads(16, 0), 1, "a zero budget still gets a thread");
+        // Always strictly below a machine with room to spare.
+        for cores in 2..=64 {
+            assert!(decode_threads(cores, cores) < cores, "{cores} cores");
+        }
     }
 
     #[test]
     fn the_accelerator_goes_before_the_input() {
-        let args = build_thumb_args("a.mp4", &plan_for(0.5, 20, false), None, Some("auto"));
+        let args = build_thumb_args("a.mp4", &plan_for(0.5, 20, false), None, Some("auto"), false);
         let hw = args.iter().position(|a| a == "-hwaccel").expect("-hwaccel");
         assert_eq!(args[hw + 1], "auto");
         assert!(hw < args.iter().position(|a| a == "-i").unwrap(), "an input option");
@@ -1492,7 +1874,7 @@ mod tests {
             "no second format when the tone-map already ends in one: {vf}"
         );
 
-        let still = build_thumb_args("a.png", &plan_for(5.0, 1, true), None, Some("auto"));
+        let still = build_thumb_args("a.png", &plan_for(5.0, 1, true), None, Some("auto"), true);
         assert_eq!(arg_after(&still, "-vf"), "scale=170:96:flags=area,format=yuv420p");
         assert_eq!(arg_after(&still, "-frames:v"), "1");
         assert!(!still.contains(&"-hwaccel".to_string()), "nothing to accelerate in an image");
@@ -2015,6 +2397,219 @@ mod tests {
         );
     }
 
+    // ---- did the decode get to the end? ---------------------------------------
+
+    #[test]
+    fn a_video_duration_is_read_from_ffprobes_line() {
+        assert_eq!(parse_duration("10.040000\n"), Some(10.04));
+        assert_eq!(parse_duration("  3600  \r\n"), Some(3600.0));
+        // Only the first line.
+        assert_eq!(parse_duration("2.5\n99\n"), Some(2.5));
+        // A stream with no duration of its own prints N/A (Matroska often has none).
+        assert_eq!(parse_duration("N/A\n"), None);
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("\n"), None);
+        assert_eq!(parse_duration("0\n"), None);
+        assert_eq!(parse_duration("-1.5\n"), None);
+        assert_eq!(parse_duration("inf\n"), None);
+        assert_eq!(parse_duration("NaN\n"), None);
+    }
+
+    #[test]
+    fn the_expected_thumbnails_follow_the_videos_own_length() {
+        let plan = plan_for(0.5, 20, false); // a 10 s container
+                                             // The stream's own duration wins when it is shorter than the container's...
+        assert_eq!(predicted_frames(&plan, Some(2.5), 10.0), 5);
+        // ...but never predicts more than was planned, or than the container has.
+        assert_eq!(predicted_frames(&plan, Some(60.0), 10.0), 20);
+        assert_eq!(predicted_frames(&plan, Some(10.0), 10.0), 20);
+        // Unknown (no stream duration, or nonsense): the container's.
+        assert_eq!(predicted_frames(&plan, None, 10.0), 20);
+        assert_eq!(predicted_frames(&plan, Some(f64::NAN), 10.0), 20);
+        assert_eq!(predicted_frames(&plan, Some(0.0), 4.0), 8);
+        // A container with no usable duration of its own defers to the stream.
+        assert_eq!(predicted_frames(&plan, Some(3.0), 0.0), 6);
+        // Neither: one frame, never zero.
+        assert_eq!(predicted_frames(&plan, None, 0.0), 1);
+    }
+
+    #[test]
+    fn two_thumbnails_short_is_tolerated_three_is_not() {
+        assert!(!is_short(20, 20));
+        assert!(!is_short(19, 20));
+        assert!(!is_short(18, 20), "the last windows may have no sample of their own");
+        assert!(is_short(17, 20));
+        assert!(is_short(0, 3));
+        assert!(!is_short(0, 2));
+        assert!(!is_short(30, 20), "more than predicted is never short");
+    }
+
+    /// `n` raw thumbnails of a plan, as one decode would deliver them.
+    fn fake_decoded(plan: &Plan, n: u32, keyframes_only: bool) -> Decoded {
+        Decoded {
+            raw: vec![90u8; plan.frame_bytes() * n as usize],
+            source: PathBuf::from("/fake/clip.mp4"),
+            keyframes_only,
+        }
+    }
+
+    #[test]
+    fn a_decode_that_reached_the_end_is_complete_without_asking_ffprobe() {
+        let plan = plan_for(0.5, 20, false);
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 20, false)), &|_| {
+            panic!("a full strip needs no second opinion")
+        })
+        .unwrap();
+        assert_eq!((checked.frames, checked.complete), (20, true));
+        assert_eq!(checked.raw.len(), plan.frame_bytes() * 20);
+    }
+
+    #[test]
+    fn a_truncated_decode_is_not_complete() {
+        // A file that goes bad halfway: ffmpeg exits 0 with 5 of the 20 thumbnails,
+        // and the stream says it runs the full 10 s. (The stream length is the
+        // point — a video really only 2.5 s long is the next test.)
+        let plan = plan_for(0.5, 20, false);
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 5, false)), &|_| {
+            Some(10.0)
+        })
+        .unwrap();
+        assert_eq!((checked.frames, checked.complete), (5, false));
+        // Without a stream duration the container's stands in for it.
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 5, false)), &|_| None).unwrap();
+        assert_eq!((checked.frames, checked.complete), (5, false));
+        // Three short is the line.
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 17, false)), &|_| {
+            Some(10.0)
+        })
+        .unwrap();
+        assert!(!checked.complete);
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 18, false)), &|_| {
+            Some(10.0)
+        })
+        .unwrap();
+        assert!(checked.complete);
+    }
+
+    #[test]
+    fn a_video_shorter_than_its_container_is_complete_at_its_own_length() {
+        // The audio runs 10 s, the picture 2.5 s: five thumbnails are all there is.
+        let plan = plan_for(0.5, 20, false);
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 5, false)), &|_| {
+            Some(2.5)
+        })
+        .unwrap();
+        assert_eq!((checked.frames, checked.complete), (5, true));
+        // A stream with no duration of its own cannot make that case; the strip is
+        // judged against the container and kept out of the disk cache.
+        let checked = decode_checked(&plan, 10.0, "clip", &mut |_| Ok(fake_decoded(&plan, 5, false)), &|_| None).unwrap();
+        assert!(!checked.complete);
+    }
+
+    #[test]
+    fn keyframe_sampling_that_falls_short_is_retried_with_every_frame() {
+        // A 60 s asset sampled every 5 s: 12 thumbnails. A file whose keyframes are
+        // sparse or badly flagged yields 3 by keyframes; every frame yields 12.
+        let plan = plan_for(5.0, 12, false);
+        let mut asked = Vec::new();
+        let checked = decode_checked(
+            &plan,
+            60.0,
+            "clip",
+            &mut |keyframes| {
+                asked.push(keyframes);
+                Ok(fake_decoded(&plan, if keyframes { 3 } else { 12 }, keyframes))
+            },
+            &|_| Some(60.0),
+        )
+        .unwrap();
+        assert_eq!(asked, [true, false]);
+        assert_eq!((checked.frames, checked.complete), (12, true));
+
+        // A keyframe pass that is only the usual tail short (the last keyframe
+        // ended before the last window) is accepted as it is.
+        let mut asked = Vec::new();
+        let checked = decode_checked(
+            &plan,
+            60.0,
+            "clip",
+            &mut |keyframes| {
+                asked.push(keyframes);
+                Ok(fake_decoded(&plan, 11, keyframes))
+            },
+            &|_| Some(60.0),
+        )
+        .unwrap();
+        assert_eq!(asked, [true]);
+        assert_eq!((checked.frames, checked.complete), (11, true));
+
+        // If the retry is short too, that is a truncated file, not a keyframe problem.
+        let checked = decode_checked(&plan, 60.0, "clip", &mut |k| Ok(fake_decoded(&plan, 3, k)), &|_| Some(60.0)).unwrap();
+        assert_eq!((checked.frames, checked.complete), (3, false));
+    }
+
+    #[test]
+    fn a_decode_that_produced_nothing_or_failed_is_an_error() {
+        let plan = plan_for(0.5, 20, false);
+        let err = decode_checked(
+            &plan,
+            10.0,
+            "/m/clip.mp4",
+            &mut |_| Ok(fake_decoded(&plan, 0, false)),
+            &|_| Some(10.0),
+        )
+        .err()
+        .expect("no frames")
+        .to_string();
+        assert!(err.contains("no frames could be read from /m/clip.mp4"), "{err}");
+        // A partial thumbnail's bytes do not make a frame.
+        let mut half = fake_decoded(&plan, 0, false);
+        half.raw = vec![0; plan.frame_bytes() / 2];
+        assert!(decode_checked(&plan, 10.0, "c", &mut |_| Ok(half_clone(&half)), &|_| Some(10.0)).is_err());
+        let err = decode_checked(&plan, 10.0, "c", &mut |_| Err(Error::Engine("boom".into())), &|_| {
+            panic!("a failed decode is not judged")
+        })
+        .err()
+        .expect("failed")
+        .to_string();
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    fn half_clone(d: &Decoded) -> Decoded {
+        Decoded {
+            raw: d.raw.clone(),
+            source: d.source.clone(),
+            keyframes_only: d.keyframes_only,
+        }
+    }
+
+    #[test]
+    fn a_cache_hit_never_looks_for_a_proxy() {
+        // Resolving the proxy can run an ffprobe; a hit — the memo's or the disk's —
+        // must not pay for one, so the resolver is only called to *build*.
+        let dir = Scratch::new("hit");
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"media").unwrap();
+        let a = asset(file.to_str().unwrap(), 10.0, vec![video(Some(1920), Some(1080), false)]);
+        let plan = Plan::for_asset(&a).unwrap();
+        let key = entry_key(&a, &plan);
+        let strip = sample_strip(&plan, 20, 3);
+
+        // The disk cache.
+        write_entry(&dir.0, &key, &strip);
+        let hit = load_or_build(Some(&dir.0), &key, &a, &plan, || {
+            panic!("the proxy was looked up on a disk hit")
+        })
+        .unwrap();
+        assert_eq!(hit, strip);
+
+        // The memo.
+        let memoed = Arc::new(sample_strip(&plan, 20, 4));
+        memo().lock().unwrap_or_else(|e| e.into_inner()).put(key, Arc::clone(&memoed));
+        let hit = shared_strip(None, &a, || panic!("the proxy was looked up on a memo hit")).unwrap();
+        assert!(Arc::ptr_eq(&hit, &memoed));
+    }
+
     // ---- real ffmpeg --------------------------------------------------------
 
     use crate::engine::cli::{command, probe};
@@ -2104,7 +2699,7 @@ mod tests {
                 frame_height: 36,
                 still: false,
             };
-            let raw = decode_thumbs(&a, &plan, None).expect("decode");
+            let raw = decode_thumbs(&a, &plan, None, false).expect("decode").raw;
             assert_eq!(
                 raw.len() / plan.frame_bytes(),
                 plan.frames as usize,
@@ -2162,7 +2757,7 @@ mod tests {
             still: false,
         };
         assert_eq!(plan.frames, 6, "the container runs to {:.2}s", a.duration);
-        let lumas = centre_lumas(&decode_thumbs(&a, &plan, None).expect("decode"), &plan);
+        let lumas = centre_lumas(&decode_thumbs(&a, &plan, None, false).expect("decode").raw, &plan);
         assert_eq!(lumas.len(), 6, "{lumas:?}");
         // Frame n appears at 0.7 s + n / 25 (give or take the audio's priming
         // offset): the first thumbnail holds frame 0 back to t = 0, thumbnail k >= 1 is
@@ -2267,7 +2862,7 @@ mod tests {
         let root = dir.join("cache");
         std::fs::create_dir_all(&root).unwrap();
 
-        let strip = shared_strip(Some(&root), &a, None).expect("strip");
+        let strip = shared_strip(Some(&root), &a, || None).expect("strip");
         // 10 s at 0.5 s; 320x180 is 16:9 -> 170x96, 20 of them fit one 3400 px sheet.
         assert_eq!(
             (
@@ -2322,13 +2917,13 @@ mod tests {
         assert!(entry.join("manifest.json").is_file() && entry.join("sheet-000.jpg").is_file());
         let moved = dir.join("moved.mp4");
         std::fs::rename(&clip, &moved).unwrap();
-        let again = load_or_build(Some(&root), &key, &a, &plan, None).expect("served from the cache");
+        let again = load_or_build(Some(&root), &key, &a, &plan, || None).expect("served from the cache");
         assert_eq!(again, *strip);
         // A truncated sheet is rebuilt, not trusted (put the source back first).
         std::fs::rename(&moved, &clip).unwrap();
         let bytes = std::fs::read(entry.join("sheet-000.jpg")).unwrap();
         std::fs::write(entry.join("sheet-000.jpg"), &bytes[..bytes.len() / 2]).unwrap();
-        let rebuilt = load_or_build(Some(&root), &key, &a, &plan, None).expect("rebuilt");
+        let rebuilt = load_or_build(Some(&root), &key, &a, &plan, || None).expect("rebuilt");
         assert_eq!(rebuilt.frames, 20);
         assert_eq!(jpeg_dimensions(&rebuilt.sheets[0].jpeg), Some((3400, 96)));
         assert_eq!(
@@ -2362,7 +2957,7 @@ mod tests {
         ]);
         let root2 = dir.join("cache2");
         std::fs::create_dir_all(&root2).unwrap();
-        let from_proxy = load_or_build(Some(&root2), "proxied", &a, &plan, Some(&proxy)).expect("from the proxy");
+        let from_proxy = load_or_build(Some(&root2), "proxied", &a, &plan, || Some(proxy.clone())).expect("from the proxy");
         assert_eq!((from_proxy.frames, from_proxy.frame_width), (20, 170));
         let sheet_file = dir.join("proxied.jpg");
         std::fs::write(&sheet_file, &from_proxy.sheets[0].jpeg).unwrap();
@@ -2386,7 +2981,7 @@ mod tests {
             decoy.to_str().unwrap(),
         ]);
         let mean = |cell: &[u8]| cell.iter().map(|v| f64::from(*v)).sum::<f64>() / cell.len() as f64;
-        let decoyed = load_or_build(Some(&root2), "decoyed", &a, &plan, Some(&decoy)).expect("from the decoy");
+        let decoyed = load_or_build(Some(&root2), "decoyed", &a, &plan, || Some(decoy.clone())).expect("from the decoy");
         let decoy_sheet = dir.join("decoyed.jpg");
         std::fs::write(&decoy_sheet, &decoyed.sheets[0].jpeg).unwrap();
         let (white, original) = (
@@ -2398,18 +2993,177 @@ mod tests {
         std::fs::create_dir_all(&root3).unwrap();
         let broken = dir.join("not-a-proxy.mp4");
         std::fs::write(&broken, b"garbage").unwrap();
-        let fell_back = load_or_build(Some(&root3), "fellback", &a, &plan, Some(&broken)).expect("falls back to the original");
+        let fell_back =
+            load_or_build(Some(&root3), "fellback", &a, &plan, || Some(broken.clone())).expect("falls back to the original");
         assert_eq!(fell_back.frames, 20);
-        let gone = load_or_build(Some(&root3), "gone", &a, &plan, Some(&dir.join("vanished.mp4"))).expect("and when it is gone");
+        let gone =
+            load_or_build(Some(&root3), "gone", &a, &plan, || Some(dir.join("vanished.mp4"))).expect("and when it is gone");
         assert_eq!(gone.frames, 20);
 
         // A cache root that cannot be created (something else is in the way) still
         // yields a strip: it is built in the temp directory and just not kept.
         let blocked = dir.join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
-        let uncached = load_or_build(Some(&blocked), "blocked", &a, &plan, None).expect("built without a cache");
+        let uncached = load_or_build(Some(&blocked), "blocked", &a, &plan, || None).expect("built without a cache");
         assert_eq!(uncached.frames, 20);
         assert!(blocked.is_file(), "and what was in the way is untouched");
+    }
+
+    /// A decode that comes up short with the stream still claiming its full length
+    /// (ffmpeg exiting 0 on a file that goes bad halfway) is returned for the
+    /// session but never written to the disk cache, where it would pin a truncated
+    /// strip for good; a complete one is cached. The decode is faked (a gray frame
+    /// per thumbnail), the sheet encode is the real ffmpeg.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored truncated_decode`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_truncated_decode_is_returned_but_never_written_to_the_cache() {
+        let dir = Scratch::new("truncated");
+        let root = dir.join("cache");
+        let plan = plan_for(0.5, 20, false);
+        let part_dirs = |root: &Path| -> Vec<String> {
+            std::fs::read_dir(root)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.ends_with(".part"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // A fake decode of `frames` thumbnails from a stream that says it runs `video_secs`.
+        let build = |key: &str, frames: u32, video_secs: f64| {
+            load_or_build_with(Some(&root), key, &plan, "fake", |work| {
+                assemble(
+                    &plan,
+                    10.0,
+                    "fake",
+                    &mut |_| Ok(fake_decoded(&plan, frames, false)),
+                    &|_| Some(video_secs),
+                    work,
+                )
+            })
+            .expect("a strip")
+        };
+
+        // 5 of 20 thumbnails, the stream saying it runs the full 10 s.
+        let short = build("short", 5, 10.0);
+        assert_eq!(short.frames, 5);
+        assert_eq!(
+            jpeg_dimensions(&short.sheets[0].jpeg),
+            Some((5 * 170, 96)),
+            "a real strip, returned"
+        );
+        assert!(!root.join("short").exists(), "but it is not published");
+        assert!(
+            part_dirs(&root).is_empty(),
+            "and no working directory is left: {:?}",
+            part_dirs(&root)
+        );
+        // The next ask finds nothing cached, so a later, complete decode is what gets kept.
+        let again = build("short", 20, 10.0);
+        assert_eq!(again.frames, 20);
+        assert!(
+            root.join("short").join("manifest.json").is_file(),
+            "the complete one is cached"
+        );
+
+        // The same 5 thumbnails of a video that really is 2.5 s long are complete.
+        let genuine = build("genuine", 5, 2.5);
+        assert_eq!(genuine.frames, 5);
+        assert_eq!(load_entry(&root.join("genuine"), &plan).map(|s| s.frames), Some(5));
+    }
+
+    /// By keyframes an original's thumbnail is the last *keyframe* at or before its
+    /// time; decoding every frame gives the frame itself. A 20 s clip with a
+    /// keyframe every 2 s, each frame's luma its number mod 250 (so frame 250 is 0):
+    /// at 5 s the frame is 125 and the keyframe 100 (4 s); at 10 s both are 250,
+    /// which is a keyframe.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored keyframe_sampling`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn keyframe_sampling_takes_the_last_keyframe_at_or_before_each_time() {
+        let dir = Scratch::new("keyframes");
+        let clip = dir.join("gop.mp4");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x36:r=25:d=20,format=yuv420p,geq=lum='mod(N,250)':cb=128:cr=128",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-g",
+            "50",
+            "-keyint_min",
+            "50",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            clip.to_str().unwrap(),
+        ]);
+        let a = probed(&clip);
+        let plan = Plan {
+            interval: 5.0,
+            frames: 4,
+            frame_width: 64,
+            frame_height: 36,
+            still: false,
+        };
+
+        let exact = decode_thumbs(&a, &plan, None, false).expect("every frame");
+        assert!(!exact.keyframes_only);
+        assert_eq!(
+            centre_lumas(&exact.raw, &plan),
+            [0, 125, 0, 125],
+            "the frames themselves, at 0 / 5 / 10 / 15 s"
+        );
+
+        let sampled = decode_thumbs(&a, &plan, None, true).expect("keyframes");
+        assert!(
+            sampled.keyframes_only,
+            "a 5 s interval on an original is sampled by keyframes"
+        );
+        assert_eq!(
+            centre_lumas(&sampled.raw, &plan),
+            [0, 100, 0, 100],
+            "the last keyframe (every 2 s) at or before 0 / 5 / 10 / 15 s"
+        );
+
+        // Under the threshold the same file is sampled frame by frame.
+        let fine = Plan {
+            interval: 2.5,
+            frames: 8,
+            ..plan
+        };
+        assert!(!decode_thumbs(&a, &fine, None, true).expect("fine").keyframes_only);
+
+        // A proxy is never sampled by keyframes: it is all-intra, so every frame is one.
+        let proxy = dir.join("proxy.mp4");
+        run_ffmpeg(&[
+            "-i",
+            clip.to_str().unwrap(),
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            proxy.to_str().unwrap(),
+        ]);
+        let via_proxy = decode_thumbs(&a, &plan, Some(&proxy), true).expect("proxy");
+        assert_eq!(
+            (via_proxy.source.as_path(), via_proxy.keyframes_only),
+            (proxy.as_path(), false)
+        );
+        assert_eq!(centre_lumas(&via_proxy.raw, &plan), [0, 125, 0, 125]);
     }
 
     /// A still image is one thumbnail at the right shape.
@@ -2433,7 +3187,7 @@ mod tests {
         // Import gives a still its default length.
         a.duration = crate::model::DEFAULT_IMAGE_DURATION;
         assert!(a.is_image());
-        let strip = shared_strip(Some(&dir.join("cache")), &a, None).expect("still strip");
+        let strip = shared_strip(Some(&dir.join("cache")), &a, || None).expect("still strip");
         assert_eq!(
             (
                 strip.frames,
@@ -2471,15 +3225,21 @@ mod tests {
             "ultrafast",
             "-crf",
             "10",
+            // A keyframe on every sample: at 15 s an original is sampled by keyframes,
+            // and this way each thumbnail is exactly the frame at its time.
             "-g",
-            "30",
+            "15",
+            "-keyint_min",
+            "15",
+            "-sc_threshold",
+            "0",
             "-pix_fmt",
             "yuv420p",
             clip.to_str().unwrap(),
         ]);
         let a = probed(&clip);
         assert!((a.duration - 3600.0).abs() < 1.5, "{}", a.duration);
-        let strip = shared_strip(Some(&dir.join("cache")), &a, None).expect("strip");
+        let strip = shared_strip(Some(&dir.join("cache")), &a, || None).expect("strip");
         // 3600 s -> a thumbnail every 15 s = 240, within the cap; 64x36 is 170 px wide
         // -> 48 per sheet -> five even sheets.
         assert_eq!(strip.interval, 15.0);
@@ -2539,7 +3299,7 @@ mod tests {
             skip("skipped: this ffmpeg cannot write a display matrix");
             return;
         }
-        let strip = shared_strip(Some(&dir.join("cache")), &a, None).expect("strip");
+        let strip = shared_strip(Some(&dir.join("cache")), &a, || None).expect("strip");
         // Displayed 180x320: 96 high is 54 wide.
         assert_eq!((strip.frame_width, strip.frame_height), (54, 96));
         assert_eq!(strip.frames, 8);
@@ -2622,7 +3382,7 @@ mod tests {
         assert!(hlg_asset.hdr().is_some() && sdr_asset.hdr().is_none());
         let plan = Plan::for_asset(&hlg_asset).unwrap();
         let colourfulness = |a: &Asset| -> f64 {
-            let raw = decode_thumbs(a, &plan, None).expect("decode");
+            let raw = decode_thumbs(a, &plan, None, false).expect("decode").raw;
             // Chroma spread of the first thumbnail's U and V planes about neutral.
             let (w, h) = (plan.frame_width as usize, plan.frame_height as usize);
             let chroma = &raw[w * h..plan.frame_bytes()];
@@ -2648,7 +3408,7 @@ mod tests {
         let root = dir.join("cache");
         let strips: Vec<Arc<Filmstrip>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..6)
-                .map(|_| s.spawn(|| shared_strip(Some(&root), &a, None).expect("strip")))
+                .map(|_| s.spawn(|| shared_strip(Some(&root), &a, || None).expect("strip")))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });

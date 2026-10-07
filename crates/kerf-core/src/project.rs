@@ -865,38 +865,37 @@ impl Project {
         engine::waveform_range_of(Path::new(&asset.path), start, end, buckets)
     }
 
-    /// Resolve what a filmstrip decode needs — the asset and its ready proxy — so
-    /// a caller can pull them out under the project lock and **drop the guard**
-    /// before [`Project::decode_filmstrip`] runs ffmpeg. The proxy is `Some` only
-    /// when one has already been generated: a filmstrip never waits for it (the
-    /// original is decoded instead, and the result is the same cache entry either
-    /// way).
-    pub fn filmstrip_inputs(&self, asset_id: Uuid) -> Result<(Asset, Option<PathBuf>)> {
-        let asset = self.require_asset(asset_id)?;
-        let source = Self::preview_source(&asset);
-        let proxy = (source != Path::new(&asset.path)).then_some(source);
-        Ok((asset, proxy))
+    /// The ready proxy a filmstrip should decode instead of `asset`'s original, if
+    /// one has already been generated — never waited for: without one the original
+    /// is decoded, and the result is the same cache entry either way. (A proxy's
+    /// path depends on whether the source is HDR, which can take an `ffprobe`: that
+    /// is why this is resolved inside [`Project::decode_filmstrip`], off the project
+    /// lock, and only when the strip is not already cached.)
+    fn filmstrip_proxy(asset: &Asset) -> Option<PathBuf> {
+        let source = Self::preview_source(asset);
+        (source != Path::new(&asset.path)).then_some(source)
     }
 
     /// The thumbnail strip of an asset's video (see [`crate::Filmstrip`] for what a
     /// thumbnail is and how to place one), from the cache when it exists, else
-    /// built with one decode. Holds `&self` for the decode — surfaces use
-    /// [`Project::filmstrip_inputs`] + [`Project::decode_filmstrip`] instead.
-    /// An asset with no video stream is an `InvalidArgument`.
+    /// built with one decode. Holds `&self` for the decode — a surface resolves the
+    /// asset with [`Project::require_asset`] under the lock and calls
+    /// [`Project::decode_filmstrip`] with it released instead. An asset with no
+    /// video stream is an `InvalidArgument`.
     pub fn filmstrip(&self, asset_id: Uuid) -> Result<std::sync::Arc<engine::Filmstrip>> {
-        let (asset, proxy) = self.filmstrip_inputs(asset_id)?;
-        Self::decode_filmstrip(&asset, proxy.as_deref())
+        Self::decode_filmstrip(&self.require_asset(asset_id)?)
     }
 
     /// [`Project::filmstrip`] for an already-resolved [`Asset`], *without*
-    /// `&self` — so the caller can release the project lock before the first
-    /// call's whole-file decode (later calls are cached and cheap). `proxy` is
-    /// the asset's ready proxy from [`Project::filmstrip_inputs`], decoded in
-    /// preference to the original. Ungated like [`Project::decode_waveform_range`]:
-    /// the timeline draws from it, and a thumbnail appearing is not worth queueing
-    /// behind an export — it runs thread-capped, niced and at most twice at once.
-    pub fn decode_filmstrip(asset: &Asset, proxy: Option<&Path>) -> Result<std::sync::Arc<engine::Filmstrip>> {
-        engine::filmstrip_for(asset, proxy)
+    /// `&self` — so the caller can release the project lock before anything slow
+    /// runs: the asset's ready proxy is looked up here (decoded in preference to
+    /// the original), and the first call's whole-file decode follows (later calls
+    /// are cached and cheap). Ungated like [`Project::decode_waveform_range`]: the
+    /// timeline draws from it, and a thumbnail appearing is not worth queueing
+    /// behind an export — but, being a video decode, it keeps to a couple of niced
+    /// threads at every CPU budget (see `engine::filmstrip`).
+    pub fn decode_filmstrip(asset: &Asset) -> Result<std::sync::Arc<engine::Filmstrip>> {
+        engine::filmstrip_for(asset, || Self::filmstrip_proxy(asset))
     }
 
     /// Reduce an asset's first audio stream to `buckets` RMS magnitudes in
@@ -4064,14 +4063,10 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
         assert!(err.to_string().contains("no video stream"), "{err}");
         assert!(matches!(project.filmstrip(Uuid::new_v4()), Err(Error::AssetNotFound(_))));
-        assert!(matches!(
-            project.filmstrip_inputs(Uuid::new_v4()),
-            Err(Error::AssetNotFound(_))
-        ));
     }
 
     #[test]
-    fn filmstrip_inputs_hand_over_the_proxy_only_once_it_exists() {
+    fn a_filmstrip_decodes_the_proxy_only_once_it_exists() {
         let project = Project::open_in_memory().unwrap();
         // A unique per-process source path keeps the deterministic proxy path
         // distinct across concurrent test runs (no shared-file race).
@@ -4079,8 +4074,11 @@ mod tests {
         let asset = project
             .insert_or_get_asset(&asset_with(&path, vec![vid_stream(false)]))
             .unwrap();
-        let (got, proxy) = project.filmstrip_inputs(asset.id).unwrap();
-        assert_eq!((got.id, proxy), (asset.id, None), "no proxy yet: the original is decoded");
+        assert_eq!(
+            Project::filmstrip_proxy(&asset),
+            None,
+            "no proxy yet: the original is decoded"
+        );
 
         let width = crate::engine::proxy_width(asset.projection());
         let Some(proxy_file) = crate::engine::proxy_path(Path::new(&asset.path), width) else {
@@ -4090,7 +4088,7 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
         }
         std::fs::write(&proxy_file, b"stub").unwrap();
-        let resolved = project.filmstrip_inputs(asset.id).unwrap().1;
+        let resolved = Project::filmstrip_proxy(&asset);
         let _ = std::fs::remove_file(&proxy_file);
         assert_eq!(resolved, Some(proxy_file), "the ready proxy is preferred");
 
@@ -4099,7 +4097,7 @@ mod tests {
         let still = project
             .insert_or_get_asset(&asset_with(&still_path, vec![vid_stream(true)]))
             .unwrap();
-        assert_eq!(project.filmstrip_inputs(still.id).unwrap().1, None);
+        assert_eq!(Project::filmstrip_proxy(&still), None);
     }
 
     /// `cargo test -p kerf-core --no-default-features -- --ignored filmstrip_of_an_imported`
@@ -4136,10 +4134,10 @@ mod tests {
         );
         assert!(strip.sheets[0].jpeg.starts_with(&[0xFF, 0xD8]), "a JPEG");
 
-        // The surface's shape: resolve under the lock, decode with it released.
-        // The second ask is the memoized strip, not a second decode.
-        let (resolved, proxy) = project.filmstrip_inputs(asset.id).unwrap();
-        let again = Project::decode_filmstrip(&resolved, proxy.as_deref()).unwrap();
+        // The surface's shape: resolve the asset under the lock, decode with it
+        // released. The second ask is the memoized strip, not a second decode.
+        let resolved = project.require_asset(asset.id).unwrap();
+        let again = Project::decode_filmstrip(&resolved).unwrap();
         assert!(std::sync::Arc::ptr_eq(&strip, &again));
         // The strip went to the real cache under a path unique to this run.
         if let Some(entry) = crate::engine::cached_filmstrip_dir(&resolved) {

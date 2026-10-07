@@ -1553,12 +1553,13 @@ async fn get_filmstrip(state: State<'_, AppState>, asset_id: String) -> CmdResul
     let id = id(&asset_id)?;
     let shared = state.project.clone();
     blocking(move || {
-        // Resolve the asset and its proxy (only if one is already ready — a
-        // filmstrip never waits for it) under the lock, then drop the guard before
-        // the decode: it reads the whole file the first time, and the timeline asks
-        // for every clip's strip at once. Same shape as `get_waveform_range`.
-        let (asset, proxy) = lock_user(&shared).filmstrip_inputs(id).map_err(|e| e.to_string())?;
-        let strip = Project::decode_filmstrip(&asset, proxy.as_deref()).map_err(|e| e.to_string())?;
+        // Only the asset record under the lock — a database read — then drop the
+        // guard before anything touches the media: `decode_filmstrip` finds the
+        // asset's ready proxy (which can run an ffprobe) and, the first time, reads
+        // the whole file, and the timeline asks for every clip's strip at once.
+        // Same shape as `get_waveform_range`.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        let strip = Project::decode_filmstrip(&asset).map_err(|e| e.to_string())?;
         Ok(filmstrip_payload(&strip))
     })
     .await

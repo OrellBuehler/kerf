@@ -195,8 +195,9 @@ pub fn lease() -> Lease {
 /// `-threads` is a per-file codec option, so where it sits decides what it
 /// means. These are the *front* flags, which land in the first input's option
 /// group and so cap the decoder — the expensive half of every analysis pass.
-fn head_flags(threads: usize) -> Vec<String> {
-    if !limited() || threads == 0 || threads >= cores() {
+/// `force` writes them even at a full budget (see [`cap_args`]).
+fn head_flags(threads: usize, force: bool) -> Vec<String> {
+    if (!force && !limited()) || threads == 0 || threads >= cores() {
         return Vec::new();
     }
     let n = threads.to_string();
@@ -219,7 +220,22 @@ fn head_flags(threads: usize) -> Vec<String> {
 /// which is what keeps the pure argument builders' tests describing exactly what
 /// ffmpeg is handed.
 pub fn limit_args(args: &mut Vec<String>, threads: usize) {
-    let head = head_flags(threads);
+    splice_caps(args, threads, false);
+}
+
+/// [`limit_args`] that holds at **any** budget, 100% included.
+///
+/// For the background jobs that run *beside* whatever has the heavy-job lease
+/// rather than behind it (a filmstrip decodes video while a proxy encode or an
+/// export owns the machine): "at 100% nothing is capped" describes a job the user
+/// asked for and is waiting on, and these are the opposite — their own cap is
+/// what keeps them out of that job's way, not the user's share of the machine.
+pub fn cap_args(args: &mut Vec<String>, threads: usize) {
+    splice_caps(args, threads, true);
+}
+
+fn splice_caps(args: &mut Vec<String>, threads: usize, force: bool) {
+    let head = head_flags(threads, force);
     if head.is_empty() {
         return;
     }
@@ -233,7 +249,7 @@ pub fn limit_args(args: &mut Vec<String>, threads: usize) {
 /// arguments are pushed. Only the decode side — a command assembled this way
 /// has no output sink to insert before yet.
 pub fn limit_cmd(cmd: &mut Command, threads: usize) {
-    let head = head_flags(threads);
+    let head = head_flags(threads, false);
     if !head.is_empty() {
         cmd.args(head);
     }
@@ -249,6 +265,16 @@ pub fn background(cmd: &mut Command) {
     if !limited() {
         return;
     }
+    lower_priority(cmd);
+}
+
+/// [`background`] at any budget, 100% included — the priority half of
+/// [`cap_args`], for jobs that run beside a render rather than behind it.
+pub fn background_always(cmd: &mut Command) {
+    lower_priority(cmd);
+}
+
+fn lower_priority(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -321,6 +347,31 @@ mod tests {
         // The encoder cap sits in the output group: after the last input,
         // immediately before the sink.
         assert_eq!(&args[args.len() - 3..], &["-threads", "1", "out.mp4"]);
+        set_cpu_percent(restore);
+    }
+
+    #[test]
+    fn a_hard_cap_holds_at_a_full_budget() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        set_cpu_percent(100);
+        let original: Vec<String> = ["-i", "in.mp4", "out.mp4"].iter().map(|s| s.to_string()).collect();
+        // The budget-following cap stands down at 100%, the hard one does not (on a
+        // one-core machine there is nothing below the machine to cap to).
+        let mut soft = original.clone();
+        limit_args(&mut soft, 1);
+        assert_eq!(soft, original);
+        let mut hard = original.clone();
+        cap_args(&mut hard, 1);
+        if cores() > 1 {
+            assert_eq!(
+                &hard[..6],
+                &["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1"]
+            );
+            assert_eq!(&hard[hard.len() - 3..], &["-threads", "1", "out.mp4"]);
+        } else {
+            assert_eq!(hard, original);
+        }
         set_cpu_percent(restore);
     }
 
