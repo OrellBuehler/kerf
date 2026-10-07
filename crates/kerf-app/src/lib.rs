@@ -23,7 +23,7 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, Project,
     Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition,
-    TransitionKind, VideoEffect,
+    TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1428,6 +1428,29 @@ async fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usi
     .await
 }
 
+/// `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
+/// peak pairs per channel — what the timeline draws a clip's waveform from.
+/// The first call for a file decodes it into a cached peak pyramid; every later
+/// window at any zoom is a slice read.
+#[tauri::command]
+async fn get_waveform_range(
+    state: State<'_, AppState>,
+    asset_id: String,
+    start: f64,
+    end: f64,
+    buckets: usize,
+) -> CmdResult<WaveformRange> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve under the lock, read (and on a first call decode) with it
+        // released — same shape as `get_waveform`.
+        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
+        Project::decode_waveform_range(&asset, start, end, buckets).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// A window of an asset's audio as raw mono s16le PCM for the preview's Web
 /// Audio playback. Returns raw bytes rather than JSON — a minute of 32 kHz
 /// audio is ~3.8 MB, which a JSON number array would balloon ~5×.
@@ -2252,6 +2275,7 @@ pub fn run() {
             start_playback,
             stop_playback,
             get_waveform,
+            get_waveform_range,
             get_audio,
             get_energy,
             list_tasks,

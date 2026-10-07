@@ -305,8 +305,9 @@ so the feature is **only** activated through these forwards — which is what ma
   size is checked before anything is allocated. Loaded pyramids sit in a
   byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
-  op (an asset with no audio stream is `InvalidArgument`); `get_waveform` /
-  `get_energy` are unchanged.
+  op (an asset with no audio stream is `InvalidArgument`), exposed as the
+  `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
+  are unchanged.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -744,9 +745,14 @@ it never watches the cut. `core_err` splits the caller's mistakes (a stale id, a
 out-of-range value, a stale staged edit) out as `invalid_params`: reported as
 `internal_error`, a mistyped uuid reads to a model as a broken server rather than
 as something it can fix and retry. Sizes an agent picks out of a schema
-description — `get_waveform`/`get_energy` buckets, `get_frame`/`preview_timeline`
-widths — are clamped rather than trusted, the way `skim_asset` already clamps its
-grid. `set_speech_model` is the write side of `transcription_status`
+description — `get_waveform`/`get_energy`/`get_waveform_range` buckets,
+`get_frame`/`preview_timeline` widths — are clamped rather than trusted, the way `skim_asset` already clamps its
+grid. `get_waveform_range` reads an asset's audio as signed min/max peaks per
+channel over a **source-seconds** window (the cached peak pyramid, so the first call
+per file decodes and every later window is a slice); it answers in *compact* JSON
+(pretty-printing puts each of up to 16k numbers on its own line) and rejects a window
+with `end <= start` as `invalid_params`, since the engine reads one as a row of
+zeros and a model would take that for silence. `set_speech_model` is the write side of `transcription_status`
 (`download_speech_model` only fills the cache; transcription uses whichever model
 is *selected*, so downloading without selecting was a silent no-op) — it makes
 both writes the GUI picker makes, though the picker itself only re-reads at
@@ -822,6 +828,7 @@ time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`get_waveform_range` → a source-seconds window as min/max peaks per channel,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -897,7 +904,8 @@ blocking pool via the `blocking()` helper — resolving inputs under the shared
 project lock and **releasing it before the slow part** (see `lock_user`; the
 lock-free `Project::decode_*` statics exist for exactly this). The MCP server's
 heavy tools (`analyze_asset`, `get_frame`, `skim_asset`, `preview_timeline`,
-`get_waveform`/`get_energy`, `export`) follow the same shape with `lock_agent`.
+`get_waveform`/`get_energy`/`get_waveform_range`, `export`) follow the same shape
+with `lock_agent`.
 Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
@@ -1434,7 +1442,10 @@ all project data renders from the real backend.
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
 **seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform
 is explorable in a plain browser via `bun run dev` (frames return `null` there → Preview
-keeps its placeholder). This browser sample is a **dev harness only** — the desktop app always
+keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
+deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
+asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
+stretch so the clipping colour is visible). This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
