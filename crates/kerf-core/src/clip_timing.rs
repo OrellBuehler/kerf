@@ -365,14 +365,19 @@ pub fn ffmpeg_frame_time(k: u64, fps_num: u32, fps_den: u32) -> f64 {
     k as f64 * (f64::from(fps_den) / f64::from(fps_num))
 }
 
-/// A frame rate as FFmpeg holds it: the rational `av_parse_video_rate` makes of the
-/// text the graph carries (`fps=29.97`, `color=r=29.97`).
+/// A frame rate as FFmpeg holds it: the rational it makes of the text the graph carries.
 ///
 /// The graph prints `{}` of an `f64` and FFmpeg turns that text back into a rational
-/// with `av_d2q(value, 1001000)`, so `29.97` is `2997/100` and its neighbour
-/// `29.97002997002997` is `30000/1001` — two different frame grids, and which one an
-/// export runs on is decided by the number's spelling, not by what it is near. Every
-/// time the graph evaluates at output frame `k` is `k * (den / num)`
+/// with `av_d2q`, so `29.97` is `2997/100` and its neighbour `29.97002997002997` is
+/// `30000/1001` — two different frame grids, and which one an export runs on is decided
+/// by the number's spelling, not by what it is near. **It is not one parse but two**, with
+/// different limits, and a rate with more than 1001000 in a term gets different grids from
+/// them: the `color=r=` base canvas (and so the overlay's clock, `t`) is
+/// [`Rational::from_fps`] (`av_d2q(x, 1001000)`), and each clip's `fps=` filter is
+/// [`Rational::from_fps_filter`] (`av_d2q(x, INT_MAX)`; `29.970029` is `92997/3103` on the
+/// canvas and `29970029/1000000` on the clip). Every standard rate — anything that is a
+/// small ratio, `24`, `25`, `29.97`, `30000/1001`, `59.94`, ... — gets the same rational
+/// from both. Every time the graph evaluates at output frame `k` is `k * (den / num)`
 /// (`ffmpeg_frame_time`); [`Rational::exact_time`] is the exact slot boundary, for
 /// the source-frame *pick* alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,10 +392,21 @@ impl Rational {
         (num > 0 && den > 0).then_some(Self { num, den })
     }
 
-    /// What FFmpeg parses `{fps}` to: `av_d2q` with the video-rate limit, `None` for
-    /// a rate it would refuse (not positive and finite, or one that reduces to nothing).
+    /// What a `color=r={fps}` source (the export's canvas) parses `{fps}` to: `av_d2q`
+    /// with the 1001000 limit of an option of video-rate type. `None` for a rate it
+    /// would refuse (not positive and finite, or one that reduces to nothing).
     pub fn from_fps(fps: f64) -> Option<Self> {
-        let (num, den) = av_d2q(fps, 1_001_000)?;
+        Self::reduced(av_d2q(fps, 1_001_000)?)
+    }
+
+    /// What the `fps={fps}` filter parses `{fps}` to: `av_d2q` with `INT_MAX` as the limit,
+    /// the grid a clip's frames are placed on. Equal to [`Rational::from_fps`] for every
+    /// rate whose terms fit 1001000.
+    pub fn from_fps_filter(fps: f64) -> Option<Self> {
+        Self::reduced(av_d2q(fps, i128::from(i32::MAX))?)
+    }
+
+    fn reduced((num, den): (i128, i128)) -> Option<Self> {
         Self::new(u32::try_from(num).ok()?, u32::try_from(den).ok()?)
     }
 
@@ -411,6 +427,13 @@ impl Rational {
     /// The output frame whose slot start is nearest `t` (`0` for a negative time).
     pub fn frame_at(self, t: f64) -> u64 {
         (t.max(0.0) * f64::from(self.num) / f64::from(self.den)).round() as u64
+    }
+
+    /// The output frame on screen at `t`: the one whose slot `[k/fps, (k+1)/fps)` holds it
+    /// (`0` for a negative time). A time a millionth of a frame short of a boundary is on
+    /// it, so `k / fps` computed in floating point is frame `k` and not `k - 1`.
+    pub fn frame_containing(self, t: f64) -> u64 {
+        (t.max(0.0) * f64::from(self.num) / f64::from(self.den) + 1e-6).floor() as u64
     }
 }
 
@@ -967,6 +990,18 @@ mod tests {
         assert_eq!(r(24000.0 / 1001.0), Some((24000, 1001)));
         assert_eq!(r(23.976), Some((2997, 125)));
         assert_eq!(r(0.5), Some((1, 2)));
+        assert_eq!(r(59.94), Some((2997, 50)));
+        // The `fps=` filter parses with a larger limit than the `color=r=` canvas: the two
+        // agree on every standard rate and part at a rate with big terms.
+        let f = |fps: f64| Rational::from_fps_filter(fps).map(|r| (r.num, r.den));
+        for same in [24.0, 25.0, 29.97, 30000.0 / 1001.0, 59.94, 23.976, 0.5, 144.0] {
+            assert_eq!(r(same), f(same), "{same}");
+        }
+        assert_eq!(
+            (r(29.970029), f(29.970029)),
+            (Some((92997, 3103)), Some((29_970_029, 1_000_000)))
+        );
+        assert_eq!(f(1.23456789012345), Some((1_973_935_681, 1_598_887_916)));
         // A rate FFmpeg refuses.
         for bad in [0.0, -24.0, f64::NAN, f64::INFINITY] {
             assert_eq!(r(bad), None, "{bad}");
@@ -984,6 +1019,18 @@ mod tests {
         // The nearest frame to a time, and to a negative one.
         let r24 = Rational::new(24, 1).unwrap();
         assert_eq!((r24.frame_at(1.0), r24.frame_at(1.02), r24.frame_at(-3.0)), (24, 24, 0));
+        // The frame on screen is the one whose slot holds the time — including a boundary
+        // that floating point put a hair short of.
+        assert_eq!(
+            (
+                r24.frame_containing(1.02),
+                r24.frame_containing(1.05),
+                r24.frame_containing(-3.0)
+            ),
+            (24, 25, 0)
+        );
+        assert!((0..2000u64).all(|k| r24.frame_containing(k as f64 / 24.0) == k));
+        assert!((0..2000u64).all(|k| ntsc.frame_containing(ntsc.exact_time(k)) == k));
         assert_eq!(ntsc.frame_at(ntsc.exact_time(90)), 90);
         assert!(Rational::new(0, 1).is_none() && Rational::new(1, 0).is_none());
     }

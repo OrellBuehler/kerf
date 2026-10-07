@@ -826,9 +826,14 @@ no editing logic in the adapter.
   **The plan is complete, and a `Planner` prepares a cut once.** `Planner::new` does the
   per-cut work (`for_render`, `transition_fx`, geometry, the asset facts, each clip's
   window / fades / motion keys, fonts) and a **per-track clip index** (sorted by start,
-  with a running maximum of window ends), so `at(t)` / `at_frame(k)` are
-  `O(log n + active clips)`; a clip with no asset is an error only when a frame asks for
-  it. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
+  with a running maximum of window ends): `at(t)` / `at_frame(k)` binary-search to the
+  clips that have started and walk back only while an earlier window could still reach
+  the frame — `O(log n)` plus the clips on screen for a cut whose clips follow one
+  another, but `O(n)` for a track with one very long clip under many short ones (the
+  running maximum never lets the walk stop). `at(t)` is the output frame **on screen** at
+  `t` (`Rational::frame_containing`: the slot `[k/fps, (k+1)/fps)` holds it, a hair of
+  floating point included), not the nearest. A clip with no asset is an error only when a
+  frame asks for it; an `fps` FFmpeg would not parse is an error in either mode. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
   (a chroma key's colour made safe), `reframe` (`PlanReframe { pose, interp }`: sampled
   — the `sendcmd` schedule's held pose is for the pass that draws a reframe), `hdr`,
   `projection`, `animated` (which keyed channels move) and `fx: LayerFx` — **transitions
@@ -837,7 +842,10 @@ no editing logic in the adapter.
   push travel at this frame (`MotionKeys::at`) and whether the layer is on its `tail`; a
   dissolve is two ordinary layers. The plan holds the live `PlanText`s (colour and box
   made safe, the font file resolved once, bold known to be real or synthetic), and the
-  canvas the delivery's `fps` (a `Rational`), `pix_fmt`, gif and composite colour policy.
+  canvas the delivery's `fps` (a `Rational`: the `color=r=` canvas's parse, the overlay's
+  clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
+  are placed on; the same for every rate with small terms, different for `29.970029`),
+  `pix_fmt`, gif and composite colour policy.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, fades and transitions left out of the picture, half-open spans,
   text drawn statically). `Motion` is the export graph at output frame `k`: every
@@ -846,7 +854,20 @@ no editing logic in the adapter.
   plays on its tail; a keyframed clip is never padded and always scales again
   (`LayerGeometry::resolve_with` and its `Placement`, which `resolve` defaults to
   `Placement::STILL`; a slide's travel joins the position in every branch); text is on
-  `between(t,start,end)`. A Motion plan holds **candidates** at a clip's closing edge —
+  `between(t,start,end)`. **A still plan is never drawn inside a transition**: it has no
+  layer for the outgoing clip playing on its tail — the export keeps drawing it until its
+  window closes, which is *after* the alpha ramp (the fade counts frames and rounds) and
+  around an incoming clip that does not cover it (6.9 dB, max 255 at 24 fps, 0.6 s dissolve,
+  frame 62) — so `RenderPlan.tails` records every clip whose tail window is open at the
+  frame (read at `t` and at `ffmpeg_frame_time(frame)`) and `reasons` refuses it
+  (`Unsupported::StillTail`), as it refuses a still inside a fade step or a travel,
+  **whatever the caps**: `fades`, `transitions`, `keyed_*` and `motion` are about Motion
+  plans (the FFmpeg still draws no fades), `mask` / `text` / `effects` / `reframe` / `hdr`
+  hold for both. `frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn`
+  (kerf-gpu parity: dissolve / slide / push / dip, covering and partial incoming clip,
+  frames before / inside / after, both FFmpegs) holds every listed frame to "refused, or
+  the still it draws like is the export's frame and the GPU matches it", so the second half
+  of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge —
   `PlanTiming` carries the window, source window, speed and direction the source-frame
   pick (next slice) works from, and `rendered.rs` pins that every drawn clip is planned
   and the only extras are on the frame the window closes on. `engine/cli/sweep.rs` holds
@@ -854,6 +875,12 @@ no editing logic in the adapter.
   `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the
   layer's `origin`, travel and all, a title's position and `between`, five frame rates)
   — parsing `enable=` back out of the graph would only restate what the builder printed.
+  It checks the *grammar* at the output frame's time, not the graph's clock: the zoom is
+  read at the source frame's time and not always shown (above). **A7 concern**: a Motion
+  plan decides the composite's matrix per frame from the layers on it
+  (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
+  over a cut whose bottom layer changes the matrix the export converts with may not be the
+  one a frame's own layers suggest — to be measured before the GPU encodes an export.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
   `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `mask`,
   `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
@@ -865,8 +892,9 @@ no editing logic in the adapter.
   keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
   gif are refused. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
-  `reasons(&GpuCaps::A0, ..)`. A still is now refused only while a fade step is live or a
-  layer travels (A0 refused the whole `[start - d/2, start + d)` of a transition).
+  `reasons(&GpuCaps::A0, ..)`. A still is refused while a fade step is live, a layer
+  travels or a tail window is open — exactly, where A0 refused the whole
+  `[start - d/2, start + d)` of a transition and missed the tail after the ramp.
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,

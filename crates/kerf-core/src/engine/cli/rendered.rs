@@ -149,7 +149,7 @@ fn planned_strength(planner: &Planner, clip: &Clip, tint: FadeTint, k: u64) -> f
     plan.layers
         .iter()
         .find(|l| l.clip_id == clip.id)
-        .map_or(0.0, |l| l.fx.strength(tint, plan.frame, plan.canvas.fps))
+        .map_or(0.0, |l| plan.strength(l, tint))
 }
 
 /// A clip is drawn on exactly the output frames whose FFmpeg time is inside its
@@ -369,12 +369,33 @@ fn a_fade_follows_ffmpegs_frame_counting_at_every_rate() {
 }
 
 /// The frame rate the export grid runs on is the rational FFmpeg makes of the text the
-/// graph carries: `Rational::from_fps` is a port of `av_d2q`, and here it meets the real
-/// one (`showinfo` states the rate its input is configured with).
+/// graph carries — by two parses with different limits. The `color=r=` canvas (and so the
+/// overlay's clock) is `Rational::from_fps`, each clip's `fps=` filter
+/// `Rational::from_fps_filter`; both are ports of `av_d2q` and here meet the real one
+/// (`showinfo` states the rate its input is configured with), on standard rates, on awkward
+/// ones, and on the ones where the two parts part.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
 fn a_frame_rate_parses_to_the_rational_the_graph_runs_on() {
     use crate::clip_timing::Rational;
+    let configured = |source: &str, vf: &str| {
+        let run = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "info", "-f", "lavfi", "-i"])
+            .arg(source)
+            .args(["-vf", vf, "-frames:v", "1", "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&run.stderr).into_owned();
+        let rate = log
+            .split("frame_rate: ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|r| r.split_once('/'))
+            .and_then(|(n, d)| Rational::new(n.parse().ok()?, d.parse().ok()?));
+        (rate, log)
+    };
+    let mut parted = 0;
     for fps in [
         24.0,
         25.0,
@@ -391,23 +412,18 @@ fn a_frame_rate_parses_to_the_rational_the_graph_runs_on() {
         0.1,
         144.0,
         1000.0 / 3.0,
+        29.970029,
+        1.23456789012345,
+        59.99999,
+        1234.56789,
     ] {
-        let run = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-loglevel", "info", "-f", "lavfi", "-i"])
-            .arg(format!("color=c=black:s=16x16:r={fps}:d=1"))
-            .args(["-vf", "showinfo=checksum=0", "-frames:v", "1", "-f", "null", "-"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        let log = String::from_utf8_lossy(&run.stderr);
-        let rate = log
-            .split("frame_rate: ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .and_then(|r| r.split_once('/'))
-            .and_then(|(n, d)| Rational::new(n.parse().ok()?, d.parse().ok()?));
-        assert_eq!(Rational::from_fps(fps), rate, "{fps}: {log}");
+        let (canvas, log) = configured(&format!("color=c=black:s=16x16:r={fps}:d=1"), "showinfo=checksum=0");
+        assert_eq!(Rational::from_fps(fps), canvas, "color=r={fps}: {log}");
+        let (filter, log) = configured("color=c=black:s=16x16:r=30:d=1", &format!("fps={fps},showinfo=checksum=0"));
+        assert_eq!(Rational::from_fps_filter(fps), filter, "fps={fps}: {log}");
+        parted += usize::from(canvas != filter);
     }
+    assert!(parted >= 3, "the two parses should part on the awkward rates ({parted})");
 }
 
 /// A keyframed zoom is `scale eval=frame`, which sits **before** the chain's `fps`, and

@@ -56,7 +56,19 @@ impl EffectKinds {
 /// draws exactly. [`GpuCaps::A0`] (also the default) is what shipped first: layers,
 /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and nothing
 /// below.
+///
+/// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity` and
+/// `keyed_zoom` are about the export graph and apply to [`PlanMode::Motion`] plans only:
+/// the FFmpeg still draws no fades and a still plan has no tail layers, so a *still* plan
+/// inside a fade, a travel or a tail is refused whatever these say. `mask`, `text`,
+/// `reframe`, `hdr` and `effects` hold for both, since both graphs draw them.
+///
+/// `#[non_exhaustive]`: another crate starts from [`GpuCaps::A0`] and sets the fields it
+/// draws (`let mut caps = GpuCaps::A0; caps.mask = true;`).
+///
+/// [`PlanMode::Motion`]: crate::render_plan::PlanMode::Motion
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct GpuCaps {
     /// Plans of an export frame ([`PlanMode::Motion`](crate::render_plan::PlanMode)):
     /// the frame pick that follows the `fps` filter and the per-frame geometry of a
@@ -133,6 +145,8 @@ pub enum Unsupported {
     Travel(LayerRef),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
+    /// A still plan's clip whose tail window is open: the export draws it, the plan has no layer.
+    StillTail(LayerRef),
     KeyedOpacity(LayerRef),
     /// A keyframed zoom, which the export reads at the source frame's time and may hold still.
     KeyedZoom(LayerRef),
@@ -187,6 +201,11 @@ impl fmt::Display for Unsupported {
             Self::Fade(l, FadeEdge::Out, false) => write!(f, "{l}: inside its fade-out"),
             Self::Travel(l) => write!(f, "{l}: moving through a slide or push transition"),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
+            Self::StillTail(l) => write!(
+                f,
+                "{}: playing on past its end under a transition, which a still plan does not draw",
+                l.name
+            ),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
             Self::KeyedZoom(l) => write!(
                 f,

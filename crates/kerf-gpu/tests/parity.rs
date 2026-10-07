@@ -146,8 +146,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kerf_core::{
-    export_still, Asset, Clip, Color, CompositeColorPolicy, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, Project,
-    RenderPlan, StreamKind, Subsampling, Timeline, Track, Transform,
+    export_still, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, ExportOptions, Fit, ImageFormat, Keyframe,
+    Project, RateControl, RenderPlan, StreamKind, Subsampling, Timeline, Track, Transform, Transition, TransitionKind,
 };
 use kerf_gpu::geometry::LayerGeometry;
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
@@ -776,7 +776,11 @@ fn report() -> &'static Mutex<BTreeMap<String, String>> {
 /// `limits`. Returns the failures (empty when every time passes) after printing
 /// a line per time.
 fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
-    let opts = ExportOptions::default();
+    check_with(case, tl, assets, times, limits, &ExportOptions::default());
+}
+
+/// [`check`] for a render with options (the frame rate the plan counts frames in, say).
+fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits, opts: &ExportOptions) {
     let out_dir = target_dir().join("parity");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -787,7 +791,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
         .collect();
     let mut failures = Vec::new();
     for &t in times {
-        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+        let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let why = plan.unsupported_reasons_at(size);
         assert!(
@@ -799,7 +803,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
         let (w, h) = (size.0 as usize, size.1 as usize);
 
         let ref_png = scratch.join(format!("{slug}-{t}.png"));
-        export_still(tl, assets, &opts, t, &ref_png, ImageFormat::Png, 0).expect("FFmpeg still");
+        export_still(tl, assets, opts, t, &ref_png, ImageFormat::Png, 0).expect("FFmpeg still");
         let reference = ffmpeg(&[
             "-i",
             ref_png.to_str().unwrap(),
@@ -1795,6 +1799,157 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         &[m.gradient.clone(), m.testsrc.clone()],
         0.5,
         Refusal::Plan("odd size"),
+    );
+}
+
+/// One transition cut at 30 fps — an outgoing clip for a second, then `testsrc2` from 1.0 s —
+/// through `kind` over `secs`, the incoming clip `scale` of the frame (1 covers it, 0.5 leaves a
+/// border).
+///
+/// What FFmpeg's still draws is the frame each *clip's own span* contributes: no fades, and no
+/// clip past its end. What the **export** draws is what plays, and a transition differs from the
+/// still in more places than where it is visibly mid-way: the outgoing clip's `enable` window
+/// runs on after the ramp (or the travel) is over, and it is drawn around an incoming clip that
+/// does not cover it. So the contract tested here is the one that matters — for every frame
+/// listed, either the plan refuses it, or the still it draws like is the export's frame (and the
+/// GPU matches that still strictly) — plus the expectations written out per frame: before the
+/// transition and after it frames are drawn, inside it (and on the frame after the ramp where
+/// only the tail is left) they are refused, and the second half of a dip, which has neither a
+/// tail nor a fade left, is drawn. Both FFmpegs.
+///
+/// A dissolve of 0.61 s is chosen so that a frame with *only* the tail left exists at 30 fps:
+/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. (A
+/// slide or a push cannot part from the still there: its travel ends when its window does, and
+/// an equal-rate outgoing clip has no frame at the very end; those frames are refused anyway.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
+    let m = media();
+    // The export runs at 30 fps whatever the outgoing clip's own rate is (it would take the first clip's).
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    std::fs::create_dir_all(&scratch).unwrap();
+    // Per kind: the length, the frames to look at as `(frame, refused)`, and the frame on which
+    // only the outgoing clip's tail is left.
+    type Frames = &'static [(u64, bool)];
+    let motion: Frames = &[
+        (15, false),
+        (29, false),
+        (30, true),
+        (37, true),
+        (44, true),
+        (45, true),
+        (46, false),
+        (55, false),
+    ];
+    let cases: [(&str, TransitionKind, f64, Frames, Option<u64>); 4] = [
+        (
+            "dissolve",
+            TransitionKind::Crossfade,
+            0.61,
+            &[
+                (15, false),
+                (29, false),
+                (30, true),
+                (38, true),
+                (47, true),
+                (48, true),
+                (49, false),
+                (55, false),
+            ],
+            Some(48),
+        ),
+        ("slide", TransitionKind::SlideLeft, 0.5, motion, None),
+        ("push", TransitionKind::PushUp, 0.5, motion, None),
+        (
+            "dip",
+            TransitionKind::DipToBlack,
+            0.8,
+            &[
+                (15, false),
+                (18, false),
+                (19, true),
+                (29, true),
+                (30, true),
+                (41, true),
+                (42, false),
+                (43, false),
+                (55, false),
+            ],
+            None,
+        ),
+    ];
+    let mut parted = 0;
+    for (name, kind, secs, frames, tail_only) in cases {
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        for (cover, scale) in [("covering", 1.0), ("partial", 0.5)] {
+            let mut incoming = clip(&m.testsrc, 0.0, 1.0, 1.0);
+            incoming.transform.scale = scale;
+            incoming.transition_in = Some(Transition { kind, duration: secs });
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), incoming]], None);
+            // What plays: the whole cut exported losslessly, every frame read back.
+            let file = scratch.join(format!("transition-{name}-{cover}.mkv"));
+            let lossless = ExportOptions {
+                container: Container::Mkv,
+                video_codec: Some("libx264".into()),
+                rate_control: RateControl::Lossless,
+                ..opts.clone()
+            };
+            kerf_core::render_with(&tl, &assets, &file, &lossless).expect("export");
+            let played = ffmpeg(&["-i", file.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+            let _ = std::fs::remove_file(&file);
+            for &(k, refused) in frames {
+                let case = format!("transition/{name}-{cover}");
+                let t = k as f64 / 30.0;
+                let plan = RenderPlan::at(&tl, &assets, &opts, t, policy()).expect("plan");
+                let size = plan.size(u32::MAX);
+                let (w, h) = (size.0 as usize, size.1 as usize);
+                assert_eq!(plan.frame, k as i64);
+                let why = plan.unsupported_reasons_at(size);
+                assert_eq!(!why.is_empty(), refused, "{case}: frame {k}: {why:?}");
+                // The still the plan stands for, against the frame that plays.
+                let png = scratch.join(format!("transition-{name}-{cover}-{k}.png"));
+                export_still(&tl, &assets, &opts, t, &png, ImageFormat::Png, 0).expect("FFmpeg still");
+                let still = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+                let _ = std::fs::remove_file(&png);
+                let export = &played[k as usize * w * h * 3..(k as usize + 1) * w * h * 3];
+                let (apart, _) = compare(export, &still, w, h, EDGE_STEP);
+                eprintln!(
+                    "{case:<28} frame {k:<3} {} still vs export {:>5.1} dB",
+                    if refused { "refused" } else { "drawn  " },
+                    apart.psnr_all
+                );
+                if refused {
+                    // Only the tail is left on this frame; a border around the incoming clip shows it.
+                    if scale < 1.0 && tail_only == Some(k) {
+                        assert!(
+                            apart.psnr_all < 25.0,
+                            "{case}: frame {k} is refused for a tail the export draws, yet the still agrees ({:.1} dB)",
+                            apart.psnr_all
+                        );
+                        assert!(
+                            why.iter().any(|r| r.contains("past its end")) && !why.iter().any(|r| r.contains("inside")),
+                            "{case}: frame {k}: {why:?}"
+                        );
+                        parted += 1;
+                    }
+                } else {
+                    assert!(
+                        apart.psnr_all >= 35.0,
+                        "{case}: frame {k} is drawn like the still, but the export draws it differently ({:.1} dB)",
+                        apart.psnr_all
+                    );
+                    check_with(&case, &tl, &assets, &[t], STRICT, &opts);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        parted, 1,
+        "the dissolve parts from the export on the frame only its tail is left on"
     );
 }
 

@@ -212,8 +212,13 @@ pub struct PlanCanvas {
     /// The composite colour policy the matrix was decided under — kept so
     /// [`RenderPlan::reasons`] can say why a stack is refused without re-planning.
     pub policy: CompositeColorPolicy,
-    /// The output rate, as the rational FFmpeg parses the graph's `fps=` text to.
+    /// The output rate as the `color=r=` canvas parses the graph's text to: the clock the
+    /// overlay (and so every `t` the graph evaluates) runs on.
     pub fps: Rational,
+    /// The rate as the `fps=` filter of each clip parses it — the grid its frames are placed
+    /// on, which the source-frame pick works from. The same as [`PlanCanvas::fps`] for every
+    /// rate with small terms (see [`Rational`]).
+    pub pick_fps: Rational,
     /// The delivery's terminal pixel format. A [`PlanMode::Motion`] frame is only
     /// drawn for 8-bit 4:2:0 (`yuv420p`); a preview still is always that.
     pub pix_fmt: String,
@@ -496,8 +501,15 @@ pub struct RenderPlan {
     pub layers: Vec<PlanLayer>,
     /// The text overlays live at this frame, in the order they are drawn (on top).
     pub overlays: Vec<PlanText>,
-    /// Clips that are on screen but whose source has no picture to draw.
+    /// Clips that are on screen but whose source has no picture to draw. `index` is the
+    /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
+    /// **Still plans only**: the clips whose tail window is open at this frame. The export keeps
+    /// drawing a clip past its end under the one that replaces it (a dissolve, a slide, a
+    /// push), around an incoming clip that does not cover it; a still plan has no layer for
+    /// that, and is refused ([`Unsupported::StillTail`]) whatever the caps. A Motion plan holds
+    /// them as layers (`fx.tail`). `index` as for `pictureless`.
+    pub tails: Vec<LayerRef>,
 }
 
 /// The matrix the composite is converted with under `policy`, and the reasons a
@@ -638,6 +650,7 @@ impl RenderPlan {
             }
         }
         out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));
+        out.extend(self.tails.iter().cloned().map(Unsupported::StillTail));
         for (n, layer) in self.layers.iter().enumerate() {
             let at = || LayerRef {
                 index: n,
@@ -696,14 +709,16 @@ impl RenderPlan {
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
             }
-            // The still ignores fades and transitions (it shows the frame each
-            // visible clip contributes); the export and the streamed playback do
-            // not. A frame inside one is a frame the compositor cannot draw like
-            // either until it draws fades, so it is FFmpeg's.
-            if let Some((edge, dissolve)) = layer.fx.in_progress(frame, fps).filter(|_| !caps.fades) {
+            // The still ignores fades and transitions (it shows the frame each visible clip
+            // contributes), the export and the streamed playback do not. A **still plan** has
+            // no tail layers and the FFmpeg still no fades, so it is never drawn inside one,
+            // whatever the caps say: those abilities are for [`PlanMode::Motion`] plans, and a
+            // frame inside a fade or a transition is FFmpeg's.
+            let motion = self.mode == PlanMode::Motion;
+            if let Some((edge, dissolve)) = layer.fx.in_progress(frame, fps).filter(|_| !(motion && caps.fades)) {
                 out.push(Unsupported::Fade(at(), edge, dissolve));
             }
-            if layer.fx.travels() && !caps.transitions {
+            if layer.fx.travels() && !(motion && caps.transitions) {
                 out.push(Unsupported::Travel(at()));
             }
             if layer.fx.tail && !caps.transitions {
@@ -817,6 +832,12 @@ impl RenderPlan {
             keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).map(|a| a.rotates),
             offset: layer.fx.motion,
         }
+    }
+
+    /// What the `tint` fades of `layer` leave of its picture at this plan's frame
+    /// ([`LayerFx::strength`]): `1` untouched, `0` gone.
+    pub fn strength(&self, layer: &PlanLayer, tint: FadeTint) -> f64 {
+        layer.fx.strength(tint, self.frame, self.canvas.fps)
     }
 
     /// The size a render of this plan at `max_width` comes out — what the FFmpeg
