@@ -34,6 +34,7 @@
 //! Everything is 8-bit between stages, in encoded gamma — FFmpeg's own working
 //! space — so there is no linear-light round trip to disagree about.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,7 @@ use kerf_core::{GpuCaps, RenderPlan, YuvMatrix};
 use wgpu::util::DeviceExt;
 
 use crate::eq;
+use crate::frame_source::{FrameSource, Hint};
 use crate::gpu::{Gpu, GpuError};
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 use crate::source::{chroma_size, decode_layers, YuvFrame};
@@ -687,6 +689,17 @@ impl Compositor {
         self.composite_as(plan, frames, size, Output::Rgb)
     }
 
+    /// [`Compositor::composite`] over shared frames (a [`FrameSource`]'s are `Arc`s, which
+    /// may be in its cache and in another composite at once).
+    pub fn composite_shared(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        size: (u32, u32),
+    ) -> Result<RgbaFrame, GpuError> {
+        self.composite_as(plan, frames, size, Output::Rgb)
+    }
+
     /// [`Compositor::composite`] stopping before the final YUV -> RGB conversion:
     /// the canvas as the 8-bit Y, U and V planes the layers were blended in (the
     /// chroma planes at half size). It exists so the scaler and the blend can be
@@ -713,10 +726,10 @@ impl Compositor {
         })
     }
 
-    fn composite_as(
+    fn composite_as<F: Borrow<YuvFrame>>(
         &self,
         plan: &RenderPlan,
-        frames: &[Option<YuvFrame>],
+        frames: &[Option<F>],
         size: (u32, u32),
         output: Output,
     ) -> Result<RgbaFrame, GpuError> {
@@ -745,7 +758,9 @@ impl Compositor {
         // Everything that can be refused is refused before the GPU is touched.
         let mut drawn = Vec::with_capacity(frames.len());
         for (n, (layer, frame)) in plan.layers.iter().zip(frames).enumerate() {
-            let Some(frame) = frame else { continue };
+            let Some(frame) = frame.as_ref().map(Borrow::borrow) else {
+                continue;
+            };
             if !frame.is_consistent() {
                 return Err(GpuError::Decode(format!(
                     "layer {n}: the planes do not add up to a {}x{} 4:2:0 picture",
@@ -1120,6 +1135,38 @@ impl Compositor {
         let decode = t0.elapsed();
         let t1 = Instant::now();
         let frame = self.composite(plan, &frames, size)?;
+        Ok((
+            frame,
+            RenderTimings {
+                decode,
+                composite: t1.elapsed(),
+            },
+        ))
+    }
+}
+
+impl Compositor {
+    /// [`Compositor::render_plan`] with the layers' frames from a [`FrameSource`] (long-lived
+    /// runs and a cache) instead of one `ffmpeg` per layer. The frames are the same, byte for
+    /// byte: a `FrameSource` answers a still's pick with the frame its `-ss` decodes. An error is
+    /// for that frame only — `Busy`, a timeout, `Unsupported` — and the caller renders it
+    /// through FFmpeg.
+    pub fn render_plan_with(
+        &self,
+        plan: &RenderPlan,
+        size: (u32, u32),
+        source: &FrameSource,
+        hint: Hint,
+    ) -> Result<(RgbaFrame, RenderTimings), GpuError> {
+        let reasons = plan.reasons(&self.caps(), size);
+        if !reasons.is_empty() {
+            return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        let t0 = Instant::now();
+        let frames = source.frames(&plan.layers, hint)?;
+        let decode = t0.elapsed();
+        let t1 = Instant::now();
+        let frame = self.composite_shared(plan, &frames, size)?;
         Ok((
             frame,
             RenderTimings {

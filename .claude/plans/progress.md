@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks` (A1a-0..3 merged locally; A1b next) … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107 (merged); A1b-1: OrellBuehler/kerf#111 | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (cursor) next. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -146,6 +146,16 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   mp4/mkv/ts/avi/nut time bases, VFR, speeds and reverse on both FFmpegs.
   Proxies carry a `StreamInfo` sidecar so the interactive path never
   ffprobes; `Handover` pins the canvas for A4's stream restarts.
+- **2026-10-07 — A1b-2: parity with the still beats the true frame.** On a long-GOP
+  transport stream `-ss t` lands on the next keyframe and the decode does not recover
+  (finding 5), in the one-shot decode and the FFmpeg still alike. A run restarted
+  earlier would return the frame really at `t` — right by the timestamps, wrong by the
+  contract (the GPU frame must be the frame FFmpeg would draw). So a file whose first
+  run lands more than two frame intervals late is marked `late_seek` and decoded
+  one-shot from then on; speed is lost only on such files. Also: parity asserts equal
+  decoded planes, not equal composites — a one-off RGBA mismatch on 9.0.2
+  (`pip/odd-361x203-in-722x640 @ 0.5`) never recurred in nine suites and a
+  six-thread stress test, and rendering one plan twice never differed.
 
 ## Needs a real machine
 

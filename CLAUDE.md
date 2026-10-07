@@ -1416,7 +1416,8 @@ refused if anything is transparent. A child is killed after 30 s or when it writ
 and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still draws
 nothing for that layer, and so does the compositor. The layers of a frame decode in
 parallel, each given `budget / layers` threads even at a full CPU budget
-(`limit_ffmpeg_args(args, share)`). No cache, no proxy: that is A1.
+(`limit_ffmpeg_args(args, share)`). That is the one-shot path; `FrameSource` (below) is the
+long-lived one.
 
 **A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
 of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:
@@ -1482,6 +1483,55 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   tests need no clock.
 - kerf-core: `Pick::progress` / `FpsPick::seek` (above), `source_identity`,
   `disable_decode_hwaccel`.
+
+**`FrameSource`** (A1b-2, `frame_source.rs`) puts those pieces to work: frames for a plan's
+layers from **long-lived `ffmpeg` runs** and the frame cache instead of a spawn per frame.
+`FrameSource::new(FrameSourceConfig)` → `Arc`, one per process, every call blocking (blocking
+pool, never under the project lock); `frames(&layers, Hint)` decodes the layers side by side and
+**layers asking for the same frame of one file share one decode**; `Compositor::render_plan_with`
+is `render_plan` over it (`composite_shared` takes the `Arc` frames). A run is
+`run_args`: `-hide_banner -nostats -nostdin -loglevel info [-hwaccel h] -copyts -start_at_zero -ss
+T -i path -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv -fps_mode passthrough
+-f yuv4mpegpipe -pix_fmt yuv420p pipe:1`, spawned under `plain_log_env` with the CPU cap divided
+among the runs alive; a reader thread pairs each y4m frame with its `showinfo` line **by number**
+and files it under `(identity captured at spawn, pts)`. Only `Pick::AtOrAfter` is served (a still's
+pick, keyed by **`kerf_core::seek_ticks(t, tb)`**, the tick the still's `-ss {:.6}` becomes);
+`Before` / `Fps` are a cursor's (A1b-3) and come back `Unsupported`; a still image is one one-shot
+decode, cached. What it guarantees: **a frame from a run is the one-shot decode's, byte for byte**
+— the parity harness decodes every compared case both ways and asserts equal planes (FFmpeg 6.1.1
+and 9.0.2), and `tests/frame_source.rs` does it for 80 times each on a 29.97 mp4, a VFR matroska
+and a transport stream with a container start, plus six threads at once. The rules it holds to:
+- A run's first frame covers from its seek tick (at most one frame interval back); a run **from
+  0** covers everything before its first frame (a late-starting picture). A clean end calls
+  `mark_end` (a time past it is `Ok(None)`, no decode); a clean run with **no** frame is a seek
+  past the end (`mark_end(seek_tick - 1)`); a non-zero exit with no frame is a **failed start**,
+  never an end, and its error carries ffmpeg's stderr tail.
+- **A seek that lands late** (the first frame more than two intervals after a seek above 0: a
+  long-GOP transport stream seeks to the next keyframe and does not recover, finding 5) marks
+  the file `late_seek`, and its frames come from `decode_layer` from then on: what `-ss t`
+  returns there is not a function of the timestamps, and the FFmpeg still returns that late
+  keyframe too (measured on 6.1.1: `-ss 1.184` on a GOP-30 `.ts` gives the frame at 2.002 s
+  on both paths; the byte-for-byte test passes on 9.0.2 too). A run that reads past its target without the cache proving the frame is given up on
+  and the request routed again; after two starts it decodes one-shot (`SourceStats::fallbacks`).
+- **Nothing waits forever**: a reaper thread (it holds a `Weak`) kills a run that is wanted
+  and silent for `first_frame_timeout` (30 s) / `frame_timeout` (15 s) and one idle for
+  `idle_kill` (20 s), and drops a finished run's record after 5 s; a `Scrub` / `Forward`
+  request gives up after `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run
+  blocks once it is past what was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most
+  24), so the pipe fills and ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill
+  every child. One-shots are capped (`max_oneshots`, 2).
+- **The path can be off**: the first use runs **`self_test`** (an `mpeg4` clip at 30000/1001
+  made by ffmpeg's own encoder, decoded from frame 5 with the production flags, every pts
+  expected exactly, all inside 10 s), and if it fails (FFmpeg < 5.1 has no `-fps_mode` or
+  `showinfo=checksum`) the process decodes with `decode_layer`, as does
+  `KERF_FRAME_SOURCE=oneshot` and any asset that never recorded its pixel format.
+- Hardware decode is `kerf_core::decode_hwaccel()` (now public); a run that dies before its
+  first frame with it is retried once in software, and success calls `disable_decode_hwaccel`.
+- `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
+  holds a run that hangs and one that dies to a prompt `GpuError::Decode`.
+  `bench_frame_source_decode_vs_one_shot` (`KERF_BENCH=1`) times both paths: here, release, software
+  decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
+  one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
