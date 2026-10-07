@@ -50,15 +50,21 @@ export interface TitleMetrics {
 }
 
 export const TITLE_METRICS: Readonly<Record<HeightPreset, TitleMetrics>> = {
-	compact: { row: 18, pad: 3, font: 10 },
+	compact: { row: 21, pad: 3, font: 10 },
 	medium: { row: 22, pad: 4, font: 10 },
 	large: { row: 30, pad: 6, font: 12 }
 };
 
+/** The titles lane's header holds an "add a title" button this tall (px), and the
+ *  lane has a 1 px bottom border: no lane is shorter than the two together, or the
+ *  button is clipped. */
+export const TITLE_ADD_BTN_PX = 26;
+export const MIN_TITLE_LANE_PX = TITLE_ADD_BTN_PX + 1;
+
 /** Titles lane height for `rows` stacked rows of titles at a preset. */
 export const titleLaneHeight = (preset: HeightPreset, rows: number): number => {
 	const m = TITLE_METRICS[preset];
-	return Math.max(1, rows) * m.row + m.pad * 2;
+	return Math.max(MIN_TITLE_LANE_PX, Math.max(1, rows) * m.row + m.pad * 2);
 };
 
 export const isPreset = (v: unknown): v is HeightPreset => v === 'compact' || v === 'medium' || v === 'large';

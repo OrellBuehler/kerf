@@ -348,12 +348,54 @@ describe('rows', () => {
 		for (const r of rows) expect(r.y + r.h).toBeLessThanOrEqual(36);
 	});
 
-	test('many tracks get thinner rows and still fit, a few are capped at a comfortable height', () => {
+	test('a few tracks are capped at a comfortable height, with the usual gap', () => {
 		expect(rowLayout(1, 36)[0].h).toBe(12);
+		const two = rowLayout(2, 36);
+		expect(two[1].y - (two[0].y + two[0].h)).toBe(2);
 		const many = rowLayout(8, 36);
 		expect(many[0].h).toBeLessThan(12);
 		expect(many[7].y + many[7].h).toBeLessThanOrEqual(36);
-		for (const r of rowLayout(40, 36)) expect(r.h).toBeGreaterThanOrEqual(1);
+	});
+
+	test('past ten tracks the rows still fit: the gap gives first, then every row is a pixel', () => {
+		const strip = 36;
+		const pad = 4;
+		for (const n of [10, 11, 12, 14, 20, 28]) {
+			const rows = rowLayout(n, strip);
+			expect(rows).toHaveLength(n);
+			const last = rows[n - 1];
+			expect(last.y + last.h).toBeLessThanOrEqual(strip - pad + 1e-9);
+			for (const r of rows) expect(r.h).toBeGreaterThanOrEqual(1 - 1e-9); // 28 rows of 28 px: a hairline each
+			for (let i = 1; i < n; i++) expect(rows[i].y).toBeGreaterThanOrEqual(rows[i - 1].y + rows[i - 1].h - 1e-9); // none overlap
+		}
+		// the gap is what shrinks: 12 tracks have no room for the 2 px they were given
+		const twelve = rowLayout(12, strip);
+		expect(twelve[1].y - (twelve[0].y + twelve[0].h)).toBeLessThan(2);
+		expect(twelve[0].h).toBeGreaterThanOrEqual(1);
+	});
+
+	test('more tracks than pixels share the height fractionally rather than running off the strip', () => {
+		for (const n of [29, 40, 100, 500]) {
+			const rows = rowLayout(n, 36);
+			expect(rows).toHaveLength(n);
+			const last = rows[n - 1];
+			expect(last.y + last.h).toBeLessThanOrEqual(36 - 4 + 1e-9);
+			expect(rows[0].y).toBe(4);
+			for (const r of rows) expect(r.h).toBeGreaterThan(0);
+		}
+	});
+
+	test('fits whatever the strip height or padding', () => {
+		for (const height of [0, 10, 36, 80]) {
+			for (const n of [1, 3, 9, 15, 60]) {
+				for (const pad of [0, 4, 20]) {
+					const rows = rowLayout(n, height, { pad });
+					const bottom = rows.length ? rows[rows.length - 1].y + rows[rows.length - 1].h : 0;
+					// a strip with no room (padding past its height) places rows at the padding, empty
+					expect(bottom).toBeLessThanOrEqual(Math.max(height - pad, pad) + 1e-9);
+				}
+			}
+		}
 	});
 
 	test('no tracks, no rows', () => {

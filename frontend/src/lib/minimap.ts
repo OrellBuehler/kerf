@@ -216,16 +216,31 @@ export function trackBlocks(clips: readonly MapClip[], g: MapGeo): Block[] {
 	return out;
 }
 
-/** Where each track's row sits on a strip `heightPx` tall: top to bottom in track
- *  order, each as tall as the strip leaves it (at most `maxRow`). */
+/**
+ * Where each track's row sits on a strip `heightPx` tall: top to bottom in track
+ * order, each as tall as the strip leaves it (at most `maxRow`). **Always fits**:
+ * the gap between rows is what gives first (down to none), and past that — more
+ * tracks than pixels — rows share the height fractionally (a hairline each, drawn
+ * anti-aliased) rather than running off the bottom of the strip.
+ */
 export function rowLayout(
 	trackCount: number,
 	heightPx: number,
 	o: { pad?: number; gap?: number; maxRow?: number } = {}
 ): { y: number; h: number }[] {
-	const { pad = 4, gap = 2, maxRow = 12 } = o;
-	if (trackCount <= 0) return [];
-	const room = Math.max(0, heightPx - pad * 2 - gap * (trackCount - 1));
-	const h = clamp(room / trackCount, 1, maxRow);
-	return Array.from({ length: trackCount }, (_, i) => ({ y: pad + i * (h + gap), h }));
+	const { pad = 4, gap: wantGap = 2, maxRow = 12 } = o;
+	const n = trackCount;
+	if (n <= 0) return [];
+	const room = Math.max(0, heightPx - pad * 2);
+	let gap = 0;
+	let h: number;
+	if (n > room) {
+		// not even a pixel a row: share what there is
+		h = room / n;
+	} else {
+		// a pixel a row at least; the gap takes whatever that leaves, up to what was asked for
+		gap = n > 1 ? Math.min(wantGap, (room - n) / (n - 1)) : 0;
+		h = Math.min(maxRow, (room - gap * (n - 1)) / n);
+	}
+	return Array.from({ length: n }, (_, i) => ({ y: pad + i * (h + gap), h }));
 }

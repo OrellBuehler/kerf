@@ -59,6 +59,9 @@
 	const scale = $derived(rect ? canvasScale(rect.x1 - rect.x0, ratio) : ratio);
 	const columns = $derived(rect ? Math.max(1, Math.round((rect.x1 - rect.x0) * scale)) : 0);
 
+	/** The cache calls this when the strip arrives, fails, or is dropped from under us. */
+	const notify = () => arrivals++;
+
 	function announce(ready: boolean) {
 		if (ready === announced) return;
 		announced = ready;
@@ -99,9 +102,12 @@
 			}
 			// Still on its way (or evicted since): ask again — cheap, and it replaces
 			// whatever this clip asked for before.
-			filmstrips.want(owner, asset, () => arrivals++);
+			filmstrips.want(owner, asset, notify);
 			return;
 		}
+		// Drawing from it: the cache must not evict it from under a visible clip (and
+		// tells us if it is dropped anyway, so this canvas redraws instead of going stale).
+		filmstrips.hold(owner, asset, notify);
 		const ctx = el.getContext('2d');
 		if (!ctx) return;
 		// Assigning a canvas's size reallocates its backing store even when it is the

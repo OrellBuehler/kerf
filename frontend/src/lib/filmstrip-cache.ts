@@ -13,9 +13,16 @@
  *    again on every scroll — it is tried again after a cooldown that doubles with
  *    every failure in a row (`Backoff`), and reported once;
  *  - memory is bounded *in bytes* (a sheet is a few MB decoded, and an asset has
- *    up to a few dozen): the least recently used asset goes first, the one just
- *    used never does, so a working set larger than the budget degrades to
- *    reloading rather than to nothing.
+ *    up to a few dozen), by who still needs what: an asset **no clip is drawing
+ *    from** goes first, least recently used first; an asset a visible clip still
+ *    holds is never evicted — a canvas that is on screen would otherwise have to
+ *    reload what it just drew from, and two clips alternating over a budget they
+ *    cannot share would reload each other's strips forever. So when everything
+ *    on screen is more than the budget, the cache **overshoots** it for as long
+ *    as those clips are visible, and gives the excess back (`release` trims) the
+ *    moment they scroll away. The asset just loaded is exempt from that one pass.
+ *    Dropping an asset a clip still wants (`prune`, `clear`) tells it, so its
+ *    canvas redraws from a reload instead of keeping a stale bitmap.
  *
  * The strip's geometry is kept without its `data:` URLs (the JPEGs are decoded
  * and the strings are dead weight). Fetching and decoding are injected, so this
@@ -190,19 +197,39 @@ export class FilmstripCache {
 		this.#pump();
 	}
 
-	/** Forget what `owner` wanted (its clip went away, scrolled out, or got too short). */
+	/**
+	 * Say that `owner` (one clip's canvas) is drawing from `assetId`'s strip — it is
+	 * on screen and holds it — without asking for anything: no load, no
+	 * notification when the strip is there. What this buys is protection from
+	 * eviction (an asset with a live owner is never the one to go) and a tell if
+	 * the strip is dropped from under it (`prune`, `clear`). `want` registers the
+	 * same interest for a strip that is not held yet.
+	 */
+	hold(owner: string, assetId: string, notify: () => void): void {
+		const previous = this.#owners.get(owner);
+		this.#owners.set(owner, { assetId, notify });
+		if (previous && previous.assetId !== assetId) {
+			this.#prune(previous.assetId);
+			this.#trim();
+		}
+	}
+
+	/** Forget what `owner` wanted (its clip went away, scrolled out, or got too short).
+	 *  An asset nobody draws from any more is what the memory budget evicts, so any
+	 *  overshoot is given back here. */
 	release(owner: string): void {
 		const o = this.#owners.get(owner);
 		if (!o) return;
 		this.#owners.delete(owner);
 		this.#prune(o.assetId);
+		this.#trim();
 	}
 
 	/** Keep only the assets in `keep`: one removed from the project frees its
 	 *  sheets (and its failure record) rather than waiting for the LRU. */
 	prune(keep: Iterable<string>): void {
 		const alive = new Set(keep);
-		for (const id of [...this.#entries.keys()]) if (!alive.has(id)) this.#evict(id);
+		for (const id of [...this.#entries.keys()]) if (!alive.has(id)) this.#evict(id, true);
 		for (const id of [...this.#queue.keys()]) if (!alive.has(id)) this.#queue.delete(id);
 		this.#backoff.retain(alive);
 		for (const id of [...this.#reported]) if (!alive.has(id)) this.#reported.delete(id);
@@ -211,11 +238,16 @@ export class FilmstripCache {
 	/** Drop everything: the strips, the queue, the failures. Loads in flight finish unseen. */
 	clear(): void {
 		this.#epoch++;
-		for (const id of [...this.#entries.keys()]) this.#evict(id);
+		const owners = [...this.#owners.values()];
+		for (const id of [...this.#entries.keys()]) this.#evict(id, false);
 		this.#queue.clear();
 		this.#backoff.clear();
 		this.#reported.clear();
 		this.#owners.clear();
+		// What they drew from is gone: they redraw (and ask again) rather than keep a stale bitmap.
+		queueMicrotask(() => {
+			for (const o of owners) o.notify();
+		});
 	}
 
 	/** A queued asset no owner wants any more never loads. */
@@ -251,7 +283,10 @@ export class FilmstripCache {
 				(loaded) => {
 					this.#finish(assetId, epoch);
 					if (epoch !== this.#epoch) {
+						// A load from before a `clear` lands nowhere — but it still held a slot,
+						// and what queued behind it has been waiting for that slot.
 						for (const c of loaded.close) c();
+						this.#pump();
 						return;
 					}
 					this.#backoff.succeed(assetId);
@@ -298,23 +333,38 @@ export class FilmstripCache {
 
 	#put(assetId: string, entry: Entry): void {
 		const old = this.#entries.get(assetId);
-		if (old) this.#evict(assetId);
+		if (old) this.#evict(assetId, false);
 		this.#entries.set(assetId, entry);
 		this.#bytes += entry.bytes;
-		// Over budget: the least recently used goes first — never the one just put.
-		while (this.#bytes > this.#maxBytes && this.#entries.size > 1) {
-			const oldest = this.#entries.keys().next().value;
-			if (oldest === undefined || oldest === assetId) break;
-			this.#evict(oldest);
+		this.#trim(assetId);
+	}
+
+	/** Bring the memory back under budget, if it can be: assets no clip is drawing
+	 *  from, least recently used first, never `except` (the one just loaded) and
+	 *  never an asset with a live owner. What is left over budget is the working set
+	 *  on screen, which stays until it is not on screen. */
+	#trim(except?: string): void {
+		if (this.#bytes <= this.#maxBytes) return;
+		const live = new Set<string>();
+		for (const o of this.#owners.values()) live.add(o.assetId);
+		for (const id of [...this.#entries.keys()]) {
+			if (this.#bytes <= this.#maxBytes) return;
+			if (id === except || live.has(id)) continue;
+			this.#evict(id, false);
 		}
 	}
 
-	#evict(assetId: string): void {
+	/** Free an asset's sheets. `tell` says whether the clips still drawing from it
+	 *  hear about it (a removal they will see for themselves does not need to). */
+	#evict(assetId: string, tell: boolean): void {
 		const e = this.#entries.get(assetId);
 		if (!e) return;
 		this.#entries.delete(assetId);
 		this.#bytes -= e.bytes;
 		for (const c of e.close) c();
+		// Off the caller's stack: `prune` runs from an effect, and the owners' redraw
+		// is another component's.
+		if (tell) queueMicrotask(() => this.#tell(assetId));
 	}
 
 	/** Tell the owners that wanted `assetId`. */

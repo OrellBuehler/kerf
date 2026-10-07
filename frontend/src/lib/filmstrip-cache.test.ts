@@ -258,10 +258,21 @@ describe('FilmstripCache', () => {
 	});
 
 	describe('memory', () => {
-		const load = async (cache: FilmstripCache, m: ReturnType<typeof manual>, asset: string, sheets = 2) => {
-			cache.want(`o-${asset}`, asset, () => {});
-			m.calls.find((c) => c.asset === asset)!.ok(strip(sheets));
+		/** Load `asset` for an owner `o-<asset>`. By default the clip then scrolls away
+		 *  (releases it) — what makes an asset evictable; `keep` leaves it on screen,
+		 *  holding the strip it drew. */
+		const load = async (
+			cache: FilmstripCache,
+			m: ReturnType<typeof manual>,
+			asset: string,
+			o: { sheets?: number; keep?: boolean; notify?: () => void } = {}
+		) => {
+			const owner = `o-${asset}`;
+			cache.want(owner, asset, o.notify ?? (() => {}));
+			m.calls.find((c) => c.asset === asset)!.ok(strip(o.sheets ?? 2));
 			await tick();
+			if (o.keep) cache.hold(owner, asset, o.notify ?? (() => {}));
+			else cache.release(owner);
 		};
 
 		test('is bounded in bytes: the least recently used asset goes first and its images are closed', async () => {
@@ -291,15 +302,80 @@ describe('FilmstripCache', () => {
 			expect(cache.get('c')).toBeDefined();
 		});
 
-		test('the asset just loaded is never evicted, even when it alone is over the budget', async () => {
+		test('an asset a visible clip holds is kept even when it alone is over the budget, and goes when the clip lets go', async () => {
 			const m = manual();
 			const cache = new FilmstripCache(m.fetcher, decoder().dec, { maxBytes: 500, concurrency: 1 });
-			await load(cache, m, 'a'); // 2000 > 500
+			await load(cache, m, 'a', { keep: true }); // 2000 > 500
 			expect(cache.get('a')).toBeDefined();
-			await load(cache, m, 'b');
-			expect(cache.get('a')).toBeUndefined(); // now `b` is the one in use
-			expect(cache.get('b')).toBeDefined();
-			expect(cache.size).toBe(1);
+			expect(cache.bytes).toBe(2000);
+			cache.release('o-a'); // scrolled away: nothing draws from it, and the budget is 500
+			expect(cache.get('a')).toBeUndefined();
+			expect(cache.bytes).toBe(0);
+		});
+
+		test('assets nobody draws from go before one a visible clip holds, however old the held one is', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec, { maxBytes: 4500, concurrency: 1 });
+			await load(cache, m, 'a', { keep: true }); // oldest, on screen
+			await load(cache, m, 'b'); // 4000, off screen
+			await load(cache, m, 'c'); // 6000 > 4500: `b` goes, not the older `a`
+			expect(cache.get('a')).toBeDefined();
+			expect(cache.get('b')).toBeUndefined();
+			expect(cache.get('c')).toBeDefined();
+			expect(cache.bytes).toBe(4000);
+		});
+
+		test('a working set bigger than the budget is held whole — no thrash — and given back as it scrolls away', async () => {
+			const m = manual();
+			const d = decoder();
+			const cache = new FilmstripCache(m.fetcher, d.dec, { maxBytes: 3000, concurrency: 3 });
+			for (const a of ['a', 'b', 'c']) await load(cache, m, a, { keep: true }); // 6000 on screen, budget 3000
+			expect(cache.bytes).toBe(6000);
+			expect(d.closed).toHaveLength(0);
+			// scroll ticks: every clip asks again and again — nothing is re-fetched or re-decoded
+			for (let i = 0; i < 5; i++) for (const a of ['a', 'b', 'c']) cache.hold(`o-${a}`, a, () => {});
+			expect(cache.get('a') && cache.get('b') && cache.get('c')).toBeTruthy();
+			expect(m.calls).toHaveLength(3);
+			expect(d.decoded).toHaveLength(6);
+			// `a` scrolls off: it is the excess, and goes — the other two are still on screen
+			cache.release('o-a');
+			expect(cache.get('a')).toBeUndefined();
+			expect(cache.bytes).toBe(4000);
+			// `b` too: now it fits
+			cache.release('o-b');
+			expect(cache.get('b')).toBeUndefined();
+			expect(cache.get('c')).toBeDefined();
+			expect(cache.bytes).toBe(2000);
+			// and `c` leaves the budget alone from here on
+			cache.release('o-c');
+			expect(cache.get('c')).toBeDefined();
+		});
+
+		test('hold fetches nothing and says nothing while the strip is there', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec);
+			let told = 0;
+			await load(cache, m, 'a', { keep: true, notify: () => told++ });
+			const before = told;
+			cache.hold('o-a', 'a', () => told++);
+			await tick();
+			expect(told).toBe(before);
+			expect(m.calls).toHaveLength(1);
+			// holding a strip that is not there is registering interest, not asking for it
+			cache.hold('o-z', 'z', () => told++);
+			expect(m.calls).toHaveLength(1);
+			expect(cache.queued).toBe(0);
+		});
+
+		test('an owner that moves to another asset lets the first one go', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec, { maxBytes: 2500, concurrency: 1 });
+			await load(cache, m, 'a', { keep: true });
+			await load(cache, m, 'b', { keep: true }); // 4000 > 2500, both on screen
+			expect(cache.bytes).toBe(4000);
+			cache.hold('o-a', 'b', () => {}); // clip `a` now draws from `b`: nothing draws from `a` any more
+			expect(cache.get('a')).toBeUndefined();
+			expect(cache.bytes).toBe(2000);
 		});
 
 		test('a long pan across many assets holds the memory bounded', async () => {
@@ -342,6 +418,48 @@ describe('FilmstripCache', () => {
 			expect(cache.failure('bad')).toBeUndefined();
 			expect(cache.bytes).toBe(2000);
 			expect(d.closed).toHaveLength(2);
+		});
+
+		test('dropping a strip a clip still draws from tells it, so its canvas redraws from a reload', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec);
+			let told = 0;
+			await load(cache, m, 'a', { keep: true, notify: () => told++ });
+			const before = told;
+			cache.prune([]); // the asset left the project
+			expect(cache.get('a')).toBeUndefined();
+			await tick();
+			expect(told).toBe(before + 1);
+			// a clip that asks again loads it afresh
+			cache.want('o-a', 'a', () => {});
+			expect(m.calls.filter((c) => c.asset === 'a')).toHaveLength(2);
+		});
+
+		test('clear tells the clips that were drawing, so they ask again', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec);
+			let told = 0;
+			await load(cache, m, 'a', { keep: true, notify: () => told++ });
+			const before = told;
+			cache.clear();
+			await tick();
+			expect(told).toBe(before + 1);
+			expect(cache.get('a')).toBeUndefined();
+		});
+
+		test('a load that was running through a clear frees its slot, so what queued behind it starts', async () => {
+			const m = manual();
+			const cache = new FilmstripCache(m.fetcher, decoder().dec, { concurrency: 1 });
+			cache.want('o1', 'a', () => {}); // running, holding the only slot
+			cache.clear();
+			cache.want('o2', 'b', () => {}); // queued behind `a`, which is still running
+			expect(m.calls.map((c) => c.asset)).toEqual(['a']);
+			expect(cache.queued).toBe(1);
+			m.calls[0].ok(strip()); // `a` lands nowhere (the cache was cleared)...
+			await tick();
+			expect(cache.get('a')).toBeUndefined();
+			expect(m.calls.map((c) => c.asset)).toEqual(['a', 'b']); // ...and `b` is no longer stuck
+			expect(cache.queued).toBe(0);
 		});
 
 		test('clear drops everything; a load that was running lands nowhere and is closed', async () => {

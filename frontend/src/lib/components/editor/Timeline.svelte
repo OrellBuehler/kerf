@@ -1509,9 +1509,15 @@
 		>
 	</div>
 
-	<!-- The whole cut on one strip: where the view is, and a way to move it. -->
+	<!-- The whole cut on one strip: where the view is, and a way to move it. A
+	     pointer overview, hidden from assistive tech on purpose: everything it does
+	     is already reachable from the keyboard (the scroller itself, the zoom
+	     buttons and + / -, ⇧Z to fit, J / K / L and the playhead's follow) — a
+	     second focusable widget with partial parity would be more to learn than
+	     to use. Its toggle in the toolbar stays labelled. -->
 	{#if ui.minimap && hasClips}
 		<div
+			aria-hidden="true"
 			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
 		>
 			<div

@@ -5,8 +5,10 @@ import {
 	HEIGHT_PRESETS,
 	MAX_REMEMBERED,
 	MINIMAP_KEY,
+	MIN_TITLE_LANE_PX,
 	MIXER_MIN_PX,
 	PRESET_PX,
+	TITLE_ADD_BTN_PX,
 	TITLE_METRICS,
 	heightOf,
 	heightPx,
@@ -66,6 +68,18 @@ describe('the presets', () => {
 		expect(titleLaneHeight('large', 1)).toBeGreaterThan(titleLaneHeight('medium', 1));
 		// no rows is still one row's room (the lane shows its hint)
 		expect(titleLaneHeight('medium', 0)).toBe(titleLaneHeight('medium', 1));
+	});
+
+	test('the titles lane is never too short for its header\'s add button (plus the lane\'s border)', () => {
+		for (const p of HEIGHT_PRESETS) {
+			for (const rows of [0, 1, 2, 5]) {
+				expect(titleLaneHeight(p, rows)).toBeGreaterThanOrEqual(TITLE_ADD_BTN_PX + 1);
+			}
+		}
+		// the compact lane sits right at that floor, with its one row centred in it
+		const c = TITLE_METRICS.compact;
+		expect(titleLaneHeight('compact', 1)).toBe(c.row + c.pad * 2);
+		expect(titleLaneHeight('compact', 1)).toBe(MIN_TITLE_LANE_PX);
 	});
 
 	test('isPreset and stepPreset', () => {
