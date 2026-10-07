@@ -561,7 +561,31 @@ no editing logic in the adapter.
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
   per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, and its diff).
+  labels, `stale`, and its diff). **Ripple** is here too, pure + unit-tested:
+  `Timeline::ripple_from(before)` takes what an edit left behind and the cut it
+  started from and, per track, matched by **id** like `diff`, shifts the clips the
+  edit left *starting where they started* by the net change in length of what it
+  did ahead of them — a clip's length change (right trim, speed) or removal, or an
+  add that landed **on footage that was there** (an add that fits in free space,
+  and every append, moves nothing). It carries the rules that were bugs waiting:
+  a **left-edge trim keeps the clip's start** (the GUI commits it as `source_in`
+  *plus* a later `timeline_start` to hold the right edge; ripple keeps the start
+  and follows the length, so both forms give one result — only when the trim is
+  the whole edit on the track); a **split shifts nothing** (the new half is an add
+  over the footage the other half gave up, and they cancel); **moves never ripple**
+  (a clip that merely changed its start or track is not "footage ahead");
+  **clips the edit itself moved are not followers**, so an op that already closes
+  the gap is not shifted twice; tracks are **independent** (no sync lock — a V1
+  ripple leaves A1 where it is, which is why linked A/V is its own backlog item),
+  a **locked track never moves**, and overlays / markers do not move. It **never
+  produces an overlap**: if shifting would leave a touched clip overlapping
+  another or before 0 (an add that lands *inside* a clip would need a split), that
+  track is returned as the edit made it. `Timeline::move_clips` /
+  `remove_clips` are the pure, all-or-nothing multi-clip edits behind the
+  marquee: a `ClipMove` is a clip, an **absolute** start and an optional
+  same-kind track; the group is checked as a group (moving clips pass through the
+  places they are leaving, never onto each other or a clip that stays), and a
+  locked track, a start before 0 or a clip named twice refuses the lot.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -584,6 +608,21 @@ no editing logic in the adapter.
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
+  **Ripple mode** is a project flag (`ripple_mode` / `set_ripple_mode`, in `meta`
+  like `speech_model`: persisted with the file, default off, not an edit) that
+  `edit_timeline` honors for every op — it snapshots the timeline, runs the op,
+  and stores `after.ripple_from(&before)`, on the staged path too (so the review
+  diff shows the clips that followed). It is applied there, not per op, so a new
+  op ripples with no code of its own; with the flag off nothing is cloned and
+  nothing changes. `Project::with_ripple(Option<bool>, |p| ..)` forces it on/off
+  for the calls inside (`None` inherits) — how a tool takes an optional `ripple`
+  argument; `ripple_active()` is the effective answer. The ops that decide their
+  own layout go through `edit_timeline_exact` and never ripple: `ripple_delete`,
+  `cut_clip_range`, the beat snap, `reorder`, `move_clip(s)`, `insert_clips`.
+  `trim` re-reads its clip afterwards because a ripple can move it. A forced-on
+  `remove_clips` is the multi-select ripple delete. `move_clips` / `remove_clips`
+  are single revisions (`Move N clips` / `Remove N clips`), and — unlike the
+  single-clip ops, which leave locks to the GUI — refuse clips on a locked track.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or

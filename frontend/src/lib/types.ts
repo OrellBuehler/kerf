@@ -335,6 +335,15 @@ export const DEFAULT_REFRAME: Reframe = {
 	fov: 100
 };
 
+/** One clip's destination in a group move (`move_clips`): where it starts
+ *  afterwards (absolute seconds) and, optionally, another track of the same
+ *  kind. Omitted, the clip stays on its track. */
+export interface ClipMove {
+	clip_id: string;
+	timeline_start: number;
+	track_id?: string;
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;

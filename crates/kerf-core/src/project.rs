@@ -2,6 +2,7 @@
 //! analysis metadata, and the non-destructive timeline (EDL). All timeline
 //! operations mutate the stored EDL; nothing is re-encoded until [`Project::export`].
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -13,10 +14,10 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::default_beat_tolerance;
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, CropFrame, Delivery, EditSource, Framing, Keyframe,
-    Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
-    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover,
-    MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, ClipMove, CropFrame, Delivery, EditSource, Framing,
+    Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus,
+    Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect,
+    Voiceover, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -141,6 +142,11 @@ fn voiceover_name(text: &str) -> String {
 /// `meta` key holding the seq of the currently-applied revision.
 const HISTORY_HEAD: &str = "history_head";
 
+/// `meta` key holding whether editing ripples (`"true"` / `"false"`; absent
+/// reads as off). A property of the project, like the speech model — not part of
+/// the timeline, so flipping it is not an edit and records no revision.
+const RIPPLE_MODE: &str = "ripple_mode";
+
 pub struct Project {
     conn: Connection,
     /// The `.kerf` file backing this project, or `None` for an in-memory one.
@@ -149,6 +155,11 @@ pub struct Project {
     path: Option<PathBuf>,
     /// Attributed to edits recorded in the history (see [`Project::set_actor`]).
     actor: EditSource,
+    /// A per-call answer to "does this edit ripple?" that outranks the project's
+    /// flag while it is set — see [`Project::with_ripple`]. A `Cell`, because the
+    /// edit methods take `&self` and the project is only ever used from one
+    /// thread at a time (it sits behind the app's mutex).
+    ripple_override: Cell<Option<bool>>,
 }
 
 impl Project {
@@ -159,6 +170,7 @@ impl Project {
             conn: Connection::open(&path)?,
             path: Some(path),
             actor: EditSource::User,
+            ripple_override: Cell::new(None),
         };
         project.init()?;
         Ok(project)
@@ -171,6 +183,7 @@ impl Project {
             conn: Connection::open(&path)?,
             path: Some(path),
             actor: EditSource::User,
+            ripple_override: Cell::new(None),
         };
         project.init()?;
         Ok(project)
@@ -182,6 +195,7 @@ impl Project {
             conn: Connection::open_in_memory()?,
             path: None,
             actor: EditSource::User,
+            ripple_override: Cell::new(None),
         };
         project.init()?;
         Ok(project)
@@ -290,6 +304,58 @@ impl Project {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ---- ripple mode ------------------------------------------------------
+
+    /// Whether this project edits in **ripple mode**: when on, an edit that
+    /// changes how much footage sits ahead of a clip — a trim, a speed change, a
+    /// delete, an insert onto footage — carries the later clips on that track
+    /// along, gaps kept (see [`Timeline::ripple_from`] for the exact rules).
+    /// Off by default, and persisted with the project. This is the *project's*
+    /// setting; whether a given edit ripples is [`Project::ripple_active`].
+    pub fn ripple_mode(&self) -> Result<bool> {
+        Ok(matches!(self.meta(RIPPLE_MODE)?.as_deref(), Some("true" | "1")))
+    }
+
+    /// Turn ripple mode on or off for the project. Not an edit: it records no
+    /// revision and does not touch the timeline.
+    pub fn set_ripple_mode(&self, on: bool) -> Result<()> {
+        self.set_meta(RIPPLE_MODE, if on { "true" } else { "false" })
+    }
+
+    /// Whether an edit made right now ripples: a per-call override from
+    /// [`Project::with_ripple`] when one is in force, else the project's flag.
+    pub fn ripple_active(&self) -> Result<bool> {
+        match self.ripple_override.get() {
+            Some(on) => Ok(on),
+            None => self.ripple_mode(),
+        }
+    }
+
+    /// Run `f` with ripple forced `on` or `off` for every edit it makes, or — for
+    /// `None` — leave whatever is in force alone (the project's flag, or an
+    /// enclosing override). This is how a tool takes an optional per-call
+    /// `ripple` argument without every edit method growing a parameter:
+    ///
+    /// ```ignore
+    /// project.with_ripple(args.ripple, |p| p.trim(clip, None, Some(4.0), None))?;
+    /// ```
+    ///
+    /// The override is undone when `f` returns, however it returns, and it
+    /// covers staged agent edits the same way as live ones.
+    pub fn with_ripple<R>(&self, ripple: Option<bool>, f: impl FnOnce(&Project) -> R) -> R {
+        struct Restore<'a>(&'a Cell<Option<bool>>, Option<bool>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.ripple_override, self.ripple_override.get());
+        if ripple.is_some() {
+            self.ripple_override.set(ripple);
+        }
+        f(self)
     }
 
     // ---- assets -----------------------------------------------------------
@@ -847,7 +913,38 @@ impl Project {
     /// write and the history append are wrapped in a single transaction — so an
     /// edit and its history head move atomically — and the timeline is
     /// serialized once and reused for both writes.
+    ///
+    /// **Ripple mode** lives here, so every op honors it uniformly — the agent's
+    /// staged ones included: with it on (see [`Project::ripple_active`]) the
+    /// timeline is snapshotted before `f` runs and the result goes through
+    /// [`Timeline::ripple_from`] before it is stored. With it off nothing is
+    /// cloned and the edit is exactly what `f` made.
     fn edit_timeline<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        let ripple = self.ripple_active()?;
+        self.run_edit(label, ripple, f)
+    }
+
+    /// [`Self::edit_timeline`] for an op that decides its own layout and so is
+    /// never rippled: `ripple_delete` and `cut_clip_range` and the beat snap
+    /// already close or reflow the track themselves (so rippling them again would
+    /// be at best a no-op and at worst — a snap whose compensating moves happen to
+    /// land a clip back where it started — a second, wrong shift), `reorder`
+    /// reflows, and a move changes where clips *are*, not how much footage sits
+    /// ahead of them.
+    fn edit_timeline_exact<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        self.run_edit(label, false, f)
+    }
+
+    fn run_edit<R>(&self, label: &str, ripple: bool, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+        let f = move |timeline: &mut Timeline| -> Result<R> {
+            if !ripple {
+                return f(timeline);
+            }
+            let before = timeline.clone();
+            let result = f(timeline)?;
+            *timeline = timeline.ripple_from(&before);
+            Ok(result)
+        };
         // While the agent has a staging session open its edits go to the
         // proposal instead, leaving the cut the user is looking at alone. The
         // GUI never stages, so a user edit always lands live — and makes any
@@ -1271,6 +1368,11 @@ impl Project {
     /// the same edit — a left-edge trim from the GUI shifts the start so the
     /// right edge stays put, and doing both here keeps undo a single step.
     /// Omitted, the timeline position is preserved.
+    ///
+    /// In **ripple mode** the later clips on the track follow the change in the
+    /// clip's length, and a left-edge trim keeps the clip's start whether or not
+    /// `timeline_start` was passed (see [`Timeline::ripple_from`]); the returned
+    /// clip is the one as it ended up.
     pub fn trim(
         &self,
         clip_id: Uuid,
@@ -1278,7 +1380,7 @@ impl Project {
         source_out: Option<f64>,
         timeline_start: Option<f64>,
     ) -> Result<Clip> {
-        self.edit_timeline("Trim clip", |timeline| {
+        let clip = self.edit_timeline("Trim clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
             if let Some(value) = source_in {
@@ -1300,16 +1402,26 @@ impl Project {
                 timeline.tracks[ti].sort_by_start();
             }
             Ok(out)
-        })
+        })?;
+        // The ripple can move the trimmed clip itself (a left-edge trim keeps its
+        // start), so hand back what is on the timeline rather than what the trim
+        // alone produced.
+        if self.ripple_active()? {
+            if let Some(current) = self.working_timeline()?.clip(clip.id) {
+                return Ok(current.clone());
+            }
+        }
+        Ok(clip)
     }
 
     /// Cut a **source-time** range out of a clip: the clip is split around the
     /// intersection of `[from, to]` with its source window, the middle piece
     /// removed, and later clips on the track ripple left to close the gap.
     /// This is the transcript-editing primitive — delete a sentence and the
-    /// cut tightens. Returns the kept pieces in play order.
+    /// cut tightens. Returns the kept pieces in play order. It closes the gap
+    /// itself, so ripple mode leaves it alone.
     pub fn cut_clip_range(&self, clip_id: Uuid, from: f64, to: f64) -> Result<Vec<Clip>> {
-        self.edit_timeline("Cut range", |timeline| {
+        self.edit_timeline_exact("Cut range", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = timeline.tracks[ti].clips[ci].clone();
             let a = from.max(clip.source_in);
@@ -1371,7 +1483,7 @@ impl Project {
 
     /// Move a clip to a new index within its track and re-flow the track gaplessly.
     pub fn reorder(&self, track_id: Uuid, clip_id: Uuid, new_index: usize) -> Result<()> {
-        self.edit_timeline("Reorder clip", |timeline| {
+        self.edit_timeline_exact("Reorder clip", |timeline| {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
             let current = track
                 .clips
@@ -1391,9 +1503,10 @@ impl Project {
     /// gaps are allowed. A move that would overlap another clip on the
     /// destination track is rejected, so each track stays a well-ordered,
     /// non-overlapping lane (which keeps the positional render well-defined).
+    /// A move never ripples, whatever the ripple mode.
     pub fn move_clip(&self, clip_id: Uuid, timeline_start: f64, track_id: Option<Uuid>) -> Result<Clip> {
         let start = timeline_start.max(0.0);
-        self.edit_timeline("Move clip", |timeline| {
+        self.edit_timeline_exact("Move clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let src_kind = timeline.tracks[ti].kind;
             let dest_ti = match track_id {
@@ -1431,6 +1544,28 @@ impl Project {
         })
     }
 
+    /// Move several clips in **one** edit — one revision, `Move N clips` — for a
+    /// marquee selection dragged together. Each [`ClipMove`] names a clip, where
+    /// it starts afterwards (absolute seconds) and, optionally, another track of
+    /// the same kind; the UI works out the landing spots, this decides whether
+    /// they are legal.
+    ///
+    /// All or nothing: the whole group is validated before anything moves, and
+    /// any error — an unknown clip or track, a different-kind track, a locked
+    /// track (source or destination), a clip named twice, a start before 0 or
+    /// not finite, or a landing spot that overlaps a clip that is staying or
+    /// another clip in the group — leaves the timeline and its history exactly as
+    /// they were. Clips moving together may pass through the places they are
+    /// leaving, so nudging a run of abutting clips by a second is fine.
+    /// Never ripples. Returns the moved clips in request order.
+    pub fn move_clips(&self, moves: &[ClipMove]) -> Result<Vec<Clip>> {
+        let label = match moves {
+            [_] => "Move clip".to_string(),
+            _ => format!("Move {} clips", moves.len()),
+        };
+        self.edit_timeline_exact(&label, |timeline| timeline.move_clips(moves))
+    }
+
     /// Insert `placements` — each a `(track_id, clip)` pair — so the earliest
     /// lands at `at`, preserving the relative offsets between them. Backs both
     /// paste (clips carried on a clipboard, whose sources may already be gone)
@@ -1452,7 +1587,7 @@ impl Project {
         let at = at.max(0.0);
         let base = placements.iter().map(|(_, c)| c.timeline_start).fold(f64::INFINITY, f64::min);
 
-        self.edit_timeline("Insert clips", |timeline| {
+        self.edit_timeline_exact("Insert clips", |timeline| {
             // Resolve every destination first, so an unknown track fails before
             // any edit lands.
             let mut staged: Vec<(usize, Clip)> = Vec::with_capacity(placements.len());
@@ -1512,9 +1647,9 @@ impl Project {
 
     /// Remove a clip and close the gap it leaves: every later clip on the **same
     /// track** shifts left by the removed clip's duration. (Plain [`remove`]
-    /// leaves a gap.)
+    /// leaves a gap — unless ripple mode is on, which makes it this.)
     pub fn ripple_delete(&self, clip_id: Uuid) -> Result<()> {
-        self.edit_timeline("Ripple delete", |timeline| {
+        self.edit_timeline_exact("Ripple delete", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let removed = timeline.tracks[ti].clips[ci].clone();
             let dur = removed.duration();
@@ -1664,13 +1799,32 @@ impl Project {
         })
     }
 
-    /// Remove a clip from the timeline.
+    /// Remove a clip from the timeline. Leaves a gap, unless ripple mode is on,
+    /// in which case the later clips on its track close it.
     pub fn remove(&self, clip_id: Uuid) -> Result<()> {
         self.edit_timeline("Remove clip", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             timeline.tracks[ti].clips.remove(ci);
             Ok(())
         })
+    }
+
+    /// Remove several clips in **one** edit — one revision — for a multi-select
+    /// delete. All or nothing: an unknown id, or a clip on a locked track, refuses
+    /// the whole thing; a clip named twice is removed once. Leaves gaps — unless
+    /// ripple mode is on (or forced with [`Project::with_ripple`]), in which case
+    /// every track closes up behind what it lost, which is how a multi-select
+    /// *ripple* delete is made. Returns how many clips were removed.
+    pub fn remove_clips(&self, clip_ids: &[Uuid]) -> Result<usize> {
+        let ripple = self.ripple_active()?;
+        let n = clip_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        let label = match (n, ripple) {
+            (1, false) => "Remove clip".to_string(),
+            (1, true) => "Ripple delete".to_string(),
+            (n, false) => format!("Remove {n} clips"),
+            (n, true) => format!("Ripple delete {n} clips"),
+        };
+        self.edit_timeline(&label, |timeline| timeline.remove_clips(clip_ids))
     }
 
     /// Set a clip's linear gain.
@@ -2235,7 +2389,7 @@ impl Project {
                 tempos.insert(asset.id, tempo);
             }
         }
-        self.edit_timeline("Cut to the beat", |timeline| {
+        self.edit_timeline_exact("Cut to the beat", |timeline| {
             let beats = timeline.beat_grid(&tempos);
             if beats.len() < 2 {
                 return Err(Error::InvalidArgument(
@@ -3497,7 +3651,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DiffKind, Fit};
+    use crate::model::{ClipMove, DiffKind, Fit};
 
     #[test]
     fn sample_project_has_assets_and_timeline() {
@@ -5338,5 +5492,385 @@ mod tests {
             mad < 8.0,
             "proxy and original previews differ by {mad:.1} levels: converted twice or not at all"
         );
+    }
+
+    // ---- ripple mode and multi-clip edits ---------------------------------------
+
+    /// V1 holding `a [0,5)  b [6,10)  c [12,15)` — a gap of 1s and one of 2s.
+    fn gapped_project() -> (Project, Uuid, [Clip; 3]) {
+        let (project, asset) = project_with_video_asset();
+        let a = project.add_clip_to_timeline(asset, None, 0.0, 5.0, Some(0.0)).unwrap();
+        let b = project.add_clip_to_timeline(asset, None, 0.0, 4.0, Some(6.0)).unwrap();
+        let c = project.add_clip_to_timeline(asset, None, 0.0, 3.0, Some(12.0)).unwrap();
+        (project, asset, [a, b, c])
+    }
+
+    /// Where each clip on the first track starts, in lane order.
+    fn v1_starts(project: &Project) -> Vec<f64> {
+        project.timeline().unwrap().tracks[0]
+            .clips
+            .iter()
+            .map(|c| c.timeline_start)
+            .collect()
+    }
+
+    #[test]
+    fn ripple_mode_is_off_by_default_persists_with_the_file_and_is_not_an_edit() {
+        let path = std::env::temp_dir().join(format!("kerf-ripple-{}.kerf", Uuid::new_v4()));
+        let project = Project::create(&path).unwrap();
+        assert!(!project.ripple_mode().unwrap());
+        let revisions = project.history().unwrap().len();
+
+        project.set_ripple_mode(true).unwrap();
+        assert!(project.ripple_mode().unwrap() && project.ripple_active().unwrap());
+        assert_eq!(project.history().unwrap().len(), revisions, "a setting, not an edit");
+        drop(project);
+
+        let reopened = Project::open(&path).unwrap();
+        assert!(reopened.ripple_mode().unwrap(), "it travels with the project");
+        reopened.set_ripple_mode(false).unwrap();
+        assert!(!reopened.ripple_mode().unwrap());
+        drop(reopened);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn with_the_mode_off_a_trim_leaves_the_later_clips_where_they_were() {
+        let (project, _, [a, ..]) = gapped_project();
+        project.trim(a.id, None, Some(3.0), None).unwrap();
+        assert_eq!(v1_starts(&project), vec![0.0, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn a_ripple_trim_carries_the_track_along_as_one_revision() {
+        let (project, _, [a, ..]) = gapped_project();
+        project.set_ripple_mode(true).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        project.trim(a.id, None, Some(3.0), None).unwrap(); // 5s -> 3s
+        assert_eq!(v1_starts(&project), vec![0.0, 4.0, 10.0], "gaps of 1s and 2s kept");
+        assert_eq!(project.history().unwrap().len(), revisions + 1);
+
+        project.undo().unwrap();
+        assert_eq!(v1_starts(&project), vec![0.0, 6.0, 12.0], "undo is one step too");
+    }
+
+    #[test]
+    fn a_ripple_left_trim_keeps_the_start_and_reports_the_clip_as_it_ended_up() {
+        let (project, _, [_, b, _]) = gapped_project();
+        project.set_ripple_mode(true).unwrap();
+
+        // What the GUI sends for a left-edge drag of one second: the in-point
+        // moves and so does the start, to hold the right edge at 10.0.
+        let trimmed = project.trim(b.id, Some(1.0), None, Some(7.0)).unwrap();
+        assert_eq!(trimmed.timeline_start, 6.0, "the clip stays where it started");
+        assert_eq!(trimmed.duration(), 3.0);
+        assert_eq!(v1_starts(&project), vec![0.0, 6.0, 11.0], "and the rest follows it in");
+    }
+
+    #[test]
+    fn ripple_mode_follows_speed_changes_deletes_and_inserts() {
+        let (project, asset, [_, b, c]) = gapped_project();
+        project.set_ripple_mode(true).unwrap();
+
+        project.set_speed(b.id, 2.0).unwrap(); // 4s -> 2s
+        assert_eq!(v1_starts(&project), vec![0.0, 6.0, 10.0]);
+
+        project.remove(b.id).unwrap(); // closes b's 2s
+        assert_eq!(v1_starts(&project), vec![0.0, 8.0]);
+
+        // Appending moves nothing; dropping onto `c` pushes it by the new length.
+        project.cut_clip(asset, 0.0, 2.0).unwrap();
+        assert_eq!(v1_starts(&project)[1], 8.0);
+        project.add_clip_to_timeline(asset, None, 0.0, 2.0, Some(8.0)).unwrap();
+        let tl = project.timeline().unwrap();
+        assert_eq!(tl.clip(c.id).unwrap().timeline_start, 10.0);
+    }
+
+    #[test]
+    fn ripple_mode_leaves_ops_that_close_the_gap_themselves_alone() {
+        // The same cut, edited with the mode off and on, must come out the same.
+        let run = |ripple: bool| {
+            let (project, _, [a, b, _]) = gapped_project();
+            project.set_ripple_mode(ripple).unwrap();
+            project.ripple_delete(b.id).unwrap();
+            let after_delete = v1_starts(&project);
+            project.cut_clip_range(a.id, 1.0, 2.0).unwrap();
+            (after_delete, v1_starts(&project))
+        };
+        let (plain_delete, plain_cut) = run(false);
+        assert_eq!(plain_delete, vec![0.0, 8.0]);
+        assert_eq!(run(true), (plain_delete, plain_cut));
+    }
+
+    #[test]
+    fn a_move_never_ripples() {
+        let (project, _, [a, ..]) = gapped_project();
+        project.set_ripple_mode(true).unwrap();
+        project.move_clip(a.id, 0.5, None).unwrap();
+        assert_eq!(v1_starts(&project), vec![0.5, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn the_beat_snap_comes_out_the_same_in_ripple_mode() {
+        let run = |ripple: bool| {
+            let project = Project::open_in_memory().unwrap();
+            project.set_ripple_mode(ripple).unwrap();
+            let video = project
+                .insert_or_get_asset(&asset_with("/beat-video.mp4", vec![vid_stream(false)]))
+                .unwrap();
+            let music = project
+                .insert_or_get_asset(&asset_with("/beat-music.wav", vec![aud_stream()]))
+                .unwrap();
+            project
+                .set_analysis(&AssetAnalysis {
+                    asset_id: music.id,
+                    tempo: Some(crate::model::Tempo {
+                        bpm: 120.0,
+                        beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
+                        confidence: 0.8,
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+            project.extract_audio(music.id).unwrap();
+            project.cut_clip(video.id, 0.0, 1.1).unwrap();
+            project.cut_clip(video.id, 2.0, 2.9).unwrap();
+            project.cut_clip(video.id, 4.0, 5.0).unwrap();
+            project.snap_to_beats(None, None).unwrap();
+            project.timeline().unwrap().tracks[0]
+                .clips
+                .iter()
+                .map(|c| (c.timeline_start, c.timeline_end()))
+                .collect::<Vec<_>>()
+        };
+        let plain = run(false);
+        assert_eq!(plain, vec![(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
+        assert_eq!(run(true), plain);
+    }
+
+    #[test]
+    fn with_ripple_overrides_the_flag_for_the_call_and_nothing_else() {
+        let (project, _, [a, b, _]) = gapped_project();
+        assert!(!project.ripple_active().unwrap());
+
+        // Forced on over a project that is off.
+        project.with_ripple(Some(true), |p| {
+            assert!(p.ripple_active().unwrap());
+            p.trim(a.id, None, Some(4.0), None).unwrap();
+        });
+        assert_eq!(v1_starts(&project), vec![0.0, 5.0, 11.0]);
+        assert!(!project.ripple_mode().unwrap(), "the project's flag was never touched");
+        assert!(!project.ripple_active().unwrap(), "and the override is gone");
+
+        // Forced off over a project that is on; `None` inherits; nesting restores.
+        project.set_ripple_mode(true).unwrap();
+        project.with_ripple(Some(false), |p| {
+            p.trim(a.id, None, Some(3.0), None).unwrap();
+            assert!(!p.ripple_active().unwrap());
+            p.with_ripple(None, |inner| assert!(!inner.ripple_active().unwrap(), "inherits the outer"));
+            p.with_ripple(Some(true), |inner| assert!(inner.ripple_active().unwrap()));
+            assert!(!p.ripple_active().unwrap(), "inner override undone");
+        });
+        assert_eq!(v1_starts(&project), vec![0.0, 5.0, 11.0], "a 1s trim that did not ripple");
+        project.with_ripple(None, |p| p.trim(b.id, None, Some(3.0), None).unwrap());
+        assert_eq!(v1_starts(&project), vec![0.0, 5.0, 10.0], "None follows the project's flag");
+        assert!(project.ripple_active().unwrap());
+    }
+
+    #[test]
+    fn a_staged_agent_edit_ripples_in_the_proposal_and_not_the_live_cut() {
+        let (mut project, _, [a, ..]) = gapped_project();
+        project.set_ripple_mode(true).unwrap();
+        project.set_actor(EditSource::Agent);
+        let revisions = project.history().unwrap().len();
+
+        project.begin_staging(None, None).unwrap();
+        project.trim(a.id, None, Some(3.0), None).unwrap();
+
+        let live: Vec<f64> = v1_starts(&project);
+        assert_eq!(live, vec![0.0, 6.0, 12.0], "the cut the user is looking at has not moved");
+        let staged = project.working_timeline().unwrap();
+        let proposed: Vec<f64> = staged.tracks[0].clips.iter().map(|c| c.timeline_start).collect();
+        assert_eq!(proposed, vec![0.0, 4.0, 10.0]);
+
+        let diff = project.staged().unwrap().unwrap().diff;
+        let kinds: Vec<DiffKind> = diff.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == DiffKind::ClipMoved).count(),
+            2,
+            "the review card shows the clips that followed: {kinds:?}"
+        );
+        assert!(kinds.contains(&DiffKind::ClipRetrimmed));
+
+        project.apply_staged(false).unwrap();
+        assert_eq!(v1_starts(&project), vec![0.0, 4.0, 10.0]);
+        assert_eq!(project.history().unwrap().len(), revisions + 1);
+    }
+
+    #[test]
+    fn ripple_mode_never_moves_a_locked_track() {
+        let (project, _, [a, ..]) = gapped_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        project.set_ripple_mode(true).unwrap();
+        project.trim(a.id, None, Some(3.0), None).unwrap();
+        assert_eq!(v1_starts(&project), vec![0.0, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn move_clips_is_one_revision_and_keeps_the_group_together() {
+        let (project, _, [a, b, c]) = gapped_project();
+        let revisions = project.history().unwrap().len();
+
+        let moved = project
+            .move_clips(&[
+                ClipMove {
+                    clip_id: b.id,
+                    timeline_start: 7.0,
+                    track_id: None,
+                },
+                ClipMove {
+                    clip_id: c.id,
+                    timeline_start: 13.0,
+                    track_id: None,
+                },
+            ])
+            .unwrap();
+        assert_eq!(moved.iter().map(|c| c.timeline_start).collect::<Vec<_>>(), vec![7.0, 13.0]);
+        assert_eq!(v1_starts(&project), vec![0.0, 7.0, 13.0]);
+        assert!(project.timeline().unwrap().clip(a.id).is_some());
+
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().label, "Move 2 clips");
+    }
+
+    #[test]
+    fn a_refused_group_move_leaves_the_timeline_and_history_alone() {
+        let (project, _, [a, b, _]) = gapped_project();
+        let revisions = project.history().unwrap().len();
+        let before = serde_json::to_string(&project.timeline().unwrap()).unwrap();
+
+        // `b` would be fine; `a` lands on `b`'s spot.
+        let result = project.move_clips(&[
+            ClipMove {
+                clip_id: b.id,
+                timeline_start: 20.0,
+                track_id: None,
+            },
+            ClipMove {
+                clip_id: a.id,
+                timeline_start: 12.5,
+                track_id: None,
+            },
+        ]);
+        assert!(matches!(result, Err(Error::InvalidArgument(_))), "{result:?}");
+        assert_eq!(project.history().unwrap().len(), revisions);
+        assert_eq!(serde_json::to_string(&project.timeline().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn an_agents_group_move_is_staged_like_any_other_edit() {
+        let (mut project, _, [a, ..]) = gapped_project();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project
+            .move_clips(&[ClipMove {
+                clip_id: a.id,
+                timeline_start: 0.5,
+                track_id: None,
+            }])
+            .unwrap();
+        assert_eq!(v1_starts(&project)[0], 0.0, "the live cut is untouched");
+        assert_eq!(project.working_timeline().unwrap().clip(a.id).unwrap().timeline_start, 0.5);
+        assert_eq!(project.staged().unwrap().unwrap().edits, vec!["Move clip".to_string()]);
+    }
+
+    #[test]
+    fn remove_clips_is_one_revision_and_all_or_nothing() {
+        let (project, _, [a, b, c]) = gapped_project();
+        let revisions = project.history().unwrap().len();
+
+        // One bad id and nothing is removed.
+        assert!(matches!(
+            project.remove_clips(&[a.id, Uuid::new_v4()]),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), revisions);
+        assert_eq!(v1_starts(&project).len(), 3);
+
+        assert_eq!(project.remove_clips(&[a.id, c.id, a.id]).unwrap(), 2);
+        let tl = project.timeline().unwrap();
+        assert_eq!(tl.tracks[0].clips.len(), 1);
+        assert_eq!(tl.tracks[0].clips[0].id, b.id);
+        assert_eq!(tl.tracks[0].clips[0].timeline_start, 6.0, "a plain delete leaves the gap");
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().label, "Remove 2 clips");
+    }
+
+    #[test]
+    fn remove_clips_under_ripple_closes_every_track_behind_it() {
+        let (project, asset, [a, b, c]) = gapped_project();
+        let v2 = project.add_track(StreamKind::Video, None).unwrap();
+        let on_v2 = project.add_clip_to_timeline(asset, Some(v2.id), 0.0, 2.0, Some(1.0)).unwrap();
+        let later_on_v2 = project.add_clip_to_timeline(asset, Some(v2.id), 0.0, 2.0, Some(5.0)).unwrap();
+
+        // Forced on for the call: a multi-select *ripple* delete.
+        let n = project
+            .with_ripple(Some(true), |p| p.remove_clips(&[a.id, on_v2.id]))
+            .unwrap();
+        assert_eq!(n, 2);
+        let tl = project.timeline().unwrap();
+        assert_eq!(tl.clip(b.id).unwrap().timeline_start, 1.0, "b: 6 - 5");
+        assert_eq!(tl.clip(c.id).unwrap().timeline_start, 7.0);
+        assert_eq!(
+            tl.clip(later_on_v2.id).unwrap().timeline_start,
+            3.0,
+            "V2 closed by its own 2s"
+        );
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Ripple delete 2 clips");
+        assert!(!project.ripple_mode().unwrap());
+    }
+
+    #[test]
+    fn a_ripple_remove_of_one_clip_is_a_ripple_delete() {
+        let remove = |ripple_delete: bool| {
+            let (project, _, [_, b, _]) = gapped_project();
+            if ripple_delete {
+                project.ripple_delete(b.id).unwrap();
+            } else {
+                project.with_ripple(Some(true), |p| p.remove(b.id)).unwrap();
+            }
+            serde_json::to_value(&project.timeline().unwrap().tracks[0].clips)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["timeline_start"].as_f64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(remove(true), remove(false));
+    }
+
+    #[test]
+    fn group_edits_refuse_a_locked_track() {
+        let (project, _, [a, b, _]) = gapped_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        let moved = project.move_clips(&[ClipMove {
+            clip_id: a.id,
+            timeline_start: 0.5,
+            track_id: None,
+        }]);
+        assert!(matches!(moved, Err(Error::InvalidArgument(why)) if why.contains("locked")));
+        assert!(matches!(
+            project.remove_clips(&[b.id]),
+            Err(Error::InvalidArgument(why)) if why.contains("locked")
+        ));
+        assert_eq!(project.history().unwrap().len(), revisions);
     }
 }
