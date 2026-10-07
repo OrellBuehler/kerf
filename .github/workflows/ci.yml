@@ -219,6 +219,80 @@ jobs:
           cargo test -p kerf-core --no-default-features --locked -- \
             --ignored --skip downloads_a_real_model
 
+  # The GPU compositor against FFmpeg. `kerf-gpu`'s parity harness renders the
+  # same timelines at the same times through FFmpeg's own still and through the
+  # wgpu compositor and holds them to a PSNR / max-error threshold (see
+  # `crates/kerf-gpu/tests/parity.rs`). A runner has no GPU, so wgpu runs on
+  # Mesa's lavapipe software Vulkan driver — which is also what makes the
+  # thresholds reproducible rather than a property of someone's graphics card.
+  # The harness synthesizes its own media. It runs against the distro FFmpeg
+  # **and** the pinned one the release bundles ship: the two disagree about
+  # colour (FFmpeg 9 negotiates the composite's matrix across the overlay chain,
+  # FFmpeg 6 does not — the compositor probes which it is dealing with), so a
+  # parity that held for one build is not evidence about the other. The benchmark
+  # in the same crate skips itself unless `KERF_BENCH` is set.
+  parity:
+    name: gpu parity (${{ matrix.ffmpeg }} ffmpeg, lavapipe)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ffmpeg: system
+          - ffmpeg: pinned
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KERF_HWACCEL: none
+      KERF_HW_ENCODE: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+      - name: Install FFmpeg (distro)
+        if: matrix.ffmpeg == 'system'
+        run: |
+          sudo apt-get install -y ffmpeg
+          echo "KERF_FFMPEG=ffmpeg" >> "$GITHUB_ENV"
+          echo "KERF_FFPROBE=ffprobe" >> "$GITHUB_ENV"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: matrix.ffmpeg == 'pinned'
+      - name: Fetch FFmpeg (pinned)
+        if: matrix.ffmpeg == 'pinned'
+        run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.triple }}
+      - name: Use the pinned FFmpeg
+        if: matrix.ffmpeg == 'pinned'
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        # The path comes from the matrix, never from the event payload.
+        run: | # zizmor: ignore[github-env]
+          set -euo pipefail
+          bin="$(pwd)/crates/kerf-app/binaries"
+          echo "KERF_FFMPEG=$bin/ffmpeg-$TRIPLE" >> "$GITHUB_ENV"
+          echo "KERF_FFPROBE=$bin/ffprobe-$TRIPLE" >> "$GITHUB_ENV"
+      - name: FFmpeg version
+        run: '"$KERF_FFMPEG" -hide_banner -version | head -1'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: parity-${{ matrix.ffmpeg }}
+      - name: Run the parity harness
+        run: cargo test -p kerf-gpu --no-default-features --locked -- --ignored
+      # A failing case leaves its reference / GPU / diff images behind.
+      - name: Keep the images of a failed comparison
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parity-images-${{ matrix.ffmpeg }}
+          path: target/parity/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Every other job builds `--no-default-features`, so the in-process libav
   # backend (`engine/ffmpeg.rs`, and the experimental `libav-render` pipeline)
   # only ever compiled on a machine that happened to have the dev libraries.
@@ -332,7 +406,7 @@ jobs:
   ci-ok:
     name: ci ok
     if: always()
-    needs: [lint, clippy, msrv, frontend, engine, libav, build, whisper]
+    needs: [lint, clippy, msrv, frontend, engine, parity, libav, build, whisper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

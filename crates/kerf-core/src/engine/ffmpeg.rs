@@ -57,6 +57,8 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
         };
 
         match medium {
@@ -66,6 +68,10 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                     info.height = Some(video.height());
                     info.color_transfer = transfer_name(video.color_transfer_characteristic());
                     info.color_primaries = primaries_name(video.color_primaries());
+                    // Named like the codec above: the variant, lower-cased, which is
+                    // ffprobe's spelling (`yuva420p`). `None` is "unspecified".
+                    info.pix_fmt = Some(format!("{:?}", video.format()).to_lowercase()).filter(|p| p != "none");
+                    info.color_space = space_name(video.color_space());
                 }
                 // Mirror the ffprobe path's two projection signals (see
                 // `super::cli::detect_projection`): the container's declared
@@ -139,6 +145,24 @@ fn transfer_name(t: ff::color::TransferCharacteristic) -> Option<String> {
         _ => None,
     };
     name.map(str::to_string)
+}
+
+/// The stream's YCbCr matrix in ffprobe's spelling, `None` when it declares none.
+/// Named through the variant's `Debug` form (like the pixel format above) so
+/// this needs no variant list from the binding.
+fn space_name(s: ff::color::Space) -> Option<String> {
+    let name = match format!("{s:?}").to_lowercase().as_str() {
+        "bt709" => "bt709",
+        "bt470bg" => "bt470bg",
+        "smpte170m" => "smpte170m",
+        "smpte240m" => "smpte240m",
+        "fcc" => "fcc",
+        "ycgco" => "ycgco",
+        "bt2020ncl" => "bt2020nc",
+        "bt2020cl" => "bt2020c",
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 fn primaries_name(p: ff::color::Primaries) -> Option<String> {
