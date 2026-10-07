@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle` … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle` (A1a-0 merged locally) … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -104,6 +104,16 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 - **2026-10-07 — keybindings are strict.** A chord means exactly its
   modifiers (⇧J no longer shuttles, Ctrl chords don't fire on macOS) so
   conflicts are unambiguous; one-press actions ignore auto-repeat.
+
+- **2026-10-07 — per-worktree build dirs.** A shared `CARGO_TARGET_DIR`
+  across worktrees let cargo reuse another branch's test binary (workspace
+  crate hashes ignore the worktree path), so some runs were vacuous. Every
+  worktree now builds into its own `/home/user/.ct/<name>`, deleted when the
+  worktree goes; the integration branch was re-verified clean that way.
+- **2026-10-07 — golden argv oracle.** 4000 seeded cases digest the export,
+  still and preview builders (A1a-0); libm-derived numbers are rounded to 10
+  significant digits before hashing (FMA vs generic `pow` differ in the last
+  ulp), digest files are pinned LF.
 
 ## Needs a real machine
 
