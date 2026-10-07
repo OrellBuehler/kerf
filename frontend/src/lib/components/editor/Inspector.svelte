@@ -9,7 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
+	import { GENERATED_TITLE_FILL, MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
 	import type { TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
@@ -20,6 +20,7 @@
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
 	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
+	import { settings } from '$lib/settings.svelte';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
@@ -427,7 +428,7 @@
 	<div style="display:flex;gap:9px;align-items:center">
 		<div
 			style="width:40px;height:28px;border-radius:3px;flex:none;background:{o.generated
-				? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))'
+				? GENERATED_TITLE_FILL
 				: 'var(--track-text)'};border:1px solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
 		>
 			<Icon n="captions" s={14} />
@@ -584,7 +585,7 @@
 				>
 					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
 					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
-					them all; Delete removes them all.
+					them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
 				</div>
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">

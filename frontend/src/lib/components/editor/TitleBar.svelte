@@ -36,7 +36,7 @@
 	<div style="min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:10px">
 		<button
 			onclick={() => settings.toggle()}
-			title="Settings — how much of this machine Kerf may use (⌘,)"
+			title={settings.withShortcut('Settings — performance, appearance and keyboard shortcuts', 'app.settings')}
 			aria-label="Settings"
 			style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {settings.open
 				? 'var(--border-strong)'

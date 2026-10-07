@@ -713,6 +713,11 @@ export interface VoiceoverResult {
 	timeline: Timeline;
 }
 
+/** What the app was launched asking to open (kerf-app's `LaunchProject`, externally
+ *  tagged): a `.kerf` that exists, or one named on the command line that is not
+ *  there — never created, so the page says so instead. */
+export type LaunchRequest = { open: string } | { missing: string };
+
 /** A newer signed release found on GitHub by the updater. */
 export interface UpdateInfo {
 	/** The available version, e.g. `0.18.0`. */
@@ -749,6 +754,10 @@ export interface AppSettings {
 	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
 	 *  back in. Opaque to the backend. */
 	workspaces: unknown | null;
+	/** What the user changed about the keyboard shortcuts: `{ version, bindings:
+	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
+	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
+	keybindings: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

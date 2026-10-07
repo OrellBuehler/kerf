@@ -1030,17 +1030,26 @@ pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
 
-/// The HDR transfer of the first video stream of the file at `path`, for the
-/// decodes that are handed a bare path rather than an [`Asset`] (a scrubbed
-/// frame, a contact sheet, a proxy). Probed once per file and cached against the
-/// file's size and modified time. A generated proxy answers `None` — it was
-/// tone-mapped when it was encoded, which is the point.
-pub(crate) fn source_hdr(path: &Path) -> Option<Hdr> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<Hdr>>>> = OnceLock::new();
+/// What the decodes that are handed a bare path rather than an [`Asset`] need to
+/// know about a file's first video stream, from one `ffprobe`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SourceTraits {
+    /// The HDR transfer, if the stream is HLG or PQ.
+    pub hdr: Option<Hdr>,
+    /// Seconds between the container's start and the video's first frame (see
+    /// [`head_lead`]); `0.0` for an ordinary file.
+    pub lead: f64,
+}
+
+/// [`SourceTraits`] of the file at `path`, probed once per file and cached
+/// against the file's size and modified time. `None` when the probe itself
+/// fails (not cached, so a transient failure is retried).
+pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
+    static CACHE: OnceLock<Mutex<HashMap<String, SourceTraits>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = source_key(path);
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
-        return hit;
+        return Some(hit);
     }
     let output = command(&ffprobe_bin())
         .args([
@@ -1049,25 +1058,74 @@ pub(crate) fn source_hdr(path: &Path) -> Option<Hdr> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_transfer",
+            "stream=color_transfer,start_time:format=start_time,format_name",
         ])
-        // `default` rather than `csv`: a file with side data (a phone's display
-        // matrix) makes the csv writer append a stray empty field to the value.
-        .args(["-of", "default=nw=1:nk=1"])
+        // JSON rather than `csv`/`default`: the stream and the format both have a
+        // `start_time`, and a file with side data (a phone's display matrix) makes
+        // the csv writer append a stray empty field to the value.
+        .args(["-of", "json"])
         .arg(path)
         .stdin(Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let hdr = match String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("").trim() {
+    let traits = parse_source_traits(&String::from_utf8_lossy(&output.stdout));
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, traits);
+    }
+    Some(traits)
+}
+
+/// The pure half of [`source_traits`]: read the probe's JSON. Anything missing
+/// or unparsable (`N/A` is simply absent) leaves the neutral value, so an odd
+/// file is treated as an ordinary one.
+fn parse_source_traits(json: &str) -> SourceTraits {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return SourceTraits::default();
+    };
+    let secs = |field: Option<&serde_json::Value>| -> Option<f64> {
+        field?.as_str()?.trim().parse::<f64>().ok().filter(|t| t.is_finite())
+    };
+    let stream = v.get("streams").and_then(|s| s.get(0));
+    let hdr = match stream
+        .and_then(|s| s.get("color_transfer"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+    {
         "arib-std-b67" => Some(Hdr::Hlg),
         "smpte2084" => Some(Hdr::Pq),
         _ => None,
     };
-    if let Ok(mut c) = cache.lock() {
-        c.insert(key, hdr);
-    }
-    hdr
+    let format = v.get("format");
+    // MPEG-TS (a camcorder's `.mts` / `.m2ts` included) cannot be fixed this way:
+    // its demuxer measures the container's start over only the streams being read,
+    // so a read with the audio discarded — which is what makes the proxy — rebases
+    // the video to zero, the pad's clone and the first frame come out one tick
+    // apart, and a seek into the proxy lands where a plain proxy's would. The lead
+    // is reported as none, so the source keeps the plain proxy and its cache key.
+    let transport_stream = format
+        .and_then(|f| f.get("format_name"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.split(',').any(|n| n == "mpegts"));
+    let lead = if transport_stream {
+        0.0
+    } else {
+        head_lead(
+            secs(stream.and_then(|s| s.get("start_time"))),
+            secs(format.and_then(|f| f.get("start_time"))),
+        )
+    };
+    SourceTraits { hdr, lead }
+}
+
+/// The HDR transfer of the first video stream of the file at `path`, for the
+/// decodes that are handed a bare path rather than an [`Asset`] (a scrubbed
+/// frame, a contact sheet, a proxy). Probed once per file and cached against the
+/// file's size and modified time. A generated proxy answers `None` — it was
+/// tone-mapped when it was encoded, which is the point.
+pub(crate) fn source_hdr(path: &Path) -> Option<Hdr> {
+    source_traits(path)?.hdr
 }
 
 // ---- silence / scene analysis ---------------------------------------------
@@ -1935,6 +1993,45 @@ pub(super) fn source_key(src: &Path) -> String {
     format!("{}|{len}|{mtime}", src.display())
 }
 
+/// How long after the container's start the video's first frame lies, in
+/// seconds: the video stream's start less the container's (the earliest of all
+/// its streams — audio at 0 and video at 0.08 s gives 0.08).
+///
+/// The number matters because ffmpeg's input `-ss T` is **relative to the
+/// container's start**, not to the video's. A source that starts its video late
+/// is asked for source time `T` and answers with the frame `lead` seconds into
+/// the video's own timeline; a proxy is video-only, so its container *is* the
+/// video and starts where the video does — which would make the same `-ss T`
+/// land `lead` seconds further into the footage (see [`build_proxy_args`]).
+/// Negative or missing values are `0.0`.
+fn head_lead(stream_start: Option<f64>, format_start: Option<f64>) -> f64 {
+    match (stream_start, format_start) {
+        (Some(stream), Some(format)) => (stream - format).max(0.0),
+        _ => 0.0,
+    }
+}
+
+/// The smallest lead worth a proxy of its own. Under a millisecond is a hair
+/// inside the error of the container's own timestamps; anything above shifts a
+/// seek by a whole frame for the stretch of each frame interval it covers.
+const HEAD_PAD_MIN: f64 = 0.001;
+
+/// Whether a source with this [`head_lead`] needs its proxy's head filled in.
+fn needs_head_pad(lead: f64) -> bool {
+    lead > HEAD_PAD_MIN
+}
+
+/// The cache-key text of a proxy (pure, unit-tested): the source's identity and
+/// the width, plus a suffix for each way the proxy was made differently from the
+/// plain one. A suffix is only ever *added* to a source that needs it, so the
+/// key of every ordinary SDR file with a normal start is what it always was and
+/// its cached proxy stays good.
+fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) -> String {
+    let tone = if tonemapped { "|sdr" } else { "" };
+    let pad = if head_padded { "|lead" } else { "" };
+    format!("{source_key}|{width}{tone}{pad}")
+}
+
 /// The on-disk path of `src`'s preview proxy at `width` (whether or not it
 /// exists yet): `<cache>/kerf/proxies/<hash>.mp4`. `None` when no OS cache
 /// directory is resolvable (a proxy simply can't be cached — preview falls back
@@ -1947,10 +2044,57 @@ pub(super) fn source_key(src: &Path) -> String {
 /// An HDR source also keys on the fact that its proxy is **tone-mapped**: a
 /// proxy cached before the engine did that is an untouched HDR picture squeezed
 /// into BT.709, and must be rebuilt rather than trusted. SDR keys are unchanged.
+///
+/// So does a source whose video **starts after its container** (`|lead`): a proxy
+/// cached before the engine filled that head in has the video starting at its own
+/// time zero, and a seek into it lands on the wrong frame (see [`head_lead`]).
+/// FFmpeg 9 wrote exactly such proxies for every build that had the default
+/// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
+/// named `<hash>.lead.mp4` ([`is_head_padded_proxy`]).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    let tone = if source_hdr(src).is_some() { "|sdr" } else { "" };
-    Some(dir.join(format!("{:016x}.mp4", fnv1a(&format!("{}|{width}{tone}", source_key(src))))))
+    let traits = source_traits(src).unwrap_or_default();
+    let padded = needs_head_pad(traits.lead);
+    let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
+    Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
+}
+
+/// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
+const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
+
+/// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
+/// one made with a padded head.
+fn proxy_file_name(hash: u64, head_padded: bool) -> String {
+    if head_padded {
+        format!("{hash:016x}{HEAD_PADDED_SUFFIX}")
+    } else {
+        format!("{hash:016x}.mp4")
+    }
+}
+
+/// Whether `path` is a proxy [`generate_proxy`] made with a padded head (pure,
+/// unit-tested): `.../kerf/proxies/<16 hex digits>.lead.mp4`.
+///
+/// That it is padded is a fact about the *file*, so it travels in the file's name
+/// instead of in a flag every caller of the graph builders would have to carry
+/// beside the path — a preview asset is its original with the path swapped, and
+/// the graph needs to know, per input, to drop the pad's clone frame before it
+/// trims (see [`video_clip_chain`]). An original, or any proxy that was not padded,
+/// does not match, and its argv and graph are what they always were.
+pub(crate) fn is_head_padded_proxy(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(hash) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(HEAD_PADDED_SUFFIX))
+    else {
+        return false;
+    };
+    let dir = |p: Option<&Path>| p.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    hash.len() == 16
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && dir(path.parent()).as_deref() == Some("proxies")
+        && dir(path.parent().and_then(Path::parent)).as_deref() == Some("kerf")
 }
 
 /// The proxy for `src` at `width` **if it has already been generated** (the file
@@ -2031,6 +2175,28 @@ fn proxy_hw_encoder() -> Option<&'static str> {
 /// preview stream, scrubbed stills, the composited frame — sees ordinary SDR and
 /// converts nothing a second time. (Upright rotation is the decoder's: ffmpeg
 /// autorotates and writes the proxy without a matrix.)
+///
+/// `head_pad` is for a source whose video starts after its container (see
+/// [`head_lead`]), and carries the spelling of the frame-sync flag
+/// ([`fps_mode_flag`]). The proxy has no audio to start the container early, so
+/// without help its video would start at its own zero and an input `-ss T` would
+/// land `lead` seconds past where the original's does — which is what an
+/// FFmpeg-9 proxy of a late-starting video did. The fix keeps every timestamp
+/// exactly and fills the gap the way the original answers a seek into it, by
+/// holding the first frame: one clone of it at time zero, merged in front of the
+/// stream by `interleave` (which orders by timestamp, so nothing is regridded).
+/// That is not `-fps_mode cfr`, the other way to fill a head: cfr snaps every
+/// frame to a grid anchored at zero, which is half a frame off for most leads
+/// (a seek then picks the neighbouring frame at every frame boundary) and turns
+/// a variable-frame-rate source into a constant one. The mode is spelled out as
+/// `vfr` because FFmpeg 6 and older default an mp4 to cfr — which would undo it —
+/// and FFmpeg 7 and newer to vfr. An ordinary source passes `None` and gets the
+/// plain `-vf` chain it always did. The clone is a frame the original has no
+/// counterpart for, so a reader that starts the proxy from zero without a seek —
+/// which the original answers with its real first frame — drops it again (see
+/// [`video_clip_chain`]); the proxy's file name says it has one
+/// ([`is_head_padded_proxy`]).
+#[allow(clippy::too_many_arguments)]
 fn build_proxy_args(
     src: &str,
     dst: &str,
@@ -2039,6 +2205,7 @@ fn build_proxy_args(
     encoder: &str,
     hw_decode: Option<&str>,
     tonemap: Option<&str>,
+    head_pad: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".to_string(),
@@ -2050,18 +2217,22 @@ fn build_proxy_args(
         args.push("-hwaccel".to_string());
         args.push(hw.to_string());
     }
-    args.extend([
-        "-i".to_string(),
-        src.to_string(),
-        "-an".to_string(),
-        "-vf".to_string(),
-        match tonemap {
-            Some(t) => format!("scale='min({width},iw)':-2:flags=bilinear,{t}"),
-            None => format!("scale='min({width},iw)':-2:flags=bilinear"),
-        },
-        "-c:v".to_string(),
-        encoder.to_string(),
-    ]);
+    let chain = match tonemap {
+        Some(t) => format!("scale='min({width},iw)':-2:flags=bilinear,{t}"),
+        None => format!("scale='min({width},iw)':-2:flags=bilinear"),
+    };
+    args.extend(["-i".to_string(), src.to_string(), "-an".to_string()]);
+    if head_pad.is_some() {
+        args.extend([
+            "-filter_complex".to_string(),
+            format!("[0:v:0]{chain},split[a][b];[a]trim=end_frame=1,setpts=PTS-STARTPTS[h];[h][b]interleave[v]"),
+            "-map".to_string(),
+            "[v]".to_string(),
+        ]);
+    } else {
+        args.extend(["-vf".to_string(), chain]);
+    }
+    args.extend(["-c:v".to_string(), encoder.to_string()]);
     args.extend(quality_args(encoder, 24));
     args.extend([
         "-g".to_string(),
@@ -2070,6 +2241,11 @@ fn build_proxy_args(
         threads.max(1).to_string(),
         "-pix_fmt".to_string(),
         encode_pix_fmt(encoder).to_string(),
+    ]);
+    if let Some(flag) = head_pad {
+        args.extend([flag.to_string(), "vfr".to_string()]);
+    }
+    args.extend([
         // The encode writes a `.part` temp file, whose extension tells ffmpeg
         // nothing — name the muxer instead of letting it guess, or it exits
         // with "unable to find a suitable output format" before decoding a frame.
@@ -2108,9 +2284,22 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
     // rather than starting one per file at once.
     let cpu = cpu::lease();
     let threads = proxy_threads(cpu.threads());
-    let tonemap = source_hdr(src).map(tonemap_filter);
+    // One cached probe answers both: whether to tone-map and whether the video
+    // starts late (the same one `proxy_path` keyed this proxy on).
+    let traits = source_traits(src).unwrap_or_default();
+    let tonemap = traits.hdr.map(tonemap_filter);
+    let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let run = |encoder: &str, hw_decode: Option<&str>| -> Result<std::process::Output> {
-        let mut args = build_proxy_args(src_str, tmp_str, threads, width, encoder, hw_decode, tonemap.as_deref());
+        let mut args = build_proxy_args(
+            src_str,
+            tmp_str,
+            threads,
+            width,
+            encoder,
+            hw_decode,
+            tonemap.as_deref(),
+            head_pad,
+        );
         cpu::limit_args(&mut args, threads);
         bg_command(&bin)
             .args(&args)
@@ -2122,7 +2311,12 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
     // then costs the CPU almost nothing. A failure falls back to the software
     // pipeline once, and a hardware-*encoder* failure whose software retry
     // succeeds disables hardware encodes for the rest of the process.
-    let hw_enc = proxy_hw_encoder();
+    // A padded proxy is encoded from a graph whose output has no frame rate (its
+    // `interleave` hands the encoder microsecond timestamps), which a hardware
+    // encoder may refuse — and one refusal turns hardware encoding off for the
+    // whole process. These sources are rare and the encode is the same all-intra
+    // x264 pass, so they never ask.
+    let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
     let hw_dec = decode_hwaccel();
     let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
     if !output.status.success() && (hw_enc.is_some() || hw_dec.is_some()) {
@@ -4183,29 +4377,71 @@ impl Drop for GraphScript {
     }
 }
 
+/// The options this ffmpeg build knows that the engine's argv depends on, read
+/// from `ffmpeg -h full` once per process. Only these booleans are kept — the help
+/// text itself is over a megabyte. A binary that cannot run at all reads as
+/// "knows none of them", which every probe below takes as the modern spelling: any
+/// render on that binary is about to fail the same way regardless.
+struct HelpFlags {
+    filter_complex_script: bool,
+    fps_mode: bool,
+    vsync: bool,
+}
+
+fn help_flags() -> &'static HelpFlags {
+    static FLAGS: OnceLock<HelpFlags> = OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let help = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "quiet", "-h", "full"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        HelpFlags {
+            filter_complex_script: help.contains("-filter_complex_script"),
+            fps_mode: help.contains("-fps_mode"),
+            vsync: help.contains("-vsync"),
+        }
+    })
+}
+
 /// The argv spelling that points *this* ffmpeg at a filtergraph file, probed
 /// once per process: FFmpeg 8 removed `-filter_complex_script` (deprecated in
 /// 7.0 as equivalent to the generic `-/filter_complex <file>` form), so on a
 /// bundled FFmpeg 8 the old spelling aborts every spilled render with
 /// `Unrecognized option` — while a pre-7.0 binary knows only the old one.
-/// `-h full` still lists the option wherever it exists; a probe that cannot
-/// run at all answers with the modern form, since any render on that binary is
-/// about to fail the same way regardless.
+/// `-h full` still lists the option wherever it exists.
 fn graph_script_flag() -> &'static str {
     static FLAG: OnceLock<&'static str> = OnceLock::new();
     FLAG.get_or_init(|| {
-        let legacy = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-loglevel", "quiet", "-h", "full"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("-filter_complex_script"))
-            .unwrap_or(false);
+        let legacy = help_flags().filter_complex_script;
         tracing::debug!(legacy, "probed ffmpeg for -filter_complex_script");
         if legacy {
             "-filter_complex_script"
         } else {
             "-/filter_complex"
         }
+    })
+}
+
+/// The flag that sets how this ffmpeg paces output frames, given which of the two
+/// spellings its `-h full` lists (pure, unit-tested): `-fps_mode` since 5.1, which
+/// FFmpeg 9 is left with — it removed `-vsync`, `Unrecognized option` — and
+/// `-vsync` before that.
+fn fps_mode_flag_for(knows_fps_mode: bool, knows_vsync: bool) -> &'static str {
+    if knows_fps_mode || !knows_vsync {
+        "-fps_mode"
+    } else {
+        "-vsync"
+    }
+}
+
+/// [`fps_mode_flag_for`] for this machine's ffmpeg, probed once per process.
+fn fps_mode_flag() -> &'static str {
+    static FLAG: OnceLock<&'static str> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let help = help_flags();
+        fps_mode_flag_for(help.fps_mode, help.vsync)
     })
 }
 
@@ -4751,6 +4987,10 @@ struct ClipFx {
     /// chain. `None` for SDR — and for a preview asset swapped to its proxy,
     /// which was converted when it was encoded.
     hdr: Option<Hdr>,
+    /// The clip's input is a head-padded proxy (see [`is_head_padded_proxy`]). Read
+    /// from the start with no seek, such an input opens with the pad's clone of the
+    /// first frame, which the original it stands for has no frame for.
+    head_pad: bool,
 }
 
 /// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
@@ -4760,7 +5000,9 @@ fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let mut fx = vec![ClipFx::default(); total_clips];
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
-        fx[flat].hdr = assets.iter().find(|a| a.id == clip.asset_id).and_then(|a| a.hdr());
+        let asset = assets.iter().find(|a| a.id == clip.asset_id);
+        fx[flat].hdr = asset.and_then(|a| a.hdr());
+        fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
     }
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
     let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
@@ -5417,6 +5659,17 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     });
 
     let mut p: Vec<String> = Vec::new();
+    // A head-padded proxy opens with one clone of its first frame at time zero (see
+    // [`build_proxy_args`]), which a seek skips — and a read from the start does
+    // not. The original has no such frame: its first one is the real one, and the
+    // `setpts` below puts *that* at the clip's start. Dropping the clone first makes
+    // the proxy do the same, so a clip cut from the very head of a late-starting
+    // source plays the frames the export renders instead of `lead` seconds of the
+    // first frame held. Only a padded proxy gets the filter; every other input's
+    // chain is exactly what it was.
+    if fx.head_pad && !is_image && seek == 0.0 {
+        p.push("trim=start_frame=1".to_string());
+    }
     p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
     if clip.is_reversed() {
         p.push("reverse".to_string());
@@ -6317,7 +6570,7 @@ mod tests {
 
     #[test]
     fn proxy_args_are_all_intra_audioless_and_keep_timing() {
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "libx264", None, None);
+        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "libx264", None, None, None);
         // All-intra: every frame a keyframe, so a preview seek decodes one frame.
         let gop = args.iter().position(|a| a == "-g").expect("-g present");
         assert_eq!(args[gop + 1], "1");
@@ -6350,7 +6603,16 @@ mod tests {
     fn proxy_args_with_hw_encoder_spell_quality_per_family_and_stay_all_intra() {
         // NVENC: CRF intent becomes -rc vbr -cq, input format nv12, and the
         // all-intra / no-retime invariants hold exactly as in software.
-        let args = build_proxy_args("/in.mov", "/out.mp4", 3, PROXY_MAX_WIDTH, "h264_nvenc", Some("auto"), None);
+        let args = build_proxy_args(
+            "/in.mov",
+            "/out.mp4",
+            3,
+            PROXY_MAX_WIDTH,
+            "h264_nvenc",
+            Some("auto"),
+            None,
+            None,
+        );
         assert!(args.windows(2).any(|w| w[0] == "-hwaccel" && w[1] == "auto"));
         assert!(args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "h264_nvenc"));
         assert!(args.windows(2).any(|w| w[0] == "-cq" && w[1] == "24"));
@@ -6362,6 +6624,203 @@ mod tests {
         let hw = args.iter().position(|a| a == "-hwaccel").unwrap();
         let input = args.iter().position(|a| a == "-i").unwrap();
         assert!(hw < input);
+    }
+
+    #[test]
+    fn an_ordinary_proxy_is_the_same_argv_it_always_was() {
+        // Nothing here may change for a source that starts its video with its
+        // container: that is every file whose proxy is already cached and right.
+        assert_eq!(
+            build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None, None).join(" "),
+            "-hide_banner -loglevel error -y -i /in.mov -an \
+             -vf scale='min(1280,iw)':-2:flags=bilinear -c:v libx264 -preset veryfast -crf 24 \
+             -g 1 -threads 3 -pix_fmt yuv420p -f mp4 /out.mp4"
+        );
+    }
+
+    #[test]
+    fn a_late_video_start_is_filled_by_one_held_frame_and_keeps_every_timestamp() {
+        let args = build_proxy_args(
+            "/in.mov",
+            "/out.mp4",
+            3,
+            1280,
+            "libx264",
+            Some("auto"),
+            Some("TONEMAP"),
+            Some("-fps_mode"),
+        );
+        let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].as_str());
+        // One clone of the first frame at time zero, merged in by timestamp.
+        let graph = flag("-filter_complex").expect("a filter_complex");
+        assert!(
+            graph.contains("split[a][b]") && graph.contains("trim=end_frame=1,setpts=PTS-STARTPTS[h]"),
+            "{graph}"
+        );
+        assert!(graph.ends_with("[h][b]interleave[v]"), "{graph}");
+        // The downscale and the tone-map run once, before the split, so the clone is
+        // a proxy-sized SDR frame like the rest.
+        assert!(
+            graph.starts_with("[0:v:0]scale='min(1280,iw)':-2:flags=bilinear,TONEMAP,split"),
+            "{graph}"
+        );
+        assert_eq!(flag("-map"), Some("[v]"));
+        assert!(!args.contains(&"-vf".to_string()), "one chain, not two");
+        // Variable frame rate, spelled the way this ffmpeg takes it: cfr (every
+        // FFmpeg-6 mp4's default) would snap the frames to a grid again.
+        assert_eq!(flag("-fps_mode"), Some("vfr"));
+        assert!(!args.contains(&"cfr".to_string()));
+        // Everything else about the proxy is as ever: all-intra, no retime, no seek.
+        assert_eq!(flag("-g"), Some("1"));
+        assert!(args.contains(&"-an".to_string()));
+        assert!(!args.contains(&"-ss".to_string()) && !args.contains(&"-r".to_string()));
+        assert_eq!(args.last().unwrap(), "/out.mp4");
+        // The flag's spelling is the caller's, for a pre-5.1 ffmpeg.
+        let legacy = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None, Some("-vsync"));
+        assert!(legacy.windows(2).any(|w| w[0] == "-vsync" && w[1] == "vfr"));
+        // A hardware encoder only changes the encoder's own flags.
+        let nvenc = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "h264_nvenc", None, None, Some("-fps_mode"));
+        assert!(nvenc.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "nv12"));
+        assert!(nvenc.windows(2).any(|w| w[0] == "-fps_mode" && w[1] == "vfr"));
+    }
+
+    #[test]
+    fn head_lead_is_the_video_start_past_the_container_start() {
+        // Audio at 0 and video at 0.08 s.
+        assert!((head_lead(Some(0.08), Some(0.0)) - 0.08).abs() < 1e-12);
+        // Relative to the container, whatever clock it started on (an MPEG-TS
+        // capture begins at some arbitrary tens of seconds).
+        assert!((head_lead(Some(603.5), Some(600.0)) - 3.5).abs() < 1e-9);
+        // The video *is* the start, the video is early, or something is missing:
+        // no lead.
+        assert_eq!(head_lead(Some(0.0), Some(0.0)), 0.0);
+        assert_eq!(head_lead(Some(0.0), Some(0.5)), 0.0);
+        assert_eq!(head_lead(None, Some(0.0)), 0.0);
+        assert_eq!(head_lead(Some(1.0), None), 0.0);
+        assert!(needs_head_pad(0.08) && needs_head_pad(5.0));
+        assert!(!needs_head_pad(0.0) && !needs_head_pad(HEAD_PAD_MIN) && !needs_head_pad(0.0004));
+    }
+
+    #[test]
+    fn source_traits_reads_hdr_and_lead_from_one_probe() {
+        let json = r#"{"programs":[],"streams":[{"color_transfer":"arib-std-b67","start_time":"0.080013"}],
+                       "format":{"start_time":"0.000000"}}"#;
+        let t = parse_source_traits(json);
+        assert_eq!(t.hdr, Some(Hdr::Hlg));
+        assert!((t.lead - 0.080013).abs() < 1e-9);
+        let pq = parse_source_traits(r#"{"streams":[{"color_transfer":"smpte2084"}],"format":{"start_time":"0.0"}}"#);
+        assert_eq!((pq.hdr, pq.lead), (Some(Hdr::Pq), 0.0));
+        // `N/A` is left out by ffprobe's JSON writer; an unknown transfer is SDR.
+        let plain = parse_source_traits(r#"{"streams":[{"color_transfer":"bt709"}],"format":{"start_time":"0.000000"}}"#);
+        assert_eq!(plain, SourceTraits::default());
+        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), SourceTraits::default());
+        assert_eq!(parse_source_traits("not json"), SourceTraits::default());
+        // A transport stream (a camcorder's .mts / .m2ts) is reported as having no
+        // lead whatever its streams' starts say: a padded proxy cannot fix it, so it
+        // keeps the plain proxy and its key.
+        let ts = r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mpegts","start_time":"1.400000"}}"#;
+        assert_eq!(parse_source_traits(ts).lead, 0.0);
+        let mp4 =
+            r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"1.4"}}"#;
+        assert!((parse_source_traits(mp4).lead - 0.121333).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_proxy_is_rebuilt_only_for_the_sources_that_were_made_wrong() {
+        let src = "/media/a.mov|1234|99";
+        // The key of an ordinary SDR file with a normal start is what it has
+        // always been, so its cached proxy is still found.
+        assert_eq!(proxy_key(src, 1280, false, false), "/media/a.mov|1234|99|1280");
+        // The `|sdr` precedent, and the new suffix stacked after it.
+        assert_eq!(proxy_key(src, 1280, true, false), "/media/a.mov|1234|99|1280|sdr");
+        assert_eq!(proxy_key(src, 1280, false, true), "/media/a.mov|1234|99|1280|lead");
+        assert_eq!(proxy_key(src, 3072, true, true), "/media/a.mov|1234|99|3072|sdr|lead");
+        let keys = [
+            proxy_key(src, 1280, false, false),
+            proxy_key(src, 1280, true, false),
+            proxy_key(src, 1280, false, true),
+            proxy_key(src, 1280, true, true),
+        ];
+        let hashes: std::collections::HashSet<u64> = keys.iter().map(|k| fnv1a(k)).collect();
+        assert_eq!(hashes.len(), keys.len(), "every variant gets its own file");
+    }
+
+    #[test]
+    fn a_padded_proxy_is_told_by_its_name_and_nothing_else_is() {
+        assert_eq!(proxy_file_name(0xabc, false), "0000000000000abc.mp4");
+        assert_eq!(proxy_file_name(0xabc, true), "0000000000000abc.lead.mp4");
+        let padded = is_head_padded_proxy;
+        assert!(padded("/home/u/.cache/kerf/proxies/0000000000000abc.lead.mp4"));
+        #[cfg(windows)]
+        assert!(padded(r"C:\Users\u\AppData\Local\kerf\proxies\0123456789ABCDEF.lead.mp4"));
+        // The plain proxy of the same source, an original, a lookalike elsewhere and a
+        // name that is not a proxy's hash are none of them padded.
+        assert!(!padded("/home/u/.cache/kerf/proxies/0000000000000abc.mp4"));
+        assert!(!padded("/media/clip.mp4"));
+        assert!(!padded("/media/0000000000000abc.lead.mp4"));
+        assert!(!padded("/home/u/.cache/kerf/proxies/clip.lead.mp4"));
+        assert!(!padded("/home/u/.cache/kerf/proxies/0000000000000abcd.lead.mp4"));
+        assert!(!padded("/home/u/.cache/other/proxies/0000000000000abc.lead.mp4"));
+        // And the names `generate_proxy` writes, in the directory it writes them to,
+        // are the ones that read back.
+        if let Some(dir) = dirs::cache_dir().map(|d| d.join("kerf").join("proxies")) {
+            assert!(!is_head_padded_proxy(&dir.join(proxy_file_name(7, false)).to_string_lossy()));
+            assert!(is_head_padded_proxy(&dir.join(proxy_file_name(7, true)).to_string_lossy()));
+        }
+    }
+
+    /// A clip read from the very start of a padded proxy (no `-ss`) opens with the
+    /// pad's clone of the first frame, which the original it stands for has no
+    /// frame for: the chain drops it before the trim. A read that is seeked skips
+    /// the clone already, and anything that is not a padded proxy is untouched.
+    #[test]
+    fn a_head_clip_of_a_padded_proxy_drops_the_pads_clone_and_nothing_else_does() {
+        let proxy = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4";
+        let original = Asset {
+            path: "/media/clip.mp4".into(),
+            ..av_asset(Uuid::new_v4(), 30.0)
+        };
+        let padded = Asset {
+            path: proxy.into(),
+            ..original.clone()
+        };
+        let plain_proxy = Asset {
+            path: "/home/u/.cache/kerf/proxies/0123456789abcdef.mp4".into(),
+            ..original.clone()
+        };
+        let graph = |asset: &Asset, source_in: f64| {
+            let timeline = single(vec![make_clip(asset.id, source_in, source_in + 4.0, 0.0)]);
+            let args = build_preview_args(&timeline, std::slice::from_ref(asset), 0.0, 30.0, 960, 6).unwrap();
+            flag_val(&args, "-filter_complex").unwrap().to_string()
+        };
+        // From the head: the clone goes, ahead of the trim that rebases the clip.
+        let head = graph(&padded, 0.0);
+        assert!(head.contains("trim=start_frame=1,trim=start=0:end=4,"), "{head}");
+        // `clip_seek` treats a millisecond as the head too; just past it is seeked.
+        assert!(graph(&padded, 0.0005).contains("trim=start_frame=1,"));
+        assert!(!graph(&padded, 0.002).contains("start_frame"), "a seek skips the clone");
+        assert!(!graph(&padded, 1.5).contains("start_frame"));
+        // The same clip on the original, or on a proxy that was not padded: no filter,
+        // and the graph is the one it always was.
+        for asset in [&original, &plain_proxy] {
+            assert!(!graph(asset, 0.0).contains("start_frame"), "{asset:?}");
+        }
+        assert_eq!(graph(&original, 0.0), graph(&plain_proxy, 0.0));
+        // An export reads the original, so it never has one either way.
+        let timeline = single(vec![make_clip(original.id, 0.0, 4.0, 0.0)]);
+        let export = build_export_args(&timeline, &[original], "out.mp4", &ExportOptions::default()).unwrap();
+        assert!(!export.join(" ").contains("start_frame"));
+    }
+
+    #[test]
+    fn the_frame_sync_flag_is_spelled_the_way_this_ffmpeg_takes_it() {
+        // (knows -fps_mode, knows -vsync): FFmpeg 6 knows both; 9 removed -vsync;
+        // 4 predates -fps_mode.
+        assert_eq!(fps_mode_flag_for(true, true), "-fps_mode");
+        assert_eq!(fps_mode_flag_for(true, false), "-fps_mode");
+        assert_eq!(fps_mode_flag_for(false, true), "-vsync");
+        // A binary that would not run: the modern spelling, like every probe here.
+        assert_eq!(fps_mode_flag_for(false, false), "-fps_mode");
     }
 
     #[test]
@@ -6622,11 +7081,18 @@ mod tests {
         assert_eq!(proxy_width(Some(Projection::Flat)), PROXY_MAX_WIDTH);
         assert_eq!(proxy_width(Some(Projection::Equirect)), PROXY_MAX_WIDTH_SPHERICAL);
         assert_eq!(proxy_width(Some(Projection::DualFisheye)), PROXY_MAX_WIDTH_SPHERICAL);
-        assert!(
-            build_proxy_args("/in.mp4", "/out.mp4", 1, PROXY_MAX_WIDTH_SPHERICAL, "libx264", None, None)
-                .iter()
-                .any(|a| a.contains("scale='min(3072,iw)':-2"))
-        );
+        assert!(build_proxy_args(
+            "/in.mp4",
+            "/out.mp4",
+            1,
+            PROXY_MAX_WIDTH_SPHERICAL,
+            "libx264",
+            None,
+            None,
+            None
+        )
+        .iter()
+        .any(|a| a.contains("scale='min(3072,iw)':-2")));
         // Marking an asset as 360 must not silently reuse the small proxy that
         // was rendered while it looked flat, so the width is part of the key.
         if let (Some(flat), Some(sphere)) = (
@@ -10945,13 +11411,13 @@ mod tests {
             args.join(" ").contains("scale=240:-2:flags=bilinear,TONEMAP,tile=2x2"),
             "{args:?}"
         );
-        let proxy = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, Some("TONEMAP")).join(" ");
+        let proxy = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, Some("TONEMAP"), None).join(" ");
         assert!(
             proxy.contains("scale='min(1280,iw)':-2:flags=bilinear,TONEMAP -c:v libx264"),
             "{proxy}"
         );
         // SDR stays byte-identical.
-        let plain = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None).join(" ");
+        let plain = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None, None).join(" ");
         assert!(plain.contains("flags=bilinear -c:v libx264"), "{plain}");
     }
 
@@ -10982,6 +11448,16 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Deletes a file when dropped, pass or fail — for a proxy a test generated into
+    /// the user's own cache, which a failing assert must not leave behind.
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
     }
 
@@ -11221,6 +11697,175 @@ mod tests {
         assert!(!dump.contains("Display Matrix") && !dump.contains("\"rotate\""), "{dump}");
         assert_eq!((w, h), (rw, rh));
         assert_eq!(red_bar_edge(w, h, &rgb), red_bar_edge(rw, rh, &ref_rgb));
+    }
+
+    /// Six seconds of 30 fps video whose frames number themselves — bit `k` of the
+    /// frame number is the `k`-th eighth of the picture's width, white for 1 — so a
+    /// decoded frame says which source frame it is, however it was scaled or
+    /// compressed. The video starts `lead` seconds after the audio (an empty edit
+    /// in the mp4, the way a camera that opens its mic first writes it). `None`
+    /// when this ffmpeg cannot make the file.
+    fn late_barcode_clip(dir: &Scratch, name: &str, lead: f64) -> Option<PathBuf> {
+        let (video, audio, out) = (dir.join(&format!("v-{name}")), dir.join(&format!("a-{name}")), dir.join(name));
+        let bars = "color=c=black:s=640x360:r=30:d=6,format=yuv420p,\
+                    geq=lum='if(bitand(trunc(N/pow(2,trunc(X*8/W))),1),235,16)':cb=128:cr=128";
+        let delay = lead.to_string();
+        let ok = try_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            bars,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            video.to_str().unwrap(),
+        ]) && try_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=8",
+            "-c:a",
+            "aac",
+            audio.to_str().unwrap(),
+        ]) && try_ffmpeg(&[
+            "-itsoffset",
+            &delay,
+            "-i",
+            video.to_str().unwrap(),
+            "-i",
+            audio.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            out.to_str().unwrap(),
+        ]);
+        ok.then_some(out)
+    }
+
+    /// Which numbered frame of [`late_barcode_clip`] `path` answers a seek to `t` with,
+    /// through the same single-frame decode the preview scrubs with.
+    fn barcode_at(dir: &Scratch, path: &Path, t: f64) -> u32 {
+        let jpeg = frame_jpeg(path, t, 640, 2, true).expect("frame");
+        let file = dir.join("barcode.jpg");
+        std::fs::write(&file, jpeg).unwrap();
+        let (w, h, rgb) = rgb_frame(&file, None);
+        (0..8)
+            .filter(|k| rgb[((h / 2) * w + (2 * k + 1) * w / 16) * 3] > 125)
+            .map(|k| 1u32 << k)
+            .sum()
+    }
+
+    /// The presentation times of the first `n` video packets in `path`'s own clock.
+    fn first_packet_times(path: &Path, n: usize) -> Vec<f64> {
+        let out = command(&ffprobe_bin())
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time"])
+            .args(["-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .take(n)
+            .map(|l| l.trim().parse().expect("a packet time"))
+            .collect()
+    }
+
+    /// A source whose video starts after its audio. FFmpeg 7+ no longer pads such
+    /// a head when it writes the audio-less proxy, so the proxy's container began
+    /// at the video and `-ss T` on it landed `lead` seconds deeper into the footage
+    /// than `-ss T` on the original — preview and export showed different frames
+    /// (two at half a second in, a five-second slip for a five-second lead). The
+    /// leads are chosen to break each cheaper fix: 0.064 s is 1.92 frames, which
+    /// `-fps_mode cfr` rounds *up* and then seeks a frame early at every frame
+    /// boundary; 1.5 s is a gap long enough to see; 0 is the control — an ordinary
+    /// file whose proxy must come out exactly as before.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored late_starting_video`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn proxy_of_a_late_starting_video_answers_every_seek_like_the_original() {
+        let dir = Scratch::new("late-proxy");
+        let times = [
+            0.0, 0.01, 0.03, 0.05, 0.07, 0.1, 0.2, 0.5, 0.51, 1.0, 1.49, 1.51, 1.7, 3.333, 4.0, 5.9,
+        ];
+        for (i, lead) in [0.0, 0.064, 0.08, 1.5].into_iter().enumerate() {
+            let Some(media) = late_barcode_clip(&dir, &format!("late{i}.mp4"), lead) else {
+                skip("skipped: this ffmpeg cannot make the late-starting test clip");
+                return;
+            };
+            let traits = source_traits(&media).expect("probe");
+            assert_eq!(
+                needs_head_pad(traits.lead),
+                lead > 0.0,
+                "lead {lead}: the probe saw {}",
+                traits.lead
+            );
+            if lead > 0.0 {
+                assert!(
+                    (traits.lead - lead).abs() < 0.005,
+                    "lead {lead}: the probe saw {}",
+                    traits.lead
+                );
+            }
+
+            let proxy = generate_proxy(&media, PROXY_MAX_WIDTH).expect("proxy");
+            let _cleanup = RemoveOnDrop(proxy.clone());
+            assert_eq!(
+                is_head_padded_proxy(&proxy.to_string_lossy()),
+                lead > 0.0,
+                "lead {lead}: the name says whether the head was padded: {proxy:?}"
+            );
+            let mut seen = Vec::new();
+            for t in times {
+                let (want, got) = (barcode_at(&dir, &media, t), barcode_at(&dir, &proxy, t));
+                assert_eq!(
+                    got, want,
+                    "lead {lead}: a seek to {t}s lands on frame {got} of the proxy, {want} of the original"
+                );
+                seen.push(want);
+            }
+            assert!(seen.first() < seen.last(), "lead {lead}: the clip never moved: {seen:?}");
+
+            // The structure behind it: the proxy starts with its container, holding
+            // the first frame until the footage begins where the original does.
+            let (orig, prox) = (first_packet_times(&media, 1), first_packet_times(&proxy, 2));
+            let after = source_traits(&proxy).map(|t| t.lead).unwrap_or(f64::NAN);
+            assert_eq!(after, 0.0, "lead {lead}: the proxy's video starts with its container");
+            if lead > 0.0 {
+                assert_eq!(prox[0], 0.0);
+                assert!((prox[1] - orig[0]).abs() < 0.002, "lead {lead}: {prox:?} against {orig:?}");
+            } else {
+                assert_eq!(prox[0], orig[0], "an ordinary source is not given a pad");
+            }
+        }
+
+        // A transport stream cannot be fixed this way (its demuxer rebases a read with
+        // the audio discarded), so it is left alone: no lead, the plain proxy and key.
+        let ts = dir.join("late.ts");
+        let late = dir.join("late1.mp4");
+        if try_ffmpeg(&[
+            "-i",
+            late.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            ts.to_str().unwrap(),
+        ]) {
+            let traits = source_traits(&ts).expect("probe");
+            assert_eq!(traits.lead, 0.0, "a .ts is never padded");
+            let proxy = generate_proxy(&ts, PROXY_MAX_WIDTH).expect("proxy");
+            let _cleanup = RemoveOnDrop(proxy.clone());
+            assert!(!is_head_padded_proxy(&proxy.to_string_lossy()));
+        }
     }
 
     /// 10-bit HLG BT.2020 footage, made by re-encoding a tagged SDR test card, so

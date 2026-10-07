@@ -45,6 +45,46 @@ so the feature is **only** activated through these forwards — which is what ma
   gives 1280 normally but 3072 for a spherical asset, because reframing crops
   ~100° out of the sphere and would otherwise leave ~355 real pixels. That width
   is part of the cache key, so marking an asset 360 rebuilds its proxy.
+  **A proxy must answer `-ss T` with the frame the original does, including when
+  the video starts late**: ffmpeg's input `-ss` is relative to the *container's*
+  start (its earliest stream), and a proxy is video-only, so for a source whose
+  video starts after its audio (`head_lead` = video start − container start,
+  above 1 ms; audio at 0, video at 0.08 s) a plain proxy starts at the video and
+  every seek lands `lead` seconds deeper into the footage than the export's.
+  FFmpeg ≤ 6 hid this by accident (its default cfr mp4 sync pads the head, but
+  regrids every frame to a grid anchored at zero — half a frame off for most
+  leads, so still a frame out at every boundary); FFmpeg 7+ defaults an mp4 to
+  vfr and keeps the late start, so the bundled 9.0 proxies were two frames out at
+  half a second (a five-second lead: five seconds). `build_proxy_args(head_pad)`
+  fixes only those sources: one clone of the first frame at t=0, merged in front
+  of the stream by `interleave` (orders by timestamp, µs time base, so every
+  other frame keeps its exact pts), with `-fps_mode vfr` spelled by
+  `fps_mode_flag()` (`-vsync` before 5.1; 9.0 removed it). Not `-fps_mode cfr`:
+  that regrids every frame and turns variable-frame-rate phone footage constant.
+  The key gains `|lead` for these sources only (every ordinary file's key is
+  unchanged, so nothing else is rebuilt) and the file is named `<hash>.lead.mp4`:
+  that it is padded is a fact about the *file*, so it travels in the name
+  (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
+  path. `source_traits` is the one cached ffprobe per file that answers HDR, the
+  lead and the container. The clone is a frame the original has no counterpart
+  for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
+  from the very head of the source) would hold it for `lead` while the export
+  starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
+  input's name and `video_clip_chain` opens that chain with `trim=start_frame=1`.
+  Any seeked read skips the clone already. Ordinary assets get no such filter and
+  an unchanged argv. A padded proxy never takes a hardware encoder (its output
+  has no frame rate for the encoder to be told, and one refusal disables HW
+  encode process-wide). **MPEG-TS is not fixed and is left alone**
+  (`.ts`/`.mts`/`.m2ts`, `format_name` `mpegts`: lead reported 0, plain proxy,
+  unchanged key): the TS demuxer measures the container start over the streams it
+  reads, so the audio-less read rebases the video to zero and no pad can restore
+  the original's offset — a late-starting transport stream still previews its
+  seeks `lead` off. **Known export issue, not fixed here**: the export itself
+  rebases a head clip's first video frame to the clip start (`trim=start=0` then
+  `setpts=PTS-STARTPTS`), so for a late-start source a clip cut from the head has
+  its video `lead` early against its own audio (the preview now matches the
+  export, not the source's true sync); only clips that start past the lead are in
+  sync.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
   encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
   each compiled-in candidate is verified with a one-frame test encode, because
@@ -267,7 +307,8 @@ so the feature is **only** activated through these forwards — which is what ma
   runs on delivery-sized, kept frames — and before any colour work; the composited
   still prefixes it per clip. The *single-input* decodes (`decode_frame`,
   `contact_sheet`, `generate_proxy`) have only a path, so they ask `source_hdr`
-  (one cached ffprobe per file) and append the chain after their own downscale.
+  (a view of `source_traits`, one cached ffprobe per file) and append the chain
+  after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
   frames. **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
@@ -1212,7 +1253,7 @@ the user has not got.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch` (a `LaunchSlot`), and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted before the page has a listener is lost. It returns `{open: path}` once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. **A second launch that arrives while the webview is still booting** would hit the same lost event, so until the webview has asked the slot *holds* its request instead (newest wins; one lock covers both halves, so a request is delivered exactly one way) and only afterwards is it emitted. A `.kerf` argument naming nothing on disk is never opened — `Project::open` would *create* it — and comes back as `{missing: path}` (second launch: the `launch-project-missing` event), which the page toasts as `File not found: …`. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`: two animation frames *or* a 150 ms timer, since a hidden page may never get a frame), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up) — but only a `show` that *worked* (a window existed and `show()` succeeded) keeps the claim, so a request that finds no window gives it back and the failsafe retries every 500 ms. A second launch always brings the window forward (`unminimize` + `show` + `set_focus`) and marks the reveal done only if that worked — it can run before the config windows exist, and then the failsafe is still armed. It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). **Not verifiable without a display**: whether the *first visible frame* is already painted when `show()` lands (a hidden window may not render until shown, which is why `backgroundColor` exists) and how long the timer-vs-frame race takes per OS — check both on a real desktop. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
@@ -1271,13 +1312,14 @@ the engine, the cores it works out to, and the machine it is a share of —
 of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
 The file also carries the **workspaces** (which one is active, each one's
-dock arrangement, the library rail's tab and folded state), the **color theme**
-and `layout` — the single arrangement from before there were workspaces, now only
-migrated from — as opaque `serde_json::Value`s: the frontend owns their shape and
+dock arrangement, the library rail's tab and folded state), the **color theme**,
+the **keybindings** the user changed and `layout` — the single arrangement from
+before there were workspaces, now only migrated from — as opaque
+`serde_json::Value`s: the frontend owns their shape and
 validates them on the way back in, so `get_settings` re-reads the file for those
 where the engine-held values are read live). **`set_settings` takes a patch**,
 not the whole object — only the fields that changed (`{workspaces}`, `{theme}`,
-`{cpu_percent}`), merged into the file under a mutex, and only those fields are
+`{keybindings}`, `{cpu_percent}`), merged into the file under a mutex, and only those fields are
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
 directory, fsync, rename over), and a file that does not parse is moved aside to
@@ -1302,7 +1344,7 @@ ffmpeg error when a stream someone is still watching dies, so the preview can sa
 why it went black. **Logging** (`init_logging`): stdout plus a daily-rolling `kerf.<date>.log` (14 kept) in
 `<app data dir>/logs` — `log_dir_path` is the one place that is decided, shared by
 `init_logging`, `log_dir` and `reveal_logs`; if it is not writable the app logs to stdout
-only. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
+only. **The file layer is synchronous**: the `RollingFileAppender` is the layer's writer directly (`file_layer`), one `write` per event, not behind `tracing_appender::non_blocking`. That queue's worker thread is what a hard crash takes the last lines with — an aborting panic, `process::exit`, or a segfault in FFmpeg / ONNX Runtime never reaches a `WorkerGuard`'s `Drop`, a flush in the panic hook would not cover them, and dropping the guard there would silence logging for the rest of a session after a panic on a thread that does not end the process. Logging is a few dozen lines a session, none in a hot loop, so a syscall each is free. Two Rust tests hold it: `a_line_is_on_disk_the_moment_logging_returns` logs and reads straight back 40 times (a queue-backed writer fails it every time), and a child process that logs a burst and `process::exit(1)`s (no destructors, so anything *buffered* is lost — `abort()` would be more literal but raises apport / WER / ReportCrash; `exit` is not enough to catch a queue, which drains during it). `log_panic` / `panic_summary` are what the panic hook writes. `RunEvent::Exit` logs `kerf exiting`, and `installUpdate` logs a line first, but neither makes the end of a log conclusive: the Windows updater install calls `process::exit` past `RunEvent::Exit`, and End Task / SIGTERM skip it — a log that ends without `kerf exiting` *may* have crashed, and one that ends in an update line did not. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
 directories (never env dumps or args). Failures reach the file from three places:
 Tauri commands return plain `String` errors that Tauri offers no hook to observe, so the
 single `invoke` wrapper in `api.ts` forwards every rejection (command name + message,
@@ -1445,9 +1487,38 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
   pseudo-elements) from those variables, with `--slider-accent` as the one
   per-slider choice; changing a shape value makes the theme `Custom`, and
-  High contrast ships thicker lines. `app.html` still paints dark before hydration. That file is also the
-  `tailwind.css` in `components.json`. Run `bunx shadcn-svelte add <name>` to
-  add primitives.
+  High contrast ships thicker lines. `app.html` paints Kerf Dark before hydration
+  (and the desktop window stays hidden until the theme is applied — see kerf-app).
+  **Two bun guards keep this true** (`theme-guard.test.ts`): a scan fails on any
+  color literal (`#hex`, `rgb()`, `hsl()`, …) in `src/` outside `theme.ts`,
+  `kerf-tokens.css`, `app.html` (pinned to Kerf Dark's `surface-app`, as is the
+  window's `backgroundColor`) and the two browser-harness image generators
+  (`sample-frame.ts`, `sample-filmstrip.ts`, whose colors are picture, not
+  interface); and every preset must meet WCAG contrast (`contrast.ts`) for the
+  pairs the UI draws — 4.5:1 for reading text and the labels on solid fills
+  (`text-primary` / `-secondary` on every surface, `text-muted` on the resting
+  ones, `text-on-accent`, `agent-fg`, `text-on-video` on the clip bodies), 3:1 for
+  muted text on hover / active, accent and status hues as text on the panels and
+  the strokes that carry meaning (clip edges, the playhead / selection amber, the
+  waveform, the drag ghost), plus the `color-mix` fill of a generated caption's
+  block (`GENERATED_TITLE_FILL`, resolved per preset by `mixSrgb` and held to 4.5
+  under its label). `text-disabled` is exempt on a *disabled* control but the UI
+  also draws the idle state of live toggles in it (DUCK / S / L, the bell), so it
+  is held to 3:1 on the resting surfaces; the translucent hairlines are exempt.
+  High contrast is also held to 7:1 on its reading text. The pair list
+  and its reasoning live at the top of that test; a failing preset gets its
+  *values* fixed, not the list. Writing it found real defects — Kerf Light's clip
+  bodies were pale under white labels (1.5:1), the logo mark was a hard-coded
+  near-white that vanished on Light, and five dialogs carried a dead `rgba`
+  shadow fallback — so Light's clip fills, waveform, amber, three status hues,
+  muted text, disabled text and `agent-fg` were adjusted (Dark and High contrast
+  passed as they were). **A stored theme is a copy**, so users who had picked Kerf
+  Light kept the old colors: `upgradeStoredTheme` (on what `settings` reads back,
+  never on an import) moves a theme whose colors are *exactly* a
+  `SUPERSEDED_KERF_LIGHT` set to the current preset — name and shape kept — and
+  leaves anything else alone; whenever Light's colors change again, the outgoing
+  set goes on that list. `layout.css` is also the `tailwind.css` in `components.json`. Run
+  `bunx shadcn-svelte add <name>` to add primitives.
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
@@ -1940,11 +2011,12 @@ engine. Below the queue, the **History** section renders
 
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close), and `+page.svelte` makes the app behind them `inert` and returns early from
-its global key handler while any is open — Space / Delete / J-K-L / ⌘Z would
+close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
+which focuses itself) `inert` and returns early from its global key handler while
+any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
-Bare-key shortcuts already stand down inside any text input / textarea / select /
-contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
+Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
+textarea / select / contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
@@ -1972,9 +2044,48 @@ notice was about. It is also why the failure paths that used to reject into noth
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
 calls) now report: a notice that is never raised cannot be recovered from a log.
 
+**Keyboard shortcuts are an action registry, not key checks.** `src/lib/keymap.ts`
+(pure, bun-tested) names every shortcut as an action — id, label, group, default
+chord(s) — and `+page.svelte`'s one window handler asks `settings.actionFor(e)`
+which action an event is and runs that id's entry in a `Record<ActionId, handler>`
+(an action without a handler is a type error; a handler returns `false` when it
+did not take the key). Nothing else spells a key: menus and tooltips read
+`settings.shortcut(id)` / `withShortcut(label, id)`, and `keymap.test.ts` scans the
+sources so a hand-written `(⌘Z)` or `shortcut: 'Del'` fails. Chords match what the
+key *types* (`KeyboardEvent.key`, so AZERTY / Dvorak get their Z; a non-ASCII
+character falls back to the physical key's US letter; Shift is dropped from
+punctuation, since `+` is Shift+= on one layout and bare on another; a key that
+would not read back from its stored spelling — `ß`, macOS's no-break space for ⌥Space
+(which is `Space`) — is never recorded as something that silently vanishes). `Mod` in the
+stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* its
+modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
+`keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
+stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone).
+**Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
+like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
+nothing is customised), so an untouched action follows the running build's defaults
+and changing a default needs no migration; `KEYMAP_VERSION` / `MIGRATIONS` carry a
+customisation across a rename or split, and `parseKeyOverrides` drops unknown ids
+and unreadable chords and forgets anything equal to the defaults (a stored `[]` is
+a deliberate unbind). `resolveBindings` keeps what fires unambiguous: a customised
+chord beats another action's *default* (a later build's new default never steals a
+key already in use), and any other collision goes to the earlier registry entry.
+An action marked `repeat: false` (paste, duplicate, marker, ripple toggle, play /
+pause, the file commands, …) acts once per press — the page swallows a held key's
+auto-repeat — while stepping, zooming and undo keep repeating.
+**Settings › Keyboard** (`KeyboardSettings.svelte`) is search, click-to-record
+(Esc cancels, Backspace removes, Tab leaves), a conflict prompt naming the other
+action with Swap / Unbind / Cancel (`applyRebind` never guesses; Cancel has the
+focus, so a held Enter cannot answer it), per-row Reset — on offer whenever the
+chords in force differ from the defaults, and asking the same question when another
+action has since taken one (`applyReset`) — and Reset all, and a read-only list of the keys that are *not* rebindable (Esc
+abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
+control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
+after every change: focus left on the page behind a modal stops Escape closing it.
+
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Four
+panel, so the next preference is a row in a list rather than new chrome. Five
 sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
@@ -1995,10 +2106,10 @@ at once (`applyTheme`) and is written 300 ms later — a picker fires per pixel
 of a drag — and while one is pending a view coming back from another write
 leaves the theme alone, so the newer colors never flicker back. Changing any
 color makes the theme `Custom` (`presetIdFor` compares colors, not the name).
-The percentage is clamped by the engine, so the
+And **Keyboard**, described above. The percentage is clamped by the engine, so the
 view that comes *back* from `set_settings` is what renders, not the value asked
 for; in the browser harness `api.ts` answers from localStorage
-(`kerf.settings.*`, the layout and theme as JSON strings) over
+(`kerf.settings.*`, the layout, theme, workspaces and keybindings as JSON strings) over
 `navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,

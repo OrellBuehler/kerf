@@ -392,16 +392,16 @@
 			{
 				label: ui.playing ? 'Pause' : 'Play',
 				icon: ui.playing ? 'pause' : 'play',
-				shortcut: 'Space',
+				shortcut: settings.shortcut('playback.toggle'),
 				disabled: empty,
 				action: () => ui.togglePlay()
 			},
 			{ type: 'separator' },
-			{ label: 'Go to start', icon: 'skip-back', shortcut: 'Home', disabled: empty, action: () => ui.seek(0) },
+			{ label: 'Go to start', icon: 'skip-back', shortcut: settings.shortcut('playback.toStart'), disabled: empty, action: () => ui.seek(0) },
 			{
 				label: 'Go to end',
 				icon: 'skip-forward',
-				shortcut: 'End',
+				shortcut: settings.shortcut('playback.toEnd'),
 				disabled: empty,
 				action: () => ui.seek(editor.duration)
 			},
