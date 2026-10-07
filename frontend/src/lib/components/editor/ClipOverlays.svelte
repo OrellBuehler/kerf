@@ -12,7 +12,8 @@
 	 *    volume line's grab band stops short of them;
 	 *  - none of it is hit-testable until the clip is hovered or selected (an
 	 *    invisible 10 px band across every clip would change where a plain drag
-	 *    starts), and none of it exists under the razor, which cuts anywhere;
+	 *    starts), and none of it exists under any tool but Select: the razor cuts
+	 *    anywhere, and roll / slip / slide own the whole clip body;
 	 *  - a locked track keeps its keyframes clickable (that only seeks) and loses
 	 *    the rest.
 	 *
@@ -39,7 +40,7 @@
 		sound,
 		selected,
 		locked,
-		razor,
+		tooled,
 		trimEdge = null,
 		onlive,
 		onselect,
@@ -58,8 +59,9 @@
 		sound: boolean;
 		selected: boolean;
 		locked: boolean;
-		/** The razor tool is active: nothing here is grabbable. */
-		razor: boolean;
+		/** A tool other than Select is active (razor, roll, slip, slide): it owns the
+		 *  whole clip, so nothing here is grabbable. */
+		tooled: boolean;
 		/** The edge being trimmed right now, so its halo stays lit under the pointer. */
 		trimEdge?: 'l' | 'r' | null;
 		/** Told the clip's volume while the line is being dragged, `null` when it is not —
@@ -107,7 +109,7 @@
 
 	const dur = $derived(clipDuration(clip));
 	const roomy = $derived(width >= 44 && height >= 28);
-	const interactive = $derived(!locked && !razor);
+	const interactive = $derived(!locked && !tooled);
 	const fadeIn = $derived(liveFade.in ?? clip.fade_in ?? 0);
 	const fadeOut = $derived(liveFade.out ?? clip.fade_out ?? 0);
 	const fadeInPx = $derived(Math.min(fadeIn * pxPerSec, width));
@@ -293,7 +295,7 @@
 		<div
 			role="presentation"
 			class="kf"
-			class:blocked={razor}
+			class:blocked={tooled}
 			title="Keyframe at {stamp(k.time)} — click to go there"
 			onpointerdown={stop}
 			onclick={(e) => onKeyframeClick(e, k)}
@@ -303,7 +305,7 @@
 		</div>
 	{/each}
 
-	{#if !razor && width > 24}
+	{#if !tooled && width > 24}
 		<div
 			role="presentation"
 			class="edge l"

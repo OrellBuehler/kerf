@@ -60,7 +60,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 
 | | |
 | --- | --- |
-| **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, ripple delete, markers, mute/solo/lock, snapping to edges / playhead / **beats**. |
+| **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, **roll / slip / slide** trim tools, trim-to-playhead, ripple delete, markers, mute/solo/lock, snapping to edges / playhead / **beats**. |
 | **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle and audible Web-Audio scrub. |
 | **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
 | **Smart crop** | Reshaping 16:9 to 9:16 throws away most of one axis. `smart_crop` samples where each shot's content actually is (edge detail + motion, no model to ship) and writes the crop that keeps it, per clip — an ordinary transform the sliders can still override. |
@@ -150,7 +150,8 @@ frame at full source detail.
 <details>
 <summary><b>Cut & arrange</b></summary>
 
-`cut_clip` · `add_clip_to_timeline` · `split_at` · `trim` · `reorder` · `move_clip` ·
+`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `trim` · `roll_edit` ·
+`slip_clip` · `slide_clip` · `reorder` · `move_clip` ·
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·

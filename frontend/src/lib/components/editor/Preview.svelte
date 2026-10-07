@@ -3,6 +3,7 @@
 	import Icon from './Icon.svelte';
 	import { formatTimecode } from '$lib/timecode';
 	import Badge from './Badge.svelte';
+	import TrimMonitor from './TrimMonitor.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -513,6 +514,11 @@
 							</div>
 						{/each}
 					</div>
+				{/if}
+				<!-- A roll, slip or slide being dragged: the frames either side of the edit
+				     stand in for the playhead's frame until it is let go. -->
+				{#if ui.trimMonitor}
+					<TrimMonitor monitor={ui.trimMonitor} />
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>

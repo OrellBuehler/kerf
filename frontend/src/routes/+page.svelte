@@ -19,7 +19,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { cutSelection, deleteSelection } from '$lib/ops';
+	import { cutSelection, deleteSelection, trimSelection } from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
@@ -356,6 +356,10 @@
 				.catch(clipErr),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
+		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
+		// why when there is nothing to cut, so neither returns `false`.
+		'edit.trimStart': () => void trimSelection('left'),
+		'edit.trimEnd': () => void trimSelection('right'),
 		'edit.clearSelection': () => {
 			// Whatever else Escape is for gets it first: a menu or the notification
 			// panel closing, a drag being abandoned (those stop the event; a dialog
@@ -370,6 +374,15 @@
 		},
 		'tool.razor': () => {
 			ui.tool = 'razor';
+		},
+		'tool.roll': () => {
+			ui.tool = 'roll';
+		},
+		'tool.slip': () => {
+			ui.tool = 'slip';
+		},
+		'tool.slide': () => {
+			ui.tool = 'slide';
 		},
 		// A project setting: the registry marks it `repeat: false`, so a held key
 		// does not flip it back and forth.
