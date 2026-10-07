@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
-use kerf_core::{RenderPlan, YuvMatrix};
+use kerf_core::{GpuCaps, RenderPlan, YuvMatrix};
 use wgpu::util::DeviceExt;
 
 use crate::eq;
@@ -235,6 +235,14 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 }
 
 impl Compositor {
+    /// What this compositor draws exactly, as data: the plan refuses (through
+    /// [`RenderPlan::reasons`]) whatever is not in it. Today that is [`GpuCaps::A0`] —
+    /// layers, transform, crop, fit, `eq`, opacity, stills and sampled keyframes; each
+    /// later pass flips its bit beside the pass and its parity cases.
+    pub fn caps(&self) -> GpuCaps {
+        GpuCaps::A0
+    }
+
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —
     /// when the device rejects the shader or a pipeline, or is already lost.
     pub fn new(gpu: Arc<Gpu>) -> Result<Self, GpuError> {
@@ -712,9 +720,9 @@ impl Compositor {
         size: (u32, u32),
         output: Output,
     ) -> Result<RgbaFrame, GpuError> {
-        let reasons = plan.unsupported_reasons_at(size);
+        let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
-            return Err(GpuError::Unsupported(reasons.join("; ")));
+            return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
         if frames.len() != plan.layers.len() {
             return Err(GpuError::Decode(format!(
@@ -1103,9 +1111,9 @@ impl Compositor {
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
     /// timing the two halves apart.
     pub fn render_plan(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(RgbaFrame, RenderTimings), GpuError> {
-        let reasons = plan.unsupported_reasons_at(size);
+        let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
-            return Err(GpuError::Unsupported(reasons.join("; ")));
+            return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
         let t0 = Instant::now();
         let frames = decode_layers(&plan.layers)?;
@@ -1120,6 +1128,10 @@ impl Compositor {
             },
         ))
     }
+}
+
+fn join_reasons(reasons: &[kerf_core::Unsupported]) -> String {
+    reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 }
 
 /// A scale stage as one plane sees it.

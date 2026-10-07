@@ -3157,6 +3157,11 @@ pub(crate) struct RenderGeometry {
     pub fit: Fit,
     /// The export's `scaler` as chosen (`None` is swscale's bicubic default).
     pub scaler: Option<String>,
+    /// The output rate, exactly as the graph's `fps=` / `color=r=` print it (`{}` of
+    /// this `f64`, which FFmpeg parses back to a rational).
+    pub fps: f64,
+    /// The delivery's terminal pixel format (`format=` in the graph).
+    pub pix_fmt: String,
 }
 
 pub(crate) fn render_geometry(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> RenderGeometry {
@@ -3166,6 +3171,8 @@ pub(crate) fn render_geometry(timeline: &Timeline, assets: &[Asset], opts: &Expo
         height: f.height,
         fit: f.fit,
         scaler: f.scaler,
+        fps: f.fps,
+        pix_fmt: f.pix_fmt,
     }
 }
 
@@ -5091,7 +5098,7 @@ fn video_effect_filter(e: &VideoEffect) -> Option<String> {
 /// `fontcolor=`/`bordercolor=`/`boxcolor=`/`chromakey=` unquoted — like every
 /// other free-form string spliced into this graph, a comma or colon here would
 /// start a new filter node or option instead of naming a colour.
-fn valid_color(s: &str) -> bool {
+pub(crate) fn valid_color(s: &str) -> bool {
     let (base, alpha) = s.split_once('@').map_or((s, None), |(b, a)| (b, Some(a)));
     if let Some(a) = alpha {
         if a.is_empty() || a.matches('.').count() > 1 || !a.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -5110,7 +5117,7 @@ fn valid_color(s: &str) -> bool {
 /// `s` if [`valid_color`], else `fallback` — the safe way to splice a
 /// caller-controlled colour into a filter value; rendering must never fail or
 /// inject over a bad one.
-fn safe_color<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+pub(crate) fn safe_color<'a>(s: &'a str, fallback: &'a str) -> &'a str {
     if valid_color(s) {
         s
     } else {
@@ -6198,6 +6205,10 @@ mod golden;
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
+
+/// The export plan against the *evaluated* export graph, on a grid of frames.
+#[cfg(test)]
+mod sweep;
 
 #[cfg(test)]
 mod tests {
