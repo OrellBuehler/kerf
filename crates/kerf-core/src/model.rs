@@ -2094,6 +2094,22 @@ pub struct Clip {
     /// render graph is built — the per-clip counterpart of muting a track.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub enabled: bool,
+    /// The link group this clip belongs to: clips sharing a `link_id` are one
+    /// piece of material — a picture and the sound that goes with it — and an
+    /// edit to one is carried to the others (see [`Timeline::link_partners`] and
+    /// the `links` module). At most one clip of a group per track. Never part of
+    /// the render graph; `None` (omitted from the file) is an unlinked clip, which
+    /// is every clip a project made before links existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<Uuid>,
+    /// Whether the clip plays the audio of its *own* asset. A video clip's
+    /// footage normally carries its sound with it; `false` mutes just that —
+    /// the picture is untouched — which is how a clip's sound is **detached**
+    /// onto an audio track (`Project::detach_audio`) without being heard twice.
+    /// Defaulted and omitted at `true`, so every graph written before the field
+    /// existed is byte-identical.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub source_audio: bool,
 }
 
 fn yes() -> bool {
@@ -2131,6 +2147,8 @@ impl Clip {
             mask: None,
             framings: Vec::new(),
             enabled: true,
+            link_id: None,
+            source_audio: true,
         }
     }
 
@@ -2248,6 +2266,18 @@ impl Clip {
             source - self.source_in
         };
         self.timeline_start + offset / self.speed_mag()
+    }
+
+    /// The source timestamp playing at timeline time `time` — the inverse of
+    /// [`Clip::source_to_timeline`], honoring speed and reverse. Not clamped to the
+    /// clip's window.
+    pub fn timeline_to_source(&self, time: f64) -> f64 {
+        let along = (time - self.timeline_start) * self.speed_mag();
+        if self.is_reversed() {
+            self.source_out - along
+        } else {
+            self.source_in + along
+        }
     }
 
     /// True when any part of the source span `[from, to)` is inside this clip's
@@ -3287,6 +3317,9 @@ impl Timeline {
     }
 }
 
+mod links;
+pub use links::Detached;
+
 // ---- ripple ----------------------------------------------------------------
 
 impl Timeline {
@@ -3332,9 +3365,11 @@ impl Timeline {
     /// * **An edit that already rippled is not rippled twice.** A clip the edit
     ///   itself moved is not a follower, so `ripple_delete` and `cut_clip_range`
     ///   (whose later clips are all moved) come back unchanged.
-    /// * **Tracks are independent** — a ripple on `V1` never moves `A1`, there
-    ///   is no sync lock — and a **locked** track never moves (an edit to it is
-    ///   left as made). **Overlays and markers do not move** either; they are
+    /// * **Tracks are independent — except for linked clips.** A ripple on `V1`
+    ///   does not move the rest of `A1`, but a clip it moved takes its *linked
+    ///   partners* along by the same amount (the sync lock, see
+    ///   `Timeline::follow_links`); a **locked** track never moves (an edit to it
+    ///   is left as made). **Overlays and markers do not move** either; they are
     ///   timeline-level, not track-level, and rippling titles can come later.
     ///
     /// **It never produces an overlap.** If shifting the followers (or restoring
@@ -3346,6 +3381,15 @@ impl Timeline {
     ///
     /// Pure, and the identity when nothing about any track's timing changed.
     pub fn ripple_from(&self, before: &Timeline) -> Timeline {
+        self.ripple_from_with(before, true)
+    }
+
+    /// [`Timeline::ripple_from`] with the sync lock for linked material made
+    /// explicit: with `links` on, a clip the ripple moved drags its linked partners
+    /// on other tracks along by the same amount (see `Timeline::follow_links`) —
+    /// the picture's sound stays with it even when the sound's own track had
+    /// nothing to ripple. With `links` off, tracks are independent.
+    pub fn ripple_from_with(&self, before: &Timeline, links: bool) -> Timeline {
         let in_before: HashSet<Uuid> = before.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
         let in_after: HashSet<Uuid> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
         let mut out = self.clone();
@@ -3359,6 +3403,9 @@ impl Timeline {
             if let Some(rippled) = ripple_track(track, prior, &in_before, &in_after) {
                 *track = rippled;
             }
+        }
+        if links {
+            out.follow_links(self, before);
         }
         out
     }
@@ -4677,6 +4724,21 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     }
     if before.enabled != after.enabled {
         parts.push(if after.enabled { "re-enabled" } else { "disabled" }.to_string());
+    }
+    // Links and the detached-sound flag are edits too: without these a proposal
+    // that only links two clips diffs as empty and `apply_staged` discards it.
+    if before.source_audio != after.source_audio {
+        parts.push(if after.source_audio { "own sound on" } else { "own sound off" }.to_string());
+    }
+    if before.link_id != after.link_id {
+        parts.push(
+            match (before.link_id, after.link_id) {
+                (_, None) => "unlinked",
+                (None, Some(_)) => "linked",
+                (Some(_), Some(_)) => "relinked",
+            }
+            .to_string(),
+        );
     }
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));

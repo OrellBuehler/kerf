@@ -21,7 +21,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | A6 Headless agent rendering | — | — | todo | |
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Open: linked A/V + detach audio (verify `extract_audio` doubling), blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done (core + surfaces, UI still to come): linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, sync-lock ripple, `extract_audio` doubling verified +6.02 dB and fixed). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -131,6 +131,25 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   GPU.
 - **2026-10-07 — edit modes act per track.** Roll/slip/slide don't move a
   linked partner (no sync lock until linked A/V lands).
+  **Superseded 2026-10-07 (`feat/linked-av`):** with links in force they act on the
+  group — roll rolls each partner pair sharing the cut, slip and slide move every
+  partner, and the whole edit clamps to the tightest member.
+- **2026-10-07 — linked A/V (core + surfaces).** `Clip.link_id` (identity, at most one
+  clip per track) and `Clip.source_audio` (omitted at `true`; only `false` reaches the
+  graph, as a drop from the audio mix, so the golden oracle did not move). Links are on
+  by default and per call `link: false` (`Project::with_links`) is the escape hatch —
+  no project-wide switch. A linked edit is a group edit: all or nothing, a locked
+  partner refuses it. Ripple scope changed: tracks stay independent **except** that a
+  clip the ripple pushed drags its linked partners by the same amount (clips only,
+  never the lane). `reorder`, property edits and captions are deliberately not
+  link-aware. Imports / `cut_clip` / `add_clip` still do not auto-link an A/V asset's
+  sound (follow-up option).
+- **2026-10-07 — `extract_audio` doubled the sound, measured.** The export mixes every
+  clip whose asset has audio, video tracks included, so appending the asset's audio
+  with its picture still on V1 was +6.02 dB over the clip alone (real render, ffmpeg
+  6.1). `extract_audio(asset)` now detaches the asset's cut picture clips and only
+  appends when none is on the timeline; the per-clip form is `detach_audio`. The
+  sample project seeded the doubled shape; it now seeds the detached-then-unlinked one.
 
 ## Needs a real machine
 

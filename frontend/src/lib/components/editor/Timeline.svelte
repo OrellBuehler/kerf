@@ -1720,8 +1720,8 @@
 		     is lit while on, with a second cue in the ruler corner. -->
 		<button
 			title={editor.rippleMode
-				? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own: there is no sync lock yet, so linked audio and video do not move together.`
-				: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own (no sync lock yet).`}
+				? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
+				: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
 			aria-pressed={editor.rippleMode}
 			onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
 			style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode

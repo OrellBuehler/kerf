@@ -772,8 +772,10 @@ no editing logic in the adapter.
   over the footage the other half gave up, and they cancel); **moves never ripple**
   (a clip that merely changed its start or track is not "footage ahead");
   **clips the edit itself moved are not followers**, so an op that already closes
-  the gap is not shifted twice; tracks are **independent** (no sync lock — a V1
-  ripple leaves A1 where it is, which is why linked A/V is its own backlog item),
+  the gap is not shifted twice; tracks are **independent — except for linked
+  clips**: a clip the ripple moved takes its *linked partners* along by the same
+  amount (the sync lock, `follow_links`; only clips follow, never the rest of the
+  partner's lane — see Linked A/V below),
   a **locked track never moves**, and overlays / markers do not move. It **never
   produces an overlap**: if shifting would leave a touched clip overlapping
   another or before 0 (an add that lands *inside* a clip would need a split), that
@@ -826,6 +828,62 @@ no editing logic in the adapter.
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Linked A/V** (`model/links.rs`, pure + unit-tested; a child module of `model`) is a
+  picture and its sound as one piece of material. **`Clip.link_id`** joins clips into a
+  group (at most one clip per track; omitted when `None`); **`Clip.source_audio`**
+  (default `true`, omitted) is whether the clip plays the audio of its *own* asset. Only
+  `source_audio: false` reaches the graph — `clip_sounds` (`engine/cli.rs`) drops the clip
+  from the audio mix, in the export gating, `validate_export` and `cut_summary` — so
+  every existing graph is byte-identical and the golden oracle did not move.
+  **The `extract_audio` doubling was verified, then fixed.** The export mixes the audio
+  of every clip whose asset has an audio stream, video tracks included, so appending the
+  asset's audio to A1 with its picture still on V1 summed the sound with itself: graph
+  level (`amix=inputs=2`, two identical `atrim` chains) and on a real render (**+6.02 dB**
+  over the clip alone; fixed, +0.00 dB; an A1 fader at 0.5 then reads -6.02 dB —
+  `engine/cli/linked_audio.rs`). `extract_audio(asset)` now **detaches** each picture clip
+  of the asset still playing its own sound, and only appends the whole audio when none is
+  on the timeline. **`Project::detach_audio(clip)`**: an audio clip with the same source
+  span, speed and position on the audio track at the picture's own position (V1 → A1)
+  when it has room, else the first that does, else a new `A{n}`; linked to the picture,
+  whose `source_audio` goes false. The audio clip carries volume, audio effects, fades and
+  the transition (the `audio_clip_chain` strings are pinned equal before / after); the
+  picture keeps inert copies so **`reattach_audio`** (name either clip) restores it.
+  Imports / `cut_clip` / `add_clip` do **not** auto-link an A/V asset's sound (a possible
+  follow-up). **Edits carry their change to the partners**, and a partner on a locked
+  track refuses the whole edit (a linked edit is a group edit, so it also checks the named
+  clip's own lock, which the single-clip ops still do not): *move* by the same Δt on each
+  partner's own track (a track change is the named clip's alone); *trim*
+  (`carry_extent_edit`) moves the edge **a partner shares within 1 ms**, clamped to its
+  footage, never overlap-checked (ripple settles it); *split* cuts every partner the time
+  is inside and links the new right halves to each other; *remove* / *ripple delete* take
+  the partners; *cut a source range* takes the same stretch of **timeline** out of each
+  overlapping partner; *speed* applies the same **ratio**; *split-and-remove* cuts partners
+  the time is inside; *roll* rolls each partner pair sharing the cut, *slip* the same
+  timeline moment of footage (scaled by the speed ratio, stills skipped), *slide* each
+  partner with its own neighbours — all clamped to the **intersection of the members'
+  ranges**; the beat snap re-syncs afterwards (`carry_links_since`). **Ripple's sync
+  lock** (`follow_links`, in `ripple_from_with`): a clip the ripple *pushed* (not one the
+  edit moved — a left trim's start handed back is not footage pushed) drags the partners
+  nobody has moved yet by the same amount, so a title trimmed on V1 pulls the next shot
+  *and its sound* in; only clips follow, never the lane, and like the ripple it skips a
+  locked track and never makes an overlap. `ripple_delete` and a cut range, which close
+  their own gaps, call `sync_pushed` for the same effect. **The sync guard** is the net
+  under all of it: two linked clips of one asset at one speed are *in step* when their
+  content offsets agree (the moment of footage playing at a timeline time is the same,
+  whatever stretch each shows), and `run_edit` — so every edit, staged ones included —
+  refuses with `out of step` any edit that would leave an in-step pair apart
+  (`Timeline::first_sync_break`; a ripple whose partner a clip blocks, a left trim of a
+  pair never cut to the same edges, a `reorder`), instead of desynchronizing silently.
+  Pairs already apart, different assets, `link: false` and a project that links nothing
+  (no snapshot taken) are exempt. Property edits (volume / fades / effects / colour /
+  transitions), `set_clip_enabled` and captions are not carried (offsets do not change).
+  Paste / duplicate give copies of a pasted group a fresh shared link id.
+  **`Project::with_links(Option<bool>, ..)`** is `with_ripple`'s sibling — no project
+  switch, links are on unless a call says `false`; `run_edit` hands it to the ripple pass
+  so the sync lock drops too. `link_clips` / `unlink_clips` (unlinking either half of a
+  pair unlinks it; a group left with one clip dissolves), `detach_audio`, `reattach_audio`
+  are one revision each; `Timeline::diff` reports `linked` / `unlinked` / `own sound
+  off|on`. `Project::sample()` seeds its interview sound detached-then-*unlinked*.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -1336,7 +1394,12 @@ the overlap.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
 `reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
-pins against the generated schemas. **Edit modes over MCP**: `roll_edit` (`clip_a`
+pins against the generated schemas. **Linked A/V over MCP**: `detach_audio` / `reattach_audio` (`clip_id`; detach answers
+`{clip, track_id, created_track}`), `link_clips` / `unlink_clips` (`clip_ids`), and an optional
+`link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
+pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
+track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Edit modes over MCP**: `roll_edit` (`clip_a`
 the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
 seconds, positive = later in its own footage) and `slide_clip` answer the
 `EditOutcome` JSON (`applied` / `clamped` say how far a clamp let it go; a clamp to
@@ -1454,8 +1517,12 @@ time), `import_captions` / `import_captions_text` (a subtitle file by path / by 
 the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
-`extract_audio`, `concatenate` — each returns the
-refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`extract_audio` (detaches an asset's cut clips, see Linked A/V),
+`detach_audio` / `reattach_audio` / `link_clips` / `unlink_clips`, `concatenate` — each
+returns the refreshed `Timeline`; every edit that carries linked clips takes an optional
+`link` (`false` edits the named clips alone: `trim_clip`, `move_clip(s)`, `split_clip`,
+`remove_clip(s)`, `ripple_delete`, `cut_clip_range`, `set_speed`, `roll_edit`, `slip_clip`,
+`slide_clip`, `split_remove(_clips)`, via `with_links`)), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `get_waveform_range` → a source-seconds window as min/max peaks per channel,
 `get_filmstrip` → an asset's thumbnail strip, the `Filmstrip` JSON with each sheet's
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
@@ -1913,7 +1980,7 @@ project flag — read in `load()` (so launch, New and Open) and again on the
 `ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
 the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
 `aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
-ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
+ruler underline, and its tooltip says each track ripples on its own but a moved clip takes its linked partners along.
 All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
 no longer stopped by its neighbours (it pushes them — only the source's footage, the
 0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
@@ -2410,7 +2477,16 @@ checks, same messages), and `src/lib/edit-modes.ts` for the edit modes
 (`rollEdit` / `slipClip` / `slideClip` / `splitRemove` plus their `*Range`
 functions — the clamp a drag holds the pointer to — replaying the Rust tests, messages
 included; `api.ts` runs them in the harness, `editor.roll` / `slip` / `slide` /
-`splitRemove` / `splitRemoveClips` are the thin actions over them). `api.ts` keeps the project's ripple flag in the harness state
+`splitRemove` / `splitRemoveClips` are the thin actions over them). **Linked A/V is the same
+arrangement**: `link-groups.ts` + `links.ts` mirror `model/links.rs`, the `*Linked` modes live
+in `edit-modes.ts`, `followLinks` (the sync lock) in `ripple.ts`, and `links.test.ts` replays
+the Rust cases name for name; `api.ts` runs the link-aware edits through `devApply` (a scratch
+copy, so a locked partner leaves the harness untouched, like the backend), every one taking
+an optional trailing `link` (`false` = the named clip alone), plus `detachAudio` /
+`reattachAudio` / `linkClips` / `unlinkClips`. `audio.ts` schedules no clip with
+`source_audio === false` — scheduling both a picture and its detached sound *is* the
+doubling. The editor chrome for any of it (link badges, a Detach audio action, Alt-drag as
+`link: false`) is not built yet. `api.ts` keeps the project's ripple flag in the harness state
 (`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
 that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
 voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
