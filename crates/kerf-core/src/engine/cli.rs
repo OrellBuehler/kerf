@@ -6150,7 +6150,11 @@ fn build_still_args(
                 args.push(hw.to_string());
             }
             args.push("-ss".to_string());
-            args.push(format!("{src:.3}"));
+            // Microseconds, not milliseconds: `-ss` is an exact tick on a fine time
+            // base, and a frame at 1.0006 s is returned by `-ss 1.0006` but skipped
+            // by the spelling `1.001`. `kerf-gpu`'s `decode_args` spells it the
+            // same way, so the two decode the same frame.
+            args.push(format!("{src:.6}"));
         }
         args.push("-i".to_string());
         args.push(asset.path.clone());
@@ -7891,7 +7895,7 @@ mod tests {
         let args = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 2.0, 640, 4).unwrap();
         let joined = args.join(" ");
         assert_eq!(joined.matches("-i /x.mp4").count(), 1);
-        assert!(joined.contains("-ss 7.000"));
+        assert!(joined.contains("-ss 7.000000 -i /x.mp4"), "{joined}");
         // 16:9 export shape capped to max_width 640 -> 640x360.
         assert!(joined.contains("color=c=black:s=640x360"));
         assert!(joined.contains("[0:v]trim=end_frame=1"));
@@ -7992,7 +7996,7 @@ mod tests {
             let from_plan: Vec<(String, String)> = plan
                 .layers
                 .iter()
-                .map(|l| (l.path.clone(), format!("{:.3}", l.source_time)))
+                .map(|l| (l.path.clone(), format!("{:.6}", l.source_time)))
                 .collect();
             assert_eq!(from_args, from_plan, "t={t}");
 
@@ -10589,6 +10593,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(middle < 60.0, "inside the mask the upper clip is kept, got {middle}");
         assert!(corner > 180.0, "outside it the lower track shows through, got {corner}");
+    }
+
+    /// A frame at 1.0006 s is returned by `-ss 1.0006` and skipped by the
+    /// spelling `1.001`: on a fine time base the still has to say the time to the
+    /// microsecond. The clip is a 10 fps ramp (frame `n` is luma `16 + 8n`) in
+    /// which every frame from the 10th on sits 0.6 ms late, written to an mp4
+    /// with a 1/10000 time base (the encoder's too, which would otherwise round
+    /// every timestamp to a tenth of a second) so the offset survives the container.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored fine_time_base`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_still_picks_the_frame_at_a_fine_time_base_second() {
+        let dir = std::env::temp_dir().join(format!("kerf-fine-ss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("ramp.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=gray:s=64x64:r=10:d=2,format=yuv420p,geq=lum='16+8*N':cb=128:cr=128,\
+                 settb=1/10000,setpts='PTS+if(gte(N,10),6,0)'",
+            ])
+            .args(["-c:v", "libx264", "-crf", "8", "-g", "1", "-bf", "0", "-pix_fmt", "yuv420p"])
+            .args([
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base",
+                "1/10000",
+                "-video_track_timescale",
+                "10000",
+            ])
+            .arg(&media)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+
+        // Which ramp frame a decode at `-ss <ss>` returns, read off its first luma sample.
+        let frame_at = |ss: &str| -> u32 {
+            let out = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-ss", ss, "-i"])
+                .arg(&media)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"])
+                .stdin(Stdio::null())
+                .output()
+                .expect("run ffmpeg");
+            assert!(out.status.success() && !out.stdout.is_empty());
+            ((f64::from(out.stdout[0]) - 16.0) / 8.0).round() as u32
+        };
+        // The premise, on this ffmpeg: the exact time lands on frame 10, the
+        // millisecond rounding of it skips to frame 11.
+        assert_eq!(frame_at("1.000600"), 10, "the fixture has no frame at 1.0006");
+        assert_eq!(frame_at("1.001"), 11, "this ffmpeg does not skip a frame on `-ss 1.001`");
+
+        let mut asset = av_asset(Uuid::new_v4(), 2.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(64, 64, 10.0)];
+        // Source 1.0006 at timeline 0: the still at t=0 is that source second.
+        let timeline = single(vec![make_clip(asset.id, 1.0006, 1.9, 0.0)]);
+        let args = build_still_args(
+            &timeline,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            0.0,
+            64,
+            None,
+            &StillOutput::RgbPipe,
+        )
+        .expect("still args");
+        let rgb = run_still(
+            &timeline,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            0.0,
+            64,
+            None,
+            &StillOutput::RgbPipe,
+        )
+        .expect("render the still");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Full-range grey of luma 16 + 8n is 255 * 8n / 219: 93 for frame 10, 102 for 11.
+        let grey = f64::from(rgb[0]);
+        let frame = (grey * 219.0 / 255.0 / 8.0).round() as u32;
+        assert_eq!(
+            frame, 10,
+            "the still showed ramp frame {frame} (grey {grey}), not the one at 1.0006 s"
+        );
+        assert!(args.join(" ").contains("-ss 1.000600 -i "), "{args:?}");
     }
 
     /// A bare `%` used to be a drawtext configuration error that silently

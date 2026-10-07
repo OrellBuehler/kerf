@@ -255,8 +255,12 @@ so the feature is **only** activated through these forwards — which is what ma
   exception: a still has no source timeline, so its input is `-loop 1 -framerate
   fps -t <window>` instead of `-ss`'d, and its in-graph `trim` stays absolute (seek
   forced to 0); `frame_*`/`timeline_frame` likewise decode the single frame without
-  seeking. `render_with_progress` streams ffmpeg's `-progress` to report
-  `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
+  seeking. The **composited still's `-ss` is spelled to the microsecond** (`{:.6}`, and
+  `kerf-gpu`'s `decode_args` the same): `-ss` is exact on a fine time base, and with a
+  frame at 1.0006 s `-ss 1.0006` returns it where the old `{:.3}` spelling, `1.001`,
+  skipped to the next frame (`a_still_picks_the_frame_at_a_fine_time_base_second`,
+  `#[ignore]`d, both FFmpegs). `render_with_progress` streams ffmpeg's `-progress` to
+  report `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
@@ -836,7 +840,9 @@ no editing logic in the adapter.
   it, or the argv text changed; digest and coverage failures are reported together.
   `KERF_GOLDEN_CASES=<file>` writes a digest per case (diff base vs change to find the case
   in a failing block), `KERF_GOLDEN_DUMP=<n>` prints one case's argv,
-  `KERF_GOLDEN_COVERAGE=1` the thinnest families.
+  `KERF_GOLDEN_COVERAGE=1` the thinnest families. The one intended change since it
+  landed, the still's `-ss` going from `{:.3}` to `{:.6}`, re-blessed `still.txt` alone
+  (only `-ss` values differ in any still argv); `export.txt` and `preview.txt` never moved.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
