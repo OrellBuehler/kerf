@@ -838,9 +838,8 @@ mod tests {
                 continue;
             }
             let r = ask(&runs, of, target, true, intent);
-            let ticket = match guard.check(intent, &r, now) {
-                Ok(t) => t,
-                Err(_) => return (starts, restarts, reuses, Some(now)),
+            let Ok(ticket) = guard.check(intent, &r, now) else {
+                return (starts, restarts, reuses, Some(now));
             };
             guard.finished(ticket, now + cost, Frame);
             let head = |lead: u32| target - i64::from(lead) * FT + FT;
