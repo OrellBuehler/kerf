@@ -71,13 +71,12 @@ mod ffmpeg;
 pub use cli::{
     audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame, detect_scenes,
     detect_silence, export_still, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy, hw_encoders, insta360_pair,
-    proxy_path, proxy_width, ready_proxy, salience_map, stitch_insta360, stitched_path, stream_preview, timeline_frame,
+    proxy_path, proxy_width, ready_proxy, salience_map, seek_arg, stitch_insta360, stitched_path, stream_preview, timeline_frame,
     timeline_frame_region, validate_export, waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat,
     PreviewFrame, RateControl, Region, RenderStatus, VariantProgress,
 };
 
 pub(crate) use cli::insta360_pair_name;
-pub(crate) use cli::is_head_padded_proxy;
 pub(crate) use cli::render_geometry;
 pub use cli::{composite_color_policy, ffmpeg_command, ffmpeg_path, limit_ffmpeg_args};
 

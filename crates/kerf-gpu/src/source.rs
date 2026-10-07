@@ -136,9 +136,9 @@ pub fn decode_args(layer: &PlanLayer, alpha: bool) -> Vec<String> {
         .collect();
     if !layer.is_image {
         args.push("-ss".into());
-        // Microseconds: the same spelling as the FFmpeg still's `-ss`, which a
-        // millisecond rounding made skip a frame on a fine time base.
-        args.push(format!("{:.6}", layer.source_time));
+        // The one spelling the FFmpeg still uses too, so both decode the same frame
+        // on a fine time base (milliseconds skip one).
+        args.push(kerf_core::seek_arg(layer.source_time));
     }
     args.extend(["-i".to_string(), layer.path.clone()]);
     // `out_range=tv` states the range the shader assumes (limited) instead of
@@ -485,7 +485,12 @@ mod tests {
         l.stream.height = 64;
         l.source_time = 1.0006;
         let frame = decode_layer(&l).expect("decode").expect("a frame");
+        // The premise, on this ffmpeg: the millisecond spelling of that second (`1.001`,
+        // what `{:.3}` made of it) lands on the frame after.
+        l.source_time = 1.001;
+        let next = decode_layer(&l).expect("decode").expect("a frame");
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(next.y[0], 16 + 8 * 11, "this ffmpeg does not skip a frame on `-ss 1.001`");
         assert_eq!(
             frame.y[0],
             16 + 8 * 10,

@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use super::cpu;
 use super::ProbeResult;
-use crate::clip_timing::{clip_seek, clip_source_window, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint};
+use crate::clip_timing::{
+    clip_seek, clip_source_window, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint, HEAD_PADDED_SUFFIX,
+};
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
@@ -2051,7 +2053,7 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// time zero, and a seek into it lands on the wrong frame (see [`head_lead`]).
 /// FFmpeg 9 wrote exactly such proxies for every build that had the default
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
-/// named `<hash>.lead.mp4` ([`is_head_padded_proxy`]).
+/// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
     let traits = source_traits(src).unwrap_or_default();
@@ -2059,9 +2061,6 @@ pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
 }
-
-/// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
-const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
 
 /// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
 /// one made with a padded head.
@@ -2071,31 +2070,6 @@ fn proxy_file_name(hash: u64, head_padded: bool) -> String {
     } else {
         format!("{hash:016x}.mp4")
     }
-}
-
-/// Whether `path` is a proxy [`generate_proxy`] made with a padded head (pure,
-/// unit-tested): `.../kerf/proxies/<16 hex digits>.lead.mp4`.
-///
-/// That it is padded is a fact about the *file*, so it travels in the file's name
-/// instead of in a flag every caller of the graph builders would have to carry
-/// beside the path — a preview asset is its original with the path swapped, and
-/// the graph needs to know, per input, to drop the pad's clone frame before it
-/// trims (see [`video_clip_chain`]). An original, or any proxy that was not padded,
-/// does not match, and its argv and graph are what they always were.
-pub(crate) fn is_head_padded_proxy(path: &str) -> bool {
-    let path = Path::new(path);
-    let Some(hash) = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_suffix(HEAD_PADDED_SUFFIX))
-    else {
-        return false;
-    };
-    let dir = |p: Option<&Path>| p.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
-    hash.len() == 16
-        && hash.bytes().all(|b| b.is_ascii_hexdigit())
-        && dir(path.parent()).as_deref() == Some("proxies")
-        && dir(path.parent().and_then(Path::parent)).as_deref() == Some("kerf")
 }
 
 /// The proxy for `src` at `width` **if it has already been generated** (the file
@@ -2196,7 +2170,7 @@ fn proxy_hw_encoder() -> Option<&'static str> {
 /// counterpart for, so a reader that starts the proxy from zero without a seek —
 /// which the original answers with its real first frame — drops it again (see
 /// [`video_clip_chain`]); the proxy's file name says it has one
-/// ([`is_head_padded_proxy`]).
+/// (`is_head_padded_proxy`, in `clip_timing`).
 #[allow(clippy::too_many_arguments)]
 fn build_proxy_args(
     src: &str,
@@ -5890,6 +5864,17 @@ impl StillOutput {
     }
 }
 
+/// How a seek that has to land on one particular frame is spelled: `-ss` to the
+/// microsecond.
+///
+/// `-ss` is an exact tick on a fine time base, so milliseconds are not enough: with a
+/// frame at 1.0006 s, `-ss 1.0006` returns it and the spelling `1.001` skips to the
+/// next. The composited still and `kerf-gpu`'s decode of the same layer both call
+/// this, so the two cannot drift apart and show different frames.
+pub fn seek_arg(seconds: f64) -> String {
+    format!("{seconds:.6}")
+}
+
 /// Pure arg builder for a composited still, parameterized by its sink (no I/O,
 /// unit-tested).
 ///
@@ -5950,11 +5935,7 @@ fn build_still_args(
                 args.push(hw.to_string());
             }
             args.push("-ss".to_string());
-            // Microseconds, not milliseconds: `-ss` is an exact tick on a fine time
-            // base, and a frame at 1.0006 s is returned by `-ss 1.0006` but skipped
-            // by the spelling `1.001`. `kerf-gpu`'s `decode_args` spells it the
-            // same way, so the two decode the same frame.
-            args.push(format!("{src:.6}"));
+            args.push(seek_arg(src));
         }
         args.push("-i".to_string());
         args.push(asset.path.clone());
@@ -6199,9 +6180,14 @@ fn atempo_chain(speed: f64) -> String {
 #[cfg(test)]
 mod golden;
 
+/// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
+#[cfg(test)]
+mod rendered;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clip_timing::is_head_padded_proxy;
     use crate::engine::test_support::{
         audio_stream, audio_track, av_asset, image_stream, img_asset, make_clip, single, test_asset, timeline_of, video_stream,
         video_track, StatusBounded,
@@ -10265,6 +10251,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(middle < 60.0, "inside the mask the upper clip is kept, got {middle}");
         assert!(corner > 180.0, "outside it the lower track shows through, got {corner}");
+    }
+
+    #[test]
+    fn a_seek_is_spelled_to_the_microsecond() {
+        assert_eq!(seek_arg(1.0006), "1.000600");
+        assert_eq!(seek_arg(7.0), "7.000000");
+        assert_eq!(seek_arg(0.0), "0.000000");
+        assert_eq!(seek_arg(12.3456789), "12.345679");
     }
 
     /// A frame at 1.0006 s is returned by `-ss 1.0006` and skipped by the

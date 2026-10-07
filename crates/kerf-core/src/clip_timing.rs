@@ -9,17 +9,59 @@
 //! [`ClipTiming`] is the one place those numbers are decided: `video_clip_chain`
 //! and `build_filter_complex` print what it returns (`fades`, `window`,
 //! `motion_keys`), and a plan asks it the same question at a time `t`
-//! (`visible`, `motion_at`). Moving a number here moves both.
+//! (`enabled`, `motion_at`). Moving a number here moves both.
+//!
+//! **What FFmpeg does with those numbers is not the number.** The overlay's `enable`
+//! window is necessary but not sufficient for a clip to be drawn (the source has to
+//! have a frame there, and the `fps` pick decides which); FFmpeg evaluates `enable`
+//! and every time expression at `t = k * (den / num)` ([`ffmpeg_frame_time`]), which
+//! is not `k / fps` — one ulp below it for a third of the frame-aligned starts at
+//! 24 fps, hiding the clip's first frame; and a `fade` counts frames
+//! ([`FadeStep::progress_at_frame`]) instead of interpolating time. Exact rationals
+//! belong to the frame *pick* alone. Each of these is pinned against rendered pixels
+//! by an `#[ignore]`d test in `engine/cli.rs`.
 //!
 //! **Video only.** `audio_clip_chain` composes the same [`ClipFx`] differently
 //! (`afade_in` joins the fade-in, and the tail is its fade-out), so it keeps its
 //! own arithmetic and shares only [`ClipTiming::duration`], the window and the seek.
 //!
-//! Pure: no I/O, no machine reads. The one outside dependency is the file-name
-//! convention `is_head_padded_proxy` reads, which is a string function.
+//! Pure: no I/O, no machine reads, no dependency on the engine.
+//!
+//! The reading half (`enabled`, `motion_at`, `progress`, `ffmpeg_frame_time`,
+//! `clips_with_fx`) has no caller outside tests until the render plan reads it, so
+//! it is exempt from the dead-code lint rather than deleted.
 
-use crate::engine::is_head_padded_proxy;
+use std::path::Path;
+
 use crate::model::{interpolate, Asset, Clip, Hdr, Timeline};
+
+/// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
+pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
+
+/// Whether `path` is a proxy `generate_proxy` made with a padded head (pure,
+/// unit-tested): `.../kerf/proxies/<16 hex digits>.lead.mp4`.
+///
+/// That it is padded is a fact about the *file*, so it travels in the file's name
+/// instead of in a flag every caller of the graph builders would have to carry
+/// beside the path — a preview asset is its original with the path swapped, and
+/// the graph needs to know, per input, to drop the pad's clone frame before it
+/// trims (see `video_clip_chain`). An original, or any proxy that was not padded,
+/// does not match, and its argv and graph are what they always were.
+pub(crate) fn is_head_padded_proxy(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(hash) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(HEAD_PADDED_SUFFIX))
+    else {
+        return false;
+    };
+    let dir = |p: Option<&Path>| p.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    hash.len() == 16
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && dir(path.parent()).as_deref() == Some("proxies")
+        && dir(path.parent().and_then(Path::parent)).as_deref() == Some("kerf")
+}
 
 /// Per-clip render adjustments derived from transitions. `tail` extends an
 /// outgoing clip so it keeps showing under the incoming one; `xfade_in` is the
@@ -55,9 +97,16 @@ pub struct ClipFx {
     pub head_pad: bool,
 }
 
-/// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
-/// track-then-clip order), resolving each `transition_in` against the clip that
-/// precedes it on the same track in timeline order.
+/// Compute the [`ClipFx`] for every clip, resolving each `transition_in` against the
+/// clip that precedes it on the same track in timeline order.
+///
+/// The result is indexed by **flat clip storage index**: tracks in order, and within
+/// a track the clips in the order they are *stored* (not timeline order, and not an
+/// ffmpeg input index — inputs are deduplicated). `timeline` has to be the one the
+/// graph is built from (`Timeline::for_render()`, with the same slice or delivery
+/// applied), and `assets` the same list the graph sees, including a preview's proxy
+/// swap: a different list gives a different tail, HDR flag or head-pad answer.
+/// [`clips_with_fx`] pairs each clip with its entry so a caller cannot mis-pair them.
 pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
     let mut fx = vec![ClipFx::default(); total_clips];
@@ -163,6 +212,25 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     fx
 }
 
+/// Every clip of `timeline` with its [`ClipFx`], in `transition_fx`'s order:
+/// `(track index, index in the track's storage, the clip, its fx)`. The pairing the
+/// graph builders do with a running flat index, done once, so a renderer that walks
+/// the clips cannot index the table with a different count.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clips_with_fx<'a>(
+    timeline: &'a Timeline,
+    assets: &[Asset],
+) -> impl Iterator<Item = (usize, usize, &'a Clip, ClipFx)> + 'a {
+    let fx = transition_fx(timeline, assets);
+    timeline
+        .tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(ti, track)| track.clips.iter().enumerate().map(move |(ci, clip)| (ti, ci, clip)))
+        .zip(fx)
+        .map(|((ti, ci, clip), fx)| (ti, ci, clip, fx))
+}
+
 /// The source-time window `[start, end]` a clip needs from its asset, accounting
 /// for reverse playback and any crossfade tail (which borrows unused handle past
 /// `source_out`, or below `source_in` when reversed). The single source of truth
@@ -220,6 +288,81 @@ pub struct FadeStep {
     pub d: f64,
 }
 
+/// `av_parse_time` on the decimal text a duration option is handed (the graph
+/// prints `{}` of the `f64`): whole microseconds, the digits past the sixth
+/// dropped rather than rounded.
+fn parse_micros(seconds: f64) -> i64 {
+    let text = format!("{seconds}");
+    let negative = text.starts_with('-');
+    let text = text.trim_start_matches('-');
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    let micros: String = frac.chars().take(6).collect();
+    let magnitude =
+        whole.parse::<i64>().unwrap_or(0).saturating_mul(1_000_000) + format!("{micros:0<6}").parse::<i64>().unwrap_or(0);
+    if negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// `av_rescale_q(parse_time(seconds), 1/1000000, den/num)`: the frames FFmpeg's
+/// `fade` turns a time into at the filter's input time base (`1/fps` after the
+/// chain's `fps`), rounded to nearest, halves away from zero.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fade_ticks(seconds: f64, fps_num: u32, fps_den: u32) -> i64 {
+    let n = i128::from(parse_micros(seconds)) * i128::from(fps_num);
+    let d = 1_000_000 * i128::from(fps_den.max(1));
+    let half = d / 2;
+    let rounded = if n >= 0 { (n + half) / d } else { -((-n + half) / d) };
+    rounded as i64
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl FadeStep {
+    /// How much of the picture is left at output frame `k` (timeline frame
+    /// `k` of an `fps_num/fps_den` export): `1` untouched, `0` faded away, so a
+    /// fade-in rises `0 -> 1` and a fade-out falls `1 -> 0`.
+    ///
+    /// FFmpeg's `fade` does not interpolate time. It converts `st` and `d` to
+    /// frames of its input time base — `S = round(st * fps)`, `N = round(d * fps)`
+    /// (at least 1) — and from frame `S` moves in `N` equal steps: frame `S + i`
+    /// carries `i / N`, held at the end value past `S + N` (and, before `S`, at the
+    /// start value). A fade is therefore never `(t - st) / d`: it starts on a frame
+    /// boundary, which for an off-grid `st` is up to half a frame away from `st`,
+    /// and it is up to half a frame longer or shorter than `d`. The same counting
+    /// serves the black and white dips and a dissolve's alpha ramp (`tint` only says
+    /// what is faded to). Pinned against rendered alpha on 6.1 and 9.0.
+    pub fn progress_at_frame(&self, k: i64, fps_num: u32, fps_den: u32) -> f64 {
+        let start = fade_ticks(self.st, fps_num, fps_den);
+        let steps = fade_ticks(self.d, fps_num, fps_den).max(1);
+        let done = (k - start).clamp(0, steps) as f64 / steps as f64;
+        match self.edge {
+            FadeEdge::In => done,
+            FadeEdge::Out => 1.0 - done,
+        }
+    }
+
+    /// [`Self::progress_at_frame`] for a time on the frame grid: `t` is rounded to
+    /// the nearest frame of `fps_num/fps_den` first.
+    pub fn progress(&self, t: f64, fps_num: u32, fps_den: u32) -> f64 {
+        let k = (t * f64::from(fps_num) / f64::from(fps_den.max(1))).round() as i64;
+        self.progress_at_frame(k, fps_num, fps_den)
+    }
+}
+
+/// The time FFmpeg evaluates a frame at: the frame's pts times `av_q2d` of the time
+/// base, in doubles — `k * (den / num)`, **not** `k * den / num` and not `k / fps`.
+/// The three differ by an ulp, and an `enable='between(t,s,e)'` or a `fade` start
+/// decided on that ulp keeps or drops a whole frame: at 24 fps about a third of the
+/// frame-aligned clip starts evaluate to just under their own start and lose their
+/// first frame. Use this wherever a graph expression is evaluated for output frame
+/// `k`; keep exact rationals for the frame *pick* only.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn ffmpeg_frame_time(k: u64, fps_num: u32, fps_den: u32) -> f64 {
+    k as f64 * (f64::from(fps_den) / f64::from(fps_num))
+}
+
 /// The offset a motion transition puts on a clip, as keyframes over **clip-local**
 /// seconds in frame widths (`x`) and heights (`y`). Both channels share their
 /// times; they are kept apart because the graph prints each as its own expression.
@@ -229,10 +372,15 @@ pub struct MotionKeys {
     pub y: Vec<(f64, f64)>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl MotionKeys {
-    /// The offset at clip-local time `local`: piecewise linear, held flat beyond
-    /// the first and last key — the same curve `keyframe_expr` writes out.
-    fn at(&self, local: f64) -> (f64, f64) {
+    /// The offset `(dx, dy)` at clip-local time `local`, in **frame fractions**:
+    /// piecewise linear, held flat beyond the first and last key — the same curve
+    /// `keyframe_expr` writes out. It is exact; the overlay it drives does not
+    /// place at a fraction of a pixel but at `(int)(fraction * extent) & ~1` per axis
+    /// (truncated toward zero, then to the 4:2:0 chroma grid), which a renderer that
+    /// wants the same pixels has to apply.
+    pub fn at(&self, local: f64) -> (f64, f64) {
         let sample = |pts: &[(f64, f64)]| {
             let mut pts = pts.to_vec();
             pts.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -261,15 +409,21 @@ impl<'a> ClipTiming<'a> {
         self.clip.duration() + self.fx.tail
     }
 
-    /// The span of **timeline** time the clip is on screen, `(start, end)`, tail
-    /// included.
+    /// The overlay's `enable` window on the **timeline**, `(start, end)`, tail
+    /// included: what the graph prints as `enable='between(t,start,end)'`.
     pub fn window(&self) -> (f64, f64) {
         (self.clip.timeline_start, self.clip.timeline_end() + self.fx.tail)
     }
 
-    /// Whether the clip is on screen at timeline time `t`. Both ends count, as the
-    /// graph's `enable='between(t,start,end)'` does.
-    pub fn visible(&self, t: f64) -> bool {
+    /// Whether the overlay's `enable` expression is true at `t`: the window with
+    /// both ends included, as `between` has it. **Necessary, not sufficient, for the
+    /// clip to be drawn**: it is not "on screen at `t`". The export draws nothing at
+    /// `t == end` from an equal-rate source (the source has no frame there), draws a
+    /// slower source's last frame at it through the `fps` filter, and is evaluated
+    /// at [`ffmpeg_frame_time`], not at an exact `k / fps`. Which frames are drawn is
+    /// the pick's decision.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn enabled(&self, t: f64) -> bool {
         let (start, end) = self.window();
         t >= start && t <= end
     }
@@ -337,7 +491,10 @@ impl<'a> ClipTiming<'a> {
     }
 
     /// The offset `(dx, dy)` a motion transition puts on the clip at timeline time
-    /// `t`, in frame widths and heights; `(0, 0)` for a clip that does not move.
+    /// `t`, in **frame fractions** (widths and heights); `(0, 0)` for a clip that does
+    /// not move. Exact: see [`MotionKeys::at`] for how the overlay truncates it to
+    /// pixels.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn motion_at(&self, t: f64) -> (f64, f64) {
         self.motion_keys()
             .map_or((0.0, 0.0), |keys| keys.at(t - self.clip.timeline_start))
@@ -374,16 +531,18 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_clip_is_on_screen_for_its_own_length_and_nothing_else_moves() {
+    fn a_plain_clip_has_the_enable_window_of_its_own_length_and_nothing_else_moves() {
         let asset = asset();
         let tl = single(vec![make_clip(asset.id, 5.0, 9.0, 3.0)]);
         let fx = transition_fx(&tl, std::slice::from_ref(&asset));
         assert_eq!(fx, vec![ClipFx::default()]);
         let t = timing(&tl, &fx, 0);
         assert_eq!((t.duration(), t.window()), (4.0, (3.0, 7.0)));
-        // Both ends count, as the graph's `between(t,3,7)` does.
-        assert!(t.visible(3.0) && t.visible(7.0) && t.visible(5.0));
-        assert!(!t.visible(2.999) && !t.visible(7.001));
+        // `between(t,3,7)` includes both ends. That is the *enable* expression, not
+        // what is drawn: the export draws nothing at t == 7 from an equal-rate source
+        // (`a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it`).
+        assert!(t.enabled(3.0) && t.enabled(7.0) && t.enabled(5.0));
+        assert!(!t.enabled(2.999) && !t.enabled(7.001));
         assert!(t.fades().is_empty());
         assert_eq!(t.motion_keys(), None);
         assert_eq!(t.motion_at(4.0), (0.0, 0.0));
@@ -423,7 +582,7 @@ mod tests {
         let (out, inc) = (timing(&tl, &fx, 0), timing(&tl, &fx, 1));
         // The outgoing clip keeps playing for the transition, on source past its out point.
         assert_eq!((out.duration(), out.window()), (11.0, (0.0, 11.0)));
-        assert!(out.visible(10.5) && !out.visible(11.5));
+        assert!(out.enabled(10.5) && !out.enabled(11.5));
         assert_eq!(clip_source_window(out.clip, out.fx), (0.0, 11.0));
         // Its picture is not faded: the incoming clip's alpha ramp does the mixing.
         assert!(out.fades().is_empty());
@@ -504,7 +663,7 @@ mod tests {
         close(out.motion_at(10.0), (0.0, 0.0));
         close(out.motion_at(11.0), (0.0, -0.5));
         close(out.motion_at(12.0), (0.0, -1.0));
-        assert!(out.visible(12.0) && !out.visible(12.001));
+        assert!(out.enabled(12.0) && !out.enabled(12.001));
         // The keys are what the graph prints: clip-local seconds.
         assert_eq!(inc.motion_keys().unwrap().y, vec![(0.0, 1.0), (2.0, 0.0)]);
     }
@@ -556,5 +715,132 @@ mod tests {
         let sdr = asset();
         let tl = single(vec![make_clip(sdr.id, 0.0, 4.0, 0.0)]);
         assert_eq!(transition_fx(&tl, std::slice::from_ref(&sdr)), vec![ClipFx::default()]);
+    }
+
+    #[test]
+    fn ffmpegs_frame_time_is_not_the_exact_one() {
+        // `k * (den / num)`, the way `pts * av_q2d(time_base)` multiplies, lands an ulp
+        // off `k / fps`: below it for a third of the frames at 24 fps (so a clip that
+        // starts exactly on one is enabled one frame late), about half at 29.97, and
+        // above it for 13 % at 25. Where it is exact nothing moves.
+        let share = |num: u32, den: u32, cmp: fn(f64, f64) -> bool| {
+            let n = 2400;
+            (1..=n)
+                .filter(|&k| cmp(ffmpeg_frame_time(k, num, den), (k * u64::from(den)) as f64 / f64::from(num)))
+                .count() as f64
+                / n as f64
+        };
+        assert!((share(24, 1, |a, b| a < b) - 1.0 / 3.0).abs() < 0.01);
+        assert!((share(2997, 100, |a, b| a < b) - 0.5).abs() < 0.01);
+        assert!((share(25, 1, |a, b| a > b) - 0.13).abs() < 0.01);
+        assert_eq!(share(25, 1, |a, b| a < b), 0.0);
+        // The first one it bites at 24 fps: frame 5 starts a clip at 5/24 s, and FFmpeg
+        // evaluates it just before that.
+        assert!(ffmpeg_frame_time(5, 24, 1) < 5.0 / 24.0);
+        assert_eq!(ffmpeg_frame_time(0, 24, 1), 0.0);
+    }
+
+    #[test]
+    fn microseconds_are_truncated_like_av_parse_time_and_frames_are_rounded() {
+        assert_eq!(parse_micros(5.3), 5_300_000);
+        assert_eq!(parse_micros(5.299999999999999), 5_299_999);
+        assert_eq!(parse_micros(2.0), 2_000_000);
+        assert_eq!(parse_micros(0.0000005), 0);
+        assert_eq!(parse_micros(-1.5), -1_500_000);
+        // Halves go up, as av_rescale_q rounds: 12.5 -> 13, 82.5 -> 83, 132.5 -> 133 ...
+        assert_eq!(fade_ticks(0.5, 25, 1), 13);
+        assert_eq!(fade_ticks(3.3, 25, 1), 83);
+        assert_eq!(fade_ticks(5.3, 25, 1), 133);
+        // ... but `5.299999999999999` is 5.299999 s to FFmpeg, 132.499975 frames.
+        assert_eq!(fade_ticks(5.299999999999999, 25, 1), 132);
+        // Fractional frame rates: 29.97 is 2997/100.
+        assert_eq!((fade_ticks(3.0, 2997, 100), fade_ticks(1.0, 2997, 100)), (90, 30));
+    }
+
+    fn step(edge: FadeEdge, st: f64, d: f64) -> FadeStep {
+        FadeStep {
+            edge,
+            tint: FadeTint::Alpha,
+            st,
+            d,
+        }
+    }
+
+    #[test]
+    fn a_fade_counts_frames_from_the_rounded_start_in_equal_steps() {
+        // 24 fps, in from 3.0 s over 1.0 s: frame 72, 24 steps.
+        let f = step(FadeEdge::In, 3.0, 1.0);
+        let p = |k| f.progress_at_frame(k, 24, 1);
+        assert_eq!((p(0), p(71), p(72)), (0.0, 0.0, 0.0));
+        assert_eq!((p(73), p(84), p(96), p(97), p(500)), (1.0 / 24.0, 0.5, 1.0, 1.0, 1.0));
+        // ... and out is the same count read the other way.
+        let f = step(FadeEdge::Out, 3.0, 1.0);
+        assert_eq!(
+            (
+                f.progress_at_frame(72, 24, 1),
+                f.progress_at_frame(84, 24, 1),
+                f.progress_at_frame(96, 24, 1)
+            ),
+            (1.0, 0.5, 0.0)
+        );
+        assert_eq!(f.progress_at_frame(0, 24, 1), 1.0);
+        // Off the grid: out from 3.3 s over 0.7 s at 24 fps starts at frame 79 (79.2)
+        // and takes 17 steps (16.8), not 16.8, and not from 3.3 exactly.
+        let f = step(FadeEdge::Out, 3.3, 0.7);
+        assert_eq!(f.progress_at_frame(79, 24, 1), 1.0);
+        assert_eq!(f.progress_at_frame(80, 24, 1), 16.0 / 17.0);
+        assert_eq!(f.progress_at_frame(96, 24, 1), 0.0);
+        // A fade shorter than half a frame is one step, not a division by zero.
+        let f = step(FadeEdge::In, 1.5, 0.01);
+        assert_eq!((f.progress_at_frame(36, 24, 1), f.progress_at_frame(37, 24, 1)), (0.0, 1.0));
+        // `progress(t)` is the same read at the frame `t` is on.
+        let f = step(FadeEdge::In, 3.0, 1.0);
+        assert_eq!(f.progress(3.5, 24, 1), 0.5);
+        assert_eq!(f.progress(3.0 + 1.0 / 29.97, 2997, 100), f.progress_at_frame(91, 2997, 100));
+    }
+
+    #[test]
+    fn a_motion_offset_is_in_frame_fractions_and_exact() {
+        let asset = asset();
+        let (tl, fx) = pair(&asset, TransitionKind::SlideLeft, 2.0);
+        let keys = timing(&tl, &fx, 1).motion_keys().unwrap();
+        // Public, so a renderer can evaluate the curve the graph prints.
+        close(keys.at(1.0), (0.5, 0.0));
+        close(keys.at(-3.0), (1.0, 0.0));
+        // 4:2:0 overlay placement truncates the pixel offset to an even number: 0.5 of
+        // a 33 px frame is 16.5 px, which the overlay draws at 16.
+        assert_eq!(((keys.at(1.0).0 * 33.0) as i32) & !1, 16);
+    }
+
+    #[test]
+    fn clips_come_with_their_own_fx_even_when_stored_out_of_order() {
+        let asset = asset();
+        let (mut shuffled, _) = pair(&asset, TransitionKind::Crossfade, 1.0);
+        // Store the incoming clip first: the table is indexed by storage, not by time.
+        shuffled.tracks[0].clips.reverse();
+        let rows: Vec<_> = clips_with_fx(&shuffled, std::slice::from_ref(&asset)).collect();
+        assert_eq!(rows.len(), 2);
+        let (ti, ci, incoming, fx_in) = &rows[0];
+        assert_eq!((*ti, *ci, incoming.timeline_start), (0, 0, 10.0));
+        assert_eq!((fx_in.xfade_in, fx_in.tail), (1.0, 0.0));
+        let (ti, ci, outgoing, fx_out) = &rows[1];
+        assert_eq!((*ti, *ci, outgoing.timeline_start), (0, 1, 0.0));
+        assert_eq!((fx_out.xfade_in, fx_out.tail), (0.0, 1.0));
+        // ... and it is the same table `transition_fx` returns.
+        let table = transition_fx(&shuffled, std::slice::from_ref(&asset));
+        assert_eq!(rows.iter().map(|r| r.3).collect::<Vec<_>>(), table);
+    }
+
+    #[test]
+    fn a_head_padded_proxy_is_told_by_its_path_alone() {
+        let hash = "0123456789abcdef";
+        assert!(is_head_padded_proxy(&format!(
+            "/cache/kerf/proxies/{hash}{HEAD_PADDED_SUFFIX}"
+        )));
+        assert!(!is_head_padded_proxy(&format!("/cache/kerf/proxies/{hash}.mp4")));
+        assert!(!is_head_padded_proxy(&format!("/cache/kerf/elsewhere/{hash}.lead.mp4")));
+        assert!(!is_head_padded_proxy(&format!("/cache/proxies/{hash}.lead.mp4")));
+        assert!(!is_head_padded_proxy("/cache/kerf/proxies/short.lead.mp4"));
+        assert!(!is_head_padded_proxy("/media/clip.lead.mp4"));
     }
 }
