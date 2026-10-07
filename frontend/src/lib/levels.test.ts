@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	ceilingLabel,
+	ceilingToPos,
 	clampCeiling,
 	clampMasterVolume,
 	DEFAULT_MASTER,
@@ -7,6 +9,8 @@ import {
 	isNeutralMaster,
 	levelNotes,
 	masterOf,
+	nudgeCeiling,
+	posToCeiling,
 	trackRenders
 } from './levels';
 import type { Asset, LevelReading, Loudness, Timeline, TrackLevels } from './types';
@@ -175,5 +179,40 @@ describe('estimateLevels', () => {
 		const levels = run(tl);
 		expect(levels.tracks.map((t) => t.heard)).toEqual([true, false]);
 		expect(levels.master?.integrated_lufs).toBeCloseTo(-20, 5);
+	});
+});
+
+describe('the limiter ceiling slider', () => {
+	test('travels from -24 on the left to 0 on the right, in half dB', () => {
+		expect(ceilingToPos(-24)).toBe(0);
+		expect(ceilingToPos(0)).toBe(1);
+		expect(ceilingToPos(-12)).toBe(0.5);
+		expect(ceilingToPos(-90)).toBe(0);
+		expect(ceilingToPos(6)).toBe(1);
+		expect(posToCeiling(0)).toBe(-24);
+		expect(posToCeiling(1)).toBe(0);
+		expect(posToCeiling(0.5)).toBe(-12);
+		expect(posToCeiling(0.9583)).toBe(-1);
+		expect(posToCeiling(-2)).toBe(-24);
+		expect(posToCeiling(9)).toBe(0);
+		for (const db of [-24, -12.5, -6, -3, -1, -0.5, 0]) expect(posToCeiling(ceilingToPos(db))).toBe(db);
+	});
+
+	test('nudges on the grid of its size, within the range', () => {
+		expect(nudgeCeiling(-1, 1)).toBe(-0.5);
+		expect(nudgeCeiling(-1, -1)).toBe(-1.5);
+		expect(nudgeCeiling(-1.2, 1)).toBe(-1);
+		expect(nudgeCeiling(-1, 1, 'fine')).toBe(-0.9);
+		expect(nudgeCeiling(-1, -1, 'coarse')).toBe(-3);
+		expect(nudgeCeiling(-1, -1, 'page')).toBe(-6);
+		expect(nudgeCeiling(0, 1)).toBe(0);
+		expect(nudgeCeiling(-24, -1)).toBe(-24);
+		expect(Object.is(nudgeCeiling(-0.5, 1), 0)).toBe(true);
+	});
+
+	test('reads like the limiter’s label', () => {
+		expect(ceilingLabel(-1)).toBe('-1.0 dBFS');
+		expect(ceilingLabel(0)).toBe('0.0 dBFS');
+		expect(ceilingLabel(-0.01)).toBe('0.0 dBFS');
 	});
 });

@@ -18,7 +18,8 @@
 	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
-	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
+	import { faderToGain, gainLabel, gainToFader, panLabel } from '$lib/mixer';
+	import { trackHasSound } from '$lib/mixer-strips';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
 	import { beginDrag } from '$lib/drag';
 	import {
@@ -94,12 +95,10 @@
 		new Set(editor.assets.filter((a) => a.streams?.some((st) => st.kind === 'audio')).map((a) => a.id))
 	);
 	/** True when a track can actually be heard — an audio track, or a video track
-	 *  whose clips carry sound. A track with no audio at all gets no fader: a
-	 *  mixer strip on a silent track is furniture, not a control. */
-	function hasSound(t: Track): boolean {
-		if (t.kind === 'audio') return true;
-		return t.clips.some((c) => audibleAssets.has(c.asset_id));
-	}
+	 *  whose clips carry sound *and still play it*. A track with no audio at all gets
+	 *  no fader: a mixer strip on a silent track is furniture, not a control. The one
+	 *  rule the Mixer panel's strips follow too (`mixer-strips.ts`). */
+	const hasSound = (t: Track): boolean => trackHasSound(t, audibleAssets);
 
 	/** Shared look for the one-letter S / L track flags. */
 	const flagBtn = (on: boolean, accent: string) =>
@@ -1882,8 +1881,8 @@
 					{#if t.kind === 'audio'}
 						<button
 							title={t.duck
-								? 'Ducking on — this track dips under the rest of the mix on export'
-								: 'Duck this track under the rest of the mix on export'}
+								? 'Ducking on — this track dips under the rest of the mix on export (the preview plays it at its fader)'
+								: 'Duck this track under the rest of the mix on export (the preview plays it at its fader)'}
 							aria-label="Toggle ducking"
 							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
 							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:var(--line-width) solid {t.duck
@@ -1938,16 +1937,18 @@
 						     one audio move every cut needs, and doing it clip by clip is
 						     not the same control. -->
 						<div style="display:flex;align-items:center;gap:6px">
+							<!-- Position along the fader's dB taper (`mixer.ts`), not linear gain: the
+							     same mapping, and so the same place for a level, as the Mixer's fader. -->
 							<input
 								type="range"
 								min="0"
-								max={Math.max(MAX_GAIN, t.volume ?? 1)}
-								step="0.01"
-								value={t.volume ?? 1}
+								max="1"
+								step="0.005"
+								value={gainToFader(t.volume ?? 1)}
 								disabled={editor.busy}
 								aria-label="{t.name} level"
 								title="Level {gainLabel(t.volume ?? 1)} — double-click for unity"
-								onchange={(e) => void editor.setTrackVolume(t.id, +e.currentTarget.value).catch(err)}
+								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
 								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
 								style="flex:1;min-width:0;height:20px;--slider-accent:var(--kerf-400);cursor:pointer"
 							/>

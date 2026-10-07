@@ -77,6 +77,7 @@ import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { sampleFilmstrip } from './sample-filmstrip';
+import { synthPcm } from './sample-audio';
 import { sampleFrameUrl } from './sample-frame';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
@@ -2327,7 +2328,12 @@ export async function getAudio(
 	sampleRate = 32000,
 	clipId?: string
 ): Promise<ArrayBuffer | null> {
-	if (!inTauri()) return null;
+	if (!inTauri()) {
+		// No decoder here: a synthetic voice at the loudness the sample analysis gives the
+		// asset, so playback, the faders and the Mixer's meters have a sound to act on.
+		const lufs = sampleAnalysis[assetId]?.loudness?.integrated_lufs;
+		return synthPcm(assetId, start, duration, sampleRate, lufs).buffer as ArrayBuffer;
+	}
 	return invoke<ArrayBuffer>('get_audio', { assetId, start, duration, sampleRate, clipId });
 }
 

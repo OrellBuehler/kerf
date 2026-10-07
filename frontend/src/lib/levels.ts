@@ -45,6 +45,29 @@ export const clampMasterVolume = (v: number): number => Math.min(MASTER_MAX_VOLU
 /** A ceiling as the engine clamps it: `-24..=0` dBFS. */
 export const clampCeiling = (db: number): number => Math.min(0, Math.max(MASTER_MIN_CEILING_DB, db));
 
+/** How far one keypress moves the limiter's ceiling, in dB. */
+export const CEILING_STEP = { fine: 0.1, normal: 0.5, coarse: 3, page: 6 } as const;
+
+/** The ceiling slider's travel: a ceiling's place on it, `0..1` (left is `-24`, right is `0`). */
+export const ceilingToPos = (db: number): number => (clampCeiling(db) - MASTER_MIN_CEILING_DB) / -MASTER_MIN_CEILING_DB;
+
+/** The ceiling a place on the travel means, to the half dB — what the label can say. */
+export const posToCeiling = (pos: number): number =>
+	clampCeiling(Math.round((MASTER_MIN_CEILING_DB + Math.min(1, Math.max(0, pos)) * -MASTER_MIN_CEILING_DB) * 2) / 2);
+
+/** The ceiling nudged by `steps` marks of `size`, on that size's own dB grid, within `-24..0`. */
+export function nudgeCeiling(db: number, steps: number, size: keyof typeof CEILING_STEP = 'normal'): number {
+	const grid = CEILING_STEP[size];
+	const eps = 1e-9;
+	const from = clampCeiling(db);
+	const cell = steps >= 0 ? Math.floor(from / grid + eps) : Math.ceil(from / grid - eps);
+	const next = clampCeiling(Math.round((cell + steps) * grid * 1000) / 1000);
+	return next === 0 ? 0 : next;
+}
+
+/** `-1.0 dBFS`: a ceiling as the limiter's label writes it. */
+export const ceilingLabel = (db: number): string => `${(Math.abs(db) < 0.05 ? 0 : db).toFixed(1)} dBFS`;
+
 /** Whether the master leaves the mix alone (unity gain, no limiter) — `MasterBus::is_neutral`. */
 export function isNeutralMaster(master: MasterBus): boolean {
 	return !master.limiter && Math.abs(master.volume - 1) <= Number.EPSILON;

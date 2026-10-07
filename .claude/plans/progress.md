@@ -14,7 +14,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | merged (local) | Per-asset filmstrip (proxy preferred, keyframe sampling for long originals, capped + niced even at 100%), `get_filmstrip` (no MCP tool: `skim_asset` covers agents), height presets (UI-only), minimap. |
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
-| B4 Mixer | `feat/mixer` | — | in-progress | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Open: Mixer panel UI, Web Audio master + meters, preview ducking label. |
+| B4 Mixer | `feat/mixer` | — | done (awaiting PR) | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
 | B5 Keyframes v2 | — | — | todo | |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
@@ -153,6 +153,13 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   already small and proven: the metered levels build (`build_filter_complex_metered`)
   sums each track into a submix before the final sum, and equals the flat graph in
   what it measures (an ignored test renders the export and reads it back).
+- **2026-10-07 — B4 preview: ducking export-only, limiter approximated.** Web
+  Audio has no sidechain compressor without an AudioWorklet, and a worklet would be
+  a second DSP implementation to keep in step with `sidechaincompress`. So the
+  preview plays a ducked track at its fader, and the Duck toggle's tooltip says so.
+  The master limiter previews as a hard-knee `DynamicsCompressorNode` at the ceiling,
+  with its makeup gain trimmed out. It is labelled an approximation, and Measure
+  reads the real export graph.
 - **2026-10-07 — master bus placement and limiter.** After the final sum / duck
   bus and before `loudnorm`. The limiter is `alimiter` with `level=0` (its
   default auto-level scales the output back up to full scale, turning a ceiling

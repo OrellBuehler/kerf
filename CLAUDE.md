@@ -2441,7 +2441,33 @@ two gain legs into a merger *are* the stereo pair. `src/lib/levels.ts` holds the
 bus's limits (the Rust constants), `levelNotes` (the *faithful* mirror of the advice
 `Levels::new` writes) and `estimateLevels`, the browser harness's stand-in for `get_levels`
 (an *approximation* from the sample analysis through faders, pan, master and limiter,
-flagged `estimated`). The old
+flagged `estimated`). The **Mixer panel** (`Mixer.svelte`, in the panel registry and the
+Audio workspace preset, reachable from the Panels menu) is one vertical `MixerStrip` per
+audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
+`trackHasSound`, which the track header uses too. It mirrors `clip_sounds`, so a video
+track whose sound was all detached has no strip. Each strip has a dB-tapered fader,
+pan, M / S / Duck and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
+at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
+`slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
+nudges written once it goes quiet (or on Enter / blur). Escape abandons a gesture,
+double-click resets, and Ctrl+Z during an unwritten run takes the run back rather than
+undoing the edit before it.
+
+The meters are **measured**. `audio.ts` routes each track through a bus gain and its
+pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
+limiter, which is a `DynamicsCompressorNode` approximation (`limiterParams` in
+`audio-mix.ts` trims its automatic makeup gain; the tooltip says it is an
+approximation of the export's `alimiter`), then a master analyser. The fader moved
+from the clip envelope (`clipGainAt`) onto the bus, which is the same product, so what
+plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
+and a held peak. The meters animate only while playing. Ducking is **export-only**:
+Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
+the preview plays the track at its fader. **Measure** on the master strip calls
+`get_levels` over the whole cut, or over in → out when both marks are set, and
+`levels-view.ts` phrases the result. In the browser harness, `sample-audio.ts`
+synthesizes a voice-like signal per asset at its analysed loudness, so playback,
+meters and faders are drivable under `bun run dev`. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
