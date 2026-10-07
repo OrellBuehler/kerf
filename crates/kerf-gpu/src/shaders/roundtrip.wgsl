@@ -4,13 +4,16 @@
 // reference, with the derivation and the measurements, is src/roundtrip.rs):
 //
 //   fs_rgb       Y, U, V  -> R, G, B   swscale's yuv2rgb tables, the layer's matrix
-//   fs_luma      R, G, B  -> Y         BT.601 (the RGB frame carries no tag)
+//   fs_luma      R, G, B  -> Y         the composite's matrix (BT.601 unless negotiated)
 //   fs_chroma_h  R, G, B  -> U, V      sums of horizontal pixel pairs, 15 bits
 //   fs_chroma_v  U, V     -> U, V      swscale's vertical bicubic, 2:1, 12-bit weights
 
 struct P {
     k: vec4<i32>,     // crv, cbu, cgu, cgv: the chroma coefficients, scaled by cy
     m: vec4<i32>,     // cy, oy, the luma offset in the table, unused
+    ky: vec4<i32>,    // the way back (RGB -> YCbCr): luma weights ry, gy, by (15 bits)
+    ku: vec4<i32>,    // ... and ru, gu, bu
+    kv: vec4<i32>,    // ... and rv, gv, bv
     size: vec2<i32>,  // the picture (luma size)
     csize: vec2<i32>, // ... and its chroma planes
     channel: i32,     // fs_chroma_v: 0 = U, 1 = V
@@ -62,7 +65,7 @@ fn fs_rgb(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 fn fs_luma(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let o = vec2<i32>(frag.xy);
     let c = vec3<i32>(round(textureLoad(t1, o, 0).rgb * 255.0));
-    let y14 = (8414 * c.x + 16519 * c.y + 3208 * c.z + (32 << 14u) + (1 << 8u)) >> 9u;
+    let y14 = (p.ky.x * c.x + p.ky.y * c.y + p.ky.z * c.z + (32 << 14u) + (1 << 8u)) >> 9u;
     let y8 = clamp((y14 + 32) >> 6u, 0, 255);
     return vec4<f32>(f32(y8) / 255.0, 0.0, 0.0, 1.0);
 }
@@ -78,8 +81,8 @@ fn fs_chroma_h(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let a = vec3<i32>(round(textureLoad(t1, vec2<i32>(x0, o.y), 0).rgb * 255.0));
     let b = vec3<i32>(round(textureLoad(t1, vec2<i32>(x1, o.y), 0).rgb * 255.0));
     let s = a + b;
-    let u = (-4865 * s.x - 9528 * s.y + 14392 * s.z + (256 << 15u) + (1 << 9u)) >> 10u;
-    let v = (14392 * s.x - 12061 * s.y - 2332 * s.z + (256 << 15u) + (1 << 9u)) >> 10u;
+    let u = (p.ku.x * s.x + p.ku.y * s.y + p.ku.z * s.z + (256 << 15u) + (1 << 9u)) >> 10u;
+    let v = (p.kv.x * s.x + p.kv.y * s.y + p.kv.z * s.z + (256 << 15u) + (1 << 9u)) >> 10u;
     // 15 bits, as the scaler's intermediate (value * 128).
     return vec4<f32>(f32(u * 2), f32(v * 2), 0.0, 1.0);
 }

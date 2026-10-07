@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::engine::{render_geometry, ExportOptions, Fit};
 use crate::error::{Error, Result};
-use crate::model::{Asset, Clip, Color, StreamInfo, StreamKind, Timeline, Transform};
+use crate::layer_geometry::LayerGeometry;
+use crate::model::{pix_fmt_layout, Asset, Clip, Color, PixLayout, StreamInfo, StreamKind, Timeline, Transform};
 
 /// A video clip visible at a timeline time, paired with where in its source the
 /// frame comes from.
@@ -95,9 +96,9 @@ pub fn still_size(frame_w: u32, frame_h: u32, max_width: u32) -> (u32, u32) {
 }
 
 /// The YUV→RGB matrix applied when the composited frame is converted for
-/// display. A plan carries one, because FFmpeg composites in YUV *without*
-/// converting between its layers' own matrices and converts the **result**
-/// once — so there is exactly one matrix per frame, not one per layer.
+/// display. A plan carries one, because FFmpeg composites in YUV and converts the
+/// **result** once — so there is exactly one matrix per frame, not one per layer.
+/// Which one it is depends on the FFmpeg: [`CompositeColorPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YuvMatrix {
     /// BT.601 (Kr 0.299, Kb 0.114).
@@ -119,6 +120,35 @@ impl YuvMatrix {
     }
 }
 
+/// How this FFmpeg picks the YCbCr matrix of the composite — the matrix the one
+/// final conversion to RGB (and so the picture a still or a preview shows) uses.
+/// It differs between FFmpeg versions, so it is a property of the FFmpeg in use,
+/// measured rather than guessed from a version string: see
+/// [`composite_color_policy`](crate::composite_color_policy), which probes it once
+/// per process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeColorPolicy {
+    /// The composite is untagged — the black canvas carries no colourspace — and
+    /// every layer is blended as it is: one matrix, **BT.601**, whatever the
+    /// layers were tagged. FFmpeg 6.
+    FixedBt601,
+    /// Colourspace is negotiated across the overlay chain (FFmpeg 9): the
+    /// **bottom layer's tag** becomes the composite's matrix, and a layer tagged
+    /// otherwise is converted into it by the scaler — an arithmetic the compositor
+    /// does not reproduce, so such a stack is refused. The matrix of a stack whose
+    /// layers all agree follows their tag.
+    BottomLayerTag,
+}
+
+/// The steepest shrink of one scale stage the compositor claims to match: swscale's
+/// vertical scaler on x86 is not bit-exact with the C arithmetic the compositor
+/// follows, and the difference grows with the number of input samples per output
+/// one — one level up to about 4:1, two to three up to 20:1, up to five at 40:1
+/// (`the_scaler_matches_ffmpegs_scale_plane_by_plane`). Past it the figure is not
+/// measured (a 58:1 shrink of a 4K test pattern reads 16 levels off in RGB), so the
+/// frame goes through FFmpeg.
+pub const MAX_SHRINK: u32 = 40;
+
 /// The frame a plan renders into.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanCanvas {
@@ -131,15 +161,14 @@ pub struct PlanCanvas {
     pub fit: Fit,
     /// The export's `scale` flags (`bicubic` when none is chosen), as typed.
     pub scaler: Option<String>,
-    /// The matrix the composited frame is converted with. **BT.601 limited
-    /// range**, because that is what FFmpeg does today and parity is the point:
-    /// the still graph hands the PNG / JPEG encoder a composited `yuv420p` frame
-    /// whose colorspace is unspecified (the black base it is drawn onto carries
-    /// none), and swscale reads "unspecified" as BT.601 — measured, for
-    /// BT.709-tagged, BT.601-tagged and untagged sources alike. An export is
-    /// not converted at all, so a player shows it as BT.709 (HD); the two
-    /// disagree by a few levels on saturated colour. Moving this to BT.709 is a
-    /// decision for the day the GPU path *replaces* the FFmpeg preview.
+    /// The matrix the composited frame is converted with, limited range, as this
+    /// FFmpeg does it ([`CompositeColorPolicy`]): **BT.601** when the composite is
+    /// untagged (FFmpeg 6 — measured for BT.709-tagged, BT.601-tagged and untagged
+    /// sources alike), or, where colourspace is negotiated along the overlay chain
+    /// (FFmpeg 9), the matrix the layers share. An export is not converted at all,
+    /// so a player shows it as BT.709 (HD); the two disagree by a few levels on
+    /// saturated colour. Moving this to BT.709 is a decision for the day the GPU
+    /// path *replaces* the FFmpeg preview.
     pub matrix: YuvMatrix,
 }
 
@@ -167,18 +196,38 @@ pub struct PlanStream {
 }
 
 impl PlanStream {
+    /// The layout of the picture, from the probed pixel format; `None` when it was
+    /// never recorded (an asset saved before it was) or is not a known-opaque one.
+    pub fn layout(&self) -> Option<PixLayout> {
+        self.pix_fmt.as_deref().and_then(pix_fmt_layout)
+    }
+
     /// The matrix FFmpeg converts this picture with *inside* a graph (the frame's
-    /// own, which `scale` takes from its colorspace tag): BT.709 and BT.2020 as
-    /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at
-    /// all** (swscale's default). `None` for a matrix the compositor has no
-    /// coefficients for.
+    /// own, which `scale` takes from its colourspace tag): BT.709 and BT.2020 as
+    /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at all**
+    /// (swscale's default) — and for an RGB picture, which is converted to YCbCr
+    /// with that default.
+    ///
+    /// `None` when it cannot be known: a matrix the compositor has no coefficients
+    /// for, or an asset whose pixel format was never recorded. For such an asset
+    /// "no tag" means *either* untagged *or* "probed before tags were read", and a
+    /// BT.709 clip from an old project must not be taken for BT.601.
     pub fn matrix(&self) -> Option<YuvMatrix> {
+        self.pix_fmt.as_ref()?;
+        if self.layout() == Some(PixLayout::Rgb) {
+            return Some(YuvMatrix::Bt601);
+        }
         match self.color_space.as_deref() {
             None | Some("smpte170m") | Some("bt470bg") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
             Some("bt2020nc") => Some(YuvMatrix::Bt2020),
             Some(_) => None,
         }
+    }
+
+    /// An RGB-family picture (see [`PixLayout::Rgb`]).
+    pub fn is_rgb(&self) -> bool {
+        self.layout() == Some(PixLayout::Rgb)
     }
 
     fn of(s: &StreamInfo) -> Option<Self> {
@@ -227,13 +276,67 @@ pub struct RenderPlan {
     unsupported: Vec<String>,
 }
 
+/// The matrix the composite is converted with under `policy`, and the reasons a
+/// stack cannot be drawn under it.
+///
+/// [`CompositeColorPolicy::FixedBt601`] is BT.601, always. Under
+/// [`CompositeColorPolicy::BottomLayerTag`] it is the matrix every layer shares —
+/// FFmpeg 9 takes it from the bottom layer's tag and converts the others into it,
+/// which is reproduced only when there is nothing to convert: layers of different
+/// matrices are refused, as is a layer whose matrix is unknown, and an RGB picture
+/// in a stack that is not BT.601 (the converter that makes it YCbCr takes whatever
+/// matrix the neighbours negotiated, and the result depends on the order).
+fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsupported: &mut Vec<String>) -> YuvMatrix {
+    if policy == CompositeColorPolicy::FixedBt601 {
+        return YuvMatrix::Bt601;
+    }
+    let mut shared: Option<YuvMatrix> = None;
+    let mut mixed = false;
+    let mut rgb = false;
+    for (n, layer) in layers.iter().enumerate() {
+        if layer.stream.is_rgb() {
+            rgb = true;
+            continue;
+        }
+        match layer.stream.matrix() {
+            None => unsupported.push(format!(
+                "layer {n}: its colour matrix is unknown, and FFmpeg's composite takes its matrix from the layers' tags"
+            )),
+            Some(m) => match shared {
+                None => shared = Some(m),
+                Some(first) if first != m => mixed = true,
+                Some(_) => {}
+            },
+        }
+    }
+    if mixed {
+        unsupported.push(
+            "layers tagged with different YCbCr matrices: FFmpeg converts them into the bottom layer's, which is not reproduced"
+                .to_string(),
+        );
+    }
+    let matrix = shared.unwrap_or(YuvMatrix::Bt601);
+    if rgb && matrix != YuvMatrix::Bt601 {
+        unsupported.push(format!(
+            "an RGB picture in a {matrix:?} stack: FFmpeg converts it with the stack's matrix, which is not reproduced"
+        ));
+    }
+    matrix
+}
+
 impl RenderPlan {
     /// The plan for timeline time `t`: what `timeline_frame` / `export_still`
     /// would draw. Like them it renders the cut as [`Timeline::for_render`]
     /// sees it, so a muted or solo-shadowed track is as absent here as there.
     ///
     /// Errors the way the still does: a clip whose asset is not in `assets`.
-    pub fn at(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Result<RenderPlan> {
+    pub fn at(
+        timeline: &Timeline,
+        assets: &[Asset],
+        opts: &ExportOptions,
+        t: f64,
+        color: CompositeColorPolicy,
+    ) -> Result<RenderPlan> {
         let rendered = timeline.for_render();
         let geom = render_geometry(&rendered, assets, opts);
         let t = t.max(0.0);
@@ -259,21 +362,31 @@ impl RenderPlan {
             }
             // Alpha is composited by FFmpeg (a ProRes 4444 title, a VP9 or FFV1
             // clip with transparency, a GIF); the compositor draws opaque 4:2:0
-            // and would flatten it onto black without a word.
-            if stream.pix_fmt.as_deref().is_some_and(crate::model::pix_fmt_has_alpha) {
-                unsupported.push(format!(
-                    "{label}: the picture has an alpha channel ({})",
-                    stream.pix_fmt.as_deref().unwrap_or_default()
-                ));
+            // and would flatten it onto black without a word. The probed pixel
+            // format must be on the allow-list of known-opaque ones — a name a
+            // deny-list never thought of (`ayuv`, `vuya`, the `rgb32` aliases) is
+            // refused too. `None` (never recorded) is the decoder's to find out.
+            if let Some(fmt) = stream.pix_fmt.as_deref() {
+                if crate::model::pix_fmt_has_alpha(fmt) {
+                    unsupported.push(format!("{label}: the picture has an alpha channel ({fmt})"));
+                } else if pix_fmt_layout(fmt).is_none() {
+                    unsupported.push(format!(
+                        "{label}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)"
+                    ));
+                }
             }
-            // Below full opacity FFmpeg takes the layer through RGB and back with its
-            // own matrix (the frame's tag, not the composite's), which only the
-            // matrices the compositor has coefficients for can be reproduced for.
+            // Below full opacity FFmpeg takes the layer through RGB and back (see
+            // `kerf-gpu`'s `roundtrip`), out of YCbCr with the picture's own matrix,
+            // which has to be known for the arithmetic to be reproduced.
             let opacity = ac.transform().opacity;
             if opacity < 1.0 && stream.matrix().is_none() {
                 unsupported.push(format!(
-                    "{label}: opacity below 1 on a {} picture",
-                    stream.color_space.as_deref().unwrap_or("untagged")
+                    "{label}: opacity below 1 on a picture whose colour matrix is {}",
+                    match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
+                        (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
+                        (Some(_), Some(tag)) => format!("`{tag}`, which the compositor has no coefficients for"),
+                        (Some(_), None) => "unknown".to_string(),
+                    }
                 ));
             }
             if !clip.effects.is_empty() {
@@ -328,6 +441,8 @@ impl RenderPlan {
             unsupported.push(format!("scaler '{s}'"));
         }
 
+        let matrix = composite_matrix(&layers, color, &mut unsupported);
+
         Ok(RenderPlan {
             time: t,
             canvas: PlanCanvas {
@@ -335,17 +450,72 @@ impl RenderPlan {
                 height: geom.height,
                 fit: geom.fit,
                 scaler: geom.scaler,
-                matrix: YuvMatrix::Bt601,
+                matrix,
             },
             layers,
             unsupported,
         })
     }
 
-    /// Whether the compositor draws this frame exactly. `false` means "render it
-    /// through FFmpeg"; [`RenderPlan::unsupported_reasons`] says why.
+    /// Whether the compositor draws this frame exactly, **judged without the render
+    /// size**. `false` means "render it through FFmpeg"; [`RenderPlan::unsupported_reasons`]
+    /// says why. A `true` is necessary, not sufficient: what depends on the size the
+    /// frame is rendered at (an enlargement of a picture whose chroma is not 4:2:0, a
+    /// translucent layer of odd size, a crop that leaves nothing) is
+    /// [`RenderPlan::gpu_supported_at`]'s.
     pub fn gpu_supported(&self) -> bool {
         self.unsupported.is_empty()
+    }
+
+    /// Why the frame cannot be drawn at `size` ([`RenderPlan::size`]): the size-free
+    /// reasons of [`RenderPlan::unsupported_reasons`] plus those the geometry at this
+    /// size adds. Pure; ask it before decoding anything.
+    pub fn unsupported_reasons_at(&self, size: (u32, u32)) -> Vec<String> {
+        let mut reasons = self.unsupported.clone();
+        for (n, layer) in self.layers.iter().enumerate() {
+            let src = (layer.stream.width, layer.stream.height);
+            let geom = match LayerGeometry::resolve(src, size, self.canvas.fit, &layer.transform) {
+                Ok(g) => g,
+                Err(e) => {
+                    reasons.push(format!("layer {n}: {e}"));
+                    continue;
+                }
+            };
+            // FFmpeg scales a picture in the format it has; the compositor scales
+            // the 8-bit 4:2:0 a decode reduces it to. Shrinking agrees (the chroma
+            // that is thrown away is thrown away either way); enlarging does not —
+            // FFmpeg interpolates real chroma where the compositor interpolates
+            // chroma that was already averaged away (a 2x enlargement of 4:4:4 is 27
+            // levels off, of RGB 69). An unrecorded format is not known to be 4:2:0.
+            if let Some(stage) = geom
+                .stages
+                .iter()
+                .find(|s| s.src.w > MAX_SHRINK * s.scaled.0 || s.src.h > MAX_SHRINK * s.scaled.1)
+            {
+                reasons.push(format!(
+                    "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers",
+                    stage.src.w, stage.src.h, stage.scaled.0, stage.scaled.1
+                ));
+            }
+            let enlarging = geom.stages.iter().find(|s| s.scaled.0 > s.src.w || s.scaled.1 > s.src.h);
+            if let Some(stage) = enlarging.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
+            {
+                reasons.push(format!(
+                    "layer {n}: enlarges a {}x{} picture to {}x{}, and its format ({}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales natively",
+                    stage.src.w,
+                    stage.src.h,
+                    stage.scaled.0,
+                    stage.scaled.1,
+                    layer.stream.pix_fmt.as_deref().unwrap_or("not recorded")
+                ));
+            }
+        }
+        reasons
+    }
+
+    /// Whether the compositor draws this frame exactly when rendered at `size`.
+    pub fn gpu_supported_at(&self, size: (u32, u32)) -> bool {
+        self.unsupported_reasons_at(size).is_empty()
     }
 
     /// Why the frame cannot be drawn on the GPU yet — empty when it can.
@@ -381,7 +551,7 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
-            pix_fmt: None,
+            pix_fmt: Some("yuv420p".into()),
             color_space: None,
         }
     }
@@ -413,7 +583,7 @@ mod tests {
     }
 
     fn plan(tl: &Timeline, assets: &[Asset], t: f64) -> RenderPlan {
-        RenderPlan::at(tl, assets, &ExportOptions::default(), t).unwrap()
+        RenderPlan::at(tl, assets, &ExportOptions::default(), t, CompositeColorPolicy::FixedBt601).unwrap()
     }
 
     #[test]
@@ -551,7 +721,7 @@ mod tests {
             resolution: Some((720, 1280)),
             ..ExportOptions::default()
         };
-        let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0).unwrap();
+        let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &opts, 1.0, CompositeColorPolicy::FixedBt601).unwrap();
         assert_eq!((p.canvas.width, p.canvas.height), (720, 1280));
     }
 
@@ -568,7 +738,7 @@ mod tests {
     fn an_unknown_asset_is_an_error_like_the_still() {
         let tl = timeline(vec![vec![Clip::new(Uuid::new_v4(), 0.0, 1.0, 0.0)]]);
         assert!(matches!(
-            RenderPlan::at(&tl, &[], &ExportOptions::default(), 0.5),
+            RenderPlan::at(&tl, &[], &ExportOptions::default(), 0.5, CompositeColorPolicy::FixedBt601),
             Err(Error::AssetNotFound(_))
         ));
     }
@@ -709,6 +879,196 @@ mod tests {
         }
     }
 
+    /// A plan over one clip per `(pix_fmt, tag)`, bottom first.
+    fn stack(policy: CompositeColorPolicy, layers: &[(&str, Option<&str>)]) -> RenderPlan {
+        let assets: Vec<Asset> = layers
+            .iter()
+            .map(|(fmt, tag)| {
+                let mut v = video(640, 360);
+                v.pix_fmt = Some((*fmt).into());
+                v.color_space = tag.map(Into::into);
+                asset("a", 20.0, vec![v])
+            })
+            .collect();
+        let tl = timeline(assets.iter().map(|a| vec![Clip::new(a.id, 0.0, 10.0, 0.0)]).collect());
+        RenderPlan::at(&tl, &assets, &ExportOptions::default(), 1.0, policy).unwrap()
+    }
+
+    #[test]
+    fn the_fixed_policy_converts_every_composite_as_bt601() {
+        for tag in [None, Some("bt709"), Some("bt2020nc")] {
+            let p = stack(
+                CompositeColorPolicy::FixedBt601,
+                &[("yuv420p", tag), ("yuv420p", Some("bt709"))],
+            );
+            assert_eq!(p.canvas.matrix, YuvMatrix::Bt601);
+            assert!(p.gpu_supported(), "{:?}", p.unsupported_reasons());
+        }
+    }
+
+    #[test]
+    fn under_negotiation_the_composite_follows_the_layers_tag() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        for (tag, want) in [
+            (None, YuvMatrix::Bt601),
+            (Some("smpte170m"), YuvMatrix::Bt601),
+            (Some("bt470bg"), YuvMatrix::Bt601),
+            (Some("bt709"), YuvMatrix::Bt709),
+            (Some("bt2020nc"), YuvMatrix::Bt2020),
+        ] {
+            let p = stack(B, &[("yuv420p", tag)]);
+            assert_eq!(
+                (p.canvas.matrix, p.gpu_supported()),
+                (want, true),
+                "{tag:?}: {:?}",
+                p.unsupported_reasons()
+            );
+            // ...for a whole stack that agrees, whatever the layers' formats.
+            let p = stack(B, &[("yuv420p", tag), ("yuv444p", tag), ("yuv420p10le", tag), ("gray", tag)]);
+            assert_eq!(
+                (p.canvas.matrix, p.gpu_supported()),
+                (want, true),
+                "{tag:?}: {:?}",
+                p.unsupported_reasons()
+            );
+        }
+        // No layers: an untagged canvas.
+        let p = stack(B, &[]);
+        assert_eq!(p.canvas.matrix, YuvMatrix::Bt601);
+        assert!(p.gpu_supported());
+    }
+
+    #[test]
+    fn under_negotiation_layers_that_disagree_are_refused_not_converted_wrong() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        // FFmpeg 9 converts the top into the bottom's matrix with arithmetic the
+        // compositor does not reproduce — in either order, and for 601 vs untagged
+        // there is nothing to convert.
+        for layers in [
+            [("yuv420p", Some("bt709")), ("yuv420p", None)],
+            [("yuv420p", None), ("yuv420p", Some("bt709"))],
+            [("yuv420p", Some("bt709")), ("yuv420p", Some("bt2020nc"))],
+        ] {
+            let p = stack(B, &layers);
+            assert!(!p.gpu_supported(), "{layers:?}");
+            assert!(p.unsupported_reasons().iter().any(|r| r.contains("different YCbCr matrices")));
+        }
+        let p = stack(B, &[("yuv420p", None), ("yuv420p", Some("smpte170m"))]);
+        assert!(p.gpu_supported(), "{:?}", p.unsupported_reasons());
+        // A matrix with no coefficients here, and an asset that never recorded its tags.
+        let p = stack(B, &[("yuv420p", Some("smpte240m"))]);
+        assert!(p.unsupported_reasons().iter().any(|r| r.contains("colour matrix is unknown")));
+        // RGB pictures take the stack's matrix in FFmpeg's converter: only a BT.601
+        // stack is one the compositor can reproduce.
+        let p = stack(B, &[("rgb24", None), ("yuv420p", None)]);
+        assert!(p.gpu_supported(), "{:?}", p.unsupported_reasons());
+        let p = stack(B, &[("yuv420p", Some("bt709")), ("rgb24", None)]);
+        assert!(p.unsupported_reasons().iter().any(|r| r.contains("RGB picture")));
+        let p = stack(B, &[("rgb24", None), ("yuv420p", Some("bt709"))]);
+        assert!(p.unsupported_reasons().iter().any(|r| r.contains("RGB picture")));
+    }
+
+    #[test]
+    fn an_asset_that_never_recorded_its_pixel_format_has_an_unknown_matrix() {
+        // `color_space: None` means "untagged" for a recorded asset and "not read
+        // yet" for an old one: BT.709 footage from an old project at opacity < 1
+        // must not be taken for BT.601.
+        let (ok, why) = supported_with(|tl, a| {
+            a.streams[0].pix_fmt = None;
+            tl.tracks[0].clips[0].transform.opacity = 0.5;
+        });
+        assert!(!ok && why.iter().any(|r| r.contains("probed before")), "{why:?}");
+        // An opaque layer does not care, under the fixed policy.
+        let (ok, why) = supported_with(|_, a| a.streams[0].pix_fmt = None);
+        assert!(ok, "{why:?}");
+        // Under negotiation the composite's matrix depends on every tag.
+        let mut v = video(640, 360);
+        v.pix_fmt = None;
+        let a = asset("a", 20.0, vec![v]);
+        let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+        let p = RenderPlan::at(
+            &tl,
+            &[a],
+            &ExportOptions::default(),
+            1.0,
+            CompositeColorPolicy::BottomLayerTag,
+        )
+        .unwrap();
+        assert!(!p.gpu_supported());
+    }
+
+    #[test]
+    fn a_pixel_format_off_the_allow_list_is_refused_even_if_it_does_not_look_like_alpha() {
+        for fmt in ["ayuv", "vuya", "rgb32", "bgr32", "ayuv64le", "something_new"] {
+            let (ok, why) = supported_with(|_, a| a.streams[0].pix_fmt = Some(fmt.into()));
+            assert!(!ok, "{fmt}: {why:?}");
+        }
+    }
+
+    #[test]
+    fn what_depends_on_the_render_size_is_decided_with_it() {
+        let with_fmt = |fmt: Option<&str>, scale: f64, opacity: f64| {
+            let mut v = video(640, 360);
+            v.pix_fmt = fmt.map(Into::into);
+            let a = asset("a", 20.0, vec![v]);
+            let mut c = Clip::new(a.id, 0.0, 10.0, 0.0);
+            c.transform.scale = scale;
+            c.transform.opacity = opacity;
+            let tl = timeline(vec![vec![c]]);
+            plan(&tl, std::slice::from_ref(&a), 1.0)
+        };
+        // Enlarging a picture FFmpeg scales natively in another format is refused;
+        // 4:2:0 and gray are not, and shrinking is not, whatever the format.
+        for (fmt, scale, refused) in [
+            ("yuv420p", 2.0, false),
+            ("yuv420p10le", 2.0, false),
+            ("gray", 2.0, false),
+            ("yuv444p", 1.5, true),
+            ("yuv422p", 2.0, true),
+            ("bgr0", 2.0, true),
+            ("rgb24", 2.0, true),
+            ("yuv420p12le", 2.0, true),
+            ("yuv444p", 1.0, false),
+            ("yuv444p", 0.5, false),
+            ("rgb24", 0.5, false),
+        ] {
+            let p = with_fmt(Some(fmt), scale, 1.0);
+            let why = p.unsupported_reasons_at(p.size(u32::MAX));
+            assert_eq!(!why.is_empty(), refused, "{fmt} x{scale}: {why:?}");
+        }
+        // A format that was never recorded is not known to be 4:2:0.
+        let p = with_fmt(None, 2.0, 1.0);
+        assert!(!p.gpu_supported_at(p.size(u32::MAX)));
+        // The size decides: the same 640x360 source into a 1920x1080 frame is an
+        // enlargement at full size and a plain copy at preview width 640.
+        let a = {
+            let mut v = video(640, 360);
+            v.pix_fmt = Some("yuv444p".into());
+            asset("a", 20.0, vec![v])
+        };
+        let tl = {
+            let mut t = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            t.format = Some(crate::model::Delivery::new(1920, 1080, Fit::Contain));
+            t
+        };
+        let p = plan(&tl, std::slice::from_ref(&a), 1.0);
+        assert!(!p.gpu_supported_at(p.size(u32::MAX)));
+        assert!(p.gpu_supported_at(p.size(640)));
+        // A shrink steeper than the scaler comparison covers is FFmpeg's: 640 px to
+        // 13 is past 40:1, 640 px to 19 is not.
+        let p = with_fmt(Some("yuv420p"), 0.02, 1.0);
+        let why = p.unsupported_reasons_at(p.size(u32::MAX));
+        assert!(why.iter().any(|r| r.contains("steeper than the 40:1")), "{why:?}");
+        let p = with_fmt(Some("yuv420p"), 0.03, 1.0);
+        assert!(p.gpu_supported_at(p.size(u32::MAX)));
+        // A translucent layer of odd size, at the size it is rendered.
+        let p = with_fmt(Some("yuv420p"), 0.33, 0.5);
+        let why = p.unsupported_reasons_at(p.size(u32::MAX));
+        assert!(why.iter().any(|r| r.contains("odd size")), "{why:?}");
+        let p = with_fmt(Some("yuv420p"), 0.5, 0.5);
+        assert!(p.gpu_supported_at(p.size(u32::MAX)));
+    }
+
     #[test]
     fn the_matrix_follows_the_tag_and_defaults_to_bt601_like_swscale() {
         let of = |tag: Option<&str>| {
@@ -744,9 +1104,23 @@ mod tests {
             scaler: Some(s.into()),
             ..ExportOptions::default()
         };
-        let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &with("bicubic"), 1.0).unwrap();
+        let p = RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&a),
+            &with("bicubic"),
+            1.0,
+            CompositeColorPolicy::FixedBt601,
+        )
+        .unwrap();
         assert!(p.gpu_supported());
-        let p = RenderPlan::at(&tl, std::slice::from_ref(&a), &with("lanczos"), 1.0).unwrap();
+        let p = RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&a),
+            &with("lanczos"),
+            1.0,
+            CompositeColorPolicy::FixedBt601,
+        )
+        .unwrap();
         assert!(!p.gpu_supported());
     }
 }

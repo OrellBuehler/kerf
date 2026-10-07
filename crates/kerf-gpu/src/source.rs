@@ -324,13 +324,15 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
             "{path}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
         )));
     }
-    if layer
-        .stream
-        .pix_fmt
-        .as_deref()
-        .is_some_and(kerf_core::model::pix_fmt_has_alpha)
-    {
-        return Err(GpuError::Unsupported(format!("{path} has an alpha channel")));
+    // A recorded pixel format must be on the allow-list of known-opaque ones: the
+    // plan refuses the rest too, but a caller that skipped it must not get alpha
+    // flattened onto black.
+    if let Some(fmt) = layer.stream.pix_fmt.as_deref() {
+        if kerf_core::model::pix_fmt_layout(fmt).is_none() {
+            return Err(GpuError::Unsupported(format!(
+                "{path}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)"
+            )));
+        }
     }
     // The probed size bounds what the child may write; a bigger decode than the
     // probe said is a mismatch like a different one.

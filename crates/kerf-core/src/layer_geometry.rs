@@ -1,5 +1,6 @@
 //! The integer geometry of one layer, worked out the way FFmpeg's filters work
-//! it out.
+//! it out — shared by [`crate::render_plan::RenderPlan`] (which refuses what the
+//! sizes make unrenderable) and the GPU compositor (which draws it).
 //!
 //! The still graph hands a clip to `crop → scale → (pad | scale) → rotate →
 //! overlay`, and each of those rounds differently: `crop` rounds with `lrint` and
@@ -16,7 +17,7 @@
 //! the transform's own scale), an optional rotation, and where the result lands
 //! on the canvas.
 
-use kerf_core::{Fit, Transform};
+use crate::model::{Fit, Transform};
 
 /// A pixel rectangle in some picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

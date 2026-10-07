@@ -18,18 +18,30 @@
 //!   test patterns and super-whites are, because the clamp comes before the blend.)
 //!   Everything stays in encoded gamma, FFmpeg's own space: there is no
 //!   linear-light round trip to disagree about.
-//! * **The matrix is fixed, not read from the stream.** The composite is
-//!   converted with **BT.601, limited range** ([`kerf_core::YuvMatrix::Bt601`], a
-//!   field of the plan): the composited frame carries no colorspace tag, swscale
-//!   reads that as BT.601, and a BT.709 source gets BT.601 coefficients in
-//!   FFmpeg's still too (measured: tagged BT.709, tagged BT.601 and untagged files
-//!   convert identically, on FFmpeg 6.1 and 9.0). Matching it is the point; the
-//!   stream's matrix is used in exactly one place, the RGB round trip of a
-//!   translucent layer (below), because there FFmpeg converts *the layer* with its
-//!   frame's own tag. Chroma is replicated 2x2 at the final conversion, as
-//!   swscale's unscaled path does, not interpolated. Sources are asked for limited
-//!   range explicitly (`scale=out_range=tv`): FFmpeg 9 no longer converts a
-//!   full-range JPEG for `-pix_fmt` alone.
+//! * **The composite's matrix is the FFmpeg's, probed.** The conversion to RGB is
+//!   limited range with the matrix of [`kerf_core::YuvMatrix`], a field of the plan,
+//!   and which matrix FFmpeg uses depends on the FFmpeg. [`kerf_core::composite_color_policy`]
+//!   renders a tagged and an untagged clip through the real still graph once per
+//!   process and reads which behaviour it has ([`kerf_core::CompositeColorPolicy`]):
+//!   - **`FixedBt601`** (FFmpeg 6.1: the black base carries no colourspace, so the
+//!     composite is read as BT.601 whatever the layers were tagged — BT.709, BT.601
+//!     and untagged files convert identically);
+//!   - **`BottomLayerTag`** (FFmpeg 9.0: colourspace is negotiated along the overlay
+//!     chain, the bottom layer's tag becomes the composite's, and a layer tagged
+//!     otherwise is converted into it by a scaler stage). The compositor draws a
+//!     stack whose layers share one matrix class with that matrix — BT.709, BT.2020,
+//!     or BT.601 (`smpte170m`, `bt470bg` and untagged are one class) — and **refuses
+//!     a mixed stack**, a layer whose matrix is unknown, and an RGB picture in a
+//!     stack that is not BT.601, because the arithmetic of the conversion into the
+//!     bottom layer's matrix was not reproduced (float and fixed-point models of it
+//!     were off by up to 26 levels).
+//!
+//!   Everything is judged by the plan, from the policy, before anything is decoded.
+//!   An asset that never recorded its pixel format has an unknown matrix and is
+//!   treated like a mixed tag wherever the matrix matters. Chroma is replicated 2x2
+//!   at the final conversion, as swscale's unscaled path does, not interpolated.
+//!   Sources are asked for limited range explicitly (`scale=out_range=tv`): FFmpeg 9
+//!   no longer converts a full-range JPEG for `-pix_fmt` alone.
 //! * **`eq`.** Colour correction runs on the Y / U / V planes through vf_eq's own
 //!   tables ([`eq`]), before any RGB exists — it is not an RGB operation, and
 //!   Kerf's "temperature" is a power function on the chroma planes. The black bars
@@ -44,31 +56,44 @@
 //!   Planes are scaled independently at their own size and rounded to 8 bits
 //!   between stages, like FFmpeg's filters. The committed evidence is
 //!   `tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`: every
-//!   plane within one level of `ffmpeg -vf scale`, on test patterns, noise and a
-//!   checkerboard, scaled down and up, on FFmpeg 6.1 and 9.0.
+//!   plane within one level of `ffmpeg -vf scale` up to about 4:1, scaled down and
+//!   up, within two to three levels on 8:1 to 20:1 downscales of noise and test
+//!   patterns and within five at 40:1 (x86 swscale's vertical scaler is not
+//!   bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0. A
+//!   shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
+//!   refused. FFmpeg scales a picture in the
+//!   format it has; the decode reduces it to 8-bit 4:2:0 first, which agrees for a
+//!   shrink and not for an **enlargement** of a picture that is not 4:2:0 (a 2x
+//!   enlargement of 4:4:4 is 27 levels off, of RGB 69), so the plan refuses that
+//!   from the pixel format.
 //! * **Opacity below 1** takes FFmpeg's RGB round trip ([`roundtrip`]): the layer
 //!   goes `yuva420p -> argb -> yuva420p`, because `colorchannelmixer` only takes
-//!   RGB, with its own matrix out and BT.601 back, and an alpha plane that ends up
-//!   at `round(lrint(255 * op) * 256 / 255)` ([`geometry::ffmpeg_alpha`]).
-//!   Reproduced in integer arithmetic; a translucent layer of odd size is refused.
+//!   RGB. Out of YCbCr with the layer's own matrix (swscale's converter, exact), back
+//!   with the composite's (luma exact, chroma within a level of the pair-averaged,
+//!   vertically scaled one), and an alpha plane that ends up at
+//!   `round(lrint(255 * op) * 256 / 255)` ([`geometry::ffmpeg_alpha`]). Reproduced
+//!   in integer arithmetic; a translucent layer of odd size is refused, as is one
+//!   whose matrix is unknown.
 //! * **Geometry.** FFmpeg's integer rounding (`crop`, `scale`, `pad`, `overlay`,
 //!   `rotate`) is reproduced in [`geometry`], so layers land on the same pixels —
 //!   including the chroma block an odd layer's last pixel shares with the pixel
 //!   just past it.
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
-//!   (`gpu_supported`), and the decode and the compositor refuse what only they can
-//!   see ([`GpuError::Unsupported`]): a picture that decodes at another size than
-//!   the probe said (an EXIF orientation), an alpha channel, a ratio the scaler
-//!   needs two passes for, a translucent odd layer. The caller's answer to every
-//!   one is the FFmpeg path.
+//!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
+//!   an enlargement of a picture whose chroma is not 4:2:0, a translucent layer of
+//!   odd size) and the decode and the compositor refuse what only they can see
+//!   ([`GpuError::Unsupported`]): a picture that decodes at another size than the
+//!   probe said (an EXIF orientation), a pixel format that is not on the allow-list
+//!   of known-opaque ones, a ratio the scaler needs two passes for. The caller's
+//!   answer to every one is the FFmpeg path.
 //! * **A GPU failure is an error, not a panic.** wgpu panics by default on a bad
 //!   call; here every unit of GPU work runs in error scopes and a lost device is
 //!   tracked ([`gpu`]). After [`GpuError::DeviceLost`] the owner builds a new
-//!   [`Gpu`] and a new [`Compositor`] on it.
+//!   [`Gpu`] and a new [`Compositor`] on it. Reading the frame back waits a bounded
+//!   time (`READBACK_TIMEOUT`) and reports a timeout instead of hanging the caller.
 
 pub mod compositor;
 pub mod eq;
-pub mod geometry;
 pub mod gpu;
 pub mod roundtrip;
 pub mod source;
@@ -76,4 +101,6 @@ pub mod sws;
 
 pub use compositor::{Compositor, RenderTimings, RgbaFrame};
 pub use gpu::{Gpu, GpuError, GpuOptions};
+/// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
+pub use kerf_core::layer_geometry as geometry;
 pub use source::{decode_args, decode_layer, decode_layers, YuvFrame};

@@ -42,11 +42,11 @@ use kerf_core::{RenderPlan, YuvMatrix};
 use wgpu::util::DeviceExt;
 
 use crate::eq;
-use crate::geometry::{LayerGeometry, Rect, ScaleStage};
 use crate::gpu::{Gpu, GpuError};
-use crate::roundtrip::Yuv2Rgb;
+use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
+use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,9 @@ struct ConvertParams {
 struct RoundTripParams {
     k: [i32; 4],
     m: [i32; 4],
+    ky: [i32; 4],
+    ku: [i32; 4],
+    kv: [i32; 4],
     size: [i32; 2],
     csize: [i32; 2],
     channel: i32,
@@ -124,6 +127,9 @@ struct Plane {
     w: u32,
     h: u32,
 }
+
+/// How long a frame may take to come back from the GPU before the render gives up.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const MID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
@@ -491,21 +497,26 @@ impl Compositor {
     }
 
     /// The layer's planes after FFmpeg's `yuva420p -> argb -> yuva420p` (see
-    /// [`crate::roundtrip`]): out of YUV with the layer's matrix, then back as
-    /// BT.601 with the chroma rebuilt from the RGB.
+    /// [`crate::roundtrip`]): out of YUV with the layer's matrix, then back with
+    /// the composite's (`back`) and the chroma rebuilt from the RGB.
     fn translucent_planes(
         &self,
         enc: &mut wgpu::CommandEncoder,
         input: &[Plane; 3],
-        matrix: YuvMatrix,
+        forward: YuvMatrix,
+        back: YuvMatrix,
     ) -> Result<[Plane; 3], GpuError> {
         let [py, pu, pv] = input;
         let (w, h) = (py.w, py.h);
         let (cw, ch) = (pu.w, pu.h);
-        let t = Yuv2Rgb::new(matrix);
+        let t = Yuv2Rgb::new(forward);
+        let b = Rgb2Yuv::new(back);
         let params = RoundTripParams {
             k: [t.crv, t.cbu, t.cgu, t.cgv],
             m: [t.cy, t.oy, 326 + 512, 0],
+            ky: [b.ry, b.gy, b.by, 0],
+            ku: [b.ru, b.gu, b.bu, 0],
+            kv: [b.rv, b.gv, b.bv, 0],
             size: [w as i32, h as i32],
             csize: [cw as i32, ch as i32],
             channel: 0,
@@ -660,7 +671,7 @@ impl Compositor {
     /// Composite `frames` (one decoded picture per plan layer; `None` is a layer
     /// whose source had no frame there, which FFmpeg draws nothing for) at `size`.
     ///
-    /// Refuses a plan that is not [`RenderPlan::gpu_supported`], a frame that does
+    /// Refuses a plan that is not [`RenderPlan::gpu_supported_at`] this size, a frame that does
     /// not match its layer's stream, or planes whose lengths do not match their
     /// size, so a caller that forgot to ask gets an error naming why instead of a
     /// wrong picture — or a wgpu panic.
@@ -701,8 +712,9 @@ impl Compositor {
         size: (u32, u32),
         output: Output,
     ) -> Result<RgbaFrame, GpuError> {
-        if !plan.gpu_supported() {
-            return Err(GpuError::Unsupported(plan.unsupported_reasons().join("; ")));
+        let reasons = plan.unsupported_reasons_at(size);
+        if !reasons.is_empty() {
+            return Err(GpuError::Unsupported(reasons.join("; ")));
         }
         if frames.len() != plan.layers.len() {
             return Err(GpuError::Decode(format!(
@@ -879,8 +891,10 @@ impl Compositor {
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
             if geom.translucent {
-                let matrix = layer.stream.matrix().unwrap_or(YuvMatrix::Bt601);
-                current = self.translucent_planes(&mut enc, &current, matrix)?;
+                // Out of YCbCr with the layer's own matrix; back with the
+                // composite's (BT.601 under a fixed policy, the negotiated one else).
+                let forward = layer.stream.matrix().unwrap_or(YuvMatrix::Bt601);
+                current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix)?;
             }
             let [py, pu, pv] = &current;
 
@@ -1050,14 +1064,20 @@ impl Compositor {
 
         let (tx, rx) = std::sync::mpsc::channel();
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            // The receiver outlives the poll below; a send can only fail if the
-            // caller already gave up.
+            // The receiver outlives the wait below unless that gave up, in which
+            // case nobody wants the result.
             let _ = tx.send(r);
         });
+        // A wait that cannot hang the caller: a GPU that stops answering is an
+        // error (the owner falls back to FFmpeg and may rebuild the device), not a
+        // thread stuck in `poll` forever.
         device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| GpuError::Readback(e.to_string()))?;
-        rx.recv()
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(READBACK_TIMEOUT),
+            })
+            .map_err(|e| GpuError::Readback(format!("the GPU did not finish within {} s: {e}", READBACK_TIMEOUT.as_secs())))?;
+        rx.recv_timeout(Duration::from_secs(1))
             .map_err(|e| GpuError::Readback(e.to_string()))?
             .map_err(|e| GpuError::Readback(e.to_string()))?;
         let mapped = buffer
@@ -1080,8 +1100,9 @@ impl Compositor {
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
     /// timing the two halves apart.
     pub fn render_plan(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(RgbaFrame, RenderTimings), GpuError> {
-        if !plan.gpu_supported() {
-            return Err(GpuError::Unsupported(plan.unsupported_reasons().join("; ")));
+        let reasons = plan.unsupported_reasons_at(size);
+        if !reasons.is_empty() {
+            return Err(GpuError::Unsupported(reasons.join("; ")));
         }
         let t0 = Instant::now();
         let frames = decode_layers(&plan.layers)?;

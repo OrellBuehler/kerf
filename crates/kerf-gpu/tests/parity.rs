@@ -17,7 +17,9 @@
 //!
 //! The two renderers are not bit-identical, and the harness says where. The
 //! scaler is swscale's own tables in swscale's integer arithmetic and agrees with
-//! `ffmpeg -vf scale` to one level on every plane
+//! `ffmpeg -vf scale` to one level on every plane up to about 4:1, to two or
+//! three levels on 8:1 to 20:1 downscales and to five at 40:1 (the steepest the plan
+//! accepts)
 //! (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
 //! opaque layer's blend is FFmpeg's in YUV. What remains is a hard coloured edge
 //! landing on a different pixel (chroma is averaged over 2x2 in one's alpha blend
@@ -52,6 +54,29 @@
 //! and an amplified diff are written to `target/parity/`. `KERF_PARITY_EXPLORE=1`
 //! prints every figure and fails nothing, for measuring a change case by case.
 //!
+//! # Which FFmpeg
+//!
+//! The suite passes on FFmpeg 6.1.1 (the distro build CI's `system` leg runs) and
+//! on the pinned 9.0.2 build the Windows and macOS bundles ship (the `pinned` leg),
+//! and the two compose a frame's colour differently. The harness reads the policy
+//! the same way the product does (`kerf_core::composite_color_policy`, probed from
+//! the real still graph) and the plan takes it as input:
+//!
+//! * 6.1.1 is **`FixedBt601`**: the composite is converted as BT.601 whatever the
+//!   layers were tagged. Every stack is drawable, mixed tags included, and the
+//!   mixed cases are judged strictly.
+//! * 9.0.2 is **`BottomLayerTag`**: the bottom layer's tag is the composite's
+//!   matrix. Stacks of one matrix (BT.709, BT.2020, BT.601 / untagged), opaque or
+//!   translucent, single or layered, are drawn and judged strictly
+//!   (`the_composite_follows_the_matrix_ffmpeg_negotiates`,
+//!   `translucent_layers_take_the_round_trip_with_the_right_matrices`); stacks of
+//!   mixed tags are asserted **refused by the plan** (`check_mixed`), because the
+//!   conversion FFmpeg makes of the other layers is not reproduced.
+//!
+//! Either way the case is *judged*: a figure that is not FFmpeg's is a failure
+//! when the plan said it could draw the frame, and a refusal is asserted rather
+//! than assumed.
+//!
 //! # Known divergences (none hidden by a threshold)
 //!
 //! * **Opacity below 1** is reproduced, not approximated: FFmpeg takes the layer
@@ -59,8 +84,20 @@
 //!   `roundtrip.wgsl` follow it in integer arithmetic. Out of YUV is exact on
 //!   random pictures (the layer's own matrix); luma back is exact; chroma back is
 //!   within one level (x86 FFmpeg's vertical scaler is not bit-exact with the C one
-//!   this follows). Translucent layers of an **odd size are refused**: FFmpeg's
-//!   chroma pairing reads uninitialised padding past an odd picture.
+//!   this follows). The way out uses the layer's own matrix and the way back the
+//!   composite's. Translucent layers of an **odd size are refused** (by the plan,
+//!   once the render size is known): FFmpeg's chroma pairing reads uninitialised
+//!   padding past an odd picture. A translucent layer whose matrix is unknown (an
+//!   asset that never recorded its pixel format) is refused too.
+//! * **Enlarging a picture that is not 4:2:0** (4:2:2, 4:4:4, RGB, 12-bit) is
+//!   refused: FFmpeg scales in the format the picture has, the decode reduces it
+//!   to 8-bit 4:2:0 first, and the two disagree by 15 to 69 levels on an
+//!   enlargement (`enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused`).
+//!   Shrinking and 1:1 agree for every format.
+//! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
+//!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
+//!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
+//!   read 16 levels off in RGB).
 //! * **A rotated edge** is a fixed-point stair-step in FFmpeg and a float sample
 //!   here; the interior agrees to a level. FFmpeg's own `rotate` also leaves a few
 //!   green pixels along the edge of a neutral layer (chroma it never wrote); the
@@ -80,8 +117,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kerf_core::{
-    export_still, Asset, Clip, Color, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, Project, RenderPlan, StreamKind,
-    Timeline, Track, Transform,
+    export_still, Asset, Clip, Color, CompositeColorPolicy, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, Project,
+    RenderPlan, StreamKind, Timeline, Track, Transform,
 };
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
 
@@ -119,20 +156,35 @@ const PSNR_ALL_MIN_ROTATED: f64 = 30.0;
 
 /// The least share of a frame that must lie outside the edge band, so the strict
 /// flat check judges at least half of every ordinary case. The recorded cases sit
-/// between 70% and 100% flat (the busiest, a downscale of the test pattern to
-/// 320x180, 70.6%); a case below this is [`BUSY`] and says so.
+/// between 70% and 100% flat (the busiest, a shrink to 320x180, 70.1%); a case
+/// below this is [`BUSY`] and says so.
 const FLAT_SHARE_MIN: f64 = 0.5;
 
-/// The scaler comparison's bounds, on the planes themselves (levels of 255): no
-/// sample differs from `ffmpeg -vf scale` by more than one level, on any source.
+/// The scaler comparison's bounds, on the planes themselves (levels of 255). Up to
+/// about 4:1 no sample differs from `ffmpeg -vf scale` by more than one level, on
+/// any source. A shrink of 8:1 or more reduces each output sample from dozens of
+/// inputs, and swscale's x86 vertical scaler rounds each of them slightly
+/// differently from the C arithmetic this follows: measured 2-3 on noise and test
+/// patterns at 8:1 to 20:1 and up to 5 at 40:1, identically on FFmpeg 6.1.1 and
+/// 9.0.2, so those are the bounds there (`SCALER_MAX_EXTREME`, `SCALER_MAX_STEEP`)
+/// and it is claimed no further: the plan refuses a steeper shrink than 40:1.
 /// The mean bounds are what the one-level differences add up to: smooth footage
 /// (measured <= 0.06) is almost exact; on a checkerboard — 219 levels of
 /// contrast per pixel — x86 FFmpeg's non-bit-exact vertical scaler is a level
 /// low on over half the samples (measured 0.57), the same bias at every
 /// amplitude, which is why the busy bound is the looser one.
 const SCALER_MAX: i32 = 1;
+const SCALER_MAX_EXTREME: i32 = 3;
 const SCALER_SMOOTH_MEAN: f64 = 0.1;
 const SCALER_BUSY_MEAN: f64 = 0.75;
+/// ...and for a shrink of 8:1 or more, where even a smooth test pattern lands
+/// every output sample on dozens of inputs (measured at most 0.52, on a 20:1
+/// shrink of the test pattern).
+const SCALER_EXTREME_MEAN: f64 = 0.6;
+/// A shrink of 32:1 up to the 40:1 the plan stops at (`kerf_core::MAX_SHRINK`):
+/// noise reads up to 5 levels off a plane, 0.85 on average.
+const SCALER_MAX_STEEP: i32 = 5;
+const SCALER_STEEP_MEAN: f64 = 1.0;
 
 /// How far from neutral (the spread of a pixel's three channels, levels of 255) a
 /// rotated mid-grey layer over black may get anywhere in the frame: rounding in
@@ -195,6 +247,11 @@ fn compositor() -> &'static Compositor {
     C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
 }
 
+/// How this FFmpeg picks the composite's matrix (probed from the real graph, once).
+fn policy() -> CompositeColorPolicy {
+    kerf_core::composite_color_policy()
+}
+
 fn target_dir() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .parent()
@@ -242,6 +299,8 @@ struct Media {
     alpha: Asset,
     /// Busy sources: per-pixel noise and a 1-px checkerboard (0.2 s of video).
     noise: Asset,
+    /// Noise at 1280x720, for the extreme downscales.
+    noise_hd: Asset,
     checker: Asset,
     /// A 640x360 still that never ends, to sit under a clip that does.
     still_long: Asset,
@@ -251,6 +310,22 @@ struct Media {
     /// The colour bars tagged BT.2020 (non-constant luminance): the matrix a
     /// translucent layer is taken out of YUV with is the stream's own.
     bars2020: Asset,
+    /// `bars`, `testsrc` and `gradient` carry no colour tag. These are the same
+    /// kinds of picture tagged BT.709 and BT.2020, for the cases that are about
+    /// what FFmpeg does with a tag.
+    bars709: Asset,
+    testsrc709: Asset,
+    gradient709: Asset,
+    testsrc2020: Asset,
+    gradient2020: Asset,
+    /// The test pattern in formats that are not 8-bit 4:2:0 — what FFmpeg scales
+    /// natively and the compositor, which works on 4:2:0, does not.
+    yuv422: Asset,
+    bgr0: Asset,
+    gray: Asset,
+    /// An RGB PNG the size of the suite's usual canvas (640x360): fitting it into
+    /// that canvas is not an enlargement, which `still` (480x270) is.
+    png640: Asset,
 }
 
 /// The asset a real import would make: the file, probed by the same code the
@@ -290,7 +365,21 @@ fn media() -> &'static Media {
             p
         };
         let testsrc = video("testsrc.mp4", "testsrc2=size=640x360:rate=30:duration=2");
-        let bars = video("bars.mp4", "smptehdbars=size=640x360:rate=30:duration=2");
+        // `smptehdbars` tags itself BT.709; the suite's base picture is untagged, so
+        // that the cases which are not about colour tags are the same under every
+        // FFmpeg (which tag a stack's composite takes is the version's business).
+        let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let bt2020 = "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt709";
+        let bars = video("bars.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{untagged}"));
+        let bars709 = video("bars709.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{bt709}"));
+        let testsrc709 = video("testsrc709.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{bt709}"));
+        let testsrc2020 = video("testsrc2020.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{bt2020}"));
+        let gradients = "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001";
+        // (`gradients` makes RGB: the conversion to 4:2:0 has to come before the tag,
+        // or it replaces it with "unspecified".)
+        let gradient709 = video("gradient709.mp4", &format!("{gradients},format=yuv420p,{bt709}"));
+        let gradient2020 = video("gradient2020.mp4", &format!("{gradients},format=yuv420p,{bt2020}"));
         let gradient = video(
             "gradient.mp4",
             "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001",
@@ -392,6 +481,10 @@ fn media() -> &'static Media {
             "noise.mp4",
             "nullsrc=size=640x360:rate=30:duration=0.2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'",
         );
+        let noise_hd = video(
+            "noise_hd.mp4",
+            "nullsrc=size=1280x720:rate=30:duration=0.1,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'",
+        );
         let checker = video(
             "checker.mp4",
             "nullsrc=size=640x360:rate=30:duration=0.2,format=yuv420p,geq=lum='if(eq(mod(X+Y,2),0),235,16)':cb=128:cr=128",
@@ -409,32 +502,33 @@ fn media() -> &'static Media {
             "rgb24",
             still_long.to_str().unwrap(),
         ]);
-        let bars2020 = dir.join("bars2020.mp4");
+        let bars2020 = video("bars2020.mp4", &format!("smptebars=size=640x360:rate=30:duration=2,{bt2020}"));
+        let grey = video("grey.mp4", "color=c=0x808080:s=640x360:r=30:d=2");
+        let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=2");
+        let png640 = dir.join("still640.png");
         ffmpeg(&[
             "-f",
             "lavfi",
             "-i",
-            "smptebars=size=640x360:rate=30:duration=2",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-qp",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-colorspace",
-            "bt2020nc",
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "bt709",
-            bars2020.to_str().unwrap(),
+            "testsrc2=size=640x360",
+            "-frames:v",
+            "1",
+            png640.to_str().unwrap(),
         ]);
-        let grey = video("grey.mp4", "color=c=0x808080:s=640x360:r=30:d=2");
-        let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=2");
+        let yuv422 = ffv1("yuv422.mkv", "testsrc2=size=640x360:rate=30:duration=2", "yuv422p", &["ffv1"]);
+        let bgr0 = ffv1("bgr0.mkv", "testsrc2=size=640x360:rate=30:duration=2", "bgr0", &["ffv1"]);
+        let gray = ffv1("gray.mkv", "testsrc2=size=640x360:rate=30:duration=2", "gray", &["ffv1"]);
         Media {
             bars2020: probed(&bars2020),
+            bars709: probed(&bars709),
+            testsrc709: probed(&testsrc709),
+            gradient709: probed(&gradient709),
+            testsrc2020: probed(&testsrc2020),
+            gradient2020: probed(&gradient2020),
+            png640: probed(&png640),
+            yuv422: probed(&yuv422),
+            bgr0: probed(&bgr0),
+            gray: probed(&gray),
             grey: probed(&grey),
             black: probed(&black),
             tenbit: probed(&tenbit),
@@ -446,6 +540,7 @@ fn media() -> &'static Media {
             exif: probed(&exif),
             alpha: probed(&alpha),
             noise: probed(&noise),
+            noise_hd: probed(&noise_hd),
             checker: probed(&checker),
             still_long: probed(&still_long),
             testsrc: probed(&testsrc),
@@ -635,13 +730,15 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
         .collect();
     let mut failures = Vec::new();
     for &t in times {
-        let plan = RenderPlan::at(tl, assets, &opts, t).expect("plan");
-        assert!(
-            plan.gpu_supported(),
-            "{case} @ {t}: the plan says the GPU cannot draw this: {:?}",
-            plan.unsupported_reasons()
-        );
+        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
+        let why = plan.unsupported_reasons_at(size);
+        assert!(
+            why.is_empty(),
+            "{case} @ {t}: the plan says the GPU cannot draw this at {size:?} (canvas {}x{}): {why:?}",
+            plan.canvas.width,
+            plan.canvas.height
+        );
         let (w, h) = (size.0 as usize, size.1 as usize);
 
         let ref_png = scratch.join(format!("{slug}-{t}.png"));
@@ -1047,7 +1144,7 @@ fn a_rotated_neutral_layer_has_no_colour_fringe() {
         c.transform.scale = 0.7;
         let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
         let assets = [m.black.clone(), m.grey.clone()];
-        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5).expect("plan");
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let (frame, _) = compositor().render_plan(&plan, size).expect("GPU render");
         let spread = |rgb: &[u8]| {
@@ -1282,8 +1379,9 @@ fn still_images() {
     // composite works in (FFmpeg does it in the graph; the decode does it here).
     let tl = timeline(vec![vec![clip(&m.jpeg, 0.0, 5.0, 0.0)]], None);
     check("still/jpeg", &tl, std::slice::from_ref(&m.jpeg), &[1.0], STRICT);
-    // On top of video, scaled.
-    let mut pic = clip(&m.still, 0.0, 5.0, 0.0);
+    // On top of video, scaled (a 640x360 PNG: a smaller one fitted into this frame
+    // would be an enlargement of an RGB picture, which is refused).
+    let mut pic = clip(&m.png640, 0.0, 5.0, 0.0);
     pic.transform = Transform {
         scale: 0.5,
         pos_x: -0.2,
@@ -1294,7 +1392,7 @@ fn still_images() {
     check(
         "still/pip-over-video",
         &tl,
-        &[m.gradient.clone(), m.still.clone()],
+        &[m.gradient.clone(), m.png640.clone()],
         &[1.0],
         STRICT,
     );
@@ -1498,7 +1596,7 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
 
 /// What a refused frame must be refused for.
 enum Refusal {
-    /// The plan itself says no (`gpu_supported()`), with this in its reasons.
+    /// The plan itself says no (`gpu_supported_at`), with this in its reasons.
     Plan(&'static str),
     /// The plan cannot know, the render finds out (the decode, or the layer's
     /// geometry): `Unsupported` with this in it.
@@ -1509,7 +1607,7 @@ enum Refusal {
 /// no — by the plan or by the decode — instead of drawing it wrong.
 fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Refusal) {
     let opts = ExportOptions::default();
-    let plan = RenderPlan::at(tl, assets, &opts, t).expect("plan");
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     let png = scratch.join(format!("refused-{}.png", case.replace('/', "_")));
@@ -1517,12 +1615,14 @@ fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Re
     let _ = std::fs::remove_file(&png);
     match expect {
         Refusal::Plan(reason) => {
-            assert!(!plan.gpu_supported(), "{case}: the plan should refuse");
-            let reasons = plan.unsupported_reasons().join("; ");
+            let reasons = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            assert!(!reasons.is_empty(), "{case}: the plan should refuse");
+            let reasons = reasons.join("; ");
             assert!(reasons.contains(reason), "{case}: {reasons:?} does not say {reason:?}");
         }
         Refusal::Render(reason) => {
-            assert!(plan.gpu_supported(), "{case}: {:?}", plan.unsupported_reasons());
+            let why = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            assert!(why.is_empty(), "{case}: {why:?}");
             let err = compositor()
                 .render_plan(&plan, plan.size(u32::MAX))
                 .expect_err("the render should refuse");
@@ -1568,21 +1668,38 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         Refusal::Plan("alpha"),
     );
     // An asset saved before the pixel format was recorded: the decode checks the
-    // alpha plane itself.
+    // alpha plane itself. (Under a negotiating FFmpeg the plan refuses it sooner —
+    // the composite's matrix depends on a tag it cannot know — so the decode is
+    // asked directly.)
     let mut unknown = m.alpha.clone();
     unknown.streams[0].pix_fmt = None;
     let tl = timeline(
         vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![clip(&unknown, 0.0, 2.0, 0.0)]],
         None,
     );
-    check_refused(
-        "refused/alpha-video-unknown-pix-fmt",
-        &tl,
-        &[m.bars.clone(), unknown],
-        0.5,
-        Refusal::Render("transparency"),
+    let assets = [m.bars.clone(), unknown];
+    let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    let err = kerf_gpu::decode_layer(&plan.layers[1]).expect_err("the decode should find the transparency");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("transparency")),
+        "{err}"
     );
-
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check_refused(
+            "refused/alpha-video-unknown-pix-fmt",
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Render("transparency"),
+        ),
+        CompositeColorPolicy::BottomLayerTag => check_refused(
+            "refused/alpha-video-unknown-pix-fmt (negotiated)",
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Plan("matrix is unknown"),
+        ),
+    }
     // A translucent layer with an odd side (0.33 of a 640x360 is 211x118): FFmpeg's
     // RGB round trip reads uninitialised padding past the picture there.
     let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
@@ -1597,7 +1714,7 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         &tl,
         &[m.gradient.clone(), m.testsrc.clone()],
         0.5,
-        Refusal::Render("odd size"),
+        Refusal::Plan("odd size"),
     );
 }
 
@@ -1617,7 +1734,7 @@ fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
     );
     let assets = [m.still_long.clone(), m.testsrc.clone()];
     for t in [1.99, 3.0] {
-        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), t).expect("plan");
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), t, policy()).expect("plan");
         let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
         assert!(frames[0].is_some(), "the still has its frame at {t}");
         assert!(
@@ -1626,6 +1743,289 @@ fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
         );
     }
     check("clamped-end/nothing-drawn", &tl, &assets, &[1.99, 3.0], STRICT);
+}
+
+/// A stack whose layers carry different YCbCr matrices (or an RGB picture in a stack
+/// that is not BT.601). Under a fixed-matrix FFmpeg nothing converts them and the
+/// compositor draws it like any other; under one that negotiates the matrix across
+/// the overlay chain, FFmpeg converts every layer into the bottom layer's with an
+/// arithmetic the compositor does not reproduce (measured: 15-30 levels off), so the
+/// plan refuses it — and the case holds the refusal, with FFmpeg rendering it.
+fn check_mixed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reason: &'static str) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, STRICT),
+        CompositeColorPolicy::BottomLayerTag => {
+            check_refused(&format!("{case} (negotiated)"), tl, assets, times[0], Refusal::Plan(reason));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
+    let m = media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    // One tagged clip, and stacks whose layers all carry the same tag: the composite
+    // is converted with that tag under a negotiating FFmpeg and as BT.601 under a
+    // fixed one, and in both cases the compositor does what FFmpeg does.
+    for (name, a) in [
+        ("matrix/bt709-bars", &m.bars709),
+        ("matrix/bt709-testsrc2", &m.testsrc709),
+        ("matrix/bt709-gradient", &m.gradient709),
+        ("matrix/bt2020-bars", &m.bars2020),
+        ("matrix/bt2020-testsrc2", &m.testsrc2020),
+    ] {
+        let tl = timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None);
+        check(name, &tl, std::slice::from_ref(a), &[0.5], STRICT);
+    }
+    let pip = |a: &Asset| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    let tl = timeline(
+        vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc709)]],
+        None,
+    );
+    check(
+        "matrix/bt709-layered",
+        &tl,
+        &[m.gradient709.clone(), m.testsrc709.clone()],
+        &[0.5],
+        STRICT,
+    );
+    let tl = timeline(
+        vec![vec![clip(&m.gradient2020, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc2020)]],
+        None,
+    );
+    check(
+        "matrix/bt2020-layered",
+        &tl,
+        &[m.gradient2020.clone(), m.testsrc2020.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // Mixed tags, any order: refused under negotiation.
+    for (name, base, top) in [
+        ("matrix/mixed-709-over-untagged", &m.gradient, &m.testsrc709),
+        ("matrix/mixed-untagged-over-709", &m.gradient709, &m.testsrc),
+        ("matrix/mixed-709-over-2020", &m.gradient2020, &m.testsrc709),
+        ("matrix/mixed-2020-over-709", &m.gradient709, &m.testsrc2020),
+    ] {
+        let tl = timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
+        check_mixed(name, &tl, &[base.clone(), top.clone()], &[0.5], "different YCbCr matrices");
+    }
+    // An RGB picture (a PNG) among untagged layers is nothing special; among tagged
+    // ones FFmpeg converts it with the negotiated matrix.
+    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip(&m.png640)]], None);
+    check(
+        "matrix/rgb-png-over-untagged",
+        &tl,
+        &[m.gradient.clone(), m.png640.clone()],
+        &[0.5],
+        STRICT,
+    );
+    let tl = timeline(vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.png640)]], None);
+    check_mixed(
+        "matrix/rgb-png-over-709",
+        &tl,
+        &[m.gradient709.clone(), m.png640.clone()],
+        &[0.5],
+        "RGB picture",
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
+    let m = media();
+    // Out of YCbCr with the layer's own matrix, back with the composite's: a
+    // translucent BT.709 layer over BT.709 ones is consistent under either policy.
+    let fade = |a: &Asset, op: f64| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform.opacity = op;
+        c
+    };
+    for (name, a, op) in [
+        ("translucent/bt709-bars-0.5-alone", &m.bars709, 0.5),
+        ("translucent/bt709-testsrc2-0.65-alone", &m.testsrc709, 0.65),
+        ("translucent/bt2020-bars-0.6-alone", &m.bars2020, 0.6),
+    ] {
+        let tl = timeline(vec![vec![fade(a, op)]], None);
+        check(name, &tl, std::slice::from_ref(a), &[0.5], STRICT);
+    }
+    let tl = timeline(
+        vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![fade(&m.testsrc709, 0.5)]],
+        None,
+    );
+    check(
+        "translucent/bt709-over-bt709",
+        &tl,
+        &[m.bars709.clone(), m.testsrc709.clone()],
+        &[0.5],
+        STRICT,
+    );
+    let tl = timeline(
+        vec![vec![clip(&m.bars2020, 0.0, 2.0, 0.0)], vec![fade(&m.gradient2020, 0.4)]],
+        None,
+    );
+    check(
+        "translucent/bt2020-over-bt2020",
+        &tl,
+        &[m.bars2020.clone(), m.gradient2020.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // Translucent untagged over a BT.709 base, and the other way round: mixed.
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![fade(&m.testsrc, 0.5)]], None);
+    check_mixed(
+        "translucent/untagged-over-bt709",
+        &tl,
+        &[m.bars709.clone(), m.testsrc.clone()],
+        &[0.5],
+        "different YCbCr matrices",
+    );
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![fade(&m.testsrc709, 0.5)]], None);
+    check_mixed(
+        "translucent/bt709-over-untagged",
+        &tl,
+        &[m.bars.clone(), m.testsrc709.clone()],
+        &[0.5],
+        "different YCbCr matrices",
+    );
+    // Formats that are not 8-bit 4:2:0 take the same round trip (FFmpeg converts
+    // them to yuva420p first; so does the decode).
+    for (name, a) in [
+        ("translucent/yuv444p", &m.yuv444),
+        ("translucent/yuv422p", &m.yuv422),
+        ("translucent/yuv420p10le", &m.tenbit),
+        ("translucent/gray", &m.gray),
+        ("translucent/full-range-mjpeg", &m.fullrange),
+        ("translucent/jpeg-still", &m.jpeg),
+        ("translucent/rgb-png-still", &m.png640),
+    ] {
+        let dur = a.duration.min(2.0);
+        let mut c = clip(a, 0.0, dur, 0.0);
+        c.transform.opacity = 0.6;
+        let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![c]], None);
+        check(name, &tl, &[m.testsrc.clone(), a.clone()], &[0.5], STRICT);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused() {
+    let m = media();
+    // FFmpeg scales the picture in the format it has; the compositor in the 8-bit
+    // 4:2:0 a decode reduces it to. Shrinking agrees. Enlarging a 4:4:4 picture was
+    // 27 levels off, 4:2:2 15, RGB video 51, an RGB PNG 69.
+    let scaled = |a: &Asset, scale: f64, fit: Option<Delivery>| {
+        let dur = a.duration.min(2.0);
+        let mut c = clip(a, 0.0, dur, 0.0);
+        c.transform.scale = scale;
+        timeline(vec![vec![c]], fit)
+    };
+    for (name, a) in [
+        ("yuv444p", &m.yuv444),
+        ("yuv422p", &m.yuv422),
+        ("bgr0", &m.bgr0),
+        ("rgb24-png", &m.still),
+    ] {
+        let assets = std::slice::from_ref(a);
+        for scale in [1.5, 2.0] {
+            check_refused(
+                &format!("enlarge/{name}-x{scale}"),
+                &scaled(a, scale, None),
+                assets,
+                0.5,
+                Refusal::Plan("enlarges"),
+            );
+        }
+        check_refused(
+            &format!("enlarge/{name}-fit-to-960x540"),
+            &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+            assets,
+            0.5,
+            Refusal::Plan("enlarges"),
+        );
+        // ...and what is not an enlargement is drawn, held to the strict limits.
+        check(&format!("shrink/{name}-x0.5"), &scaled(a, 0.5, None), assets, &[0.5], STRICT);
+        check(
+            &format!("shrink/{name}-fit-to-320x180"),
+            &scaled(a, 1.0, Some(Delivery::new(320, 180, Fit::Contain))),
+            assets,
+            &[0.5],
+            STRICT,
+        );
+        check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5], STRICT);
+    }
+    // 4:2:0 and gray are what the compositor works in: enlarging them is fine —
+    // including 10 bit (FFmpeg scales it at 10 bits and dithers once at the end).
+    for (name, a) in [
+        ("yuv420p10le", &m.tenbit),
+        ("gray", &m.gray),
+        ("yuv420p", &m.testsrc),
+        ("yuvj420p-jpeg", &m.jpeg),
+    ] {
+        let assets = std::slice::from_ref(a);
+        check(
+            &format!("enlarge-ok/{name}-x1.5"),
+            &scaled(a, 1.5, None),
+            assets,
+            &[0.5],
+            STRICT,
+        );
+        check(
+            &format!("enlarge-ok/{name}-fit-to-960x540"),
+            &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+            assets,
+            &[0.5],
+            STRICT,
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
+    let m = media();
+    // A project saved before the pixel format and colour tags were probed: its
+    // `color_space: None` could mean untagged or "not read yet".
+    let mut old = m.testsrc709.clone();
+    for s in &mut old.streams {
+        s.pix_fmt = None;
+        s.color_space = None;
+    }
+    let assets = std::slice::from_ref(&old);
+    // Opaque and unscaled: drawn (the decode looks for alpha itself).
+    let tl = timeline(vec![vec![clip(&old, 0.0, 2.0, 0.0)]], None);
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        check("old-asset/opaque", &tl, assets, &[0.5], STRICT);
+    } else {
+        // ...unless the composite's matrix depends on its tag.
+        check_refused(
+            "old-asset/opaque (negotiated)",
+            &tl,
+            assets,
+            0.5,
+            Refusal::Plan("matrix is unknown"),
+        );
+    }
+    // Translucent: BT.709 footage must not be round-tripped as BT.601.
+    let mut c = clip(&old, 0.0, 2.0, 0.0);
+    c.transform.opacity = 0.6;
+    let tl = timeline(vec![vec![c]], None);
+    check_refused("old-asset/translucent", &tl, assets, 0.5, Refusal::Plan("probed before"));
+    // Enlarged: not known to be 4:2:0.
+    let mut c = clip(&old, 0.0, 2.0, 0.0);
+    c.transform.scale = 1.5;
+    let tl = timeline(vec![vec![c]], None);
+    check_refused("old-asset/enlarged", &tl, assets, 0.5, Refusal::Plan("not recorded"));
 }
 
 // ---- the scaler, plane by plane --------------------------------------------------
@@ -1663,31 +2063,45 @@ fn ffmpeg_scaled_planes(layer: &kerf_core::PlanLayer, w: u32, h: u32) -> (Vec<u8
 
 /// Every plane of the GPU's scale of a picture to a canvas of its own shape (so
 /// nothing is padded or cropped) against `ffmpeg -vf scale`. This is the committed
-/// evidence for "the shader's bicubic is swscale's to within a level" — measured
-/// on the planes themselves, on smooth footage (`SCALER_SMOOTH_MAX`) and on noise
-/// and a checkerboard, where every sample depends on the exact kernel
-/// (`SCALER_BUSY_MAX`, `SCALER_BUSY_MEAN`).
+/// evidence for "the shader's bicubic is swscale's to within a level up to about
+/// 4:1, and to 2-5 levels on the extreme downscales" — measured on the planes
+/// themselves, on smooth footage (`SCALER_SMOOTH_MEAN`) and on noise and a
+/// checkerboard, where every sample depends on the exact kernel
+/// (`SCALER_BUSY_MEAN`).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
     let m = media();
     let opts = ExportOptions::default();
     type Case<'a> = (&'a str, &'a Asset, f64, &'a [(u32, u32)], f64);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             "testsrc2",
             &m.testsrc,
             0.5,
-            &[(480, 270), (320, 180), (960, 540), (1920, 1080)],
+            &[(480, 270), (320, 180), (960, 540), (1920, 1080), (64, 36), (32, 18)],
             SCALER_SMOOTH_MEAN,
         ),
-        ("bars", &m.bars, 0.5, &[(480, 270), (960, 540)], SCALER_SMOOTH_MEAN),
-        ("gradient", &m.gradient, 0.5, &[(480, 270), (960, 540)], SCALER_SMOOTH_MEAN),
+        ("bars", &m.bars, 0.5, &[(480, 270), (960, 540), (64, 36)], SCALER_SMOOTH_MEAN),
+        (
+            "gradient",
+            &m.gradient,
+            0.5,
+            &[(480, 270), (960, 540), (64, 36)],
+            SCALER_SMOOTH_MEAN,
+        ),
         (
             "noise",
             &m.noise,
             0.1,
-            &[(480, 270), (384, 216), (960, 540)],
+            &[(480, 270), (384, 216), (960, 540), (64, 36)],
+            SCALER_BUSY_MEAN,
+        ),
+        (
+            "noise-hd",
+            &m.noise_hd,
+            0.05,
+            &[(640, 360), (320, 180), (128, 72), (96, 54), (64, 36), (32, 18)],
             SCALER_BUSY_MEAN,
         ),
         (
@@ -1705,8 +2119,9 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                 vec![vec![clip(asset, 0.0, asset.duration, 0.0)]],
                 Some(Delivery::new(w, h, Fit::Contain)),
             );
-            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t).expect("plan");
-            assert!(plan.gpu_supported(), "{:?}", plan.unsupported_reasons());
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t, policy()).expect("plan");
+            let why = plan.unsupported_reasons_at((w, h));
+            assert!(why.is_empty(), "{why:?}");
             let gpu_planes = {
                 let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
                 compositor().composite_yuv(&plan, &frames, (w, h)).expect("composite")
@@ -1744,14 +2159,38 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                     .lock()
                     .unwrap()
                     .insert(format!("scaler {name} {w:05}x{h:05} {plane}"), line);
-                if max > SCALER_MAX || mean > mean_limit {
+                // A shrink of 8:1 or more reduces each output sample from dozens of
+                // inputs, and swscale's x86 vertical scaler rounds each of them
+                // slightly differently from the C arithmetic this follows.
+                let ratio = plan.layers[0].stream.width / w;
+                let (max_limit, mean_limit) = if ratio >= 32 {
+                    (SCALER_MAX_STEEP, mean_limit.max(SCALER_STEEP_MEAN))
+                } else if ratio >= 8 {
+                    (SCALER_MAX_EXTREME, mean_limit.max(SCALER_EXTREME_MEAN))
+                } else {
+                    (SCALER_MAX, mean_limit)
+                };
+                if max > max_limit || mean > mean_limit {
                     failures.push(format!(
-                        "{name} -> {w}x{h} {plane}: max {max} (<= {SCALER_MAX}), mean {mean:.3} (<= {mean_limit})"
+                        "{name} -> {w}x{h} {plane}: max {max} (<= {max_limit}), mean {mean:.3} (<= {mean_limit})"
                     ));
                 }
             }
         }
     }
+    // Past the steepest shrink measured (`MAX_SHRINK`, 40:1) the plan declines and
+    // FFmpeg draws it.
+    let tl = timeline(
+        vec![vec![clip(&m.noise_hd, 0.0, m.noise_hd.duration, 0.0)]],
+        Some(Delivery::new(30, 16, Fit::Contain)),
+    );
+    check_refused(
+        "shrink/noise-hd-past-40:1",
+        &tl,
+        std::slice::from_ref(&m.noise_hd),
+        0.05,
+        Refusal::Plan("steeper"),
+    );
     write_report();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -1870,14 +2309,20 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 //                rotated layer), and at least 50% of the frame in the flat region
 //   whole image  PSNR >= 40 dB (>= 30 dB for a case with a rotated layer)
 //   busy source  (noise, checkerboard) no band: whole image PSNR >= 40 dB, max <= 8
-//   scaler       every plane within 1 level of `ffmpeg -vf scale`
+//   scaler       every plane within 1 level of `ffmpeg -vf scale` up to ~4:1; within
+//                3 levels (mean <= 0.6) on 8:1 to 20:1 downscales, within 5 (mean
+//                <= 1.0) from 32:1 to the 40:1 the plan stops at
 //
-// One run on Mesa lavapipe (llvmpipe, LLVM 20.1.2, Vulkan) against FFmpeg 6.1.1.
-// The last column is the same case against the pinned FFmpeg 9.0.2 build (what the
-// Windows and macOS bundles ship): `=` is the same figures (within 0.15 dB, same
-// max), otherwise "flat PSNR / flat max" there. Both runs pass every case.
-// The smallest flat share of any non-busy case is 70.6% (`contain/downscale-
-// 320x180`, band 29.4%); the largest band among the cases judged strictly is that
+// One run on Mesa lavapipe (llvmpipe, LLVM 20.1.2, Vulkan) against FFmpeg 6.1.1
+// (policy `FixedBt601`). The last column is the same case against the pinned
+// FFmpeg 9.0.2 build (what the Windows and macOS bundles ship; policy
+// `BottomLayerTag`): `=` is the same figures (within 0.15 dB, same max), otherwise
+// "flat PSNR / flat max" there, and `refused` is a stack the plan declines on that
+// FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
+// never recorded its pixel format), asserted refused rather than compared. Both
+// runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
+// The smallest flat share of any non-busy case is 70.1% (the `shrink/` cases to
+// 320x180, band 29.9%); the largest band among the cases judged strictly is that
 // one. Every run rewrites `target/parity/report.txt` (these columns plus the
 // decode / composite time of the GPU path and the scaler lines).
 //
@@ -1904,6 +2349,14 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // cover/9x16                                     0.5   360x640 |    46.4 dB        5 |    46.5 dB        5 |  7.4%    =
 // cover/9x16                                     1.2   360x640 |    46.3 dB        4 |    46.4 dB        5 |  6.5%    =
 // cover/portrait-in-16x9                         0.7   640x360 |    49.0 dB        5 |    48.8 dB        5 | 11.5%    =
+// enlarge-ok/gray-fit-to-960x540                 0.5   960x540 |    51.2 dB        2 |    51.0 dB        2 | 10.4%    =
+// enlarge-ok/gray-x1.5                           0.5   640x360 |    51.2 dB        2 |    50.9 dB        2 | 13.2%    =
+// enlarge-ok/yuv420p-fit-to-960x540              0.5   960x540 |    48.8 dB        5 |    48.5 dB        5 | 14.3%    =
+// enlarge-ok/yuv420p-x1.5                        0.5   640x360 |    47.7 dB        5 |    47.5 dB        5 | 17.7%    =
+// enlarge-ok/yuv420p10le-fit-to-960x540          0.5   960x540 |    47.8 dB        5 |    47.4 dB        5 | 14.3%    =
+// enlarge-ok/yuv420p10le-x1.5                    0.5   640x360 |    46.7 dB        5 |    46.4 dB        5 | 17.8%    =
+// enlarge-ok/yuvj420p-jpeg-fit-to-960x540        0.5   960x540 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
+// enlarge-ok/yuvj420p-jpeg-x1.5                  0.5   480x270 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // gap                                            1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // geometry/crop-then-cover                       0.5   360x640 |    48.2 dB        5 |    48.0 dB        5 | 13.0%    =
 // geometry/fully-off-canvas                      0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
@@ -1915,12 +2368,26 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // letterbox/landscape-over-portrait-9x16         0.5   360x640 |    55.8 dB        3 |    54.4 dB        5 |  8.3%    =
 // letterbox/odd-fit-over-gradient                0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
 // letterbox/portrait-over-landscape              0.5   640x360 |    55.2 dB        3 |    53.5 dB        5 | 12.0%    =
+// matrix/bt2020-bars                             0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 |  7.8% 47.9 / 2
+// matrix/bt2020-layered                          0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% 46.2 / 4
+// matrix/bt2020-testsrc2                         0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// matrix/bt709-bars                              0.5   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4% 49.9 / 3
+// matrix/bt709-gradient                          0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
+// matrix/bt709-layered                           0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% 46.9 / 4
+// matrix/bt709-testsrc2                          0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// matrix/mixed-2020-over-709                     0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
+// matrix/mixed-709-over-2020                     0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
+// matrix/mixed-709-over-untagged                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
+// matrix/mixed-untagged-over-709                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
+// matrix/rgb-png-over-709                        0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2% refused
+// matrix/rgb-png-over-untagged                   0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2%    =
+// old-asset/opaque                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7% refused
 // opacity/0.3+scale+rotate                       0.5   640x360 |    46.6 dB        5 |    43.5 dB       66 | 14.2%    =
 // opacity/0.5                                      0   640x360 |    43.4 dB        4 |    43.5 dB        5 | 21.8%    =
 // opacity/0.5                                      1   640x360 |    43.2 dB        5 |    43.3 dB        5 | 22.4%    =
-// opacity/bars-0.5-over-testsrc2                 0.5   640x360 |    43.9 dB        5 |    43.9 dB        5 | 22.9% 44.5 / 5
-// opacity/bars-0.65-alone                        0.5   640x360 |    45.7 dB        4 |    45.4 dB        4 |  9.8% 45.0 / 5
-// opacity/bt2020-bars-0.6                        0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 45.1 / 4
+// opacity/bars-0.5-over-testsrc2                 0.5   640x360 |    44.5 dB        5 |    44.5 dB        5 | 22.9%    =
+// opacity/bars-0.65-alone                        0.5   640x360 |    45.0 dB        5 |    44.9 dB        5 |  9.8%    =
+// opacity/bt2020-bars-0.6                        0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 46.2 / 4
 // opacity/keyframed-fade+grade                   0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 | 14.8%    =
 // opacity/odd-source-cropped-0.7                 0.5   640x360 |    43.7 dB        6 |    43.8 dB        6 | 28.7%    =
 // opacity/testsrc2-0.65+brightness0.2            0.5   640x360 |    42.1 dB        5 |    42.1 dB        5 | 14.9%    =
@@ -1929,6 +2396,18 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // pip/odd-361x203-in-722x640                     0.5   722x640 |    48.4 dB        5 |    48.3 dB        5 |  7.7%    =
 // pip/scaled+offset                                0   640x360 |    49.4 dB        3 |    49.3 dB        5 | 15.9%    =
 // pip/scaled+offset                                1   640x360 |    49.4 dB        5 |    49.3 dB        5 | 16.0%    =
+// same-size/bgr0                                 0.5   640x360 |    48.4 dB        3 |    48.3 dB        3 | 15.7%    =
+// same-size/rgb24-png                            0.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
+// same-size/yuv422p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.3%    =
+// same-size/yuv444p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
+// shrink/bgr0-fit-to-320x180                     0.5   320x180 |    46.9 dB        4 |    46.3 dB        5 | 29.9%    =
+// shrink/bgr0-x0.5                               0.5   640x360 |    54.2 dB        4 |    52.4 dB        5 |  9.8%    =
+// shrink/rgb24-png-fit-to-320x180                0.5   320x180 |    46.6 dB        5 |    46.4 dB        6 | 27.8%    =
+// shrink/rgb24-png-x0.5                          0.5   480x270 |    54.3 dB        4 |    52.3 dB        5 | 11.7%    =
+// shrink/yuv422p-fit-to-320x180                  0.5   320x180 |    48.9 dB        4 |    48.1 dB        5 | 29.4%    =
+// shrink/yuv422p-x0.5                            0.5   640x360 |    56.2 dB        4 |    54.1 dB        5 |  9.7%    =
+// shrink/yuv444p-fit-to-320x180                  0.5   320x180 |    48.9 dB        3 |    48.0 dB        6 | 29.9%    =
+// shrink/yuv444p-x0.5                            0.5   640x360 |    56.3 dB        3 |    54.0 dB        6 |  9.8%    =
 // single/gradient                                  0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // single/gradient                                  1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // single/smptehdbars                               0   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
@@ -1944,7 +2423,7 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // still/alone                                      0   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // still/alone                                    2.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
-// still/pip-over-video                             1   640x360 |    46.5 dB        5 |    45.5 dB       15 |  9.4%    =
+// still/pip-over-video                             1   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2%    =
 // time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%    =
 // time/keyframes                                1.25   640x360 |    48.2 dB        5 |    34.3 dB      217 | 25.9%    =
 // time/keyframes                                   2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
@@ -1959,10 +2438,26 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // transform/rotate-90                            0.5   640x360 |    47.2 dB        3 |    47.3 dB        3 |  8.2%    =
 // transform/scale+rotate+crop                    0.5   640x360 |    47.0 dB        6 |    33.3 dB      255 | 17.1%    =
 // transform/scale+rotate+crop                    1.5   640x360 |    46.9 dB        6 |    33.4 dB      255 | 17.1%    =
-// scaler (plane by plane vs ffmpeg -vf scale; worst plane per source, FFmpeg 6.1.1)
-//   bars       max 1  worst mean 0.014
+// translucent/bt2020-bars-0.6-alone              0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 46.2 / 4
+// translucent/bt2020-over-bt2020                 0.5   640x360 |    44.0 dB        5 |    44.1 dB        5 |  7.8% 42.4 / 5
+// translucent/bt709-bars-0.5-alone               0.5   640x360 |    50.0 dB        3 |    49.7 dB        4 |  9.7% 50.5 / 3
+// translucent/bt709-over-bt709                   0.5   640x360 |    45.3 dB        5 |    45.2 dB        5 | 22.8% 44.0 / 5
+// translucent/bt709-over-untagged                0.5   640x360 |    45.3 dB        5 |    45.2 dB        5 | 22.8% refused
+// translucent/bt709-testsrc2-0.65-alone          0.5   640x360 |    43.1 dB        5 |    42.9 dB        5 | 15.3% 40.9 / 5
+// translucent/full-range-mjpeg                   0.5   640x360 |    48.2 dB        5 |    47.7 dB        5 | 15.6% 48.5 / 6
+// translucent/gray                               0.5   640x360 |    43.8 dB        5 |    43.8 dB        5 | 15.2%    =
+// translucent/jpeg-still                         0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// translucent/rgb-png-still                      0.5   640x360 |    49.6 dB        5 |    48.8 dB        6 | 18.7%    =
+// translucent/untagged-over-bt709                0.5   640x360 |    43.4 dB        4 |    43.4 dB        5 | 22.8% refused
+// translucent/yuv420p10le                        0.5   640x360 |    48.3 dB        5 |    47.7 dB        5 | 15.6%    =
+// translucent/yuv422p                            0.5   640x360 |    48.4 dB        5 |    47.8 dB        5 | 16.2%    =
+// translucent/yuv444p                            0.5   640x360 |    48.4 dB        5 |    47.6 dB        5 | 16.4%    =
+// scaler (plane by plane vs `ffmpeg -vf scale`; worst plane per source, FFmpeg 6.1.1;
+// every source is at most 1 level off up to ~4:1, the 2-5 are the 8:1 to 40:1 shrinks)
+//   bars       max 2  worst mean 0.493
 //   checker    max 1  worst mean 0.572
-//   gradient   max 1  worst mean 0.054
-//   noise      max 1  worst mean 0.099
-//   testsrc2   max 1  worst mean 0.033
-// ... identical on FFmpeg 9.0.2 (max 1 everywhere; same worst means).
+//   gradient   max 2  worst mean 0.191
+//   noise      max 1  worst mean 0.250
+//   noise-hd   max 5  worst mean 0.792   (1280x720 down to 32x18, 40:1)
+//   testsrc2   max 3  worst mean 0.521   (down to 32x18, 20:1)
+// ... FFmpeg 9.0.2: the same maxima, worst means 0.493 / 0.572 / 0.191 / 0.227 / 0.833 / 0.521.

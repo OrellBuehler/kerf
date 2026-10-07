@@ -19,18 +19,22 @@
 //!   exactly (zero mismatches on random pictures, all three matrices).
 //! * **argb -> yuv** goes through the generic scaler. Luma is
 //!   `(ry*R + gy*G + by*B + rounding) >> 9`, then rounded to 8 bits: exact. The
-//!   RGB frame in between carries no colourspace tag, so the coefficients are
-//!   BT.601 whatever the layer's own matrix was. Chroma is the sum of each pair of
+//!   RGB frame in between carries no colourspace tag of its own, so the way back
+//!   takes the matrix of the composite it is headed for — BT.601 on an FFmpeg whose
+//!   composite is untagged, the stack's matrix on one that negotiates it
+//!   ([`kerf_core::CompositeColorPolicy`]) — and never the layer's own: a BT.709
+//!   layer goes out of YCbCr as BT.709 and comes back as whatever the canvas is.
+//!   Chroma is the sum of each pair of
 //!   horizontal pixels (swscale halves the chroma of an RGB source on input), then a
 //!   vertical stretched-bicubic filter over the rows (`chrSrcVSubSample` is 0 for
 //!   RGB, so it is a real 2:1 scale): within one level everywhere.
 //! * **alpha** is `lrint(255 * opacity)` scaled by 256/255 on the way back to YUV:
-//!   see [`crate::geometry::ffmpeg_alpha`].
+//!   see [`kerf_core::layer_geometry::ffmpeg_alpha`].
 //!
 //! **Odd sizes are not reproduced, and not drawn**: on a picture with an odd
 //! width the pairing of pixels reads one pixel past the line — padding the graph
 //! never initialised — and an odd height takes swscale off its unscaled yuv -> rgb
-//! path altogether. [`crate::geometry::LayerGeometry::resolve`] refuses such a
+//! path altogether. [`kerf_core::layer_geometry::LayerGeometry::resolve`] refuses such a
 //! translucent layer, so that frame goes through FFmpeg.
 
 use kerf_core::YuvMatrix;
@@ -107,32 +111,82 @@ impl Yuv2Rgb {
     }
 }
 
-/// swscale's integer RGB -> YUV coefficients for BT.601, limited range out, 15
-/// fractional bits (`RGB2YUV_SHIFT`): the explicit table it substitutes for the
-/// default matrix.
-pub const RY: i32 = 8414;
-pub const GY: i32 = 16519;
-pub const BY: i32 = 3208;
-pub const RU: i32 = -4865;
-pub const GU: i32 = -9528;
-pub const BU: i32 = 14392;
-pub const RV: i32 = 14392;
-pub const GV: i32 = -12061;
-pub const BV: i32 = -2332;
-
-/// The 8-bit luma of an RGB pixel.
-pub fn rgb_to_luma(r: i32, g: i32, b: i32) -> i32 {
-    let y14 = (RY * r + GY * g + BY * b + (32 << 14) + (1 << 8)) >> 9;
-    ((y14 + 32) >> 6).clamp(0, 255)
+/// swscale's integer RGB -> YCbCr coefficients for a matrix, limited range out, 15
+/// fractional bits (`RGB2YUV_SHIFT`): `fill_rgb2yuv_table`. For BT.601 swscale
+/// substitutes an explicit table (the analytic one rounds differently in a few
+/// places).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb2Yuv {
+    pub ry: i32,
+    pub gy: i32,
+    pub by: i32,
+    pub ru: i32,
+    pub gu: i32,
+    pub bu: i32,
+    pub rv: i32,
+    pub gv: i32,
+    pub bv: i32,
 }
 
-/// The 15-bit `(U, V)` of a horizontal pair of RGB pixels given as the *sum* of
-/// the two (swscale's `bgr24ToUV_half`), before the vertical filter.
-pub fn pair_to_chroma15(sum: [i32; 3]) -> (i32, i32) {
-    let [r, g, b] = sum;
-    let u = (RU * r + GU * g + BU * b + (256 << 15) + (1 << 9)) >> 10;
-    let v = (RV * r + GV * g + BV * b + (256 << 15) + (1 << 9)) >> 10;
-    (u * 2, v * 2)
+/// `ROUNDED_DIV`.
+fn rounded_div(a: i64, b: i64) -> i64 {
+    (if a >= 0 { a + (b >> 1) } else { a - (b >> 1) }) / b
+}
+
+impl Rgb2Yuv {
+    pub fn new(matrix: YuvMatrix) -> Self {
+        if matrix == YuvMatrix::Bt601 {
+            return Self {
+                ry: 8414,
+                gy: 16519,
+                by: 3208,
+                ru: -4865,
+                gu: -9528,
+                bu: 14392,
+                rv: 14392,
+                gv: -12061,
+                bv: -2332,
+            };
+        }
+        const ONE: i64 = 65_536;
+        const S: u32 = 15;
+        let [vr, ub, ug, vg] = {
+            let [crv, cbu, cgu, cgv] = coefficients(matrix);
+            [crv, cbu, -cgu, -cgv]
+        };
+        let cy = ONE * 255 / 219;
+        let w = rounded_div(ONE * ONE * ug, ub);
+        let v = rounded_div(ONE * ONE * vg, vr);
+        let z = ONE * ONE - w - v;
+        let (c_y, c_u, c_v) = (rounded_div(cy * z, ONE), rounded_div(ub * z, ONE), rounded_div(vr * z, ONE));
+        let one = 1i64 << S;
+        Self {
+            ry: -rounded_div(one * v, c_y) as i32,
+            gy: rounded_div(one * ONE * ONE, c_y) as i32,
+            by: -rounded_div(one * w, c_y) as i32,
+            ru: rounded_div(one * v, c_u) as i32,
+            gu: -rounded_div(one * ONE * ONE, c_u) as i32,
+            bu: rounded_div(one * (z + w), c_u) as i32,
+            rv: rounded_div(one * (v + z), c_v) as i32,
+            gv: -rounded_div(one * ONE * ONE, c_v) as i32,
+            bv: rounded_div(one * w, c_v) as i32,
+        }
+    }
+
+    /// The 8-bit luma of an RGB pixel.
+    pub fn luma(&self, r: i32, g: i32, b: i32) -> i32 {
+        let y14 = (self.ry * r + self.gy * g + self.by * b + (32 << 14) + (1 << 8)) >> 9;
+        ((y14 + 32) >> 6).clamp(0, 255)
+    }
+
+    /// The 15-bit `(U, V)` of a horizontal pair of RGB pixels given as the *sum* of
+    /// the two (swscale's `bgr24ToUV_half`), before the vertical filter.
+    pub fn pair_to_chroma15(&self, sum: [i32; 3]) -> (i32, i32) {
+        let [r, g, b] = sum;
+        let u = (self.ru * r + self.gu * g + self.bu * b + (256 << 15) + (1 << 9)) >> 10;
+        let v = (self.rv * r + self.gv * g + self.bv * b + (256 << 15) + (1 << 9)) >> 10;
+        (u * 2, v * 2)
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +273,7 @@ mod tests {
     /// off on random pictures).
     #[test]
     fn rgb_to_yuv_is_what_ffmpeg_measured() {
+        let back = Rgb2Yuv::new(YuvMatrix::Bt601);
         for ((r, g, b), (y, u, v)) in [
             ((255, 0, 0), (81, 90, 240)),
             ((0, 255, 0), (145, 54, 34)),
@@ -230,10 +285,30 @@ mod tests {
             ((128, 128, 128), (126, 128, 128)),
             ((200, 30, 160), (98, 160, 194)),
         ] {
-            assert_eq!(rgb_to_luma(r, g, b), y, "luma of {r},{g},{b}");
-            let (u15, v15) = pair_to_chroma15([2 * r, 2 * g, 2 * b]);
+            assert_eq!(back.luma(r, g, b), y, "luma of {r},{g},{b}");
+            let (u15, v15) = back.pair_to_chroma15([2 * r, 2 * g, 2 * b]);
             assert!((((u15 + 64) >> 7).clamp(0, 255) - u).abs() <= 1, "U of {r},{g},{b}");
             assert!((((v15 + 64) >> 7).clamp(0, 255) - v).abs() <= 1, "V of {r},{g},{b}");
+        }
+    }
+
+    #[test]
+    fn the_rgb_to_yuv_tables_follow_swscales_derivation() {
+        // BT.601 is swscale's explicit table; the others come from the analytic
+        // derivation (`0.2126 * 219 / 255 * 2^15` = 5983 for BT.709's red luma).
+        let t601 = Rgb2Yuv::new(YuvMatrix::Bt601);
+        assert_eq!((t601.ry, t601.gy, t601.by), (8414, 16519, 3208));
+        assert_eq!((t601.ru, t601.gu, t601.bu), (-4865, -9528, 14392));
+        let t709 = Rgb2Yuv::new(YuvMatrix::Bt709);
+        assert_eq!((t709.ry, t709.gy, t709.by), (5983, 20127, 2032));
+        assert_eq!((t709.ru, t709.gu, t709.bu), (-3298, -11094, 14392));
+        assert_eq!((t709.rv, t709.gv, t709.bv), (14392, -13073, -1320));
+        let t2020 = Rgb2Yuv::new(YuvMatrix::Bt2020);
+        assert_eq!((t2020.ry, t2020.gy, t2020.by), (7393, 19080, 1669));
+        assert_eq!((t2020.rv, t2020.gv, t2020.bv), (14392, -13235, -1158));
+        // Each row of luma weights sums to the full-range gain, 219/255 of 2^15.
+        for t in [t601, t709, t2020] {
+            assert!(((t.ry + t.gy + t.by) - 28_142).abs() <= 1, "{t:?}");
         }
     }
 
@@ -241,7 +316,7 @@ mod tests {
     fn a_saturated_bt709_colour_stays_in_gamut_only_with_its_own_matrix() {
         // SMPTE HD bars' yellow (Y 168, U 44, V 136) is in gamut as BT.709 and
         // out of it as BT.601: the reason the way out of YUV uses the layer's own
-        // matrix while the way back is BT.601.
+        // matrix rather than the composite's.
         let own = Yuv2Rgb::new(YuvMatrix::Bt709).rgb(168, 44, 136);
         assert!(
             own[2] <= 3 && (185..=195).contains(&own[0]) && (185..=195).contains(&own[1]),

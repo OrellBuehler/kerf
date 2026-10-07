@@ -166,24 +166,102 @@ impl Hdr {
 /// Whether an ffprobe pixel-format name carries an alpha channel. A name is
 /// matched, not looked up in libavutil's table (this crate needs no dev
 /// libraries): `yuva*` and `gbrap*` planar families, the packed `rgba` / `bgra` /
-/// `argb` / `abgr` (and their 64-bit forms), `ya8` / `ya16*`, and `pal8`, whose
-/// palette may hold transparent entries (a GIF) with nothing in the name to say so.
+/// `argb` / `abgr` (and their 64-bit forms), `ayuv` / `vuya`, `ya8` / `ya16*`,
+/// the `rgb32` / `bgr32` aliases, and `pal8`, whose palette may hold transparent
+/// entries (a GIF) with nothing in the name to say so.
+///
+/// This is the deny-list; what a renderer that draws only opaque pictures should
+/// trust is the allow-list, [`pix_fmt_layout`] — a format on neither is unknown.
 pub fn pix_fmt_has_alpha(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("yuva")
         || n.starts_with("gbrap")
         || n.starts_with("ya8")
         || n.starts_with("ya16")
+        || n.starts_with("ayuv")
+        || n.starts_with("vuya")
+        || n.starts_with("rgb32")
+        || n.starts_with("bgr32")
         || n == "pal8"
         || ["rgba", "bgra", "argb", "abgr"].iter().any(|p| n.starts_with(p))
 }
 
+/// How a known-opaque picture is laid out, as far as FFmpeg's scaler cares: the
+/// chroma it carries decides whether decoding to 8-bit 4:2:0 *before* scaling (what
+/// a renderer that handles only 4:2:0 has to do) gives the picture FFmpeg's own
+/// scaling of the native format would — it does not when the picture is enlarged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixLayout {
+    /// 8- or 10-bit 4:2:0 (`yuv420p`, `yuvj420p`, `yuv420p10le`, `nv12`, `p010le`, ...):
+    /// the layout the compositor works in.
+    Yuv420,
+    /// Luma only (`gray`, `gray10le`, ...): scaling touches one plane, and the
+    /// 4:2:0 chroma is constant.
+    Gray,
+    /// Any other YCbCr layout (4:2:2, 4:4:4, 4:1:1, 4:4:0, 12 bit and up, packed).
+    OtherYuv,
+    /// An RGB-family picture (`rgb24`, `bgr0`, `gbrp`, ...): FFmpeg scales it as
+    /// RGB, and converts to YCbCr only where the graph says so.
+    Rgb,
+}
+
+/// The layout of a **known-opaque** pixel format, from an allow-list; `None` for
+/// anything else — alpha-carrying, palettised, or simply not on the list. A
+/// renderer that cannot draw alpha should refuse what is not here rather than
+/// trust a deny-list to have thought of every name (`ayuv`, `vuya`, and the
+/// `rgb32` aliases all slipped past one).
+pub fn pix_fmt_layout(name: &str) -> Option<PixLayout> {
+    let n = name.to_ascii_lowercase();
+    // `yuv420p10le` -> `yuv420p10`.
+    let t = n.strip_suffix("le").or_else(|| n.strip_suffix("be")).unwrap_or(&n);
+    // The semi-planar high-depth names carry their depth in the name itself.
+    match t {
+        "p010" => return Some(PixLayout::Yuv420),
+        "p012" | "p016" | "p210" | "p212" | "p216" | "p410" | "p412" | "p416" => return Some(PixLayout::OtherYuv),
+        _ => {}
+    }
+    // Split a depth tail off a planar name: (`yuv420p`, 10). `rgb24` / `bgr24` /
+    // `rgb48` keep their digits: they are part of the name, not a depth.
+    let digits = t.chars().rev().take_while(char::is_ascii_digit).count();
+    let (stem, tail) = t.split_at(t.len() - digits);
+    let (base, bits) = match tail.parse::<u32>() {
+        Ok(b) if stem.ends_with('p') || stem == "gray" => (stem, b),
+        _ => (t, 8),
+    };
+    let planar_depth = matches!(bits, 8 | 9 | 10 | 12 | 14 | 16);
+    match base {
+        "yuv420p" | "yuvj420p" if bits <= 10 && planar_depth => Some(PixLayout::Yuv420),
+        "yuv420p" if planar_depth => Some(PixLayout::OtherYuv),
+        "nv12" | "nv21" => Some(PixLayout::Yuv420),
+        "gray" if planar_depth => Some(PixLayout::Gray),
+        "yuv422p" | "yuvj422p" | "yuv444p" | "yuvj444p" | "yuv440p" | "yuvj440p" | "yuv411p" | "yuvj411p" | "yuv410p"
+            if planar_depth =>
+        {
+            Some(PixLayout::OtherYuv)
+        }
+        "nv16" | "nv24" | "nv42" | "uyvy422" | "yuyv422" | "yvyu422" | "uyyvyy411" => Some(PixLayout::OtherYuv),
+        "gbrp" if planar_depth => Some(PixLayout::Rgb),
+        "rgb24" | "bgr24" | "rgb0" | "bgr0" | "0rgb" | "0bgr" | "rgb48" | "bgr48" | "rgb8" | "bgr8" | "rgb4" | "bgr4"
+        | "rgb4_byte" | "bgr4_byte" | "rgb565" | "bgr565" | "rgb555" | "bgr555" | "rgb444" | "bgr444" | "x2rgb10" | "x2bgr10" => {
+            Some(PixLayout::Rgb)
+        }
+        _ => None,
+    }
+}
+
 impl StreamInfo {
     /// Whether the picture has an alpha channel, when the probe recorded the
-    /// pixel format. `None` is "not known" (an asset saved before
-    /// [`StreamInfo::pix_fmt`] existed), which is not the same as "no alpha".
+    /// pixel format: `Some(true)` for a format that carries one, `Some(false)` for
+    /// a known-opaque one ([`pix_fmt_layout`]), and `None` when the format was
+    /// never recorded (an asset saved before [`StreamInfo::pix_fmt`] existed) **or**
+    /// is not one the allow-list knows. `None` is not "no alpha".
     pub fn has_alpha(&self) -> Option<bool> {
-        self.pix_fmt.as_deref().map(pix_fmt_has_alpha)
+        let name = self.pix_fmt.as_deref()?;
+        if pix_fmt_has_alpha(name) {
+            Some(true)
+        } else {
+            pix_fmt_layout(name).map(|_| false)
+        }
     }
 
     /// The HDR transfer this video stream is encoded in, or `None` for SDR and
@@ -3525,6 +3603,102 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pixel_format_allow_list_knows_opaque_formats_and_nothing_else() {
+        use PixLayout::*;
+        for (name, layout) in [
+            ("yuv420p", Yuv420),
+            ("yuvj420p", Yuv420),
+            ("yuv420p10le", Yuv420),
+            ("yuv420p10be", Yuv420),
+            ("yuv420p9le", Yuv420),
+            ("nv12", Yuv420),
+            ("nv21", Yuv420),
+            ("p010le", Yuv420),
+            ("yuv420p12le", OtherYuv),
+            ("yuv420p16le", OtherYuv),
+            ("p016le", OtherYuv),
+            ("yuv422p", OtherYuv),
+            ("yuv444p", OtherYuv),
+            ("yuvj444p", OtherYuv),
+            ("yuv422p10le", OtherYuv),
+            ("yuv444p16le", OtherYuv),
+            ("yuv411p", OtherYuv),
+            ("yuyv422", OtherYuv),
+            ("gray", Gray),
+            ("gray10le", Gray),
+            ("gray16le", Gray),
+            ("rgb24", Rgb),
+            ("bgr24", Rgb),
+            ("bgr0", Rgb),
+            ("0rgb", Rgb),
+            ("rgb48le", Rgb),
+            ("gbrp", Rgb),
+            ("gbrp10le", Rgb),
+            ("rgb565le", Rgb),
+            ("x2rgb10le", Rgb),
+        ] {
+            assert_eq!(pix_fmt_layout(name), Some(layout), "{name}");
+            assert!(!pix_fmt_has_alpha(name), "{name} is opaque");
+        }
+        // Alpha-carrying, palettised and unlisted names are all `None` — including the
+        // ones a deny-list forgot (`ayuv`, `vuya`, the `rgb32` aliases).
+        for name in [
+            "yuva420p",
+            "yuva444p10le",
+            "gbrap",
+            "gbrap16le",
+            "rgba",
+            "bgra",
+            "argb",
+            "abgr",
+            "rgba64le",
+            "ya8",
+            "ya16le",
+            "ayuv",
+            "vuya",
+            "ayuv64le",
+            "rgb32",
+            "bgr32",
+            "pal8",
+            "grayf32le",
+            "something_new",
+            "",
+        ] {
+            assert_eq!(pix_fmt_layout(name), None, "{name}");
+        }
+        for name in [
+            "yuva420p", "gbrap", "rgba", "ayuv", "vuya", "rgb32", "bgr32", "pal8", "ya8", "argb64le",
+        ] {
+            assert!(pix_fmt_has_alpha(name), "{name} carries alpha");
+        }
+        // `has_alpha` is three-valued: yes, no, and "not recorded or not known".
+        let mut s = StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: Some(1),
+            height: Some(1),
+            fps: None,
+            sample_rate: None,
+            channels: None,
+            image: false,
+            projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
+            pix_fmt: None,
+            color_space: None,
+        };
+        assert_eq!(s.has_alpha(), None);
+        s.pix_fmt = Some("yuv420p".into());
+        assert_eq!(s.has_alpha(), Some(false));
+        s.pix_fmt = Some("ayuv".into());
+        assert_eq!(s.has_alpha(), Some(true));
+        s.pix_fmt = Some("something_new".into());
+        assert_eq!(s.has_alpha(), None);
+    }
 
     #[test]
     fn a_stream_saved_before_rotation_and_colour_were_probed_still_loads_as_sdr() {

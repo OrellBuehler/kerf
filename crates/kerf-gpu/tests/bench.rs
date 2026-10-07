@@ -148,7 +148,7 @@ fn bench_time_per_still_gpu_vs_ffmpeg() {
         for layers in [1usize, 3, 6] {
             let tl = timeline(&asset, layers);
             let assets = std::slice::from_ref(&asset);
-            let plan = RenderPlan::at(&tl, assets, &opts, 0.5).expect("plan");
+            let plan = RenderPlan::at(&tl, assets, &opts, 0.5, kerf_core::composite_color_policy()).expect("plan");
             assert!(plan.gpu_supported(), "{:?}", plan.unsupported_reasons());
             let size = plan.size(u32::MAX);
 

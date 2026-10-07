@@ -20,7 +20,7 @@ use crate::model::{
     Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
     SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
-use crate::render_plan::{active_video_clips, still_size};
+use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
 /// pure function of (source path, time, filter, codec, quality), so caching is
@@ -658,6 +658,182 @@ fn zscale_available() -> bool {
         tracing::debug!(available = ok, "probed ffmpeg for zscale + tonemap");
         ok
     })
+}
+
+// ---- the composite's colour policy ---------------------------------------------
+
+/// How this ffmpeg picks the matrix of a composite — see [`CompositeColorPolicy`].
+/// Probed once per process by **running the still graph** twice on the same
+/// picture, once in a clip tagged BT.709 and once in an untagged one, and seeing
+/// whether the finished composites differ: FFmpeg 6 hands the encoder an untagged
+/// frame (BT.601 whatever the clip was, so the two agree); FFmpeg 9 negotiates the
+/// colourspace across the overlay chain, so the tagged clip's composite is
+/// converted as BT.709 and the two differ. Measured, not read off a version string.
+///
+/// If the probe cannot run or reads something it does not understand it answers
+/// [`CompositeColorPolicy::BottomLayerTag`], the cautious one: it draws only stacks
+/// whose layers agree on a matrix, which are the stacks every policy renders
+/// alike.
+pub fn composite_color_policy() -> CompositeColorPolicy {
+    static POLICY: OnceLock<CompositeColorPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let measured = measure_composite_color_policy();
+        let policy = measured.unwrap_or(CompositeColorPolicy::BottomLayerTag);
+        tracing::debug!(
+            ?policy,
+            measured = measured.is_some(),
+            "probed ffmpeg's composite colour policy"
+        );
+        policy
+    })
+}
+
+/// The probe picture: a flat YCbCr whose red the two matrices convert to values
+/// well apart (about 20 levels on FFmpeg's converter).
+const POLICY_PROBE_YUV: (u8, u8, u8) = (60, 128, 230);
+
+/// Which policy two measured reds say: the same red from the tagged and the
+/// untagged clip means the tag did not reach the conversion.
+fn policy_from_reds(tagged: u8, untagged: u8) -> Option<CompositeColorPolicy> {
+    match tagged.abs_diff(untagged) {
+        0..=3 => Some(CompositeColorPolicy::FixedBt601),
+        10.. => Some(CompositeColorPolicy::BottomLayerTag),
+        _ => None,
+    }
+}
+
+fn measure_composite_color_policy() -> Option<CompositeColorPolicy> {
+    let tagged = probe_composite_red(true)?;
+    let untagged = probe_composite_red(false)?;
+    tracing::debug!(tagged, untagged, "composite colour probe");
+    policy_from_reds(tagged, untagged)
+}
+
+/// The red of the middle pixel of the still graph's composite over a one-frame
+/// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
+fn probe_composite_red(tag_bt709: bool) -> Option<u8> {
+    use std::io::Write;
+    let bin = ffmpeg_bin();
+    let (y, u, v) = POLICY_PROBE_YUV;
+    // 1. A one-frame clip of exactly that picture (raw planes, so no generator gets
+    // to round it), tagged the way a camera's file is, or not.
+    let mut raw = vec![y; 64 * 64];
+    raw.extend(std::iter::repeat_n(u, 32 * 32));
+    raw.extend(std::iter::repeat_n(v, 32 * 32));
+    // The tag goes on the *input* (a decoder option): put on the output of a
+    // raw-video encode it would make FFmpeg 9 convert the picture into the new
+    // matrix on the way, and the two clips would no longer hold the same planes.
+    let mut maker = command(&bin);
+    maker.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-s",
+        "64x64",
+    ]);
+    if tag_bt709 {
+        maker.args(["-colorspace", "bt709"]);
+    }
+    let mut maker = maker
+        .args([
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "matroska",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut maker_in = maker.stdin.take()?;
+    let writer = std::thread::spawn(move || {
+        let _ = maker_in.write_all(&raw);
+    });
+    let made = maker.wait_with_output().ok()?;
+    let _ = writer.join();
+    if !made.status.success() || made.stdout.is_empty() {
+        return None;
+    }
+    let clip = made.stdout;
+
+    // 2. The still graph of a one-clip timeline over that clip, built by the very
+    // builder the stills use, ending in raw RGB.
+    let asset = Asset {
+        id: uuid::Uuid::new_v4(),
+        path: "pipe:0".to_string(),
+        name: "probe".to_string(),
+        duration: 1.0,
+        streams: vec![StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "ffv1".to_string(),
+            width: Some(64),
+            height: Some(64),
+            fps: Some(1.0),
+            sample_rate: None,
+            channels: None,
+            image: false,
+            projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
+            pix_fmt: Some("yuv420p".to_string()),
+            color_space: tag_bt709.then(|| "bt709".to_string()),
+        }],
+        imported_at: chrono::Utc::now(),
+        source_paths: Vec::new(),
+        voiceover: None,
+    };
+    let timeline = Timeline {
+        tracks: vec![crate::model::Track {
+            clips: vec![Clip::new(asset.id, 0.0, 1.0, 0.0)],
+            ..crate::model::Track::new(StreamKind::Video, "V1")
+        }],
+        overlays: Vec::new(),
+        markers: Vec::new(),
+        format: None,
+    };
+    let args = build_still_args(
+        &timeline,
+        std::slice::from_ref(&asset),
+        &ExportOptions::default(),
+        0.0,
+        64,
+        None,
+        &StillOutput::RgbPipe,
+    )
+    .ok()?;
+    let mut child = command(&bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let feeder = std::thread::spawn(move || {
+        // The clip is a few kilobytes; ffmpeg may close the pipe before reading it
+        // all, which is not the feeder's problem.
+        let _ = stdin.write_all(&clip);
+    });
+    let out = child.wait_with_output().ok()?;
+    let _ = feeder.join();
+    if !out.status.success() || out.stdout.len() != 64 * 64 * 3 {
+        return None;
+    }
+    Some(out.stdout[(32 * 64 + 32) * 3])
 }
 
 /// The filter chain that turns decoded HDR frames into 8-bit SDR BT.709 —
@@ -5410,6 +5586,9 @@ pub enum StillOutput {
     JpegPipe { quality: u8 },
     /// An image file. JPEG honors `quality`; PNG is lossless and ignores it.
     File { path: String, format: ImageFormat, quality: u8 },
+    /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
+    /// wants the converted pixels themselves.
+    RgbPipe,
 }
 
 /// The image formats a cover frame can be written as.
@@ -5461,6 +5640,9 @@ impl StillOutput {
                     "mjpeg".to_string(),
                     "pipe:1".to_string(),
                 ]);
+            }
+            StillOutput::RgbPipe => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
             }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {
@@ -7142,7 +7324,14 @@ mod tests {
         let opts = ExportOptions::default();
         for (t, max_width) in [(2.5, 640), (0.5, 640), (6.0, 1920), (45.0, 320)] {
             let args = build_timeline_frame_args(&timeline, &assets, &opts, t, max_width, 4).unwrap();
-            let plan = RenderPlan::at(&timeline, &assets, &opts, t).unwrap();
+            let plan = RenderPlan::at(
+                &timeline,
+                &assets,
+                &opts,
+                t,
+                crate::render_plan::CompositeColorPolicy::FixedBt601,
+            )
+            .unwrap();
 
             // `-ss <t> -i <path>` pairs, in input order.
             let mut from_args = Vec::new();
@@ -10059,6 +10248,34 @@ mod tests {
         let unknown = probe_json(r#""width":1280,"height":720"#);
         assert_eq!(unknown.streams[0].pix_fmt, None);
         assert_eq!(unknown.streams[0].has_alpha(), None);
+    }
+
+    #[test]
+    fn the_probe_reads_a_policy_off_two_reds() {
+        // The tag did not reach the conversion: the same red either way.
+        assert_eq!(policy_from_reds(193, 193), Some(CompositeColorPolicy::FixedBt601));
+        assert_eq!(policy_from_reds(194, 192), Some(CompositeColorPolicy::FixedBt601));
+        // It did: BT.709 reads this picture's red about 18 levels higher.
+        assert_eq!(policy_from_reds(211, 193), Some(CompositeColorPolicy::BottomLayerTag));
+        // Neither: not a difference the probe knows how to read.
+        assert_eq!(policy_from_reds(200, 193), None);
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn the_composite_policy_is_measured_from_the_graph_not_guessed() {
+        // Whatever this ffmpeg is, the probe must read *something* off the real
+        // graph (a `None` would mean it silently fell back to the cautious answer).
+        let measured = measure_composite_color_policy();
+        eprintln!(
+            "composite colour policy of {}: {measured:?} (reds tagged {:?} / untagged {:?})",
+            ffmpeg_bin(),
+            probe_composite_red(true),
+            probe_composite_red(false)
+        );
+        assert!(measured.is_some(), "the probe could not read the still graph's matrix");
+        assert_eq!(composite_color_policy(), measured.unwrap());
     }
 
     #[test]

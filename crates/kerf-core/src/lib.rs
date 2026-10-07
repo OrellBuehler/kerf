@@ -8,6 +8,7 @@
 pub mod analysis;
 pub mod error;
 pub mod fonts;
+pub mod layer_geometry;
 pub mod model;
 pub mod platform;
 pub mod project;
@@ -27,12 +28,12 @@ pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
-    contact_sheet_times, download_speech_model, export_still, ffmpeg_command, ffmpeg_path, generate_proxy, hw_encoders,
-    insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants, render_with,
-    render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export,
-    voiceover_status, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, PreviewFrame,
-    RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, DEFAULT_SPEECH_MODEL,
-    DEFAULT_VOICE, MAX_VOICE_SPEED, MIN_VOICE_SPEED,
+    composite_color_policy, contact_sheet_times, download_speech_model, export_still, ffmpeg_command, ffmpeg_path,
+    generate_proxy, hw_encoders, insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants,
+    render_with, render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview,
+    validate_export, voiceover_status, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Fit,
+    ImageFormat, PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus,
+    DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, MAX_VOICE_SPEED, MIN_VOICE_SPEED,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
@@ -47,4 +48,4 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, VOICEOVER_TRACK};
-pub use render_plan::{PlanCanvas, PlanLayer, PlanStream, RenderPlan, YuvMatrix};
+pub use render_plan::{CompositeColorPolicy, PlanCanvas, PlanLayer, PlanStream, RenderPlan, YuvMatrix, MAX_SHRINK};

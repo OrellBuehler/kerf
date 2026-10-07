@@ -6,10 +6,14 @@
 
 use chrono::Utc;
 use kerf_core::{
-    Asset, Clip, Delivery, ExportOptions, Fit, RenderPlan, StreamInfo, StreamKind, Timeline, Track, Transform, VideoEffect,
+    Asset, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, RenderPlan, StreamInfo, StreamKind, Timeline, Track,
+    Transform, VideoEffect,
 };
 use kerf_gpu::{Compositor, Gpu, GpuError, GpuOptions, YuvFrame};
 use uuid::Uuid;
+
+/// The synthetic frames here are untagged: both policies agree on them.
+const POLICY: CompositeColorPolicy = CompositeColorPolicy::FixedBt601;
 
 fn gpu() -> std::sync::Arc<Gpu> {
     Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)")
@@ -39,7 +43,7 @@ fn asset(w: u32, h: u32) -> Asset {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
-            pix_fmt: None,
+            pix_fmt: Some("yuv420p".into()),
             color_space: None,
         }],
         imported_at: Utc::now(),
@@ -74,7 +78,7 @@ fn flat(w: u32, h: u32, y: u8, u: u8, v: u8) -> Option<YuvFrame> {
 
 fn plan_for(a: &Asset, c: Clip) -> RenderPlan {
     let tl = timeline_of(vec![c]);
-    RenderPlan::at(&tl, std::slice::from_ref(a), &ExportOptions::default(), 0.5).unwrap()
+    RenderPlan::at(&tl, std::slice::from_ref(a), &ExportOptions::default(), 0.5, POLICY).unwrap()
 }
 
 #[test]
@@ -82,7 +86,7 @@ fn plan_for(a: &Asset, c: Clip) -> RenderPlan {
 fn an_empty_frame_is_opaque_black() {
     let a = asset(64, 36);
     let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 5.0)]);
-    let plan = RenderPlan::at(&tl, &[a], &ExportOptions::default(), 1.0).unwrap();
+    let plan = RenderPlan::at(&tl, &[a], &ExportOptions::default(), 1.0, POLICY).unwrap();
     assert!(plan.layers.is_empty());
     let frame = compositor().composite(&plan, &[], (64, 36)).unwrap();
     assert_eq!((frame.width, frame.height), (64, 36));
@@ -141,7 +145,7 @@ fn a_letterboxed_picture_covers_the_layers_below_with_its_bars() {
         clips: vec![Clip::new(a.id, 0.0, 1.0, 0.0)],
         ..Track::new(StreamKind::Video, "V2")
     });
-    let plan = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.5).unwrap();
+    let plan = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.5, POLICY).unwrap();
     assert_eq!(plan.layers.len(), 2);
     let frames = [flat(64, 36, 235, 128, 128), flat(64, 36, 100, 128, 128)];
     let frame = compositor().composite(&plan, &frames, (36, 64)).unwrap();
