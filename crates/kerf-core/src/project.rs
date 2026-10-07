@@ -629,7 +629,7 @@ impl Project {
     /// Stills and audio-only assets never get a proxy, so they resolve to the
     /// original. Falls back to the original whenever no proxy exists yet, so a
     /// preview never blocks waiting on generation.
-    fn preview_source(asset: &Asset) -> PathBuf {
+    pub(crate) fn preview_source(asset: &Asset) -> PathBuf {
         let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
         if has_video && !asset.is_image() {
             if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())) {
@@ -4018,6 +4018,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::captions_import::{parse_captions, CaptionFormat, CaptionImportRequest, ImportSummary, MAX_IMPORTED_CAPTIONS};
+    use crate::engine::test_support::{remove_proxy, ProxyGuard};
     use crate::model::{ClipMove, DiffKind, Fit};
 
     #[test]
@@ -4385,7 +4386,7 @@ mod tests {
         }
         std::fs::write(&proxy, b"stub").unwrap();
         let resolved = Project::preview_source(&asset);
-        let _ = std::fs::remove_file(&proxy);
+        remove_proxy(&proxy);
         assert_eq!(resolved, proxy);
     }
 
@@ -4427,7 +4428,7 @@ mod tests {
         }
         std::fs::write(&proxy_file, b"stub").unwrap();
         let resolved = Project::filmstrip_proxy(&asset);
-        let _ = std::fs::remove_file(&proxy_file);
+        remove_proxy(&proxy_file);
         assert_eq!(resolved, Some(proxy_file), "the ready proxy is preferred");
 
         // A still never has a proxy, so it resolves to the original.
@@ -6415,7 +6416,7 @@ mod tests {
         let after = project.preview_assets().unwrap();
         let (timeline, _) = project.timeline_frame_inputs().unwrap();
         let from_proxy = rgb(&Project::composite_timeline_frame(&timeline, &after, 1.0, 640, 2).unwrap());
-        let _ = std::fs::remove_file(&proxy);
+        remove_proxy(&proxy);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(tags, "yuv420p,bt709", "the proxy is SDR");
@@ -6432,16 +6433,6 @@ mod tests {
             mad < 8.0,
             "proxy and original previews differ by {mad:.1} levels: converted twice or not at all"
         );
-    }
-
-    /// Deletes a file when dropped, pass or fail: a proxy a test generated into the
-    /// user's own cache must not outlive a failing assert.
-    struct RemoveOnDrop(PathBuf);
-
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
     }
 
     /// Deletes a scratch directory when dropped, pass or fail.
@@ -6556,7 +6547,7 @@ mod tests {
         project.add_clip_to_timeline(asset.id, None, 1.234, 3.0, Some(2.0)).unwrap();
         let (timeline, originals) = (project.timeline().unwrap(), project.list_assets().unwrap());
         let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
-        let _cleanup = RemoveOnDrop(proxy.clone());
+        let _cleanup = ProxyGuard(proxy.clone());
         let (_, previews) = project.timeline_frame_inputs().unwrap();
         assert_eq!(previews[0].path, proxy.to_string_lossy(), "the preview decodes the proxy");
 
@@ -6607,7 +6598,7 @@ mod tests {
         let project = Project::open_in_memory().unwrap();
         let asset = project.import_asset(&media).unwrap();
         let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
-        let _cleanup = RemoveOnDrop(proxy.clone());
+        let _cleanup = ProxyGuard(proxy.clone());
 
         // A frame a clip shows, 40 frames from its start — past the second mark, where the
         // held-frame slip is a whole `lead` of them.

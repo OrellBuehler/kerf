@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational};
 use crate::engine::Fit;
 use crate::error::Result;
+use crate::frame_pick::Pick;
 use crate::layer_geometry::{LayerGeometry, Placement};
 use crate::model::{
     pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection, ResolvedReframe, StreamInfo,
@@ -383,18 +384,18 @@ impl LayerFx {
     }
 }
 
-/// What the source-frame pick needs of a layer, which is not what its decoded
-/// `source_time` says: FFmpeg's `fps` filter picks the frame for output frame `k`
-/// by the rule `the last frame with pts < ws + s * ((k + 1/2) / fps - start)`
-/// (mirrored over the window for reverse), so the pick wants the window, the speed
-/// and the start — and the plan's `frame` and `canvas.fps`.
+/// What the layer's clip does in time, beside the [`Pick`] that carries what the source-frame
+/// choice needs (`FpsPick`: the export's `fps` filter does not pick "the frame containing
+/// `source_time`", see `frame_pick.rs`). The window here is the overlay's `enable` one;
+/// the speed and direction repeat what the pick holds, for a reader that wants them without
+/// matching on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlanTiming {
     /// The overlay's `enable` window on the timeline, tail included. A [`PlanMode::Motion`]
     /// plan holds every layer whose window contains the frame time (end included, as
     /// `between` has it): **candidates**. An equal-rate source has no frame at the
     /// window's end and the export draws nothing there; which layers are really drawn
-    /// is the pick's to say.
+    /// is the pick's to say ([`PlanLayer::pick`]: `None` is no frame).
     pub window: (f64, f64),
     /// The source window the chain trims (`clip_source_window`, tail included).
     pub source_window: (f64, f64),
@@ -449,6 +450,20 @@ pub struct PlanText {
 /// A layer whose source has no picture of a known size: not drawable under any caps.
 pub type Pictureless = LayerRef;
 
+/// Which file a layer decodes: what [`PlanLayer::path`] and [`PlanLayer::stream`] describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlanSource {
+    /// The file is a generated preview proxy rather than the asset's own, so
+    /// [`PlanLayer::stream`] is the proxy's picture (see [`crate::MediaResolver`]).
+    pub proxy: bool,
+}
+
+impl PlanSource {
+    /// The asset's own file.
+    pub const ORIGINAL: Self = Self { proxy: false };
+}
+
 /// One video layer of a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanLayer {
@@ -456,14 +471,23 @@ pub struct PlanLayer {
     pub asset_id: Uuid,
     /// Index of the timeline track the layer comes from (0 is the bottom one).
     pub track: usize,
+    /// The file the layer decodes: the asset's own, or its proxy ([`PlanLayer::source`]).
     pub path: String,
+    pub source: PlanSource,
     /// A still image: decoded once, never seeked.
     pub is_image: bool,
     /// The source time to decode (speed / reverse honored, clamped to the asset).
     pub source_time: f64,
+    /// Which frame of the file the layer shows: the still's `-ss` pick, or the export's `fps`
+    /// pick ([`Pick::Fps`], in a [`PlanMode::Motion`] plan) — a decoder resolves it against the
+    /// frames it has. Which candidates at a clip's closing edge are drawn at all is its answer
+    /// too: `None` is no frame.
+    pub pick: Pick,
     /// Seconds from the clip's start; keyframes were sampled here. A [`PlanMode::Motion`]
     /// plan samples at the graph's own frame time, which is not `frame / fps`.
     pub clip_time: f64,
+    /// The picture **the decoded file** carries (`path`): a proxy's size and pixel format, not
+    /// the original's.
     pub stream: PlanStream,
     /// The transform **sampled** at this instant.
     pub transform: Transform,
@@ -575,16 +599,7 @@ impl RenderPlan {
         t: f64,
         color: CompositeColorPolicy,
     ) -> Result<RenderPlan> {
-        Planner::new(
-            timeline,
-            assets,
-            opts,
-            PlanRequest {
-                mode: PlanMode::Still,
-                color,
-            },
-        )?
-        .at(t)
+        Planner::new(timeline, assets, opts, PlanRequest::still(color))?.at(t)
     }
 
     /// Why a compositor with `caps` cannot draw this frame at `size`
@@ -647,6 +662,12 @@ impl RenderPlan {
             }
             if self.canvas.gif {
                 out.push(Unsupported::Gif);
+            }
+            if self.canvas.fps != self.canvas.pick_fps && !self.layers.is_empty() {
+                out.push(Unsupported::PickRate {
+                    canvas: self.canvas.fps,
+                    clips: self.canvas.pick_fps,
+                });
             }
         }
         out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));

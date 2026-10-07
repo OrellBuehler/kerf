@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::model::{Asset, Clip, StreamInfo, StreamKind, Timeline, Track};
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,23 @@ impl StatusBounded for Command {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+/// Remove a proxy a test generated into the user's own cache: the file **and the sidecar**
+/// `generate_proxy` wrote beside it.
+pub(crate) fn remove_proxy(proxy: &Path) {
+    let _ = std::fs::remove_file(proxy);
+    let _ = std::fs::remove_file(super::proxy_sidecar_path(proxy));
+}
+
+/// [`remove_proxy`] when dropped, pass or fail: a proxy in the user's cache must not outlive
+/// a failing assert.
+pub(crate) struct ProxyGuard(pub(crate) PathBuf);
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        remove_proxy(&self.0);
     }
 }
 
