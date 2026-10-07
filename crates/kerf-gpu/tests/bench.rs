@@ -105,6 +105,7 @@ fn timeline(asset: &Asset, layers: usize) -> Timeline {
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     }
 }
 

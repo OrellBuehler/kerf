@@ -16,9 +16,10 @@ use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
-    Delivery, EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision,
-    SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
-    Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
+    Delivery, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe, ReframeKeyframe,
+    Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay,
+    TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect, Voiceover,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -765,6 +766,79 @@ impl Project {
             has_audio,
             has_text: !rendered.overlays.is_empty(),
         })
+    }
+
+    /// The owned inputs a levels measurement needs: the working timeline and the
+    /// **original** assets — it measures what the export would write, so no proxy
+    /// swap. Resolved together so the caller can drop the project lock before
+    /// [`Project::measure_levels`] runs ffmpeg over the whole cut.
+    pub fn levels_inputs(&self) -> Result<(Timeline, Vec<Asset>)> {
+        Ok((self.working_timeline()?, self.list_assets()?))
+    }
+
+    /// Measure how loud the cut is — the finished mix and each track — over
+    /// `range` (the whole cut when `None`), **without** `&self`: the lock-free
+    /// half of [`Project::levels`].
+    ///
+    /// One ffmpeg pass over the export's own audio graph with `ebur128` meters
+    /// on every track's strip and on the finished mix, so the master reading is
+    /// what the file would contain: the master fader and limiter are in it, and
+    /// `loudnorm` is when asked for. Whole-file work, so it holds the heavy-job
+    /// lease; `cancel` is polled and kills the pass ([`Error::Cancelled`]).
+    ///
+    /// A track's reading is its strip output, ahead of the duck bus and the
+    /// master. A track that is muted (or shadowed by a solo) has no reading and
+    /// `heard: false`.
+    pub fn measure_levels(
+        timeline: &Timeline,
+        assets: &[Asset],
+        range: Option<TimeRange>,
+        loudnorm: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Levels> {
+        if let Some(r) = range {
+            if !r.start.is_finite() || !r.end.is_finite() || r.start < 0.0 || r.end <= r.start {
+                return Err(Error::InvalidArgument("range needs 0 <= start < end, in seconds".to_string()));
+            }
+        }
+        // A span entirely past the end would fall back to measuring the whole cut
+        // (that is what a range export does with one) — and answer a question that
+        // was not asked. Say so instead.
+        let cut = timeline.for_render().duration();
+        if let Some(r) = range.filter(|r| cut > 0.0 && r.start >= cut) {
+            return Err(Error::InvalidArgument(format!(
+                "range starts at {:.1}s but the cut is only {cut:.1}s long",
+                r.start
+            )));
+        }
+        let measured = engine::mix_levels(timeline, assets, range, loudnorm, cancel)?;
+        let tracks = timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.clips
+                    .iter()
+                    .any(|c| assets.iter().any(|a| a.id == c.asset_id && a.has_audio()))
+            })
+            .map(|(i, t)| TrackLevels {
+                track_id: t.id,
+                name: t.name.clone(),
+                kind: t.kind,
+                ducked: t.duck,
+                heard: timeline.track_renders(t),
+                level: measured.tracks.iter().find(|(ti, _)| *ti == i).map(|(_, l)| *l),
+            })
+            .collect();
+        Ok(Levels::new(measured.duration, measured.master, tracks, loudnorm))
+    }
+
+    /// [`Project::measure_levels`] over the working timeline, holding `&self`
+    /// for the whole pass. Callers that share the project behind a lock use
+    /// [`Project::levels_inputs`] and release it first.
+    pub fn levels(&self, range: Option<TimeRange>, loudnorm: bool) -> Result<Levels> {
+        let (timeline, assets) = self.levels_inputs()?;
+        Self::measure_levels(&timeline, &assets, range, loudnorm, &|| false)
     }
 
     /// The owned inputs a **cover frame** render needs: the working timeline and
@@ -1843,6 +1917,44 @@ impl Project {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
             track.pan = pan;
             Ok(track.clone())
+        })
+    }
+
+    /// Set the master fader: the linear gain on the finished mix, after every
+    /// track and the duck bus and before `loudnorm`. Clamped to
+    /// `0..=`[`MASTER_MAX_VOLUME`] (+12 dB); a value that is not a number is
+    /// refused rather than clamped into nonsense. One revision, and an agent's
+    /// goes to its staged proposal like any other edit.
+    pub fn set_master_volume(&self, volume: f64) -> Result<MasterBus> {
+        if !volume.is_finite() {
+            return Err(Error::InvalidArgument("master volume must be a number".to_string()));
+        }
+        let volume = volume.clamp(0.0, MASTER_MAX_VOLUME);
+        self.edit_timeline("Set master level", |timeline| {
+            timeline.master.volume = volume;
+            Ok(timeline.master)
+        })
+    }
+
+    /// Switch the master limiter on or off, optionally moving its ceiling.
+    ///
+    /// The limiter holds the finished mix under `ceiling_db` (dBFS, clamped to
+    /// `-24..=0`; omitted, it keeps the ceiling it had — `-1` for a master never
+    /// touched) so a loud passage cannot clip the delivery. It is a **sample**
+    /// peak ceiling: the true peak can land a fraction of a dB above it, which
+    /// [`Project::levels`] reports. A ceiling given while switching off is kept
+    /// for the next time. One revision.
+    pub fn set_master_limiter(&self, enabled: bool, ceiling_db: Option<f64>) -> Result<MasterBus> {
+        if ceiling_db.is_some_and(|c| !c.is_finite()) {
+            return Err(Error::InvalidArgument("limiter ceiling must be a number".to_string()));
+        }
+        let ceiling_db = ceiling_db.map(|c| c.clamp(MASTER_MIN_CEILING_DB, 0.0));
+        self.edit_timeline("Set master limiter", |timeline| {
+            timeline.master.limiter = enabled;
+            if let Some(c) = ceiling_db {
+                timeline.master.ceiling_db = c;
+            }
+            Ok(timeline.master)
         })
     }
 
@@ -5319,6 +5431,127 @@ mod tests {
         project.apply_staged(false).unwrap();
         assert_eq!(project.history().unwrap().len(), revisions_before);
         assert!(project.staged().unwrap().is_none());
+    }
+
+    // ---- the master bus ----------------------------------------------------
+
+    #[test]
+    fn the_master_fader_clamps_and_each_move_is_one_revision() {
+        let project = Project::sample().unwrap();
+        let before = project.history().unwrap().len();
+
+        let master = project.set_master_volume(0.5).unwrap();
+        assert_eq!(master.volume, 0.5);
+        assert_eq!(project.timeline().unwrap().master.volume, 0.5);
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), before + 1);
+        assert_eq!(history.last().unwrap().label, "Set master level");
+
+        assert_eq!(
+            project.set_master_volume(99.0).unwrap().volume,
+            crate::model::MASTER_MAX_VOLUME
+        );
+        assert_eq!(project.set_master_volume(-2.0).unwrap().volume, 0.0);
+        // Not a number is refused, not clamped into something: and changes nothing.
+        let head = project.history().unwrap().len();
+        assert!(matches!(project.set_master_volume(f64::NAN), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            project.set_master_volume(f64::INFINITY),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), head);
+
+        // Back at unity the saved timeline carries no master at all again.
+        project.set_master_volume(1.0).unwrap();
+        assert!(!project.timeline_json().unwrap().contains("master"));
+    }
+
+    #[test]
+    fn the_master_limiter_remembers_its_ceiling() {
+        let project = Project::sample().unwrap();
+        let on = project.set_master_limiter(true, None).unwrap();
+        assert!(on.limiter);
+        assert_eq!(on.ceiling_db, -1.0, "the default ceiling when none was ever chosen");
+
+        let moved = project.set_master_limiter(true, Some(-3.5)).unwrap();
+        assert_eq!(moved.ceiling_db, -3.5);
+        // Off keeps the ceiling, and turning it back on without one returns to it.
+        let off = project.set_master_limiter(false, None).unwrap();
+        assert!(!off.limiter);
+        assert_eq!(off.ceiling_db, -3.5);
+        assert_eq!(project.set_master_limiter(true, None).unwrap().ceiling_db, -3.5);
+
+        // The ends: below the filter's floor, above full scale.
+        assert_eq!(
+            project.set_master_limiter(true, Some(-90.0)).unwrap().ceiling_db,
+            crate::model::MASTER_MIN_CEILING_DB
+        );
+        assert_eq!(project.set_master_limiter(true, Some(6.0)).unwrap().ceiling_db, 0.0);
+        assert!(matches!(
+            project.set_master_limiter(true, Some(f64::NAN)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Set master limiter");
+    }
+
+    #[test]
+    fn an_agents_master_edit_stages_and_is_not_thrown_away_as_empty() {
+        let project = agent_project();
+        let revisions_before = project.history().unwrap().len();
+        project.begin_staging(None, None).unwrap();
+        project.set_master_volume(0.6).unwrap();
+        project.set_master_limiter(true, Some(-2.0)).unwrap();
+
+        // The cut the user is looking at has not moved; the agent's view has.
+        assert!(project.timeline().unwrap().master.is_default());
+        let proposed = project.working_timeline().unwrap().master;
+        assert_eq!((proposed.volume, proposed.limiter, proposed.ceiling_db), (0.6, true, -2.0));
+        assert_eq!(project.history().unwrap().len(), revisions_before);
+
+        // And it reads as a change to review — an empty diff would be discarded.
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.diff.entries.len(), 1, "{:?}", staged.diff);
+        assert_eq!(staged.diff.entries[0].kind, DiffKind::MasterChanged);
+
+        let applied = project.apply_staged(false).unwrap();
+        assert_eq!(applied.master.volume, 0.6);
+        assert!(project.timeline().unwrap().master.limiter);
+        assert_eq!(project.history().unwrap().len(), revisions_before + 1);
+    }
+
+    #[test]
+    fn a_levels_range_past_the_end_of_the_cut_is_refused_not_widened() {
+        let project = Project::sample().unwrap();
+        let (timeline, assets) = project.levels_inputs().unwrap();
+        let end = timeline.for_render().duration();
+        let past = Project::measure_levels(
+            &timeline,
+            &assets,
+            Some(TimeRange {
+                start: end + 5.0,
+                end: end + 9.0,
+            }),
+            false,
+            &|| false,
+        );
+        match past {
+            Err(Error::InvalidArgument(why)) => assert!(why.contains("only"), "{why}"),
+            other => panic!("expected the caller's mistake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_levels_of_a_cut_with_no_audio_say_so_without_running_anything() {
+        // No clips, so there is no graph to meter and ffmpeg is never launched.
+        let project = Project::open_in_memory().unwrap();
+        let levels = project.levels(None, false).unwrap();
+        assert!(levels.master.is_none());
+        assert!(levels.tracks.is_empty());
+        assert_eq!(levels.notes, ["The cut has no audio to measure."]);
+        assert_eq!(levels.target_lufs, -14.0);
+        // A range that is not a span is the caller's mistake.
+        let bad = project.levels(Some(TimeRange { start: 4.0, end: 2.0 }), false);
+        assert!(matches!(bad, Err(Error::InvalidArgument(_))), "{bad:?}");
     }
 
     #[test]

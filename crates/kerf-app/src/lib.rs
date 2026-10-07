@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask,
-    Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
-    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
+    Mask, Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, TimeRange,
+    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -833,6 +833,39 @@ fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdR
     let project = state.project();
     project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set the master fader — the linear gain on the finished mix, after every
+/// track and the duck bus and before loudness normalisation.
+#[tauri::command(async)]
+fn set_master_volume(state: State<'_, AppState>, volume: f64) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_volume(volume).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Switch the master limiter on or off, optionally moving its ceiling (dBFS).
+/// Omitting `ceiling_db` keeps the one it had.
+#[tauri::command(async)]
+fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Option<f64>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_limiter(enabled, ceiling_db).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Measure how loud the cut is — the finished mix and each track — in one pass
+/// over the audio the export would render. Whole-file work, so it resolves its
+/// inputs under the project lock and runs ffmpeg with it released. `range` is a
+/// `{start, end}` span of the cut (default all of it); `loudnorm` measures the
+/// mix as an export with normalisation on would write it.
+#[tauri::command]
+async fn get_levels(state: State<'_, AppState>, range: Option<TimeRange>, loudnorm: Option<bool>) -> CmdResult<Levels> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).levels_inputs().map_err(|e| e.to_string())?;
+        Project::measure_levels(&timeline, &assets, range, loudnorm.unwrap_or(false), &|| false).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Set the frame the project is cut for, or clear it back to the source shape.
@@ -2744,6 +2777,9 @@ pub fn run() {
             set_track_duck,
             set_track_volume,
             set_track_pan,
+            set_master_volume,
+            set_master_limiter,
+            get_levels,
             set_delivery_format,
             set_track_muted,
             set_track_solo,

@@ -142,6 +142,7 @@ pub(crate) fn timeline_of(tracks: Vec<Track>) -> Timeline {
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     }
 }
 

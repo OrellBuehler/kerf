@@ -629,6 +629,7 @@ fn timeline(tracks: Vec<Vec<Clip>>, format: Option<Delivery>) -> Timeline {
         overlays: Vec::new(),
         markers: Vec::new(),
         format,
+        master: Default::default(),
     }
 }
 

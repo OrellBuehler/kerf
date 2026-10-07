@@ -1,4 +1,4 @@
-//! The golden argv oracle: 4000 seeded timelines whose ffmpeg argv must not move.
+//! The golden argv oracle: 4800 seeded timelines (4000, then 800 with a master bus) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -7,6 +7,13 @@
 //! `transition_fx` or `build_filter_complex` has to leave all three untouched; an
 //! intended change to one builder moves only its own file, so the other two keep
 //! proving nothing else moved.
+//!
+//! **The master-bus family is appended, not interleaved.** Cases `0..`[`CASES`] are the
+//! oracle as it was before the master bus existed and none of them has one; the
+//! [`MASTER_CASES`] after them draw their timelines from the same generator and then
+//! get a master bus ([`master_for`], no dice of its own). Adding the family therefore
+//! moved no existing case — `KERF_GOLDEN_CASES` on the commit before and after agrees
+//! on all of `0..CASES` — and only appended block lines to the three digest files.
 //!
 //! **Machine-independent by construction.** The builders read the machine in four
 //! places, each pinned: the preview's decode acceleration (the
@@ -46,9 +53,12 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::*;
-use crate::model::{Keyframe, TextKeyframe, Track, Transition, TransitionKind};
+use crate::model::{Keyframe, MasterBus, TextKeyframe, Track, Transition, TransitionKind};
 
 const CASES: usize = 4000;
+/// The master-bus cases appended after the first [`CASES`] (see the module docs).
+const MASTER_CASES: usize = 800;
+const TOTAL: usize = CASES + MASTER_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -152,6 +162,15 @@ audio-bitrate -b:a
 audio-flac-level -compression_level
 audio-muted -an
 loudnorm loudnorm=
+master-fader dropout_transition=0,volume=
+master-limiter ,alimiter=limit=
+master-limiter-loudnorm :latency=1,loudnorm=
+master-fader-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=
+master-limiter-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
+master-fader-clamped ,volume=4,
+master-fader-silent ,volume=0[outa]
+master-ceiling-clamped-low limit=0.063096:
+master-ceiling-clamped-high limit=1:attack=
 mono-delivery channel_layouts=mono
 codec-x264 -c:v libx264
 codec-x265 -c:v libx265
@@ -408,6 +427,61 @@ fn retarget_tiny(tl: &mut Timeline, i: usize) {
     }
 }
 
+/// The master bus of the `j`-th master-bus case: a function of `j` alone, so the
+/// family never rolls a die (and the cases before it cannot move). A cycle of
+/// fader only, limiter only, both and "both, from a file that never went through the
+/// op" — a fader past +12 dB, a ceiling below the filter's floor or above 0 dB, a
+/// muted master, and values that are not numbers at all.
+fn master_for(j: usize) -> MasterBus {
+    // Non-dyadic on purpose (see `Rng::real`): 0.353..1.603 and -0.5..-9.9 dB.
+    let volume = 0.353 + ((j * 37) % 125) as f64 / 100.0;
+    let ceiling_db = -(0.5 + ((j * 13) % 95) as f64 / 10.0);
+    match j % 16 {
+        0 | 4 | 8 => MasterBus {
+            volume,
+            ..MasterBus::default()
+        },
+        1 | 5 | 9 => MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        },
+        2 | 6 | 10 => MasterBus {
+            limiter: true,
+            ceiling_db,
+            ..MasterBus::default()
+        },
+        3 | 11 => MasterBus {
+            volume,
+            limiter: true,
+            ceiling_db,
+        },
+        7 => MasterBus {
+            volume: 9.0,
+            limiter: true,
+            ceiling_db: -90.0,
+        },
+        12 => MasterBus {
+            volume: 0.0,
+            ..MasterBus::default()
+        },
+        13 => MasterBus {
+            limiter: true,
+            ceiling_db: 12.0,
+            ..MasterBus::default()
+        },
+        14 => MasterBus {
+            volume: 1.0 + (j % 5) as f64 * 0.1,
+            limiter: true,
+            ceiling_db: -1.0,
+        },
+        _ => MasterBus {
+            volume: f64::NAN,
+            limiter: true,
+            ceiling_db: f64::INFINITY,
+        },
+    }
+}
+
 fn has_video(a: &Asset) -> bool {
     a.streams.iter().any(|s| s.kind == StreamKind::Video)
 }
@@ -634,6 +708,9 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     retarget_alpha(&mut timeline, i, assets);
     retarget_hdr43(&mut timeline, i, assets);
     retarget_tiny(&mut timeline, i);
+    if i >= CASES {
+        timeline.master = master_for(i - CASES);
+    }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
         .flat_map(|c| [c.timeline_start, c.timeline_end(), c.timeline_end() - 1e-3, c.timeline_start + 1e-4])
@@ -767,7 +844,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 19] = [
+const STRUCTURAL: [&str; 20] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -787,6 +864,7 @@ const STRUCTURAL: [&str; 19] = [
     "preview-zoom-keyed-last",
     "alpha-kept",
     "preview-alpha-kept",
+    "master-nonfinite",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -920,6 +998,10 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             "reframe-single-keyframe",
         ),
         (times.iter().any(|t| *t < 0.0), "time-negative"),
+        (
+            !tl.master.volume.is_finite() || !tl.master.ceiling_db.is_finite(),
+            "master-nonfinite",
+        ),
         // A keyed clip whose scale moves is the one the export restructures; one
         // whose scale holds still (position / rotation / opacity keys only) keeps
         // the chain it always had, so both are covered.
@@ -1006,7 +1088,7 @@ fn the_argv_builders_still_produce_the_golden_digests() {
             .map(|w| {
                 let (assets, table) = (&assets, &table);
                 s.spawn(move || {
-                    (w..CASES)
+                    (w..TOTAL)
                         .step_by(threads)
                         .map(|i| (i, run(i, assets, table)))
                         .collect::<Vec<_>>()

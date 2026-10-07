@@ -510,6 +510,122 @@ pub struct Loudness {
     pub threshold_lufs: f64,
 }
 
+/// The streaming-delivery loudness target, in LUFS — the level the export's
+/// `loudnorm` normalises to, and what [`Levels`] judges a mix against.
+pub const LEVELS_TARGET_LUFS: f64 = -14.0;
+/// The true-peak ceiling platforms ask of a delivery, in dBTP.
+pub const LEVELS_TRUE_PEAK_CEILING_DBTP: f64 = -1.0;
+
+/// What one `ebur128` meter read over a stretch of the mix. Every number is
+/// `None` where there is nothing to report — a silent stretch has no integrated
+/// loudness and a peak of minus infinity, neither of which JSON can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct LevelReading {
+    /// Integrated (programme) loudness in LUFS, gated per EBU R128. `None` when
+    /// nothing in the span was loud enough to count.
+    pub integrated_lufs: Option<f64>,
+    /// Loudness range in LU: how far the loud and quiet passages sit apart.
+    pub loudness_range_lu: Option<f64>,
+    /// The loudest short-term (3 s window) loudness reached, in LUFS. `None` for
+    /// a span under three seconds, where the first full window never closes.
+    pub short_term_max_lufs: Option<f64>,
+    /// The highest sample, in dBFS.
+    pub peak_dbfs: Option<f64>,
+    /// The highest *true* (inter-sample) peak in dBTP — what a re-encode can
+    /// clip on, and so what the master is judged on for delivery.
+    pub true_peak_dbtp: Option<f64>,
+}
+
+/// One track's reading: the strip's output, after its fader and pan and ahead of
+/// the duck bus and the master.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackLevels {
+    pub track_id: Uuid,
+    pub name: String,
+    pub kind: StreamKind,
+    /// The track is flagged to duck under the rest of the mix. Its reading is
+    /// taken *before* the duck, so it is as loud as the track is on its own.
+    pub ducked: bool,
+    /// Whether the track reaches the render at all — `false` for a muted track,
+    /// or one a solo shadows, which is why it has no `level`.
+    pub heard: bool,
+    pub level: Option<LevelReading>,
+}
+
+/// How loud the cut is: the finished mix and each track that feeds it, measured
+/// in one pass over the audio the export would render.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Levels {
+    /// Seconds of the cut measured (the range asked for, clamped to the cut).
+    pub duration: f64,
+    /// The finished mix — master fader, limiter and, when asked for, `loudnorm`
+    /// included. `None` when the cut has no audio to measure.
+    pub master: Option<LevelReading>,
+    pub tracks: Vec<TrackLevels>,
+    /// Whether the measurement ran through `loudnorm`, as an export with
+    /// normalisation on would.
+    pub loudnorm: bool,
+    /// The streaming loudness target the notes judge against.
+    pub target_lufs: f64,
+    /// What the numbers mean for delivery, phrased as advice (over target,
+    /// over the true-peak ceiling, a track clipping the sum).
+    pub notes: Vec<String>,
+}
+
+impl Levels {
+    /// Put a measurement together with the tracks it came from and judge it.
+    pub fn new(duration: f64, master: Option<LevelReading>, tracks: Vec<TrackLevels>, loudnorm: bool) -> Self {
+        let notes = level_notes(master.as_ref(), &tracks);
+        Self {
+            duration,
+            master,
+            tracks,
+            loudnorm,
+            target_lufs: LEVELS_TARGET_LUFS,
+            notes,
+        }
+    }
+}
+
+/// The advice behind [`Levels::notes`], pure so the thresholds are tested.
+fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels]) -> Vec<String> {
+    let Some(master) = master else {
+        return vec!["The cut has no audio to measure.".to_string()];
+    };
+    let mut notes = Vec::new();
+    match master.integrated_lufs {
+        None => notes.push("The mix is silent.".to_string()),
+        Some(i) if i - LEVELS_TARGET_LUFS > 1.0 => notes.push(format!(
+            "Integrated loudness {i:.1} LUFS is {:.1} LU over the {LEVELS_TARGET_LUFS:.0} LUFS streaming target — platforms \
+             will turn it down. Lower the master or the loudest track, or export with loudnorm.",
+            i - LEVELS_TARGET_LUFS
+        )),
+        Some(i) if LEVELS_TARGET_LUFS - i > 3.0 => notes.push(format!(
+            "Integrated loudness {i:.1} LUFS is {:.1} LU under the {LEVELS_TARGET_LUFS:.0} LUFS streaming target — it will \
+             sound quiet beside other posts. Raise the master or the tracks, or export with loudnorm.",
+            LEVELS_TARGET_LUFS - i
+        )),
+        Some(i) => notes.push(format!(
+            "Integrated loudness {i:.1} LUFS is close to the {LEVELS_TARGET_LUFS:.0} LUFS streaming target."
+        )),
+    }
+    if let Some(tp) = master.true_peak_dbtp.filter(|tp| *tp > LEVELS_TRUE_PEAK_CEILING_DBTP) {
+        notes.push(format!(
+            "True peak {tp:.1} dBTP is over the {LEVELS_TRUE_PEAK_CEILING_DBTP:.0} dBTP platforms ask for and can clip when \
+             re-encoded. Turn on the master limiter (set_master_limiter) or lower the master."
+        ));
+    }
+    for track in tracks {
+        if let Some(peak) = track.level.and_then(|l| l.peak_dbfs).filter(|p| *p > 0.0) {
+            notes.push(format!(
+                "Track {} peaks at {peak:+.1} dBFS before the master and will clip the sum — lower its fader.",
+                track.name
+            ));
+        }
+    }
+    notes
+}
+
 /// Coarse content class of an asset's audio. Heuristic (energy continuity +
 /// zero-crossing-rate variability), so it is a hint, not a trained classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3024,6 +3140,120 @@ fn window_sum(weights: &[f64], from: f64, to: f64) -> f64 {
     sum
 }
 
+/// The last stage of the mix: what every track has been summed into, before
+/// the delivery's loudness normalisation.
+///
+/// A fader and a safety limiter, nothing more — the point is that the *finished*
+/// mix can be pulled down or kept under a ceiling without touching a single
+/// track, clip or effect. In the export graph it sits after the final sum (and
+/// the duck bus) and **before** `loudnorm`, so a normalised delivery is
+/// normalised from the level the master was left at.
+///
+/// Every field is defaulted, and [`MasterBus::is_default`] keeps a project that
+/// never touched the master from writing a `master` key at all, so such a
+/// project reads and renders exactly as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MasterBus {
+    /// The master fader: a linear gain on the finished mix (`1.0` is unity).
+    /// [`set_master_volume`](crate::Project::set_master_volume) clamps it to
+    /// `0..=`[`MASTER_MAX_VOLUME`].
+    #[serde(default = "unity_master_volume")]
+    pub volume: f64,
+    /// A lookahead limiter holding the finished mix under `ceiling_db`.
+    #[serde(default)]
+    pub limiter: bool,
+    /// Where the limiter stops the signal, in dBFS (so `-1.0` keeps the mix a
+    /// decibel under full scale). Only read while `limiter` is on, but kept
+    /// while it is off, so switching the limiter back on returns to the
+    /// ceiling that was chosen.
+    ///
+    /// A **sample-peak** ceiling: the limiter does not oversample, so the
+    /// *true* peak of the result can sit a fraction of a dB higher
+    /// ([`Project::levels`](crate::Project::levels) measures it).
+    #[serde(default = "default_master_ceiling")]
+    pub ceiling_db: f64,
+}
+
+/// The top of the master fader: +12 dB, as far as a fader has any business going
+/// (the track faders stop at the same place).
+pub const MASTER_MAX_VOLUME: f64 = 4.0;
+/// The lowest ceiling the limiter can be given: `alimiter` takes a linear
+/// `limit` of at least 0.0625, which is -24.08 dB.
+pub const MASTER_MIN_CEILING_DB: f64 = -24.0;
+/// The default limiter ceiling, in dBFS.
+pub const MASTER_DEFAULT_CEILING_DB: f64 = -1.0;
+
+fn unity_master_volume() -> f64 {
+    1.0
+}
+
+fn default_master_ceiling() -> f64 {
+    MASTER_DEFAULT_CEILING_DB
+}
+
+impl Default for MasterBus {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            limiter: false,
+            ceiling_db: MASTER_DEFAULT_CEILING_DB,
+        }
+    }
+}
+
+impl MasterBus {
+    /// Nothing set: what a project that never touched the master holds, and the
+    /// only value that is not written to the `.kerf` file.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether the master leaves the mix alone — unity gain and no limiter. A
+    /// neutral master adds nothing to the export graph, which is what keeps
+    /// every graph from before the master existed byte-identical (a stored
+    /// `ceiling_db` with the limiter off is not neutral by `is_default`, but is
+    /// by this).
+    pub fn is_neutral(&self) -> bool {
+        !self.limiter && (self.safe_volume() - 1.0).abs() <= f64::EPSILON
+    }
+
+    /// The fader as the graph will use it: finite, within `0..=`
+    /// [`MASTER_MAX_VOLUME`]. A `.kerf` file never goes through the op that
+    /// clamps, and `NaN` or a negative gain must not reach `volume=`.
+    pub fn safe_volume(&self) -> f64 {
+        if self.volume.is_finite() {
+            self.volume.clamp(0.0, MASTER_MAX_VOLUME)
+        } else {
+            1.0
+        }
+    }
+
+    /// The ceiling as the graph will use it: finite, within
+    /// [`MASTER_MIN_CEILING_DB`]`..=0`.
+    pub fn safe_ceiling_db(&self) -> f64 {
+        if self.ceiling_db.is_finite() {
+            self.ceiling_db.clamp(MASTER_MIN_CEILING_DB, 0.0)
+        } else {
+            MASTER_DEFAULT_CEILING_DB
+        }
+    }
+
+    /// The limiter's ceiling as a linear amplitude (`alimiter`'s `limit`).
+    pub fn limit_linear(&self) -> f64 {
+        10f64.powf(self.safe_ceiling_db() / 20.0)
+    }
+
+    /// The master fader in dB, or `None` at zero gain (silence).
+    pub fn volume_db(&self) -> Option<f64> {
+        let v = self.safe_volume();
+        (v > 0.0).then(|| 20.0 * v.log10())
+    }
+}
+
+fn master_is_default(master: &MasterBus) -> bool {
+    master.is_default()
+}
+
 /// The non-destructive timeline (EDL): a set of multi-kind tracks, the text
 /// overlays (titles / lower-thirds / captions) drawn over the composited
 /// picture, and the user's markers.
@@ -3039,6 +3269,10 @@ pub struct Timeline {
     /// the shape follows the first video clip's footage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<Delivery>,
+    /// The master bus: the fader and limiter the finished mix passes through.
+    /// Defaulted and not written while untouched (see [`MasterBus`]).
+    #[serde(default, skip_serializing_if = "master_is_default")]
+    pub master: MasterBus,
 }
 
 impl Default for Timeline {
@@ -3055,6 +3289,7 @@ impl Timeline {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: MasterBus::default(),
         }
     }
 
@@ -3166,6 +3401,7 @@ impl Timeline {
             overlays: self.overlays.clone(),
             markers: self.markers.clone(),
             format: self.format,
+            master: self.master,
         }
     }
 
@@ -3220,6 +3456,8 @@ impl Timeline {
                 .collect(),
             markers: self.markers.clone(),
             format: Some(delivery),
+            // The same mix at every frame: a variant changes the picture only.
+            master: self.master,
         }
     }
 
@@ -3248,6 +3486,8 @@ impl Timeline {
             // A slice is still the same delivery: range export and playback both
             // build from one, and either would otherwise fall back to footage shape.
             format: self.format,
+            // ...and the same mix: a range export of a limited master is limited.
+            master: self.master,
         };
         for track in &self.tracks {
             let mut t = Track {
@@ -4430,6 +4670,7 @@ pub enum DiffKind {
     MarkerRemoved,
     MarkerChanged,
     FormatChanged,
+    MasterChanged,
 }
 
 impl DiffKind {
@@ -4796,6 +5037,30 @@ fn overlay_changes(before: &TextOverlay, after: &TextOverlay) -> Option<String> 
     joined(parts)
 }
 
+/// What differs between two master buses, phrased like the track strip's
+/// (`level 100% → 70%`), or `None` when the mix would come out the same. The
+/// ceiling only counts while the limiter is on afterwards — a stored ceiling
+/// the limiter is not using changes nothing anyone can hear.
+fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
+    let mut parts = Vec::new();
+    if (before.volume - after.volume).abs() > DIFF_EPS {
+        parts.push(format!("level {:.0}% → {:.0}%", before.volume * 100.0, after.volume * 100.0));
+    }
+    if before.limiter != after.limiter {
+        parts.push(if after.limiter {
+            format!("limiter on at {:.1} dB", after.ceiling_db)
+        } else {
+            "limiter off".to_string()
+        });
+    } else if after.limiter && (before.ceiling_db - after.ceiling_db).abs() > DIFF_EPS {
+        parts.push(format!(
+            "limiter ceiling {:.1} → {:.1} dB",
+            before.ceiling_db, after.ceiling_db
+        ));
+    }
+    joined(parts)
+}
+
 fn fmt_delivery(d: &Delivery) -> String {
     format!("{}x{} ({})", d.width, d.height, d.fit.as_str())
 }
@@ -5086,6 +5351,12 @@ impl Timeline {
                 (None, None) => unreachable!(),
             };
             rest.push(DiffEntry::new(DiffKind::FormatChanged, summary));
+        }
+        // The master bus: without this an agent proposal that only rides the
+        // master fader or turns the limiter on diffs as empty, and apply_staged
+        // throws it away (the same trap the track faders had).
+        if let Some(detail) = master_changes(&self.master, &after.master) {
+            rest.push(DiffEntry::new(DiffKind::MasterChanged, "Changed the master bus".to_string()).detail(detail));
         }
 
         tracks.append(&mut clips);
@@ -5468,6 +5739,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let r = tl.for_render();
         // The disabled clip is gone but the enabled one stays.
@@ -5493,6 +5765,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let r = tl.for_render();
         assert!(r.tracks[0].clips.is_empty(), "unsoloed video track is shadowed");
@@ -5512,6 +5785,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         assert!(tl.for_render().tracks[0].clips.is_empty());
     }
@@ -5568,6 +5842,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: Some(Delivery::new(1080, 1920, Fit::Cover)),
+            master: Default::default(),
         };
 
         let square = tl.for_delivery(Delivery::new(1080, 1080, Fit::Cover));
@@ -5602,6 +5877,7 @@ mod tests {
             overlays: vec![caption, title],
             markers: Vec::new(),
             format: Some(Delivery::new(1920, 1080, Fit::Contain)),
+            master: Default::default(),
         };
         let vertical = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
         let fitted = vertical.overlays[0].size;
@@ -5620,6 +5896,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let mut after = before.clone();
         after.tracks[0].clips[0].set_framing(framed((9, 16), 0.1, 0.5));
@@ -5641,6 +5918,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let r = tl.for_render();
         assert_eq!(
@@ -5679,6 +5957,7 @@ mod tests {
             overlays: Vec::new(),
             markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
             format: None,
+            master: Default::default(),
         };
         let s = tl.slice(3.0, 7.0);
         let names: Vec<_> = s.markers.iter().map(|m| m.name.as_str()).collect();
@@ -5699,6 +5978,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);
@@ -6003,6 +6283,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         }
     }
 
@@ -6036,6 +6317,204 @@ mod tests {
         assert!(clip.covers_source(8.0, 11.0), "straddling the in-point still shows");
         assert!(!clip.covers_source(0.0, 10.0), "ending exactly at the in-point shows nothing");
         assert!(!clip.covers_source(20.0, 25.0));
+    }
+
+    // ---- the master bus ---------------------------------------------------
+
+    #[test]
+    fn an_untouched_master_is_not_written_and_an_old_file_reads_back_neutral() {
+        let tl = Timeline::new();
+        let json = serde_json::to_string(&tl).unwrap();
+        assert!(
+            !json.contains("master"),
+            "a default master must not change the saved JSON: {json}"
+        );
+        // A timeline saved before the master existed.
+        let old: Timeline = serde_json::from_str(r#"{"tracks":[]}"#).unwrap();
+        assert!(old.master.is_default());
+        assert!(old.master.is_neutral());
+    }
+
+    #[test]
+    fn a_master_round_trips_and_a_partial_one_fills_from_the_defaults() {
+        let mut tl = Timeline::new();
+        tl.master = MasterBus {
+            volume: 0.7,
+            limiter: true,
+            ceiling_db: -3.0,
+        };
+        let back: Timeline = serde_json::from_str(&serde_json::to_string(&tl).unwrap()).unwrap();
+        assert_eq!(back.master, tl.master);
+        let partial: Timeline = serde_json::from_str(r#"{"tracks":[],"master":{"limiter":true}}"#).unwrap();
+        assert_eq!(
+            partial.master,
+            MasterBus {
+                volume: 1.0,
+                limiter: true,
+                ceiling_db: -1.0
+            }
+        );
+    }
+
+    #[test]
+    fn the_master_is_neutral_until_it_changes_the_mix() {
+        let mut m = MasterBus::default();
+        assert!(m.is_neutral() && m.is_default());
+        // A stored ceiling the limiter is not using changes nothing in the graph...
+        m.ceiling_db = -6.0;
+        assert!(m.is_neutral());
+        // ...but is still something to save.
+        assert!(!m.is_default());
+        m.limiter = true;
+        assert!(!m.is_neutral());
+        m.limiter = false;
+        m.volume = 0.5;
+        assert!(!m.is_neutral());
+        m.volume = 0.0;
+        assert!(!m.is_neutral(), "a muted master is a master");
+    }
+
+    #[test]
+    fn a_master_from_a_hand_edited_file_is_made_safe_for_the_graph() {
+        let m = MasterBus {
+            volume: f64::NAN,
+            limiter: true,
+            ceiling_db: f64::INFINITY,
+        };
+        assert_eq!(m.safe_volume(), 1.0);
+        assert_eq!(m.safe_ceiling_db(), MASTER_DEFAULT_CEILING_DB);
+        let m = MasterBus {
+            volume: 99.0,
+            limiter: true,
+            ceiling_db: -90.0,
+        };
+        assert_eq!(m.safe_volume(), MASTER_MAX_VOLUME);
+        assert_eq!(m.safe_ceiling_db(), MASTER_MIN_CEILING_DB);
+        let m = MasterBus {
+            volume: -3.0,
+            ..MasterBus::default()
+        };
+        assert_eq!(m.safe_volume(), 0.0);
+        assert!((MasterBus::default().limit_linear() - 0.891_250_938).abs() < 1e-6, "-1 dB");
+    }
+
+    #[test]
+    fn the_master_follows_the_cut_into_every_render_of_it() {
+        let master = MasterBus {
+            volume: 0.5,
+            limiter: true,
+            ceiling_db: -2.0,
+        };
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Audio, "A1", vec![clip_at(0.0, 8.0)])],
+            master,
+            ..Timeline::new()
+        };
+        assert_eq!(tl.for_render().master, master, "muted tracks are dropped, the mix is not");
+        assert_eq!(
+            tl.slice(2.0, 6.0).master,
+            master,
+            "a range export of a limited master is limited"
+        );
+        assert_eq!(
+            tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover)).master,
+            master,
+            "a variant changes the picture, not the mix"
+        );
+    }
+
+    #[test]
+    fn diff_sees_the_master_bus() {
+        // An agent proposal that only rides the master fader or turns the limiter
+        // on must not diff as empty — apply_staged discards an empty proposal.
+        let tl = Timeline::new();
+        assert!(tl.diff(&tl.clone()).is_empty());
+
+        let mut after = tl.clone();
+        after.master.volume = 0.7;
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        assert_eq!(diff.entries[0].kind, DiffKind::MasterChanged);
+        assert_eq!(diff.entries[0].detail.as_deref(), Some("level 100% → 70%"));
+
+        let mut limited = tl.clone();
+        limited.master.limiter = true;
+        let detail = tl.diff(&limited).entries[0].detail.clone().unwrap();
+        assert_eq!(detail, "limiter on at -1.0 dB");
+        // Moving the ceiling matters only while the limiter is on.
+        let mut moved = limited.clone();
+        moved.master.ceiling_db = -3.0;
+        assert_eq!(
+            limited.diff(&moved).entries[0].detail.as_deref(),
+            Some("limiter ceiling -1.0 → -3.0 dB")
+        );
+        let mut parked = tl.clone();
+        parked.master.ceiling_db = -3.0;
+        assert!(
+            tl.diff(&parked).is_empty(),
+            "a ceiling nothing is using is not a change to review"
+        );
+        // Switching off reads as that, whatever the ceiling.
+        assert_eq!(limited.diff(&tl).entries[0].detail.as_deref(), Some("limiter off"));
+    }
+
+    // ---- levels -----------------------------------------------------------
+
+    fn reading(i: Option<f64>, tp: Option<f64>) -> LevelReading {
+        LevelReading {
+            integrated_lufs: i,
+            true_peak_dbtp: tp,
+            ..LevelReading::default()
+        }
+    }
+
+    fn strip(name: &str, peak: f64) -> TrackLevels {
+        TrackLevels {
+            track_id: Uuid::new_v4(),
+            name: name.into(),
+            kind: StreamKind::Audio,
+            ducked: false,
+            heard: true,
+            level: Some(LevelReading {
+                peak_dbfs: Some(peak),
+                ..LevelReading::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn the_levels_notes_judge_the_mix_against_the_streaming_target() {
+        let notes = |i, tp| Levels::new(10.0, Some(reading(i, tp)), Vec::new(), false).notes;
+        assert!(notes(Some(-14.0), Some(-3.0))[0].contains("close to"), "on target");
+        assert!(notes(Some(-13.2), Some(-3.0))[0].contains("close to"), "within a LU of it");
+        assert!(notes(Some(-9.0), Some(-3.0))[0].contains("5.0 LU over"), "too loud");
+        assert!(notes(Some(-19.0), Some(-3.0))[0].contains("5.0 LU under"), "too quiet");
+        assert!(
+            notes(Some(-16.5), Some(-3.0))[0].contains("close to"),
+            "a little under is fine"
+        );
+        assert!(notes(None, None)[0].contains("silent"));
+        // Over the true-peak ceiling is its own note, and names the fix.
+        let hot = notes(Some(-14.0), Some(0.4));
+        assert_eq!(hot.len(), 2, "{hot:?}");
+        assert!(
+            hot[1].contains("0.4 dBTP") && hot[1].contains("set_master_limiter"),
+            "{hot:?}"
+        );
+        assert_eq!(notes(Some(-14.0), Some(-1.0)).len(), 1, "exactly at the ceiling is allowed");
+    }
+
+    #[test]
+    fn the_levels_notes_name_a_track_that_clips_the_sum() {
+        let tracks = vec![strip("A1", -6.0), strip("Music", 1.5)];
+        let notes = Levels::new(10.0, Some(reading(Some(-14.0), Some(-3.0))), tracks, false).notes;
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].contains("Music") && notes[1].contains("+1.5 dBFS"), "{notes:?}");
+        // No audio at all is one plain note.
+        assert_eq!(
+            Levels::new(0.0, None, Vec::new(), false).notes,
+            ["The cut has no audio to measure."]
+        );
     }
 
     #[test]
@@ -6169,6 +6648,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 2.0, "first"), seg(10.0, 12.0, "second")]);
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -6191,6 +6671,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let lines = captioned(
             &timeline,
@@ -6330,6 +6811,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 3.0, "only once")]);
         assert_eq!(lines.len(), 1, "{lines:?}");

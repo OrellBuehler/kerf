@@ -977,6 +977,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     };
     let args = build_still_args(
         &timeline,
@@ -4618,6 +4619,22 @@ struct FilterGraph {
     filter: String,
     has_video: bool,
     has_audio: bool,
+    /// The `ebur128` taps a [metered](build_filter_complex_metered) build added,
+    /// each ending on a pad the caller `-map`s. Empty for every other build.
+    meters: Vec<Meter>,
+}
+
+/// One level meter in a metered audio graph: an `ebur128` instance on a track's
+/// finished strip or on the master, ending on a pad to `-map` (the filter passes
+/// its audio through, so an output has to be consumed somewhere).
+#[derive(Debug, Clone, PartialEq)]
+struct Meter {
+    /// The pad the meter ends on (`lv3`, `lvmaster`), without brackets.
+    pad: String,
+    /// The `ebur128@<name>` instance name its log lines carry (`t3`, `master`).
+    name: String,
+    /// The index of the timeline track it listens to, `None` for the master.
+    track: Option<usize>,
 }
 
 /// Build the positional, multi-track `filter_complex`.
@@ -4654,6 +4671,34 @@ fn build_filter_complex(
     want_audio: bool,
     plan: &InputPlan,
 ) -> FilterGraph {
+    build_filter_complex_metered(timeline, assets, fmt, total, opts, want_video, want_audio, plan, false)
+}
+
+/// [`build_filter_complex`], optionally with **level meters** in the sound.
+///
+/// With `meter` off this *is* the export graph, byte for byte. With it on, the
+/// sound is built the same way — same per-clip chains, same ducking, same master
+/// bus and `loudnorm` — except that each track's clips are first summed into
+/// that track's own submix, which is tapped (`asplit` → `ebur128`) before it
+/// joins the bus, and the finished mix is tapped last. Summing a submix and then
+/// the submixes is the same arithmetic as summing every clip at once
+/// (`amix=normalize=0`), so what the master tap hears is what the export would
+/// write, and the per-track taps cost one pass over the media rather than one
+/// per track. A track's tap is its strip *output* — fader and pan applied, ahead
+/// of the duck bus and the master — which is why a ducked track reads as loud as
+/// it would play on its own.
+#[allow(clippy::too_many_arguments)]
+fn build_filter_complex_metered(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    total: f64,
+    opts: &ExportOptions,
+    want_video: bool,
+    want_audio: bool,
+    plan: &InputPlan,
+    meter: bool,
+) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| {
         assets
             .iter()
@@ -4677,8 +4722,11 @@ fn build_filter_complex(
     // Audio entries also carry the owning track's mix — the duck flag for the bus
     // split, the fader and the pan for the clip's own chain.
     let mut audio: Vec<(usize, usize, &crate::model::Clip, TrackMix)> = Vec::new();
+    // ...and, parallel to it, the index of the track each audio clip is on (what a
+    // metered build groups the submixes by).
+    let mut audio_track: Vec<usize> = Vec::new();
     let mut base = 0;
-    for track in &timeline.tracks {
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
         order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
         for &cj in &order {
@@ -4699,6 +4747,7 @@ fn build_filter_complex(
                         pan: track.pan_gains(),
                     },
                 ));
+                audio_track.push(track_index);
             }
         }
         base += track.clips.len();
@@ -4863,6 +4912,7 @@ fn build_filter_complex(
     }
 
     // ---- sound: positioned per-clip audio summed with amix ------------------
+    let mut meters: Vec<Meter> = Vec::new();
     if has_audio_out {
         for (flat, input, clip, mix) in &audio {
             let src = if acount[*input] > 1 {
@@ -4877,24 +4927,69 @@ fn build_filter_complex(
                 chain = audio_clip_chain(clip, fmt, &fx[*flat], layout, *mix)
             ));
         }
-        // Optional single-pass loudness normalization on the final mix; loudnorm
-        // upsamples to 192 kHz internally, so resample back to the output rate.
+        // What the final sum adds up, as `(pad, ducked)`: every clip's own pad —
+        // or, when metering, each track's submix (tapped on its way in).
+        let mut sources: Vec<(String, bool)> = audio.iter().map(|(f, _, _, m)| (format!("a{f}"), m.duck)).collect();
+        if meter {
+            sources.clear();
+            let mut tracks: Vec<usize> = audio_track.clone();
+            tracks.dedup();
+            for ti in tracks {
+                let flats: Vec<usize> = audio
+                    .iter()
+                    .zip(&audio_track)
+                    .filter(|(_, t)| **t == ti)
+                    .map(|((f, _, _, _), _)| *f)
+                    .collect();
+                let duck = timeline.tracks[ti].duck;
+                let strip = if let [only] = flats[..] {
+                    format!("a{only}")
+                } else {
+                    chains.push(format!(
+                        "{ins}amix=inputs={n}:normalize=0:dropout_transition=0[tk{ti}]",
+                        ins = flats.iter().map(|f| format!("[a{f}]")).collect::<String>(),
+                        n = flats.len(),
+                    ));
+                    format!("tk{ti}")
+                };
+                chains.push(format!("[{strip}]asplit=2[tm{ti}][tl{ti}]"));
+                // Sample and true peak both: which track is hot is the question a
+                // reading answers, and the oversampling that costs (about 5 ms of
+                // work per second of audio per tap) is small beside the decode.
+                chains.push(format!("[tl{ti}]ebur128@t{ti}=peak=sample+true[lv{ti}]"));
+                meters.push(Meter {
+                    pad: format!("lv{ti}"),
+                    name: format!("t{ti}"),
+                    track: Some(ti),
+                });
+                sources.push((format!("tm{ti}"), duck));
+            }
+        }
+        // The master bus (its fader, then the limiter) and the optional
+        // single-pass loudness normalization close the final mix, in that
+        // order; loudnorm upsamples to 192 kHz internally, so resample back to
+        // the output rate. A neutral master adds nothing, so a graph from before
+        // the master existed is unchanged.
         let mix_tail = if opts.loudnorm {
-            format!(",loudnorm=I=-14:TP=-1.5:LRA=11,aresample={sr}", sr = fmt.sample_rate)
+            format!(
+                "{master},loudnorm=I=-14:TP=-1.5:LRA=11,aresample={sr}",
+                master = master_filters(&timeline.master),
+                sr = fmt.sample_rate
+            )
         } else {
-            String::new()
+            master_filters(&timeline.master)
         };
-        let pads = |flats: &[usize]| flats.iter().map(|f| format!("[a{f}]")).collect::<String>();
-        let ducked: Vec<usize> = audio.iter().filter(|(_, _, _, m)| m.duck).map(|(f, _, _, _)| *f).collect();
-        let keyed: Vec<usize> = audio.iter().filter(|(_, _, _, m)| !m.duck).map(|(f, _, _, _)| *f).collect();
+        let pads = |names: &[&str]| names.iter().map(|n| format!("[{n}]")).collect::<String>();
+        let ducked: Vec<&str> = sources.iter().filter(|(_, d)| *d).map(|(n, _)| n.as_str()).collect();
+        let keyed: Vec<&str> = sources.iter().filter(|(_, d)| !*d).map(|(n, _)| n.as_str()).collect();
         if ducked.is_empty() || keyed.is_empty() {
             // No ducking in play (nothing flagged, or nothing to key from): one
             // flat sum of every clip, exactly as before.
-            let flats: Vec<usize> = audio.iter().map(|(f, _, _, _)| *f).collect();
+            let all: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
             chains.push(format!(
                 "{ins}amix=inputs={n}:normalize=0:dropout_transition=0{mix_tail}[outa]",
-                ins = pads(&flats),
-                n = flats.len(),
+                ins = pads(&all),
+                n = all.len(),
             ));
         } else {
             // Mix each group into a bus, dip the ducked bus under the keyed one
@@ -4916,13 +5011,51 @@ fn build_filter_complex(
                 "[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"
             ));
         }
+        if meter {
+            // The finished mix, as the export would write it (the true peak of
+            // this one is the number a delivery is judged on).
+            chains.push("[outa]ebur128@master=peak=sample+true[lvmaster]".to_string());
+            meters.push(Meter {
+                pad: "lvmaster".to_string(),
+                name: "master".to_string(),
+                track: None,
+            });
+        }
     }
 
     FilterGraph {
         filter: chains.join(";"),
         has_video,
         has_audio: has_audio_out,
+        meters,
     }
+}
+
+/// The filters the master bus adds after the final sum — its fader, then its
+/// limiter — each led by the comma that joins it to the `amix` before it, or
+/// the empty string while the master is neutral (the graph exactly as it was
+/// before there was a master).
+///
+/// The limiter is `alimiter` with the two options that matter spelled out:
+/// `level=0`, because its default **auto-levels** — scales the output back up so
+/// the peak lands at full scale, which would turn a ceiling into a makeup gain —
+/// and `latency=1`, because without it the lookahead delays the whole mix by the
+/// attack time and drops the last few milliseconds at the end, putting the sound
+/// out of step with the picture. Attack 5 ms is the filter's own lookahead; the
+/// 100 ms release is slow enough not to pump on low notes. The ceiling is
+/// rounded to six decimals, which is far below anything audible and keeps the
+/// text from depending on the last digit of a libm `pow`.
+fn master_filters(master: &crate::model::MasterBus) -> String {
+    let mut out = String::new();
+    let volume = master.safe_volume();
+    if (volume - 1.0).abs() > f64::EPSILON {
+        out += &format!(",volume={}", fnum(volume));
+    }
+    if master.limiter {
+        let limit = (master.limit_linear() * 1e6).round() / 1e6;
+        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0:latency=1", fnum(limit));
+    }
+    out
 }
 
 /// The owning track's mix settings, carried alongside each of its audio clips.
@@ -6315,6 +6448,11 @@ fn atempo_chain(speed: f64) -> String {
     parts.join(",")
 }
 
+/// Measuring the mix (`ebur128` meters on the export's own audio graph): a child
+/// module so it reaches the private graph builders.
+mod levels;
+pub use levels::mix_levels;
+
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.
 #[cfg(test)]
@@ -7207,6 +7345,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
@@ -9144,6 +9283,164 @@ mod tests {
         let args = build_export_args(&single(vec![clip]), &[asset], "out.mp4", &opts).unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("loudnorm=I=-14:TP=-1.5:LRA=11,aresample="), "{joined}");
+    }
+
+    // ---- the master bus ----------------------------------------------------
+
+    use crate::model::MasterBus;
+
+    /// A video track with one clip of sound, delivered through a master `bus`.
+    fn master_cut(bus: MasterBus) -> (Timeline, Vec<Asset>) {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut tl = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        tl.master = bus;
+        (tl, vec![asset])
+    }
+
+    fn mix_of(tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> String {
+        build_export_args(tl, assets, "out.mp4", opts).unwrap().join(" ")
+    }
+
+    #[test]
+    fn a_neutral_master_adds_nothing_to_the_mix() {
+        let (tl, assets) = master_cut(MasterBus::default());
+        let opts = ExportOptions::default();
+        let g = mix_of(&tl, &assets, &opts);
+        assert!(g.contains("amix=inputs=1:normalize=0:dropout_transition=0[outa]"), "{g}");
+        assert!(!g.contains("alimiter"), "{g}");
+        // A ceiling kept while the limiter is off is neutral too: the same argv.
+        let mut parked = tl;
+        parked.master.ceiling_db = -6.0;
+        assert_eq!(mix_of(&parked, &assets, &opts), g);
+    }
+
+    #[test]
+    fn the_master_fader_follows_the_final_sum() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.5,
+            ..MasterBus::default()
+        });
+        let g = mix_of(&tl, &assets, &ExportOptions::default());
+        assert!(
+            g.contains("amix=inputs=1:normalize=0:dropout_transition=0,volume=0.5[outa]"),
+            "{g}"
+        );
+        assert!(!g.contains("alimiter"), "{g}");
+    }
+
+    #[test]
+    fn the_limiter_holds_the_ceiling_without_levelling_or_delaying_the_mix() {
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        let g = mix_of(&tl, &assets, &ExportOptions::default());
+        // -1 dB is 0.891251 linear. `level=0` because the default auto-levels the
+        // output back up to full scale; `latency=1` because without it the lookahead
+        // delays the sound against the picture and drops its tail.
+        assert!(
+            g.contains("dropout_transition=0,alimiter=limit=0.891251:attack=5:release=100:level=0:latency=1[outa]"),
+            "{g}"
+        );
+        assert!(!g.contains("dropout_transition=0,volume"), "no fader at unity: {g}");
+    }
+
+    #[test]
+    fn the_master_runs_after_the_sum_and_before_loudnorm() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.8,
+            limiter: true,
+            ceiling_db: -3.0,
+        });
+        let opts = ExportOptions {
+            loudnorm: true,
+            ..ExportOptions::default()
+        };
+        let g = mix_of(&tl, &assets, &opts);
+        let amix = g.find("amix=inputs=1").expect(&g);
+        let fader = g.find(",volume=0.8,").expect(&g);
+        let limiter = g.find(",alimiter=limit=0.707946:").expect(&g);
+        let norm = g.find(",loudnorm=I=-14").expect(&g);
+        assert!(amix < fader && fader < limiter && limiter < norm, "{g}");
+        assert!(g.contains("loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[outa]"), "{g}");
+    }
+
+    #[test]
+    fn the_master_closes_the_duck_bus_sum() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut music = audio_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        music.duck = true;
+        let mut tl = timeline_of(vec![video_track(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), music]);
+        tl.master.volume = 0.6;
+        let g = mix_of(&tl, &[asset], &ExportOptions::default());
+        assert!(
+            g.contains("[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=0.6[outa]"),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn a_range_export_keeps_the_master() {
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        let opts = ExportOptions {
+            range: Some(crate::model::TimeRange { start: 2.0, end: 6.0 }),
+            ..ExportOptions::default()
+        };
+        assert!(mix_of(&tl, &assets, &opts).contains("alimiter=limit=0.891251"));
+    }
+
+    #[test]
+    fn a_delivery_variant_keeps_the_master() {
+        // `render_variants` builds every file from `for_delivery`: the same mix at
+        // every frame, only the picture changes.
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.5,
+            limiter: true,
+            ceiling_db: -2.0,
+        });
+        let variant = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
+        let g = mix_of(&variant, &assets, &ExportOptions::default());
+        assert!(g.contains(",volume=0.5,alimiter=limit=0.794328:"), "{g}");
+    }
+
+    #[test]
+    fn the_playback_stream_has_no_sound_for_the_master_to_touch() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.5,
+            limiter: true,
+            ceiling_db: -1.0,
+        });
+        let args = build_preview_args_with(&tl, &assets, 0.0, 30.0, 640, 4, None)
+            .unwrap()
+            .join(" ");
+        assert!(!args.contains("alimiter") && !args.contains("volume=0.5"), "{args}");
+    }
+
+    #[test]
+    fn master_filters_are_safe_for_a_file_that_never_went_through_the_op() {
+        let bus = |volume, ceiling_db| MasterBus {
+            volume,
+            limiter: true,
+            ceiling_db,
+        };
+        // Not a number: no fader, the default ceiling.
+        assert_eq!(
+            master_filters(&bus(f64::NAN, f64::NAN)),
+            ",alimiter=limit=0.891251:attack=5:release=100:level=0:latency=1"
+        );
+        // Beyond the ends: clamped to what `alimiter` accepts (its `limit` is 0.0625..=1).
+        assert_eq!(
+            master_filters(&bus(9.0, 12.0)),
+            ",volume=4,alimiter=limit=1:attack=5:release=100:level=0:latency=1"
+        );
+        assert_eq!(
+            master_filters(&bus(-1.0, -90.0)),
+            ",volume=0,alimiter=limit=0.063096:attack=5:release=100:level=0:latency=1"
+        );
+        assert_eq!(master_filters(&MasterBus::default()), "");
     }
 
     #[test]
@@ -11611,6 +11908,7 @@ mod tests {
                 overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
+                master: Default::default(),
             };
             crate::render_plan::RenderPlan::at(&timeline, &[asset], &ExportOptions::default(), 1.0, policy).unwrap()
         };

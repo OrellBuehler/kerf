@@ -28,6 +28,7 @@ import type {
 	ImportProgress,
 	Keyframe,
 	LaunchRequest,
+	Levels,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -71,6 +72,7 @@ import {
 import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
 import { rippleFrom } from './ripple';
 import { sourceLimits } from './trim-tools';
+import { clampCeiling, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
@@ -1247,6 +1249,71 @@ export async function setTrackPan(trackId: string, pan: number): Promise<Timelin
 		return snapshot();
 	}
 	return invoke<Timeline>('set_track_pan', { trackId, pan: p });
+}
+
+/** Keep the harness timeline's master absent while it is the default, like the saved file. */
+function storeDevMaster(next: { volume: number; limiter: boolean; ceiling_db: number }) {
+	const untouched =
+		next.volume === DEFAULT_MASTER.volume &&
+		next.limiter === DEFAULT_MASTER.limiter &&
+		next.ceiling_db === DEFAULT_MASTER.ceiling_db;
+	if (untouched) delete devTimeline.master;
+	else devTimeline.master = next;
+}
+
+/**
+ * Set the master fader — the linear gain on the finished mix, after every track
+ * and before `loudnorm`. Clamped to `0..4` (+12 dB), as the engine does.
+ */
+export async function setMasterVolume(volume: number): Promise<Timeline> {
+	if (!Number.isFinite(volume)) throw new Error('master volume must be a number');
+	const v = clampMasterVolume(volume);
+	if (!inTauri()) {
+		storeDevMaster({ ...masterOf(devTimeline), volume: v });
+		recordDev('Set master level');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_master_volume', { volume: v });
+}
+
+/**
+ * Switch the master limiter on or off, optionally moving its ceiling (dBFS,
+ * clamped to -24..0). Omitting `ceilingDb` keeps the one it had.
+ */
+export async function setMasterLimiter(enabled: boolean, ceilingDb?: number | null): Promise<Timeline> {
+	if (ceilingDb != null && !Number.isFinite(ceilingDb)) throw new Error('limiter ceiling must be a number');
+	const ceiling = ceilingDb == null ? null : clampCeiling(ceilingDb);
+	if (!inTauri()) {
+		const current = masterOf(devTimeline);
+		storeDevMaster({ ...current, limiter: enabled, ceiling_db: ceiling ?? current.ceiling_db });
+		recordDev('Set master limiter');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_master_limiter', { enabled, ceilingDb: ceiling });
+}
+
+/**
+ * Measure how loud the cut is — the finished mix and each track — in one pass
+ * over the audio the export would render (`range` is a `{start, end}` span of the
+ * cut, default all of it; `loudnorm` measures it as an export with normalisation
+ * on would write it). Whole-file work: it takes seconds on a long cut. Outside the
+ * desktop app there is no ffmpeg, so the numbers are an **estimate** from the
+ * sample analysis, and the result says so (`estimated`).
+ */
+export async function getLevels(range?: { start: number; end: number } | null, loudnorm = false): Promise<Levels> {
+	if (!inTauri()) {
+		// The backend refuses a span that starts past the end rather than widening it
+		// to the whole cut, which would answer a question nobody asked.
+		const cut = timelineDuration(devTimeline);
+		if (range && cut > 0 && range.start >= cut) {
+			throw new Error(`range starts at ${range.start.toFixed(1)}s but the cut is only ${cut.toFixed(1)}s long`);
+		}
+		return estimateLevels(devTimeline, sampleAssets, (id) => sampleAnalysis[id]?.loudness ?? undefined, {
+			range,
+			loudnorm
+		});
+	}
+	return invoke<Levels>('get_levels', { range: range ?? null, loudnorm });
 }
 
 /** Set the frame the project is cut for, or pass `null` to follow the footage. */
