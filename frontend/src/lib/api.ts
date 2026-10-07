@@ -23,6 +23,7 @@ import type {
 	Filmstrip,
 	ImportProgress,
 	Keyframe,
+	LaunchRequest,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -58,8 +59,10 @@ import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { sampleFilmstrip } from './sample-filmstrip';
+import { sampleFrameUrl } from './sample-frame';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
+import { parseLaunchRequest } from './launch';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export function inTauri(): boolean {
@@ -380,6 +383,27 @@ export async function onWindowCloseRequested(
 	});
 }
 
+/** Show the main window. The desktop app creates it hidden (`visible: false`) so
+ *  the webview's unthemed first frame is never seen; the page calls this once the
+ *  theme is applied and the first frame has painted (`reveal.ts`). Rust shows the
+ *  window itself after a few seconds if this never comes, and ignores a repeat.
+ *  A no-op in the browser harness, which has no native window. */
+export async function showMainWindow(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('show_main_window');
+}
+
+/** What this launch was started asking to open (`kerf path/to/cut.kerf`) — a
+ *  `.kerf` that exists, or one that was named and is not there — handed over once;
+ *  `null` when there was nothing or it was already taken. A second launch's request
+ *  arrives as an event instead (`open-project-file` / `launch-project-missing`),
+ *  unless it came while this page was still starting, in which case it is waiting
+ *  here too, newest first. */
+export async function takeLaunchProject(): Promise<LaunchRequest | null> {
+	if (!inTauri()) return null;
+	return parseLaunchRequest(await invoke<unknown>('take_launch_project'));
+}
+
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */
 export async function newProject(): Promise<boolean> {
 	if (!inTauri()) return false;
@@ -387,8 +411,8 @@ export async function newProject(): Promise<boolean> {
 	return true;
 }
 
-/** Open a `.kerf` file — the one at `path` when given (a second launch hands
- *  one over), else one picked natively; resolves to its path, or `null` if
+/** Open a `.kerf` file — the one at `path` when given (a launch hands one over),
+ *  else one picked natively; resolves to its path, or `null` if
  *  cancelled. */
 export async function openProject(path?: string): Promise<string | null> {
 	if (!inTauri()) return null;
@@ -556,18 +580,6 @@ function samplePlayback(start: number, fps: number, onFrame: (f: PlaybackFrame) 
 		clearTimeout(spawn);
 		if (timer) clearInterval(timer);
 	};
-}
-
-/** A frame that visibly moves, so a frozen preview looks frozen. */
-function sampleFrameUrl(time: number): string {
-	const x = (((time * 90) % 700) - 60).toFixed(1);
-	const svg =
-		`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360">` +
-		`<rect width="640" height="360" fill="#0d1116"/>` +
-		`<rect x="${x}" y="150" width="60" height="60" fill="#e29d2e"/>` +
-		`<text x="20" y="336" fill="#8fa3b8" font-family="monospace" font-size="22">${time.toFixed(2)}s</text>` +
-		`</svg>`;
-	return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
 // ---- speech-to-text --------------------------------------------------------
@@ -2426,6 +2438,10 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
  */
 export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
+	// The installer can end this process outright (on Windows the plugin exits
+	// without a normal shutdown), so the logfile's last line would otherwise look
+	// like a crash. This one says it was the update.
+	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
 	await pendingUpdate.downloadAndInstall((e) => {

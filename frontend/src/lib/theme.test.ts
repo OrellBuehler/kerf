@@ -1,5 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { COLOR_TOKENS, SHAPE_NAMES, shapeProps, PRESETS, PRESET_IDS, parseTheme, presetIdFor, type Theme } from './theme';
+import {
+	COLOR_TOKENS,
+	SHAPE_NAMES,
+	SUPERSEDED_KERF_LIGHT,
+	shapeProps,
+	PRESETS,
+	PRESET_IDS,
+	parseTheme,
+	presetIdFor,
+	upgradeStoredTheme,
+	type Theme
+} from './theme';
 
 /** `--name: value` pairs from the token stylesheet, `var()` aliases resolved. */
 async function cssTokens(): Promise<Map<string, string>> {
@@ -119,5 +130,69 @@ describe('presetIdFor', () => {
 		const t: Theme = { ...PRESETS['kerf-dark'], colors: { ...PRESETS['kerf-dark'].colors, waveform: '#ffffff' } };
 		expect(presetIdFor(t)).toBe('custom');
 		expect(presetIdFor({ ...PRESETS['kerf-dark'], name: 'Renamed' })).toBe('kerf-dark');
+	});
+});
+
+describe('upgradeStoredTheme', () => {
+	const light = PRESETS['kerf-light'];
+	/** A theme as an earlier build stored it: the old Kerf Light colors, the way
+	 *  the settings file carries them. */
+	const storedOld = (i: number, over: Partial<Theme> = {}): Theme => ({ ...light, colors: { ...SUPERSEDED_KERF_LIGHT[i] }, ...over });
+
+	test('every superseded Light is complete, distinct, and not the current one', () => {
+		expect(SUPERSEDED_KERF_LIGHT.length).toBeGreaterThanOrEqual(2);
+		for (const old of SUPERSEDED_KERF_LIGHT) {
+			expect(Object.keys(old).sort()).toEqual([...COLOR_TOKENS].sort());
+			for (const t of COLOR_TOKENS) expect(old[t], t).toMatch(/^#[0-9a-f]{6}$/);
+			// A superseded set equal to the current preset would be a migration to itself.
+			expect(COLOR_TOKENS.some((t) => old[t] !== light.colors[t])).toBe(true);
+		}
+		const keys = SUPERSEDED_KERF_LIGHT.map((o) => COLOR_TOKENS.map((t) => o[t]).join());
+		expect(new Set(keys).size).toBe(keys.length);
+	});
+
+	test('an untouched earlier Kerf Light becomes the current preset', () => {
+		for (let i = 0; i < SUPERSEDED_KERF_LIGHT.length; i++) {
+			const out = upgradeStoredTheme(storedOld(i));
+			expect(out).toEqual(light);
+			expect(presetIdFor(out)).toBe('kerf-light');
+		}
+	});
+
+	test('it does so for what the settings file really hands back', () => {
+		// JSON round trip, then parseTheme (which lower-cases hex), then the upgrade.
+		const raw = JSON.parse(JSON.stringify(storedOld(0)).replace(/"#([0-9a-f]{6})"/g, (_, h) => `"#${h.toUpperCase()}"`));
+		const out = upgradeStoredTheme(parseTheme(raw)!);
+		expect(out).toEqual(light);
+	});
+
+	test('the name and shape it was saved with are kept', () => {
+		const shape = { ...light.shape, 'slider-thumb': 20 };
+		const out = upgradeStoredTheme(storedOld(0, { name: 'My light', shape }));
+		expect(out.name).toBe('My light');
+		expect(out.shape).toEqual(shape);
+		expect(out.colors).toEqual(light.colors);
+	});
+
+	test('one color the user changed leaves the whole theme alone', () => {
+		for (let i = 0; i < SUPERSEDED_KERF_LIGHT.length; i++) {
+			const edited = storedOld(i);
+			edited.colors = { ...edited.colors, waveform: '#123456' };
+			expect(upgradeStoredTheme(edited)).toBe(edited);
+		}
+	});
+
+	test('the current Light, the other presets and anything else pass through untouched', () => {
+		for (const id of PRESET_IDS) expect(upgradeStoredTheme(PRESETS[id])).toBe(PRESETS[id]);
+		const custom: Theme = { ...PRESETS['kerf-dark'], name: 'Mine', colors: { ...PRESETS['kerf-dark'].colors, waveform: '#ffffff' } };
+		expect(upgradeStoredTheme(custom)).toBe(custom);
+		// The old Light's colors under a dark scheme are somebody's own mix, not the preset.
+		const darkWithOldLight: Theme = { ...storedOld(0), scheme: 'dark' };
+		expect(upgradeStoredTheme(darkWithOldLight)).toBe(darkWithOldLight);
+	});
+
+	test('upgrading twice changes nothing more', () => {
+		const once = upgradeStoredTheme(storedOld(0));
+		expect(upgradeStoredTheme(once)).toBe(once);
 	});
 });

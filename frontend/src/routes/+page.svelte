@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, untrack } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { toast, notifications } from '$lib/notifications.svelte';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
@@ -20,7 +20,9 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { cutSelection, deleteSelection } from '$lib/ops';
-	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
+	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
+	import { afterPaint, revealWindow } from '$lib/reveal';
+	import { missingProjectMessage } from '$lib/launch';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -36,8 +38,19 @@
 		untrack(() => ui.resync());
 	});
 
+	// The desktop window is created hidden, so the unthemed first frame is never
+	// seen. Once the settings are in — which is when the theme is applied and the
+	// dock is built — wait for the frame that draws them and show the window. (If
+	// this never runs, the backend shows it itself after a few seconds.)
+	let revealed = false;
+	$effect(() => {
+		if (!settings.loaded || revealed) return;
+		revealed = true;
+		void revealWindow({ settle: tick, paint: afterPaint, show: showMainWindow });
+	});
+
 	onMount(() => {
-		void editor.load();
+		const firstLoad = editor.load();
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
@@ -117,6 +130,8 @@
 					await listen('proxy-ready', () => ui.refreshPreview()),
 					// A second launch with a `.kerf` argument: the running app opens it.
 					await listen<string>('open-project-file', (e) => void openProjectAt(e.payload)),
+					// …or one naming a file that is not there, which is never created.
+					await listen<string>('launch-project-missing', (e) => toast.error(missingProjectMessage(e.payload))),
 					// An agent can pick the speech model over MCP; the status is
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
@@ -140,6 +155,17 @@
 						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
 					)
 				);
+				// A `.kerf` on the command line of this very launch (a second launch's
+				// arrives as the events above, unless it came while this page was still
+				// starting, when it is waiting here instead). Asked for only now — with
+				// the listeners up and the first load done, so the open is neither raced
+				// by that load nor lost to a listener that did not exist yet — and it
+				// goes through the same path as the event, unsaved-work question
+				// included. A path that is not there is reported, never created.
+				await firstLoad;
+				const launched = await takeLaunchProject().catch(() => null);
+				if (launched && 'open' in launched) await openProjectAt(launched.open);
+				else if (launched) toast.error(missingProjectMessage(launched.missing));
 			});
 		}
 		return () => {
@@ -172,7 +198,7 @@
 		}
 	}
 
-	/** Open a project file — `path` when a second launch handed one over, else the picker. */
+	/** Open a project file — `path` when a launch handed one over, else the picker. */
 	async function openProjectAt(path?: string) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');

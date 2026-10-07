@@ -15,7 +15,7 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { deleteSelection } from '$lib/ops';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
-	import { packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
+	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
 	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
 	import { readPalette } from '$lib/waveform-draw';
@@ -1857,7 +1857,7 @@
 						oncontextmenu={(e) => onTitleContextMenu(e, o)}
 						onclick={(e) => e.stopPropagation()}
 						title="{o.generated ? 'Caption' : 'Title'}: {o.text}"
-						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))' : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? GENERATED_TITLE_FILL : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 					>
 						<span
 							style="position:relative;font-size:{titleMetrics.font}px;font-weight:{o.generated ? 500 : 600};color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
