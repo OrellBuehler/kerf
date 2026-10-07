@@ -5645,6 +5645,121 @@ mod tests {
         );
     }
 
+    /// A source whose video starts after its audio (a camera that opens its mic
+    /// first). Its preview decodes the proxy and its export decodes the original,
+    /// and a clip cut from the middle must show the same frame in both: an input
+    /// `-ss` is relative to the *container's* start, and an FFmpeg-9 proxy of such
+    /// a file used to start its container at the video, so every cut landed a few
+    /// frames deeper in the preview than in the render.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored late_starting_source`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    #[allow(clippy::print_stderr)]
+    fn late_starting_source_previews_the_frame_the_export_cuts() {
+        use crate::engine::test_support::StatusBounded;
+        let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+        let dir = std::env::temp_dir().join(format!("kerf-late-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .status_bounded()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        // Frames that number themselves: bit k of the frame number is the k-th
+        // eighth of the picture's width, white for 1.
+        let bars = "color=c=black:s=640x360:r=30:d=6,format=yuv420p,\
+                    geq=lum='if(bitand(trunc(N/pow(2,trunc(X*8/W))),1),235,16)':cb=128:cr=128";
+        let (video, audio, media) = (dir.join("v.mp4"), dir.join("a.mp4"), dir.join("late.mp4"));
+        let made = run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            bars,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            video.to_str().unwrap(),
+        ]) && run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=8",
+            "-c:a",
+            "aac",
+            audio.to_str().unwrap(),
+        ]) && run(&[
+            "-itsoffset",
+            "0.064",
+            "-i",
+            video.to_str().unwrap(),
+            "-i",
+            audio.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            media.to_str().unwrap(),
+        ]);
+        if !made {
+            eprintln!("skipped: this ffmpeg cannot make the late-starting test clip");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let barcode = |jpeg: &[u8]| -> u32 {
+            let file = dir.join("frame.jpg");
+            std::fs::write(&file, jpeg).unwrap();
+            let out = std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-i"])
+                .arg(&file)
+                .args(["-vf", "scale=640:360,format=gray", "-f", "rawvideo", "pipe:1"])
+                .output()
+                .unwrap();
+            (0..8)
+                .filter(|k| out.stdout[180 * 640 + (2 * k + 1) * 640 / 16] > 125)
+                .map(|k| 1u32 << k)
+                .sum()
+        };
+
+        let project = Project::open_in_memory().unwrap();
+        let asset = project.import_asset(&media).unwrap();
+        // Two cuts from the middle of the source, one on the frame grid and one off it.
+        project.add_clip_to_timeline(asset.id, None, 0.5, 2.0, Some(0.0)).unwrap();
+        project.add_clip_to_timeline(asset.id, None, 1.234, 3.0, Some(2.0)).unwrap();
+        let (timeline, originals) = (project.timeline().unwrap(), project.list_assets().unwrap());
+        let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
+        let (_, previews) = project.timeline_frame_inputs().unwrap();
+        assert_eq!(previews[0].path, proxy.to_string_lossy(), "the preview decodes the proxy");
+
+        let mut mismatches = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for t in [0.0, 0.1, 0.25, 0.5, 1.0, 1.4, 2.0, 2.05, 2.3, 3.0, 3.7] {
+            let render = barcode(&Project::composite_timeline_frame(&timeline, &originals, t, 640, 2).unwrap());
+            let preview = barcode(&Project::composite_timeline_frame(&timeline, &previews, t, 640, 2).unwrap());
+            seen.insert(render);
+            if render != preview {
+                mismatches.push((t, render, preview));
+            }
+        }
+        let _ = std::fs::remove_file(&proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen.len() > 5, "the clips never moved: {seen:?}");
+        assert!(
+            mismatches.is_empty(),
+            "(time, export's frame, preview's frame) differ: {mismatches:?}"
+        );
+    }
+
     // ---- ripple mode and multi-clip edits ---------------------------------------
 
     /// V1 holding `a [0,5)  b [6,10)  c [12,15)` — a gap of 1s and one of 2s.
