@@ -1687,7 +1687,178 @@ fn time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange
     }
 }
 
+/// One caption line on its way to the screen: when, what, and which input it
+/// was cut from. `origin` is what lets an import say *which cue* fell outside the
+/// cut or lost its slot to another — transcript captioning never reads it.
+struct CaptionLine {
+    range: TimeRange,
+    text: String,
+    origin: usize,
+}
+
+/// Chunk `text` over `span` into caption lines and keep what lies inside
+/// `window`. The span is chunked *whole* and each line is clipped afterwards, so
+/// a sentence that is cut in half captions only the half still in the cut — and
+/// a line left with less than a readable sliver is not kept at all.
+fn push_caption_lines(
+    lines: &mut Vec<CaptionLine>,
+    text: &str,
+    span: TimeRange,
+    window: (f64, f64),
+    origin: usize,
+    layout: CaptionLayout,
+) {
+    for (range, chunk) in time_chunks(chunk_words(text, layout), span, layout.min_line) {
+        let start = range.start.max(window.0);
+        let end = range.end.min(window.1);
+        if end - start < layout.min_visible {
+            continue;
+        }
+        lines.push(CaptionLine {
+            range: TimeRange { start, end },
+            text: chunk,
+            origin,
+        });
+    }
+}
+
+/// Project timed text that is in a clip's **source** time through every clip that
+/// shows its footage. `segments_for` answers which text belongs to an asset — a
+/// transcript map for [`Timeline::captions`], one imported file for
+/// [`Timeline::place_cues`]. `rendered` must already be [`Timeline::for_render`]
+/// so a muted track and a disabled clip are as uncaptioned as they are unheard.
+fn project_through_clips<'a>(
+    rendered: &Timeline,
+    segments_for: impl Fn(Uuid) -> Option<&'a [TranscriptSegment]>,
+    layout: CaptionLayout,
+) -> Vec<CaptionLine> {
+    let mut lines: Vec<CaptionLine> = Vec::new();
+    for track in &rendered.tracks {
+        for clip in &track.clips {
+            let Some(segments) = segments_for(clip.asset_id) else {
+                continue;
+            };
+            let window = (clip.timeline_start, clip.timeline_end());
+            for (origin, seg) in segments.iter().enumerate() {
+                let text = seg.text.trim();
+                let timed = seg.start.is_finite() && seg.end.is_finite() && seg.end > seg.start;
+                if text.is_empty() || !timed || !clip.covers_source(seg.start, seg.end) {
+                    continue;
+                }
+                let span = clip.source_span_to_timeline(seg.start, seg.end);
+                push_caption_lines(&mut lines, text, span, window, origin, layout);
+            }
+        }
+    }
+    lines
+}
+
+/// Settle chunked lines into the caption lane: ordered, de-duplicated, never two
+/// on screen at once, each sized to fit the frame. Returns each overlay with the
+/// `origin` of the line it came from.
+fn settle_caption_lines(mut lines: Vec<CaptionLine>, layout: CaptionLayout, aspect: f64) -> Vec<(TextOverlay, usize)> {
+    lines.sort_by(|a, b| a.range.start.total_cmp(&b.range.start).then_with(|| a.text.cmp(&b.text)));
+    // The same words can reach two clips — `extract_audio` leaves the picture
+    // and its detached audio both referencing the asset — and drawing one
+    // caption twice is drawing it bolder, not twice.
+    lines.dedup_by(|a, b| a.text == b.text && (a.range.start - b.range.start).abs() < 1e-3);
+    // Captions are one lane of text at one screen position, so two at once is
+    // two unreadable ones. The same footage reaching the cut twice — a
+    // callback shot, or a full source parked under the edit — otherwise
+    // collides with whatever is already on screen. First line in wins the
+    // slot; the next starts where it ends, or is dropped if nothing readable
+    // is left of it.
+    let mut placed: Vec<CaptionLine> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let start = placed
+            .last()
+            .map_or(line.range.start, |prev| line.range.start.max(prev.range.end));
+        if line.range.end - start < layout.min_visible {
+            continue;
+        }
+        placed.push(CaptionLine {
+            range: TimeRange {
+                start,
+                end: line.range.end,
+            },
+            ..line
+        });
+    }
+    placed
+        .into_iter()
+        .map(|line| {
+            let size = fit_size(&line.text, layout.size, aspect);
+            let mut o = TextOverlay::new(line.text, line.range.start.max(0.0), line.range.end);
+            o.pos_y = layout.pos_y;
+            o.size = size;
+            o.bold = layout.bold;
+            o.bg = Some("black@0.5".to_string());
+            o.generated = true;
+            (o, line.origin)
+        })
+        .collect()
+}
+
+/// Which clock an imported caption file's times are on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaptionTimeBase {
+    /// The file was made for the finished cut: its times *are* timeline time.
+    /// What a subtitle file normally is.
+    #[default]
+    Timeline,
+    /// The file times one source — a transcript, or subtitles for the uncut
+    /// footage. Each cue is projected through every clip of this asset, exactly
+    /// as a transcript segment is, so it follows trims, reorders and speed.
+    Source(Uuid),
+}
+
+impl CaptionTimeBase {
+    /// The base a caller asked for by name (`timeline` / `source`), plus the
+    /// asset a `source` base is about. Both surfaces take these two loose
+    /// arguments, so the rules for combining them live in one place: an asset
+    /// alone implies `source`; neither implies `timeline`; and a contradiction
+    /// is an error rather than one of the two being quietly preferred.
+    pub fn resolve(base: Option<&str>, asset_id: Option<Uuid>) -> Result<Self> {
+        let named = base.map(|b| b.trim().to_ascii_lowercase());
+        match (named.as_deref(), asset_id) {
+            (None | Some("" | "timeline"), None) => Ok(Self::Timeline),
+            (None | Some("" | "source"), Some(asset)) => Ok(Self::Source(asset)),
+            (Some("source"), None) => Err(Error::InvalidArgument(
+                "base \"source\" needs asset_id: the asset whose footage the cue times belong to".to_string(),
+            )),
+            (Some("timeline"), Some(_)) => Err(Error::InvalidArgument(
+                "asset_id only applies to base \"source\"; cues in timeline time are not tied to an asset".to_string(),
+            )),
+            (Some(other), _) => Err(Error::InvalidArgument(format!(
+                "unknown caption time base {other:?}; expected \"timeline\" or \"source\""
+            ))),
+        }
+    }
+}
+
+/// Imported cues laid onto the cut: the overlays, and an account of every cue.
+/// `placed + dropped_outside + dropped_overlap` is the number of cues offered.
+#[derive(Debug, Clone, Default)]
+pub struct CaptionPlacement {
+    pub overlays: Vec<TextOverlay>,
+    /// Cues that put at least one caption on screen.
+    pub placed: usize,
+    /// Cues that reached nothing: past the end of the cut, or timing footage no
+    /// (rendered) clip shows, or too little of either to read.
+    pub dropped_outside: usize,
+    /// Cues that did reach the cut but lost their slot — the same words at the
+    /// same moment as an earlier cue, or wholly under one that was already on
+    /// screen. Captions are one lane of text.
+    pub dropped_overlap: usize,
+}
+
 impl Timeline {
+    /// The frame captions are fitted to: the project's own, else 16:9.
+    fn caption_aspect(&self) -> f64 {
+        self.format
+            .map_or(DEFAULT_CAPTION_ASPECT, |d| f64::from(d.width) / f64::from(d.height))
+    }
+
     /// Caption overlays for the cut as it currently stands.
     ///
     /// The point of doing this over the timeline rather than over an asset: a
@@ -1702,71 +1873,65 @@ impl Timeline {
     /// clip are as uncaptioned as they are unheard.
     pub fn captions(&self, transcripts: &HashMap<Uuid, Vec<TranscriptSegment>>, opts: CaptionOptions) -> Vec<TextOverlay> {
         let layout = opts.resolve();
-        let aspect = self
-            .format
-            .map_or(DEFAULT_CAPTION_ASPECT, |d| f64::from(d.width) / f64::from(d.height));
         let rendered = self.for_render();
-        let mut lines: Vec<(TimeRange, String)> = Vec::new();
-        for track in &rendered.tracks {
-            for clip in &track.clips {
-                let Some(segments) = transcripts.get(&clip.asset_id) else {
-                    continue;
-                };
-                let (visible_start, visible_end) = (clip.timeline_start, clip.timeline_end());
-                for seg in segments {
-                    let text = seg.text.trim();
-                    if text.is_empty() || seg.end <= seg.start || !clip.covers_source(seg.start, seg.end) {
+        let lines = project_through_clips(&rendered, |asset| transcripts.get(&asset).map(Vec::as_slice), layout);
+        settle_caption_lines(lines, layout, self.caption_aspect())
+            .into_iter()
+            .map(|(overlay, _)| overlay)
+            .collect()
+    }
+
+    /// Lay the cues of an imported subtitle file onto the cut as caption
+    /// overlays — [`Timeline::captions`] for text that did not come from a
+    /// transcript.
+    ///
+    /// Everything after the time mapping is shared with transcript captioning
+    /// (chunking to the style's line length, the flicker floors, one lane with
+    /// no two lines at once, fitting to the delivery frame), so an imported set
+    /// looks and behaves like a generated one. The mapping is the only part that
+    /// differs:
+    ///
+    /// * [`CaptionTimeBase::Source`] *is* transcript captioning — the cues are
+    ///   projected through the asset's clips, honoring trim, speed, reverse and
+    ///   `for_render`.
+    /// * [`CaptionTimeBase::Timeline`] takes the cue times as they stand. They
+    ///   are clipped to the length the cut renders at (a subtitle file for the
+    ///   whole film outruns a short cut), and — unlike source time — a muted
+    ///   track does not silence them: the file captions the finished cut, not
+    ///   one clip's sound. With nothing on the timeline yet there is no end to
+    ///   run past, so nothing is dropped.
+    pub fn place_cues(&self, cues: &[TranscriptSegment], base: CaptionTimeBase, opts: CaptionOptions) -> CaptionPlacement {
+        let layout = opts.resolve();
+        let rendered = self.for_render();
+        let lines = match base {
+            CaptionTimeBase::Source(asset) => project_through_clips(&rendered, |id| (id == asset).then_some(cues), layout),
+            CaptionTimeBase::Timeline => {
+                let cut_end = rendered.duration();
+                let window = (0.0, if cut_end > 0.0 { cut_end } else { f64::INFINITY });
+                let mut lines = Vec::new();
+                for (origin, cue) in cues.iter().enumerate() {
+                    let text = cue.text.trim();
+                    if text.is_empty() || !cue.start.is_finite() || !cue.end.is_finite() || cue.end <= cue.start {
                         continue;
                     }
-                    // Chunk over the segment's *whole* projected span, then clip
-                    // each line to the clip — so a sentence cut in half captions
-                    // only the half that is still in the cut.
-                    let span = clip.source_span_to_timeline(seg.start, seg.end);
-                    for (range, chunk) in time_chunks(chunk_words(text, layout), span, layout.min_line) {
-                        let start = range.start.max(visible_start);
-                        let end = range.end.min(visible_end);
-                        if end - start < layout.min_visible {
-                            continue;
-                        }
-                        lines.push((TimeRange { start, end }, chunk));
-                    }
+                    let span = TimeRange {
+                        start: cue.start,
+                        end: cue.end,
+                    };
+                    push_caption_lines(&mut lines, text, span, window, origin, layout);
                 }
+                lines
             }
+        };
+        let reached: HashSet<usize> = lines.iter().map(|l| l.origin).collect();
+        let settled = settle_caption_lines(lines, layout, self.caption_aspect());
+        let kept: HashSet<usize> = settled.iter().map(|(_, origin)| *origin).collect();
+        CaptionPlacement {
+            placed: kept.len(),
+            dropped_outside: cues.len() - reached.len(),
+            dropped_overlap: reached.len() - kept.len(),
+            overlays: settled.into_iter().map(|(overlay, _)| overlay).collect(),
         }
-        lines.sort_by(|a, b| a.0.start.total_cmp(&b.0.start).then_with(|| a.1.cmp(&b.1)));
-        // The same words can reach two clips — `extract_audio` leaves the picture
-        // and its detached audio both referencing the asset — and drawing one
-        // caption twice is drawing it bolder, not twice.
-        lines.dedup_by(|a, b| a.1 == b.1 && (a.0.start - b.0.start).abs() < 1e-3);
-        // Captions are one lane of text at one screen position, so two at once is
-        // two unreadable ones. The same footage reaching the cut twice — a
-        // callback shot, or a full source parked under the edit — otherwise
-        // collides with whatever is already on screen. First line in wins the
-        // slot; the next starts where it ends, or is dropped if nothing readable
-        // is left of it.
-        let mut placed: Vec<(TimeRange, String)> = Vec::with_capacity(lines.len());
-        for (range, text) in lines {
-            let start = placed
-                .last()
-                .map_or(range.start, |(prev, _): &(TimeRange, String)| range.start.max(prev.end));
-            if range.end - start < layout.min_visible {
-                continue;
-            }
-            placed.push((TimeRange { start, end: range.end }, text));
-        }
-        placed
-            .into_iter()
-            .map(|(range, text)| {
-                let size = fit_size(&text, layout.size, aspect);
-                let mut o = TextOverlay::new(text, range.start.max(0.0), range.end);
-                o.pos_y = layout.pos_y;
-                o.size = size;
-                o.bold = layout.bold;
-                o.bg = Some("black@0.5".to_string());
-                o.generated = true;
-                o
-            })
-            .collect()
     }
 }
 
@@ -3370,7 +3535,7 @@ fn num_changed(a: f64, b: f64) -> bool {
 }
 
 /// `m:ss.d`, the way an editor reads a timeline position.
-fn fmt_time(secs: f64) -> String {
+pub(crate) fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0);
     let m = (s / 60.0).floor();
     format!("{}:{:04.1}", m as i64, s - m * 60.0)
@@ -5256,6 +5421,351 @@ mod tests {
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 3.0, "only once")]);
         assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    // ---- imported captions ----------------------------------------------------
+
+    /// A cut with one `len`-second clip of `asset` from its start.
+    fn cut_of(asset: Uuid, len: f64) -> Timeline {
+        one_clip(Clip::new(asset, 0.0, len, 0.0))
+    }
+
+    fn rounded(overlays: &[TextOverlay]) -> Vec<(String, f64, f64)> {
+        overlays
+            .iter()
+            .map(|o| {
+                (
+                    o.text.clone(),
+                    (o.start * 100.0).round() / 100.0,
+                    (o.end * 100.0).round() / 100.0,
+                )
+            })
+            .collect()
+    }
+
+    /// Every cue offered is in exactly one bucket — the invariant the summary's
+    /// numbers are built on.
+    fn accounted(p: &CaptionPlacement, offered: usize) {
+        assert_eq!(p.placed + p.dropped_outside + p.dropped_overlap, offered, "{p:?}");
+    }
+
+    #[test]
+    fn cues_in_timeline_time_land_where_the_file_says() {
+        let timeline = cut_of(Uuid::new_v4(), 10.0);
+        let cues = [seg(1.0, 3.0, "Hello there"), seg(4.0, 6.0, "General Kenobi")];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        assert_eq!(
+            rounded(&p.overlays),
+            [("Hello there".into(), 1.0, 3.0), ("General Kenobi".into(), 4.0, 6.0)]
+        );
+        accounted(&p, 2);
+        assert_eq!((p.placed, p.dropped_outside, p.dropped_overlap), (2, 0, 0));
+        // Written as generated captions in the style's own look, so Recaption,
+        // Clear and the delivery re-fit all treat them as captions.
+        let layout = CaptionStyle::Lines.layout();
+        assert!(p
+            .overlays
+            .iter()
+            .all(|o| o.generated && o.pos_y == layout.pos_y && o.bg.is_some()));
+    }
+
+    #[test]
+    fn an_imported_cue_is_chunked_exactly_like_a_transcript_segment() {
+        // The refactor's whole point: one chunking / timing / fitting path. A
+        // cue in timeline time over an identity clip must come out the same as
+        // the same words as a transcript segment of that clip — in both styles,
+        // and on a tall frame where the fit binds.
+        let asset = Uuid::new_v4();
+        let mut timeline = cut_of(asset, 12.0);
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let line = seg(
+            0.5,
+            11.0,
+            "Today we are talking about non-destructive editing in Kerf, and a few extraordinarily long words",
+        );
+        let mut map = HashMap::new();
+        map.insert(asset, vec![line.clone()]);
+        for style in [CaptionStyle::Lines, CaptionStyle::WordPunch] {
+            let opts = CaptionOptions::styled(style);
+            let from_transcript = timeline.captions(&map, opts);
+            let from_cues = timeline
+                .place_cues(std::slice::from_ref(&line), CaptionTimeBase::Timeline, opts)
+                .overlays;
+            assert!(from_cues.len() > 1, "{style:?} should split a long cue");
+            assert_eq!(from_cues.len(), from_transcript.len(), "{style:?}");
+            for (a, b) in from_cues.iter().zip(&from_transcript) {
+                assert_eq!(
+                    (&a.text, a.start, a.end, a.size, a.pos_y, a.bold, &a.bg, a.generated),
+                    (&b.text, b.start, b.end, b.size, b.pos_y, b.bold, &b.bg, b.generated),
+                    "{style:?}"
+                );
+            }
+        }
+        // And the same asset-based placement is `captions` itself.
+        let via_source = timeline.place_cues(&[line], CaptionTimeBase::Source(asset), CaptionOptions::default());
+        assert_eq!(
+            rounded(&via_source.overlays),
+            rounded(&timeline.captions(&map, CaptionOptions::default()))
+        );
+    }
+
+    #[test]
+    fn imported_captions_shrink_to_fit_a_vertical_frame_and_take_the_style() {
+        let mut timeline = cut_of(Uuid::new_v4(), 6.0);
+        timeline.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let cues = [seg(0.0, 6.0, "non-destructive editing")];
+        let p = timeline.place_cues(
+            &cues,
+            CaptionTimeBase::Timeline,
+            CaptionOptions::styled(CaptionStyle::WordPunch),
+        );
+        let layout = CaptionStyle::WordPunch.layout();
+        let long = p
+            .overlays
+            .iter()
+            .find(|o| o.text == "non-destructive")
+            .expect("the long word");
+        let short = p.overlays.iter().find(|o| o.text == "editing").expect("the short word");
+        assert!(long.size < layout.size, "the long word shrinks to fit 9:16: {}", long.size);
+        assert_eq!(short.size, layout.size);
+        assert!(p.overlays.iter().all(|o| o.bold && o.pos_y == layout.pos_y));
+        // An override still moves one number.
+        let opts = CaptionOptions {
+            pos_y: Some(0.5),
+            ..CaptionOptions::styled(CaptionStyle::WordPunch)
+        };
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, opts);
+        assert!(p.overlays.iter().all(|o| o.pos_y == 0.5 && o.bold));
+    }
+
+    #[test]
+    fn timeline_cues_past_the_end_of_the_cut_are_dropped_and_the_straddler_clipped() {
+        let timeline = cut_of(Uuid::new_v4(), 10.0);
+        let cues = [
+            seg(2.0, 4.0, "inside"),
+            seg(9.0, 12.0, "straddles the end"),
+            seg(10.0, 12.0, "starts at the end"),
+            seg(20.0, 25.0, "long gone"),
+        ];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        accounted(&p, 4);
+        assert_eq!((p.placed, p.dropped_outside), (2, 2));
+        let last = p.overlays.last().unwrap();
+        assert!(last.text.contains("end") && (last.end - 10.0).abs() < 1e-9, "{last:?}");
+        assert!(p.overlays.iter().all(|o| o.end <= 10.0 + 1e-9));
+        // A sliver under the readable floor at the very end is not kept either.
+        let sliver = timeline.place_cues(
+            &[seg(9.95, 12.0, "barely")],
+            CaptionTimeBase::Timeline,
+            CaptionOptions::default(),
+        );
+        assert!(sliver.overlays.is_empty());
+        assert_eq!(sliver.dropped_outside, 1);
+    }
+
+    #[test]
+    fn timeline_cues_on_an_empty_timeline_have_no_end_to_run_past() {
+        let timeline = Timeline::new();
+        let cues = [seg(0.0, 2.0, "first"), seg(600.0, 602.0, "much later")];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        assert_eq!((p.placed, p.dropped_outside), (2, 0));
+    }
+
+    #[test]
+    fn a_muted_track_silences_source_cues_but_not_timeline_cues() {
+        let asset = Uuid::new_v4();
+        let mut timeline = cut_of(asset, 6.0);
+        let mut music = Track::new(StreamKind::Audio, "A1");
+        music.clips = vec![Clip::new(Uuid::new_v4(), 0.0, 20.0, 0.0)];
+        timeline.tracks.push(music);
+        let cues = [seg(1.0, 3.0, "heard")];
+        // Source time is a claim about footage: a muted clip shows nothing.
+        timeline.tracks[0].muted = true;
+        let src = timeline.place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default());
+        assert!(src.overlays.is_empty());
+        assert_eq!(src.dropped_outside, 1);
+        // Timeline time is a claim about the finished cut. With the picture muted
+        // the cut renders no further than its remaining content — here, the
+        // music — and the cue is still inside it.
+        let tl = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        assert_eq!(tl.placed, 1);
+        // A disabled clip is as absent as a muted track.
+        timeline.tracks[0].muted = false;
+        timeline.tracks[0].clips[0].enabled = false;
+        assert!(timeline
+            .place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default())
+            .overlays
+            .is_empty());
+    }
+
+    #[test]
+    fn source_cues_follow_trim_move_speed_and_reverse() {
+        let asset = Uuid::new_v4();
+        let cues = [seg(12.0, 14.0, "alpha beta")];
+        let place = |clip: Clip| {
+            one_clip(clip)
+                .place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default())
+                .overlays
+        };
+        // Trimmed to 10..20 and moved to 4s: the cue's 12..14 is 6..8.
+        let trimmed = Clip::new(asset, 10.0, 20.0, 4.0);
+        assert_eq!(rounded(&place(trimmed.clone())), [("alpha beta".into(), 6.0, 8.0)]);
+        // Double speed halves the distance from the in-point.
+        let fast = Clip {
+            speed: 2.0,
+            ..trimmed.clone()
+        };
+        assert_eq!(rounded(&place(fast)), [("alpha beta".into(), 5.0, 6.0)]);
+        // Reversed: the source's tail is heard first and the range stays ordered.
+        let reversed = Clip {
+            speed: -1.0,
+            ..trimmed.clone()
+        };
+        assert_eq!(rounded(&place(reversed)), [("alpha beta".into(), 10.0, 12.0)]);
+        // A cue entirely before the in-point shows nothing.
+        let early = one_clip(trimmed).place_cues(
+            &[seg(0.0, 5.0, "trimmed away")],
+            CaptionTimeBase::Source(asset),
+            CaptionOptions::default(),
+        );
+        assert!(early.overlays.is_empty());
+        assert_eq!(early.dropped_outside, 1);
+    }
+
+    #[test]
+    fn a_source_cue_cut_in_half_only_captions_what_survived() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 2.0, 0.0));
+        let cues = [seg(0.0, 4.0, "alpha bravo charlie delta echo foxtrot")];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default());
+        assert!(p.overlays.iter().all(|o| o.end <= 2.0 + 1e-9), "{:?}", p.overlays);
+        assert!(!p.overlays.iter().any(|o| o.text.contains("foxtrot")), "{:?}", p.overlays);
+        assert_eq!(rounded(&p.overlays).len(), 1);
+        assert_eq!(p.placed, 1);
+
+        // Several lines survive when more of the cue does: placed counts cues,
+        // not the lines a long one becomes.
+        let longer = one_clip(Clip::new(asset, 0.0, 6.0, 0.0));
+        let cues = [seg(
+            0.0,
+            8.0,
+            "one two three four five six seven eight nine ten eleven twelve",
+        )];
+        let p = longer.place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default());
+        assert!(p.overlays.len() > 1, "{:?}", p.overlays);
+        assert_eq!(p.placed, 1, "one cue, however many lines it became");
+        accounted(&p, 1);
+    }
+
+    #[test]
+    fn source_cues_reach_every_clip_of_the_asset_and_only_that_asset() {
+        let asset = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        // The same footage twice (a callback shot) with someone else's in between.
+        track.clips = vec![
+            Clip::new(asset, 0.0, 4.0, 0.0),
+            Clip::new(other, 0.0, 4.0, 4.0),
+            Clip::new(asset, 0.0, 4.0, 8.0),
+        ];
+        let timeline = Timeline {
+            tracks: vec![track],
+            ..Timeline::new()
+        };
+        let p = timeline.place_cues(
+            &[seg(1.0, 3.0, "said twice")],
+            CaptionTimeBase::Source(asset),
+            CaptionOptions::default(),
+        );
+        assert_eq!(
+            rounded(&p.overlays),
+            [("said twice".into(), 1.0, 3.0), ("said twice".into(), 9.0, 11.0)]
+        );
+        assert_eq!(p.placed, 1, "still one cue");
+        accounted(&p, 1);
+    }
+
+    #[test]
+    fn imported_cues_never_share_the_screen() {
+        let timeline = cut_of(Uuid::new_v4(), 20.0);
+        let cues = [
+            seg(0.0, 4.0, "alpha beta"),
+            // Starts under the first: waits for it to end.
+            seg(2.0, 6.0, "gamma delta"),
+            // Wholly under what is already on screen: nothing readable is left.
+            seg(3.0, 3.4, "buried"),
+            // The same words at the same moment as an earlier cue.
+            seg(8.0, 10.0, "twice over"),
+            seg(8.0, 10.0, "twice over"),
+        ];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        accounted(&p, 5);
+        assert_eq!((p.placed, p.dropped_outside, p.dropped_overlap), (3, 0, 2), "{p:?}");
+        assert_eq!(
+            rounded(&p.overlays),
+            [
+                ("alpha beta".into(), 0.0, 4.0),
+                ("gamma delta".into(), 4.0, 6.0),
+                ("twice over".into(), 8.0, 10.0)
+            ]
+        );
+        for pair in p.overlays.windows(2) {
+            assert!(pair[1].start >= pair[0].end - 1e-9);
+        }
+    }
+
+    #[test]
+    fn unusable_cues_count_as_not_placed_rather_than_vanishing() {
+        let asset = Uuid::new_v4();
+        let timeline = cut_of(asset, 10.0);
+        let cues = [
+            seg(1.0, 2.0, "fine"),
+            seg(3.0, 3.0, "zero length"),
+            seg(5.0, 4.0, "backwards"),
+            seg(6.0, 7.0, "   "),
+            seg(f64::NAN, 8.0, "not a time"),
+        ];
+        for base in [CaptionTimeBase::Timeline, CaptionTimeBase::Source(asset)] {
+            let p = timeline.place_cues(&cues, base, CaptionOptions::default());
+            accounted(&p, 5);
+            assert_eq!((p.placed, p.dropped_outside), (1, 4), "{base:?}");
+        }
+    }
+
+    #[test]
+    fn placement_leaves_the_timeline_it_reads_alone() {
+        let asset = Uuid::new_v4();
+        let timeline = cut_of(asset, 10.0);
+        let before = serde_json::to_string(&timeline).unwrap();
+        timeline.place_cues(
+            &[seg(0.0, 3.0, "x y z")],
+            CaptionTimeBase::Timeline,
+            CaptionOptions::default(),
+        );
+        assert_eq!(serde_json::to_string(&timeline).unwrap(), before);
+    }
+
+    #[test]
+    fn a_time_base_resolves_from_loose_arguments_and_refuses_contradictions() {
+        let asset = Uuid::new_v4();
+        let resolve = CaptionTimeBase::resolve;
+        assert_eq!(resolve(None, None).unwrap(), CaptionTimeBase::Timeline);
+        assert_eq!(resolve(Some("timeline"), None).unwrap(), CaptionTimeBase::Timeline);
+        assert_eq!(resolve(Some(" Timeline "), None).unwrap(), CaptionTimeBase::Timeline);
+        assert_eq!(resolve(Some(""), None).unwrap(), CaptionTimeBase::Timeline);
+        assert_eq!(
+            resolve(None, Some(asset)).unwrap(),
+            CaptionTimeBase::Source(asset),
+            "an asset alone implies source"
+        );
+        assert_eq!(resolve(Some("SOURCE"), Some(asset)).unwrap(), CaptionTimeBase::Source(asset));
+        assert!(resolve(Some("source"), None).unwrap_err().to_string().contains("asset_id"));
+        assert!(resolve(Some("timeline"), Some(asset))
+            .unwrap_err()
+            .to_string()
+            .contains("only applies"));
+        let err = resolve(Some("sideways"), None).unwrap_err().to_string();
+        assert!(err.contains("\"timeline\" or \"source\""), "{err}");
     }
 
     // ---- ripple ---------------------------------------------------------------

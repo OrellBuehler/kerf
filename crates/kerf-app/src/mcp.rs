@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionOptions, CaptionStyle, ClipMove, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape,
-    Project, Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionFormat, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipMove, Delivery, EditSource, ExportOptions,
+    Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition,
+    TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -123,6 +124,40 @@ struct CaptionParams {
     )]
     style: Option<CaptionStyle>,
     #[schemars(description = "Most words on one caption line (lines: 4, word_punch: 1)")]
+    max_words: Option<usize>,
+    #[schemars(description = "Most characters on one caption line (default 28); the tighter of the two limits wins")]
+    max_chars: Option<usize>,
+    #[schemars(description = "Vertical position as a fraction of frame height, 0 = top (lines: 0.88, word_punch: 0.72)")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
+    size: Option<f64>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct ImportCaptionsParams {
+    #[schemars(
+        description = "Absolute path of a .srt, .ass or .ssa subtitle file (at most 5 MiB). Give this or `text`, not both."
+    )]
+    path: Option<String>,
+    #[schemars(
+        description = "The subtitle file's text itself, for captions you wrote rather than found on disk (SubRip is the easy one to write). Give this or `path`, not both."
+    )]
+    text: Option<String>,
+    #[schemars(description = "`srt` or `ass`. Omit to detect it from the content, which is almost always right.")]
+    format: Option<String>,
+    #[schemars(
+        description = "Which clock the cue times are on. `timeline` (default): the file is a subtitle track for the finished cut, so a cue at 0:12 shows at 0:12 of the timeline (cues after the cut ends are dropped). `source`: the file times one asset's own footage — a transcript, or subtitles for the uncut recording — and needs asset_id; each cue is projected through every clip of that asset, so it follows trims, reorders and speed changes and a cue whose footage was cut gets no caption. Giving asset_id alone implies `source`."
+    )]
+    base: Option<String>,
+    #[schemars(description = "The asset whose footage the cue times belong to; only with base `source`")]
+    asset_id: Option<String>,
+    #[schemars(
+        description = "Look: `lines` (default) holds a few words as a subtitle line; `word_punch` puts one large word on screen at a time. Long cues are split into readable lines either way. Everything below is an override on top of the style."
+    )]
+    style: Option<CaptionStyle>,
+    #[schemars(
+        description = "Most words on one caption line (lines: 4, word_punch: 1). Raise it, with max_chars, to keep each cue of a professionally timed file as one caption."
+    )]
     max_words: Option<usize>,
     #[schemars(description = "Most characters on one caption line (default 28); the tighter of the two limits wins")]
     max_chars: Option<usize>,
@@ -1793,7 +1828,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
+        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated (or imported) set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
     )]
     fn generate_captions(&self, Parameters(p): Parameters<CaptionParams>) -> Result<String, McpError> {
         let opts = CaptionOptions {
@@ -1806,6 +1841,28 @@ impl KerfMcp {
         self.edit(|project| {
             let out = project.generate_captions(opts).map_err(core_err)?;
             json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Returns a summary: cues read, placed, skipped_lines, dropped_outside (past the cut's end, or footage that was cut out), dropped_overlap, captions written and replaced."
+    )]
+    fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
+        let asset = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let base = CaptionTimeBase::resolve(p.base.as_deref(), asset).map_err(core_err)?;
+        let format = CaptionFormat::from_arg(p.format.as_deref()).map_err(core_err)?;
+        // Read (and size-check) the file before taking the project lock.
+        let text = caption_source(p.path.as_deref(), p.text)?;
+        let opts = CaptionOptions {
+            style: p.style.unwrap_or_default(),
+            max_words: p.max_words,
+            max_chars: p.max_chars,
+            pos_y: p.pos_y,
+            size: p.size,
+        };
+        self.edit(|project| {
+            let summary = project.import_captions(&text, format, base, opts).map_err(core_err)?;
+            json(&summary)
         })
     }
 
@@ -1888,7 +1945,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Remove the captions generate_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
+        description = "Remove the captions generate_captions or import_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
     )]
     fn clear_captions(&self) -> Result<String, McpError> {
         self.edit(|project| {
@@ -2849,7 +2906,12 @@ impl ServerHandler for KerfMcp {
              are placed in timeline time, so a later trim or remove_silence moves \
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
-             alone. export_srt writes a subtitle file. \
+             alone. import_captions brings in a .srt / .ass / .ssa file instead \
+             (base=timeline for a subtitle track made for the finished cut, \
+             base=source with asset_id for a file that times one asset's own \
+             footage) and replaces that same caption set — so it is the caption \
+             step too: do it last, and re-run it after further edits. export_srt \
+             writes a subtitle file. \
              To narrate a cut, write the script and generate_voiceover it (English; \
              it lands on its own VO track with a transcript that is its script, \
              exactly timed), cut the picture to the narration, then caption last. \
@@ -3154,6 +3216,30 @@ fn fmt_ts(t: f64) -> String {
     format!("{minutes:02}:{seconds:06.3}")
 }
 
+/// The subtitle text an `import_captions` call carries: a file, read with the
+/// engine's guards (`.srt` / `.ass` / `.ssa`, a regular file, at most 5 MiB), or
+/// the text passed inline — exactly one of the two. A path must be absolute: a
+/// relative one would resolve against wherever the app happened to start.
+fn caption_source(path: Option<&str>, text: Option<String>) -> Result<String, McpError> {
+    match (path, text) {
+        (Some(path), None) => {
+            let path = std::path::Path::new(path);
+            if !path.is_absolute() {
+                return Err(McpError::invalid_params(
+                    format!("path {} must be an absolute file path", path.display()),
+                    None,
+                ));
+            }
+            kerf_core::read_caption_file(path).map_err(core_err)
+        }
+        (None, Some(text)) => Ok(text),
+        _ => Err(McpError::invalid_params(
+            "give exactly one of `path` (a .srt / .ass / .ssa file) or `text` (its contents)",
+            None,
+        )),
+    }
+}
+
 fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string_pretty(value).map_err(|e| McpError::internal_error(e.to_string(), None))
 }
@@ -3161,8 +3247,8 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_hosts, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite,
-        require_window, router, server_identity, track_gaps, ClipMoveParams,
+        allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error,
+        refuse_overwrite, require_window, router, server_identity, track_gaps, ClipMoveParams,
     };
 
     #[test]
@@ -3214,6 +3300,54 @@ mod tests {
         assert_eq!(fmt_ts(119.9997), "02:00.000");
         assert_eq!(fmt_ts(59.9994), "00:59.999");
         assert_eq!(fmt_ts(125.25), "02:05.250");
+    }
+
+    #[test]
+    fn a_caption_import_takes_exactly_one_of_a_path_or_text() {
+        let invalid = |r: Result<String, rmcp::ErrorData>| {
+            let err = r.expect_err("must be refused");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{}", err.message);
+            err.message.to_string()
+        };
+        // Inline text passes straight through.
+        assert_eq!(caption_source(None, Some("1\n".into())).unwrap(), "1\n");
+        // Neither, or both.
+        assert!(invalid(caption_source(None, None)).contains("exactly one"));
+        assert!(invalid(caption_source(Some("/a/b.srt"), Some("x".into()))).contains("exactly one"));
+        // A path is absolute, and the engine's guards still apply to it.
+        assert!(invalid(caption_source(Some("subs/movie.srt"), None)).contains("absolute"));
+        let dir = std::env::temp_dir().join(format!("kerf-mcp-caption-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srt = dir.join("cues.srt");
+        std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:02,000\nHi\n").unwrap();
+        assert!(caption_source(srt.to_str(), None).unwrap().contains("Hi"));
+        let txt = dir.join("cues.txt");
+        std::fs::write(&txt, "x").unwrap();
+        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .ass or .ssa"));
+        assert!(invalid(caption_source(dir.join("missing.srt").to_str(), None)).contains("cannot read"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The import tool takes a file *or* text and neither is mandatory: the
+    /// schema must not claim one is required, or a caller sending the other is
+    /// rejected before the tool can say which it wanted.
+    #[test]
+    fn caption_import_parameters_are_all_optional() {
+        let tools = router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "import_captions")
+            .expect("import_captions is registered");
+        let required = tool.input_schema.get("required").and_then(|r| r.as_array());
+        assert!(required.is_none_or(|r| r.is_empty()), "{required:?}");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties");
+        for name in ["path", "text", "format", "base", "asset_id", "style"] {
+            assert!(props.contains_key(name), "{name} is missing from the schema");
+        }
     }
 
     /// Every tool the agent can call must reach it with a description and an

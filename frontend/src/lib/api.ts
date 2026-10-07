@@ -10,6 +10,9 @@ import type {
 	AssetAnalysis,
 	AssetMetadata,
 	AudioEffect,
+	CaptionFormat,
+	CaptionImportRequest,
+	CaptionImportResult,
 	CaptionOptions,
 	Clip,
 	ClipMove,
@@ -52,6 +55,7 @@ import type {
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
+import { importCaptionsInto, resolveBase } from './caption-import';
 import { formatTime as fmtTime } from './diff';
 import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
 import { rippleFrom } from './ripple';
@@ -1627,6 +1631,53 @@ export async function clearCaptions(): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('clear_captions');
+}
+
+/** Caption the cut from a `.srt` / `.ass` / `.ssa` file on disk. `base` is
+ *  `timeline` (the file is a subtitle track for the finished cut — the default) or
+ *  `source` with an `assetId` (the file times that asset's own footage and is
+ *  projected through its clips like a transcript); `options` is the same look
+ *  `generateCaptions` takes. Replaces the previous generated / imported captions
+ *  as one `Import captions` revision and resolves to the refreshed cut plus what
+ *  the import did. A browser has no disk to read — use `importCaptionsText`. */
+export async function importCaptions(path: string, req: CaptionImportRequest = {}): Promise<CaptionImportResult> {
+	if (!inTauri()) {
+		throw new Error('Importing a subtitle file by path needs the desktop app; in a browser pass its text to importCaptionsText.');
+	}
+	return invoke<CaptionImportResult>('import_captions', {
+		path,
+		base: req.base ?? null,
+		assetId: req.assetId ?? null,
+		options: req.options ?? null
+	});
+}
+
+/** `importCaptions` for text the page already holds — a file read through an
+ *  `<input type=file>`, or pasted. `format` is `srt` / `ass`; omitted, it is
+ *  guessed from the text. This is the variant the browser harness runs. */
+export async function importCaptionsText(
+	text: string,
+	req: CaptionImportRequest & { format?: CaptionFormat } = {}
+): Promise<CaptionImportResult> {
+	if (!inTauri()) {
+		const base = resolveBase(req.base, req.assetId);
+		const { overlays, kept, summary } = importCaptionsInto(
+			devTimeline,
+			text,
+			{ format: req.format, base, options: req.options },
+			{ assetKnown: (id) => assetById(id) !== undefined }
+		);
+		devTimeline.overlays = [...kept, ...overlays.map((o) => ({ ...o, id: uid() }))];
+		recordDev('Import captions');
+		return { timeline: snapshot(), summary };
+	}
+	return invoke<CaptionImportResult>('import_captions_text', {
+		text,
+		format: req.format ?? null,
+		base: req.base ?? null,
+		assetId: req.assetId ?? null,
+		options: req.options ?? null
+	});
 }
 
 /** Write an asset's transcript to a `.srt` file; returns the path. */

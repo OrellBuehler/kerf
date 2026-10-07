@@ -254,8 +254,8 @@ export interface TextOverlay {
 	font?: string | null;
 	bold: boolean;
 	keyframes?: TextKeyframe[];
-	/** Written by `generate_captions` rather than by hand. Regenerating replaces
-	 *  these and leaves typed titles alone. */
+	/** Written by `generate_captions` or `import_captions` rather than by hand.
+	 *  Regenerating or re-importing replaces these and leaves typed titles alone. */
 	generated?: boolean;
 }
 
@@ -272,6 +272,52 @@ export interface CaptionOptions {
 	max_chars?: number;
 	pos_y?: number;
 	size?: number;
+}
+
+/** A subtitle format Kerf reads: SubRip (`.srt`) or ASS / SSA (`.ass`, `.ssa`). */
+export type CaptionFormat = 'srt' | 'ass';
+
+/** Which clock an imported subtitle file's times are on. `timeline`: a subtitle
+ *  track made for the finished cut (the default). `source`: the file times one
+ *  asset's own footage — a transcript, or subtitles for the uncut recording — and
+ *  each cue is projected through that asset's clips like a transcript. */
+export type CaptionTimeBase = 'timeline' | 'source';
+
+/** What an import did. Every usable cue lands in exactly one of `placed`,
+ *  `dropped_outside` or `dropped_overlap`, so
+ *  `cues === placed + dropped_outside + dropped_overlap`; `captions` can exceed
+ *  `placed` because a long cue is split into several lines. */
+export interface CaptionImportSummary {
+	format: CaptionFormat;
+	/** Usable cues read from the file. */
+	cues: number;
+	/** Cues that put at least one caption on screen. */
+	placed: number;
+	/** Caption overlays written. */
+	captions: number;
+	/** Entries of the file that could not be used. */
+	skipped_lines: number;
+	/** Cues past the end of the cut, or timing footage no clip shows. */
+	dropped_outside: number;
+	/** Cues that lost their slot: captions are one lane, never two at once. */
+	dropped_overlap: number;
+	/** Earlier generated / imported captions this import replaced. */
+	replaced: number;
+}
+
+/** The refreshed cut and what the import did. */
+export interface CaptionImportResult {
+	timeline: Timeline;
+	summary: CaptionImportSummary;
+}
+
+/** How a subtitle file is laid onto the cut. */
+export interface CaptionImportRequest {
+	/** Defaults to `timeline`; `source` needs `assetId`, and `assetId` alone implies it. */
+	base?: CaptionTimeBase;
+	assetId?: string;
+	/** The caption look, as `generate_captions` takes it. */
+	options?: CaptionOptions;
 }
 
 export interface Clip {

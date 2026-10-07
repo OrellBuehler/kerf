@@ -169,6 +169,126 @@ export function timeChunks(
 	}
 }
 
+/** One caption line on its way to the screen: when, what, and which input it was
+ *  cut from. `origin` lets an import say *which cue* fell outside the cut or lost
+ *  its slot to another; transcript captioning never reads it. */
+export interface CaptionLine {
+	start: number;
+	end: number;
+	text: string;
+	origin: number;
+}
+
+/** Chunk `text` over a span into caption lines and keep what lies inside the
+ *  window. The span is chunked *whole* and each line is clipped afterwards, so a
+ *  sentence cut in half captions only the half still in the cut. Mirrors
+ *  `push_caption_lines`. */
+export function pushCaptionLines(
+	lines: CaptionLine[],
+	text: string,
+	span: { start: number; end: number },
+	window: { start: number; end: number },
+	origin: number,
+	opts: CaptionOpts
+) {
+	for (const line of timeChunks(chunkWords(text, opts), span.start, span.end, opts.min_line)) {
+		const start = Math.max(line.start, window.start);
+		const end = Math.min(line.end, window.end);
+		if (end - start < opts.min_visible) continue;
+		lines.push({ start, end, text: line.text, origin });
+	}
+}
+
+/** The clips that actually reach the render: muted and solo-shadowed tracks and
+ *  disabled clips removed. Mirrors `Timeline::for_render`. */
+export function renderedClips(timeline: Timeline): Clip[] {
+	const soloed = new Set(timeline.tracks.filter((t) => t.solo).map((t) => t.kind));
+	const out: Clip[] = [];
+	for (const track of timeline.tracks) {
+		if (track.muted || (soloed.has(track.kind) && !track.solo)) continue;
+		for (const clip of track.clips) if (clip.enabled !== false) out.push(clip);
+	}
+	return out;
+}
+
+/** Project timed text in a clip's **source** time through every clip that shows
+ *  its footage. `segmentsFor` says which text belongs to an asset. Mirrors
+ *  `project_through_clips`. */
+export function projectThroughClips(
+	timeline: Timeline,
+	segmentsFor: (assetId: string) => TranscriptSegment[] | undefined,
+	opts: CaptionOpts
+): CaptionLine[] {
+	const lines: CaptionLine[] = [];
+	for (const clip of renderedClips(timeline)) {
+		const segments = segmentsFor(clip.asset_id);
+		if (!segments) continue;
+		const window = { start: clip.timeline_start, end: clip.timeline_start + clipDuration(clip) };
+		segments.forEach((seg, origin) => {
+			const text = seg.text.trim();
+			const timed = Number.isFinite(seg.start) && Number.isFinite(seg.end) && seg.end > seg.start;
+			if (!text || !timed || !coversSource(clip, seg.start, seg.end)) return;
+			const a = sourceToTimeline(clip, seg.start);
+			const b = sourceToTimeline(clip, seg.end);
+			pushCaptionLines(lines, text, { start: Math.min(a, b), end: Math.max(a, b) }, window, origin, opts);
+		});
+	}
+	return lines;
+}
+
+/** Settle chunked lines into the caption lane: ordered, de-duplicated, never two
+ *  on screen at once, each sized to fit the frame. Each overlay comes back with
+ *  the `origin` of the line it was made from. Mirrors `settle_caption_lines`. */
+export function settleCaptionLines(
+	lines: CaptionLine[],
+	opts: CaptionOpts,
+	aspect: number
+): { overlay: Omit<TextOverlay, 'id'>; origin: number }[] {
+	const sorted = [...lines].sort((x, y) => x.start - y.start || compareText(x.text, y.text));
+	// The same words can reach two clips (`extract_audio` leaves picture and
+	// detached audio both on the asset); drawing one twice is drawing it bolder.
+	const deduped = sorted.filter(
+		(l, i) => i === 0 || l.text !== sorted[i - 1].text || Math.abs(l.start - sorted[i - 1].start) >= 1e-3
+	);
+	// Captions are one lane of text at one screen position, so two at once is two
+	// unreadable ones. First line in wins the slot; the next starts where it ends,
+	// or is dropped if nothing readable is left of it.
+	const placed: CaptionLine[] = [];
+	for (const l of deduped) {
+		const start = placed.length ? Math.max(l.start, placed[placed.length - 1].end) : l.start;
+		if (l.end - start < opts.min_visible) continue;
+		placed.push({ ...l, start });
+	}
+	return placed.map((l) => ({
+		origin: l.origin,
+		overlay: {
+			text: l.text,
+			start: Math.max(l.start, 0),
+			end: l.end,
+			pos_x: 0.5,
+			pos_y: opts.pos_y,
+			size: fitSize(l.text, opts.size, aspect),
+			color: 'white',
+			bg: 'black@0.5',
+			bold: opts.bold,
+			generated: true
+		}
+	}));
+}
+
+/** Code-point order, like Rust's `str::cmp` on UTF-8 — `localeCompare` would
+ *  order "b" and "B" differently from the backend and so reorder equal-start
+ *  lines. */
+function compareText(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The frame captions are fitted to: the project's own, else 16:9. */
+function captionAspect(timeline: Timeline): number {
+	const fmt = timeline.format;
+	return fmt && fmt.height ? fmt.width / fmt.height : DEFAULT_CAPTION_ASPECT;
+}
+
 /** Caption the cut: project each transcript segment through the clips that
  *  actually show its footage. Mirrors `Timeline::captions`. */
 export function captionsForTimeline(
@@ -176,57 +296,56 @@ export function captionsForTimeline(
 	transcripts: Record<string, TranscriptSegment[]>,
 	opts: CaptionOpts = CAPTION_DEFAULTS
 ): Omit<TextOverlay, 'id'>[] {
-	const fmt = timeline.format;
-	const aspect = fmt && fmt.height ? fmt.width / fmt.height : DEFAULT_CAPTION_ASPECT;
-	const soloed = new Set(timeline.tracks.filter((t) => t.solo).map((t) => t.kind));
-	const lines: { start: number; end: number; text: string }[] = [];
-	for (const track of timeline.tracks) {
-		if (track.muted || (soloed.has(track.kind) && !track.solo)) continue;
-		for (const clip of track.clips) {
-			if (clip.enabled === false) continue;
-			const segments = transcripts[clip.asset_id];
-			if (!segments) continue;
-			const visibleStart = clip.timeline_start;
-			const visibleEnd = clip.timeline_start + clipDuration(clip);
-			for (const seg of segments) {
-				const text = seg.text.trim();
-				if (!text || seg.end <= seg.start || !coversSource(clip, seg.start, seg.end)) continue;
-				// Chunk over the segment's whole projected span, then clip each
-				// line — so a sentence cut in half captions only the surviving half.
-				const a = sourceToTimeline(clip, seg.start);
-				const b = sourceToTimeline(clip, seg.end);
-				for (const line of timeChunks(chunkWords(text, opts), Math.min(a, b), Math.max(a, b), opts.min_line)) {
-					const start = Math.max(line.start, visibleStart);
-					const end = Math.min(line.end, visibleEnd);
-					if (end - start < opts.min_visible) continue;
-					lines.push({ start, end, text: line.text });
-				}
-			}
-		}
+	const lines = projectThroughClips(timeline, (asset) => transcripts[asset], opts);
+	return settleCaptionLines(lines, opts, captionAspect(timeline)).map((l) => l.overlay);
+}
+
+/** Which clock an imported caption file's times are on: `timeline` (a subtitle
+ *  track for the finished cut) or one `source` asset's own footage. */
+export type CaptionBase = { kind: 'timeline' } | { kind: 'source'; assetId: string };
+
+/** Imported cues laid onto the cut: the overlays and an account of every cue.
+ *  `placed + droppedOutside + droppedOverlap` is the number of cues offered. */
+export interface CaptionPlacement {
+	overlays: Omit<TextOverlay, 'id'>[];
+	placed: number;
+	droppedOutside: number;
+	droppedOverlap: number;
+}
+
+/** Lay the cues of an imported subtitle file onto the cut — `captionsForTimeline`
+ *  for text that did not come from a transcript, sharing everything after the
+ *  time mapping. Mirrors `Timeline::place_cues`: a `source` base *is* transcript
+ *  captioning, a `timeline` base takes the times as they stand, clipped to the
+ *  length the cut renders at (with nothing on the timeline there is no end to run
+ *  past), and a muted track does not silence them. */
+export function placeCues(
+	timeline: Timeline,
+	cues: TranscriptSegment[],
+	base: CaptionBase,
+	opts: CaptionOpts = CAPTION_DEFAULTS
+): CaptionPlacement {
+	let lines: CaptionLine[];
+	if (base.kind === 'source') {
+		lines = projectThroughClips(timeline, (id) => (id === base.assetId ? cues : undefined), opts);
+	} else {
+		let cutEnd = 0;
+		for (const clip of renderedClips(timeline)) cutEnd = Math.max(cutEnd, clip.timeline_start + clipDuration(clip));
+		const window = { start: 0, end: cutEnd > 0 ? cutEnd : Infinity };
+		lines = [];
+		cues.forEach((cue, origin) => {
+			const text = cue.text.trim();
+			if (!text || !Number.isFinite(cue.start) || !Number.isFinite(cue.end) || cue.end <= cue.start) return;
+			pushCaptionLines(lines, text, cue, window, origin, opts);
+		});
 	}
-	lines.sort((x, y) => x.start - y.start || x.text.localeCompare(y.text));
-	const deduped = lines.filter(
-		(l, i) => i === 0 || l.text !== lines[i - 1].text || Math.abs(l.start - lines[i - 1].start) >= 1e-3
-	);
-	// Captions are one lane of text at one screen position, so two at once is two
-	// unreadable ones. First line in wins the slot; the next starts where it ends,
-	// or is dropped if nothing readable is left of it.
-	const placed: typeof deduped = [];
-	for (const l of deduped) {
-		const start = placed.length ? Math.max(l.start, placed[placed.length - 1].end) : l.start;
-		if (l.end - start < opts.min_visible) continue;
-		placed.push({ ...l, start });
-	}
-	return placed.map((l) => ({
-		text: l.text,
-		start: Math.max(l.start, 0),
-		end: l.end,
-		pos_x: 0.5,
-		pos_y: opts.pos_y,
-		size: fitSize(l.text, opts.size, aspect),
-		color: 'white',
-		bg: 'black@0.5',
-		bold: opts.bold,
-		generated: true
-	}));
+	const reached = new Set(lines.map((l) => l.origin));
+	const settled = settleCaptionLines(lines, opts, captionAspect(timeline));
+	const kept = new Set(settled.map((l) => l.origin));
+	return {
+		overlays: settled.map((l) => l.overlay),
+		placed: kept.size,
+		droppedOutside: cues.length - reached.size,
+		droppedOverlap: reached.size - kept.size
+	};
 }

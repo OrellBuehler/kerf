@@ -10,14 +10,15 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::captions_import::{parse_captions, CaptionFormat, ImportSummary};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
-use crate::model::default_beat_tolerance;
+use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, Clip, ClipMove, CropFrame, Delivery, EditSource, Framing,
-    Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus,
-    Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect,
-    Voiceover, MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipMove, CropFrame, Delivery,
+    EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo,
+    StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment,
+    Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -3365,6 +3366,111 @@ impl Project {
         Ok(created)
     }
 
+    /// Caption the cut from a subtitle file's text: parse SubRip or ASS / SSA
+    /// (`format` `None` guesses from the text), lay the cues onto the cut and
+    /// write them as caption overlays — as **one** `Import captions` revision.
+    ///
+    /// `base` says which clock the file's times are on. The default,
+    /// [`CaptionTimeBase::Timeline`], is a subtitle file made for the finished
+    /// cut; [`CaptionTimeBase::Source`] is a file that times one asset's own
+    /// footage (a transcript, subtitles for the uncut source) and is projected
+    /// through that asset's clips exactly as a transcript is, so it follows trims,
+    /// reorders and speed changes. [`Timeline::place_cues`] does the placement
+    /// with the same chunking, flicker floors, one-lane rule and frame fit as
+    /// [`Project::generate_captions`], in the style `opts` names.
+    ///
+    /// **The imported set is the caption set.** Its overlays are `generated`, so
+    /// `Recaption` / `Clear captions` / the delivery re-fit treat them like any
+    /// other captions — and that means importing *replaces* the previous
+    /// generated or imported captions (the summary's `replaced` says how many),
+    /// and a later [`Project::generate_captions`] replaces the imported ones.
+    /// Captions are one lane of text at one position; keeping two sets would put
+    /// two on screen at once. Typed titles are never touched.
+    ///
+    /// The text is the caller's to read (see
+    /// [`read_caption_file`](crate::captions_import::read_caption_file), which
+    /// does it with the project lock released). Honors the staging session like
+    /// any edit: an agent's import lands in its proposal. Errors — and writes
+    /// nothing, so the existing captions survive — when the text holds no cues
+    /// or none of them reaches the cut.
+    pub fn import_captions(
+        &self,
+        text: &str,
+        format: Option<CaptionFormat>,
+        base: CaptionTimeBase,
+        opts: CaptionOptions,
+    ) -> Result<ImportSummary> {
+        let (format, parsed) = parse_captions(text, format)?;
+        if parsed.cues.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "no captions found in the {} text ({} entries could not be read)",
+                format.as_str().to_uppercase(),
+                parsed.skipped
+            )));
+        }
+        if let CaptionTimeBase::Source(asset) = base {
+            self.require_asset(asset)?;
+        }
+        let cues: Vec<TranscriptSegment> = parsed
+            .cues
+            .iter()
+            .map(|c| TranscriptSegment {
+                start: c.start,
+                end: c.end,
+                text: c.text.clone(),
+            })
+            .collect();
+        let (first, last) = (parsed.cues[0].start, parsed.cues.iter().map(|c| c.end).fold(0.0, f64::max));
+        // The placement is computed from the very timeline the edit then writes
+        // to — the proposal for an agent that is staging — so there is no gap
+        // between looking at the cut and changing it.
+        let (placement, captions, replaced) = self.edit_timeline("Import captions", |timeline| {
+            if let CaptionTimeBase::Source(asset) = base {
+                if !timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| c.asset_id == asset) {
+                    return Err(Error::InvalidArgument(format!(
+                        "asset {asset} is not used by any clip in the cut; put it on the timeline first, \
+                         or import with base \"timeline\" if the file already times the finished cut"
+                    )));
+                }
+            }
+            let mut placement = timeline.place_cues(&cues, base, opts);
+            if placement.overlays.is_empty() {
+                return Err(Error::InvalidArgument(match base {
+                    CaptionTimeBase::Timeline => format!(
+                        "none of the {} cues fall inside the cut: they run {} to {} and the cut is {} long",
+                        cues.len(),
+                        fmt_time(first),
+                        fmt_time(last),
+                        fmt_time(timeline.for_render().duration()),
+                    ),
+                    CaptionTimeBase::Source(_) => format!(
+                        "none of the {} cues land on footage this asset shows in the cut: they run {} to {} of the \
+                         source (a muted track or a disabled clip does not count)",
+                        cues.len(),
+                        fmt_time(first),
+                        fmt_time(last),
+                    ),
+                }));
+            }
+            let before = timeline.overlays.len();
+            timeline.overlays.retain(|o| !o.generated);
+            let replaced = before - timeline.overlays.len();
+            let captions = placement.overlays.len();
+            timeline.overlays.append(&mut placement.overlays);
+            Ok((placement, captions, replaced))
+        })?;
+        Ok(ImportSummary {
+            format,
+            cues: cues.len(),
+            placed: placement.placed,
+            captions,
+            skipped_lines: parsed.skipped,
+            dropped_outside: placement.dropped_outside,
+            dropped_overlap: placement.dropped_overlap,
+            replaced,
+        })
+    }
+
     /// Read `text` aloud and describe the result as an importable [`Asset`],
     /// *without* `&self` — synthesis runs for seconds to minutes (and may first
     /// download the voice model), so like [`Project::probe_import`] it happens
@@ -3690,6 +3796,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::captions_import::{CaptionFormat, ImportSummary};
     use crate::model::{ClipMove, DiffKind, Fit};
 
     #[test]
@@ -5516,6 +5623,254 @@ mod tests {
         let project = Project::open_in_memory().unwrap();
         let err = project.generate_captions(CaptionOptions::default()).unwrap_err();
         assert!(err.to_string().contains("run analysis first"), "{err}");
+    }
+
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n2\n00:00:04,000 --> 00:00:06,000\nGeneral Kenobi\n";
+
+    /// A project whose timeline is one `len`-second clip of its first asset,
+    /// cut from `source_in`, sitting at `at`.
+    fn project_with_one_clip(source_in: f64, len: f64, at: f64) -> (Project, Uuid) {
+        let project = Project::sample().unwrap();
+        let asset = project.list_assets().unwrap()[0].id;
+        let timeline = project.timeline().unwrap();
+        let track = timeline.tracks[0].id;
+        for t in &timeline.tracks {
+            for clip in &t.clips {
+                project.remove(clip.id).unwrap();
+            }
+        }
+        project
+            .add_clip_to_timeline(asset, Some(track), source_in, source_in + len, Some(at))
+            .unwrap();
+        (project, asset)
+    }
+
+    fn captions_on(project: &Project) -> Vec<TextOverlay> {
+        project
+            .working_timeline()
+            .unwrap()
+            .overlays
+            .into_iter()
+            .filter(|o| o.generated)
+            .collect()
+    }
+
+    #[test]
+    fn importing_a_subtitle_file_is_one_revision_of_generated_captions() {
+        let (project, _) = project_with_one_clip(0.0, 20.0, 0.0);
+        let title = project.add_overlay("Chapter one".to_string(), 0.0, 1.5).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        let summary = project
+            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
+            .unwrap();
+        assert_eq!(
+            summary,
+            ImportSummary {
+                format: CaptionFormat::Srt,
+                cues: 2,
+                placed: 2,
+                captions: 2,
+                skipped_lines: 0,
+                dropped_outside: 0,
+                dropped_overlap: 0,
+                replaced: 0,
+            }
+        );
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1, "one revision, however many captions");
+        let last = history.last().unwrap();
+        assert_eq!((last.label.as_str(), last.source), ("Import captions", EditSource::User));
+
+        let captions = captions_on(&project);
+        assert_eq!(
+            captions.iter().map(|o| (o.text.as_str(), o.start, o.end)).collect::<Vec<_>>(),
+            [("Hello there", 1.0, 3.0), ("General Kenobi", 4.0, 6.0)]
+        );
+        assert!(
+            project.timeline().unwrap().overlays.iter().any(|o| o.id == title.id),
+            "the typed title is untouched"
+        );
+
+        // Importing again replaces the set rather than stacking a second one…
+        let again = project
+            .import_captions(
+                SRT,
+                None,
+                CaptionTimeBase::Timeline,
+                CaptionOptions::styled(CaptionStyle::WordPunch),
+            )
+            .unwrap();
+        assert_eq!(again.replaced, 2);
+        assert_eq!(captions_on(&project).len(), again.captions);
+        assert!(captions_on(&project).iter().all(|o| o.bold), "in the style asked for");
+        // …and Clear takes imported captions exactly as it takes generated ones.
+        assert_eq!(project.clear_captions().unwrap(), again.captions);
+        let overlays = project.timeline().unwrap().overlays;
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].id, title.id);
+    }
+
+    #[test]
+    fn a_later_generate_captions_replaces_an_imported_set() {
+        // The documented interaction: captions are one lane, so whichever set was
+        // written last is the set.
+        let (project, _) = project_with_one_clip(5.5, 7.0, 2.0);
+        project
+            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
+            .unwrap();
+        assert!(captions_on(&project).iter().any(|o| o.text == "Hello there"));
+        let generated = project.generate_captions(CaptionOptions::default()).unwrap();
+        let now = captions_on(&project);
+        assert_eq!(now.len(), generated.len());
+        assert!(!now.iter().any(|o| o.text == "Hello there"), "the imported set was replaced");
+    }
+
+    #[test]
+    fn ass_cues_in_source_time_follow_the_cut() {
+        // The asset's 5.5..12.5 sits at 2.0: source time 6.0 is timeline 2.5.
+        let (project, asset) = project_with_one_clip(5.5, 7.0, 2.0);
+        let ass = "[Script Info]\nTitle: x\n\n[Events]\n\
+                   Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                   Dialogue: 0,0:00:06.00,0:00:08.00,Default,,0,0,0,,Kept\n\
+                   Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Trimmed away\n\
+                   Dialogue: 0,0:00:30.00,0:00:32.00,Default,,0,0,0,,Past the footage\n\
+                   Dialogue: 0,broken\n";
+        let summary = project
+            .import_captions(ass, None, CaptionTimeBase::Source(asset), CaptionOptions::default())
+            .unwrap();
+        assert_eq!(summary.format, CaptionFormat::Ass);
+        assert_eq!(
+            (summary.cues, summary.placed, summary.dropped_outside, summary.skipped_lines),
+            (3, 1, 2, 1)
+        );
+        let captions = captions_on(&project);
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0].text, "Kept");
+        assert!(
+            (captions[0].start - 2.5).abs() < 1e-9 && (captions[0].end - 4.5).abs() < 1e-9,
+            "{:?}",
+            captions[0]
+        );
+    }
+
+    #[test]
+    fn an_import_that_cannot_land_writes_nothing_and_keeps_the_captions_it_would_replace() {
+        let (project, asset) = project_with_one_clip(0.0, 10.0, 0.0);
+        project
+            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
+            .unwrap();
+        let before = project.timeline().unwrap();
+        let revisions = project.history().unwrap().len();
+        let refused = |result: Result<ImportSummary>, needle: &str| {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        };
+
+        // Nothing to read.
+        refused(
+            project.import_captions(
+                "not a subtitle file",
+                None,
+                CaptionTimeBase::Timeline,
+                CaptionOptions::default(),
+            ),
+            "no captions found",
+        );
+        // Every cue after the cut ends.
+        refused(
+            project.import_captions(
+                "1\n00:05:00,000 --> 00:05:02,000\nToo late\n",
+                None,
+                CaptionTimeBase::Timeline,
+                CaptionOptions::default(),
+            ),
+            "fall inside the cut",
+        );
+        // An asset that is not in the project, and one that is but not in the cut.
+        let missing = Uuid::new_v4();
+        assert!(matches!(
+            project.import_captions(SRT, None, CaptionTimeBase::Source(missing), CaptionOptions::default()),
+            Err(Error::AssetNotFound(id)) if id == missing
+        ));
+        let unused = project
+            .list_assets()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .find(|id| *id != asset)
+            .expect("a second sample asset");
+        refused(
+            project.import_captions(SRT, None, CaptionTimeBase::Source(unused), CaptionOptions::default()),
+            "not used by any clip",
+        );
+        // Source time the clips do not show.
+        refused(
+            project.import_captions(
+                "1\n00:09:00,000 --> 00:09:02,000\nElsewhere\n",
+                None,
+                CaptionTimeBase::Source(asset),
+                CaptionOptions::default(),
+            ),
+            "land on footage",
+        );
+        // An ASS file with an unusable Format line.
+        refused(
+            project.import_captions(
+                "[Events]\nFormat: Layer, Text\nDialogue: 0,hi",
+                None,
+                CaptionTimeBase::Timeline,
+                CaptionOptions::default(),
+            ),
+            "Start, End and Text",
+        );
+
+        assert_eq!(project.history().unwrap().len(), revisions, "a refused import is not an edit");
+        assert_eq!(
+            serde_json::to_string(&project.timeline().unwrap()).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_named_format_overrides_the_guess() {
+        let (project, _) = project_with_one_clip(0.0, 10.0, 0.0);
+        let err = project
+            .import_captions(
+                SRT,
+                Some(CaptionFormat::Ass),
+                CaptionTimeBase::Timeline,
+                CaptionOptions::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no captions found in the ASS"), "{err}");
+    }
+
+    #[test]
+    fn an_agents_import_is_staged_and_lands_as_one_agent_revision() {
+        let (mut project, _) = project_with_one_clip(0.0, 10.0, 0.0);
+        project.set_actor(EditSource::Agent);
+        let revisions = project.history().unwrap().len();
+        project.begin_staging(None, None).unwrap();
+
+        let summary = project
+            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
+            .unwrap();
+        assert_eq!(summary.captions, 2);
+
+        // The cut the user is looking at has not moved; the agent's own view has.
+        assert!(project.timeline().unwrap().overlays.is_empty());
+        assert_eq!(captions_on(&project).len(), 2, "the agent sees its proposal");
+        let staged = project.staged().unwrap().expect("a proposal");
+        assert_eq!(staged.edits, ["Import captions"]);
+        assert!(staged.diff.entries.iter().any(|e| e.kind == DiffKind::OverlayAdded));
+        assert_eq!(project.history().unwrap().len(), revisions);
+
+        project.apply_staged(false).unwrap();
+        assert_eq!(project.timeline().unwrap().overlays.len(), 2);
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().source, EditSource::Agent);
     }
 
     /// A phone's HLG footage reaches the preview two ways — straight from the

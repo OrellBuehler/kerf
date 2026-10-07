@@ -653,6 +653,39 @@ no editing logic in the adapter.
   with a `CENTER_BIAS` so a flat map resolves to the plain centre crop rather than to
   whichever edge won by rounding, and `needs_crop` short-circuiting footage that is
   already the delivery shape.
+  **Caption import** (`captions_import.rs` parsers, `Timeline::place_cues`,
+  `Project::import_captions`) puts a subtitle file on the cut through the
+  *transcript* code, not beside it: `Timeline::captions` is now
+  `project_through_clips` + `settle_caption_lines` and `place_cues` calls the same two,
+  so chunking, the flicker floors, the one-lane rule and `fit_size` cannot drift.
+  `CaptionTimeBase::Source(asset)` *is* `captions` over a one-asset map (trim / speed /
+  reverse, `for_render`); `Timeline` (the default) takes the times as they stand,
+  clipped to `for_render().duration()` — a film-length SRT outruns a short cut, an
+  empty timeline has no end to run past — and, unlike source time, a muted track does
+  not silence it (the file captions the finished cut, not one clip's sound). The
+  parsers are pure and tolerant — SubRip (BOM, CRLF / CR, missing or absurd indices, a
+  `,` or `.` fraction read as a *decimal* fraction, `<i>` / `<font>` and `{\an8}`
+  stripped, no blank line between cues with the index handed back to its cue) and ASS /
+  SSA (the `[Events]` `Format:` line picks the columns, `Dialogue:` only, `{…}` blocks
+  and `\p` drawings dropped, `\N` / `\h`) — and what they cannot read is **counted,
+  never fatal** (`skipped_lines`: empty or zero / negative-length cues, a stray line, a
+  bad `Dialogue:`); styles and positions in the file are not imported, since where a
+  caption sits is the `CaptionStyle`'s call. The caps are guards, not tidiness: 5 MiB,
+  10,000 cues, 2,000 chars a cue (the line timer's merge pass is quadratic, so one huge
+  "cue" in word punch would hang), UTF-8 / BOM'd UTF-16 / Latin-1 read as Windows-1252.
+  Lines carry an `origin`, so every cue is accounted for exactly once
+  (`cues == placed + dropped_outside + dropped_overlap`; `captions >= placed`, a long
+  cue being several lines). **Imported overlays are `generated`, on purpose**: captions
+  are one lane of text, so the imported set *is* the caption set — importing replaces
+  the earlier generated / imported captions (`replaced`), Clear / Recaption / the
+  `for_delivery` re-fit treat it like any other, and a later `generate_captions`
+  replaces an imported set (two sets would put two lines on screen at once; typed
+  titles are never touched). A cue's own line breaks are re-flowed by the style — a
+  larger `max_words` / `max_chars` keeps cues whole. It is one `Import captions`
+  revision computed inside the `edit_timeline` closure (an agent's lands in its
+  proposal), and a refused import (no cues, nothing reaching the cut, an asset not on
+  the timeline) writes nothing. Core takes *text*; `read_caption_file` (`.srt` / `.ass` /
+  `.ssa`, regular file, size) runs before the lock in the Tauri command and the MCP tool.
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
@@ -1207,6 +1240,12 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
+`import_captions` is the same step for a `.srt` / `.ass` / `.ssa` file: an absolute
+`path` or inline `text` (exactly one), a `base` (`timeline`, or `source` with an
+`asset_id` — `CaptionTimeBase::resolve`, shared with the GUI, refuses a contradiction
+rather than preferring one half), and the `generate_captions` look; it returns the
+`ImportSummary` rather than every overlay, and the `instructions` call it the caption
+step (last, and it replaces the generated set).
 `generate_voiceover` narrates a script onto the `VO` track (optionally captioning the
 cut in the same call), forwarding synthesis progress to the client's token and
 re-emitting `voiceover-progress` so the GUI shows an agent's voiceover too; like an
@@ -1260,7 +1299,9 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
-time), `export_srt`, `remove_silence`, `snap_to_beats`,
+time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
+the text variant is what an `<input type=file>` or a paste uses; both return
+`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
@@ -1914,7 +1955,11 @@ is the half that only exists with media behind it. `src/lib/captions.ts` is the
 same arrangement again, but *faithful* rather than approximate — captioning is
 arithmetic all the way down, so the harness produces exactly the captions the
 backend would (the mirror caught the two-captions-at-once collision the Rust
-tests had not). The **cover frame** is saved from the preview's context menu
+tests had not) — and `caption-import.ts` carries the subtitle parsers and
+`captions.ts` `placeCues` the same way, which is how `importCaptionsText` (the
+variant the harness and a file input use; `importCaptions(path)` needs the desktop
+app) imports for real under `bun run dev`, with `describeImport` the toast line.
+The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
 `Preview` shows the composited frame under the playhead, and during

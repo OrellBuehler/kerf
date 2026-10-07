@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet,
-    Fit, Keyframe, Mask, Project, Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
-    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    Asset, AssetAnalysis, AudioEffect, CaptionFormat, CaptionOptions, CaptionTimeBase, ClipMove, Delivery, EditSource,
+    ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask, Project, Projection, ReframeKeyframe, Revision,
+    StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1193,6 +1193,74 @@ fn clear_captions(state: State<'_, AppState>) -> CmdResult<Timeline> {
     let project = state.project();
     project.clear_captions().map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// What importing a subtitle file hands back: the refreshed cut, and what the
+/// import did (cues read, placed, skipped, dropped) for the toast.
+#[derive(Serialize)]
+struct CaptionImport {
+    timeline: Timeline,
+    summary: ImportSummary,
+}
+
+/// The two loose arguments every caption import takes — which clock the file's
+/// times are on, and the asset a `source` clock is about — as the one value the
+/// engine works from. The combination rules are the engine's (the MCP tool
+/// shares them); this only parses the asset id.
+fn caption_base(base: Option<&str>, asset_id: Option<&str>) -> CmdResult<CaptionTimeBase> {
+    let asset = asset_id.map(id).transpose()?;
+    CaptionTimeBase::resolve(base, asset).map_err(|e| e.to_string())
+}
+
+/// Caption the cut from a `.srt` / `.ass` / `.ssa` file on disk. `base` is
+/// `timeline` (the file is a subtitle track for the finished cut — the default)
+/// or `source` with an `asset_id` (the file times that asset's own footage, and
+/// is projected through its clips like a transcript); `options` is the same
+/// caption look `generate_captions` takes. The file is read before the project
+/// lock is taken, and the import is one `Import captions` revision that
+/// replaces the previous generated / imported captions.
+#[tauri::command]
+async fn import_captions(
+    state: State<'_, AppState>,
+    path: String,
+    base: Option<String>,
+    asset_id: Option<String>,
+    options: Option<CaptionOptions>,
+) -> CmdResult<CaptionImport> {
+    let base = caption_base(base.as_deref(), asset_id.as_deref())?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let text = kerf_core::read_caption_file(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let summary = project
+            .import_captions(&text, None, base, options.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(CaptionImport { timeline, summary })
+    })
+    .await
+}
+
+/// [`import_captions`] for text the webview already holds (a file read through
+/// an `<input type=file>`, or pasted). `format` is `srt` / `ass` or omitted to
+/// guess from the text.
+#[tauri::command(async)]
+fn import_captions_text(
+    state: State<'_, AppState>,
+    text: String,
+    format: Option<String>,
+    base: Option<String>,
+    asset_id: Option<String>,
+    options: Option<CaptionOptions>,
+) -> CmdResult<CaptionImport> {
+    let base = caption_base(base.as_deref(), asset_id.as_deref())?;
+    let format = CaptionFormat::from_arg(format.as_deref()).map_err(|e| e.to_string())?;
+    let project = state.project();
+    let summary = project
+        .import_captions(&text, format, base, options.unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let timeline = project.timeline().map_err(|e| e.to_string())?;
+    Ok(CaptionImport { timeline, summary })
 }
 
 #[tauri::command]
@@ -2630,6 +2698,8 @@ pub fn run() {
             set_overlay_keyframes,
             generate_captions,
             clear_captions,
+            import_captions,
+            import_captions_text,
             export_srt,
             remove_silence,
             snap_to_beats,
