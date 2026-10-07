@@ -148,6 +148,14 @@ pub fn decode_hwaccel() -> Option<String> {
     }
 }
 
+/// Record that an accelerated decode failed where the software retry of the very
+/// same input worked, so every later preview-class decode skips the accelerated
+/// attempt (see [`decode_hwaccel`]). For background decodes living outside this
+/// file that run their own retry.
+pub(super) fn disable_hwaccel() {
+    HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether hardware encoding may be used at all. `KERF_HW_ENCODE=none` (or
 /// empty, or `0`) forces every internal encode onto the software encoders.
 fn hw_encode_enabled() -> bool {
@@ -993,7 +1001,7 @@ pub(crate) fn tonemap_chain(hdr: Hdr, zscale: bool) -> String {
 }
 
 /// [`tonemap_chain`] for this machine's ffmpeg.
-fn tonemap_filter(hdr: Hdr) -> String {
+pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
 

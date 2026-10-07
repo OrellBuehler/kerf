@@ -212,8 +212,8 @@
 	--statusbar-h: 26px;
 	--track-header-w: 224px;
 	--ruler-h: 26px;
-	--track-h-video: 64px;
-	--track-h-audio: 64px;
+	/* Track heights are not tokens: a track is compact / medium / large, set per
+	   track (`track-heights.ts`). */
 
 	/* ---------- Radii ---------- */
 	--radius-none: 0;

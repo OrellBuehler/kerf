@@ -641,7 +641,7 @@ fn probe_channels(path: &Path) -> Result<u8> {
 
 /// Keep the last few KB of a child's stderr: all a failure message needs, and a
 /// flood of warnings cannot grow it.
-fn drain_tail(mut stderr: impl Read) -> String {
+pub(super) fn drain_tail(mut stderr: impl Read) -> String {
     const KEEP: usize = 8 * 1024;
     let mut tail: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
