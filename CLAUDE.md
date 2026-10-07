@@ -724,8 +724,11 @@ no editing logic in the adapter.
   took 6 s, a full file ~17 min) — and `time_chunks` keeps its weights as it merges
   and stops a scan at the first short line instead of rebuilding and cloning every
   chunk per merge (the output is bit-identical; a test sweeps it against the old
-  implementation), so a cue of a thousand one-letter words in word punch is
-  milliseconds, not seconds. Tests time the pathological inputs at < 1 s unoptimized.
+  implementation). The merge is still **quadratic within a cue** (4x the words
+  costs ~16x), so the per-cue and per-import caps are what bound it: the worst
+  import they allow (100,000 one-letter words in 2,000-char cues) places in about
+  half a second unoptimized. Performance tests assert generous wall-clock limits
+  (seconds) sized to catch the algorithm or a lost cap, never a busy machine.
   Encodings: UTF-8 / BOM'd UTF-16 / Latin-1 read as Windows-1252.
   **Parsing is outside the project lock.** `parse_captions` (after `read_caption_file`)
   is a pure static step that yields a `CaptionFile`; `Project::import_captions(&file,
