@@ -679,7 +679,14 @@ the **commit** stage is hygiene, `typos` (allowlist in `_typos.toml`),
 `commit-msg` enforces the lowercase-imperative subject and rejects AI
 attribution trailers. `prek run --all-files [--hook-stage pre-push]` runs them by
 hand. CI's `lint (prek)` job runs the commit stage (skipping the hooks that have
-their own job), and `ci ok` is one status that is green only when every CI job is.
+their own job), and `ci ok` is one status that is green only when every CI job is. Every
+workflow installs Ubuntu packages through `.github/actions/apt-install` (per-request
+timeouts, apt retries, each command bounded by `sudo timeout -k` and the whole tried
+three times) — a hung or trickling mirror connection otherwise sat until the job's
+timeout and read as a cancelled job. The `timeout` goes *inside* `sudo` with a KILL
+follow-up: apt-get outlives a SIGTERM mid-download, and sudo does not relay a KILL.
+A retry drops `azure.archive.ubuntu.com` from the runner's `apt-mirrors.txt` (the
+mirror that was stalling) and goes through the rest of the list.
 Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 `println!`, justified `unsafe`, a few style lints) — every crate opts in with
 `[lints] workspace = true`.

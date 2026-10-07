@@ -9,11 +9,9 @@ runs:
   steps:
     - name: Install cmake + libclang (Linux)
       if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y cmake libclang-dev
+      uses: ./.github/actions/apt-install
+      with:
+        packages: cmake libclang-dev
 
     - name: Install cmake (macOS)
       if: runner.os == 'macOS'
