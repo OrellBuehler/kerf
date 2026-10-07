@@ -66,7 +66,8 @@ import {
 	ChevronRight,
 	PackageCheck,
 	FoldHorizontal,
-	BetweenHorizontalStart
+	BetweenHorizontalStart,
+	ChartNoAxesGantt
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -137,7 +138,8 @@ export const icons: Record<string, LucideIcon> = {
 	'chevron-right': ChevronRight,
 	'package-check': PackageCheck,
 	'fold-horizontal': FoldHorizontal,
-	'between-horizontal-start': BetweenHorizontalStart
+	'between-horizontal-start': BetweenHorizontalStart,
+	'chart-no-axes-gantt': ChartNoAxesGantt
 };
 
 export type IconName = keyof typeof icons;

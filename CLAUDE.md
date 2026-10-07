@@ -1424,9 +1424,50 @@ otherwise), and a redraw only assigns the canvas size when it changed.
 and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
 a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
 `settings.theme` change. A stereo clip gets two lanes when its clip is at least
-`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so track-height
-presets can drive it) and folds to one below that; the default 64 px track is stereo.
+`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so the track-height
+presets drive it) and folds to one below that; the default 64 px track is stereo.
 `get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**Filmstrips** are the video twin: one `<canvas>` per video clip over its on-screen part
+(`ClipFilmstrip.svelte`; the waveform's windowing, DPR cap and size discipline), blitted from
+the asset's `get_filmstrip` sheets. `filmstrip-view.ts` is the pure layout: a clip is a row of
+**slots**, each the thumbnail's aspect at the clip's height in whole px, the grid anchored at
+the clip's left edge (a scroll moves nothing on it); slot `i` shows the frame at the source
+time under the middle of its *visible* part, through `waveform-view.ts`'s `sourceAt` (trim /
+speed / reverse — a reversed clip's footage runs backwards, never flipped) and
+`filmstrip-geometry.ts`'s `frameAt` / `locate`; slot edges are rounded as *edges*, so
+neighbours never seam; a still is its one thumbnail repeated. `filmstrip-draw.ts` paints;
+`filmstrip-cache.ts` (injectable fetcher + decoder; the app's instance is `filmstrips.ts`,
+which decodes a sheet's `data:` URL through an `Image` then `createImageBitmap` — never
+`fetch`, `connect-src` refuses `data:`) keeps one decoded strip per **asset** (a split's two
+clips share it): one in-flight load per asset, two at a time newest interest first, queued
+loads nobody wants dropped, a failed asset held off with `backoff.ts`'s doubling cooldown (the
+waveform cache's rule; one warning toast), memory bounded **in bytes** (192 MB, LRU by asset,
+the one just loaded never evicted). A clip box under 28 px shows none and never fetches;
+until drawn the clip keeps its plain look, and once drawn its label moves to the foot on a
+scrim backing so a bright frame cannot swallow it.
+**Track heights** are three named presets (`track-heights.ts`): compact 32 / medium 64 (what
+it always was) / large 112 px of lane. Everything else is a function of the clip box the lane
+leaves, so nothing else knows about presets: compact (21 px) folds a stereo waveform to one
+lane, shows no thumbnails or clip grab handles, and drops the header's mixer strip; large
+(101 px) gives two readable lanes and near-native thumbnails. It is a viewer's choice, not
+part of the cut, so it is **UI-only** (`ui.heights`, per track id in `localStorage`
+`kerf.timeline.heights`; a `Track.height` field would be engine work for a per-viewer
+convenience): `all` is the global choice (what "all tracks" last set, what a track with no
+choice of its own is, and what the **titles lane** follows), a track set to it drops its
+override, "all tracks" clears every exception, and the table is capped at 256. The toolbar's
+three glyph buttons set all tracks (lit when every track agrees); a track header's name is its
+menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
+so they follow the heights.
+The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered) is
+the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
+merge, so blocks are bounded by the strip's width), the playhead, the in / out marks, and the
+visible window as a box. The box and the timeline's `scrollLeft` / zoom are one thing seen two
+ways (`windowRect` view -> box, `targetForRect` box -> view). Drag the body to scroll (the zoom
+is kept *exactly*, not re-derived from a box widened to its 8 px minimum), drag an edge to
+zoom (the other edge stays put, even after the zoom was clamped), press the bare strip to jump
+there (and keep dragging), double-click to move the playhead. Gestures are absolute from the
+press, Escape restores the view, and the timeline applies the result like a wheel zoom
+(`pendingScroll`).
 **`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
 (dB scale −36 dB…`MAX_GAIN` (+6 dB, `mixer.ts`) — one ceiling shared with the Inspector's
 slider and the track fader, a clip set above it by an agent keeps its value and is drawn at
