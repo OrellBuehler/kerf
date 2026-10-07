@@ -1294,13 +1294,14 @@ the engine, the cores it works out to, and the machine it is a share of —
 of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
 The file also carries the **workspaces** (which one is active, each one's
-dock arrangement, the library rail's tab and folded state), the **color theme**
-and `layout` — the single arrangement from before there were workspaces, now only
-migrated from — as opaque `serde_json::Value`s: the frontend owns their shape and
+dock arrangement, the library rail's tab and folded state), the **color theme**,
+the **keybindings** the user changed and `layout` — the single arrangement from
+before there were workspaces, now only migrated from — as opaque
+`serde_json::Value`s: the frontend owns their shape and
 validates them on the way back in, so `get_settings` re-reads the file for those
 where the engine-held values are read live). **`set_settings` takes a patch**,
 not the whole object — only the fields that changed (`{workspaces}`, `{theme}`,
-`{cpu_percent}`), merged into the file under a mutex, and only those fields are
+`{keybindings}`, `{cpu_percent}`), merged into the file under a mutex, and only those fields are
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
 directory, fsync, rename over), and a file that does not parse is moved aside to
@@ -1992,11 +1993,12 @@ engine. Below the queue, the **History** section renders
 
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close), and `+page.svelte` makes the app behind them `inert` and returns early from
-its global key handler while any is open — Space / Delete / J-K-L / ⌘Z would
+close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
+which focuses itself) `inert` and returns early from its global key handler while
+any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
-Bare-key shortcuts already stand down inside any text input / textarea / select /
-contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
+Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
+textarea / select / contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
@@ -2024,9 +2026,48 @@ notice was about. It is also why the failure paths that used to reject into noth
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
 calls) now report: a notice that is never raised cannot be recovered from a log.
 
+**Keyboard shortcuts are an action registry, not key checks.** `src/lib/keymap.ts`
+(pure, bun-tested) names every shortcut as an action — id, label, group, default
+chord(s) — and `+page.svelte`'s one window handler asks `settings.actionFor(e)`
+which action an event is and runs that id's entry in a `Record<ActionId, handler>`
+(an action without a handler is a type error; a handler returns `false` when it
+did not take the key). Nothing else spells a key: menus and tooltips read
+`settings.shortcut(id)` / `withShortcut(label, id)`, and `keymap.test.ts` scans the
+sources so a hand-written `(⌘Z)` or `shortcut: 'Del'` fails. Chords match what the
+key *types* (`KeyboardEvent.key`, so AZERTY / Dvorak get their Z; a non-ASCII
+character falls back to the physical key's US letter; Shift is dropped from
+punctuation, since `+` is Shift+= on one layout and bare on another; a key that
+would not read back from its stored spelling — `ß`, macOS's no-break space for ⌥Space
+(which is `Space`) — is never recorded as something that silently vanishes). `Mod` in the
+stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* its
+modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
+`keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
+stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone).
+**Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
+like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
+nothing is customised), so an untouched action follows the running build's defaults
+and changing a default needs no migration; `KEYMAP_VERSION` / `MIGRATIONS` carry a
+customisation across a rename or split, and `parseKeyOverrides` drops unknown ids
+and unreadable chords and forgets anything equal to the defaults (a stored `[]` is
+a deliberate unbind). `resolveBindings` keeps what fires unambiguous: a customised
+chord beats another action's *default* (a later build's new default never steals a
+key already in use), and any other collision goes to the earlier registry entry.
+An action marked `repeat: false` (paste, duplicate, marker, ripple toggle, play /
+pause, the file commands, …) acts once per press — the page swallows a held key's
+auto-repeat — while stepping, zooming and undo keep repeating.
+**Settings › Keyboard** (`KeyboardSettings.svelte`) is search, click-to-record
+(Esc cancels, Backspace removes, Tab leaves), a conflict prompt naming the other
+action with Swap / Unbind / Cancel (`applyRebind` never guesses; Cancel has the
+focus, so a held Enter cannot answer it), per-row Reset — on offer whenever the
+chords in force differ from the defaults, and asking the same question when another
+action has since taken one (`applyReset`) — and Reset all, and a read-only list of the keys that are *not* rebindable (Esc
+abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
+control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
+after every change: focus left on the page behind a modal stops Escape closing it.
+
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Four
+panel, so the next preference is a row in a list rather than new chrome. Five
 sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
@@ -2047,10 +2088,10 @@ at once (`applyTheme`) and is written 300 ms later — a picker fires per pixel
 of a drag — and while one is pending a view coming back from another write
 leaves the theme alone, so the newer colors never flicker back. Changing any
 color makes the theme `Custom` (`presetIdFor` compares colors, not the name).
-The percentage is clamped by the engine, so the
+And **Keyboard**, described above. The percentage is clamped by the engine, so the
 view that comes *back* from `set_settings` is what renders, not the value asked
 for; in the browser harness `api.ts` answers from localStorage
-(`kerf.settings.*`, the layout and theme as JSON strings) over
+(`kerf.settings.*`, the layout, theme, workspaces and keybindings as JSON strings) over
 `navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,

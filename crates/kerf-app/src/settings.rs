@@ -48,6 +48,12 @@ pub struct Settings {
     /// to its presets. `layout` is kept as the pre-workspaces arrangement the
     /// frontend migrates into the Edit workspace when this is absent.
     pub workspaces: Option<serde_json::Value>,
+    /// The keyboard shortcuts the user changed: `{ version, bindings: { <action
+    /// id>: [<chord>, …] } }`, only the actions they touched — an untouched one
+    /// follows the defaults of the running build. Opaque like the rest: the
+    /// frontend owns the action registry, the chord syntax and the migration
+    /// between versions, so a new action or a renamed one needs no change here.
+    pub keybindings: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -59,6 +65,7 @@ impl Default for Settings {
             layout: None,
             theme: None,
             workspaces: None,
+            keybindings: None,
         }
     }
 }
@@ -90,14 +97,15 @@ pub struct SettingsView {
     pub layout: Option<serde_json::Value>,
     pub theme: Option<serde_json::Value>,
     pub workspaces: Option<serde_json::Value>,
+    pub keybindings: Option<serde_json::Value>,
 }
 
 impl SettingsView {
     /// The engine-held preferences read straight from the engine rather than
     /// from the stored file, so what the dialog shows is what is actually in
     /// force — including an environment override the user set outside the
-    /// app. The layout, theme and workspaces only exist in the file, so those
-    /// come from `stored`.
+    /// app. The layout, theme, workspaces and keybindings only exist in the
+    /// file, so those come from `stored`.
     pub fn current(stored: &Settings) -> Self {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
@@ -109,6 +117,7 @@ impl SettingsView {
             layout: stored.layout.clone(),
             theme: stored.theme.clone(),
             workspaces: stored.workspaces.clone(),
+            keybindings: stored.keybindings.clone(),
         }
     }
 }
@@ -120,7 +129,15 @@ impl SettingsView {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`].
-const KEYS: [&str; 6] = ["cpu_percent", "transcribe", "safe_areas", "layout", "theme", "workspaces"];
+const KEYS: [&str; 7] = [
+    "cpu_percent",
+    "transcribe",
+    "safe_areas",
+    "layout",
+    "theme",
+    "workspaces",
+    "keybindings",
+];
 
 fn path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|dir| dir.join("settings.json"))
@@ -200,8 +217,8 @@ fn save_to(file: &Path, settings: &Settings) -> Result<(), String> {
 }
 
 /// Merge a patch — a JSON object holding only the fields that changed — into
-/// `settings`. A field present with `null` clears it (the layout, theme and
-/// workspaces are nullable); a field left out is untouched.
+/// `settings`. A field present with `null` clears it (the layout, theme,
+/// workspaces and keybindings are nullable); a field left out is untouched.
 fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, String> {
     let serde_json::Value::Object(patch) = patch else {
         return Err("a settings patch must be an object".to_string());
@@ -278,6 +295,7 @@ mod tests {
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
         assert!(s.workspaces.is_none());
+        assert!(s.keybindings.is_none());
     }
 
     #[test]
@@ -332,6 +350,45 @@ mod tests {
         // A null clears it, back to "never customized".
         let cleared = merge(&merged, &serde_json::json!({"workspaces": null})).unwrap();
         assert!(cleared.workspaces.is_none());
+    }
+
+    #[test]
+    fn keybindings_round_trip_untouched_and_reach_the_view() {
+        let keybindings = serde_json::json!({
+            "version": 1,
+            "bindings": {"playback.toggle": ["P"], "edit.undo": [], "edit.redo": ["Mod+Shift+Z", "Mod+Y"]}
+        });
+        let s = Settings {
+            keybindings: Some(keybindings.clone()),
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.keybindings, Some(keybindings.clone()));
+        // An empty list is a choice (unbound) and survives as one.
+        assert_eq!(SettingsView::current(&back).keybindings, Some(keybindings));
+    }
+
+    #[test]
+    fn a_keybindings_patch_changes_only_that_field() {
+        let base = Settings {
+            cpu_percent: 40,
+            theme: Some(serde_json::json!({"name": "Mine"})),
+            workspaces: Some(serde_json::json!({"active": "edit"})),
+            keybindings: Some(serde_json::json!({"version": 1, "bindings": {"tool.razor": ["B"]}})),
+            ..Settings::default()
+        };
+        let next = serde_json::json!({"version": 1, "bindings": {"playback.toggle": ["P"]}});
+        let merged = merge(&base, &serde_json::json!({ "keybindings": next })).unwrap();
+        assert_eq!(merged.keybindings, Some(next));
+        assert_eq!(merged.cpu_percent, 40);
+        assert_eq!(merged.theme, base.theme);
+        assert_eq!(merged.workspaces, base.workspaces);
+        // A patch for something else leaves the shortcuts alone…
+        let other = merge(&base, &serde_json::json!({"transcribe": false})).unwrap();
+        assert_eq!(other.keybindings, base.keybindings);
+        // …and a null is "back to the defaults".
+        let cleared = merge(&merged, &serde_json::json!({"keybindings": null})).unwrap();
+        assert!(cleared.keybindings.is_none());
     }
 
     fn scratch() -> PathBuf {
@@ -389,15 +446,18 @@ mod tests {
     fn save_then_load_round_trips() {
         let dir = scratch();
         let file = dir.join("nested").join("settings.json");
+        let keybindings = serde_json::json!({"version": 1, "bindings": {"tool.razor": ["B"]}});
         let s = Settings {
             cpu_percent: 33,
             safe_areas: true,
+            keybindings: Some(keybindings.clone()),
             ..Settings::default()
         };
         save_to(&file, &s).unwrap();
         let back = load_from(&file);
         assert_eq!(back.cpu_percent, 33);
         assert!(back.safe_areas);
+        assert_eq!(back.keybindings, Some(keybindings));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

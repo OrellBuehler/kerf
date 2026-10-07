@@ -11,6 +11,8 @@
 	import { workspaceSpec } from '$lib/workspaces';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
 	import { toast } from '$lib/notifications.svelte';
+	import { settings } from '$lib/settings.svelte';
+	import type { ActionId } from '$lib/keymap';
 
 	let {
 		onNew,
@@ -20,9 +22,11 @@
 	}: { onNew: () => void; onExport: () => void; onOpen: () => void; onSave: () => void } =
 		$props();
 
-	const tools: [Tool, string, string][] = [
-		['pointer', 'MousePointer2', 'Select (V)'],
-		['razor', 'Scissors', 'Razor (C)']
+	// [tool, icon, name, the action whose key selects it] — the hint is read from
+	// the keymap, so it shows the key the user actually has.
+	const tools: [Tool, string, string, ActionId][] = [
+		['pointer', 'MousePointer2', 'Select', 'tool.pointer'],
+		['razor', 'Scissors', 'Razor', 'tool.razor']
 	];
 
 	// The frame the cut is being made for. Changing it reshapes the preview, the
@@ -76,8 +80,8 @@
 <div
 	style="height:var(--toolbar-h);display:flex;align-items:center;gap:6px;padding:0 12px;background:var(--surface-panel);border-bottom:var(--line-width) solid var(--border-default);flex:none"
 >
-	{#each tools as [id, ic, t] (id)}
-		<IconBtn title={t} active={ui.tool === id} onclick={() => (ui.tool = id)}>
+	{#each tools as [id, ic, name, action] (id)}
+		<IconBtn title={settings.withShortcut(name, action)} active={ui.tool === id} onclick={() => (ui.tool = id)}>
 			<Icon n={ic} />
 		</IconBtn>
 	{/each}
@@ -88,7 +92,7 @@
 	{@render divider()}
 
 	<IconBtn
-		title="Undo (⌘Z)"
+		title={settings.withShortcut('Undo', 'edit.undo')}
 		disabled={!editor.canUndo}
 		onclick={() => editor.undo()}
 		style={editor.canUndo ? '' : 'opacity:.4;cursor:default'}
@@ -96,7 +100,7 @@
 		<Icon n="undo" />
 	</IconBtn>
 	<IconBtn
-		title="Redo (⇧⌘Z)"
+		title={settings.withShortcut('Redo', 'edit.redo')}
 		disabled={!editor.canRedo}
 		onclick={() => editor.redo()}
 		style={editor.canRedo ? '' : 'opacity:.4;cursor:default'}
@@ -106,15 +110,19 @@
 
 	{@render divider()}
 
-	<IconBtn title="Skip to start" onclick={() => ui.seek(0)}><Icon n="skip-back" /></IconBtn>
+	<IconBtn title={settings.withShortcut('Skip to start', 'playback.toStart')} onclick={() => ui.seek(0)}
+		><Icon n="skip-back" /></IconBtn
+	>
 	<IconBtn
-		title={ui.playing ? 'Pause' : 'Play'}
+		title={settings.withShortcut(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
 		onclick={() => ui.togglePlay()}
 		style="background:var(--surface-hover);color:var(--text-primary)"
 	>
 		<Icon n={ui.playing ? 'pause' : 'play'} />
 	</IconBtn>
-	<IconBtn title="Skip to end" onclick={() => ui.seek(editor.duration)}><Icon n="skip-forward" /></IconBtn>
+	<IconBtn title={settings.withShortcut('Skip to end', 'playback.toEnd')} onclick={() => ui.seek(editor.duration)}
+		><Icon n="skip-forward" /></IconBtn
+	>
 	<span title={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`} style="font-family:var(--font-mono);font-size:13px;color:var(--kerf-300);margin-left:6px;font-weight:500">
 		{tc(ui.time)}
 	</span>
@@ -135,14 +143,18 @@
 
 	<div style="flex:1"></div>
 
-	<Btn variant="ghost" size="sm" icon="file-plus" onclick={onNew} title="New empty project">New</Btn>
-	<Btn variant="ghost" size="sm" icon="folder-open" onclick={onOpen} title="Open project…">Open</Btn>
+	<Btn variant="ghost" size="sm" icon="file-plus" onclick={onNew} title={settings.withShortcut('New empty project', 'file.new')}
+		>New</Btn
+	>
+	<Btn variant="ghost" size="sm" icon="folder-open" onclick={onOpen} title={settings.withShortcut('Open project…', 'file.open')}
+		>Open</Btn
+	>
 	<Btn
 		variant={editor.saved ? 'ghost' : 'secondary'}
 		size="sm"
 		icon="save"
 		onclick={onSave}
-		title="Save project as…">Save</Btn
+		title={settings.withShortcut('Save project as…', 'file.save')}>Save</Btn
 	>
 	{@render divider()}
 	<Btn
@@ -153,5 +165,7 @@
 		onclick={pickPanels}>Panels</Btn
 	>
 	{@render divider()}
-	<Btn variant="primary" size="sm" icon="upload" onclick={onExport}>Export</Btn>
+	<Btn variant="primary" size="sm" icon="upload" onclick={onExport} title={settings.withShortcut('Export', 'file.export')}
+		>Export</Btn
+	>
 </div>
