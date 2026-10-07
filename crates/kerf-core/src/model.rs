@@ -75,7 +75,7 @@ impl Projection {
 }
 
 /// Structured description of a single stream inside an imported asset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub index: u32,
     pub kind: StreamKind,
