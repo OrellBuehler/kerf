@@ -142,7 +142,7 @@
 >
 	<div
 		onclick={(e) => e.stopPropagation()}
-		style="width:560px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden"
+		style="width:560px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
 	>
 		<div
 			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border-default)"

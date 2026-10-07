@@ -12,7 +12,7 @@
 import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
-import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
+import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
 import {
 	defaultWorkspaces,
@@ -106,7 +106,8 @@ class SettingsStore {
 			this.workspacesRead = true;
 		}
 		if (!this.themeDirty) {
-			this.theme = parseTheme(view.theme) ?? PRESETS['kerf-dark'];
+			const stored = parseTheme(view.theme);
+			this.theme = stored ? upgradeStoredTheme(stored) : PRESETS['kerf-dark'];
 			applyTheme(this.theme);
 		}
 		this.loaded = true;
