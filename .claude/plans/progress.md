@@ -44,6 +44,21 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   stands in for `main` (each finished WP merged into it with `--no-ff`), so
   later WPs build on earlier ones. When access returns, the branches are pushed
   and PRs opened in merge order.
+- **2026-10-07 — push access restored; stacked PRs.** The finished branches were
+  pushed in merge order. At most three PRs are open at once, each based on the
+  branch before it, so every diff shows one work package and CI runs on the
+  combined tree. When the lowest one merges, the next is retargeted to `main` and
+  `main` is merged up the stack. `local/main` is retired.
+- **2026-10-07 — FFmpeg repin.** BtbN pruned `autobuild-2026-09-22-13-18`, so every
+  pinned engine job 404'd, on `main` too. The pin moved to `autobuild-2026-10-07-13-07`
+  (same 9.0 branch, n9.0.2-22), on the first PR of the stack. `--repin` needs the
+  GitHub API, which the sandbox blocks for BtbN, so the tag was read via `git
+  ls-remote`, the build name via `git describe` of FFmpeg's `release/9.0`, and the
+  digests from the downloads. Parity and the pick tests pass on it.
+- **2026-10-07 — subagent limit.** The weekly subagent quota ran out mid-session
+  (it resets 2026-10-12). The three stopped packages (linked A/V, mixer, A1b-1 fixes)
+  were finished directly, with the same verification and no second independent
+  review. They get one before merge, once agents are available.
 - **2026-10-06 — main did not type-check.** The hand-off merge (#89) left
   duplicated imports/script blocks (21 svelte-check errors, dev server 500).
   Fixed on its own branch `fix/hand-off-duplicates` (to merge first); B1 merges
