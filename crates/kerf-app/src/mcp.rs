@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionOptions, CaptionStyle, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project,
-    Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionOptions, CaptionStyle, ClipMove, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape,
+    Project, Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -110,6 +110,10 @@ struct VoiceoverParams {
         description = "Caption the cut afterwards in this style (`lines` or `word_punch`), the same as generate_captions. Omit to leave captions alone."
     )]
     caption_style: Option<CaptionStyle>,
+    #[schemars(
+        description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -158,6 +162,10 @@ struct AddClipParams {
     source_out: f64,
     #[schemars(description = "Timeline position (seconds); omit to append")]
     timeline_start: Option<f64>,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, a clip dropped onto footage that is already there pushes that footage and everything after it later by the clip's length; appending, or filling a gap it fits in, moves nothing either way. false places the clip exactly as asked. Tracks ripple independently. A clip dropped INSIDE an existing clip would need that clip split, so ripple cannot make room: it leaves the two overlapping — place clips on the boundary between two, or split first, and check get_timeline_state. More generally ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -166,6 +174,10 @@ struct SplitParams {
     clip_id: String,
     #[schemars(description = "Timeline time at which to split (seconds)")]
     at: f64,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). A split changes no length, so ripple never moves anything here; the parameter exists so a call can state its intent either way."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -181,6 +193,10 @@ struct TrimParams {
                        when trimming the left edge so the clip's right edge stays put"
     )]
     timeline_start: Option<f64>,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's length, keeping their gaps, and a left-edge trim keeps the clip's start (so timeline_start is not needed). false trims in place and leaves later clips where they are. Tracks ripple independently (trimming on V1 never moves A1). Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -197,6 +213,50 @@ struct ReorderParams {
 struct ClipIdParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RemoveClipParams {
+    #[schemars(description = "UUID of the clip to remove")]
+    clip_id: String,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true closes the gap the clip leaves: the later clips on its track shift left by its length, gaps kept (ripple_delete is the same thing as a tool of its own). false leaves the gap. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RemoveClipsParams {
+    #[schemars(description = "UUIDs of the clips to remove, on any tracks; a clip named twice is removed once")]
+    clip_ids: Vec<String>,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true is a multi-clip ripple delete: every track closes up behind what it lost, each by its own removed length, gaps kept. false leaves the gaps. Tracks ripple independently. The result's `rippled` / `clips_shifted` say whether anything actually moved."
+    )]
+    ripple: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ClipMoveParams {
+    #[schemars(description = "UUID of the clip to move")]
+    clip_id: String,
+    #[schemars(description = "Where the clip starts afterwards, in absolute timeline seconds (not an offset); must be >= 0")]
+    timeline_start: f64,
+    #[schemars(description = "Destination track UUID (must be the same kind); omit to keep the clip on its current track")]
+    track_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct MoveClipsParams {
+    #[schemars(
+        description = "The clips to move and where each lands. Every clip may appear once. The group is checked as a group: clips moving together may pass through the places they are leaving, but may not overlap each other or a clip that stays."
+    )]
+    moves: Vec<ClipMoveParams>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetRippleModeParams {
+    #[schemars(description = "true to turn ripple mode on for the project, false to turn it off")]
+    on: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -405,6 +465,10 @@ struct SpeedParams {
     clip_id: String,
     #[schemars(description = "Playback rate: 1.0 = normal, 2.0 = 2x faster, 0.5 = half speed, negative = reverse")]
     speed: f64,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false retimes the clip and leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1064,13 +1128,19 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Add a clip referencing a source range of an asset to the timeline")]
+    #[tool(
+        description = "Add a clip referencing a source range of an asset to the timeline. Appended after the \
+                       track's last clip unless timeline_start says where. In ripple mode (get_ripple_mode, or \
+                       pass `ripple`) a clip dropped onto footage that is already there pushes it later."
+    )]
     fn add_clip_to_timeline(&self, Parameters(p): Parameters<AddClipParams>) -> Result<String, McpError> {
         let asset_id = parse_id(&p.asset_id)?;
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
         self.edit(|project| {
             let out = project
-                .add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+                .with_ripple(p.ripple, |project| {
+                    project.add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+                })
                 .map_err(core_err)?;
             json(&out)
         })
@@ -1080,17 +1150,26 @@ impl KerfMcp {
     fn split_at(&self, Parameters(p): Parameters<SplitParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
-            let (left, right) = project.split_at(clip_id, p.at).map_err(core_err)?;
+            let (left, right) = project
+                .with_ripple(p.ripple, |project| project.split_at(clip_id, p.at))
+                .map_err(core_err)?;
             json(&serde_json::json!({ "left": left, "right": right }))
         })
     }
 
-    #[tool(description = "Trim a clip's source in/out points (timeline position preserved unless timeline_start is passed)")]
+    #[tool(
+        description = "Trim a clip's source in/out points (timeline position preserved unless timeline_start is \
+                       passed). In ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track \
+                       follow the change in the clip's length and a left-edge trim keeps the clip's start. \
+                       Returns the clip as it ended up."
+    )]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
             let out = project
-                .trim(clip_id, p.source_in, p.source_out, p.timeline_start)
+                .with_ripple(p.ripple, |project| {
+                    project.trim(clip_id, p.source_in, p.source_out, p.timeline_start)
+                })
                 .map_err(core_err)?;
             json(&out)
         })
@@ -1114,6 +1193,24 @@ impl KerfMcp {
         let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
         self.edit(|project| {
             let out = project.move_clip(clip_id, p.timeline_start, track_id).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Move several clips in ONE edit (one revision, one undo step): each entry names a clip, \
+                       where it starts afterwards (absolute timeline seconds, not an offset) and optionally \
+                       another track of the same kind. All or nothing — an unknown clip, a start before 0, a \
+                       clip named twice, a locked track or a landing spot that overlaps a clip that stays (or \
+                       another clip in the group) refuses the whole call and changes nothing. Clips moving \
+                       together may pass through the places they are leaving, so nudging a run of abutting \
+                       clips by a second is fine, and two clips can swap. Never ripples, whatever the ripple \
+                       mode. Returns the moved clips in the order given."
+    )]
+    fn move_clips(&self, Parameters(p): Parameters<MoveClipsParams>) -> Result<String, McpError> {
+        let moves = clip_moves(&p.moves)?;
+        self.edit(|project| {
+            let out = project.move_clips(&moves).map_err(core_err)?;
             json(&out)
         })
     }
@@ -1364,13 +1461,86 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Remove a clip from the timeline")]
-    fn remove(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+    #[tool(
+        description = "Remove a clip from the timeline. Leaves a gap where it was, unless the project is in ripple \
+                       mode (get_ripple_mode) or `ripple` is true, which closes it."
+    )]
+    fn remove(&self, Parameters(p): Parameters<RemoveClipParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
-            project.remove(clip_id).map_err(core_err)?;
+            project
+                .with_ripple(p.ripple, |project| project.remove(clip_id))
+                .map_err(core_err)?;
             Ok("ok".to_string())
         })
+    }
+
+    #[tool(
+        description = "Remove several clips in ONE edit (one revision, one undo step) — a multi-select delete. \
+                       All or nothing: an unknown clip, or one on a locked track, refuses the whole call. Leaves \
+                       gaps, unless the project is in ripple mode (get_ripple_mode) or `ripple` is true, which \
+                       closes every track up behind what it lost (a multi-clip ripple delete). Returns \
+                       `removed` (how many clips), `ripple_active` (whether ripple applied to this call) and, \
+                       measured rather than assumed, `rippled` / `clips_shifted` (whether any later clip actually \
+                       moved, and how many — ripple on with nothing after the removed clips moves nothing)."
+    )]
+    fn remove_clips(&self, Parameters(p): Parameters<RemoveClipsParams>) -> Result<String, McpError> {
+        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
+        self.edit(|project| {
+            // What the agent sees is the cut it is building: the proposal while it has
+            // one staged, the live timeline otherwise.
+            let before = project.working_timeline().map_err(core_err)?;
+            let (removed, ripple) = project
+                .with_ripple(p.ripple, |project| {
+                    let ripple = project.ripple_active()?;
+                    project.remove_clips(&ids).map(|removed| (removed, ripple))
+                })
+                .map_err(core_err)?;
+            // Ripple on is a promise to try, not a result: a locked track never moves
+            // and a lane the shift would leave overlapping is declined, silently.
+            // So say what happened.
+            let shifted = project.working_timeline().map_err(core_err)?.clips_moved_since(&before);
+            json(&serde_json::json!({
+                "removed": removed,
+                "ripple_active": ripple,
+                "rippled": shifted > 0,
+                "clips_shifted": shifted,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Whether the project is in ripple mode. In ripple mode an edit that changes how much footage \
+                       sits ahead of a clip — a trim, a speed change, a remove, an add onto footage that is there, \
+                       a voiceover placed over footage — carries the later clips on the same track along, keeping \
+                       their gaps. Each track ripples on its own (no sync lock: a V1 ripple leaves A1 where it \
+                       is), a locked track never moves (and a lane the shift would leave overlapping is left as the \
+                       edit made it), and titles and markers stay put. Off by default; it is the \
+                       user's toolbar setting and is saved with the project. Check it before trimming or \
+                       removing, and pass `ripple` on those tools to override it for one call."
+    )]
+    fn get_ripple_mode(&self) -> Result<String, McpError> {
+        let on = self.lock().ripple_mode().map_err(core_err)?;
+        json(&serde_json::json!({ "ripple_mode": on }))
+    }
+
+    #[tool(
+        description = "Turn ripple mode on or off for the project (see get_ripple_mode). This flips the USER's \
+                       setting, which shows in their toolbar and stays until changed again, and it applies at \
+                       once — also to your staged edits. It is not an edit: no revision, and the timeline does \
+                       not move. To ripple (or not) for one call, pass `ripple` to trim / set_speed / remove / \
+                       remove_clips / add_clip_to_timeline instead, unless the user asked you to switch modes."
+    )]
+    fn set_ripple_mode(&self, Parameters(p): Parameters<SetRippleModeParams>) -> Result<String, McpError> {
+        let on = {
+            let project = self.lock();
+            project.set_ripple_mode(p.on).map_err(core_err)?;
+            project.ripple_mode().map_err(core_err)?
+        };
+        // The toolbar toggle reads the flag when a project loads, so it has to be
+        // told. Not `project-changed`: nothing it re-fetches moved.
+        self.notify("ripple-mode-changed");
+        json(&serde_json::json!({ "ripple_mode": on }))
     }
 
     #[tool(description = "Set the linear volume gain of a clip")]
@@ -1392,12 +1562,14 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's playback speed (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half, negative = reverse); this retimes the clip and changes its timeline duration"
+        description = "Set a clip's playback speed (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half, negative = reverse); this retimes the clip and changes its timeline duration. In ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track follow the change in duration."
     )]
     fn set_speed(&self, Parameters(p): Parameters<SpeedParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
-            let out = project.set_speed(clip_id, p.speed).map_err(core_err)?;
+            let out = project
+                .with_ripple(p.ripple, |project| project.set_speed(clip_id, p.speed))
+                .map_err(core_err)?;
             json(&out)
         })
     }
@@ -1691,7 +1863,9 @@ impl KerfMcp {
             })
             .map_err(core_err)?;
             let project = lock_agent(&project);
-            let (asset, clip) = project.place_voiceover(&asset, track, p.timeline_start).map_err(core_err)?;
+            let (asset, clip) = project
+                .with_ripple(p.ripple, |project| project.place_voiceover(&asset, track, p.timeline_start))
+                .map_err(core_err)?;
             let captions = match p.caption_style {
                 Some(style) => Some(
                     project
@@ -2627,7 +2801,17 @@ impl ServerHandler for KerfMcp {
              Then assemble a non-destructive edit with the \
              cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
              (move_clip frees a clip to any position or same-kind track; \
-             ripple_delete closes the gap). Layer footage with add_track / \
+             ripple_delete closes the gap; move_clips / remove_clips do the \
+             same to several clips as one revision, all or nothing). The project \
+             may be in ripple mode, so check get_ripple_mode before you trim, \
+             remove or retime: with it on, trim / set_speed / remove / \
+             add_clip_to_timeline onto footage / generate_voiceover carry the \
+             later clips on that track along by the change in length, gaps kept \
+             (track by track — a V1 ripple leaves A1 where it is), and with it \
+             off they leave the later clips where they were. Those tools take an \
+             optional `ripple` (omitted follows the mode, false is the escape \
+             hatch) to override it for one call; prefer that to set_ripple_mode, \
+             which flips the user's own setting. Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
@@ -2813,6 +2997,21 @@ fn parse_id(s: &str) -> Result<Uuid, McpError> {
     Uuid::parse_str(s).map_err(|e| McpError::invalid_params(format!("invalid uuid '{s}': {e}"), None))
 }
 
+/// The group move a tool call asked for, with its ids parsed: a mistyped uuid is
+/// the caller's, and says which one.
+fn clip_moves(moves: &[ClipMoveParams]) -> Result<Vec<ClipMove>, McpError> {
+    moves
+        .iter()
+        .map(|m| {
+            Ok(ClipMove {
+                clip_id: parse_id(&m.clip_id)?,
+                timeline_start: m.timeline_start,
+                track_id: m.track_id.as_deref().map(parse_id).transpose()?,
+            })
+        })
+        .collect()
+}
+
 fn parse_kind(s: &str) -> Result<StreamKind, McpError> {
     match s.to_lowercase().as_str() {
         "video" => Ok(StreamKind::Video),
@@ -2962,8 +3161,8 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite, require_window,
-        router, server_identity, track_gaps,
+        allowed_hosts, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite,
+        require_window, router, server_identity, track_gaps, ClipMoveParams,
     };
 
     #[test]
@@ -3075,6 +3274,97 @@ mod tests {
             assert!(properties.contains_key(field), "`{field}` missing from schema");
         }
     }
+
+    /// The per-call `ripple` override belongs on the edits that follow the
+    /// project's ripple mode and on none that decide their own layout — an
+    /// override on `move_clip` or `ripple_delete` would promise something the
+    /// core never does. Optional everywhere: omitted means "follow the mode".
+    #[test]
+    fn ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode() {
+        let tools = router().list_all();
+        let schema = |name: &str| {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let required: Vec<String> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            (properties, required)
+        };
+
+        for name in [
+            "trim",
+            "set_speed",
+            "remove",
+            "remove_clips",
+            "add_clip_to_timeline",
+            "split_at",
+            "generate_voiceover",
+        ] {
+            let (properties, required) = schema(name);
+            assert!(properties.contains_key("ripple"), "`{name}` should take `ripple`");
+            assert!(!required.iter().any(|r| r == "ripple"), "`{name}`: ripple must stay optional");
+        }
+        for name in [
+            "ripple_delete",
+            "cut_clip_range",
+            "snap_to_beats",
+            "move_clip",
+            "move_clips",
+            "reorder",
+            "duplicate_clips",
+        ] {
+            let (properties, _) = schema(name);
+            assert!(
+                !properties.contains_key("ripple"),
+                "`{name}` never ripples, so takes no `ripple`"
+            );
+        }
+
+        // The mode itself, and the group edits, are on the surface.
+        assert!(schema("get_ripple_mode").0.is_empty());
+        assert_eq!(schema("set_ripple_mode").1, ["on"]);
+        assert_eq!(schema("move_clips").1, ["moves"]);
+        assert_eq!(schema("remove_clips").1, ["clip_ids"]);
+    }
+
+    /// A group move reaches the core with every id parsed; one mistyped uuid
+    /// refuses the lot and is the caller's to fix.
+    #[test]
+    fn a_group_move_parses_its_ids_and_names_the_bad_one() {
+        use rmcp::model::ErrorCode;
+        let (clip, track) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let item = |clip_id: String, track_id: Option<String>| ClipMoveParams {
+            clip_id,
+            timeline_start: 2.5,
+            track_id,
+        };
+
+        let moves = clip_moves(&[item(clip.to_string(), None), item(clip.to_string(), Some(track.to_string()))]).unwrap();
+        assert_eq!(moves.len(), 2);
+        assert_eq!(
+            (moves[0].clip_id, moves[0].timeline_start, moves[0].track_id),
+            (clip, 2.5, None)
+        );
+        assert_eq!(moves[1].track_id, Some(track));
+
+        let e = clip_moves(&[item(clip.to_string(), None), item("not-a-uuid".to_string(), None)]).unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(e.message.contains("not-a-uuid"), "{}", e.message);
+        let e = clip_moves(&[item(clip.to_string(), Some("nope".to_string()))]).unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+    }
+
     /// The default bind is loopback, which rmcp's own defaults already cover.
     #[test]
     fn loopback_binds_keep_the_default_allow_list() {

@@ -9,6 +9,7 @@ import { audio } from './audio';
 import { toast } from './notifications.svelte';
 import type { AnalysisProgress, CaptionStyle, TranscriptionStatus } from './types';
 import type { VoiceoverPrefill } from './voiceover';
+import { ZOOM_DEFAULT, stepZoom } from './zoom';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -63,8 +64,13 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
-	/** Timeline zoom, pixels per second. */
-	zoom = $state(36);
+	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). */
+	zoom = $state(ZOOM_DEFAULT);
+	/** Bumped to ask the timeline to fit the whole cut in its window. Only the
+	 *  timeline knows how wide that is, so the shortcut (which lives in the page's
+	 *  key handler) asks rather than computes. A counter, like `seekEpoch`: a
+	 *  repeated ask is a new event. */
+	fitEpoch = $state(0);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
@@ -93,6 +99,16 @@ class EditorUi {
 		this.deliverShapes = this.deliverShapes.includes(id)
 			? this.deliverShapes.filter((v) => v !== id)
 			: [...this.deliverShapes, id];
+	}
+
+	/** One step in (`1`) or out (`-1`) on the zoom; the timeline holds the playhead still. */
+	zoomBy(dir: 1 | -1) {
+		this.zoom = stepZoom(this.zoom, dir, editor.duration);
+	}
+
+	/** Zoom so the whole cut fits the timeline's width (⇧Z). */
+	zoomToFit() {
+		this.fitEpoch++;
 	}
 
 	/** Fetch the installed system fonts once at startup. */

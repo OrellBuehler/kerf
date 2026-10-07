@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
-	import { toast } from '$lib/notifications.svelte';
+	import { toast, notifications } from '$lib/notifications.svelte';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
 	import Workspace from '$lib/components/editor/Workspace.svelte';
@@ -18,6 +18,8 @@
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { contextMenu } from '$lib/context-menu.svelte';
+	import { cutSelection, deleteSelection } from '$lib/ops';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -82,6 +84,13 @@
 				refreshing = false;
 			}
 		}
+		/** The flag changed behind our back (an agent set it): re-read it, and say so
+		 *  — it is the user's own toolbar setting that moved. */
+		async function onRippleChanged() {
+			if (await editor.loadRippleMode()) {
+				toast.info(`Ripple mode turned ${editor.rippleMode ? 'on' : 'off'} by the agent`);
+			}
+		}
 		if (inTauri()) {
 			// Files dropped onto the window import the same way the picker does —
 			// which is what the media bin's "Drop media to start" has been
@@ -112,6 +121,9 @@
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
 					await listen('speech-model-changed', () => void ui.loadTranscriptionStatus()),
+					// Likewise the ripple flag: an agent that flips it changes what
+					// the user's next trim or delete does, so the toolbar has to say.
+					await listen('ripple-mode-changed', () => void onRippleChanged()),
 					// Only a 360 lens pair reports here — its stitch is a full
 					// re-encode, so the import overlay shows how far along it is.
 					await listen<{ fraction: number }>(
@@ -313,12 +325,7 @@
 				if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
 			} else if (k === 'x') {
 				e.preventDefault();
-				const n = editor.copySelection();
-				if (n)
-					void editor
-						.removeSelected(false)
-						.then(() => toast(n === 1 ? 'Clip cut' : `${n} clips cut`))
-						.catch(clipErr);
+				void cutSelection();
 			} else if (k === 'v') {
 				e.preventDefault();
 				void editor
@@ -338,7 +345,15 @@
 		// Tools / transport (bare keys).
 		if (k === 'v') ui.tool = 'pointer';
 		else if (k === 'c') ui.tool = 'razor';
-		else if (k === 'm') {
+		else if (k === 'r' && !e.shiftKey && !e.altKey) {
+			// Ripple mode (R): a project setting, so the key must not auto-repeat it
+			// back and forth while held.
+			e.preventDefault();
+			if (!e.repeat) void editor.setRippleMode(!editor.rippleMode).catch(clipErr);
+		} else if (k === 'z' && e.shiftKey) {
+			e.preventDefault();
+			ui.zoomToFit();
+		} else if (k === 'm') {
 			void editor
 				.addMarkerAtPlayhead(ui.time)
 				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
@@ -373,10 +388,14 @@
 			ui.seek(editor.duration);
 		} else if (e.key === '+' || e.key === '=') {
 			e.preventDefault();
-			ui.zoom = Math.min(96, ui.zoom + 8);
+			ui.zoomBy(1);
 		} else if (e.key === '-') {
 			e.preventDefault();
-			ui.zoom = Math.max(8, ui.zoom - 8);
+			ui.zoomBy(-1);
+		} else if (e.key === 'Escape') {
+			// Whatever else Escape is for gets it first: a menu or the notification
+			// panel closing, a dialog, a drag being abandoned (those stop the event).
+			if (!contextMenu.visible && !notifications.open && !ui.voiceoverDialog) editor.clearSelection();
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedOverlayId) {
 			e.preventDefault();
 			void editor
@@ -385,15 +404,9 @@
 				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
 		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipIds.length > 0) {
 			e.preventDefault();
-			// Shift+Delete ripples (closes the gap); plain Delete leaves a gap.
-			void editor
-				.removeSelected(e.shiftKey)
-				.then((n) =>
-					toast(n === 1 ? 'Clip removed' : `${n} clips removed`, {
-						action: { label: 'Undo', onClick: () => void editor.undo() }
-					})
-				)
-				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
+			// One edit for the whole selection. Shift+Delete ripples (closes the
+			// gaps); plain Delete leaves them — unless ripple mode is on.
+			void deleteSelection(e.shiftKey);
 		}
 	}
 </script>

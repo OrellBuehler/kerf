@@ -424,8 +424,12 @@
 </script>
 
 <svelte:window
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && tdrag && !tdrag.committing) cancelTitleDrag();
+	onkeydowncapture={(e) => {
+		// Abandoning a drag is all Escape does then — not also "clear the selection".
+		if (e.key === 'Escape' && tdrag && !tdrag.committing) {
+			cancelTitleDrag();
+			e.stopPropagation();
+		}
 	}}
 	onblur={cancelTitleDrag}
 />
