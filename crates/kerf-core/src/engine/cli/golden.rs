@@ -5,30 +5,37 @@
 //! committed files (`golden/{export,still,preview}.txt`, one line per block of
 //! [`BLOCK`] cases). A refactor of `video_clip_chain`, `audio_clip_chain`,
 //! `transition_fx` or `build_filter_complex` has to leave all three untouched; an
-//! intended change to one builder re-blesses only its own file, so the other two
-//! keep proving nothing else moved.
+//! intended change to one builder moves only its own file, so the other two keep
+//! proving nothing else moved.
 //!
-//! **Machine-independent by construction.** The builders read the machine in three
+//! **Machine-independent by construction.** The builders read the machine in four
 //! places, each pinned: the preview's decode acceleration (the
 //! `build_preview_args_with` seam), `zscale_available()` (`with_zscale`; a case
-//! holding HDR footage is built *both* ways) and `drawtext`'s resolved font path
-//! (no overlay names a font, so none is looked up).
+//! holding HDR footage is built *both* ways), `drawtext`'s resolved font path (no
+//! overlay names a font, so none is looked up), and libm: the compressor and gate
+//! thresholds go through `powf`, whose last digits differ between glibc builds
+//! (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those numbers
+//! to 10 significant digits, which still pins the dB mapping. The digest files are
+//! LF whatever the checkout (`.gitattributes`, and the comparison ignores `\r`).
 //!
 //! **Bless** after an intended argv change, from the repo root:
 //!
 //! ```text
-//! KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden
+//! KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture
 //! ```
 //!
-//! then review `git diff` of the three files. To find the case behind a failing
+//! It rewrites all three files (and says so); `git diff` is the guard, and only the
+//! files of the builders you changed should move. To find the case behind a failing
 //! block, run the test on the base and on the change with `KERF_GOLDEN_CASES=<file>`
-//! (one digest line per case) and diff the files; `KERF_GOLDEN_DUMP=<case>` then
-//! prints that case's argv. The files are identical under any `KERF_HWACCEL` (blessed unset, `none`
-//! and `auto`): that is the independence proof.
+//! (one digest line per case) and diff the two files; `KERF_GOLDEN_DUMP=<case>` then
+//! prints that case's argv (`KERF_GOLDEN_COVERAGE=1` prints the thinnest families).
+//! The files are identical under any `KERF_HWACCEL` and
+//! with `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4`.
 //!
 //! **Coverage.** [`FAMILIES`] lists the branches the oracle exists to protect, each
-//! as text that must appear in a case's argv; the test fails if any family shows up
-//! in fewer than [`MIN_PER_FAMILY`] cases, so it cannot quietly stop covering one.
+//! as text that must appear in a case's argv, and the test fails if any family shows
+//! up in fewer than [`MIN_PER_FAMILY`] cases (the generator stopped covering it, or
+//! the argv text changed), so it cannot quietly stop covering one.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -49,7 +56,9 @@ const BLESSED: [&str; 3] = [
     include_str!("golden/preview.txt"),
 ];
 
-/// `family needle`: the family is hit when the needle is in the argv of a case.
+/// `family needle`: the family is hit when the needle is in the argv text (words
+/// joined by spaces) of a case: of the still for `still-...`, of the preview for
+/// `preview-...`, of the export for the rest.
 const FAMILIES: &str = r"
 fade-in fade=t=in:st=
 fade-out fade=t=out:st=
@@ -88,7 +97,8 @@ reframe-equirect-out output=e:
 reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
-still-image -loop
+image-input -loop 1 -framerate
+image-under-a-frame -t 0.0
 overlay drawtext=
 overlay-keyed alpha='
 overlay-percent \\%
@@ -99,19 +109,75 @@ cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
 gif paletteuse=dither=
+gif-loop-forever -loop 0
+gif-loop-once -loop -1
 hwaccel -hwaccel
 still-region crop=2*trunc(
+still-file-png image2 -vcodec png
+still-file-jpeg image2 -vcodec mjpeg -y
+still-jpeg-pipe image2pipe
+still-rgb-pipe -pix_fmt rgb24
 ducking sidechaincompress
 audio-pan pan=stereo|c0=
 audio-compressor acompressor=
+libm-canary-39 threshold=1.065368864e-2
+libm-canary-47 threshold=4.246195639e-3
+libm-canary-52 threshold=2.401596268e-3
 audio-gate agate=
 audio-equalizer equalizer=
 audio-highpass highpass=
 audio-lowpass lowpass=
 audio-tempo atempo=
 audio-reverse areverse
+audio-aac -c:a aac
+audio-mp3 -c:a libmp3lame
+audio-opus -c:a libopus
+audio-flac -c:a flac
+audio-bitrate -b:a
+audio-flac-level -compression_level
+audio-muted -an
 loudnorm loudnorm=
 mono-delivery channel_layouts=mono
+codec-x264 -c:v libx264
+codec-x265 -c:v libx265
+codec-svtav1 -c:v libsvtav1
+codec-vp9 -c:v libvpx-vp9
+codec-prores -c:v prores_ks
+codec-gif -c:v gif
+codec-nvenc -c:v h264_nvenc
+codec-qsv -c:v hevc_qsv
+codec-videotoolbox -c:v h264_videotoolbox
+codec-amf -c:v hevc_amf
+codec-unknown -c:v libfoo
+rate-crf -crf
+rate-vp9-constant-quality -b:v 0
+rate-nvenc-vbr -rc vbr
+rate-nvenc-cq -cq
+rate-qsv -global_quality
+rate-videotoolbox -q:v
+rate-amf-cqp -qp_i
+rate-bitrate -b:v 8M
+rate-bitrate-k -b:v 2500k
+rate-maxrate -maxrate
+rate-bufsize -bufsize
+rate-lossless-vp9 -lossless 1
+rate-lossless-nvenc -rc constqp
+two-pass-first -pass 1
+two-pass-second -pass 2
+two-pass-log -passlogfile
+first-pass-null -f null
+preset -preset
+vp9-speed -cpu-used
+tune -tune
+profile-high -profile:v high
+profile-main -profile:v main
+prores-profile-3 -profile:v 3
+prores-4444 -profile:v 4
+prores-4444-xq -profile:v 5
+prores-4444-pix -pix_fmt yuva444p10le
+hevc-tag -tag:v hvc1
+faststart -movflags +faststart
+title -metadata title=
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -228,7 +294,7 @@ fn maybe<T>(r: &mut Rng, p: f64, f: impl FnOnce(&mut Rng) -> T) -> Option<T> {
 // one field per line.
 #[rustfmt::skip]
 fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
-    let len = if a.is_image() { r.real(1.0, 6.0) } else { r.real(0.5, 8.0) };
+    let len = if a.is_image() { if r.chance(0.15) { r.real(0.001, 0.03) } else { r.real(1.0, 6.0) } } else { r.real(0.5, 8.0) };
     let (src_in, src_out) = match earlier.last() {
         // The same footage again (a picture-in-picture of one source): a shared input.
         Some(e) if r.chance(0.1) && !a.is_image() => (e.source_in, e.source_out),
@@ -278,7 +344,8 @@ fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
         });
     }
     for _ in 0..maybe(r, 0.2, |r| 1 + r.below(2)).unwrap_or(0) {
-        let (x, y) = (r.real(1.0, 80.0), r.real(-40.0, 12.0));
+        // A tenth of the thresholds are dB values whose `powf` differs between glibc with and without FMA.
+        let (x, y) = (r.real(1.0, 80.0), if r.chance(0.1) { r.pick(&[-39.45, -47.44, -52.39]) } else { r.real(-40.0, 12.0) });
         c.audio.push(match r.below(5) {
             0 => AudioEffect::Highpass { hz: x * 5.0 },
             1 => AudioEffect::Lowpass { hz: x * 150.0 },
@@ -304,9 +371,17 @@ fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
         if r.chance(0.12) {
             rf.output = Projection::Equirect;
         }
-        for _ in 0..maybe(r, 0.4, |r| 2 + r.below(3)).unwrap_or(0) {
-            let (time, yaw, pitch) = (r.real(0.0, c.duration() + 0.5), r.real(-200.0, 200.0), r.real(-100.0, 100.0));
-            rf.keyframes.push(ReframeKeyframe { time, yaw, pitch, roll: yaw / 7.0, fov: r.real(10.0, 170.0) });
+        // A moving camera: every channel, exactly one, a single key, or a held pose.
+        let (keys, mode, one) = (maybe(r, 0.4, |r| 1 + r.below(4)).unwrap_or(0), r.below(4), r.below(4));
+        for _ in 0..keys {
+            let v = [r.real(-200.0, 200.0), r.real(-100.0, 100.0), r.real(-30.0, 30.0), r.real(10.0, 170.0)];
+            let held = [rf.yaw, rf.pitch, rf.roll, rf.fov];
+            let at = |n: usize| if mode == 0 || mode == 2 || (mode == 1 && n == one) { v[n] } else { held[n] };
+            let time = r.real(0.0, c.duration() + 0.5);
+            rf.keyframes.push(ReframeKeyframe { time, yaw: at(0), pitch: at(1), roll: at(2), fov: at(3) });
+        }
+        if mode == 2 {
+            rf.keyframes.truncate(1);
         }
         c.reframe = Some(rf);
     }
@@ -378,13 +453,30 @@ fn options(r: &mut Rng, dur: f64) -> ExportOptions {
     let plain = [Container::Mp4, Container::Mp4, Container::Mp4, Container::Mkv, Container::Webm, Container::Mov];
     let other = [Container::Gif, Container::Mp3, Container::M4a, Container::Wav, Container::Flac];
     let mut o = ExportOptions { container: if r.chance(0.2) { r.pick(&other) } else { r.pick(&plain) }, ..ExportOptions::default() };
-    o.video_codec = maybe(r, 0.5, |r| r.pick(&["libx264", "libx265", "libvpx-vp9", "prores_ks", "gif"]).into());
-    o.crf = maybe(r, 0.3, |r| r.below(40) as u32);
+    // ProRes thrice: its profile has six values and the 4444 ones change the pixel format.
+    let codecs = ["libx264", "libx265", "libsvtav1", "libvpx-vp9", "prores_ks", "prores_ks", "prores_ks", "gif", "h264_nvenc", "hevc_nvenc",
+                  "av1_nvenc", "h264_qsv", "hevc_qsv", "h264_videotoolbox", "hevc_videotoolbox", "h264_amf", "hevc_amf", "libfoo"];
+    o.video_codec = maybe(r, 0.6, |r| r.pick(&codecs).into());
+    o.rate_control = r.pick(&[RateControl::Crf, RateControl::Crf, RateControl::Bitrate, RateControl::TwoPass, RateControl::Lossless, RateControl::Lossless]);
+    o.crf = maybe(r, 0.5, |r| r.below(40) as u32);
+    o.video_bitrate = maybe(r, 0.5, |r| r.pick(&["8M", "2500k"]).into());
+    o.max_rate = maybe(r, 0.4, |r| r.pick(&["12M", "4000k"]).into());
+    o.buf_size = maybe(r, 0.4, |r| r.pick(&["16M", "5000k"]).into());
+    o.preset = maybe(r, 0.4, |r| r.pick(&["slow", "veryfast", "p4", "5"]).into());
+    o.tune = maybe(r, 0.5, |r| r.pick(&["film", "zerolatency", "stillimage", "bogus"]).into());
+    o.profile_v = maybe(r, 0.3, |r| r.pick(&["high", "main", "main10"]).into());
+    o.prores_profile = maybe(r, 0.6, |r| r.pick(&[0, 1, 2, 3, 4, 4, 5, 5]));
+    o.audio_codec = maybe(r, 0.5, |r| r.pick(&["aac", "libmp3lame", "libopus", "flac", "pcm_s16le", "bogus"]).into());
+    o.audio_bitrate = maybe(r, 0.5, |r| r.pick(&["128k", "192k"]).into());
+    o.flac_compression = maybe(r, 0.6, |r| r.below(13) as u8);
+    o.faststart = r.chance(0.3);
+    o.metadata_title = maybe(r, 0.25, |r| r.pick(&["My cut", "Say \"hi\"", ""]).into());
+    o.gif_loop = !r.chance(0.4);
     o.resolution = maybe(r, 0.25, |r| (r.pick(&[640, 1280, 1920, 721, 1080]), r.pick(&[360, 720, 1080, 405, 1920])));
     o.fps = maybe(r, 0.3, |r| r.pick(&[24.0, 25.0, 29.97, 30_000.0 / 1001.0, 50.0, 60.0]));
     o.pix_fmt = maybe(r, 0.15, |r| r.pick(&["yuv420p", "yuv422p10le", "yuvj420p", "nope"]).into());
     o.scaler = maybe(r, 0.25, |r| r.pick(&["bicubic", "bilinear", "lanczos", "not-a-scaler"]).into());
-    o.hwaccel = maybe(r, 0.15, |_| "auto".into());
+    o.hwaccel = maybe(r, 0.25, |r| r.pick(&["auto", "none", "", "NONE", "cuda"]).into());
     (o.include_audio, o.loudnorm) = (!r.chance(0.1), r.chance(0.1));
     o.audio_channels = maybe(r, 0.12, |r| r.pick(&[1, 2]));
     o.audio_sample_rate = maybe(r, 0.1, |r| r.pick(&[22_050, 44_100]));
@@ -401,8 +493,10 @@ struct Case {
     stills: [(f64, StillOutput); 2],
     region: Option<Region>,
     still_width: u32,
-    /// The preview: playhead, fps, width, decode acceleration.
-    preview: (f64, f64, u32, Option<String>),
+    /// The preview: playhead, fps, width, JPEG quality (clamped by the builder), decode acceleration.
+    preview: (f64, f64, u32, u8, Option<String>),
+    /// The export's pass, null sink and passlog file.
+    pass: (PassPhase, &'static str, &'static str),
 }
 
 #[rustfmt::skip]
@@ -413,23 +507,30 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
         .flat_map(|c| [c.timeline_start, c.timeline_end(), c.timeline_end() - 1e-3, c.timeline_start + 1e-4])
         .collect();
-    let time = |r: &mut Rng| match r.below(6) {
-        0 => 0.0,
-        1 => dur,
-        _ if !edges.is_empty() && r.chance(0.5) => edges[r.below(edges.len())],
+    let overlay_edges: Vec<f64> = timeline.overlays.iter().flat_map(|o| [o.start, o.end]).collect();
+    let time = |r: &mut Rng| match r.below(20) {
+        0..=2 => 0.0,
+        3 | 4 => dur,
+        5 => -r.real(0.0, 2.0),
+        6 | 7 if !overlay_edges.is_empty() => overlay_edges[r.below(overlay_edges.len())],
+        8..=12 if !edges.is_empty() => edges[r.below(edges.len())],
         _ => r.real(0.0, dur.max(0.5)),
     };
-    let sink = |r: &mut Rng| match r.below(3) {
+    let sink = |r: &mut Rng| match r.below(4) {
         0 => StillOutput::JpegPipe { quality: r.pick(&[2, 4, 31]) },
         1 => StillOutput::File { path: "/golden/cover.png".into(), format: ImageFormat::Png, quality: 2 },
+        2 => StillOutput::File { path: "/golden/cover.jpg".into(), format: ImageFormat::Jpeg, quality: r.pick(&[2, 15, 31]) },
         _ => StillOutput::RgbPipe,
     };
     let opts = options(&mut r, dur);
+    let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
     Case {
         stills: [(time(&mut r), sink(&mut r)), (time(&mut r), sink(&mut r))],
         region: maybe(&mut r, 0.2, |r| Region { left: r.real(-0.1, 0.8), top: r.real(-0.1, 0.8), width: r.real(0.0, 1.2), height: r.real(0.0, 1.2) }),
         still_width: r.pick(&[320, 640, 960, 1280, 1920, u32::MAX]),
-        preview: (time(&mut r), r.pick(&[24.0, 25.0, 29.97, 30.0, 60.0]), r.pick(&[640, 960, 1280, 1920]), maybe(&mut r, 0.3, |_| "auto".into())),
+        preview: (time(&mut r), r.pick(&[24.0, 25.0, 29.97, 30.0, 60.0]), r.pick(&[2, 320, 640, 960, 1280, 1920, 100_000]),
+                  r.pick(&[0, 1, 2, 6, 31, 32, 255]), maybe(&mut r, 0.3, |r| r.pick(&["auto", "none", ""]).into())),
+        pass: (pass, r.pick(&["/dev/null", "NUL"]), r.pick(&["", "/golden/pass"])),
         timeline,
         opts,
     }
@@ -437,9 +538,36 @@ fn case(i: usize, assets: &[Asset]) -> Case {
 
 // ---- digests and coverage ------------------------------------------------------
 
+/// `db_to_linear` is `10f64.powf(db / 20.0)`, and a libm's `pow` is not correctly
+/// rounded: the last digits differ between glibc builds (with and without FMA),
+/// macOS, Windows and arm. The compressor and gate numbers (`threshold=`, `makeup=`)
+/// are therefore kept to 10 significant digits, which still pins the dB mapping: a
+/// changed formula moves the third digit, a different libm only the seventeenth.
+fn round_libm(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, key)) = ["threshold=", "makeup="]
+        .iter()
+        .filter_map(|k| Some((rest.find(k)?, k.len())))
+        .min()
+    {
+        let (head, tail) = rest.split_at(at + key);
+        out += head;
+        let digits = tail
+            .find(|c: char| !(c.is_ascii_digit() || ".eE+-".contains(c)))
+            .unwrap_or(tail.len());
+        match tail[..digits].parse::<f64>() {
+            Ok(v) => out += &format!("{v:.9e}"),
+            Err(_) => out += &tail[..digits],
+        }
+        rest = &tail[digits..];
+    }
+    out + rest
+}
+
 fn repr(args: &Result<Vec<String>>) -> String {
     match args {
-        Ok(a) => a.join("\0"),
+        Ok(a) => round_libm(&a.join("\0")),
         Err(e) => format!("ERR\0{e}"),
     }
 }
@@ -452,7 +580,8 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     let mut text = [String::new(), String::new(), String::new()];
     for &zscale in if both { &[true, false][..] } else { &[true][..] } {
         with_zscale(zscale, || {
-            let export = build_export_args_phase(&c.timeline, assets, "/golden/out.mp4", &c.opts, PassPhase::Single, "", "");
+            let (pass, null_sink, passlog) = c.pass;
+            let export = build_export_args_phase(&c.timeline, assets, "/golden/out.mp4", &c.opts, pass, null_sink, passlog);
             text[0] += &repr(&export);
             for (t, out) in &c.stills {
                 text[1] += &repr(&build_still_args(
@@ -466,8 +595,8 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
                 ));
                 text[1].push('\u{1}');
             }
-            let (start, fps, width, hw) = c.preview.clone();
-            text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, 6, hw));
+            let (start, fps, width, quality, hw) = c.preview.clone();
+            text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, quality, hw));
         });
     }
     (text, transitions(c, assets))
@@ -506,9 +635,24 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
     out
 }
 
+/// The families that come from the case's structure rather than from argv text.
+const STRUCTURAL: [&str; 11] = [
+    "muted-track",
+    "solo-track",
+    "disabled-clip",
+    "no-video",
+    "hwaccel-skipped",
+    "preview-quality-clamped-low",
+    "preview-quality-clamped-high",
+    "reframe-one-channel",
+    "reframe-single-keyframe",
+    "reframe-held",
+    "time-negative",
+];
+
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
     let mut f: Vec<String> = table.iter().map(|(n, _)| n.to_string()).collect();
-    f.extend(["muted-track", "solo-track", "disabled-clip", "no-video"].map(String::from));
+    f.extend(STRUCTURAL.iter().chain(&["time-at-overlay-edge"]).map(|s| s.to_string()));
     for k in TransitionKind::ALL {
         let states: &[&str] = if k.dip_color().is_some() {
             &["adjacent", "gap"]
@@ -520,29 +664,71 @@ fn expected(table: &[(&str, &str)]) -> Vec<String> {
     f
 }
 
-/// The families a case hits: its transition branches, the table entries whose text
-/// is in the export or still argv (the preview repeats the export's graph), and what
-/// only the structure shows.
+/// The families a case hits: its transition branches, the table entries whose text is
+/// in the argv they are about (see [`FAMILIES`]), and what only the structure shows.
 fn families(c: &Case, text: &[String; 3], table: &[(&str, &str)], transitions: Vec<String>) -> Vec<String> {
-    let tracks = &c.timeline.tracks;
-    let video = c
-        .timeline
-        .for_render()
-        .tracks
-        .iter()
-        .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    let flat = text.each_ref().map(|t| t.replace(['\0', '\u{1}'], " "));
     let mut f = transitions;
-    f.extend(
-        table
+    for (name, needle) in table {
+        let scope = if name.starts_with("still-") {
+            1
+        } else if name.starts_with("preview-") {
+            2
+        } else {
+            0
+        };
+        if flat[scope].contains(needle) {
+            f.push(name.to_string());
+        }
+    }
+    let tl = &c.timeline;
+    let rendered = tl.for_render();
+    let clips = || {
+        rendered
+            .tracks
             .iter()
-            .filter(|(_, n)| text[0].contains(n) || text[1].contains(n))
-            .map(|(name, _)| name.to_string()),
-    );
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| &t.clips)
+    };
+    let times = [c.stills[0].0, c.stills[1].0, c.preview.0];
+    let channels = |rf: &Reframe| {
+        let k = &rf.keyframes;
+        [
+            k.iter().any(|x| x.yaw != k[0].yaw),
+            k.iter().any(|x| x.pitch != k[0].pitch),
+            k.iter().any(|x| x.roll != k[0].roll),
+            k.iter().any(|x| x.fov != k[0].fov),
+        ]
+        .iter()
+        .filter(|moves| **moves)
+        .count()
+    };
+    let moving: Vec<usize> = clips()
+        .filter_map(|k| k.reframe.as_ref().filter(|r| r.keyframes.len() > 1))
+        .map(channels)
+        .collect();
     for (hit, name) in [
-        (tracks.iter().any(|t| t.muted), "muted-track"),
-        (tracks.iter().any(|t| t.solo), "solo-track"),
-        (tracks.iter().flat_map(|t| &t.clips).any(|k| !k.enabled), "disabled-clip"),
-        (!video, "no-video"),
+        (tl.tracks.iter().any(|t| t.muted), "muted-track"),
+        (tl.tracks.iter().any(|t| t.solo), "solo-track"),
+        (tl.tracks.iter().flat_map(|t| &t.clips).any(|k| !k.enabled), "disabled-clip"),
+        (clips().next().is_none(), "no-video"),
+        (
+            matches!(c.opts.hwaccel.as_deref(), Some(h) if h.is_empty() || h.eq_ignore_ascii_case("none")),
+            "hwaccel-skipped",
+        ),
+        (c.preview.3 < 2, "preview-quality-clamped-low"),
+        (c.preview.3 > 31, "preview-quality-clamped-high"),
+        (moving.contains(&1), "reframe-one-channel"),
+        (moving.contains(&0), "reframe-held"),
+        (
+            clips().any(|k| matches!(&k.reframe, Some(r) if r.keyframes.len() == 1)),
+            "reframe-single-keyframe",
+        ),
+        (times.iter().any(|t| *t < 0.0), "time-negative"),
+        (
+            tl.overlays.iter().any(|o| times.contains(&o.start) || times.contains(&o.end)),
+            "time-at-overlay-edge",
+        ),
     ] {
         if hit {
             f.push(name.into());
@@ -576,6 +762,22 @@ fn run(i: usize, assets: &[Asset], table: &[(&str, &str)]) -> Done {
 }
 
 #[test]
+fn round_libm_keeps_the_mapping_and_drops_the_last_digits() {
+    let a = "acompressor=threshold=0.031622776601683794:ratio=4:makeup=1.2589254117941673 agate=threshold=0.01";
+    // One ulp of the compressor threshold: what another libm's `pow` may return.
+    let b = "acompressor=threshold=0.03162277660168380:ratio=4:makeup=1.2589254117941675 agate=threshold=0.01";
+    assert_ne!(a, b);
+    assert_eq!(round_libm(a), round_libm(b));
+    // A different dB mapping (`/ 10` rather than `/ 20`) is not hidden.
+    assert_ne!(
+        round_libm(a),
+        round_libm("acompressor=threshold=0.001:ratio=4:makeup=1.2589254117941673 agate=threshold=0.01")
+    );
+    assert!(round_libm("a=threshold=0.5:b=1").contains("5.000000000e-1:b=1"));
+}
+
+#[test]
+#[allow(clippy::print_stderr)]
 fn the_argv_builders_still_produce_the_golden_digests() {
     let assets = pool();
     if let Some(n) = std::env::var("KERF_GOLDEN_DUMP").ok().and_then(|v| v.parse().ok()) {
@@ -614,14 +816,12 @@ fn the_argv_builders_still_produce_the_golden_digests() {
     if let Some(path) = std::env::var_os("KERF_GOLDEN_CASES") {
         std::fs::write(path, per_case).unwrap();
     }
-    let thin: Vec<_> = seen.iter().filter(|(_, n)| **n < MIN_PER_FAMILY).collect();
-    assert!(
-        thin.is_empty(),
-        "families under {MIN_PER_FAMILY} cases (the generator stopped covering them): {thin:?}"
-    );
 
-    let mut changed = Vec::new();
+    // The digests first, so a moved block is reported even when coverage fails too.
+    let bless = std::env::var("KERF_GOLDEN_BLESS").as_deref() == Ok("1");
+    let mut failures = Vec::new();
     for ((kind, cases), blessed) in KINDS.iter().zip(&digests).zip(BLESSED) {
+        let blessed = blessed.replace("\r\n", "\n");
         let mut want = format!(
             "# {kind} argv digests (engine/cli/golden.rs): block, then FNV-1a of its {BLOCK} cases.\n\
              # Regenerate after an intended change: KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden\n"
@@ -629,23 +829,38 @@ fn the_argv_builders_still_produce_the_golden_digests() {
         for (i, block) in cases.chunks(BLOCK).enumerate() {
             want += &format!("{i} {:016x}\n", fnv1a(&format!("{block:x?}")));
         }
-        if std::env::var_os("KERF_GOLDEN_BLESS").is_some() {
+        if bless {
             let file = format!("src/engine/cli/golden/{kind}.txt");
-            std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join(file), want).unwrap();
+            std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join(&file), &want).unwrap();
+            let moved = want != blessed;
+            eprintln!(
+                "golden: wrote {file} ({} blocks, {})",
+                cases.chunks(BLOCK).count(),
+                if moved { "changed" } else { "unchanged" }
+            );
         } else if want != blessed {
             let bad: Vec<_> = want
                 .lines()
                 .zip(blessed.lines())
                 .filter(|(a, b)| a != b)
-                .map(|(a, _)| a.split(' ').next().unwrap())
+                .map(|(a, _)| a.split(' ').next().unwrap().to_string())
                 .collect();
-            changed.push(format!("{kind}: blocks {bad:?}"));
+            failures.push(format!(
+                "the {kind} argv moved in blocks {bad:?} (case = block x {BLOCK} .. +{BLOCK}; an empty list is a stale file). If that is intended, \
+                 re-bless (see the module docs) and review `git diff`; otherwise find the case with KERF_GOLDEN_CASES=<file>."
+            ));
         }
     }
-    assert!(
-        changed.is_empty(),
-        "the argv moved ({}; case = block x {BLOCK} .. +{BLOCK}; an empty list is a stale file). If that is intended, re-bless the \
-         files of the builders you changed (see the module docs); otherwise find the case with KERF_GOLDEN_CASES=<file>.",
-        changed.join("; ")
-    );
+    if std::env::var_os("KERF_GOLDEN_COVERAGE").is_some() {
+        let mut by_count: Vec<_> = seen.iter().collect();
+        by_count.sort_by_key(|(_, n)| **n);
+        eprintln!("golden: the {} thinnest families: {:?}", 12, &by_count[..12]);
+    }
+    let thin: Vec<_> = seen.iter().filter(|(_, n)| **n < MIN_PER_FAMILY).collect();
+    if !thin.is_empty() {
+        failures.push(format!(
+            "families under {MIN_PER_FAMILY} cases (the generator stopped covering them, or the argv text changed): {thin:?}"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
