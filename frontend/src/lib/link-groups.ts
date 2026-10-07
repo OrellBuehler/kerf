@@ -104,13 +104,18 @@ export function relinkNewHalves(timeline: Timeline, ids: string[]) {
 	}
 }
 
+/** What `linkClips` has validated: the groups the clips leave behind. */
+export interface LinkPlan {
+	/** The link ids the named clips are in now (each is left, and dissolves if it ends up with one). */
+	old: Set<string>;
+}
+
 /**
- * **Link** `ids` into one group (a new link id; clips already in another group leave
- * it, and a group left with one member dissolves). Needs at least two clips, on
- * different tracks, none on a locked track. Returns the group's id. Linking clips that
- * are already exactly one group is an error, so a no-op records no revision.
+ * Whether `ids` could be linked — every check `linkClips` makes, none of its writes: the
+ * `invalid argument` it would throw, or the plan it would carry out. Pure over `timeline`,
+ * so a menu can ask before offering **Link** and say why not.
  */
-export function linkClips(timeline: Timeline, ids: string[]): string {
+export function planLink(timeline: Timeline, ids: readonly string[]): LinkPlan {
 	const seen = new Set<string>();
 	const lanes = new Set<number>();
 	for (const id of ids) {
@@ -131,20 +136,33 @@ export function linkClips(timeline: Timeline, ids: string[]): string {
 	const alreadyOneGroup =
 		old.size === 1 &&
 		ids.every((id) => !!clipById(timeline, id)?.link_id) &&
-		withLinkPartners(timeline, ids).length === seen.size;
+		withLinkPartners(timeline, [...ids]).length === seen.size;
 	if (alreadyOneGroup) throw invalid('those clips are already linked');
+	return { old };
+}
+
+/**
+ * **Link** `ids` into one group (a new link id; clips already in another group leave
+ * it, and a group left with one member dissolves). Needs at least two clips, on
+ * different tracks, none on a locked track. Returns the group's id. Linking clips that
+ * are already exactly one group is an error, so a no-op records no revision.
+ */
+export function linkClips(timeline: Timeline, ids: string[]): string {
+	const { old } = planLink(timeline, ids);
 	const group = newId();
 	for (const id of ids) clipById(timeline, id)!.link_id = group;
 	dissolveOrphans(timeline, old);
 	return group;
 }
 
-/**
- * **Unlink** `ids`: each leaves its group, and a group left with a single clip dissolves
- * (so unlinking either half of a pair unlinks the pair). Errors when none of them was
- * linked, or one is on a locked track. Returns how many of the named clips were linked.
- */
-export function unlinkClips(timeline: Timeline, ids: string[]): number {
+/** What `unlinkClips` has validated: the groups the clips leave, and how many were linked. */
+export interface UnlinkPlan {
+	old: Set<string>;
+	linked: number;
+}
+
+/** Whether `ids` could be unlinked — `unlinkClips`' checks without its writes (see `planLink`). */
+export function planUnlink(timeline: Timeline, ids: readonly string[]): UnlinkPlan {
 	const old = new Set<string>();
 	let linked = 0;
 	for (const id of ids) {
@@ -159,6 +177,16 @@ export function unlinkClips(timeline: Timeline, ids: string[]): number {
 		}
 	}
 	if (linked === 0) throw invalid('none of those clips is linked');
+	return { old, linked };
+}
+
+/**
+ * **Unlink** `ids`: each leaves its group, and a group left with a single clip dissolves
+ * (so unlinking either half of a pair unlinks the pair). Errors when none of them was
+ * linked, or one is on a locked track. Returns how many of the named clips were linked.
+ */
+export function unlinkClips(timeline: Timeline, ids: string[]): number {
+	const { old, linked } = planUnlink(timeline, ids);
 	for (const id of ids) delete clipById(timeline, id)!.link_id;
 	dissolveOrphans(timeline, old);
 	return linked;

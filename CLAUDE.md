@@ -1984,10 +1984,12 @@ ruler underline, and its tooltip says each track ripples on its own but a moved 
 All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
 no longer stopped by its neighbours (it pushes them — only the source's footage, the
 0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
-*outcome* (`rippleTrimPreview`: the trim applied to a scratch copy of the track, then
-`ripple.ts`'s `rippleFrom`), because a left-edge trim keeps the clip's start rather than
-holding the right edge — one ghost per clip it moves, the moved clips dimmed, red and
-inert if the backend would decline the ripple. The bounds are asked again at every move
+*outcome* (`linked-trim.ts`'s `linkedTrimPreview`, the generalisation of
+`ripple-trim.ts`'s single-lane `rippleTrimPreview` — a bun test holds the two equal with
+links off: the trim applied to a scratch copy of the lanes, then `ripple.ts`'s `rippleFrom`,
+sync lock included — see Linked A/V below), because a left-edge trim keeps the clip's start
+rather than holding the right edge — one ghost per clip it moves, on whichever track, the
+moved clips dimmed, red and inert if the backend would decline the ripple. The bounds are asked again at every move
 and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
 load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
 changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
@@ -2068,6 +2070,34 @@ clips are selected. The TS mirrors print numbers as the backend does: `format-fi
 `toFixedEven` rounds an exact binary tie to the even digit like Rust's `{:.N}` (JS's
 `toFixed` takes the larger: 4.25 → `4.3` vs `4.2`), used by `formatTime` and the
 refusals' `0.12s`.
+**Linked A/V in the timeline** (`link-ui.ts`, `linked-trim.ts`, `multi-move.ts`, bun-tested; the chrome
+is `Timeline.svelte`): a linked clip wears a **badge** — a chain, plus a muted speaker on a picture whose
+sound was detached (`linkBadges`; the tooltip names the partners and says what Alt does) — and hovering
+a clip outlines its partners. A **click selects the clip and its partners** (`clickSelectLinked`; Ctrl
+toggles the pair, Shift brings in partners, a marquee sweeps them with the primary staying a clip it
+touched); **Alt-click selects just the one**. **Alt is the escape hatch from links**, read live from the
+pointer and the key (a "links off" chip lights in the toolbar): `link: false` on a drag, an edge trim, the
+razor, roll / slip / slide, and the menu's *Remove only this clip*. A drag's plan is a `$derived` of the
+pointer, the cut and Alt (`planMove` with `{links}`): dragged clips take the lane offset, their partners
+are **carried by the same Δt on their own track** (`withLinkedMoves`' rule; the grabbed clip's own
+partners are never lane-shifted even when selected) and checked with the group — a locked partner or
+one that would land on a clip / before 0 turns the drop red with that said — and drawn as `carried`
+ghosts; `moves` names only the clips dragged (the backend adds the rest; a property test replays random
+linked drags against the mirror). An edge trim's bounds are the clip's narrowed by each sharing partner's
+neighbours (`linkedTrimBounds`; a partner's footage is no limit — it is trimmed less); its ghost
+(`linkedTrimPreview`) is `trim_clip` + `carry_extent_edit` + `ripple_from` with its **sync lock** + the
+sync guard on a scratch copy, so a clip ripple pushes shows the partner it drags along on its own lane,
+and a refusal is red with its reason (`api-links.test.ts` holds it equal to the harness commit).
+Roll / slip / slide run `previewEdit(…, links)` over the `*Linked` edits and `*RangeLinked` clamps:
+partners are `partner`-role ghosts with a `trackId`, the readout says `· with A1`. `gestureReason` turns
+the backend's "edit with links off" into "hold Alt". The clip menu and keymap share `linkPlans`
+(`ops.ts`): **Detach audio** (⇧D; one revision per clip, the toast's Undo takes them all back),
+**Reattach audio** (⇧⌘D; shown only where something is detached), **Link** (⌘L) / **Unlink** (⇧⌘L), each
+disabled with the backend's reason under its label (`MenuItem.reason`; `planLink` / `planUnlink` are the
+validation halves of `linkClips` / `unlinkClips`). A detached picture plays none of its sound: no volume
+line, no mixer strip when a video track's clips are all detached, and the Inspector's Volume / Audio
+effects give way to a note saying where it plays (its fades stay — they are the picture's). Picture clips
+never drew a waveform, so there is none to hide.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -2385,7 +2415,8 @@ stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* 
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
-bare keys added since (`ADDED`: N / Y / U / Q / W).
+bare keys added since (`ADDED`: N / Y / U / Q / W) and the modified chords added for linked A/V
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -2485,8 +2516,11 @@ copy, so a locked partner leaves the harness untouched, like the backend), every
 an optional trailing `link` (`false` = the named clip alone), plus `detachAudio` /
 `reattachAudio` / `linkClips` / `unlinkClips`. `audio.ts` schedules no clip with
 `source_audio === false` — scheduling both a picture and its detached sound *is* the
-doubling. The editor chrome for any of it (link badges, a Detach audio action, Alt-drag as
-`link: false`) is not built yet. `api.ts` keeps the project's ripple flag in the harness state
+doubling; the editor chrome for it is the Linked A/V paragraph above. **The harness cut starts
+detached-and-linked** (V1 `c1` silent with `link_id`, A1 `c3` its sound for the same span — heard once;
+`Project::sample` detaches the same way but then unlinks, because the kerf-core tests built on it
+edit one clip at a time), so `bun run dev` shows the feature; tests that want the old shape start
+from `reattachAudio('c1')` or `unlinkClips`. `api.ts` keeps the project's ripple flag in the harness state
 (`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
 that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
 voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
@@ -2513,8 +2547,10 @@ clips already use it / analyzed. Its **context menu leads with the facts** — t
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
 import date, then what analysis found (loudness, tempo, silence, shots,
 transcript, or "not analyzed") — above the actions that need them: add at the
-playhead / append, extract audio, remove silences (greyed out until silence has
-been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
+playhead / append, the audio action — labelled for what `extract_audio` will do
+(`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
+their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
+track), remove silences (greyed out until silence has been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
 in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
 row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
 it, which the shared `ContextMenu` renders non-interactively.

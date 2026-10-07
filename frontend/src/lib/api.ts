@@ -190,6 +190,14 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 	}
 };
 
+// The starter cut is the *detached-and-linked* shape linked A/V produces: the interview's
+// sound is its own clip on A1, linked to the picture on V1, whose own sound is muted
+// (`source_audio: false`) — so it is heard once, and a move, trim, split or delete of
+// either carries to both. (Before detaching existed this was the interview's whole audio
+// on A1 *under* a picture still playing the same sound: heard twice.) The Rust seed
+// (`Project::sample`) detaches the same way and then unlinks, because the kerf-core tests
+// built on it edit one clip at a time; the harness is for exploring, so it keeps the link.
+const SAMPLE_LINK = 'sample-link-interview';
 const sampleTimeline: Timeline = {
 	tracks: [
 		{
@@ -197,7 +205,18 @@ const sampleTimeline: Timeline = {
 			kind: 'video',
 			name: 'V1',
 			clips: [
-				{ id: 'c1', asset_id: sampleAssets[0].id, source_in: 0, source_out: 12.5, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 },
+				{
+					id: 'c1',
+					asset_id: sampleAssets[0].id,
+					source_in: 0,
+					source_out: 12.5,
+					timeline_start: 0,
+					volume: 1,
+					fade_in: 0,
+					fade_out: 0,
+					source_audio: false,
+					link_id: SAMPLE_LINK
+				},
 				{ id: 'c2', asset_id: sampleAssets[1].id, source_in: 0, source_out: 8, timeline_start: 12.5, volume: 1, fade_in: 0.5, fade_out: 0.5 }
 			]
 		},
@@ -205,7 +224,19 @@ const sampleTimeline: Timeline = {
 			id: 'a1',
 			kind: 'audio',
 			name: 'A1',
-			clips: [{ id: 'c3', asset_id: sampleAssets[0].id, source_in: 0, source_out: 120, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 }]
+			clips: [
+				{
+					id: 'c3',
+					asset_id: sampleAssets[0].id,
+					source_in: 0,
+					source_out: 12.5,
+					timeline_start: 0,
+					volume: 1,
+					fade_in: 0,
+					fade_out: 0,
+					link_id: SAMPLE_LINK
+				}
+			]
 		}
 	]
 };
@@ -2135,12 +2166,15 @@ function seedDevStaged() {
 		clip_id: second.id,
 		at: second.timeline_start
 	});
-	const bed = audio.clips[0];
+	// The sound is linked to the picture, so the trim reaches it too (an agent's edits carry to
+	// partners like anyone's); with nothing linked, the bed is shortened by a share of its own length.
+	const bed = audio.clips.find((c) => !!c.link_id && c.link_id === first.link_id) ?? audio.clips[0];
 	const bedWas = bed.source_out - bed.source_in;
-	bed.source_out = bed.source_in + bedWas - 20;
+	const bedCut = bed.link_id && bed.link_id === first.link_id ? 3.5 : Math.min(20, bedWas / 2);
+	bed.source_out = bed.source_in + bedWas - bedCut;
 	entries.push({
 		kind: 'clip_retrimmed',
-		summary: `Trimmed clip on ${audio.name} at ${fmtTime(bed.timeline_start)} — ${bedWas.toFixed(1)}s → ${(bedWas - 20).toFixed(1)}s (-20.0s)`,
+		summary: `Trimmed clip on ${audio.name} at ${fmtTime(bed.timeline_start)} — ${bedWas.toFixed(1)}s → ${(bedWas - bedCut).toFixed(1)}s (-${bedCut.toFixed(1)}s)`,
 		track_id: audio.id,
 		clip_id: bed.id,
 		at: bed.timeline_start

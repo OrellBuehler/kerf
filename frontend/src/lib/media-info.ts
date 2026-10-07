@@ -121,6 +121,59 @@ export function specLine(info: MediaInfo): string {
 	return parts.join(' · ');
 }
 
+/** What the bin's audio action will do to an asset, said before it is pressed. */
+export interface AudioExtraction {
+	/** `detach`: each picture clip still playing its own sound hands it to an audio track
+	 *  (the picture is muted, the two linked). `append`: the asset's whole audio is added to
+	 *  an audio track, because no picture clip of it is playing its own sound. */
+	mode: 'detach' | 'append';
+	/** The clips detached (`detach`), else 0. */
+	clips: number;
+	/** The menu line. */
+	label: string;
+	/** A sentence for the tooltip. */
+	detail: string;
+}
+
+/**
+ * The bin's "Extract audio" as the backend does it (`Project::extract_audio`), so the
+ * label says what will happen. When the asset is cut onto a video track with its own
+ * sound still on, each such clip is **detached** — one revision, the picture muted,
+ * an audio clip linked to it — so nothing is heard twice. Otherwise its whole audio is
+ * appended to the first audio track (a new `A1` when the cut has none). Appending while
+ * the asset's sound is already on an audio track puts a second copy there, which the
+ * label says. `null` for an asset with no audio stream.
+ */
+export function audioExtraction(a: Pick<Asset, 'id' | 'streams'>, timeline: Pick<Timeline, 'tracks'>): AudioExtraction | null {
+	if (!audioStream(a)) return null;
+	const sounding = timeline.tracks
+		.filter((t) => t.kind === 'video')
+		.flatMap((t) => t.clips)
+		.filter((c) => c.asset_id === a.id && c.source_audio !== false).length;
+	if (sounding > 0) {
+		return {
+			mode: 'detach',
+			clips: sounding,
+			label: `Detach audio from ${sounding} ${sounding === 1 ? 'clip' : 'clips'}`,
+			detail: `${sounding === 1 ? 'The clip' : 'Each clip'} on the timeline playing this file’s own sound gets that sound as a linked clip on an audio track, and the picture goes quiet — so it is heard once.`
+		};
+	}
+	const audio = timeline.tracks.find((t) => t.kind === 'audio');
+	const where = audio ? audio.name : 'A1';
+	// Its sound already sits on an audio track: appending makes a second copy of it.
+	const already = timeline.tracks.some((t) => t.kind === 'audio' && t.clips.some((c) => c.asset_id === a.id));
+	return {
+		mode: 'append',
+		clips: 0,
+		label: audio ? `Add audio to ${where}${already ? ' again' : ''}` : 'Add audio on a new track A1',
+		detail: already
+			? `This file’s sound is already on the timeline; this adds another copy of all of it to ${where}.`
+			: audio
+				? `Adds all of this file’s audio to ${where}, after what is already there.`
+				: 'The cut has no audio track: one is created and all of this file’s audio goes on it.'
+	};
+}
+
 export interface AnalysisFact {
 	label: string;
 	value: string;

@@ -12,7 +12,7 @@
 	import { getFrame, inTauri, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { thumbnails } from '$lib/thumbnails';
-	import { analysisFacts, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
+	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
@@ -154,11 +154,26 @@
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)
 		});
-		if (info.kind === 'video' && info.audio)
+		// The label says what will happen (`audioExtraction` mirrors `Project::extract_audio`): the
+		// asset's own sound is detached from every clip on the timeline still playing it — so it is
+		// heard once — and only an asset with none such is appended to an audio track.
+		const extraction = info.kind === 'video' ? audioExtraction(asset, editor.timeline) : null;
+		if (extraction)
 			items.push({
-				label: 'Extract audio to a track',
+				label: extraction.label,
 				icon: 'audio-waveform',
-				action: () => void editor.extractAudio(asset.id).catch(err)
+				action: () =>
+					void editor
+						.extractAudio(asset.id)
+						.then(() =>
+							toast.success(
+								extraction.mode === 'detach'
+									? `Detached audio from ${extraction.clips} ${extraction.clips === 1 ? 'clip' : 'clips'}`
+									: `Added the audio of ${asset.name}`,
+								{ action: { label: 'Undo', onClick: () => void editor.undo() } }
+							)
+						)
+						.catch(err)
 			});
 		items.push({
 			label: 'Remove silences',

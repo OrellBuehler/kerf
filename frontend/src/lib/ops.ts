@@ -4,6 +4,15 @@
 
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
+import { withLinkPartners } from './link-groups';
+import {
+	detachedNotice,
+	linkPlans,
+	linkedNotice,
+	reattachedNotice,
+	unlinkedNotice,
+	type LinkPlans
+} from './link-ui';
 import { toast } from './notifications.svelte';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
@@ -82,4 +91,96 @@ export async function trimSelection(side: SplitSide): Promise<void> {
 	// Some were cut and some could not be (a locked track, a clip too short): the
 	// edit that happened is visible, the one that did not needs a sentence.
 	if (plan.problems.length > 0) toast.warning(trimNotice({ ...plan, trims: [] }, selected.length, side));
+}
+
+// ---- linked A/V: detach, reattach, link, unlink --------------------------------------
+// The clip menu and the keymap both run these, over `linkPlans` — one place that knows what
+// is possible for the selection and why not, so a key and a menu line never disagree.
+
+/** What the selection can be Detached / Reattached / Linked / Unlinked, and why not. */
+export function selectionLinkPlans(): LinkPlans {
+	const audible = new Set(editor.assets.filter((a) => a.streams.some((s) => s.kind === 'audio')).map((a) => a.id));
+	return linkPlans(editor.timeline, (id) => audible.has(id), editor.selectedClipIds);
+}
+
+/** Undo `n` revisions — a detach or reattach across several clips is one revision each. */
+async function undoTimes(n: number): Promise<void> {
+	for (let i = 0; i < n; i++) await editor.undo().catch(() => {});
+}
+
+/** Run `one` on each of `ids` in turn, stopping at the first refusal. Resolves to how many
+ *  went through; the refusal, when there was one, is toasted here (what was done stays done). */
+async function eachClip(ids: readonly string[], one: (id: string) => Promise<unknown>): Promise<number> {
+	let done = 0;
+	try {
+		for (const id of ids) {
+			await one(id);
+			done++;
+		}
+	} catch (e) {
+		toast.error(errorMessage(e));
+	}
+	return done;
+}
+
+/** **Detach audio** (⇧D, the clip menu): each selected picture clip still playing its own
+ *  sound hands it to a linked clip on an audio track and goes quiet, so it is heard once.
+ *  One revision per clip; the toast's Undo takes them all back. */
+export async function detachSelection(): Promise<void> {
+	const plan = selectionLinkPlans().detach;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	const done = await eachClip(plan.ids, (id) => editor.detachAudio(id));
+	if (done === 0) return;
+	// The sound that was just made is part of the pictures' link group: select it with them.
+	editor.selectClips(withLinkPartners(editor.timeline, [...plan.ids.slice(0, done)]), editor.selectedClipId);
+	toast(detachedNotice(done), { action: { label: 'Undo', onClick: () => void undoTimes(done) } });
+}
+
+/** **Reattach audio** (⇧⌘D, the clip menu): the linked audio clip goes and the picture
+ *  plays its own sound again. */
+export async function reattachSelection(): Promise<void> {
+	const plan = selectionLinkPlans().reattach;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	const done = await eachClip(plan.ids, (id) => editor.reattachAudio(id));
+	if (done === 0) return;
+	toast(reattachedNotice(done), { action: { label: 'Undo', onClick: () => void undoTimes(done) } });
+}
+
+/** **Link** the selected clips (⌘L, the clip menu): one clip per track, a move / trim / split
+ *  / delete of one carried to the others. */
+export async function linkSelection(): Promise<void> {
+	const plan = selectionLinkPlans().link;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	try {
+		await editor.linkClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(linkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+}
+
+/** **Unlink** the selected clips (⇧⌘L, the clip menu): each leaves its group. */
+export async function unlinkSelection(): Promise<void> {
+	const plan = selectionLinkPlans().unlink;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	try {
+		await editor.unlinkClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(unlinkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }

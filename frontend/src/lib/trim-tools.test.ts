@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { rollEdit, rollRange, slideClip, slideRange, slipClip, slipRange, type SourceLimits } from './edit-modes';
 import { frameTime, onFrame, snapToFrame } from './frames';
+import { formatTimecode } from './timecode';
 import {
 	CUT_REACH_PX,
 	TOOL_HINT,
@@ -677,3 +678,109 @@ describe('trim to the playhead', () => {
 		expect(trimNotice(planPlayheadTrim(locked, [v.id], 5, 30, 'left'), 1, 'left')).toBe('V1 is locked');
 	});
 });
+
+// ---- linked clips ----------------------------------------------------------------------
+// The tools carry their edit to the clips linked to the ones they touch (`*Linked` in
+// edit-modes.ts), clamp to the tightest of the group, and the preview draws the partners
+// on their own tracks.
+
+describe('previewEdit — linked', () => {
+	/** V1: a [0,4) src 10..14, b [4,8) src 20..24 · A1: their sounds, linked pairwise. */
+	function linkedCut(sound: { head?: number } = {}) {
+		const [a, b] = [sclip(10, 14, 0), sclip(20, 24, 4)];
+		const [pa, pb] = [sclip(10, 14, 0), sclip(sound.head ?? 20, (sound.head ?? 20) + 4, 4)];
+		a.link_id = 'L1';
+		pa.link_id = 'L1';
+		b.link_id = 'L2';
+		pb.link_id = 'L2';
+		const t: Timeline = { tracks: [track('V1', [a, b]), track('A1', [pa, pb], {}, 'audio')] };
+		return { t, a, b, pa, pb, edit: { tool: 'roll', a: a.id, b: b.id } satisfies GestureEdit };
+	}
+
+	test('a roll draws the partner pair rolling with it, on its own track', () => {
+		const { t, a, b, pa, pb, edit } = linkedCut();
+		const p = previewEdit(t, edit, 1, footage(60), true);
+		expect([p.ok, p.applied, p.clamped]).toEqual([true, 1, false]);
+		expect(p.ghosts.map((g) => [g.id, g.role, g.track, g.start, g.dur])).toEqual([
+			[a.id, 'a', 'V1', 0, 5],
+			[b.id, 'b', 'V1', 5, 3],
+			[pa.id, 'partner', 'A1', 0, 5],
+			[pb.id, 'partner', 'A1', 5, 3]
+		]);
+		expect(p.ghosts[2].trackId).toBe('track-A1');
+		expect(readoutFor(p, 30).title).toBe('Roll +30 f · +1.00 s · cut 0:00:05:00 · with A1'.replace('0:00:05:00', formatTc(5)));
+	});
+
+	test('with links off the partners are not part of it', () => {
+		const { t, a, b, edit } = linkedCut();
+		const p = previewEdit(t, edit, 1, footage(60), false);
+		expect(p.ghosts.map((g) => g.id)).toEqual([a.id, b.id]);
+		expect(readoutFor(p, 30).title).not.toContain('with');
+	});
+
+	test('the range is the tightest of the group, and the reason names the linked clip', () => {
+		// The sound's incoming clip opens one second into its footage: it can give back 1 s, not 3.
+		const { t, edit } = linkedCut({ head: 1 });
+		const alone = previewEdit(t, edit, -3, footage(60), false);
+		expect(alone.applied).toBe(-3);
+		const group = previewEdit(t, edit, -3, footage(60), true);
+		expect([group.applied, group.clamped]).toEqual([-1, true]);
+		expect(group.why).toBe('linked clip on A1: the incoming clip has no footage left to extend into');
+		expect(limitNotice(group, 30)).toContain('linked clip on A1');
+	});
+
+	test('a slide carries the partner lane’s slide and the clips that give way beside it', () => {
+		const { t, b, pb, edit: _ } = linkedCut();
+		const p = previewEdit(t, { tool: 'slide', clipId: b.id }, 1, footage(60), true);
+		expect(p.ok).toBe(true);
+		const mine = p.ghosts.filter((g) => g.role !== 'partner');
+		const theirs = p.ghosts.filter((g) => g.role === 'partner');
+		expect(mine.map((g) => g.track)).toEqual(['V1', 'V1']);
+		expect(theirs.map((g) => g.track)).toEqual(['A1', 'A1']);
+		expect(theirs.map((g) => g.id)).toContain(pb.id);
+		expect(p.ghosts.find((g) => g.id === pb.id)!.start).toBe(5);
+	});
+
+	test('a slip slips the partner’s footage by the same moment', () => {
+		const { t, a, pa } = linkedCut();
+		const p = previewEdit(t, { tool: 'slip', clipId: a.id }, 2, footage(60), true);
+		expect(p.ok).toBe(true);
+		expect(p.ghosts.map((g) => [g.id, g.role, g.track])).toEqual([
+			[a.id, 'clip', 'V1'],
+			[pa.id, 'partner', 'A1']
+		]);
+		expect([p.ghosts[1].clip.source_in, p.ghosts[1].clip.source_out]).toEqual([12, 16]);
+	});
+
+	test('a partner on a locked track refuses the edit, worded for a gesture (hold Alt)', () => {
+		const { t, edit } = linkedCut();
+		t.tracks[1].locked = true;
+		const p = previewEdit(t, edit, 1, footage(60), true);
+		expect(p.ok).toBe(false);
+		expect(p.why).toBe('a linked clip is on locked track A1 — unlock it, or hold Alt to edit this clip on its own');
+		// Alt: the picture alone rolls.
+		expect(previewEdit(t, edit, 1, footage(60), false).ok).toBe(true);
+	});
+
+	test('an unlinked cut is the plain preview, links or not', () => {
+		const { t, edit } = cutPair();
+		expect(previewEdit(t, edit, 1, footage(60), true)).toEqual(previewEdit(t, edit, 1, footage(60), false));
+	});
+
+	test('it works on a reactive timeline and never touches it', () => {
+		const { t, edit } = linkedCut();
+		const reactive = (v: unknown): unknown =>
+			v && typeof v === 'object'
+				? new Proxy(v as object, { get: (target, key, recv) => reactive(Reflect.get(target, key, recv)) })
+				: v;
+		const before = structuredClone(t);
+		const p = previewEdit(reactive(t) as Timeline, edit, 1, footage(60), true);
+		expect(p.ghosts).toHaveLength(4);
+		expect(t).toEqual(before);
+	});
+});
+
+/** The timecode the readout prints for `secs` at 30 fps. */
+function formatTc(secs: number): string {
+	return formatTimecode(secs, 30);
+}

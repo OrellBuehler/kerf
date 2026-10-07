@@ -13,7 +13,15 @@
 	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { deleteSelection, trimSelection } from '$lib/ops';
+	import {
+		deleteSelection,
+		detachSelection,
+		linkSelection,
+		reattachSelection,
+		selectionLinkPlans,
+		trimSelection,
+		unlinkSelection
+	} from '$lib/ops';
 	import { importCaptionFile } from '$lib/title-actions';
 	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
@@ -54,11 +62,14 @@
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
 	import { transitionLabel } from '$lib/transitions';
-	import { marqueeMode, marqueeSelect, pickMode, sameIds, type Selection } from '$lib/selection';
+	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
+	import { linkPartners } from '$lib/link-groups';
+	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
+	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
 	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
 	import { frameTicksIn, rulerStep, tickLabel, ticksIn } from '$lib/ruler';
-	import { MIN_CLIP, rippleTrimPreview, trimBounds } from '$lib/ripple-trim';
+	import { MIN_CLIP, trimBounds, type TrimBounds } from '$lib/ripple-trim';
 	import {
 		clampZoom,
 		fitZoom,
@@ -75,6 +86,23 @@
 	const duration = $derived(Math.max(editor.duration, 8));
 	const contentW = $derived(laneWidth(editor.duration, pxPerSec));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
+
+	// ---- linked A/V ----------------------------------------------------------------
+	//
+	// A picture and its detached sound are linked clips: a click selects both, a move, trim,
+	// split or delete of one is carried to the other (the backend's default, and what every
+	// drag below previews). **Alt** is the escape hatch — Alt-click selects the one clip,
+	// Alt-drag / Alt-trim / Alt-razor edit it alone (`link: false`) — and it is read live, from
+	// the pointer and the key, so pressing or letting go of it mid-drag redraws the ghosts.
+
+	/** Whether Alt is down. */
+	let alt = $state(false);
+	/** The link badge of every clip that has one: the chain, and a muted speaker on a picture
+	 *  whose sound was detached. */
+	const badges = $derived(linkBadges(editor.timeline, (id) => editor.assetName(id)));
+	const hasLinkedClips = $derived(editor.timeline.tracks.some((t) => t.clips.some((c) => c.link_id)));
+	/** The clip under the pointer, so its partners can light up. */
+	let hoverId = $state<string | null>(null);
 
 	function fmt(s: number): string {
 		const m = Math.floor(s / 60);
@@ -94,11 +122,12 @@
 		new Set(editor.assets.filter((a) => a.streams?.some((st) => st.kind === 'audio')).map((a) => a.id))
 	);
 	/** True when a track can actually be heard — an audio track, or a video track
-	 *  whose clips carry sound. A track with no audio at all gets no fader: a
-	 *  mixer strip on a silent track is furniture, not a control. */
+	 *  whose clips carry sound *and still play it*. A track with no audio at all gets
+	 *  no fader: a mixer strip on a silent track is furniture, not a control. */
 	function hasSound(t: Track): boolean {
 		if (t.kind === 'audio') return true;
-		return t.clips.some((c) => audibleAssets.has(c.asset_id));
+		// A picture whose sound was detached plays none of its own: its audio clip's track has the fader.
+		return t.clips.some((c) => audibleAssets.has(c.asset_id) && c.source_audio !== false);
 	}
 
 	/** Shared look for the one-letter S / L track flags. */
@@ -216,6 +245,9 @@
 		return readPalette();
 	});
 
+	/** How far each asset's footage reaches: what every edit mode clamps to. */
+	const footage = $derived(sourceLimits(editor.assets));
+
 	const assetDuration = $derived.by(() => {
 		const m = new Map<string, number>();
 		for (const a of editor.assets) m.set(a.id, a.duration);
@@ -276,10 +308,10 @@
 		/** The press was on one of several selected clips — a click without a drag
 		 *  then narrows the selection to it, as a click always does. */
 		group: boolean;
+		/** The press had Alt down: that narrowing is to the one clip, partners and all. */
+		alone: boolean;
 		start: number; // the grabbed clip's ghost start (seconds)
 		trackId: string; // the grabbed clip's ghost destination track
-		/** Where the whole group would land, and whether it may. */
-		plan: MovePlan | null;
 		/** The pointer, in lane space — where the refusal's reason is written. */
 		nx: number;
 		ny: number;
@@ -288,13 +320,30 @@
 	};
 	let drag = $state<Drag | null>(null);
 
+	/** Where the dragged group would land, and whether it may — recomputed from the pointer's
+	 *  position, the cut and Alt (links on: the partners of the dragged clips are carried by the
+	 *  same Δt on their own tracks and drawn as ghosts; Alt: they stay where they are). */
+	const dragPlan = $derived.by((): MovePlan | null => {
+		const d = drag;
+		if (!d?.moved) return null;
+		return planMove(moveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
+	});
 	/** The ghosts of the drag in progress, by the track each lands on. */
 	const ghostsByTrack = $derived.by(() => {
 		const m = new Map<string, Ghost[]>();
-		for (const g of drag?.moved ? (drag.plan?.ghosts ?? []) : []) m.set(g.trackId, [...(m.get(g.trackId) ?? []), g]);
+		for (const g of dragPlan?.ghosts ?? []) m.set(g.trackId, [...(m.get(g.trackId) ?? []), g]);
 		return m;
 	});
-	const dropRefused = $derived(!!drag?.moved && !!drag.plan && !drag.plan.ok);
+	/** Every clip the drag is moving, partners carried along included. */
+	const dragIds = $derived(new Set(dragPlan?.ghosts.map((g) => g.clipId) ?? []));
+	const dropRefused = $derived(!!dragPlan && !dragPlan.ok);
+
+	/** Clips to light up as partners of the one under the pointer — not while a gesture is
+	 *  under way, when the ghosts say what is moving. */
+	const hoverPartners = $derived.by((): Set<string> => {
+		if (!hoverId || drag || trimDrag || tg) return new Set();
+		return new Set(linkPartners(editor.timeline, hoverId));
+	});
 
 	/** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
 	 *  the pointer itself, never on the quantized position: at high zoom one pixel
@@ -307,40 +356,57 @@
 		clipId: string;
 		trackId: string;
 		edge: 'l' | 'r';
-		min: number; // dragged-edge bounds, timeline seconds: stopped by the neighbours...
-		max: number;
-		rMin: number; // ...and with ripple on, which pushes the neighbours along instead
-		rMax: number;
+		/** The dragged edge's bounds, timeline seconds: stopped by the neighbours (`strict`), or
+		 *  with ripple on, which pushes them along instead (`loose`). Each is asked twice — with the
+		 *  clip's linked partners, whose own neighbours limit the edge they share, and without
+		 *  (`*Alone`: Alt, which leaves the partners out). */
+		strict: TrimBounds;
+		loose: TrimBounds;
+		strictAlone: TrimBounds;
+		looseAlone: TrimBounds;
 		origStart: number;
 		origEnd: number;
 		pos: number; // current ghost position of the dragged edge
 		downX: number; // where the pointer went down, px
 		grab: number; // pointer's offset from the edge it grabbed (seconds): the edge follows the pointer, not jumps to it
 		moved: boolean;
+		/** The pointer, in lane space — where a refusal's reason is written. */
+		nx: number;
+		ny: number;
 	};
 	let trimDrag = $state<TrimDrag | null>(null);
 
 	/** The bounds in force: ripple lifts the neighbour clamps (it pushes them along),
 	 *  and the mode is the project's, so it is asked again at every move and at the
-	 *  release rather than trusted from the press. */
-	const trimLimits = (d: TrimDrag) => (editor.rippleMode ? { min: d.rMin, max: d.rMax } : { min: d.min, max: d.max });
+	 *  release rather than trusted from the press. Alt leaves the partners out. */
+	const trimLimits = (d: TrimDrag): TrimBounds =>
+		editor.rippleMode ? (alt ? d.looseAlone : d.loose) : alt ? d.strictAlone : d.strict;
 
-	/** What the trim in progress leaves on its track under ripple: the clip and every
-	 *  clip it moves, where each lands (`ripple-trim.ts`, over the faithful port of
-	 *  the backend's `ripple_from`) — not the clip with its edge dragged, because a
-	 *  left-edge trim keeps the clip's start. Null without ripple or a moving drag. */
-	const trimPreview = $derived.by(() => {
+	/** What the trim in progress leaves on the cut — `linked-trim.ts`, over the faithful ports of
+	 *  the backend's `carry_extent_edit`, `ripple_from` (its sync lock included) and sync guard:
+	 *  the clip, the partners that follow its edge, every clip the ripple pushes and the partners
+	 *  of *those*, each where it lands, on whichever track. Not the clip with its edge dragged: a
+	 *  left-edge trim keeps the clip's start under ripple. Null while nothing but the clip itself
+	 *  changes (no ripple, no partners) — its own ghost is drawn directly — and with Alt held the
+	 *  partners are left out, as they are of the edit. */
+	const trimView = $derived.by(() => {
 		const d = trimDrag;
-		if (!d?.moved || !editor.rippleMode) return null;
-		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
-		return track ? rippleTrimPreview(track, d.clipId, d.edge, d.pos) : null;
+		if (!d?.moved) return null;
+		const links = !alt && linkPartners(editor.timeline, d.clipId).length > 0;
+		if (!editor.rippleMode && !links) return null;
+		return linkedTrimPreview(editor.timeline, d.clipId, d.edge, d.pos, {
+			ripple: editor.rippleMode,
+			links: !alt,
+			footage
+		});
 	});
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
 		e.stopPropagation();
-		editor.selectClip(c.id);
+		alt = e.altKey;
+		editor.selectClip(c.id, 'replace', e.altKey);
 		void editor.select(c.asset_id);
 		const laneLeft =
 			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
@@ -352,22 +418,22 @@
 		const clips = [...(editor.timeline.tracks.find((tr) => tr.id === t.id)?.clips ?? [])].sort(
 			(a, b) => a.timeline_start - b.timeline_start
 		);
-		const strict = trimBounds(c, edge, clips, asset?.duration, still, false);
-		const loose = trimBounds(c, edge, clips, asset?.duration, still, true);
 		trimDrag = {
 			clipId: c.id,
 			trackId: t.id,
 			edge,
-			min: strict.min,
-			max: strict.max,
-			rMin: loose.min,
-			rMax: loose.max,
+			strict: linkedTrimBounds(editor.timeline, c, edge, asset?.duration, still, false),
+			loose: linkedTrimBounds(editor.timeline, c, edge, asset?.duration, still, true),
+			strictAlone: trimBounds(c, edge, clips, asset?.duration, still, false),
+			looseAlone: trimBounds(c, edge, clips, asset?.duration, still, true),
 			origStart: start,
 			origEnd: end,
 			pos: edge === 'l' ? start : end,
 			downX: e.clientX,
 			grab: laneTime(e.clientX, laneLeft) - (edge === 'l' ? start : end),
-			moved: false
+			moved: false,
+			nx: 0,
+			ny: 0
 		};
 		capturePointer(e);
 	}
@@ -382,7 +448,8 @@
 		const { min, max } = trimLimits(trimDrag);
 		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), min, max);
 		const moved = trimDrag.moved || Math.abs(e.clientX - trimDrag.downX) >= DRAG_SLOP;
-		trimDrag = { ...trimDrag, pos, moved };
+		const box = lanesEl?.getBoundingClientRect();
+		trimDrag = { ...trimDrag, pos, moved, nx: box ? e.clientX - box.left : 0, ny: box ? e.clientY - box.top : 0 };
 	}
 
 	function onTrimUp() {
@@ -399,14 +466,25 @@
 		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
 		const clip = track?.clips.find((c) => c.id === d.clipId);
 		if (!track || !clip) return;
-		// Under ripple the neighbours are pushed along — unless the backend would
-		// decline to (it hands the edit back as made), which would leave this clip
-		// over its neighbour: the ghost was red, and letting go changes nothing.
-		if (editor.rippleMode && !rippleTrimPreview(track, d.clipId, d.edge, pos)?.ok) return;
+		// Under ripple the neighbours are pushed along, and linked partners follow the edge —
+		// unless the backend would decline to (a ripple it hands back as made would leave this
+		// clip over its neighbour; a locked partner, or a pair pulled out of step, it refuses):
+		// the ghost was red, and letting go changes nothing. A refusal with a reason says it.
+		if (editor.rippleMode || (!alt && linkPartners(editor.timeline, d.clipId).length > 0)) {
+			const view = linkedTrimPreview(editor.timeline, d.clipId, d.edge, pos, {
+				ripple: editor.rippleMode,
+				links: !alt,
+				footage
+			});
+			if (!view?.ok) {
+				if (view?.reason) toast.error(view.reason);
+				return;
+			}
+		}
 		// `pos` is the gesture's one rounded position (the ghost drew it too); every
-		// field the trim writes comes from it.
+		// field the trim writes comes from it. Alt trims the clip alone (`link: false`).
 		const e = trimEdit(clip, d.edge, pos);
-		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start).catch(err);
+		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start, alt ? false : undefined).catch(err);
 	}
 
 	/** The frame rate gestures are quantized to — the cut's own (`export_format`'s). */
@@ -449,10 +527,14 @@
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		const mode = pickMode(e);
+		// Alt is the escape hatch from links: the press selects the clip alone, and whatever
+		// it starts edits the clip alone.
+		const alone = e.altKey;
+		alt = alone;
 		if (t.locked) {
 			// Still selectable and seekable — locking guards the edit, not the view.
 			e.stopPropagation();
-			editor.selectClip(c.id, mode);
+			editor.selectClip(c.id, mode, alone);
 			void editor.select(c.asset_id);
 			ui.seek(laneTime(e.clientX, laneLeft));
 			return;
@@ -466,14 +548,15 @@
 				c.timeline_start + clipDuration(c),
 				fps
 			);
+			// A linked clip is cut with its partners at the same moment; Alt cuts this one alone.
 			if (at === null) toast.error('That clip is too short to cut on a frame');
-			else void editor.split(c.id, at).catch(err);
+			else void editor.split(c.id, at, alone ? false : undefined).catch(err);
 			return;
 		}
 		if (ui.tool === 'roll' || ui.tool === 'slip' || ui.tool === 'slide') {
 			// These act on one clip (or the cut beside it), so the press selects it, as
 			// a plain press does; a modifier press is a selection gesture and nothing more.
-			editor.selectClip(c.id, mode);
+			editor.selectClip(c.id, mode, alone);
 			void editor.select(c.asset_id);
 			if (mode !== 'replace') {
 				e.stopPropagation();
@@ -485,9 +568,15 @@
 		// Pressing a clip that is one of several selected keeps them all: it is the
 		// start of a group drag. (A click that never becomes one narrows the
 		// selection to the clip when the button comes up.)
-		const group = mode === 'replace' && editor.isSelected(c.id) && editor.selectedClipIds.length > 1;
+		// Alt on a selection that is only the clip's own link group narrows it to the clip at once.
+		const others = editor.selectedClipIds.filter((id) => id !== c.id);
+		const group =
+			mode === 'replace' &&
+			editor.isSelected(c.id) &&
+			editor.selectedClipIds.length > 1 &&
+			!(alone && onlyPartners(editor.timeline, c.id, others));
 		if (group) editor.setPrimary(c.id);
-		else editor.selectClip(c.id, mode);
+		else editor.selectClip(c.id, mode, alone);
 		void editor.select(c.asset_id);
 		// A modifier click is a selection gesture, not the start of a drag.
 		if (mode !== 'replace') {
@@ -503,9 +592,9 @@
 			dur: clipDuration(c),
 			members: new Set(group ? editor.selectedClipIds : [c.id]),
 			group,
+			alone,
 			start: c.timeline_start,
 			trackId: t.id,
-			plan: null,
 			nx: 0,
 			ny: 0,
 			downX: e.clientX,
@@ -600,10 +689,12 @@
 	}
 
 	function onWindowBlur() {
+		alt = false;
 		resetDragState();
 	}
 
 	function onPointerMove(e: PointerEvent) {
+		alt = e.altKey;
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
 		if ((drag || trimDrag || titleDrag || marquee || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
@@ -654,20 +745,19 @@
 		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.members, drag.dur);
 		const movedEnough =
 			drag.moved || trackId !== drag.origTrackId || Math.abs(e.clientX - drag.downX) >= DRAG_SLOP;
-		const plan = movedEnough ? planMove(moveTracks(editor.timeline), drag.members, drag.clipId, start, trackId) : null;
 		const box = lanesEl?.getBoundingClientRect();
 		drag = {
 			...drag,
 			start: movedEnough ? start : drag.start,
 			trackId,
 			moved: movedEnough,
-			plan,
 			nx: box ? e.clientX - box.left : 0,
 			ny: box ? e.clientY - box.top : 0
 		};
 	}
 
-	function onPointerUp() {
+	function onPointerUp(e: PointerEvent) {
+		alt = e.altKey;
 		releaseCapture();
 		if (scrubbing) {
 			scrubbing = false;
@@ -701,16 +791,18 @@
 		drag = null;
 		if (!d.moved) {
 			// A click on one clip of a selection narrows it to that clip.
-			if (d.group) editor.selectClip(d.clipId);
+			if (d.group) editor.selectClip(d.clipId, 'replace', d.alone);
 			ui.seek(d.origStart + d.grabSec); // a plain click on the clip seeks there
 			return;
 		}
-		// A refused drop — an overlap, before 0, a locked or missing lane — was red
-		// all the way; letting go changes nothing. A drop that moves nothing too.
-		const plan = d.plan;
-		if (!plan || !plan.ok || plan.noop) return;
-		// The group lands as ONE edit: one revision, one undo.
-		void editor.moveClips(plan.moves).catch(err);
+		// Asked again, as the ghosts were: the cut, the pointer's last place and Alt are what count now.
+		const plan = planMove(moveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
+		// A refused drop — an overlap, before 0, a locked or missing lane, a partner that does not
+		// fit — was red all the way; letting go changes nothing. A drop that moves nothing too.
+		if (!plan.ok || plan.noop) return;
+		// The group lands as ONE edit: one revision, one undo. Its linked partners are the
+		// backend's to carry (the same Δt on their own tracks), unless Alt left them out.
+		void editor.moveClips(plan.moves, plan.link ? undefined : false).catch(err);
 	}
 
 	// ---- roll / slip / slide: the tools that move a boundary ------------------------
@@ -744,13 +836,34 @@
 		speed: number;
 		/** What the pointer asks for (rounded once, not yet held to the range). */
 		requested: number;
-		preview: EditPreview | null;
 		moved: boolean;
 		/** The pointer in lane space — where the readout is written. */
 		nx: number;
 		ny: number;
 	};
 	let tg = $state<TrimGesture | null>(null);
+	/** What the gesture would leave — the edit run on a scratch copy of the lanes it reaches
+	 *  (with the clip's linked partners' too, unless Alt is down), after holding the pointer to
+	 *  the tightest range of the group. Derived, so Alt, an agent's edit or a flipped mode redraws it. */
+	const tgPreview = $derived.by((): EditPreview | null => {
+		const g = tg;
+		if (!g?.moved || !g.edit) return null;
+		return previewEdit(editor.timeline, g.edit, g.requested, footage, !alt);
+	});
+	/** The clips a slide carries along: the slid clip's linked partners. */
+	const slidPartners = $derived.by((): Set<string> => {
+		const g = tg;
+		if (!g?.moved || g.edit?.tool !== 'slide') return new Set();
+		return new Set(linkPartners(editor.timeline, g.edit.clipId));
+	});
+	// The Preview pane shows the frames either side of the edit as it would stand.
+	$effect(() => {
+		const g = tg;
+		const p = tgPreview;
+		if (!g) return;
+		const track = editor.timeline.tracks.find((t) => t.id === g.trackId);
+		ui.trimMonitor = p && track ? monitorFor(p, fps, track.kind) : null;
+	});
 	let cancelTrimTool: (() => void) | null = null;
 	// The panel closing gives a gesture up (this cleanup runs once, at teardown)…
 	$effect(() => () => cancelTrimTool?.());
@@ -762,9 +875,6 @@
 		const edit = tg?.edit;
 		if (edit && !subjectsPresent(editor.timeline, edit)) cancelTrimTool?.();
 	});
-
-	/** How far each asset's footage reaches: what every edit mode clamps to. */
-	const footage = $derived(sourceLimits(editor.assets));
 
 	/** The cut under the roll tool's pointer, so it can be lit and the cursor changed
 	 *  before anything is pressed. */
@@ -794,6 +904,7 @@
 
 	function beginTrimTool(e: PointerEvent, c: Clip, t: Track, laneLeft: number) {
 		const tool = ui.tool as TrimTool;
+		alt = e.altKey;
 		const pressTime = laneTime(e.clientX, laneLeft);
 		let edit: GestureEdit | null = null;
 		let origin = 0;
@@ -821,7 +932,6 @@
 			dur: clipDuration(c),
 			speed: c.speed ?? 1,
 			requested: 0,
-			preview: null,
 			moved: false,
 			nx: 0,
 			ny: 0
@@ -850,13 +960,12 @@
 		} else {
 			requested = slipDelta((e.clientX - g.downX) / pxPerSec, { speed: g.speed }, fps);
 		}
-		const preview = previewEdit(editor.timeline, g.edit, requested, footage);
 		const box = lanesEl?.getBoundingClientRect();
-		tg = { ...g, moved, requested, preview, nx: box ? e.clientX - box.left : 0, ny: box ? e.clientY - box.top : 0 };
-		ui.trimMonitor = monitorFor(preview, fps, track.kind);
+		tg = { ...g, moved, requested, nx: box ? e.clientX - box.left : 0, ny: box ? e.clientY - box.top : 0 };
 	}
 
-	function onTrimToolUp() {
+	function onTrimToolUp(e: PointerEvent) {
+		alt = e.altKey;
 		const g = tg;
 		endTrimTool();
 		if (!g) return;
@@ -868,7 +977,7 @@
 		}
 		// Asked again: an agent's edit or a flipped mode may have changed what is legal
 		// since the last move, and what is written is what the backend will take now.
-		const p = previewEdit(editor.timeline, g.edit, g.requested, footage);
+		const p = previewEdit(editor.timeline, g.edit, g.requested, footage, !alt);
 		if (!p.ok) {
 			toast.error(refusalNotice(p));
 			return;
@@ -879,12 +988,14 @@
 			return;
 		}
 		const edit = p.edit;
+		// The partners go along with a linked clip — the preview showed them — unless Alt left them out.
+		const link = alt ? false : undefined;
 		const run =
 			edit.tool === 'roll'
-				? editor.roll(edit.a, edit.b, p.applied)
+				? editor.roll(edit.a, edit.b, p.applied, link)
 				: edit.tool === 'slip'
-					? editor.slip(edit.clipId, p.applied)
-					: editor.slide(edit.clipId, p.applied);
+					? editor.slip(edit.clipId, p.applied, link)
+					: editor.slide(edit.clipId, p.applied, link);
 		// The Tauri commands answer with the refreshed timeline, not the backend's
 		// `EditOutcome`, so a clamp is told from the range the ghost was held to.
 		void run.then(() => p.clamped && toast.info(limitNotice(p, fps))).catch(err);
@@ -923,6 +1034,8 @@
 		downX: number;
 		downY: number;
 		mode: ReturnType<typeof marqueeMode>;
+		/** Alt was down at the press: the rectangle selects the clips it touches and no partners. */
+		alone: boolean;
 		/** The selection as the press found it; every update is computed from this. */
 		base: Selection;
 		moved: boolean;
@@ -976,6 +1089,7 @@
 			downX: e.clientX,
 			downY: e.clientY,
 			mode: marqueeMode(e),
+			alone: e.altKey,
 			base: { ids: [...editor.selectedClipIds], primary: editor.selectedClipId },
 			moved: false
 		};
@@ -991,8 +1105,9 @@
 		const moved = m.moved || Math.hypot(clientX - m.downX, clientY - m.downY) >= DRAG_SLOP;
 		marquee = { ...m, x, y, cx: clientX, cy: clientY, moved };
 		if (!moved) return;
+		// Sweeping a picture sweeps its sound with it (a linked clip is picked as a pair), unless Alt.
 		const hits = marqueeHits({ x0: m.ax, y0: m.ay, x1: x, y1: y }, laneBoxes(), trackSpans(), pxPerSec);
-		const sel = marqueeSelect(m.base, hits, m.mode);
+		const sel = marqueeSelectLinked(editor.timeline, m.base, hits, m.mode, m.alone);
 		// Only a change is written: most moves of the pointer touch the same clips.
 		if (!sameIds(sel.ids, editor.selectedClipIds) || sel.primary !== editor.selectedClipId) {
 			editor.selectClips(sel.ids, sel.primary);
@@ -1129,6 +1244,17 @@
 			.catch(err);
 	}
 
+	/** Remove one clip and leave the clips linked to it where they are (`link: false`). */
+	function removeAlone(id: string, ripple: boolean) {
+		void (ripple ? editor.rippleDelete(id, false) : editor.remove(id, false))
+			.then(() =>
+				toast('Clip removed — its linked clips stay', {
+					action: { label: 'Undo', onClick: () => void editor.undo() }
+				})
+			)
+			.catch(err);
+	}
+
 	function trackItems(t: Track): MenuItem[] {
 		return [
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
@@ -1162,6 +1288,9 @@
 		const within = ui.time > c.timeline_start && ui.time < c.timeline_start + clipDuration(c);
 		const enabled = c.enabled !== false;
 		const n = editor.isSelected(c.id) ? editor.selectedClipIds.length : 1;
+		// Detach / Reattach / Link / Unlink for what is selected, each with the reason it cannot be.
+		const lp = selectionLinkPlans();
+		const linked = linkPartners(editor.timeline, c.id).length > 0;
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
@@ -1207,6 +1336,47 @@
 						.catch(err)
 			},
 			{ type: 'separator' },
+			...(lp.detach.show
+				? [
+						{
+							label: lp.detach.label,
+							icon: 'volume-x',
+							shortcut: settings.shortcut('edit.detachAudio'),
+							disabled: lp.detach.reason !== null,
+							reason: lp.detach.reason ?? undefined,
+							action: () => void detachSelection()
+						} satisfies MenuItem
+					]
+				: []),
+			...(lp.reattach.show
+				? [
+						{
+							label: lp.reattach.label,
+							icon: 'audio-waveform',
+							shortcut: settings.shortcut('edit.reattachAudio'),
+							disabled: lp.reattach.reason !== null,
+							reason: lp.reattach.reason ?? undefined,
+							action: () => void reattachSelection()
+						} satisfies MenuItem
+					]
+				: []),
+			{
+				label: lp.link.label,
+				icon: 'link',
+				shortcut: settings.shortcut('edit.link'),
+				disabled: lp.link.reason !== null,
+				reason: lp.link.reason ?? undefined,
+				action: () => void linkSelection()
+			},
+			{
+				label: lp.unlink.label,
+				icon: 'unlink',
+				shortcut: settings.shortcut('edit.unlink'),
+				disabled: lp.unlink.reason !== null,
+				reason: lp.unlink.reason ?? undefined,
+				action: () => void unlinkSelection()
+			},
+			{ type: 'separator' },
 			{
 				label: enabled ? 'Disable clip' : 'Enable clip',
 				icon: enabled ? 'eye-off' : 'eye',
@@ -1236,7 +1406,28 @@
 				shortcut: settings.shortcut('edit.rippleDelete'),
 				danger: true,
 				action: () => removeClip(c.id, true)
-			}
+			},
+			// Delete the picture and keep its sound, or the other way round: `link: false`.
+			...(linked
+				? [
+						{
+							label: 'Remove only this clip',
+							icon: 'trash',
+							danger: true,
+							disabled: !!t.locked,
+							reason: t.locked ? `Track ${t.name} is locked` : undefined,
+							action: () => removeAlone(c.id, false)
+						} satisfies MenuItem,
+						{
+							label: 'Ripple delete only this clip',
+							icon: 'trash',
+							danger: true,
+							disabled: !!t.locked,
+							reason: t.locked ? `Track ${t.name} is locked` : undefined,
+							action: () => removeAlone(c.id, true)
+						} satisfies MenuItem
+					]
+				: [])
 		]);
 	}
 
@@ -1617,7 +1808,11 @@
 	onpointercancel={onPointerCancel}
 	onblur={onWindowBlur}
 	onresize={syncView}
+	onkeyup={(e) => {
+		if (e.key === 'Alt') alt = false;
+	}}
 	onkeydowncapture={(e) => {
+		if (e.key === 'Alt') alt = true;
 		// Escape gives a clip, edge, title or marquee drag up without writing
 		// anything — and that is all it does: the page's Escape (clear the
 		// selection) must not also fire.
@@ -1644,8 +1839,17 @@
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
-				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}"
+				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}{hasLinkedClips ? `. ${ALT_HINT}` : ''}"
 				style="font-size:10px;color:var(--kerf-300)">{editor.selectedClips.length} selected</span
+			>
+		{/if}
+		{#if alt && hasLinkedClips}
+			<!-- Alt is down: whatever is dragged, trimmed or cut now leaves linked clips where they are. -->
+			<span
+				data-alt-chip
+				title={ALT_HINT}
+				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--warning);background:var(--warning-surface)"
+				><Icon n="unlink" s={10} />links off</span
 			>
 		{/if}
 		{#if editor.selectedClip}
@@ -2177,18 +2381,29 @@
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
 						{@const primary = editor.selectedClipId === c.id}
-						{@const sliding = !!tg?.moved && tg.edit?.tool === 'slide' && tg.edit.clipId === c.id}
-						{@const dragging = (drag?.moved && drag.members.has(c.id)) || !!trimPreview?.shifted.has(c.id) || sliding}
+						{@const sliding =
+							!!tg?.moved &&
+							tg.edit?.tool === 'slide' &&
+							(tg.edit.clipId === c.id || slidPartners.has(c.id))}
+						{@const dragging = (drag?.moved && dragIds.has(c.id)) || !!trimView?.shifted.has(c.id) || sliding}
 						<!-- A slip shows the footage moving under the clip's edges as it is dragged:
-						     the picture and the waveform are drawn from the window it would have. -->
+						     the picture and the waveform are drawn from the window it would have — the
+						     clip's linked partners' too, which slip with it. -->
 						{@const shown =
-							tg?.moved && tg.edit?.tool === 'slip' && tg.edit.clipId === c.id
-								? (tg.preview?.ghosts.find((g) => g.id === c.id)?.clip ?? c)
+							tg?.moved && tg.edit?.tool === 'slip'
+								? (tgPreview?.ghosts.find((g) => g.id === c.id)?.clip ?? c)
 								: c}
 						{@const off = c.enabled === false || !renders(t)}
+						{@const badge = badges.get(c.id)}
+						{@const lit = hoverPartners.has(c.id)}
 						<button
 							class="kclip"
+							data-clip-id={c.id}
+							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
+							data-sound-detached={c.source_audio === false ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
+							onpointerenter={() => (hoverId = c.id)}
+							onpointerleave={() => (hoverId = hoverId === c.id ? null : hoverId)}
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 							onclick={(e) => e.stopPropagation()}
 							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
@@ -2197,7 +2412,7 @@
 								? '0 0 0 1px var(--kerf-500)'
 								: selected
 									? '0 0 0 1px var(--kerf-600)'
-									: 'none'}"
+									: 'none'};outline:{lit ? '1.5px solid var(--kerf-300)' : 'none'};outline-offset:1px"
 						>
 							{#if t.kind === 'audio'}
 								<ClipWaveform
@@ -2262,12 +2477,27 @@
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
 							{/if}
+							{#if badge && width >= 22}
+								<!-- The link: a chain on a clip that has partners, and a muted speaker on a
+								     picture whose sound was detached. Partners light up while it is hovered
+								     (the clip's own hover does that too); the tooltip says what Alt does. -->
+								<span
+									data-link-badge
+									title={badge.title}
+									style="position:absolute;right:8px;bottom:3px;z-index:3;display:inline-flex;align-items:center;gap:3px;padding:1px 4px;border-radius:3px;background:color-mix(in srgb,var(--scrim) 60%,transparent);color:{lit
+										? 'var(--kerf-200)'
+										: 'var(--text-on-video)'};box-shadow:{lit ? '0 0 0 1px var(--kerf-400)' : 'none'}"
+								>
+									{#if badge.partners.length > 0}<Icon n="link" s={10} />{/if}
+									{#if badge.detached}<Icon n="volume-x" s={10} />{/if}
+								</span>
+							{/if}
 							<ClipOverlays
 								clip={c}
 								{width}
 								{pxPerSec}
 								{fps}
-								sound={audibleAssets.has(c.asset_id)}
+								sound={audibleAssets.has(c.asset_id) && c.source_audio !== false}
 								{selected}
 								locked={!!t.locked}
 								tooled={ui.tool !== 'pointer'}
@@ -2286,26 +2516,37 @@
 						</button>
 					{/each}
 					<!-- One ghost per clip of the dragged group, where it would land: red
-					     all over when the group cannot (the drop then does nothing). -->
+					     all over when the group cannot (the drop then does nothing). A linked
+					     partner carried along is a ghost too, on its own track, marked with the chain. -->
 					{#each ghostsByTrack.get(t.id) ?? [] as g (g.clipId)}
 						<div
+							data-ghost={g.carried ? 'carried' : 'moved'}
 							style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 								6,
 								g.dur * pxPerSec
-							)}px;border:1.5px dashed {dropRefused ? 'var(--red-500)' : 'var(--kerf-400)'};border-radius:2px;background:{dropRefused
+							)}px;border:1.5px dashed {dropRefused ? 'var(--red-500)' : g.carried ? 'var(--kerf-300)' : 'var(--kerf-400)'};border-radius:2px;background:{dropRefused
 								? 'var(--danger-surface)'
-								: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
-						></div>
+								: `color-mix(in srgb,var(--drag-ghost) ${g.carried ? 10 : 16}%,transparent)`};pointer-events:none;z-index:25;overflow:hidden"
+						>
+							{#if g.carried}
+								<span style="position:absolute;left:3px;top:2px;color:{dropRefused ? 'var(--red-500)' : 'var(--kerf-300)'}"
+									><Icon n="link" s={10} /></span
+								>
+							{/if}
+						</div>
 					{/each}
-					{#if trimPreview && trimDrag?.trackId === t.id}
-						<!-- Ripple: where the trimmed clip and everything it moves would be — a
-						     left edge keeps the clip's start, so this is not the edge dragged. -->
-						{#each trimPreview.ghosts as g (g.id)}
+					{#if trimView}
+						<!-- Where the trimmed clip and everything the trim changes would be, on every
+						     track: its linked partners following the edge, the clips ripple pushes and
+						     — the sync lock — the partners of those. A left edge keeps the clip's start
+						     under ripple, so this is not the edge dragged. -->
+						{#each trimView.ghosts.filter((g) => g.trackId === t.id) as g (g.id)}
 							<div
+								data-ghost={g.id === trimDrag?.clipId ? 'trimmed' : trimView.shifted.has(g.id) ? 'shifted' : 'partner'}
 								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 									2,
 									g.dur * pxPerSec
-								)}px;border:1.5px dashed {trimPreview.ok ? 'var(--kerf-400)' : 'var(--red-500)'};border-radius:2px;background:{trimPreview.ok
+								)}px;border:1.5px dashed {trimView.ok ? 'var(--kerf-400)' : 'var(--red-500)'};border-radius:2px;background:{trimView.ok
 									? 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'
 									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
 							></div>
@@ -2326,14 +2567,16 @@
 							style="position:absolute;left:{rollHover.time * pxPerSec - 1}px;top:3px;bottom:3px;width:2px;border-radius:1px;background:var(--kerf-300);box-shadow:0 0 6px 1px var(--kerf-400);pointer-events:none;z-index:24"
 						></div>
 					{/if}
-					{#if tg?.moved && tg.preview && tg.trackId === t.id}
+					{#if tg?.moved && tgPreview}
 						<!-- A roll, slip or slide in progress: every clip it changes, where it would
-						     stand. Amber when the drag is held at a limit, red when the backend
-						     would turn it down (letting go then writes nothing). -->
-						{@const pv = tg.preview}
+						     stand — a linked clip's partners on their own tracks. Amber when the drag is
+						     held at a limit, red when the backend would turn it down (letting go then
+						     writes nothing). -->
+						{@const pv = tgPreview}
 						{@const edge = !pv.ok ? 'var(--red-500)' : pv.clamped ? 'var(--warning)' : 'var(--kerf-400)'}
-						{#each pv.ghosts as g (g.id)}
+						{#each pv.ghosts.filter((g) => g.trackId === t.id) as g (g.id)}
 							<div
+								data-ghost={g.role === 'partner' ? 'partner' : g.role}
 								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 									2,
 									g.dur * pxPerSec
@@ -2344,7 +2587,7 @@
 										: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
 							></div>
 						{/each}
-						{#if tg.edit?.tool === 'roll'}
+						{#if tg.edit?.tool === 'roll' && tg.trackId === t.id}
 							<!-- Where the cut was, and where it is: the distance is the roll. -->
 							<div
 								style="position:absolute;left:{tg.origin * pxPerSec}px;top:2px;bottom:2px;width:0;border-left:1px dashed var(--text-muted);pointer-events:none;z-index:25"
@@ -2378,8 +2621,8 @@
 			{/if}
 
 			<!-- a roll, slip or slide: how far, and what it leaves — or what is stopping it -->
-			{#if tg?.moved && tg.preview}
-				{@const ro = readoutFor(tg.preview, fps)}
+			{#if tg?.moved && tgPreview}
+				{@const ro = readoutFor(tgPreview, fps)}
 				{@const line = ro.tone === 'refused' ? 'var(--red-500)' : ro.tone === 'limit' ? 'var(--warning)' : 'var(--border-strong)'}
 				<div
 					role="status"
@@ -2393,12 +2636,22 @@
 			{/if}
 
 			<!-- why a group drag is red, while it is still a drag -->
-			{#if drag?.moved && dropRefused && drag.plan?.reason}
+			{#if drag?.moved && dropRefused && dragPlan?.reason}
 				<div
 					role="status"
 					style="position:absolute;left:{drag.nx + 14}px;top:{drag.ny + 18}px;z-index:35;pointer-events:none;max-width:280px;padding:3px 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--red-500);background:var(--surface-raised);color:var(--text-primary);font-size:11px;line-height:1.35"
 				>
-					{drag.plan.reason}
+					{dragPlan.reason}
+				</div>
+			{/if}
+
+			<!-- why a linked trim is red: a locked partner, a pair it would pull out of step -->
+			{#if trimDrag?.moved && trimView && !trimView.ok && trimView.reason}
+				<div
+					role="status"
+					style="position:absolute;left:{Math.max(4, Math.min(trimDrag.nx + 14, contentW - 300))}px;top:{trimDrag.ny + 18}px;z-index:35;pointer-events:none;max-width:290px;padding:3px 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--red-500);background:var(--surface-raised);color:var(--text-primary);font-size:11px;line-height:1.35"
+				>
+					{trimView.reason}
 				</div>
 			{/if}
 
