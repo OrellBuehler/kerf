@@ -31,29 +31,39 @@
 //!    zoom is read at the *source* frame's time and not always shown at all
 //!    ([`Animated`]);
 //! 6. a text overlay is on `between(t,start,end)`, end included;
-//! 7. the source frame is the `fps` filter's pick (carried as [`PlanTiming`], decided
-//!    by `Pick` in the next slice — until then a Motion plan holds **candidates** at a
-//!    clip's closing edge: the layers whose `enable` window contains the frame time);
+//! 7. the source frame is the `fps` filter's pick ([`Pick::Fps`], reproduced by
+//!    [`fps_pick`](crate::frame_pick::fps_pick)): a Motion plan holds **candidates** at a
+//!    clip's closing edge (the layers whose `enable` window contains the frame time), and
+//!    the pick says which of them has a frame to draw at all;
 //! 8. a reframe resamples with `cubic` (the still's is `line`);
 //! 9. tone mapping follows the fit `scale` instead of preceding the geometry;
 //! 10. the canvas carries the delivery's pixel format and gif.
 //!
 //! The delivery's `fps` is the rational FFmpeg makes of the text the graph prints.
+//!
+//! **Which file is decoded** is the request's [`MediaResolver`]: the plan's stream describes
+//! that file (a proxy's size and format, not the original's), while the delivery canvas
+//! still derives from the originals. [`Planner::span`] evaluates a stretch of the cut for
+//! what a compositor draws, and [`SpanPlan::handover`] says where a stream that carries on
+//! from the compositor has to start.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use uuid::Uuid;
 
 use crate::clip_timing::{
-    clip_source_window, clips_with_fx, ffmpeg_frame_time, ClipFx, ClipTiming, FadeStep, MotionKeys, Rational,
+    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, ClipFx, ClipTiming, FadeEdge, FadeStep, MotionKeys, Rational,
 };
 use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
+use crate::frame_pick::{FpsPick, Pick};
+use crate::media::{MediaResolver, OriginalMedia, SourceMedia};
 use crate::model::{Asset, Hdr, Projection, StreamKind, TextOverlay, Timeline, VideoEffect};
-use crate::plan_caps::LayerRef;
+use crate::plan_caps::{GpuCaps, LayerRef};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
-    PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix,
+    PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix,
 };
 
 fn frame_index(k: u64) -> i64 {
@@ -61,22 +71,25 @@ fn frame_index(k: u64) -> i64 {
 }
 
 /// What a [`Planner`] is asked to plan. Build one with [`PlanRequest::still`] or
-/// [`PlanRequest::motion`]: the next slice adds the media resolver to it.
+/// [`PlanRequest::motion`], and [`PlanRequest::with_media`] to plan a proxy preview.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct PlanRequest {
+pub struct PlanRequest<'a> {
     pub mode: PlanMode,
     /// The composite colour policy of the FFmpeg in use (`composite_color_policy()`): an
     /// input, so a test pins any of the three without an FFmpeg.
     pub color: CompositeColorPolicy,
+    /// Which file each asset is decoded from ([`OriginalMedia`] unless asked otherwise).
+    pub media: &'a dyn MediaResolver,
 }
 
-impl PlanRequest {
+impl PlanRequest<'static> {
     /// What `build_still_args` draws ([`PlanMode::Still`]).
     pub fn still(color: CompositeColorPolicy) -> Self {
         Self {
             mode: PlanMode::Still,
             color,
+            media: &OriginalMedia,
         }
     }
 
@@ -85,6 +98,18 @@ impl PlanRequest {
         Self {
             mode: PlanMode::Motion,
             color,
+            media: &OriginalMedia,
+        }
+    }
+}
+
+impl PlanRequest<'_> {
+    /// The same request over another [`MediaResolver`].
+    pub fn with_media(self, media: &dyn MediaResolver) -> PlanRequest<'_> {
+        PlanRequest {
+            mode: self.mode,
+            color: self.color,
+            media,
         }
     }
 }
@@ -94,6 +119,7 @@ impl PlanRequest {
 struct AssetFacts {
     name: String,
     path: String,
+    proxy: bool,
     is_image: bool,
     duration: f64,
     /// `None` when the asset has no video picture of a known size.
@@ -155,9 +181,36 @@ impl Planner {
     ///
     /// A clip whose asset is not in `assets` is an error only when a frame asks for it,
     /// as for the still. `Err` for a frame rate FFmpeg would refuse, in either mode.
-    pub fn new(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, req: PlanRequest) -> Result<Self> {
+    pub fn new(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, req: PlanRequest<'_>) -> Result<Self> {
         let rendered = timeline.for_render();
+        // The canvas is the frame the cut is made for: the originals' streams decide it.
         let geom = render_geometry(&rendered, assets, opts);
+        // What decoding each asset yields: the original, or a proxy and *its* picture. The
+        // clips' transitions, HDR flag and padded head follow the file that is opened.
+        // Only what the cut shows is resolved: a resolver may read the disk, and a library holds
+        // assets the timeline never uses.
+        let shown: std::collections::HashSet<Uuid> = rendered
+            .tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| t.clips.iter().map(|c| c.asset_id))
+            .collect();
+        let media: Vec<SourceMedia> = assets
+            .iter()
+            .map(|a| {
+                if shown.contains(&a.id) {
+                    req.media.resolve(a)
+                } else {
+                    SourceMedia::original(a)
+                }
+            })
+            .collect();
+        let decoded: Cow<[Asset]> = if media.iter().any(|m| m.proxy) {
+            Cow::Owned(assets.iter().zip(&media).map(|(a, m)| m.decoded(a)).collect())
+        } else {
+            Cow::Borrowed(assets)
+        };
+        let assets: &[Asset] = &decoded;
         // A rate FFmpeg would not parse is an error in either mode: nothing sensible can be
         // said about frames of a graph that does not build.
         let parse = |r: Option<Rational>| {
@@ -169,7 +222,8 @@ impl Planner {
         );
         let facts: HashMap<Uuid, AssetFacts> = assets
             .iter()
-            .map(|a| {
+            .zip(&media)
+            .map(|(a, m)| {
                 let stream = a
                     .streams
                     .iter()
@@ -178,6 +232,7 @@ impl Planner {
                 let facts = AssetFacts {
                     name: a.name.clone(),
                     path: a.path.clone(),
+                    proxy: m.proxy,
                     is_image: a.is_image(),
                     duration: a.duration,
                     stream,
@@ -325,6 +380,95 @@ impl Planner {
         self.plan(slot, eval, frame_index(k))
     }
 
+    /// Whether a compositor with `caps` draws output frame `k` exactly at `size`. A frame that
+    /// cannot be planned (a clip whose asset is gone) is not drawn.
+    fn draws(&self, k: u64, size: (u32, u32), caps: &GpuCaps) -> bool {
+        self.at_frame(k).is_ok_and(|plan| plan.reasons(caps, size).is_empty())
+    }
+
+    /// The output frames of `[a, b)`: from the frame on screen at `a` to the last whose slot
+    /// starts before `b`.
+    fn frames_in(&self, a: f64, b: f64) -> std::ops::Range<u64> {
+        let fps = self.canvas.fps;
+        let first = fps.frame_containing(a);
+        let end = (b.max(0.0) * f64::from(fps.num) / f64::from(fps.den) - 1e-6).ceil().max(0.0) as u64;
+        first..end.max(first)
+    }
+
+    /// Whether a compositor with `caps` draws every frame of `[a, b)` at `size`, frame by frame,
+    /// run-length encoded ([`SpanPlan`]): where a playback loop hands a stretch of the cut to
+    /// the compositor and where to FFmpeg's stream. Every frame of the grid is evaluated, not
+    /// breakpoints: support flips *inside* a keyframed span (opacity through 1.0, a scale
+    /// through 40:1).
+    pub fn span(&self, a: f64, b: f64, size: (u32, u32), caps: &GpuCaps) -> SpanPlan {
+        let frames = self.frames_in(a, b);
+        let mut runs: Vec<SpanRun> = Vec::new();
+        for k in frames.clone() {
+            let supported = self.draws(k, size, caps);
+            match runs.last_mut() {
+                Some(run) if run.supported == supported => run.frames.end = k + 1,
+                _ => runs.push(SpanRun {
+                    frames: k..k + 1,
+                    supported,
+                }),
+            }
+        }
+        SpanPlan {
+            fps: self.canvas.fps,
+            first: frames.start,
+            runs,
+            windows: self.open_windows(),
+        }
+    }
+
+    /// The time of the first frame, from the one on screen at `a` to the one `limit` seconds
+    /// later, that a compositor with `caps` does not draw at `size` — evaluated **lazily**,
+    /// stopping at the first one, so asking again every few frames of a playback costs the
+    /// frames up to the answer and not the whole stretch. `None` when all of them are drawn.
+    pub fn first_unsupported(&self, a: f64, limit: f64, size: (u32, u32), caps: &GpuCaps) -> Option<f64> {
+        let fps = self.canvas.fps;
+        let first = fps.frame_containing(a);
+        // Both ends are in: the frame on screen at `a`, and the one on screen `limit` later.
+        (first..=fps.frame_containing(a + limit.max(0.0)).max(first))
+            .find(|&k| !self.draws(k, size, caps))
+            .map(|k| fps.exact_time(k))
+    }
+
+    /// The windows `(lo, hi)` of the timeline in which a stream that **starts inside** them
+    /// would not be the cut. `Timeline::slice` cuts the front off a clip it starts in the middle
+    /// of, and that changes a transition from either side of it:
+    ///
+    /// * the clip that is cut loses its fade-in and its `transition_in`, so a stream started inside
+    ///   a fade-in, a dissolve, a dip's second half or a slide has none of it;
+    /// * the clip *before* the transition is shortened (or, from its end on, dropped), and the
+    ///   transition is clamped to what is left of it: a dissolve shortens, a dip's fade-out
+    ///   restarts from the cut, and with the outgoing clip gone the incoming one fades up from
+    ///   black instead of crossing it.
+    ///
+    /// So a clip that fades in is in the way from its start to the end of the fade, and one that
+    /// transitions out is in the way from `lead` before its end (the transition's length on its
+    /// side) to its end — closed at the end, since a stream starting *on* the cut has lost the
+    /// outgoing clip altogether.
+    fn open_windows(&self) -> Vec<(f64, f64)> {
+        let mut windows = Vec::new();
+        for clip in &self.clips {
+            let (start, end) = (clip.window.0, clip.window.1 - clip.fx.tail);
+            windows.extend(
+                clip.fades
+                    .iter()
+                    .filter(|f| f.edge == FadeEdge::In)
+                    .map(|f| (f.st, f.st + f.d)),
+            );
+            windows.extend(clip.fx.move_in.map(|(_, _, secs)| (start, start + secs)));
+            let lead = clip.fx.tail.max(clip.fx.black_out).max(clip.fx.white_out);
+            if lead > 0.0 {
+                windows.push((end - lead, end + 1e-6));
+            }
+        }
+        windows.retain(|w| w.1 > w.0);
+        windows
+    }
+
     /// The clips of `track` that could be on screen at `eval`, bottom to top within the track.
     fn candidates(&self, track: &TrackIndex, eval: f64) -> Vec<usize> {
         let upto = track.order.partition_point(|&c| self.clips[c].window.0 <= eval);
@@ -375,13 +519,33 @@ impl Planner {
                     pose,
                     interp: if motion { ReframeInterp::Cubic } else { ReframeInterp::Line },
                 });
+                let source_time = clip_source_time(clip, asset.duration, slot);
+                // A still image has the one frame; a still plan asks for the frame `-ss` lands on;
+                // the export asks the `fps` filter, which needs the whole window and the rate.
+                let pick = if asset.is_image {
+                    Pick::AtOrAfter(0.0)
+                } else if motion {
+                    Pick::Fps(FpsPick {
+                        speed: clip.speed_mag(),
+                        reverse: clip.is_reversed(),
+                        window: planned.source_window,
+                        start: clip.timeline_start,
+                        frame: u64::try_from(frame).unwrap_or(0),
+                        fps: self.canvas.pick_fps,
+                        drop_first: planned.fx.head_pad && clip_seek(planned.source_window.0) == 0.0,
+                    })
+                } else {
+                    Pick::AtOrAfter(source_time)
+                };
                 layers.push(PlanLayer {
                     clip_id: clip.id,
                     asset_id: clip.asset_id,
                     track: planned.track,
                     path: asset.path.clone(),
+                    source: PlanSource { proxy: asset.proxy },
+                    pick,
                     is_image: asset.is_image,
-                    source_time: clip_source_time(clip, asset.duration, slot),
+                    source_time,
                     clip_time: local,
                     stream,
                     transform: clip.transform_at(local),
@@ -471,6 +635,81 @@ impl Planner {
     }
 }
 
+/// A run of consecutive output frames a compositor draws (or does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanRun {
+    pub frames: std::ops::Range<u64>,
+    pub supported: bool,
+}
+
+/// Where a stream has to start so that it carries on from the compositor: see
+/// [`SpanPlan::handover`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Handover {
+    /// The time to start the stream at: no fade-in or transition is open here, so the
+    /// stream's own `Timeline::slice` is the cut.
+    pub stream_start: f64,
+    /// The first frame to show from it, the time the compositor stopped at; the frames the
+    /// stream produces before it are dropped.
+    pub first_shown: f64,
+}
+
+/// What a compositor draws over a stretch of the cut ([`Planner::span`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanPlan {
+    fps: Rational,
+    first: u64,
+    runs: Vec<SpanRun>,
+    windows: Vec<(f64, f64)>,
+}
+
+impl SpanPlan {
+    /// The planned frames as runs, in order (the first frame of the first run is the frame
+    /// on screen at the span's start).
+    pub fn runs(&self) -> &[SpanRun] {
+        &self.runs
+    }
+
+    /// The time of the first frame at or after `a` and within `limit` seconds of it that is
+    /// not drawn, among the frames this span planned.
+    pub fn first_unsupported(&self, a: f64, limit: f64) -> Option<f64> {
+        let from = self.fps.frame_containing(a).max(self.first);
+        let to = self.fps.frame_containing(a + limit.max(0.0));
+        self.runs
+            .iter()
+            .filter(|r| !r.supported && r.frames.end > from && r.frames.start <= to)
+            .map(|r| r.frames.start.max(from))
+            .next()
+            .map(|k| self.fps.exact_time(k))
+    }
+
+    /// Where a stream that takes over from the compositor at `a` has to start.
+    ///
+    /// `stream_preview` plays `Timeline::slice(start, end)`, which cuts the front off the clips it
+    /// starts in the middle of: a fade-in is zeroed and a transition dropped or clamped, together
+    /// with the tail the outgoing clip would play under it (see `open_windows`). A stream started
+    /// inside a fade-in, a transition on either side of the cut or a slide would therefore cut
+    /// where the cut fades. So it starts at the latest time at or before `a` that no such window
+    /// is open at, and the caller drops the frames before `first_shown = a`.
+    pub fn handover(&self, a: f64) -> Handover {
+        let mut start = a;
+        // A window is open strictly inside it: starting where a clip begins keeps its fade-in.
+        while let Some(lo) = self
+            .windows
+            .iter()
+            .filter(|w| w.0 < start && start < w.1)
+            .map(|w| w.0)
+            .reduce(f64::min)
+        {
+            start = lo;
+        }
+        Handover {
+            stream_start: start,
+            first_shown: a,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +718,7 @@ mod tests {
     use crate::model::{Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
     use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
     use crate::render_plan::active_video_clips;
+    use crate::render_plan::RenderPlan;
 
     const FIXED: CompositeColorPolicy = CompositeColorPolicy::FixedBt601;
 
@@ -496,7 +736,16 @@ mod tests {
     }
 
     fn planner(tl: &Timeline, assets: &[Asset], mode: PlanMode, opts: &ExportOptions) -> Planner {
-        Planner::new(tl, assets, opts, PlanRequest { mode, color: FIXED }).unwrap()
+        Planner::new(
+            tl,
+            assets,
+            opts,
+            PlanRequest {
+                mode,
+                ..PlanRequest::still(FIXED)
+            },
+        )
+        .unwrap()
     }
 
     fn keyed(time: f64, scale: f64, pos_x: f64) -> Keyframe {
@@ -771,7 +1020,10 @@ mod tests {
                 &tl,
                 std::slice::from_ref(&a),
                 &opts(f64::INFINITY),
-                PlanRequest { mode, color: FIXED },
+                PlanRequest {
+                    mode,
+                    ..PlanRequest::still(FIXED)
+                },
             );
             assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{mode:?}");
         }
@@ -1091,5 +1343,461 @@ mod tests {
         let crop = |t: Transform| (t.crop_left, t.crop_right);
         assert_eq!(crop(landscape.layers[0].transform), (0.0, 0.0));
         assert_eq!(crop(delivered.layers[0].transform), (0.2, 0.3));
+    }
+
+    // ---- picks, the media a plan describes, spans and the hand-over ----------------------
+
+    #[test]
+    fn a_still_asks_for_the_frame_ss_lands_on_and_an_export_frame_carries_the_fps_pick() {
+        let (a, img) = (asset(), crate::engine::test_support::img_asset(Uuid::new_v4()));
+        let mut back = make_clip(a.id, 2.0, 6.0, 1.0);
+        back.speed = -2.0;
+        let tl = timeline_of(vec![
+            video_track(vec![back]),
+            video_track(vec![make_clip(img.id, 0.0, 3.0, 0.0)]),
+        ]);
+        let assets = [a, img];
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(30.0)).at(1.5).unwrap();
+        // The still decodes where `-ss` goes; a still image has its one frame.
+        assert_eq!(still.layers[0].pick, Pick::AtOrAfter(still.layers[0].source_time));
+        assert_eq!(still.layers[1].pick, Pick::AtOrAfter(0.0));
+        let export = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(45).unwrap();
+        let want = FpsPick {
+            speed: 2.0,
+            reverse: true,
+            window: (2.0, 6.0),
+            start: 1.0,
+            frame: 45,
+            fps: Rational::new(30, 1).unwrap(),
+            drop_first: false,
+        };
+        assert_eq!(export.layers[0].pick, Pick::Fps(want));
+        assert_eq!(export.layers[1].pick, Pick::AtOrAfter(0.0));
+        // A transition's tail is in the pick's window, as it is in the chain's trim.
+        let (out, mut inc) = (
+            make_clip(assets[0].id, 0.0, 2.0, 0.0),
+            make_clip(assets[0].id, 10.0, 14.0, 2.0),
+        );
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let tl = single(vec![out, inc]);
+        let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(75).unwrap();
+        assert!(matches!(plan.layers[0].pick, Pick::Fps(p) if p.window == (0.0, 3.0)));
+    }
+
+    #[test]
+    fn a_padded_proxy_read_from_the_start_drops_the_clone_and_a_seek_skips_it() {
+        let mut a = asset();
+        a.path = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4".into();
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 2.0, 0.0)]),
+            video_track(vec![make_clip(a.id, 1.0, 3.0, 0.0)]),
+            video_track(vec![make_clip(a.id, 0.0005, 2.0, 0.0)]),
+        ]);
+        let plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0))
+            .at_frame(3)
+            .unwrap();
+        let drops: Vec<_> = plan
+            .layers
+            .iter()
+            .map(|l| matches!(l.pick, Pick::Fps(p) if p.drop_first))
+            .collect();
+        // From the very head (and within a millisecond of it, which the chain does not seek)
+        // the clone goes; from a second in, `-ss` has skipped it.
+        assert_eq!(drops, [true, false, true]);
+        let plain = asset();
+        let tl = single(vec![make_clip(plain.id, 0.0, 2.0, 0.0)]);
+        let plan = planner(&tl, &[plain], PlanMode::Motion, &opts(30.0)).at_frame(3).unwrap();
+        assert!(matches!(plan.layers[0].pick, Pick::Fps(p) if !p.drop_first));
+    }
+
+    /// Every asset decodes from a 1280x720 4:2:0 proxy of its own, as `ProxyMedia` finds one.
+    #[derive(Debug)]
+    struct Proxied;
+
+    impl MediaResolver for Proxied {
+        fn resolve(&self, asset: &Asset) -> SourceMedia {
+            let mut video = asset.streams[0].clone();
+            (video.width, video.height) = (Some(1280), Some(720));
+            (video.pix_fmt, video.color_transfer, video.color_primaries) = (Some("yuv420p".into()), None, None);
+            SourceMedia {
+                path: "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4".into(),
+                proxy: true,
+                video: Some(video),
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_over_a_proxy_describes_the_proxy_and_keeps_the_originals_canvas() {
+        let mut a = asset();
+        a.streams[0].pix_fmt = Some("yuv422p10le".into());
+        a.streams[0].color_transfer = Some("arib-std-b67".into());
+        let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        let assets = std::slice::from_ref(&a);
+        let layer_of = |request: PlanRequest| Planner::new(&tl, assets, &opts(30.0), request).unwrap().at_frame(3).unwrap();
+        let original = layer_of(PlanRequest::motion(FIXED));
+        let (l, proxied) = (&original.layers[0], layer_of(PlanRequest::motion(FIXED).with_media(&Proxied)));
+        // The file itself: its size and format, and an HDR flag the chain tone-maps.
+        assert!(!l.source.proxy && l.path == a.path);
+        assert_eq!((l.stream.width, l.stream.pix_fmt.as_deref()), (1920, Some("yuv422p10le")));
+        assert!(l.hdr.is_some());
+        // The proxy: the 4:2:0 picture it is (so nothing is refused for the format of the
+        // original), already SDR, its path, and the pad's clone to drop.
+        let p = &proxied.layers[0];
+        assert!(p.source.proxy && p.path.ends_with("0123456789abcdef.lead.mp4"));
+        assert_eq!(
+            (p.stream.width, p.stream.height, p.stream.pix_fmt.as_deref()),
+            (1280, 720, Some("yuv420p"))
+        );
+        assert!(p.hdr.is_none() && matches!(p.pick, Pick::Fps(f) if f.drop_first));
+        // The delivery frame is the cut's, whatever is decoded; the geometry starts from the picture
+        // that arrives.
+        assert_eq!(
+            (proxied.canvas.width, proxied.canvas.height),
+            (original.canvas.width, original.canvas.height)
+        );
+        let size = (proxied.canvas.width, proxied.canvas.height);
+        let stage = proxied.layer_geometry(p, size).unwrap().stages[0].src;
+        assert_eq!((stage.w, stage.h), (1280, 720));
+        // The default request is the original, and says so.
+        assert_eq!(PlanRequest::still(FIXED).media.resolve(&a), SourceMedia::original(&a));
+    }
+
+    /// Counts how often it is asked.
+    #[derive(Debug, Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl MediaResolver for Counting {
+        fn resolve(&self, asset: &Asset) -> SourceMedia {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SourceMedia::original(asset)
+        }
+    }
+
+    #[test]
+    fn only_the_assets_a_cut_shows_are_resolved() {
+        // A resolver may read the disk, and a library holds assets the timeline never uses.
+        let (shown, unused, audio) = (asset(), asset(), crate::engine::test_support::av_asset(Uuid::new_v4(), 5.0));
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(shown.id, 0.0, 2.0, 0.0)]),
+            crate::engine::test_support::audio_track(vec![make_clip(audio.id, 0.0, 2.0, 0.0)]),
+        ]);
+        let counting = Counting::default();
+        let request = PlanRequest::motion(FIXED).with_media(&counting);
+        Planner::new(&tl, &[shown, unused, audio], &opts(30.0), request).unwrap();
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_rate_the_canvas_and_the_clips_parse_differently_is_refused_in_an_export_frame() {
+        let a = asset();
+        let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        let refused = |fps: f64, mode| {
+            let plan = planner(&tl, std::slice::from_ref(&a), mode, &opts(fps)).at_frame(5).unwrap();
+            let caps = GpuCaps {
+                motion: true,
+                ..GpuCaps::A0
+            };
+            plan.reasons(&caps, plan.size(u32::MAX))
+                .iter()
+                .any(|r| matches!(r, Unsupported::PickRate { .. }))
+        };
+        // 29.970029 is 92997/3103 on the canvas and 29970029/1000000 on a clip: two frame grids.
+        assert!(refused(29.970029, PlanMode::Motion));
+        assert!(!refused(29.97, PlanMode::Motion) && !refused(30.0, PlanMode::Motion));
+        assert!(!refused(29.970029, PlanMode::Still));
+    }
+
+    /// A 30 fps export of a cut with a fade-in over the first second and a dissolve into a second
+    /// clip at 4 s (1 s long), the second also fading in.
+    fn fading_cut() -> (Timeline, Vec<Asset>) {
+        let a = asset();
+        let mut first = make_clip(a.id, 0.0, 4.0, 0.0);
+        first.fade_in = 1.0;
+        let mut second = make_clip(a.id, 10.0, 16.0, 4.0);
+        second.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        (single(vec![first, second]), vec![a])
+    }
+
+    #[test]
+    fn a_span_says_where_the_compositor_draws_and_the_first_frame_it_does_not() {
+        let (tl, assets) = fading_cut();
+        let p = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+        let size = (1920, 1080);
+        let motion = GpuCaps {
+            motion: true,
+            ..GpuCaps::A0
+        };
+        // Frames 0..30 are inside the fade-in, 120..151 inside the dissolve (the outgoing clip
+        // on its tail, the incoming on its ramp): runs of refusals either side of what is drawn.
+        let span = p.span(0.0, 6.0, size, &motion);
+        let runs: Vec<_> = span.runs().iter().map(|r| (r.frames.clone(), r.supported)).collect();
+        // (Frame 150 is the cut's closing frame: the outgoing clip is still drawn there, on its tail.)
+        assert_eq!(runs, [(0..30, false), (30..120, true), (120..151, false), (151..180, true)]);
+        // Asking for the next refusal is asking for the first frame of a run.
+        let at = |k: u64| Rational::new(30, 1).unwrap().exact_time(k);
+        assert_eq!(span.first_unsupported(0.0, 5.0), Some(0.0));
+        assert_eq!(span.first_unsupported(1.5, 5.0), Some(at(120)));
+        assert_eq!(span.first_unsupported(1.5, 2.0), None);
+        assert_eq!(span.first_unsupported(4.5, 5.0), Some(4.5));
+        assert_eq!(span.first_unsupported(5.0, 5.0), Some(5.0));
+        assert_eq!(span.first_unsupported(5.1, 5.0), None);
+        // The lazy scan stops at the first one and agrees with the span's answer everywhere.
+        for a in [0.0, 0.5, 1.0, 1.5, 3.9, 4.2, 5.0, 5.9] {
+            for limit in [0.0, 0.5, 2.0, 5.0] {
+                let planned = span.first_unsupported(a, limit);
+                let lazy = p.first_unsupported(a, limit, size, &motion);
+                // The span planned frames up to 6 s: a scan that runs past it has more to say.
+                assert!(
+                    a + limit > 6.0 || planned == lazy,
+                    "from {a}, {limit} s: {planned:?} vs {lazy:?}"
+                );
+            }
+        }
+        // The compositor that draws fades and transitions draws all of it.
+        let all = GpuCaps {
+            fades: true,
+            transitions: true,
+            ..motion
+        };
+        assert!(p.span(0.0, 6.0, size, &all).runs().iter().all(|r| r.supported));
+        assert_eq!(p.first_unsupported(0.0, 6.0, size, &all), None);
+        // An unplannable frame is not drawn: a clip whose asset is not there.
+        let broken = planner(&tl, &[], PlanMode::Motion, &opts(30.0));
+        assert_eq!(broken.first_unsupported(0.0, 1.0, size, &all), Some(0.0));
+    }
+
+    #[test]
+    fn a_stream_that_takes_over_starts_where_no_fade_or_transition_is_open() {
+        let (tl, assets) = fading_cut();
+        let p = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+        let span = p.span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
+        let start = |a: f64| {
+            let h = span.handover(a);
+            assert_eq!(h.first_shown, a);
+            h.stream_start
+        };
+        // Inside the fade-in it starts where the clip does. A dissolve is in the way from the last
+        // second of the outgoing clip to the end of the ramp: the slice would shorten it, or drop
+        // the outgoing clip altogether. On the edges, or in the clear, it starts where asked.
+        assert_eq!((start(0.5), start(1.0), start(2.0), start(3.0)), (0.0, 1.0, 2.0, 3.0));
+        assert_eq!((start(3.5), start(4.0), start(4.5)), (3.0, 3.0, 3.0));
+        assert_eq!((start(5.0), start(5.5)), (5.0, 5.5));
+        // Windows chain: a second track's fade-in that starts before the dissolve pulls it back again.
+        let a = assets[0].clone();
+        let mut over = make_clip(a.id, 0.0, 3.0, 2.5);
+        over.fade_in = 1.0;
+        let mut tl = tl;
+        tl.tracks.push(video_track(vec![over]));
+        let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
+        assert_eq!(span.handover(4.2).stream_start, 2.5);
+    }
+
+    /// What a layer shows of its fades, travel and tail: the plan's per-frame state. A layer on
+    /// the frame its window closes on is only a *candidate* (the pick decides, and an ulp of
+    /// floating point in a shifted slice can add or drop it), so it is left out.
+    fn fx_state(plan: &RenderPlan) -> Vec<(Vec<f64>, bool, (f64, f64))> {
+        plan.layers
+            .iter()
+            .filter(|l| plan.time < l.timing.window.1 - 1e-6)
+            .map(|l| {
+                let fades = [FadeTint::Black, FadeTint::White, FadeTint::Alpha]
+                    .map(|t| plan.strength(l, t))
+                    .to_vec();
+                (fades, l.fx.tail, l.fx.motion)
+            })
+            .collect()
+    }
+
+    /// The claim behind [`SpanPlan::handover`]: a slice started at `stream_start` is the cut from
+    /// `first_shown` on, and one started inside a transition is not.
+    #[test]
+    fn a_slice_started_at_the_handover_is_the_cut_and_one_started_inside_a_dissolve_is_not() {
+        let (tl, assets) = fading_cut();
+        let fps = 30.0;
+        let full = planner(&tl, &assets, PlanMode::Motion, &opts(fps));
+        let span = full.span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
+        let rate = full.canvas().fps;
+        let mut compared = 0;
+        for a in [0.5, 1.0, 3.5, 4.0, 4.5, 4.9, 5.2] {
+            let stream_start = span.handover(a).stream_start;
+            let sliced = planner(&tl.slice(stream_start, 6.0), &assets, PlanMode::Motion, &opts(fps));
+            let offset = (stream_start * fps).round() as u64;
+            for k in (a * fps).round() as u64..170 {
+                let (whole, part) = (full.at_frame(k).unwrap(), sliced.at_frame(k - offset).unwrap());
+                assert_eq!(
+                    fx_state(&whole),
+                    fx_state(&part),
+                    "from {a} (stream {stream_start}), frame {k}"
+                );
+                compared += whole.layers.len();
+            }
+        }
+        assert!(compared > 500);
+        // Started inside the dissolve with no hand-over, the stream has no ramp and no tail.
+        let naive = planner(&tl.slice(4.5, 6.0), &assets, PlanMode::Motion, &opts(fps));
+        let (whole, part) = (full.at_frame(rate.frame_at(4.5)).unwrap(), naive.at_frame(0).unwrap());
+        assert_eq!(whole.layers.len(), 2);
+        assert_eq!(part.layers.len(), 1);
+        assert_eq!(part.strength(&part.layers[0], FadeTint::Alpha), 1.0);
+        assert!(whole.strength(&whole.layers[1], FadeTint::Alpha) < 1.0);
+    }
+
+    /// The same for the other families — a dip to black, a slide, a push, a dip to white — from
+    /// every eighth of a second across a 15 s cut: the slice at the hand-over is the cut, and a
+    /// slice started where the stream was asked for (inside a transition, or just before one,
+    /// where the outgoing clip is cut short) is not, for some of them. (32 fps and eighths of a
+    /// second: every time is exact in binary, so no ulp of a shifted clip start moves a frame.)
+    #[test]
+    fn a_slice_started_at_the_handover_keeps_dips_slides_and_pushes_too() {
+        let a = asset();
+        let clips: Vec<_> = [
+            None,
+            Some(TransitionKind::DipToBlack),
+            Some(TransitionKind::SlideLeft),
+            Some(TransitionKind::PushLeft),
+            Some(TransitionKind::DipToWhite),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let mut c = make_clip(a.id, 10.0 * i as f64, 10.0 * i as f64 + 3.0, 3.0 * i as f64);
+            c.transition_in = kind.map(|kind| Transition {
+                kind,
+                duration: if kind == TransitionKind::DipToWhite { 0.625 } else { 1.0 },
+            });
+            c
+        })
+        .collect();
+        let tl = single(clips);
+        let assets = [a];
+        let fps = 32.0;
+        let full = planner(&tl, &assets, PlanMode::Motion, &opts(fps));
+        let span = full.span(0.0, 15.0, (1920, 1080), &GpuCaps::A0);
+        let (mut compared, mut naive_wrong, mut moved) = (0, 0, 0);
+        for i in 1..=112u64 {
+            let at = i as f64 / 8.0;
+            let first = i * 4;
+            let stream_start = span.handover(at).stream_start;
+            let from = |start: f64| {
+                let sliced = planner(&tl.slice(start, 15.0), &assets, PlanMode::Motion, &opts(fps));
+                let offset = (start * fps).round() as u64;
+                move |k: u64| sliced.at_frame(k - offset).unwrap()
+            };
+            let (handed, naive) = (from(stream_start), from(at));
+            for k in first..first + 64 {
+                let whole = fx_state(&full.at_frame(k).unwrap());
+                assert_eq!(whole, fx_state(&handed(k)), "from {at} (stream {stream_start}), frame {k}");
+                naive_wrong += usize::from(whole != fx_state(&naive(k)));
+                moved += usize::from(whole.iter().any(|l| l.2 != (0.0, 0.0)));
+                compared += whole.len();
+            }
+        }
+        assert!(
+            compared > 4000 && moved > 100,
+            "{compared} layers, {moved} frames with travel"
+        );
+        assert!(naive_wrong > 500, "a slice started in the way must differ ({naive_wrong})");
+    }
+
+    /// `KERF_BENCH=1 cargo test -p kerf-core --no-default-features --release -- --ignored --nocapture
+    /// planner::tests::bench`: what planning a 500-clip cut costs. Print-only (a wall-clock limit
+    /// on a shared machine measures the machine); `a_500_clip_cut_...` guards the shape instead.
+    #[test]
+    #[ignore = "benchmark: set KERF_BENCH=1"]
+    #[allow(clippy::print_stderr)]
+    fn bench_planning_a_500_clip_cut() {
+        if std::env::var_os("KERF_BENCH").is_none() {
+            eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+            return;
+        }
+        let (tl, assets) = five_hundred_clips();
+        let time = |what: &str, n: usize, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            let dt = t.elapsed();
+            eprintln!("{what}: {dt:?} ({:?} each over {n})", dt / n.max(1) as u32);
+        };
+        let mut p = None;
+        time("Planner::new, 500 clips on 5 tracks", 1, &mut || {
+            p = Some(planner(&tl, &assets, PlanMode::Motion, &opts(30.0)));
+        });
+        let p = p.unwrap();
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            ..GpuCaps::A0
+        };
+        time("at_frame (5 layers on screen)", 3000, &mut || {
+            for k in 0..3000u64 {
+                std::hint::black_box(p.at_frame((k * 7) % 7000).unwrap());
+            }
+        });
+        time("span, 10 s (300 frames)", 300, &mut || {
+            std::hint::black_box(p.span(60.0, 70.0, (1920, 1080), &caps));
+        });
+        time("first_unsupported over 5 s, nothing unsupported", 150, &mut || {
+            std::hint::black_box(p.first_unsupported(60.0, 5.0, (1920, 1080), &caps));
+        });
+    }
+
+    /// 5 tracks of 100 clips of 2 to 3 s, every fifth dissolving in.
+    fn five_hundred_clips() -> (Timeline, Vec<Asset>) {
+        let a = asset();
+        let mut rng = 0xC0FF_EE00_1234_5678u64;
+        let tracks = (0..5)
+            .map(|_| {
+                let mut t = 0.0;
+                video_track(
+                    (0..100)
+                        .map(|i| {
+                            let len = 2.0 + (xorshift(&mut rng) % 100) as f64 / 100.0;
+                            let mut c = make_clip(a.id, 10.0, 10.0 + len, t);
+                            if i % 5 == 4 {
+                                c.transition_in = Some(Transition {
+                                    kind: TransitionKind::Crossfade,
+                                    duration: 0.5,
+                                });
+                            }
+                            t += len;
+                            c
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        (timeline_of(tracks), vec![a])
+    }
+
+    #[test]
+    fn a_500_clip_cut_plans_and_spans_in_time_proportional_to_what_is_on_screen() {
+        // Not a benchmark: a guard on the shape. Planning a frame walks the clips on screen, not
+        // the 500; the limits are generous (a busy machine runs the suite in parallel) and sized
+        // to catch an algorithm that scans every clip per frame *and* per plan.
+        let (tl, assets) = five_hundred_clips();
+        let p = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+        let started = std::time::Instant::now();
+        let mut layers = 0;
+        for k in 0..1500u64 {
+            layers += p.at_frame(k * 5).unwrap().layers.len();
+        }
+        assert!(layers > 5000, "{layers}");
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            ..GpuCaps::A0
+        };
+        let span = p.span(100.0, 104.0, (1920, 1080), &caps);
+        assert_eq!(span.runs().iter().map(|r| r.frames.end - r.frames.start).sum::<u64>(), 120);
+        assert_eq!(p.first_unsupported(100.0, 4.0, (1920, 1080), &caps), None);
+        assert!(started.elapsed().as_secs() < 8, "{:?}", started.elapsed());
     }
 }

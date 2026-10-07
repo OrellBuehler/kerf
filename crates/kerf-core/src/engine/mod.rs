@@ -77,6 +77,7 @@ pub use cli::{
 };
 
 pub(crate) use cli::insta360_pair_name;
+pub(crate) use cli::proxy_video_info;
 pub(crate) use cli::render_geometry;
 pub use cli::{composite_color_policy, ffmpeg_command, ffmpeg_path, limit_ffmpeg_args};
 pub(crate) use cli::{safe_color, valid_color};

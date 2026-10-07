@@ -27,7 +27,6 @@ use crate::clip_timing::{ffmpeg_frame_time, Rational};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track};
 use crate::model::{Fit, Keyframe, TextKeyframe, Transition, TransitionKind};
 use crate::planner::{PlanRequest, Planner};
-use crate::render_plan::PlanMode;
 
 /// FFmpeg's expression grammar as `keyframe_expr`, `motion_expr` and the overlay /
 /// `drawtext` positions use it: `+ - * /`, unary minus, `if lt between hypot`, variables.
@@ -285,16 +284,7 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                 fps: Some(fps),
                 ..ExportOptions::default()
             };
-            let planner = Planner::new(
-                &tl,
-                &assets,
-                &opts,
-                PlanRequest {
-                    mode: PlanMode::Motion,
-                    color: CompositeColorPolicy::FixedBt601,
-                },
-            )
-            .unwrap();
+            let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(CompositeColorPolicy::FixedBt601)).unwrap();
             assert_eq!(planner.canvas().fps, Rational::new(num, den).unwrap());
             let args = build_export_args(&tl, &assets, "x.mp4", &opts).unwrap();
             let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];

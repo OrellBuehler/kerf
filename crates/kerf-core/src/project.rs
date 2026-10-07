@@ -628,7 +628,7 @@ impl Project {
     /// Stills and audio-only assets never get a proxy, so they resolve to the
     /// original. Falls back to the original whenever no proxy exists yet, so a
     /// preview never blocks waiting on generation.
-    fn preview_source(asset: &Asset) -> PathBuf {
+    pub(crate) fn preview_source(asset: &Asset) -> PathBuf {
         let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
         if has_video && !asset.is_image() {
             if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())) {

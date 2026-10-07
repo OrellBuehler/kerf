@@ -2312,6 +2312,15 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    // What decoding this proxy yields, written *before* the proxy becomes visible so a
+    // reader that finds the file finds its description too (see [`ProxySidecar`]). A
+    // failed probe only costs the sidecar: the reader probes once and writes it itself.
+    if let Some(video) = probe(&tmp)
+        .ok()
+        .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
+    {
+        write_proxy_sidecar(&dst, &tmp, video);
+    }
     // Another generator may have finished the same proxy while we encoded; if so
     // ours is redundant — drop the temp and use the existing file.
     if dst.is_file() {
@@ -2320,6 +2329,97 @@ pub fn generate_proxy(src: &Path, width: u32) -> Result<PathBuf> {
     }
     std::fs::rename(&tmp, &dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
     Ok(dst)
+}
+
+/// What `generate_proxy` writes beside a proxy (`<hash>.json` next to `<hash>.mp4`, the
+/// same name a `.lead.mp4` proxy's sidecar takes with its own ending): the video stream
+/// **of the proxy file** — its size, pixel format and colour tags, not the original's.
+///
+/// A proxy is a smaller, always-`yuv420p`, upright picture, so what a renderer that decodes
+/// it has to know about its layer (geometry, a format it refuses, a matrix) is a fact about
+/// the proxy. Asking `ffprobe` for it would put a process spawn on the interactive path; the
+/// sidecar makes it a small file read. It carries the proxy's byte size so a proxy that was
+/// replaced under the same name does not keep describing the one that is gone.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProxySidecar {
+    version: u32,
+    size: u64,
+    video: StreamInfo,
+}
+
+const PROXY_SIDECAR_VERSION: u32 = 1;
+
+/// Where the sidecar of `proxy` lives.
+fn proxy_sidecar_path(proxy: &Path) -> PathBuf {
+    proxy.with_extension("json")
+}
+
+/// Write `proxy`'s sidecar, describing `file` (the proxy itself, or the temp it is being
+/// written as). Best effort and atomic (temp file, rename): the worst a failure does is make
+/// the reader probe.
+fn write_proxy_sidecar(proxy: &Path, file: &Path, video: StreamInfo) {
+    let Ok(size) = std::fs::metadata(file).map(|m| m.len()) else {
+        return;
+    };
+    let sidecar = ProxySidecar {
+        version: PROXY_SIDECAR_VERSION,
+        size,
+        video,
+    };
+    let dst = proxy_sidecar_path(proxy);
+    // Not the proxy's own temp name (`<hash>.<pid>.part`), which this runs beside.
+    let tmp = dst.with_extension(format!("json.{}.part", std::process::id()));
+    let written = serde_json::to_vec(&sidecar)
+        .ok()
+        .is_some_and(|bytes| std::fs::write(&tmp, bytes).is_ok())
+        && std::fs::rename(&tmp, &dst).is_ok();
+    if !written {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The sidecar of `proxy` if it is there, current and describes this very file.
+fn read_proxy_sidecar(proxy: &Path) -> Option<StreamInfo> {
+    let sidecar: ProxySidecar = serde_json::from_slice(&std::fs::read(proxy_sidecar_path(proxy)).ok()?).ok()?;
+    let size = std::fs::metadata(proxy).ok()?.len();
+    (sidecar.version == PROXY_SIDECAR_VERSION && sidecar.size == size).then_some(sidecar.video)
+}
+
+/// How long a failed probe of a proxy is remembered before it is tried again.
+const PROXY_PROBE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The video stream of the proxy at `proxy`, as decoding it yields it: from its sidecar, and
+/// for a proxy that has none (one made before sidecars existed) from **one** `ffprobe`,
+/// remembered per file (size and modified time) and written back as the sidecar so no later
+/// run asks again. `None` when the proxy cannot be read; the caller decodes the original.
+///
+/// The fallback spawns a process: call it off the project lock, never from a render loop.
+/// A plan resolves it once per `Planner`.
+pub(crate) fn proxy_video_info(proxy: &Path) -> Option<StreamInfo> {
+    /// What one probe of a proxy found, and when.
+    type Probed = (Instant, Option<StreamInfo>);
+    static CACHE: OnceLock<Mutex<HashMap<String, Probed>>> = OnceLock::new();
+    if let Some(video) = read_proxy_sidecar(proxy) {
+        return Some(video);
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = source_key(proxy);
+    let remembered = cache.lock().ok().and_then(|c| c.get(&key).cloned());
+    if let Some((at, found)) = remembered {
+        if found.is_some() || at.elapsed() < PROXY_PROBE_RETRY {
+            return found;
+        }
+    }
+    let found = probe(proxy)
+        .ok()
+        .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video));
+    if let Some(video) = &found {
+        write_proxy_sidecar(proxy, proxy, video.clone());
+    }
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, (Instant::now(), found.clone()));
+    }
+    found
 }
 
 // ---- insta360 dual-lens stitching ------------------------------------------
@@ -6210,6 +6310,10 @@ mod rendered;
 #[cfg(test)]
 mod sweep;
 
+/// The `fps` pick against the frames the export renders (`#[ignore]`d).
+#[cfg(test)]
+mod picked;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6586,6 +6690,48 @@ mod tests {
             assert!(!is_head_padded_proxy(&dir.join(proxy_file_name(7, false)).to_string_lossy()));
             assert!(is_head_padded_proxy(&dir.join(proxy_file_name(7, true)).to_string_lossy()));
         }
+    }
+
+    /// A proxy's sidecar is its video stream, named after the proxy, and describes *that*
+    /// file: another size, a replaced file, another version or garbage reads as none.
+    #[test]
+    fn a_proxy_sidecar_describes_the_file_beside_it_and_nothing_else() {
+        let dir = Scratch::new("sidecar");
+        let video = StreamInfo {
+            width: Some(1280),
+            height: Some(720),
+            pix_fmt: Some("yuv420p".into()),
+            ..crate::engine::test_support::video_stream(1280, 720, 30.0)
+        };
+        // Named after the proxy, whatever its ending, and apart from its own temp file.
+        let plain = dir.join("0000000000000abc.mp4");
+        let padded = dir.join("0000000000000abc.lead.mp4");
+        assert_eq!(proxy_sidecar_path(&plain), dir.join("0000000000000abc.json"));
+        assert_eq!(proxy_sidecar_path(&padded), dir.join("0000000000000abc.lead.json"));
+        for proxy in [&plain, &padded] {
+            std::fs::write(proxy, b"not really a video").unwrap();
+            assert_eq!(read_proxy_sidecar(proxy), None, "no sidecar yet");
+            write_proxy_sidecar(proxy, proxy, video.clone());
+            assert_eq!(read_proxy_sidecar(proxy), Some(video.clone()));
+            // The file it describes was replaced by another one: it no longer applies.
+            std::fs::write(proxy, b"a different, longer encode").unwrap();
+            assert_eq!(read_proxy_sidecar(proxy), None);
+            // A sidecar from another version of the format, and a half-written one.
+            write_proxy_sidecar(proxy, proxy, video.clone());
+            let path = proxy_sidecar_path(proxy);
+            let current = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, current.replace("\"version\":1", "\"version\":99")).unwrap();
+            assert_eq!(read_proxy_sidecar(proxy), None);
+            std::fs::write(&path, &current[..current.len() / 2]).unwrap();
+            assert_eq!(read_proxy_sidecar(proxy), None);
+        }
+        // Writing leaves nothing behind, and never touches the proxy's own temp name.
+        let temps: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        assert!(temps.is_empty(), "{temps:?}");
     }
 
     /// A clip read from the very start of a padded proxy (no `-ss`) opens with the

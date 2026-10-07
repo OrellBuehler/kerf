@@ -291,12 +291,12 @@ pub struct FadeStep {
 /// `av_parse_time` on the decimal text a duration option is handed (the graph
 /// prints `{}` of the `f64`): whole microseconds, the digits past the sixth
 /// dropped rather than rounded.
-fn parse_micros(seconds: f64) -> i64 {
+pub(crate) fn parse_micros(seconds: f64) -> i64 {
     parse_micros_text(&format!("{seconds}"))
 }
 
 /// [`parse_micros`] for the text itself: what `sendcmd` makes of a printed time.
-fn parse_micros_text(text: &str) -> i64 {
+pub(crate) fn parse_micros_text(text: &str) -> i64 {
     let negative = text.starts_with('-');
     let text = text.trim_start_matches('-');
     let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
