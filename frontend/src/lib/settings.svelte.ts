@@ -3,7 +3,7 @@
 // The settings that belong to the machine rather than to the cut: how much of
 // the computer Kerf's media engine may take (`kerf_core::engine::cpu` enforces
 // the budget), whether analysis transcribes, what the preview draws, how the
-// workspace is arranged and what colors it is drawn in.
+// workspace is arranged, what colors it is drawn in and which keys do what.
 //
 // The persisted values live on the Rust side (the platform config directory),
 // so this holds only the resolved view and writes through `api.ts` — which
@@ -23,6 +23,29 @@ import {
 	type WorkspaceId,
 	type WorkspacesState
 } from './workspaces';
+import {
+	applyRebind,
+	detectPlatform,
+	displayChord,
+	emptyOverrides,
+	hasOverrides,
+	matchAction,
+	parseKeyOverrides,
+	rebindConflicts,
+	resetAction,
+	resetAll,
+	resolveBindings,
+	sameChord,
+	serializeOverrides,
+	setActionChords,
+	type ActionDef,
+	type ActionId,
+	type Chord,
+	type KeyEventLike,
+	type KeyOverrides,
+	type Rebind,
+	type Resolution
+} from './keymap';
 import type { AppSettings, SettingsView } from './types';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -76,6 +99,19 @@ class SettingsStore {
 	private writeWorkspaces = singleFlight(async () => {
 		await this.write({ workspaces: this.workspaces }, 'workspace layout');
 	});
+	/** What the user changed about the keyboard — only that; an action they never
+	 *  touched follows the defaults of whatever build is running. Like
+	 *  `workspaces` it is read once and is the live copy from then on, every
+	 *  change written through (newest wins), replaced and never mutated. */
+	keyOverrides = $state.raw<KeyOverrides>(emptyOverrides());
+	private keysRead = false;
+	private writeKeys = singleFlight(async () => {
+		await this.write({ keybindings: serializeOverrides(this.keyOverrides) }, 'keyboard shortcuts');
+	});
+	/** ⌘ and ⇧ are what a Mac writes; Ctrl and Shift are what everywhere else does. */
+	readonly platform = detectPlatform();
+	/** Every action's chords in force: the defaults with the user's changes on top. */
+	bindings = $derived(resolveBindings(this.keyOverrides, this.platform));
 	theme = $state<Theme>(PRESETS['kerf-dark']);
 	/** Color edits apply at once and are written a moment later; while one is
 	 *  pending, a view coming back from another write must not overwrite the
@@ -105,6 +141,10 @@ class SettingsStore {
 			this.workspaces = parseWorkspaces(view.workspaces, view.layout);
 			this.workspacesRead = true;
 		}
+		if (!this.keysRead) {
+			this.keyOverrides = parseKeyOverrides(view.keybindings, this.platform);
+			this.keysRead = true;
+		}
 		if (!this.themeDirty) {
 			const stored = parseTheme(view.theme);
 			this.theme = stored ? upgradeStoredTheme(stored) : PRESETS['kerf-dark'];
@@ -121,6 +161,7 @@ class SettingsStore {
 			console.error('could not read settings', e);
 		} finally {
 			this.workspacesRead = true;
+			this.keysRead = true;
 			this.loaded = true;
 		}
 	}
@@ -210,6 +251,71 @@ class SettingsStore {
 	setLibraryCollapsed(collapsed: boolean) {
 		if (collapsed === this.workspaces.library.collapsed) return;
 		this.changeWorkspaces({ ...this.workspaces, library: { ...this.workspaces.library, collapsed } });
+	}
+
+	// ---- keyboard ---------------------------------------------------------------
+
+	/** The action a keypress runs, or null. */
+	actionFor(e: KeyEventLike): ActionId | null {
+		return matchAction(e, this.bindings) as ActionId | null;
+	}
+
+	/** What an action is bound to, as menus print it (`⌘Z`, `Ctrl+Z`), in order. */
+	keysFor(id: ActionId | string): string[] {
+		return (this.bindings[id] ?? []).map((c) => displayChord(c, this.platform));
+	}
+
+	/** The first chord, for a menu item or a tooltip — empty when unbound, so
+	 *  the hint disappears with the key. */
+	shortcut(id: ActionId): string {
+		return this.keysFor(id)[0] ?? '';
+	}
+
+	/** `Razor (C)`, or `Razor` when nothing is bound to it. */
+	withShortcut(label: string, id: ActionId): string {
+		const k = this.shortcut(id);
+		return k ? `${label} (${k})` : label;
+	}
+
+	/** The other actions that already use this chord where `rebind` would put it. */
+	conflictsFor(rebind: Rebind): ActionDef[] {
+		return rebindConflicts(this.bindings, rebind);
+	}
+
+	get hasKeyOverrides(): boolean {
+		return hasOverrides(this.keyOverrides);
+	}
+
+	/** Whether an action has been changed from its defaults. */
+	isCustomKey(id: string): boolean {
+		return id in this.keyOverrides.bindings;
+	}
+
+	/** Give an action a chord — in place of `rebind.replacing`, or beside its
+	 *  others — settling any collision the way `resolution` says. With a collision
+	 *  and no resolution nothing changes (the dialog asks first). */
+	rebind(rebind: Rebind, resolution: Resolution | null = null) {
+		this.changeKeys(applyRebind(this.keyOverrides, this.bindings, rebind, resolution, this.platform));
+	}
+
+	/** Take one chord off an action (it may end up unbound). */
+	removeChord(id: string, chord: Chord) {
+		const mine = (this.bindings[id] ?? []).filter((c) => !sameChord(c, chord));
+		this.changeKeys(setActionChords(this.keyOverrides, id, mine, this.platform));
+	}
+
+	resetKey(id: string) {
+		this.changeKeys(resetAction(this.keyOverrides, id));
+	}
+
+	resetAllKeys() {
+		this.changeKeys(resetAll(this.keyOverrides));
+	}
+
+	private changeKeys(next: KeyOverrides) {
+		if (next === this.keyOverrides) return;
+		this.keyOverrides = next;
+		this.writeKeys.request();
 	}
 
 	/** Put a theme into force now and save it shortly — a color picker fires

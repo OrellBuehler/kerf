@@ -20,6 +20,7 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { cutSelection, deleteSelection } from '$lib/ops';
+	import type { ActionId } from '$lib/keymap';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
@@ -302,6 +303,116 @@
 
 	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
 
+	/** Delete / Shift+Delete: a selected title goes first (whichever of the two it
+	 *  was — a title has no gap to close); else the selected clips as one edit,
+	 *  with `ripple` closing the gaps behind them (plain Delete leaves them,
+	 *  unless ripple mode is on). Nothing selected: not ours, so the key is left alone. */
+	function deleteKey(ripple: boolean): void | false {
+		if (editor.selectedOverlayId) {
+			void editor
+				.removeOverlay(editor.selectedOverlayId)
+				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch(clipErr);
+		} else if (editor.selectedClipIds.length > 0) {
+			void deleteSelection(ripple);
+		} else {
+			return false;
+		}
+	}
+
+	/** What each action does. Which key runs it is `settings.actionFor`'s business
+	 *  (the registry in `keymap.ts`, with the user's changes on top); the type makes
+	 *  an action without a handler a compile error. A handler returns `false` when
+	 *  it did not take the key, so the browser still gets it. */
+	const run: Record<ActionId, (e: KeyboardEvent) => void | false> = {
+		'file.new': () => void onNew(),
+		'file.open': () => void openProjectAt(),
+		'file.save': () => void onSave(),
+		'file.import': () => void onImport(),
+		'file.export': () => onExport(),
+		'app.settings': () => settings.toggle(),
+
+		'edit.undo': () => {
+			if (editor.canUndo) void editor.undo();
+		},
+		'edit.redo': () => {
+			if (editor.canRedo) void editor.redo();
+		},
+		'edit.selectAll': () => editor.selectAll(),
+		'edit.copy': () => {
+			const n = editor.copySelection();
+			if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
+		},
+		'edit.cut': () => void cutSelection(),
+		'edit.paste': () =>
+			void editor
+				.paste(ui.time)
+				.then((n) => n && toast(n === 1 ? 'Clip pasted' : `${n} clips pasted`))
+				.catch(clipErr),
+		'edit.duplicate': () =>
+			void editor
+				.duplicateSelection()
+				.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
+				.catch(clipErr),
+		'edit.delete': () => deleteKey(false),
+		'edit.rippleDelete': () => deleteKey(true),
+		'edit.clearSelection': () => {
+			// Whatever else Escape is for gets it first: a menu or the notification
+			// panel closing, a dialog, a drag being abandoned (those stop the event).
+			if (!contextMenu.visible && !notifications.open && !ui.voiceoverDialog) editor.clearSelection();
+			// And it is never swallowed: it is how the browser backs out of things too.
+			return false;
+		},
+
+		'tool.pointer': () => {
+			ui.tool = 'pointer';
+		},
+		'tool.razor': () => {
+			ui.tool = 'razor';
+		},
+		// Ripple mode is a project setting, so the key must not auto-repeat it back
+		// and forth while held.
+		'tool.rippleMode': (e) => {
+			if (!e.repeat) void editor.setRippleMode(!editor.rippleMode).catch(clipErr);
+		},
+
+		'playback.toggle': () => ui.togglePlay(),
+		'playback.shuttleBack': () => ui.shuttle(-1),
+		'playback.pause': () => ui.pause(),
+		'playback.shuttleForward': () => ui.shuttle(1),
+		'playback.stepBack': () => ui.seek(ui.time - frameStep(false)),
+		'playback.stepForward': () => ui.seek(ui.time + frameStep(false)),
+		'playback.jumpBack': () => ui.seek(ui.time - frameStep(true)),
+		'playback.jumpForward': () => ui.seek(ui.time + frameStep(true)),
+		'playback.toStart': () => ui.seek(0),
+		'playback.toEnd': () => ui.seek(editor.duration),
+
+		'marker.add': () =>
+			void editor
+				.addMarkerAtPlayhead(ui.time)
+				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch(clipErr),
+		'marker.prev': () => ui.gotoMarker(-1),
+		'marker.next': () => ui.gotoMarker(1),
+		// The in / out pair stays ordered so a mark can't cross its partner.
+		'range.markIn': () => {
+			ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
+		},
+		'range.markOut': () => {
+			ui.markOut = Math.max(ui.time, ui.markIn ?? 0);
+		},
+		'range.clearIn': () => {
+			ui.markIn = null;
+		},
+		'range.clearOut': () => {
+			ui.markOut = null;
+		},
+
+		'view.zoomIn': () => ui.zoomBy(1),
+		'view.zoomOut': () => ui.zoomBy(-1),
+		'view.zoomFit': () => ui.zoomToFit()
+	};
+
 	function onKey(e: KeyboardEvent) {
 		if (e.defaultPrevented || modalOpen) return;
 		const target = e.target instanceof Element ? e.target : null;
@@ -312,128 +423,11 @@
 		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
 
-		// File operations (⌘/Ctrl). Handled first so they win over the bare-key
-		// tool shortcuts, and any other modified combo returns without falling
-		// through (so e.g. ⌘C doesn't get read as the razor 'c').
-		if (e.metaKey || e.ctrlKey) {
-			if (k === 'z') {
-				e.preventDefault();
-				if (e.shiftKey) {
-					if (editor.canRedo) void editor.redo();
-				} else if (editor.canUndo) void editor.undo();
-			} else if (k === 'y') {
-				e.preventDefault();
-				if (editor.canRedo) void editor.redo();
-			} else if (k === 's') {
-				e.preventDefault();
-				void onSave();
-			} else if (k === 'o') {
-				e.preventDefault();
-				void openProjectAt();
-			} else if (k === 'n') {
-				e.preventDefault();
-				void onNew();
-			} else if (k === 'e') {
-				e.preventDefault();
-				onExport();
-			} else if (k === 'i') {
-				e.preventDefault();
-				void onImport();
-			} else if (e.key === ',') {
-				e.preventDefault();
-				settings.toggle();
-			} else if (k === 'a') {
-				e.preventDefault();
-				editor.selectAll();
-			} else if (k === 'c') {
-				e.preventDefault();
-				const n = editor.copySelection();
-				if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
-			} else if (k === 'x') {
-				e.preventDefault();
-				void cutSelection();
-			} else if (k === 'v') {
-				e.preventDefault();
-				void editor
-					.paste(ui.time)
-					.then((n) => n && toast(n === 1 ? 'Clip pasted' : `${n} clips pasted`))
-					.catch(clipErr);
-			} else if (k === 'd') {
-				e.preventDefault();
-				void editor
-					.duplicateSelection()
-					.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
-					.catch(clipErr);
-			}
-			return;
-		}
-
-		// Tools / transport (bare keys).
-		if (k === 'v') ui.tool = 'pointer';
-		else if (k === 'c') ui.tool = 'razor';
-		else if (k === 'r' && !e.shiftKey && !e.altKey) {
-			// Ripple mode (R): a project setting, so the key must not auto-repeat it
-			// back and forth while held.
-			e.preventDefault();
-			if (!e.repeat) void editor.setRippleMode(!editor.rippleMode).catch(clipErr);
-		} else if (k === 'z' && e.shiftKey) {
-			e.preventDefault();
-			ui.zoomToFit();
-		} else if (k === 'm') {
-			void editor
-				.addMarkerAtPlayhead(ui.time)
-				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
-		} else if (e.key === ',') ui.gotoMarker(-1);
-		else if (e.key === '.') ui.gotoMarker(1);
-		else if (k === 'j') ui.shuttle(-1);
-		else if (k === 'k') ui.pause();
-		else if (k === 'l') ui.shuttle(1);
-		else if (k === 'i') {
-			// I/O mark the working range at the playhead; Shift clears a mark.
-			// The pair stays ordered so a mark can't cross its partner.
-			if (e.shiftKey) ui.markIn = null;
-			else ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
-		} else if (k === 'o') {
-			if (e.shiftKey) ui.markOut = null;
-			else ui.markOut = Math.max(ui.time, ui.markIn ?? 0);
-		} else if (e.key === ' ') {
-			e.preventDefault();
-			ui.togglePlay();
-		} else if (e.key === 'ArrowLeft') {
-			e.preventDefault();
-			ui.seek(ui.time - frameStep(e.shiftKey));
-		} else if (e.key === 'ArrowRight') {
-			e.preventDefault();
-			ui.seek(ui.time + frameStep(e.shiftKey));
-		} else if (e.key === 'Home') {
-			e.preventDefault();
-			ui.seek(0);
-		} else if (e.key === 'End') {
-			e.preventDefault();
-			ui.seek(editor.duration);
-		} else if (e.key === '+' || e.key === '=') {
-			e.preventDefault();
-			ui.zoomBy(1);
-		} else if (e.key === '-') {
-			e.preventDefault();
-			ui.zoomBy(-1);
-		} else if (e.key === 'Escape') {
-			// Whatever else Escape is for gets it first: a menu or the notification
-			// panel closing, a dialog, a drag being abandoned (those stop the event).
-			if (!contextMenu.visible && !notifications.open && !ui.voiceoverDialog) editor.clearSelection();
-		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedOverlayId) {
-			e.preventDefault();
-			void editor
-				.removeOverlay(editor.selectedOverlayId)
-				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch((err) => toast.error(err instanceof Error ? err.message : String(err)));
-		} else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.selectedClipIds.length > 0) {
-			e.preventDefault();
-			// One edit for the whole selection. Shift+Delete ripples (closes the
-			// gaps); plain Delete leaves them — unless ripple mode is on.
-			void deleteSelection(e.shiftKey);
-		}
+		// A key that is bound to nothing — or to a combination that is not exactly
+		// this one — does nothing, and in particular never falls through to a
+		// shorter chord (⌘C is not the razor's bare C).
+		const id = settings.actionFor(e);
+		if (id && run[id](e) !== false) e.preventDefault();
 	}
 </script>
 
