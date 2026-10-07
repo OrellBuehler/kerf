@@ -810,6 +810,33 @@ no editing logic in the adapter.
   What only the decode or the compositor can see is refused there instead
   (`GpuError::Unsupported`): a picture that decodes at another size than probed, an
   alpha channel found in the pixels of an asset that never recorded its format.
+- `engine/cli/golden.rs` — **the golden argv oracle** (test-only, a child of `cli` so it
+  reaches the private builders). 4000 seeded timelines (every transition kind with / without
+  a source handle / across a gap, fades, speed, reverse, stills, keyframes, masks, effects,
+  chroma, reframe, HDR, overlays, delivery format and fit, the audio mix, and **every
+  `ExportOptions` field** with the one-, two- and no-pass encoder spellings) have their
+  `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
+  FNV-1a digests, committed as 40 block digests each in
+  `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
+  ignores `\r`). A refactor of the graph builders must leave all three untouched; an
+  intended argv change moves the files of the builders it touched. **Bless** with
+  `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
+  (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
+  only the files you meant to change should move. It is **machine-independent**: the
+  builders read the machine in four places and each is pinned — the preview's
+  `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
+  thread-local override; every HDR case is built both ways), `drawtext`'s resolved font path
+  (no overlay names a font) and **libm** (`db_to_linear` is `powf`, whose last digits differ
+  between glibc with and without FMA, macOS, Windows and arm, so `round_libm` keeps the
+  compressor / gate numbers to 10 significant digits; the generator seeds dB values known to
+  differ, so a run under `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4` fails without it). The
+  digests are identical blessed with `KERF_HWACCEL` unset, `none` and `auto`. A coverage
+  table (`family needle` lines, plus the branch `transition_fx` took and a few structural
+  tags) fails the test if a family hits fewer than 20 cases — the generator stopped covering
+  it, or the argv text changed; digest and coverage failures are reported together.
+  `KERF_GOLDEN_CASES=<file>` writes a digest per case (diff base vs change to find the case
+  in a failing block), `KERF_GOLDEN_DUMP=<n>` prints one case's argv,
+  `KERF_GOLDEN_COVERAGE=1` the thinnest families.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
