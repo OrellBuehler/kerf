@@ -1681,7 +1681,7 @@ a caption's style is not recoverable from its text and guessing it from the
 word count would flip the chip whenever a sentence happened to be short —
 the button relabels to `Recaption` once there are generated captions, since a
 later trim moves the words out from under them, with `Clear` beside it taking
-only the generated ones — and edit text / timing / position / size / color /
+only the generated ones (imported ones included) — and edit text / timing / position / size / color /
 box / bold).
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
 surfaces): the Color section leads with one-click **looks** —
@@ -1959,6 +1959,30 @@ tests had not) — and `caption-import.ts` carries the subtitle parsers and
 `captions.ts` `placeCues` the same way, which is how `importCaptionsText` (the
 variant the harness and a file input use; `importCaptions(path)` needs the desktop
 app) imports for real under `bun run dev`, with `describeImport` the toast line.
+**Import captions…** is a button in `TitlesControls` (so in the Inspector's Titles
+lane and the library's Titles tab) and an entry in the titles-lane context menu
+(plus one per clip the cut shows, up to three). The button opens an inline options
+row — not a dialog, the controls live in a narrow column — and *Choose file…* runs
+`importCaptionFile` (`title-actions.ts`): `pickCaptionFile` (desktop: the dialog
+plugin, answering a *path* the backend reads with its guards; harness: an `<input
+type=file>` read as text, opened before any `await` or the click is no longer a user
+gesture) → `confirmAction` when generated captions exist ("Replace the 12 captions
+already on the cut with those in x.srt?" — asked after the pick so it can name the
+file, counted on `editor.liveTimeline`, the cut the edit lands on rather than a
+proposal being previewed) → `editor.importCaptions` /
+`importCaptionsText` → a `describeImport` toast, a *warning* when any cue was
+dropped or unreadable (`importTone`). The selection is left alone. Timing is
+**Timed to the cut** (default) or **to a source clip**, offered only the assets a
+*rendering* clip shows (`importableAssets` — a muted track or disabled clip has no
+footage to caption), defaulting to the selected clip's; the choice lives on `ui`
+beside `captionStyle` (so both copies of the controls agree) and `resolveChoice`
+falls back to the cut when nothing is offered. An imported set and a generated one
+are both `generated` and cannot be told apart, so Recaption's and Clear's tooltips
+say they replace / remove *either* instead of guessing. The words and the request
+are `caption-import-ui.ts` (pure); the flow is bun-tested over the harness in
+`title-actions.test.ts`, which stubs `./api` and `./notifications.svelte` at module
+load (svelte-sonner cannot load under bun), and the desktop half — the dialog's
+filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.

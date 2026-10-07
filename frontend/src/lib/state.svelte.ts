@@ -172,6 +172,11 @@ class EditorState {
 
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline: Timeline | null = null;
+	/** The cut an edit lands on: the live one even while a proposal is on screen
+	 *  (every edit drops the preview first). `timeline` is what is *shown*. */
+	get liveTimeline(): Timeline {
+		return this.#liveTimeline ?? this.timeline;
+	}
 	/** Snapshot guard over `timeline` — every writer bumps it (via `#setTimeline`)
 	 *  so a `refreshTimeline()` fetch that started earlier can tell a newer write
 	 *  already landed while it was waiting and skip clobbering it. */

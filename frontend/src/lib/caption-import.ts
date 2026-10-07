@@ -330,7 +330,9 @@ export function parseFormat(name: string): CaptionFormat | null {
 	}
 }
 
-const tooLarge = () =>
+/** The refusal for a file over `MAX_CAPTION_FILE_BYTES`, shared by the parser and
+ *  the browser harness's file picker (which checks before reading it all). */
+export const fileTooLarge = () =>
 	new Error(`subtitle file is larger than ${MAX_CAPTION_FILE_BYTES >> 20} MiB — not a subtitle file`);
 
 /** Read subtitle text in `format`, or in whichever format it looks like. Throws on
@@ -340,7 +342,7 @@ export function parseCaptions(
 	text: string,
 	format?: CaptionFormat | null
 ): { format: CaptionFormat; parsed: ParsedCaptions } {
-	if (new TextEncoder().encode(text).length > MAX_CAPTION_FILE_BYTES) throw tooLarge();
+	if (new TextEncoder().encode(text).length > MAX_CAPTION_FILE_BYTES) throw fileTooLarge();
 	const used = format ?? detectFormat(text);
 	const parsed = used === 'srt' ? parseSrt(text) : parseAss(text);
 	if (parsed.cues.length > MAX_CAPTION_CUES) {
