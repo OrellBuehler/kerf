@@ -408,7 +408,7 @@ pub fn decode_layers(layers: &[PlanLayer]) -> Result<Vec<Option<YuvFrame>>, GpuE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kerf_core::{Color, PlanStream, Transform};
+    use kerf_core::{Color, LayerFx, PlanStream, PlanTiming, Transform};
     use uuid::Uuid;
 
     fn layer(is_image: bool) -> PlanLayer {
@@ -433,6 +433,20 @@ mod tests {
             },
             transform: Transform::default(),
             color: Color::default(),
+            name: "a".into(),
+            projection: None,
+            hdr: None,
+            effects: Vec::new(),
+            mask: None,
+            reframe: None,
+            fx: LayerFx::default(),
+            animated: None,
+            timing: PlanTiming {
+                window: (0.0, 10.0),
+                source_window: (0.0, 10.0),
+                speed: 1.0,
+                reversed: false,
+            },
         }
     }
 

@@ -6724,17 +6724,24 @@ mod tests {
 
     #[test]
     fn a_thousand_word_cue_in_word_punch_places_quickly() {
-        // 400 cues of a thousand one-letter words, each over a few seconds: every
-        // word is a flicker and has to be merged. The old timer rebuilt (and
-        // cloned) every chunk per merge — about three seconds per hundred such
-        // cues, so about twelve here, against well under two now. The limit is
-        // wide because tests run in parallel on a busy machine: it has to catch
-        // the algorithm, never the load.
+        // The worst import the caps allow: `MAX_CAPTION_WORDS` one-letter words in
+        // cues as long as `MAX_CUE_CHARS` lets them be, each over a few seconds,
+        // so every word is a flicker that has to be merged. Merging within a cue
+        // is still quadratic in its word count (4x the words costs ~16x), which is
+        // why a cue and an import are capped: the worst case is bounded, not the
+        // algorithm. It runs in well under half a second unoptimized; the limit is
+        // ~20x that because the suite runs in parallel on a busy machine — it has
+        // to catch a lost cap or a much slower merge, never the load. (The old
+        // timer rebuilt and cloned every chunk per merge: about 3 s for this.)
+        use crate::captions_import::{MAX_CAPTION_WORDS, MAX_CUE_CHARS};
+        let words_per_cue = MAX_CUE_CHARS.div_ceil(2);
+        let cue_count = MAX_CAPTION_WORDS / words_per_cue;
         let asset = Uuid::new_v4();
-        let timeline = cut_of(asset, 4_000.0);
-        let thousand = vec!["a"; 1000].join(" ");
-        let cues: Vec<TranscriptSegment> = (0..400)
-            .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &thousand))
+        let timeline = cut_of(asset, cue_count as f64 * 10.0);
+        let text = vec!["a"; words_per_cue].join(" ");
+        assert!(text.chars().count() <= MAX_CUE_CHARS);
+        let cues: Vec<TranscriptSegment> = (0..cue_count)
+            .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &text))
             .collect();
         let started = std::time::Instant::now();
         let p = timeline.place_cues(
@@ -6744,11 +6751,11 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_secs(8), "placing took {took:?}");
-        accounted(&p, 400);
-        assert_eq!(p.placed, 400);
+        accounted(&p, cue_count);
+        assert_eq!(p.placed, cue_count);
         // Nothing was lost to the merging: every word is still there.
         let words: usize = p.overlays.iter().map(|o| o.text.split_whitespace().count()).sum();
-        assert_eq!(words, 400 * 1000);
+        assert_eq!(words, cue_count * words_per_cue);
     }
 
     #[test]
