@@ -6,6 +6,7 @@
 	import Icon from './Icon.svelte';
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
+	import KeyboardSettings from './KeyboardSettings.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
@@ -20,7 +21,8 @@
 		{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' },
 		{ id: 'speech', label: 'Speech', icon: 'mic' },
 		{ id: 'preview', label: 'Preview', icon: 'eye' },
-		{ id: 'appearance', label: 'Appearance', icon: 'palette' }
+		{ id: 'appearance', label: 'Appearance', icon: 'palette' },
+		{ id: 'keyboard', label: 'Keyboard', icon: 'keyboard' }
 	] as const;
 	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
 
@@ -142,7 +144,12 @@
 				{/each}
 			</div>
 
-			<div style="flex:1;overflow-y:auto;padding:14px 16px;min-width:0">
+			<!-- The keyboard list has its own search and scroll, so it gets the panel whole. -->
+			<div
+				style="flex:1;min-width:0;{section === 'keyboard'
+					? 'display:flex;flex-direction:column;overflow:hidden'
+					: 'overflow-y:auto;padding:14px 16px'}"
+			>
 				{#if section === 'performance'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
 						CPU limit
@@ -391,6 +398,8 @@
 							{/each}
 						</div>
 					{/each}
+				{:else if section === 'keyboard'}
+					<KeyboardSettings />
 				{/if}
 			</div>
 		</div>

@@ -941,7 +941,7 @@
 			{
 				label: 'Split at playhead',
 				icon: 'Scissors',
-				shortcut: 'C',
+				shortcut: settings.shortcut('tool.razor'),
 				disabled: !within || !!t.locked,
 				action: () => {
 					// The playhead can be anywhere between frames; the cut is on one.
@@ -953,7 +953,7 @@
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
 				icon: 'copy',
-				shortcut: '⌘C',
+				shortcut: settings.shortcut('edit.copy'),
 				action: () => {
 					const k = editor.copySelection();
 					if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
@@ -961,7 +961,7 @@
 			},
 			{
 				label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
-				shortcut: '⌘D',
+				shortcut: settings.shortcut('edit.duplicate'),
 				action: () =>
 					void editor
 						.duplicateSelection()
@@ -988,14 +988,14 @@
 			{
 				label: n > 1 ? `Remove ${n} clips` : 'Remove',
 				icon: 'trash',
-				shortcut: 'Del',
+				shortcut: settings.shortcut('edit.delete'),
 				danger: true,
 				action: () => removeClip(c.id, false)
 			},
 			{
 				label: n > 1 ? `Ripple delete ${n} clips` : 'Ripple delete',
 				icon: 'trash',
-				shortcut: '⇧Del',
+				shortcut: settings.shortcut('edit.rippleDelete'),
 				danger: true,
 				action: () => removeClip(c.id, true)
 			}
@@ -1229,7 +1229,7 @@
 				label: o.generated ? 'Remove caption' : 'Remove title',
 				icon: 'trash',
 				danger: true,
-				shortcut: 'Del',
+				shortcut: settings.shortcut('edit.delete'),
 				action: () => void editor.removeOverlay(o.id).catch(err)
 			}
 		]);
@@ -1258,6 +1258,12 @@
 	}
 
 	// ---- ruler scrub + draggable in/out marks ---------------------------------
+
+	/** ", ⇧I clears" in a mark's tooltip — whatever key does, or nothing when none does. */
+	const clearHint = (id: 'range.clearIn' | 'range.clearOut') => {
+		const k = settings.shortcut(id);
+		return k ? `, ${k} clears` : '';
+	};
 
 	let scrubbing = false;
 	let markDrag: 'in' | 'out' | null = null;
@@ -1329,7 +1335,7 @@
 			{
 				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
 				icon: 'copy',
-				shortcut: '⌘V',
+				shortcut: settings.shortcut('edit.paste'),
 				disabled: editor.clipboard.length === 0,
 				action: () =>
 					void editor
@@ -1338,7 +1344,12 @@
 						.catch(err)
 			},
 			{ type: 'separator' },
-			{ label: 'Add marker at playhead', icon: 'bookmark', shortcut: 'M', action: addMarkerHere },
+			{
+				label: 'Add marker at playhead',
+				icon: 'bookmark',
+				shortcut: settings.shortcut('marker.add'),
+				action: addMarkerHere
+			},
 			{ type: 'separator' },
 			{
 				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
@@ -1348,13 +1359,13 @@
 			{
 				label: editor.rippleMode ? 'Turn ripple mode off' : 'Turn ripple mode on',
 				icon: 'between-horizontal-start',
-				shortcut: 'R',
+				shortcut: settings.shortcut('tool.rippleMode'),
 				action: () => void editor.setRippleMode(!editor.rippleMode).catch(err)
 			},
 			{
 				label: 'Zoom to fit',
 				icon: 'fold-horizontal',
-				shortcut: '⇧Z',
+				shortcut: settings.shortcut('view.zoomFit'),
 				disabled: !hasClips,
 				action: () => ui.zoomToFit()
 			}
@@ -1395,7 +1406,7 @@
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
-				title="Drag any of them to move them all; Delete removes them all"
+				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}"
 				style="font-size:10px;color:var(--kerf-300)">{editor.selectedClips.length} selected</span
 			>
 		{/if}
@@ -1425,7 +1436,7 @@
 		{/if}
 		<div style="flex:1"></div>
 		<button
-			title="Zoom out"
+			title={settings.withShortcut('Zoom out', 'view.zoomOut')}
 			aria-label="Zoom out"
 			onclick={() => ui.zoomBy(-1)}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
@@ -1443,14 +1454,14 @@
 			style="width:90px;height:24px;"
 		/>
 		<button
-			title="Zoom in"
+			title={settings.withShortcut('Zoom in', 'view.zoomIn')}
 			aria-label="Zoom in"
 			onclick={() => ui.zoomBy(1)}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-in" s={14} /></button
 		>
 		<button
-			title="Zoom to fit the whole cut (⇧Z)"
+			title={settings.withShortcut('Zoom to fit the whole cut', 'view.zoomFit')}
 			aria-label="Zoom to fit"
 			disabled={!hasClips}
 			onclick={() => ui.zoomToFit()}
@@ -1471,8 +1482,8 @@
 		     is lit while on, with a second cue in the ruler corner. -->
 		<button
 			title={editor.rippleMode
-				? 'Ripple on (R) — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own: there is no sync lock yet, so linked audio and video do not move together.'
-				: 'Ripple off (R) — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own (no sync lock yet).'}
+				? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own: there is no sync lock yet, so linked audio and video do not move together.`
+				: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own (no sync lock yet).`}
 			aria-pressed={editor.rippleMode}
 			onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
 			style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode
@@ -1531,7 +1542,7 @@
 	<!-- The whole cut on one strip: where the view is, and a way to move it. A
 	     pointer overview, hidden from assistive tech on purpose: everything it does
 	     is already reachable from the keyboard (the scroller itself, the zoom
-	     buttons and + / -, ⇧Z to fit, J / K / L and the playhead's follow) — a
+	     buttons and the zoom / fit / shuttle keys, and the playhead's follow) — a
 	     second focusable widget with partial parity would be more to learn than
 	     to use. Its toggle in the toolbar stays labelled. -->
 	{#if ui.minimap && hasClips}
@@ -1805,7 +1816,7 @@
 				{#if ui.markIn !== null}
 					<span
 						role="presentation"
-						title="Mark in {fmt(ui.markIn)} — drag to move, ⇧I clears"
+						title="Mark in {fmt(ui.markIn)} — drag to move{clearHint('range.clearIn')}"
 						onpointerdown={(e) => onMarkPointerDown(e, 'in')}
 						style="position:absolute;left:{ui.markIn * pxPerSec -
 							3}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
@@ -1819,7 +1830,7 @@
 				{#if ui.markOut !== null}
 					<span
 						role="presentation"
-						title="Mark out {fmt(ui.markOut)} — drag to move, ⇧O clears"
+						title="Mark out {fmt(ui.markOut)} — drag to move{clearHint('range.clearOut')}"
 						onpointerdown={(e) => onMarkPointerDown(e, 'out')}
 						style="position:absolute;left:{ui.markOut * pxPerSec -
 							9}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"

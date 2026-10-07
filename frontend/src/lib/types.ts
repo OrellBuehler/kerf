@@ -807,6 +807,10 @@ export interface AppSettings {
 	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
 	 *  back in. Opaque to the backend. */
 	workspaces: unknown | null;
+	/** What the user changed about the keyboard shortcuts: `{ version, bindings:
+	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
+	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
+	keybindings: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

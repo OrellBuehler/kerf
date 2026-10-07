@@ -642,10 +642,35 @@ fn parse_rational(s: &str) -> Option<f64> {
 
 // ---- HDR → SDR -------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// What [`zscale_available`] answers on this thread while a test pins it.
+    static ZSCALE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` as if this ffmpeg did (`true`) or did not (`false`) have `zscale`.
+#[cfg(test)]
+fn with_zscale<R>(available: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ZSCALE_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(ZSCALE_OVERRIDE.with(|c| c.replace(Some(available))));
+    f()
+}
+
 /// Whether this ffmpeg can tone-map with `zscale` + `tonemap`, probed once per
 /// process. `zscale` needs libzimg, which a minimal or hand-built ffmpeg often
 /// lacks; `tonemap` itself is part of every build.
 fn zscale_available() -> bool {
+    // Tests pin the answer so an argv oracle does not depend on the ffmpeg
+    // installed where it runs (see `golden`).
+    #[cfg(test)]
+    if let Some(forced) = ZSCALE_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let bin = ffmpeg_bin();
@@ -3769,6 +3794,22 @@ fn build_preview_args(
     max_width: u32,
     quality: u8,
 ) -> Result<Vec<String>> {
+    build_preview_args_with(timeline, assets, start, fps, max_width, quality, decode_hwaccel())
+}
+
+/// [`build_preview_args`] with the decode acceleration given rather than read from
+/// the machine (`KERF_HWACCEL`, and whether an earlier hardware failure turned it
+/// off). The one seam the golden argv oracle needs to be independent of the machine
+/// it runs on; the argv it builds is exactly what `build_preview_args` always did.
+fn build_preview_args_with(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    max_width: u32,
+    quality: u8,
+    hwaccel: Option<String>,
+) -> Result<Vec<String>> {
     // Same gate as the export: muted / solo-shadowed tracks and disabled clips
     // never reach the graph, so what plays is what would render.
     let timeline = &timeline.for_render();
@@ -3797,7 +3838,7 @@ fn build_preview_args(
         // Bilinear over the export's default: at preview size the difference is
         // invisible and the scaler runs on every frame of every clip.
         scaler: Some("bilinear".to_string()),
-        hwaccel: decode_hwaccel(),
+        hwaccel,
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
@@ -6363,6 +6404,11 @@ fn atempo_chain(speed: f64) -> String {
     parts.push(format!("atempo={s}"));
     parts.join(",")
 }
+
+/// The golden argv oracle (see its docs): a child module so it reaches the
+/// private builders.
+#[cfg(test)]
+mod golden;
 
 #[cfg(test)]
 mod tests {
