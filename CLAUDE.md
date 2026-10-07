@@ -45,6 +45,46 @@ so the feature is **only** activated through these forwards — which is what ma
   gives 1280 normally but 3072 for a spherical asset, because reframing crops
   ~100° out of the sphere and would otherwise leave ~355 real pixels. That width
   is part of the cache key, so marking an asset 360 rebuilds its proxy.
+  **A proxy must answer `-ss T` with the frame the original does, including when
+  the video starts late**: ffmpeg's input `-ss` is relative to the *container's*
+  start (its earliest stream), and a proxy is video-only, so for a source whose
+  video starts after its audio (`head_lead` = video start − container start,
+  above 1 ms; audio at 0, video at 0.08 s) a plain proxy starts at the video and
+  every seek lands `lead` seconds deeper into the footage than the export's.
+  FFmpeg ≤ 6 hid this by accident (its default cfr mp4 sync pads the head, but
+  regrids every frame to a grid anchored at zero — half a frame off for most
+  leads, so still a frame out at every boundary); FFmpeg 7+ defaults an mp4 to
+  vfr and keeps the late start, so the bundled 9.0 proxies were two frames out at
+  half a second (a five-second lead: five seconds). `build_proxy_args(head_pad)`
+  fixes only those sources: one clone of the first frame at t=0, merged in front
+  of the stream by `interleave` (orders by timestamp, µs time base, so every
+  other frame keeps its exact pts), with `-fps_mode vfr` spelled by
+  `fps_mode_flag()` (`-vsync` before 5.1; 9.0 removed it). Not `-fps_mode cfr`:
+  that regrids every frame and turns variable-frame-rate phone footage constant.
+  The key gains `|lead` for these sources only (every ordinary file's key is
+  unchanged, so nothing else is rebuilt) and the file is named `<hash>.lead.mp4`:
+  that it is padded is a fact about the *file*, so it travels in the name
+  (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
+  path. `source_traits` is the one cached ffprobe per file that answers HDR, the
+  lead and the container. The clone is a frame the original has no counterpart
+  for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
+  from the very head of the source) would hold it for `lead` while the export
+  starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
+  input's name and `video_clip_chain` opens that chain with `trim=start_frame=1`.
+  Any seeked read skips the clone already. Ordinary assets get no such filter and
+  an unchanged argv. A padded proxy never takes a hardware encoder (its output
+  has no frame rate for the encoder to be told, and one refusal disables HW
+  encode process-wide). **MPEG-TS is not fixed and is left alone**
+  (`.ts`/`.mts`/`.m2ts`, `format_name` `mpegts`: lead reported 0, plain proxy,
+  unchanged key): the TS demuxer measures the container start over the streams it
+  reads, so the audio-less read rebases the video to zero and no pad can restore
+  the original's offset — a late-starting transport stream still previews its
+  seeks `lead` off. **Known export issue, not fixed here**: the export itself
+  rebases a head clip's first video frame to the clip start (`trim=start=0` then
+  `setpts=PTS-STARTPTS`), so for a late-start source a clip cut from the head has
+  its video `lead` early against its own audio (the preview now matches the
+  export, not the source's true sync); only clips that start past the lead are in
+  sync.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
   encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
   each compiled-in candidate is verified with a one-frame test encode, because
@@ -267,7 +307,8 @@ so the feature is **only** activated through these forwards — which is what ma
   runs on delivery-sized, kept frames — and before any colour work; the composited
   still prefixes it per clip. The *single-input* decodes (`decode_frame`,
   `contact_sheet`, `generate_proxy`) have only a path, so they ask `source_hdr`
-  (one cached ffprobe per file) and append the chain after their own downscale.
+  (a view of `source_traits`, one cached ffprobe per file) and append the chain
+  after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
   frames. **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
