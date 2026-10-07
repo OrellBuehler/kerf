@@ -5645,6 +5645,212 @@ mod tests {
         );
     }
 
+    /// Deletes a file when dropped, pass or fail: a proxy a test generated into the
+    /// user's own cache must not outlive a failing assert.
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Deletes a scratch directory when dropped, pass or fail.
+    struct RemoveDirOnDrop(PathBuf);
+
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Six seconds of 30 fps video whose frames number themselves (bit k of the
+    /// frame number is the k-th eighth of the picture's width, white for 1), the
+    /// video starting `lead` seconds after the audio. `None` when this ffmpeg
+    /// cannot make it.
+    fn late_barcode_source(dir: &Path, lead: f64) -> Option<PathBuf> {
+        use crate::engine::test_support::StatusBounded;
+        let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+        let run = |args: &[&str]| {
+            std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .status_bounded()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let bars = "color=c=black:s=640x360:r=30:d=6,format=yuv420p,\
+                    geq=lum='if(bitand(trunc(N/pow(2,trunc(X*8/W))),1),235,16)':cb=128:cr=128";
+        let (video, audio, media) = (dir.join("v.mp4"), dir.join("a.mp4"), dir.join(format!("late-{lead}.mp4")));
+        let delay = lead.to_string();
+        let made = run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            bars,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            video.to_str().unwrap(),
+        ]) && run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=8",
+            "-c:a",
+            "aac",
+            audio.to_str().unwrap(),
+        ]) && run(&[
+            "-itsoffset",
+            &delay,
+            "-i",
+            video.to_str().unwrap(),
+            "-i",
+            audio.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            media.to_str().unwrap(),
+        ]);
+        made.then_some(media)
+    }
+
+    /// Which numbered frame of [`late_barcode_source`] a JPEG shows.
+    fn barcode_of(dir: &Path, jpeg: &[u8]) -> u32 {
+        let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+        let file = dir.join("frame.jpg");
+        std::fs::write(&file, jpeg).unwrap();
+        let out = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&file)
+            .args(["-vf", "scale=640:360,format=gray", "-f", "rawvideo", "pipe:1"])
+            .output()
+            .unwrap();
+        (0..8)
+            .filter(|k| out.stdout[180 * 640 + (2 * k + 1) * 640 / 16] > 125)
+            .map(|k| 1u32 << k)
+            .sum()
+    }
+
+    /// A source whose video starts after its audio (a camera that opens its mic
+    /// first). Its preview decodes the proxy and its export decodes the original,
+    /// and a clip cut from the middle must show the same frame in both: an input
+    /// `-ss` is relative to the *container's* start, and an FFmpeg-9 proxy of such
+    /// a file used to start its container at the video, so every cut landed a few
+    /// frames deeper in the preview than in the render.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored late_starting_source`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    #[allow(clippy::print_stderr)]
+    fn late_starting_source_previews_the_frame_the_export_cuts() {
+        let dir = std::env::temp_dir().join(format!("kerf-late-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = RemoveDirOnDrop(dir.clone());
+        let Some(media) = late_barcode_source(&dir, 0.064) else {
+            eprintln!("skipped: this ffmpeg cannot make the late-starting test clip");
+            return;
+        };
+
+        let project = Project::open_in_memory().unwrap();
+        let asset = project.import_asset(&media).unwrap();
+        // Two cuts from the middle of the source, one on the frame grid and one off it.
+        project.add_clip_to_timeline(asset.id, None, 0.5, 2.0, Some(0.0)).unwrap();
+        project.add_clip_to_timeline(asset.id, None, 1.234, 3.0, Some(2.0)).unwrap();
+        let (timeline, originals) = (project.timeline().unwrap(), project.list_assets().unwrap());
+        let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
+        let _cleanup = RemoveOnDrop(proxy.clone());
+        let (_, previews) = project.timeline_frame_inputs().unwrap();
+        assert_eq!(previews[0].path, proxy.to_string_lossy(), "the preview decodes the proxy");
+
+        let mut mismatches = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for t in [0.0, 0.1, 0.25, 0.5, 1.0, 1.4, 2.0, 2.05, 2.3, 3.0, 3.7] {
+            let render = barcode_of(
+                &dir,
+                &Project::composite_timeline_frame(&timeline, &originals, t, 640, 2).unwrap(),
+            );
+            let preview = barcode_of(
+                &dir,
+                &Project::composite_timeline_frame(&timeline, &previews, t, 640, 2).unwrap(),
+            );
+            seen.insert(render);
+            if render != preview {
+                mismatches.push((t, render, preview));
+            }
+        }
+        assert!(seen.len() > 5, "the clips never moved: {seen:?}");
+        assert!(
+            mismatches.is_empty(),
+            "(time, export's frame, preview's frame) differ: {mismatches:?}"
+        );
+    }
+
+    /// The same source, played from the very head of a clip cut at `source_in` 0 —
+    /// which reads the proxy from its start with no `-ss`, where every other cut
+    /// seeks. A padded proxy opens with a clone of the first frame that the original
+    /// has no frame for, and the clip came out `lead` seconds of held frame late
+    /// (with a 0.5 s lead: frame 15 at a second in where the export shows 30) —
+    /// while a cut 2 ms in, which seeks past the clone, was exact. The cliff is at
+    /// the most common clip there is, so both sides of it are pinned: the streamed
+    /// frames of the proxy, as the player shows them, against the original's.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored head_clip_of_a_late`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    #[allow(clippy::print_stderr)]
+    fn head_clip_of_a_late_starting_source_streams_the_frames_the_export_renders() {
+        let dir = std::env::temp_dir().join(format!("kerf-late-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = RemoveDirOnDrop(dir.clone());
+        let Some(media) = late_barcode_source(&dir, 0.5) else {
+            eprintln!("skipped: this ffmpeg cannot make the late-starting test clip");
+            return;
+        };
+        let project = Project::open_in_memory().unwrap();
+        let asset = project.import_asset(&media).unwrap();
+        let proxy = engine::generate_proxy(&media, engine::proxy_width(asset.projection())).unwrap();
+        let _cleanup = RemoveOnDrop(proxy.clone());
+
+        // A frame a clip shows, 40 frames from its start — past the second mark, where the
+        // held-frame slip is a whole `lead` of them.
+        for source_in in [0.0, 0.0005, 0.002, 0.5] {
+            let clip = project
+                .add_clip_to_timeline(asset.id, None, source_in, 4.0, Some(0.0))
+                .unwrap();
+            let originals = project.list_assets().unwrap();
+            let (timeline, previews) = project.timeline_frame_inputs().unwrap();
+            assert_eq!(previews[0].path, proxy.to_string_lossy(), "the preview decodes the proxy");
+            let stream = |assets: &[Asset]| -> Vec<u32> {
+                let mut frames = Vec::new();
+                engine::stream_preview(&timeline, assets, 0.0, 30.0, &mut |f| {
+                    frames.push(barcode_of(&dir, &f.jpeg));
+                    frames.len() < 40
+                })
+                .unwrap();
+                frames
+            };
+            let (export, preview) = (stream(&originals), stream(&previews));
+            assert!(
+                export.len() == 40 && export[39] > export[0],
+                "source_in {source_in}: {export:?}"
+            );
+            assert_eq!(
+                preview, export,
+                "source_in {source_in}: the preview's frames differ from the export's"
+            );
+            project.remove_clips(&[clip.id]).unwrap();
+        }
+    }
+
     // ---- ripple mode and multi-clip edits ---------------------------------------
 
     /// V1 holding `a [0,5)  b [6,10)  c [12,15)` — a gap of 1s and one of 2s.
