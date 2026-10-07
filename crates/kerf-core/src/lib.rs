@@ -8,9 +8,11 @@
 pub mod analysis;
 pub mod error;
 pub mod fonts;
+pub mod layer_geometry;
 pub mod model;
 pub mod platform;
 pub mod project;
+pub mod render_plan;
 
 mod engine;
 
@@ -26,24 +28,26 @@ pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
-    contact_sheet_times, download_speech_model, export_still, generate_proxy, hw_encoders, insta360_pair, prepare_voiceover,
-    proxy_path, proxy_width, render_variants, render_with, render_with_progress, set_speech_model, speech_model_names,
-    stitch_insta360, stitched_path, stream_preview, validate_export, voiceover_status, waveform_pyramid, waveform_range,
-    waveform_range_of, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, PreviewFrame,
-    RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
-    WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
+    composite_color_policy, contact_sheet_times, download_speech_model, export_still, ffmpeg_command, ffmpeg_path,
+    generate_proxy, hw_encoders, insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants,
+    render_with, render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview,
+    validate_export, voiceover_status, waveform_pyramid, waveform_range, waveform_range_of, Container, DownloadProgress,
+    ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, PreviewFrame, RateControl, Region, RenderStatus,
+    SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange,
+    DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionStyle, Clip, ClipMove, Color, CropFrame, Delivery,
     DiffEntry, DiffKind, EditSource, Framing, Keyframe, Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe,
-    ResolvedReframe, Revision, Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, TextKeyframe,
-    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect,
-    Voiceover,
+    ResolvedReframe, Revision, Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition,
+    TransitionKind, VideoEffect, Voiceover,
 };
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, VOICEOVER_TRACK};
+pub use render_plan::{CompositeColorPolicy, PlanCanvas, PlanLayer, PlanStream, RenderPlan, YuvMatrix, MAX_SHRINK};

@@ -1,0 +1,31 @@
+[package]
+name = "kerf-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Kerf wgpu compositor: renders a kerf-core RenderPlan on the GPU, with an FFmpeg parity harness"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["ffmpeg"]
+# Forward in-process libav probing to kerf-core, like every other crate. The
+# compositor itself never links FFmpeg: frames come from the `ffmpeg` binary.
+ffmpeg = ["kerf-core/ffmpeg"]
+
+[dependencies]
+kerf-core = { workspace = true }
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+chrono.workspace = true

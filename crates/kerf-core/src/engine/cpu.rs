@@ -196,7 +196,12 @@ pub fn lease() -> Lease {
 /// means. These are the *front* flags, which land in the first input's option
 /// group and so cap the decoder — the expensive half of every analysis pass.
 fn head_flags(threads: usize) -> Vec<String> {
-    if !limited() || threads == 0 || threads >= cores() {
+    head_flags_with(threads, limited())
+}
+
+/// [`head_flags`] with the "is the budget on" decision made by the caller.
+fn head_flags_with(threads: usize, capped: bool) -> Vec<String> {
+    if !capped || threads == 0 || threads >= cores() {
         return Vec::new();
     }
     let n = threads.to_string();
@@ -220,6 +225,32 @@ fn head_flags(threads: usize) -> Vec<String> {
 /// ffmpeg is handed.
 pub fn limit_args(args: &mut Vec<String>, threads: usize) {
     let head = head_flags(threads);
+    if head.is_empty() {
+        return;
+    }
+    if let Some(sink) = args.len().checked_sub(1) {
+        args.splice(sink..sink, ["-threads".to_string(), threads.to_string()]);
+    }
+    args.splice(0..0, head);
+}
+
+/// The threads one of `share` processes running side by side may use: the
+/// budget's threads divided among them, at least one each.
+pub fn shared_threads(budget: usize, share: usize) -> usize {
+    (budget / share.max(1)).max(1)
+}
+
+/// Cap an argv for one of `share` ffmpeg processes that run side by side (the
+/// GPU path decodes every layer of a frame in parallel). A lone process is
+/// [`limit_args`] exactly — nothing at a full budget. With several, the budget's
+/// threads are *divided*, and the cap is written even at 100%: left alone, N
+/// processes would each ask for every core, N times what the budget allows.
+pub fn limit_args_shared(args: &mut Vec<String>, share: usize) {
+    let threads = shared_threads(budget_threads(), share);
+    if share <= 1 {
+        return limit_args(args, threads);
+    }
+    let head = head_flags_with(threads, true);
     if head.is_empty() {
         return;
     }
@@ -321,6 +352,35 @@ mod tests {
         // The encoder cap sits in the output group: after the last input,
         // immediately before the sink.
         assert_eq!(&args[args.len() - 3..], &["-threads", "1", "out.mp4"]);
+        set_cpu_percent(restore);
+    }
+
+    #[test]
+    fn side_by_side_processes_split_the_budget() {
+        assert_eq!(shared_threads(12, 1), 12);
+        assert_eq!(shared_threads(12, 3), 4);
+        assert_eq!(shared_threads(12, 5), 2);
+        // Never zero, and a share of zero is a share of one.
+        assert_eq!(shared_threads(4, 16), 1);
+        assert_eq!(shared_threads(4, 0), 4);
+    }
+
+    #[test]
+    fn shared_processes_are_capped_even_at_a_full_budget_but_a_lone_one_is_not() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        set_cpu_percent(100);
+        let original: Vec<String> = ["-i", "in.mp4", "out.mp4"].iter().map(|s| s.to_string()).collect();
+        let mut lone = original.clone();
+        limit_args_shared(&mut lone, 1);
+        assert_eq!(lone, original);
+        let mut shared = original;
+        limit_args_shared(&mut shared, 4);
+        if cores() > 1 {
+            let n = shared_threads(cores(), 4).to_string();
+            assert_eq!(&shared[..2], &["-threads", n.as_str()], "{shared:?}");
+            assert_eq!(&shared[shared.len() - 3..], &["-threads", n.as_str(), "out.mp4"]);
+        }
         set_cpu_percent(restore);
     }
 
