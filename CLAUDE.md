@@ -203,7 +203,11 @@ so the feature is **only** activated through these forwards — which is what ma
   `ffmpeg_frame_time(k) = k * (den / num)`, an ulp off `k / fps`, which drops the first
   frame of a third of the frame-aligned clips at 24 fps and half at 29.97; and a `fade`
   counts frames (`S = round(st * fps)`, `N = round(d * fps)`, `i / N`), it does not
-  interpolate time. Exact rationals are for the frame pick alone. Each is pinned against
+  interpolate time. Exact rationals are for the frame pick alone: `Rational` is the delivery
+  rate as FFmpeg parses the text the graph prints (`av_d2q(x, 1001000)`, ported and checked
+  against `showinfo` on both builds: `29.97` runs on 2997/100, `29.97002997002997` on
+  30000/1001), with `frame_time(k)` for what the graph evaluates and `exact_time(k)` for the
+  pick. Each is pinned against
   rendered pixels by `#[ignore]`d tests in `engine/cli/rendered.rs` (both FFmpegs). Moving
   the extraction changed no argv byte: the golden oracle below is the proof, and the next
   change to these numbers has to go through it. Shared test fixtures (assets, streams,
@@ -214,7 +218,14 @@ so the feature is **only** activated through these forwards — which is what ma
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **Any such expression must be quoted in
+  `keyframe_expr` over clip-local time). **Known limit, measured and not fixed (it
+  would change argv): the animated zoom is not what that text says.** It sits before
+  `fps`, so it is read at the *source* frame's time, and a filter after it that
+  cannot take a mid-stream size change holds the first frame's size for the whole clip
+  — the converter `overlay` gets for a chain with no alpha format (scale-only keys) and
+  `geq` (keyed opacity) do, so the zoom never shows there; `rotate` after it is
+  erratic (`a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it_still`).
+  **Any such expression must be quoted in
   the filter value** — it contains commas, and an unquoted comma is where the
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
   x/y made every animated clip and every animated overlay abort the render with
@@ -801,16 +812,61 @@ no editing logic in the adapter.
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
   a render resizes away from the project frame.
-- `render_plan.rs` — **what one frame is made of**, shared by every renderer.
-  `RenderPlan::at(timeline, assets, opts, t, color)` is the canvas (the same
-  `export_format` the still uses, through `render_geometry`) plus the ordered video
-  layers visible at `t`: asset path, resolved source time (speed / reverse /
+- `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
+  shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
+  canvas (the same `export_format` the still uses, through `render_geometry`) plus the
+  ordered video layers visible at `t`: asset path, resolved source time (speed / reverse /
   clamped), the `Transform` sampled at clip-local time, `Color`, the stream's
-  displayed size / rotation / transfer / pixel format / matrix. It is built on
-  `active_video_clips`, the very function `build_still_args` takes its inputs from,
-  so the FFmpeg still and the GPU compositor cannot disagree about which clip is
-  where in its source (a `cli.rs` test pins the argv against the plan); `still_size`
-  is the preview-size rule both use.
+  displayed size / rotation / transfer / pixel format / matrix. It is a one-shot
+  `Planner` in `PlanMode::Still` and shares `clip_source_time` with `active_video_clips`,
+  the function `build_still_args` takes its inputs from, so the FFmpeg still and the GPU
+  compositor cannot disagree about which clip is where in its source (a `cli.rs` test
+  pins the argv against the plan, and `planner.rs` the whole plan against
+  `active_video_clips` over a busy cut); `still_size` is the preview-size rule both use.
+  **The plan is complete, and a `Planner` prepares a cut once.** `Planner::new` does the
+  per-cut work (`for_render`, `transition_fx`, geometry, the asset facts, each clip's
+  window / fades / motion keys, fonts) and a **per-track clip index** (sorted by start,
+  with a running maximum of window ends), so `at(t)` / `at_frame(k)` are
+  `O(log n + active clips)`; a clip with no asset is an error only when a frame asks for
+  it. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
+  (a chroma key's colour made safe), `reframe` (`PlanReframe { pose, interp }`: sampled
+  — the `sendcmd` schedule's held pose is for the pass that draws a reframe), `hdr`,
+  `projection`, `animated` (which keyed channels move) and `fx: LayerFx` — **transitions
+  are per-layer, as in the graph**: the clip's `FadeStep`s (evaluated by
+  `LayerFx::strength(tint, frame, fps)`, which counts frames like `fade` does), the slide /
+  push travel at this frame (`MotionKeys::at`) and whether the layer is on its `tail`; a
+  dissolve is two ordinary layers. The plan holds the live `PlanText`s (colour and box
+  made safe, the font file resolved once, bold known to be real or synthetic), and the
+  canvas the delivery's `fps` (a `Rational`), `pix_fmt`, gif and composite colour policy.
+  **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
+  one sampled transform, fades and transitions left out of the picture, half-open spans,
+  text drawn statically). `Motion` is the export graph at output frame `k`: every
+  expression the graph evaluates (`enable`, keyframes, the overlay position, `drawtext`) is
+  read at `ffmpeg_frame_time(k)`, the slot boundary is `exact_time(k)`; an outgoing clip
+  plays on its tail; a keyframed clip is never padded and always scales again
+  (`LayerGeometry::resolve_with` and its `Placement`, which `resolve` defaults to
+  `Placement::STILL`; a slide's travel joins the position in every branch); text is on
+  `between(t,start,end)`. A Motion plan holds **candidates** at a clip's closing edge —
+  `PlanTiming` carries the window, source window, speed and direction the source-frame
+  pick (next slice) works from, and `rendered.rs` pins that every drawn clip is planned
+  and the only extras are on the frame the window closes on. `engine/cli/sweep.rs` holds
+  the Motion plan against the **evaluated** graph (a ~50-line evaluator for
+  `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the
+  layer's `origin`, travel and all, a title's position and `between`, five frame rates)
+  — parsing `enable=` back out of the graph would only restate what the builder printed.
+  **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
+  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `mask`,
+  `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
+  size)` is a pure function of the plan's fields** returning `Unsupported` values whose
+  `Display` is the message the plan has always given — nothing is decided while planning,
+  so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
+  cases. A Motion plan is refused as a whole until `caps.motion`, and in Motion a moving
+  keyframed zoom (it is read at the source frame's time and not always shown at all) and
+  keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
+  gif are refused. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
+  `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
+  `reasons(&GpuCaps::A0, ..)`. A still is now refused only while a fade step is live or a
+  layer travels (A0 refused the whole `[start - d/2, start + d)` of a transition).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,
@@ -1054,7 +1110,8 @@ WebGL — so the CI target is a software adapter (Mesa **lavapipe** on Linux, WA
 Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is an
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
-`Compositor::new` and `composite` return `Result`, and a lost device is tracked — every
+`Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
+draws, `GpuCaps::A0` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 

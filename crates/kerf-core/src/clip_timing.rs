@@ -27,9 +27,10 @@
 //!
 //! Pure: no I/O, no machine reads, no dependency on the engine.
 //!
-//! The reading half (`enabled`, `motion_at`, `progress`, `ffmpeg_frame_time`,
-//! `clips_with_fx`) has no caller outside tests until the render plan reads it, so
-//! it is exempt from the dead-code lint rather than deleted.
+//! The reading half (`enabled`, `motion_at`, `ffmpeg_frame_time`, `clips_with_fx`,
+//! `FadeStep::progress_at_frame`) is what [`crate::planner::Planner`]
+//! evaluates; `FadeStep::progress` and `ClipTiming::motion_at` are kept for a caller
+//! that has a time rather than a frame and are exempt from the dead-code lint.
 
 use std::path::Path;
 
@@ -216,7 +217,6 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
 /// `(track index, index in the track's storage, the clip, its fx)`. The pairing the
 /// graph builders do with a running flat index, done once, so a renderer that walks
 /// the clips cannot index the table with a different count.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn clips_with_fx<'a>(
     timeline: &'a Timeline,
     assets: &[Asset],
@@ -292,7 +292,11 @@ pub struct FadeStep {
 /// prints `{}` of the `f64`): whole microseconds, the digits past the sixth
 /// dropped rather than rounded.
 fn parse_micros(seconds: f64) -> i64 {
-    let text = format!("{seconds}");
+    parse_micros_text(&format!("{seconds}"))
+}
+
+/// [`parse_micros`] for the text itself: what `sendcmd` makes of a printed time.
+fn parse_micros_text(text: &str) -> i64 {
     let negative = text.starts_with('-');
     let text = text.trim_start_matches('-');
     let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
@@ -309,7 +313,6 @@ fn parse_micros(seconds: f64) -> i64 {
 /// `av_rescale_q(parse_time(seconds), 1/1000000, den/num)`: the frames FFmpeg's
 /// `fade` turns a time into at the filter's input time base (`1/fps` after the
 /// chain's `fps`), rounded to nearest, halves away from zero.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fade_ticks(seconds: f64, fps_num: u32, fps_den: u32) -> i64 {
     let n = i128::from(parse_micros(seconds)) * i128::from(fps_num);
     let d = 1_000_000 * i128::from(fps_den.max(1));
@@ -318,7 +321,6 @@ fn fade_ticks(seconds: f64, fps_num: u32, fps_den: u32) -> i64 {
     rounded as i64
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FadeStep {
     /// How much of the picture is left at output frame `k` (timeline frame
     /// `k` of an `fps_num/fps_den` export): `1` untouched, `0` faded away, so a
@@ -345,6 +347,7 @@ impl FadeStep {
 
     /// [`Self::progress_at_frame`] for a time on the frame grid: `t` is rounded to
     /// the nearest frame of `fps_num/fps_den` first.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn progress(&self, t: f64, fps_num: u32, fps_den: u32) -> f64 {
         let k = (t * f64::from(fps_num) / f64::from(fps_den.max(1))).round() as i64;
         self.progress_at_frame(k, fps_num, fps_den)
@@ -358,9 +361,118 @@ impl FadeStep {
 /// frame-aligned clip starts evaluate to just under their own start and lose their
 /// first frame. Use this wherever a graph expression is evaluated for output frame
 /// `k`; keep exact rationals for the frame *pick* only.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn ffmpeg_frame_time(k: u64, fps_num: u32, fps_den: u32) -> f64 {
     k as f64 * (f64::from(fps_den) / f64::from(fps_num))
+}
+
+/// A frame rate as FFmpeg holds it: the rational `av_parse_video_rate` makes of the
+/// text the graph carries (`fps=29.97`, `color=r=29.97`).
+///
+/// The graph prints `{}` of an `f64` and FFmpeg turns that text back into a rational
+/// with `av_d2q(value, 1001000)`, so `29.97` is `2997/100` and its neighbour
+/// `29.97002997002997` is `30000/1001` — two different frame grids, and which one an
+/// export runs on is decided by the number's spelling, not by what it is near. Every
+/// time the graph evaluates at output frame `k` is `k * (den / num)`
+/// (`ffmpeg_frame_time`); [`Rational::exact_time`] is the exact slot boundary, for
+/// the source-frame *pick* alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rational {
+    pub num: u32,
+    pub den: u32,
+}
+
+impl Rational {
+    /// `num / den`; `None` when either is zero (FFmpeg refuses such a rate).
+    pub fn new(num: u32, den: u32) -> Option<Self> {
+        (num > 0 && den > 0).then_some(Self { num, den })
+    }
+
+    /// What FFmpeg parses `{fps}` to: `av_d2q` with the video-rate limit, `None` for
+    /// a rate it would refuse (not positive and finite, or one that reduces to nothing).
+    pub fn from_fps(fps: f64) -> Option<Self> {
+        let (num, den) = av_d2q(fps, 1_001_000)?;
+        Self::new(u32::try_from(num).ok()?, u32::try_from(den).ok()?)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.num) / f64::from(self.den)
+    }
+
+    /// The time FFmpeg evaluates output frame `k` at (`ffmpeg_frame_time`).
+    pub fn frame_time(self, k: u64) -> f64 {
+        ffmpeg_frame_time(k, self.num, self.den)
+    }
+
+    /// The exact start of output frame `k`'s slot, `k * den / num`, correctly rounded.
+    pub fn exact_time(self, k: u64) -> f64 {
+        (k as f64 * f64::from(self.den)) / f64::from(self.num)
+    }
+
+    /// The output frame whose slot start is nearest `t` (`0` for a negative time).
+    pub fn frame_at(self, t: f64) -> u64 {
+        (t.max(0.0) * f64::from(self.num) / f64::from(self.den)).round() as u64
+    }
+}
+
+/// libavutil's `av_reduce`, on 128-bit integers (the C one multiplies in 64 and
+/// relies on the operands having shrunk by the time they are compared).
+fn av_reduce(num: i128, den: i128, max: i128) -> (i128, i128) {
+    let (mut num, mut den) = (num.abs(), den.abs());
+    let (mut a0, mut a1) = ((0i128, 1i128), (1i128, 0i128));
+    let gcd = {
+        let (mut a, mut b) = (num, den);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    if gcd != 0 {
+        (num, den) = (num / gcd, den / gcd);
+    }
+    if num <= max && den <= max {
+        a1 = (num, den);
+        den = 0;
+    }
+    while den != 0 {
+        let x = num / den;
+        let next_den = num - den * x;
+        let (a2n, a2d) = (x * a1.0 + a0.0, x * a1.1 + a0.1);
+        if a2n > max || a2d > max {
+            let mut x = x;
+            if a1.0 != 0 {
+                x = (max - a0.0) / a1.0;
+            }
+            if a1.1 != 0 {
+                x = x.min((max - a0.1) / a1.1);
+            }
+            if den * (2 * x * a1.1 + a0.1) > num * a1.1 {
+                a1 = (x * a1.0 + a0.0, x * a1.1 + a0.1);
+            }
+            break;
+        }
+        (a0, a1) = (a1, (a2n, a2d));
+        (num, den) = (den, next_den);
+    }
+    a1
+}
+
+/// libavutil's `av_d2q` for a positive finite `d`: the best rational with both terms
+/// at most `max`, found by a continued fraction over `d` scaled to 61 bits.
+fn av_d2q(d: f64, max: i128) -> Option<(i128, i128)> {
+    if !d.is_finite() || d <= 0.0 || d > f64::from(i32::MAX) {
+        return None;
+    }
+    // `frexp`'s exponent less one is the binary exponent of the leading bit.
+    let exponent = (((d.to_bits() >> 52) & 0x7ff) as i32 - 1023).max(0);
+    let den = 1i128 << (61 - exponent);
+    let scaled = (d * den as f64 + 0.5).floor() as i128;
+    let (n, dd) = av_reduce(scaled, den, max);
+    if n != 0 && dd != 0 {
+        return Some((n, dd));
+    }
+    // The C code retries with the whole `int` range when the limit left nothing.
+    let (n, dd) = av_reduce(scaled, den, i128::from(i32::MAX));
+    (n != 0 && dd != 0).then_some((n, dd))
 }
 
 /// The offset a motion transition puts on a clip, as keyframes over **clip-local**
@@ -372,7 +484,6 @@ pub struct MotionKeys {
     pub y: Vec<(f64, f64)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MotionKeys {
     /// The offset `(dx, dy)` at clip-local time `local`, in **frame fractions**:
     /// piecewise linear, held flat beyond the first and last key — the same curve
@@ -422,7 +533,6 @@ impl<'a> ClipTiming<'a> {
     /// slower source's last frame at it through the `fps` filter, and is evaluated
     /// at [`ffmpeg_frame_time`], not at an exact `k / fps`. Which frames are drawn is
     /// the pick's decision.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn enabled(&self, t: f64) -> bool {
         let (start, end) = self.window();
         t >= start && t <= end
@@ -842,5 +952,39 @@ mod tests {
         assert!(!is_head_padded_proxy(&format!("/cache/proxies/{hash}.lead.mp4")));
         assert!(!is_head_padded_proxy("/cache/kerf/proxies/short.lead.mp4"));
         assert!(!is_head_padded_proxy("/media/clip.lead.mp4"));
+    }
+
+    #[test]
+    fn a_frame_rate_is_the_rational_ffmpeg_parses_its_text_to() {
+        let r = |fps: f64| Rational::from_fps(fps).map(|r| (r.num, r.den));
+        assert_eq!(r(24.0), Some((24, 1)));
+        assert_eq!(r(25.0), Some((25, 1)));
+        assert_eq!(r(60.0), Some((60, 1)));
+        // The spelling decides the grid: 29.97 is 2997/100 and its neighbour, the exact
+        // NTSC rate, 30000/1001 (`nominal_fps` snaps jittery footage to the former).
+        assert_eq!(r(29.97), Some((2997, 100)));
+        assert_eq!(r(30000.0 / 1001.0), Some((30000, 1001)));
+        assert_eq!(r(24000.0 / 1001.0), Some((24000, 1001)));
+        assert_eq!(r(23.976), Some((2997, 125)));
+        assert_eq!(r(0.5), Some((1, 2)));
+        // A rate FFmpeg refuses.
+        for bad in [0.0, -24.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(r(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_slot_of_a_frame_is_exact_and_the_time_the_graph_reads_is_not() {
+        let ntsc = Rational::from_fps(29.97).unwrap();
+        // The exact boundary of frame 2997 is 100 s; FFmpeg evaluates it a hair off.
+        assert_eq!(ntsc.exact_time(2997), 100.0);
+        assert_eq!(ntsc.exact_time(0), 0.0);
+        let k = (1..5000u64).find(|&k| ntsc.frame_time(k) != ntsc.exact_time(k)).unwrap();
+        assert!((ntsc.frame_time(k) - ntsc.exact_time(k)).abs() < 1e-9);
+        // The nearest frame to a time, and to a negative one.
+        let r24 = Rational::new(24, 1).unwrap();
+        assert_eq!((r24.frame_at(1.0), r24.frame_at(1.02), r24.frame_at(-3.0)), (24, 24, 0));
+        assert_eq!(ntsc.frame_at(ntsc.exact_time(90)), 90);
+        assert!(Rational::new(0, 1).is_none() && Rational::new(1, 0).is_none());
     }
 }

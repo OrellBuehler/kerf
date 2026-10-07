@@ -101,6 +101,40 @@ pub struct LayerGeometry {
 #[error("{0}")]
 pub struct GeometryError(pub String);
 
+/// How the **export** graph places a layer beyond what its sampled transform says.
+///
+/// The still graph sees a clip through the transform sampled at one instant, and
+/// [`Placement::STILL`] (the default) is exactly that — every A0 call. The export
+/// graph is built per clip from its static transform, so a few decisions are the
+/// *clip's*, not the frame's:
+///
+/// * a **keyframed** clip is never identity, whatever its sampled pose: it is not
+///   padded to the full frame but centred by the overlay, its zoom is a
+///   `scale eval=frame` that runs on every frame (so there is always a second
+///   resample, which is also what puts the Cover crop on the picture's native chroma
+///   grid), and when its keys rotate the `rotate` box is `hypot(iw,ih)` square rather
+///   than the tight `rotw`/`roth` one;
+/// * its opacity is a `geq` alpha, not the RGB round trip — other arithmetic, which
+///   [`LayerGeometry::translucent`] says nothing about;
+/// * a slide or push adds `offset` (frame widths and heights) to the overlay's
+///   position in every branch, the identity one included: the padded full frame
+///   itself travels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Placement {
+    /// `Some(rotates)` for a keyframed clip: whether any key turns the picture.
+    pub keyframed: Option<bool>,
+    /// The transition's travel, in frame fractions.
+    pub offset: (f64, f64),
+}
+
+impl Placement {
+    /// A0's placement: the sampled transform decides, nothing travels.
+    pub const STILL: Self = Self {
+        keyframed: None,
+        offset: (0.0, 0.0),
+    };
+}
+
 fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
@@ -181,9 +215,20 @@ impl LayerGeometry {
     /// otherwise it is refused, because whichever grid was picked, one of the
     /// formats it stands for would land a pixel off.
     pub fn resolve_any_grid(src: (u32, u32), canvas: (u32, u32), fit: Fit, tf: &Transform) -> Result<Self, GeometryError> {
-        let first = Self::resolve(src, canvas, fit, tf, Subsampling::YUV420)?;
+        Self::resolve_any_grid_with(src, canvas, fit, tf, Placement::STILL)
+    }
+
+    /// [`LayerGeometry::resolve_any_grid`] for a layer the export graph places.
+    pub fn resolve_any_grid_with(
+        src: (u32, u32),
+        canvas: (u32, u32),
+        fit: Fit,
+        tf: &Transform,
+        placement: Placement,
+    ) -> Result<Self, GeometryError> {
+        let first = Self::resolve_with(src, canvas, fit, tf, Subsampling::YUV420, placement)?;
         for sub in Subsampling::ALL {
-            if Self::resolve(src, canvas, fit, tf, sub)? != first {
+            if Self::resolve_with(src, canvas, fit, tf, sub, placement)? != first {
                 return Err(GeometryError(
                     "its crop rounds differently for 4:2:0 and for other pixel formats, and this one is not known well enough to say which"
                         .into(),
@@ -205,13 +250,30 @@ impl LayerGeometry {
         tf: &Transform,
         sub: Subsampling,
     ) -> Result<Self, GeometryError> {
+        Self::resolve_with(src, canvas, fit, tf, sub, Placement::STILL)
+    }
+
+    /// [`LayerGeometry::resolve`] for a layer the **export** graph places: see
+    /// [`Placement`]. `Placement::STILL` reproduces `resolve` bit for bit.
+    pub fn resolve_with(
+        src: (u32, u32),
+        canvas: (u32, u32),
+        fit: Fit,
+        tf: &Transform,
+        sub: Subsampling,
+        placement: Placement,
+    ) -> Result<Self, GeometryError> {
         let (iw, ih) = src;
+        let keyed = placement.keyframed;
+        let (mx, my) = placement.offset;
         let (ow, oh) = canvas;
         if iw == 0 || ih == 0 || ow == 0 || oh == 0 {
             return Err(GeometryError("an empty picture or canvas".into()));
         }
         if !(tf.scale.is_finite() && tf.scale > 0.0)
-            || ![tf.pos_x, tf.pos_y, tf.rotation, tf.opacity].iter().all(|v| v.is_finite())
+            || ![tf.pos_x, tf.pos_y, tf.rotation, tf.opacity, mx, my]
+                .iter()
+                .all(|v| v.is_finite())
         {
             return Err(GeometryError("a non-finite transform".into()));
         }
@@ -236,7 +298,7 @@ impl LayerGeometry {
         // transform's own scale after it (below) the crop still sees the native
         // format and rounds to its grid; without one the first scale has already
         // converted, and it is on the 4:2:0 grid whatever the source was.
-        let second_scale = !tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9;
+        let second_scale = keyed.is_some() || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
         let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
             Fit::Contain => Rect::whole(fw, fh),
@@ -254,8 +316,9 @@ impl LayerGeometry {
         }];
         let mut picture = (keep.w, keep.h);
 
-        // 3. identity: Contain pads, Cover already fills the frame.
-        if tf.is_identity() {
+        // 3. identity: Contain pads, Cover already fills the frame. A keyframed clip
+        // is never identity (see [`Placement`]).
+        if keyed.is_none() && tf.is_identity() {
             let origin = match fit {
                 Fit::Contain => (
                     even(((i64::from(ow) - i64::from(fw)) as f64 / 2.0) as i64) as i32,
@@ -282,6 +345,16 @@ impl LayerGeometry {
                 Fit::Cover => (picture, (0, 0), picture, false),
             };
             let origin = if matte { (0, 0) } else { origin };
+            // A transition's travel moves the whole padded frame: the overlay's own
+            // `x` / `y`, which is centred on a layer that is the canvas.
+            let origin = if (mx, my) == (0.0, 0.0) {
+                origin
+            } else {
+                (
+                    overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + mx * f64::from(ow)),
+                    overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + my * f64::from(oh)),
+                )
+            };
             return Ok(Self {
                 stages,
                 picture,
@@ -297,8 +370,9 @@ impl LayerGeometry {
         }
 
         // 3'. otherwise the transform's own scale: `scale=iw*sc:ih*sc`, truncated
-        // (and a result of 0 means "keep the input size").
-        if (tf.scale - 1.0).abs() > 1e-9 {
+        // (and a result of 0 means "keep the input size"). A keyframed clip's is the
+        // per-frame `scale eval=frame`, always present, even when it lands on 1.
+        if keyed.is_some() || (tf.scale - 1.0).abs() > 1e-9 {
             let w = (f64::from(picture.0) * tf.scale) as i64;
             let h = (f64::from(picture.1) * tf.scale) as i64;
             let (w, h) = (
@@ -327,27 +401,39 @@ impl LayerGeometry {
         // conversion leaves swscale's unscaled path for a generic one), reading
         // padding the graph never initialised. That is not something to copy; the
         // frame goes through FFmpeg, which has the same garbage to itself.
-        if tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
+        if keyed.is_none() && tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
             return Err(GeometryError(format!(
                 "a translucent layer of odd size {}x{} (FFmpeg's RGB round trip reads past the picture)",
                 picture.0, picture.1
             )));
         }
 
-        // 4. rotate (clockwise radians, box grown to hold the corners).
-        let rotation = (tf.rotation != 0.0).then(|| {
-            let angle = tf.rotation.to_radians();
-            Rotation {
-                angle,
-                out: rotated_box(picture.0, picture.1, angle),
+        // 4. rotate (clockwise radians, box grown to hold the corners). Keyframed
+        // rotation uses a fixed `hypot(iw,ih)` square, however far it is turned this
+        // frame; a keyframed clip whose keys do not turn has no `rotate` at all.
+        let rotation = match keyed {
+            Some(false) => None,
+            Some(true) => {
+                let side = ((f64::from(picture.0).hypot(f64::from(picture.1)) + 0.5) as u32).max(1);
+                Some(Rotation {
+                    angle: tf.rotation.to_radians(),
+                    out: (side, side),
+                })
             }
-        });
+            None => (tf.rotation != 0.0).then(|| {
+                let angle = tf.rotation.to_radians();
+                Rotation {
+                    angle,
+                    out: rotated_box(picture.0, picture.1, angle),
+                }
+            }),
+        };
         let layer = rotation.map_or(picture, |r| r.out);
 
-        // 5. overlay at `(W-w)/2 + pos*W`.
+        // 5. overlay at `(W-w)/2 + (pos + travel)*W`.
         let origin = (
-            overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + tf.pos_x * f64::from(ow)),
-            overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + tf.pos_y * f64::from(oh)),
+            overlay_coord((f64::from(ow) - f64::from(layer.0)) / 2.0 + (tf.pos_x + mx) * f64::from(ow)),
+            overlay_coord((f64::from(oh) - f64::from(layer.1)) / 2.0 + (tf.pos_y + my) * f64::from(oh)),
         );
         Ok(Self {
             stages,
@@ -358,12 +444,13 @@ impl LayerGeometry {
             picture_shows: layer,
             matte: false,
             origin,
-            opacity: if tf.opacity < 1.0 {
-                f32::from(ffmpeg_alpha(tf.opacity)) / 255.0
-            } else {
-                1.0
+            opacity: match keyed {
+                // A `geq` alpha, whose rounding is not modelled (the plan refuses it).
+                Some(_) => tf.opacity.clamp(0.0, 1.0) as f32,
+                None if tf.opacity < 1.0 => f32::from(ffmpeg_alpha(tf.opacity)) / 255.0,
+                None => 1.0,
             },
-            translucent: tf.opacity < 1.0,
+            translucent: keyed.is_none() && tf.opacity < 1.0,
         })
     }
 }
@@ -721,5 +808,132 @@ mod tests {
             ..t()
         };
         assert!(any((320, 180), Fit::Contain, &even_crop).is_ok());
+    }
+
+    // ---- how the export graph places a layer ------------------------------------
+
+    fn keyed(rotates: bool, offset: (f64, f64)) -> Placement {
+        Placement {
+            keyframed: Some(rotates),
+            offset,
+        }
+    }
+
+    #[test]
+    fn a_still_placement_is_resolve_itself() {
+        for tf in [
+            t(),
+            Transform {
+                scale: 0.5,
+                pos_x: 0.1,
+                rotation: 20.0,
+                ..t()
+            },
+            odd_crop(),
+        ] {
+            for fit in [Fit::Contain, Fit::Cover] {
+                let a = LayerGeometry::resolve((640, 360), (360, 640), fit, &tf, Subsampling::YUV420);
+                let b = LayerGeometry::resolve_with((640, 360), (360, 640), fit, &tf, Subsampling::YUV420, Placement::STILL);
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn a_keyframed_clip_is_never_padded_and_always_scales_again() {
+        // Sitting at identity this frame, the still pads the letterbox into a full frame
+        // and the export does not: its overlay centres the bare picture, and the zoom's
+        // `scale eval=frame` is a second stage even at 1.
+        let still = r420((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
+        assert!(still.matte && still.stages.len() == 1);
+        let g = LayerGeometry::resolve_with(
+            (640, 360),
+            (360, 640),
+            Fit::Contain,
+            &t(),
+            Subsampling::YUV420,
+            keyed(false, (0.0, 0.0)),
+        )
+        .unwrap();
+        assert!(!g.matte && g.stages.len() == 2 && g.rotation.is_none());
+        assert_eq!((g.picture, g.layer, g.origin), ((360, 203), (360, 203), (0, 218)));
+        // The zoom follows the sampled pose, truncated.
+        let zoomed = Transform { scale: 1.5, ..t() };
+        let g = LayerGeometry::resolve_with(
+            (640, 360),
+            (360, 640),
+            Fit::Contain,
+            &zoomed,
+            Subsampling::YUV420,
+            keyed(false, (0.0, 0.0)),
+        )
+        .unwrap();
+        assert_eq!(g.picture, (540, 304));
+        // Keys that turn the picture box it in a hypot(iw,ih) square, whatever this frame's angle.
+        let g = LayerGeometry::resolve_with(
+            (640, 360),
+            (360, 640),
+            Fit::Contain,
+            &t(),
+            Subsampling::YUV420,
+            keyed(true, (0.0, 0.0)),
+        )
+        .unwrap();
+        assert_eq!(g.rotation.map(|r| r.out), Some((413, 413)));
+        assert_eq!(g.origin, (-26, 112));
+        // The Cover crop of a picture the second scale then resizes is on its native grid.
+        let cover_y = |sub, placement| {
+            LayerGeometry::resolve_with((360, 640), (640, 360), Fit::Cover, &t(), sub, placement)
+                .unwrap()
+                .stages[0]
+                .keep
+                .y
+        };
+        assert_eq!(
+            (
+                cover_y(S422, Placement::STILL),
+                cover_y(Subsampling::YUV420, Placement::STILL)
+            ),
+            (388, 388)
+        );
+        assert_eq!(
+            (
+                cover_y(S422, keyed(false, (0.0, 0.0))),
+                cover_y(Subsampling::YUV420, keyed(false, (0.0, 0.0)))
+            ),
+            (389, 388)
+        );
+    }
+
+    #[test]
+    fn a_transitions_travel_joins_the_position_in_every_branch() {
+        let place = |tf: &Transform, fit, travel| {
+            LayerGeometry::resolve_with(
+                (640, 360),
+                (640, 360),
+                fit,
+                tf,
+                Subsampling::YUV420,
+                Placement {
+                    keyframed: None,
+                    offset: travel,
+                },
+            )
+            .unwrap()
+            .origin
+        };
+        // An identity clip's padded frame travels: half a 640 px frame, truncated to even.
+        assert_eq!(place(&t(), Fit::Contain, (0.5, 0.0)), (320, 0));
+        assert_eq!(place(&t(), Fit::Cover, (-0.25, 0.1)), (-160, 36));
+        // A static offset and the travel add before they are scaled by the frame.
+        let moved = Transform {
+            scale: 0.5,
+            pos_x: 0.1,
+            ..t()
+        };
+        assert_eq!(place(&moved, Fit::Contain, (0.0, 0.0)), (224, 90));
+        assert_eq!(place(&moved, Fit::Contain, (0.15, 0.0)), (320, 90));
+        // No travel is no change.
+        assert_eq!(place(&t(), Fit::Contain, (0.0, 0.0)), (0, 0));
     }
 }
