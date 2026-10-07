@@ -17,14 +17,26 @@
 //!   is [`Lookup::PastEnd`] — FFmpeg draws nothing there — not a miss that decodes again.
 //! * **A hit is an `Arc`**, so a frame being composited outlives its eviction; what the cache
 //!   counts is what it holds. **Pinned** frames (a cursor's read-ahead, a reversed window being
-//!   played back) are never evicted: the cap is soft for them, and [`CacheStats::bytes`] above
-//!   [`CacheStats::cap`] says so. The frame just inserted is not evicted by its own insert.
+//!   played back) are never evicted: [`FrameCache::pin`] hands out a [`PinGuard`] and the pin
+//!   lasts as long as it does (no `unpin` to forget). The cap is soft for them, and
+//!   [`CacheStats::bytes`] above [`CacheStats::cap`] says so. The frame just inserted is not
+//!   evicted by its own insert.
+//! * **A run that reads forward past frames nobody asked for must not flush the ones somebody
+//!   did.** Reading 90 frames to reach the wanted one inserts 90 frames, and on 1080p the cap is
+//!   86 of them: with the cache full of other layers' frames, one read-forward would evict all of
+//!   them and the next request would restart a run to get one back. So a frame the run only
+//!   *passed* goes in with [`FrameCache::insert_cold`]: it takes free space or the place of
+//!   another cold frame, **never a warm frame's**, and is dropped (the caller still has the
+//!   `Arc`) when there is no such room. A cold frame that is looked up turns warm; warm eviction
+//!   takes cold frames first. Which frames are *passed*: those before `Request::warm_from` (see
+//!   `router`), the wanted frame less the backward lead.
 //!
-//! Eviction scans for the oldest unpinned entry: the cap is a few hundred frames at most
-//! (256 MiB of 720p), and a scan is what `kerf-core`'s own preview cache does.
+//! Eviction scans for the oldest unpinned entry (cold ones first): the cap is a few hundred
+//! frames at most (256 MiB of 720p), and a scan is what `kerf-core`'s own preview cache does.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::source::YuvFrame;
@@ -79,12 +91,69 @@ pub enum Lookup {
     Miss,
 }
 
+/// The pin count of one entry, shared with its [`PinGuard`]s so that dropping one needs no
+/// access to the cache (and so no lock). `live` goes false when the entry is purged.
+struct PinState {
+    count: AtomicU32,
+    live: AtomicBool,
+}
+
 struct Entry {
     frame: Arc<YuvFrame>,
     covers_from: i64,
     bytes: usize,
     used: u64,
-    pins: u32,
+    /// Inserted by [`FrameCache::insert_cold`] and not looked up since.
+    cold: bool,
+    pins: Arc<PinState>,
+}
+
+impl Entry {
+    fn pinned(&self) -> bool {
+        self.pins.count.load(Ordering::Relaxed) > 0
+    }
+}
+
+/// A frame held in the cache for as long as this lives: it is not evicted. Dropping it releases
+/// the pin; that cannot evict anything (it has no cache to do it with), so the cap is met at
+/// the next insert or [`FrameCache::trim`].
+///
+/// The guard owns the *entry's* pin count, so purging the file ([`FrameCache::purge`],
+/// [`FrameCache::clear`]) detaches it: [`PinGuard::is_live`] is `false`, the frame it holds is
+/// still good, and when the guard drops it touches nothing that was cached afterwards under the
+/// same key (the new entry has a count of its own — no generation number to compare).
+#[derive(Debug)]
+pub struct PinGuard {
+    key: FrameKey,
+    frame: Arc<YuvFrame>,
+    pins: Arc<PinState>,
+}
+
+impl PinGuard {
+    pub fn key(&self) -> FrameKey {
+        self.key
+    }
+
+    pub fn frame(&self) -> &Arc<YuvFrame> {
+        &self.frame
+    }
+
+    /// The cache still holds the entry this pins.
+    pub fn is_live(&self) -> bool {
+        self.pins.live.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        self.pins.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for PinState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PinState({})", self.count.load(Ordering::Relaxed))
+    }
 }
 
 /// What the cache holds and how it has been used.
@@ -95,11 +164,15 @@ pub struct CacheStats {
     pub cap: usize,
     pub pinned: usize,
     pub pinned_bytes: usize,
+    /// Frames held that were only passed on the way to another and not looked up since.
+    pub cold: usize,
     pub inserts: u64,
     pub hits: u64,
     pub misses: u64,
     pub past_end: u64,
     pub evictions: u64,
+    /// Passed frames that were not kept because keeping them would have cost a warm one.
+    pub cold_dropped: u64,
 }
 
 /// See the [module](self).
@@ -132,15 +205,44 @@ impl FrameCache {
     /// Keep `frame` under `key`, covering `covers_from..=key.pts` (see the [module](self)), and
     /// return the frame the cache now holds. A frame already there stays (it is the same
     /// picture) and only widens its coverage: two true statements about the same file add up.
-    /// Older unpinned frames go until the cap is met; the one inserted never does.
+    /// Older unpinned frames go until the cap is met (cold ones first); the one inserted never does.
     pub fn insert(&mut self, key: FrameKey, frame: Arc<YuvFrame>, covers_from: i64) -> Arc<YuvFrame> {
+        let held = self.put(key, frame, covers_from, false);
+        self.evict(Some(key));
+        held
+    }
+
+    /// [`FrameCache::insert`] for a frame the decode only **passed** on the way to the one that
+    /// was asked for (see the [module](self)): kept in free space, or in the place of other
+    /// cold frames, but never at the cost of a warm one — when that is all there is, it is not
+    /// kept and `cold_dropped` counts it. A frame already held is left as warm as it was.
+    /// Either way the caller gets the frame back.
+    pub fn insert_cold(&mut self, key: FrameKey, frame: Arc<YuvFrame>, covers_from: i64) -> Arc<YuvFrame> {
+        if self.frames.contains_key(&key) {
+            return self.put(key, frame, covers_from, true);
+        }
+        let excess = (self.bytes + frame_bytes(&frame)).saturating_sub(self.cap);
+        let room: usize = self.frames.values().filter(|e| e.cold && !e.pinned()).map(|e| e.bytes).sum();
+        if excess > room {
+            self.stats.cold_dropped += 1;
+            return frame;
+        }
+        let held = self.put(key, frame, covers_from, true);
+        // Only cold frames can be taken: they alone were counted as room.
+        self.evict_where(Some(key), |e| e.cold);
+        held
+    }
+
+    fn put(&mut self, key: FrameKey, frame: Arc<YuvFrame>, covers_from: i64, cold: bool) -> Arc<YuvFrame> {
         let covers_from = covers_from.min(key.pts);
         self.clock += 1;
         let used = self.clock;
-        let held = match self.frames.get_mut(&key) {
+        match self.frames.get_mut(&key) {
             Some(e) => {
                 e.covers_from = e.covers_from.min(covers_from);
-                e.used = used;
+                if !cold {
+                    (e.used, e.cold) = (used, false);
+                }
                 Arc::clone(&e.frame)
             }
             None => {
@@ -154,14 +256,16 @@ impl FrameCache {
                         covers_from,
                         bytes,
                         used,
-                        pins: 0,
+                        cold,
+                        pins: Arc::new(PinState {
+                            count: AtomicU32::new(0),
+                            live: AtomicBool::new(true),
+                        }),
                     },
                 );
                 frame
             }
-        };
-        self.evict(Some(key));
-        held
+        }
     }
 
     /// The frame at exactly `key`.
@@ -169,7 +273,7 @@ impl FrameCache {
         self.clock += 1;
         let used = self.clock;
         self.frames.get_mut(&key).map(|e| {
-            e.used = used;
+            (e.used, e.cold) = (used, false);
             Arc::clone(&e.frame)
         })
     }
@@ -201,7 +305,7 @@ impl FrameCache {
         let key = match self.find(source, ticks) {
             Some(after) => FrameKey {
                 source,
-                pts: self.frames.get(&after.key)?.covers_from - 1,
+                pts: self.frames.get(&after.key)?.covers_from.checked_sub(1)?,
             },
             None => FrameKey {
                 source,
@@ -219,7 +323,7 @@ impl FrameCache {
             return None;
         }
         self.clock += 1;
-        entry.used = self.clock;
+        (entry.used, entry.cold) = (self.clock, false);
         Some(Hit {
             key: *key,
             frame: Arc::clone(&entry.frame),
@@ -231,59 +335,74 @@ impl FrameCache {
         self.ends.insert(source, last_pts);
     }
 
-    /// Keep a frame in the cache whatever is inserted next. Counted: every `pin` needs an
-    /// `unpin`. `false` when there is no such frame.
-    pub fn pin(&mut self, key: FrameKey) -> bool {
-        self.frames.get_mut(&key).map(|e| e.pins += 1).is_some()
+    /// Keep the frame at `key` in the cache for as long as the guard lives. `None` when there is
+    /// no such frame.
+    pub fn pin(&mut self, key: FrameKey) -> Option<PinGuard> {
+        let e = self.frames.get(&key)?;
+        e.pins.count.fetch_add(1, Ordering::Relaxed);
+        Some(PinGuard {
+            key,
+            frame: Arc::clone(&e.frame),
+            pins: Arc::clone(&e.pins),
+        })
     }
 
-    /// Release one [`FrameCache::pin`] (extra releases are ignored), and evict if the cap was
-    /// being held over.
-    pub fn unpin(&mut self, key: FrameKey) {
-        if let Some(e) = self.frames.get_mut(&key) {
-            e.pins = e.pins.saturating_sub(1);
-        }
+    /// Meet the cap if frames were being held over it and their guards have dropped.
+    pub fn trim(&mut self) {
         self.evict(None);
     }
 
-    /// Forget a file entirely, pins included (its runs are gone).
+    /// Forget a file entirely, pinned frames included (its runs are gone): their guards stop
+    /// being [live](PinGuard::is_live).
     pub fn purge(&mut self, source: SourceId) {
+        let mut freed = 0;
         self.frames.retain(|k, e| {
             let keep = k.source != source;
             if !keep {
-                self.bytes -= e.bytes;
+                freed += e.bytes;
+                e.pins.live.store(false, Ordering::Relaxed);
             }
             keep
         });
+        self.bytes -= freed;
         self.ends.remove(&source);
     }
 
     pub fn clear(&mut self) {
+        for e in self.frames.values() {
+            e.pins.live.store(false, Ordering::Relaxed);
+        }
         self.frames.clear();
         self.ends.clear();
         self.bytes = 0;
     }
 
     pub fn stats(&self) -> CacheStats {
-        let pinned = self.frames.values().filter(|e| e.pins > 0);
+        let pinned = self.frames.values().filter(|e| e.pinned());
         CacheStats {
             entries: self.frames.len(),
             bytes: self.bytes,
             cap: self.cap,
             pinned: pinned.clone().count(),
             pinned_bytes: pinned.map(|e| e.bytes).sum(),
+            cold: self.frames.values().filter(|e| e.cold).count(),
             ..self.stats
         }
     }
 
-    /// Drop the least recently used unpinned frames (never `keep`) until the cap is met.
+    /// Drop the least recently used unpinned frames (cold ones first, never `keep`) until the
+    /// cap is met.
     fn evict(&mut self, keep: Option<FrameKey>) {
+        self.evict_where(keep, |_| true);
+    }
+
+    fn evict_where(&mut self, keep: Option<FrameKey>, allowed: impl Fn(&Entry) -> bool) {
         while self.bytes > self.cap {
             let oldest = self
                 .frames
                 .iter()
-                .filter(|(k, e)| e.pins == 0 && Some(**k) != keep)
-                .min_by_key(|(_, e)| e.used)
+                .filter(|(k, e)| !e.pinned() && Some(**k) != keep && allowed(e))
+                .min_by_key(|(_, e)| (!e.cold, e.used))
                 .map(|(k, _)| *k);
             let Some(oldest) = oldest else { break };
             if let Some(e) = self.frames.remove(&oldest) {
@@ -388,29 +507,142 @@ mod tests {
         let mut c = FrameCache::new(24);
         c.insert(key(A, 0), frame(0), 0);
         c.insert(key(A, 1), frame(1), 1);
-        assert!(c.pin(key(A, 0)));
-        assert!(c.pin(key(A, 0)), "pins count");
-        assert!(!c.pin(key(A, 9)), "nothing to pin");
+        let first = c.pin(key(A, 0)).expect("held");
+        let again = c.pin(key(A, 0)).expect("pins count");
+        assert!(c.pin(key(A, 9)).is_none(), "nothing to pin");
+        assert_eq!((first.key(), first.frame().y[0]), (key(A, 0), 0));
         c.insert(key(A, 2), frame(2), 2);
         assert!(c.get(key(A, 0)).is_some(), "pinned");
         assert!(c.get(key(A, 1)).is_none(), "the unpinned one went instead");
         // Everything held is pinned or just inserted: the cap is exceeded, not a frame dropped.
-        assert!(c.pin(key(A, 2)));
+        let third = c.pin(key(A, 2)).expect("held");
         c.insert(key(A, 3), frame(3), 3);
         let s = c.stats();
         assert_eq!((s.entries, s.pinned, s.pinned_bytes), (3, 2, 24));
         assert!(s.bytes > s.cap, "{s:?}");
-        // Releasing a pin trims what the cap was being held over: the one frame nothing
-        // holds (3) goes at the first release, though frame 0 is still pinned once.
-        c.unpin(key(A, 0));
+        // A guard drops with no cache to evict from: the cap is met at the next `trim` (or
+        // insert). One of frame 0's two pins is still held, so frame 0 stays; frame 3, which
+        // nothing holds, goes.
+        drop(first);
+        c.trim();
         assert_eq!((c.stats().entries, c.stats().bytes, c.stats().pinned), (2, 24, 2));
         assert!(c.get(key(A, 3)).is_none());
-        // Within the cap nothing else goes, and releasing what is not pinned is harmless.
-        c.unpin(key(A, 0));
-        c.unpin(key(A, 0));
-        c.unpin(key(A, 9));
-        c.unpin(key(A, 2));
-        assert_eq!((c.stats().entries, c.stats().pinned), (2, 0));
+        drop(again);
+        drop(third);
+        c.trim();
+        assert_eq!(
+            (c.stats().entries, c.stats().pinned),
+            (2, 0),
+            "within the cap nothing else goes"
+        );
+    }
+
+    #[test]
+    fn a_guard_dropped_after_its_file_was_purged_touches_nothing_cached_since() {
+        let mut c = FrameCache::new(1 << 20);
+        run(&mut c, A, 0, &[1, 2]);
+        let stale = c.pin(key(A, 1)).expect("held");
+        assert!(stale.is_live());
+        c.purge(A);
+        assert!(!stale.is_live(), "the entry is gone");
+        assert_eq!(stale.frame().y[0], 1, "the frame it held is still good");
+        // The same key cached again is a new entry with a pin count of its own.
+        run(&mut c, A, 0, &[1]);
+        let fresh = c.pin(key(A, 1)).expect("held");
+        drop(stale);
+        assert_eq!(c.stats().pinned, 1, "dropping the stale guard did not unpin the new entry");
+        assert!(fresh.is_live());
+        c.clear();
+        assert!(!fresh.is_live());
+        drop(fresh);
+        assert_eq!(c.stats().pinned, 0);
+    }
+
+    #[test]
+    fn a_frame_that_was_only_passed_never_costs_a_frame_somebody_asked_for() {
+        // Room for three frames, all of them warm: a run reading past more of them keeps none.
+        let mut c = FrameCache::new(36);
+        run(&mut c, A, 0, &[10, 20, 30]);
+        for p in 100..110 {
+            let back = c.insert_cold(key(B, p), frame(p as u8), p);
+            assert_eq!(back.y[0], p as u8, "the caller still has the frame");
+        }
+        let s = c.stats();
+        assert_eq!((s.entries, s.cold, s.cold_dropped, s.evictions), (3, 0, 10, 0));
+        assert_eq!(tag(c.at_or_after(A, 10)), Some(10));
+        assert!(matches!(c.at_or_after(B, 100), Lookup::Miss));
+        // With free room they are kept, and they take each other's place, oldest first.
+        let mut c = FrameCache::new(36);
+        run(&mut c, A, 0, &[10]);
+        for p in 100..105 {
+            c.insert_cold(key(B, p), frame(p as u8), p);
+        }
+        let s = c.stats();
+        assert_eq!((s.entries, s.cold, s.cold_dropped, s.evictions), (3, 2, 0, 3));
+        assert!(c.get(key(B, 100)).is_none() && c.get(key(B, 102)).is_none());
+        assert!(
+            c.get(key(B, 103)).is_some() && c.get(key(B, 104)).is_some(),
+            "the newest passed frames"
+        );
+        assert!(c.get(key(A, 10)).is_some(), "the warm one never moved");
+    }
+
+    #[test]
+    fn a_cold_frame_that_is_looked_up_turns_warm_and_cold_ones_are_evicted_first() {
+        let mut c = FrameCache::new(36);
+        c.insert(key(A, 1), frame(1), 1);
+        c.insert_cold(key(A, 2), frame(2), 2);
+        c.insert_cold(key(A, 3), frame(3), 3);
+        // Looking frame 2 up (a hit) makes it a frame somebody wanted.
+        assert_eq!(tag(c.at_or_after(A, 2)), Some(2));
+        assert_eq!(c.stats().cold, 1);
+        // A warm insert over the cap takes the cold frame (3) although it is the *newest* ...
+        c.insert(key(A, 4), frame(4), 4);
+        assert!(c.get(key(A, 3)).is_none());
+        // ... and inserting a frame cold again does not warm it, nor evict anything: the next
+        // warm insert takes the oldest warm frame (1; frame 2 was looked up since).
+        c.insert_cold(key(A, 4), frame(4), 4);
+        c.insert(key(A, 5), frame(5), 5);
+        assert!(c.get(key(A, 1)).is_none());
+        assert!([2, 4, 5].iter().all(|&p| c.get(key(A, p)).is_some()));
+        // A cold insert of a frame already held leaves it as warm as it was and keeps one `Arc`.
+        let held = c.get(key(A, 4)).unwrap();
+        assert!(Arc::ptr_eq(&c.insert_cold(key(A, 4), frame(9), 3), &held));
+        assert_eq!(c.stats().cold, 0);
+    }
+
+    #[test]
+    fn a_pinned_cold_frame_is_not_room_and_a_frame_bigger_than_the_cache_is_not_kept() {
+        let mut c = FrameCache::new(24);
+        c.insert_cold(key(A, 1), frame(1), 1);
+        c.insert_cold(key(A, 2), frame(2), 2);
+        let pinned = c.pin(key(A, 1)).unwrap();
+        c.insert_cold(key(A, 3), frame(3), 3);
+        assert!(c.get(key(A, 1)).is_some() && c.get(key(A, 3)).is_some() && c.get(key(A, 2)).is_none());
+        let again = c.pin(key(A, 3)).unwrap();
+        // Everything cold is pinned: nothing can make room.
+        c.insert_cold(key(A, 4), frame(4), 4);
+        assert!(c.get(key(A, 4)).is_none());
+        assert_eq!(c.stats().cold_dropped, 1);
+        drop((pinned, again));
+        let mut tiny = FrameCache::new(5);
+        tiny.insert_cold(key(A, 1), frame(1), 1);
+        assert_eq!((tiny.stats().entries, tiny.stats().cold_dropped), (0, 1));
+    }
+
+    #[test]
+    fn the_extremes_of_a_tick_do_not_overflow() {
+        let mut c = FrameCache::new(1 << 20);
+        // A frame that claims to cover from the very first tick: the one before it is no frame.
+        c.insert(key(A, i64::MIN + 5), frame(1), i64::MIN);
+        assert_eq!(tag(c.at_or_after(A, i64::MIN)), Some(1));
+        assert!(c.before(A, i64::MIN).is_none());
+        assert!(c.before(A, i64::MIN + 5).is_none());
+        c.insert(key(A, i64::MAX), frame(2), i64::MAX - 1);
+        assert_eq!(tag(c.at_or_after(A, i64::MAX)), Some(2));
+        assert_eq!(c.before(A, i64::MAX).map(|h| h.key.pts), None);
+        c.mark_end(A, i64::MAX);
+        assert!(matches!(c.at_or_after(A, i64::MAX), Lookup::Hit(_)));
     }
 
     #[test]
@@ -500,9 +732,10 @@ mod tests {
         let mut c = FrameCache::new(1 << 20);
         run(&mut c, A, 0, &[1, 2]);
         run(&mut c, B, 0, &[1]);
-        c.pin(key(A, 1));
+        let pin = c.pin(key(A, 1));
         c.mark_end(A, 2);
         c.purge(A);
+        drop(pin);
         let s = c.stats();
         assert_eq!((s.entries, s.bytes, s.pinned), (1, 12, 0));
         assert!(matches!(c.at_or_after(A, 3), Lookup::Miss));

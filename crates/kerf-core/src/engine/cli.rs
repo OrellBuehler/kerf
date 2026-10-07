@@ -6807,8 +6807,8 @@ mod tests {
 
     /// The learned fallback is one-way and is what `decode_hwaccel()` reads, so a decoder
     /// outside the engine that calls it silences the preview path's attempts too. (Leaves the
-    /// flag cleared: nothing else in the suite may depend on it being set — `KERF_HWACCEL=none`
-    /// already clears it for a whole run.)
+    /// flag cleared: nothing else in the suite may depend on it being set — a run under
+    /// `KERF_HWACCEL=none` already decodes in software with the flag never consulted.)
     #[test]
     fn disabling_decode_hwaccel_is_shared_with_the_preview_path() {
         disable_decode_hwaccel();

@@ -401,6 +401,11 @@ pub enum PickProgress {
     /// lookahead that shows no later frame belongs to this output frame, or the first
     /// frame past the window), or, when the file has no more, say so (`eof`).
     NeedMore,
+    /// A `Before` pick whose answer lies before the **first** frame read: the run began at
+    /// or after the time asked for. If it began at the start of the file the answer is
+    /// "nothing" ([`Pick::select`] says `None`); otherwise the frame is there, and only a
+    /// run started earlier can read it. The cursor knows which; this does not.
+    NeedEarlier,
     /// Decided, and final: reading on cannot change it.
     Ready {
         /// The frame shown, an index into the frames read (`None`: nothing is drawn).
@@ -438,7 +443,7 @@ impl Pick {
     ///
     /// `read` must start where the pick needs it: a run begun with the clip's own seek
     /// ([`FpsPick::seek`]) or earlier. A frame before the first one read is not there, so
-    /// `Before` of a time the first frame is past answers `None`.
+    /// `Before` of a time the first frame is past answers [`PickProgress::NeedEarlier`].
     pub fn progress(&self, read: &SourceFrames, eof: bool) -> PickProgress {
         let len = read.pts.len();
         let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
@@ -453,7 +458,9 @@ impl Pick {
             }
             Pick::Before(t) => {
                 let at = read.pts.partition_point(|&p| p < still_shift(t, read));
-                if at < len || eof {
+                if at == 0 && len > 0 {
+                    PickProgress::NeedEarlier
+                } else if at < len || eof {
                     ready(at.checked_sub(1), at.saturating_sub(1))
                 } else {
                     PickProgress::NeedMore
@@ -949,8 +956,12 @@ mod tests {
         assert_eq!(at(Pick::AtOrAfter(99.0), 60), ready(None, 60));
         assert_eq!(at(Pick::Before(99.0), 60), ready(Some(59), 59));
         assert_eq!(at(Pick::AtOrAfter(99.0), 59), PickProgress::NeedMore);
-        // Nothing before the first frame read.
-        assert_eq!(at(Pick::Before(0.0), 3), ready(None, 0));
+        // Before the first frame read: only the cursor knows whether the run began at the
+        // file's start (nothing there) or later (restart earlier).
+        assert_eq!(at(Pick::Before(0.0), 3), PickProgress::NeedEarlier);
+        assert_eq!(at(Pick::Before(0.0), 1), PickProgress::NeedEarlier);
+        // An empty file has nothing before anything.
+        assert_eq!(at(Pick::Before(0.0), 0), PickProgress::NeedMore);
     }
 
     /// The property that makes the helper safe to stream with: fed the file a frame at a time, it
@@ -1011,6 +1022,7 @@ mod tests {
                 let (read, eof) = read_of(&pts, m, tb, last_duration);
                 match Pick::Fps(p).progress(&read, eof) {
                     PickProgress::NeedMore => assert!(first.is_none(), "case {case}: undecided again at {m} frames: {p:?}"),
+                    PickProgress::NeedEarlier => panic!("case {case}: an fps pick never needs an earlier run: {p:?}"),
                     PickProgress::Ready { shown, keep_from } => {
                         assert_eq!(
                             shown, want,

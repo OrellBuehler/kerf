@@ -1043,7 +1043,9 @@ no editing logic in the adapter.
   frame of lookahead and the first frame past the window's end (or the last frame's duration at
   the end of the file) — **`Pick::progress(&read, eof)`** (A1b-1, pure, property-tested
   against `fps_pick` over the whole file) is that cursor's rule: fed the frames a run has
-  produced so far it says `NeedMore` or `Ready { shown, keep_from }`, answers exactly as the
+  produced so far it says `NeedMore`, `NeedEarlier` (a `Before` whose answer is ahead of
+  the first frame read: nothing there if the run began at the file's start, else restart
+  earlier — only the cursor knows which) or `Ready { shown, keep_from }`, answers exactly as the
   whole file would, and answers as early as it can (one frame past the shown one, or at the
   window's end); `FpsPick::seek()` is where the run must begin; reverse needs every pts of
   the window; a non-all-intra transport stream
@@ -1414,9 +1416,12 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
 
 - `frame_cache::FrameCache` — `Arc<YuvFrame>`s keyed `(SourceId { file: source_identity,
   format }, pts in ticks)`, byte-capped (`DEFAULT_CAP_BYTES` 256 MiB), least recently used out
-  first by an O(n) scan, **pinning** (counted; a pinned frame is never evicted, the cap is
-  soft for them and `CacheStats` says so; the frame just inserted is never its own victim),
-  `Arc`s outlive eviction. Each frame states **`covers_from`**: "no frame of this file has a
+  first by an O(n) scan, **pinning** (`pin` hands out an RAII `PinGuard` and dropping it
+  unpins; a pinned frame is never evicted, the cap is soft for them and `CacheStats` says so; a
+  purge or `clear` detaches live guards — `PinGuard::is_live` goes false; the frame just
+  inserted is never its own victim), `Arc`s outlive eviction. `insert_cold` is for frames a
+  run only *passes* on the way to its target: it takes free space or a cold slot, and never
+  pushes out a frame that was asked for. `covers_from - 1` is a `checked_sub`. Each frame states **`covers_from`**: "no frame of this file has a
   pts in `covers_from..pts`", so `at_or_after(source, t)` is one `BTreeMap` range query that
   hits only when the frame *proves* it is the first at or after `t` (exact on VFR; a hole left
   by an eviction is a miss, never the next frame held), `before(source, t)` is the frame at
@@ -1435,7 +1440,12 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
 - `showinfo::ShowinfoParser` — the timestamps of a run, read off stderr as it is written
   (flags: `-hide_banner -nostats -nostdin -loglevel info ... -vf showinfo=checksum=0,... `;
   plain `showinfo` checksums every frame: +65 % decode on 6.1, +40 % on 9.0). A frame is a line
-  holding `] n:<n> pts:<pts>` and nothing else is read; `n` must count 0, 1, 2, ... (a rebuilt
+  holding `[Parsed_showinfo_N @ 0x…] n:<n> pts:<pts>` and nothing else is read. The
+  prefix is required, including for `config in time_base`, so a file name or a container
+  title containing `] n:1 pts:0` cannot poison it. ANSI colour is stripped first, and the
+  spawn calls `plain_log_env`, which removes `AV_LOG_FORCE_COLOR` and sets
+  `AV_LOG_FORCE_NOCOLOR=1`. Coloured and poisoned-title fixtures from both builds are in
+  `tests/fixtures/showinfo/`. Beyond that, `n` must count 0, 1, 2, ... (a rebuilt
   graph renumbers: an error), `config in time_base: a/b` is re-read on every occurrence (a
   frame before the first, a bad ratio or a *change* is an error), `pts:NOPTS` is an error, and
   `duration:` is kept (the last frame's is `SourceFrames::last_duration`). `line_lossy` takes
@@ -1446,17 +1456,22 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   identical frames; `tests/fixtures/y4m/` holds a real y4m of each (`.gitattributes` pins
   them binary / LF).
 - `router::route(&[RunState], &Request) -> Route` and `ThrashGuard` — which run serves a
-  request. **Reuse** an idle run of the file behind the target by at most `reuse_window`
-  frames (`REUSE_WINDOW_PROXY` 24, `REUSE_WINDOW_ORIGINAL` 96; nearest wins), else **start** (free slot: at most
+  request. **Reuse** an idle run of the file behind the target by at most `effective_window`
+  frames (`REUSE_WINDOW_PROXY` 24, `REUSE_WINDOW_ORIGINAL` 96, held to half of what the cache
+  holds at the frame's size — a 96-frame read-forward at 1080p would otherwise flush the
+  other layers; nearest wins), else **start** (free slot: at most
   3 runs a file, 6 in all) or **replace** the least recently used *idle* run (the file's when
   it is at its cap, the process's otherwise); a request behind every run of its file starts
   `BACKWARD_LEAD` (15) frames early; **`Exact` never evicts** (reuse or `OneShot`, a decode of
   its own that registers nothing), **`Prefetch` only takes a spare slot**, a busy run is
   neither reused nor evicted (`Route::Busy`). The guard counts only routes that **destroy a
   run** (`Route::replaces`: a restart or an evicting start, not filling a free slot — a
-  six-layer frame starts six runs at once) and only for `Forward`: more than 4 a sliding second
-  is `Err(Busy)` (`GpuError::Busy` via `From`: render that frame through FFmpeg's stream),
-  refusals are not counted so it recovers when the caller stops. Time is passed in, so the
+  six-layer frame starts six runs at once) and only for `Forward`. It is **time-weighted**:
+  once restarts have cost ≥ `THRASH_BUSY_SECS` (0.75 s) of the last second, the next is
+  `Err(Busy)`. A run that fails or dies empty still counts, so a crashing decoder cannot slip
+  past by freeing its slot. Evicting a stale idle run of another file does not count, so a
+  montage across more than six files is not thrash. A refusal (`GpuError::Busy` via `From`) renders that frame through FFmpeg's stream instead.
+  Refusals are not counted so it recovers when the caller stops. Time is passed in, so the
   tests need no clock.
 - kerf-core: `Pick::progress` / `FpsPick::seek` (above), `source_identity`,
   `disable_decode_hwaccel`.

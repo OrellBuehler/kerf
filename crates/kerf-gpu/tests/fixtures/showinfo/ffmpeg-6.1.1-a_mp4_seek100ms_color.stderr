@@ -1,0 +1,35 @@
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':
+  Metadata:
+    major_brand     : isom
+    minor_version   : 512
+    compatible_brands: isomiso2avc1mp41
+    encoder         : Lavf60.16.100
+  Duration: 00:00:00.25, start: 0.000000, bitrate: 53 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High 4:4:4 Intra) (avc1 / 0x31637661), yuv420p(progressive), 16x16 [SAR 1:1 DAR 1:1], 25 kb/s, 24 fps, 24 tbr, 12288 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+      vendor_id       : [0][0][0][0]
+      encoder         : Lavc60.31.102 libx264
+Stream mapping:
+  Stream #0:0 -> #0:0 (h264 (native) -> wrapped_avframe (native))
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mconfig in time_base: 1/12288, frame_rate: 24/1
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mconfig out time_base: 0/0, frame_rate: 0/0
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mn:   0 pts:   1536 pts_time:0.125   duration:    512 duration_time:0.0416667 fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mcolor_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mn:   1 pts:   2048 pts_time:0.166667 duration:    512 duration_time:0.0416667 fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mcolor_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mn:   2 pts:   2560 pts_time:0.208333 duration:    512 duration_time:0.0416667 fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[1;32m[Parsed_showinfo_0 @ 0x56033fc31f40] [0mcolor_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+Output #0, yuv4mpegpipe, to 'pipe:1':
+  Metadata:
+    major_brand     : isom
+    minor_version   : 512
+    compatible_brands: isomiso2avc1mp41
+    encoder         : Lavf60.16.100
+  Stream #0:0(und): Video: wrapped_avframe, yuv420p(tv, progressive), 16x16 [SAR 1:1 DAR 1:1], q=2-31, 200 kb/s, 24 fps, 24 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+      vendor_id       : [0][0][0][0]
+      encoder         : Lavc60.31.102 wrapped_avframe
+[1;35m[out#0/yuv4mpegpipe @ 0x56033fbb9580] [0mvideo:1kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: unknown
+frame=    3 fps=0.0 q=-0.0 Lsize=       1kB time=00:00:00.00 bitrate=N/A speed=   0x
