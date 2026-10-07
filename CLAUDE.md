@@ -773,7 +773,22 @@ live in the GUI — that order matters, because the re-fetch the event triggers
 takes the same lock. `set_speech_model` emits `speech-model-changed` instead,
 which the webview listens for to re-read the transcription status: it reads that
 once at launch, and `project-changed` would re-fetch the timeline, history and
-task queue, none of which moved. Because agent edits **stage**, "live in the GUI" now means the
+task queue, none of which moved. `set_ripple_mode` is the same shape (it emits
+`ripple-mode-changed`, not `project-changed`: a flag, not an edit). **Ripple over
+MCP**: `get_ripple_mode` / `set_ripple_mode` read and write the project flag
+(the tool description warns that the latter flips the *user's* toolbar setting —
+a call that wants one different answer passes `ripple` instead), `move_clips`
+(`moves: [{clip_id, timeline_start, track_id?}]`, ids parsed by `clip_moves`) and
+`remove_clips` (`clip_ids`, answering `{removed, rippled}`) are the one-revision
+group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
+`remove_clips`, `add_clip_to_timeline`, `split_at`, `generate_voiceover`'s
+placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
+around the core call (omitted follows the project; `false` is the escape hatch).
+The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
+`snap_to_beats`, `move_clip`, `move_clips`, `reorder`, `duplicate_clips`) take
+none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+pins against the generated schemas. The server `instructions` carry the ripple
+paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
@@ -847,15 +862,19 @@ Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an objec
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
 `analysis-progress` per step), speech-to-text (`transcription_status`,
-`set_speech_model`, `download_speech_model` → emits `model-progress`), voiceover
+`set_speech_model`, `download_speech_model` → emits `model-progress`), ripple mode
+(`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
+that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
 `voiceover-progress`, `cancel_voiceover`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
-`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+`move_clips { moves }` (a group, one revision, all or nothing), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
-width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
+width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
+(one revision; `ripple: true` is the multi-select ripple delete, via
+`with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
@@ -1547,7 +1566,19 @@ is explorable in a plain browser via `bun run dev` (frames return `null` there �
 keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
 deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
 asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
-stretch so the clipping colour is visible). This browser sample is a **dev harness only** — the desktop app always
+stretch so the clipping colour is visible). **Ripple in the harness is a port, not a
+lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
+`Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
+numbers, so a rule changed in kerf-core has to change there or a test names it) and
+`src/lib/multi-edit.ts` the same for `Timeline::move_clips` / `remove_clips` (same
+checks, same messages). `api.ts` keeps the project's ripple flag in the harness state
+(`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
+that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
+voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
+`rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
+beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
+reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`

@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, Project,
-    Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition,
-    TransitionKind, VideoEffect, WaveformRange,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, ClipMove, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask,
+    Project, Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff,
+    Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -610,6 +610,24 @@ fn cancel_voiceover(state: State<'_, AppState>) {
     state.voiceover_cancel.store(true, Ordering::SeqCst);
 }
 
+// ---- ripple mode -------------------------------------------------------------
+
+/// Whether the project edits in ripple mode (off for a project that never said).
+#[tauri::command(async)]
+fn get_ripple_mode(state: State<'_, AppState>) -> CmdResult<bool> {
+    state.project().ripple_mode().map_err(|e| e.to_string())
+}
+
+/// Turn ripple mode on or off for the project and answer with what is stored.
+/// A setting, not an edit: no revision, and the timeline does not move, so
+/// nothing is returned but the flag.
+#[tauri::command(async)]
+fn set_ripple_mode(state: State<'_, AppState>, on: bool) -> CmdResult<bool> {
+    let project = state.project();
+    project.set_ripple_mode(on).map_err(|e| e.to_string())?;
+    project.ripple_mode().map_err(|e| e.to_string())
+}
+
 // ---- timeline editing (each returns the refreshed timeline) ----------------
 
 #[tauri::command(async)]
@@ -677,6 +695,17 @@ fn move_clip(state: State<'_, AppState>, clip_id: String, timeline_start: f64, t
     let track = track_id.as_deref().map(id).transpose()?;
     let project = state.project();
     project.move_clip(clip, timeline_start, track).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Move several clips in **one** revision — a marquee selection dragged
+/// together. Each move names a clip, its absolute start and optionally another
+/// track of the same kind; the whole group is checked as a group and an illegal
+/// one changes nothing. Never ripples.
+#[tauri::command(async)]
+fn move_clips(state: State<'_, AppState>, moves: Vec<ClipMove>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.move_clips(&moves).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -820,6 +849,19 @@ fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timelin
     let id = id(&clip_id)?;
     let project = state.project();
     project.remove(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Remove several clips in **one** revision. `ripple` forces ripple on or off
+/// for the call; omitted, the project's ripple mode decides — so a multi-select
+/// *ripple* delete is this with `ripple: true`.
+#[tauri::command(async)]
+fn remove_clips(state: State<'_, AppState>, clip_ids: Vec<String>, ripple: Option<bool>) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project
+        .with_ripple(ripple, |p| p.remove_clips(&ids))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2208,12 +2250,15 @@ pub fn run() {
             prepare_voiceover,
             generate_voiceover,
             cancel_voiceover,
+            get_ripple_mode,
+            set_ripple_mode,
             cut_clip,
             add_clip,
             split_clip,
             trim_clip,
             reorder_clip,
             move_clip,
+            move_clips,
             ripple_delete,
             cut_clip_range,
             add_track,
@@ -2229,6 +2274,7 @@ pub fn run() {
             duplicate_clips,
             insert_clips,
             remove_clip,
+            remove_clips,
             set_volume,
             set_fade,
             set_speed,
