@@ -50,6 +50,9 @@ const CASES: usize = 4000;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
+/// The assets the generator draws from; the head-padded twins after them are only
+/// ever reached by [`retarget`], so that adding them moved no other case's dice.
+const LIBRARY: usize = 11;
 const BLESSED: [&str; 3] = [
     include_str!("golden/export.txt"),
     include_str!("golden/still.txt"),
@@ -97,6 +100,7 @@ reframe-equirect-out output=e:
 reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
+head-padded-proxy trim=start_frame=1
 image-input -loop 1 -framerate
 image-under-a-frame -t 0.0
 overlay drawtext=
@@ -250,7 +254,8 @@ fn audio(rate: u32, channels: u16) -> StreamInfo {
 }
 
 /// The fixed library every case draws from: shapes and rates, a still, both HDR
-/// transfers, two 360 projections, a phone clip turned by its metadata, audio only.
+/// transfers, two 360 projections, a phone clip turned by its metadata, audio only —
+/// and, after those, the head-padded proxies of four of them (see [`retarget`]).
 #[rustfmt::skip]
 fn pool() -> Vec<Asset> {
     let video = |size, fps| stream(StreamKind::Video, "h264", size, fps);
@@ -278,7 +283,43 @@ fn pool() -> Vec<Asset> {
         id: Uuid::from_u128(i as u128 + 1), path: format!("/golden/{name}.mp4"), name: name.into(), duration, streams, imported_at,
         source_paths: Vec::new(), voiceover: None,
     };
-    specs.into_iter().enumerate().map(asset).collect()
+    let mut pool: Vec<Asset> = specs.into_iter().enumerate().map(asset).collect();
+    debug_assert_eq!(pool.len(), LIBRARY);
+    // The proxy a preview of a late-starting source is cut from: the same footage at a
+    // path `is_head_padded_proxy` recognizes (`.../kerf/proxies/<16 hex>.lead.mp4`).
+    for (n, name) in ["interview", "broll", "phone", "wide"].into_iter().enumerate() {
+        let original = pool.iter().find(|a| a.name == name).unwrap().clone();
+        pool.push(Asset {
+            id: Uuid::from_u128(100 + n as u128),
+            path: format!("/golden/kerf/proxies/{:016x}.lead.mp4", 0x5eed_0000 + n as u64),
+            name: format!("{name}-padded"),
+            ..original
+        });
+    }
+    pool
+}
+
+/// Every seventh case, about half of the clips whose footage has a head-padded proxy
+/// are cut from that proxy instead. It is done once the timeline is drawn and rolls
+/// no dice of its own (the clip's id decides), so every other case is exactly what it
+/// was; it is what puts `ClipFx.head_pad` — and its `trim=start_frame=1` — in the oracle.
+fn retarget(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 7 != 3 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        let Some(original) = assets[..LIBRARY].iter().find(|a| a.id == clip.asset_id) else {
+            continue;
+        };
+        if clip.id.as_u128() % 2 == 1 {
+            if let Some(twin) = assets[LIBRARY..]
+                .iter()
+                .find(|a| a.name.strip_suffix("-padded") == Some(&original.name))
+            {
+                clip.asset_id = twin.id;
+            }
+        }
+    }
 }
 
 fn has_video(a: &Asset) -> bool {
@@ -502,7 +543,8 @@ struct Case {
 #[rustfmt::skip]
 fn case(i: usize, assets: &[Asset]) -> Case {
     let mut r = Rng::new(i as u64 + 1);
-    let timeline = timeline(&mut r, assets);
+    let mut timeline = timeline(&mut r, &assets[..LIBRARY]);
+    retarget(&mut timeline, i, assets);
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
         .flat_map(|c| [c.timeline_start, c.timeline_end(), c.timeline_end() - 1e-3, c.timeline_start + 1e-4])

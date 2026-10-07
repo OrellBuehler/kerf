@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle` (A1a-0 merged locally) … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `feat/gpu-a1a-timing` (A1a-0, A1a-1 merged locally) … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -114,6 +114,15 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   still and preview builders (A1a-0); libm-derived numbers are rounded to 10
   significant digits before hashing (FMA vs generic `pow` differ in the last
   ulp), digest files are pinned LF.
+
+- **2026-10-07 — what the export draws at clip edges.** `ClipTiming::enabled`
+  is only the overlay's enable window; FFmpeg evaluates it at
+  `k*(1/fps)` (an ulp below `k/fps` for a third of 24 fps frames), so frame-
+  aligned clip starts can lose their first frame and fades count whole frames.
+  Both are pinned by rendered tests; the GPU pick (A1a-3) must reproduce them.
+- **2026-10-07 — wall-clock tests.** Performance guards assert generous limits
+  (8–10 s, 5 s in bun) sized to catch the quadratic algorithm they guard, not a
+  busy machine running the suite in parallel.
 
 ## Needs a real machine
 
