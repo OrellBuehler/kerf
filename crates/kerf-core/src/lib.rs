@@ -48,10 +48,11 @@ pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipMove, Color, CropFrame, Delivery, DiffEntry, DiffKind, EditSource, Framing, Keyframe, Marker, Mask, MaskShape,
-    Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind,
-    Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment,
-    Transform, Transition, TransitionKind, VideoEffect, Voiceover,
+    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, DiffEntry, DiffKind, EditOutcome, EditSource, Framing, Keyframe,
+    Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SourceLimits,
+    SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS,
+    MIN_EDIT_CLIP,
 };
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,

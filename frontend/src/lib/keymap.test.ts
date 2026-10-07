@@ -300,6 +300,25 @@ function legacyAction(e: KeyEventLike): string | null {
 	return null;
 }
 
+/** Keys that were given an action after the registry existed — the old handler had no
+ *  answer for them, so a bare press is held to this instead of to nothing. Adding a
+ *  default belongs here, with the action it is, so the decision is written down. */
+const ADDED: Record<string, string> = {
+	n: 'tool.roll',
+	y: 'tool.slip',
+	u: 'tool.slide',
+	q: 'edit.trimStart',
+	w: 'edit.trimEnd'
+};
+
+/** What a keypress should do now: the old handler's answer, plus the added bare keys. */
+function expectedAction(e: KeyEventLike): string | null {
+	const was = legacyAction(e);
+	if (was) return was;
+	if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return null;
+	return ADDED[e.key.toLowerCase()] ?? null;
+}
+
 describe('the default keys are the ones the editor always had', () => {
 	test('each shortcut, written out', () => {
 		// ⌘ / Ctrl chords, then bare keys.
@@ -324,6 +343,11 @@ describe('the default keys are the ones the editor always had', () => {
 		const bare: [string, Mods, string][] = [
 			['v', {}, 'tool.pointer'],
 			['c', {}, 'tool.razor'],
+			['n', {}, 'tool.roll'],
+			['y', {}, 'tool.slip'],
+			['u', {}, 'tool.slide'],
+			['q', {}, 'edit.trimStart'],
+			['w', {}, 'edit.trimEnd'],
 			['r', {}, 'tool.rippleMode'],
 			['z', { shift: true }, 'view.zoomFit'],
 			['m', {}, 'marker.add'],
@@ -363,7 +387,7 @@ describe('the default keys are the ones the editor always had', () => {
 	test('the same key, with Caps Lock on, does the same thing', () => {
 		for (const p of PLATFORMS) {
 			const b = resolveBindings(emptyOverrides(), p);
-			for (const k of 'vcrmjklio') expect(matchAction(ev(k.toUpperCase()), b)).toBe(matchAction(ev(k), b));
+			for (const k of 'vcrmjklionyuqw') expect(matchAction(ev(k.toUpperCase()), b)).toBe(matchAction(ev(k), b));
 			expect(matchAction(ev('Z', { ...primary(p) }), b)).toBe('edit.undo');
 		}
 	});
@@ -394,7 +418,19 @@ describe('the default keys are the ones the editor always had', () => {
 	test('with no modifier, every key does what it did', () => {
 		for (const p of PLATFORMS) {
 			const b = resolveBindings(emptyOverrides(), p);
-			for (const key of KEYS) expect([key, matchAction(ev(key), b)]).toEqual([key, legacyAction(ev(key))]);
+			for (const key of KEYS) expect([key, matchAction(ev(key), b)]).toEqual([key, expectedAction(ev(key))]);
+		}
+	});
+
+	test('the keys added since are bare, so ⌘N is still a new project and ⇧Q does nothing', () => {
+		for (const p of PLATFORMS) {
+			const b = resolveBindings(emptyOverrides(), p);
+			for (const k of Object.keys(ADDED)) {
+				expect(matchAction(ev(k, { shift: true }), b)).toBeNull();
+				expect(matchAction(ev(k, { alt: true }), b)).toBeNull();
+			}
+			expect(matchAction(ev('n', primary(p)), b)).toBe('file.new');
+			for (const k of 'yuqw') expect(matchAction(ev(k, primary(p)), b)).toBe(k === 'y' ? 'edit.redo' : null);
 		}
 	});
 
@@ -885,6 +921,8 @@ describe('keys that act once per press', () => {
 			'edit.duplicate',
 			'edit.delete',
 			'edit.rippleDelete',
+			'edit.trimStart',
+			'edit.trimEnd',
 			'tool.rippleMode',
 			'playback.toggle',
 			'playback.shuttleBack',
@@ -913,7 +951,8 @@ describe('searching the list', () => {
 	});
 
 	test('finds by what the action is called', () => {
-		expect(ids('ripple')).toEqual(['edit.rippleDelete', 'tool.rippleMode']);
+		// (the two trims say in their hint that they follow ripple mode, and a hint is searched)
+		expect(ids('ripple')).toEqual(['edit.rippleDelete', 'edit.trimStart', 'edit.trimEnd', 'tool.rippleMode']);
 		expect(ids('shuttle')).toEqual(['playback.shuttleBack', 'playback.shuttleForward']);
 	});
 

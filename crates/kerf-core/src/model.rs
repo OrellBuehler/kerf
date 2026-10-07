@@ -423,6 +423,17 @@ impl Asset {
         self.streams.iter().any(|s| s.image)
     }
 
+    /// How far into this asset a clip's source window may reach (seconds): its
+    /// duration, or infinity for a still, which loops and so never runs out. What
+    /// the edit modes that slide a window over footage (roll, slip, slide) clamp to.
+    pub fn source_limit(&self) -> f64 {
+        if self.is_image() {
+            f64::INFINITY
+        } else {
+            self.duration
+        }
+    }
+
     /// The spherical projection of this asset's video, if it is 360 footage.
     /// Clips cut from such an asset are reframed to flat by default.
     pub fn projection(&self) -> Option<Projection> {
@@ -2260,6 +2271,112 @@ impl Clip {
             end: a.max(b),
         }
     }
+
+    /// Unused footage either side of the clip's source window, in **timeline**
+    /// seconds, as `(head, tail)`: how far the clip's start / end could be pulled
+    /// out before the source runs dry. A reversed clip plays the window
+    /// backwards, so its start is the source's *out* side and the two swap. A
+    /// still (`limit` infinite — see [`Asset::source_limit`]) has no footage to
+    /// run out of, so both are unbounded.
+    fn handles(&self, limit: f64) -> (f64, f64) {
+        if limit.is_infinite() {
+            return (f64::INFINITY, f64::INFINITY);
+        }
+        let mag = self.speed_mag();
+        let before = self.source_in.max(0.0) / mag;
+        let after = (limit - self.source_out).max(0.0) / mag;
+        if self.is_reversed() {
+            (after, before)
+        } else {
+            (before, after)
+        }
+    }
+
+    /// Move the clip's end by `by` timeline seconds (positive lengthens),
+    /// writing the source window the way the clip plays it: a forward clip's
+    /// out-point, a reversed clip's in-point. `looping` — a still — writes only
+    /// the out-point whichever way it plays: a still's window is its length, and
+    /// this way it can never reach below zero.
+    fn move_tail(&mut self, by: f64, looping: bool) {
+        let shift = by * self.speed_mag();
+        if self.is_reversed() && !looping {
+            self.source_in -= shift;
+        } else {
+            self.source_out += shift;
+        }
+    }
+
+    /// Move the clip's start by `by` timeline seconds — positive shortens it from
+    /// the front, negative pulls the start earlier and the clip longer — so its
+    /// **end stays where it was**. The source window follows as in
+    /// [`Clip::move_tail`], and the animation rides with the content
+    /// ([`Clip::rebase_animation`]).
+    fn move_head(&mut self, by: f64, looping: bool) {
+        self.rebase_animation(by);
+        let shift = by * self.speed_mag();
+        if self.is_reversed() || looping {
+            self.source_out -= shift;
+        } else {
+            self.source_in += shift;
+        }
+        self.timeline_start += by;
+    }
+
+    /// Re-time the clip's animation after its start moved by `by` timeline
+    /// seconds. Transform and reframe keyframes are clip-local, so when the head
+    /// moves they have to move with it or the animation slides off the footage it
+    /// was written against: a key that fired two seconds into the shot still
+    /// fires on that moment of it.
+    ///
+    /// Shortened from the front (`by > 0`) the keys inside the removed span are
+    /// gone, so the pose the clip now opens on is pinned as a key at 0 (what
+    /// [`Timeline::slice`] does for a range export) and later keys shift back.
+    /// Pulled earlier (`by < 0`) every key shifts later, and the new head holds the
+    /// first key's pose — which is what interpolation does before the first key.
+    fn rebase_animation(&mut self, by: f64) {
+        if by > 0.0 {
+            if !self.keyframes.is_empty() {
+                let pose = self.transform_at(by);
+                let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
+                kfs.extend(
+                    self.keyframes
+                        .iter()
+                        .filter(|k| k.time > by)
+                        .map(|k| Keyframe { time: k.time - by, ..*k }),
+                );
+                self.keyframes = kfs;
+            }
+            if self.reframe.as_ref().is_some_and(|r| r.is_animated()) {
+                let pose = self.reframe_at(by).expect("clip reframes");
+                let rf = self.reframe.as_mut().expect("clip reframes");
+                let mut kfs = vec![ReframeKeyframe::from_pose(0.0, &pose)];
+                kfs.extend(
+                    rf.keyframes
+                        .iter()
+                        .filter(|k| k.time > by)
+                        .map(|k| ReframeKeyframe { time: k.time - by, ..*k }),
+                );
+                rf.keyframes = kfs;
+            }
+        } else if by < 0.0 {
+            for k in &mut self.keyframes {
+                k.time -= by;
+            }
+            if let Some(rf) = self.reframe.as_mut() {
+                for k in &mut rf.keyframes {
+                    k.time -= by;
+                }
+            }
+        }
+    }
+
+    /// Hold both fades inside the clip: an edit that shortens a clip must not
+    /// leave a fade longer than what is left of it. Only ever shortens one.
+    fn clamp_fades(&mut self) {
+        let duration = self.duration();
+        self.fade_in = self.fade_in.min(duration);
+        self.fade_out = self.fade_out.min(duration);
+    }
 }
 
 /// Tempo estimates below this confidence are ignored when building a beat grid
@@ -3125,28 +3242,9 @@ impl Timeline {
                     }
                     c.fade_in = 0.0;
                     c.transition_in = None;
-                    if !c.keyframes.is_empty() {
-                        let pose = clip.transform_at(cut_front);
-                        let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
-                        kfs.extend(c.keyframes.iter().filter(|k| k.time > cut_front).map(|k| Keyframe {
-                            time: k.time - cut_front,
-                            ..*k
-                        }));
-                        c.keyframes = kfs;
-                    }
-                    // Same resampling for the reframe camera: pin the pose the
-                    // cut lands on, then shift the surviving keyframes back.
-                    // Sampled off `clip`, not `c` — `c`'s source points have
-                    // already moved above.
-                    if let Some(rf) = c.reframe.as_mut().filter(|r| r.is_animated()) {
-                        let pose = clip.reframe_at(cut_front).expect("clip reframes");
-                        let mut kfs = vec![ReframeKeyframe::from_pose(0.0, &pose)];
-                        kfs.extend(rf.keyframes.iter().filter(|k| k.time > cut_front).map(|k| ReframeKeyframe {
-                            time: k.time - cut_front,
-                            ..*k
-                        }));
-                        rf.keyframes = kfs;
-                    }
+                    // Animation re-timed to the new start, the pose it lands on pinned
+                    // as a key at 0 (transform and reframe camera alike).
+                    c.rebase_animation(cut_front);
                 }
                 if cut_back > 0.0 {
                     if c.is_reversed() {
@@ -3551,6 +3649,644 @@ impl Timeline {
     }
 }
 
+// ---- edit modes: roll, slip, slide, split-and-remove -------------------------
+
+/// Shortest a clip an edit-mode op may leave behind (seconds) — the same floor
+/// the timeline's edge-trim handles hold.
+pub const MIN_EDIT_CLIP: f64 = 0.05;
+
+/// Two clip edges closer than this are one edge. It is the engine's own test for
+/// a transition partner (`transition_fx`), so a cut that blends is a cut that
+/// can be rolled, and a clip that "touches" its neighbour here is one the render
+/// treats as touching.
+pub const ADJACENT_EPS: f64 = 1e-3;
+
+/// How far each asset's footage reaches, for the edit modes that move a clip's
+/// source window over it: [`Asset::source_limit`] per asset id (infinite for a
+/// still).
+pub type SourceLimits = HashMap<Uuid, f64>;
+
+// The doc comments on this type are what an MCP client reads in the tool schema,
+// so they are written for a model, not as rustdoc links.
+/// Which half of a split to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitSide {
+    /// Remove everything before the split point (trims the clip's start to it).
+    Left,
+    /// Remove everything after the split point (trims the clip's end to it).
+    Right,
+}
+
+impl SplitSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SplitSide::Left => "left",
+            SplitSide::Right => "right",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(SplitSide::Left),
+            "right" => Some(SplitSide::Right),
+            _ => None,
+        }
+    }
+}
+
+/// What a roll, slip or slide did: how far it was asked to go, how far it
+/// actually went (it clamps to the footage and the neighbours rather than
+/// refusing), and the clips it changed, as they stand afterwards, in timeline
+/// order.
+#[derive(Debug, Clone, Serialize)]
+pub struct EditOutcome {
+    pub requested: f64,
+    pub applied: f64,
+    /// `applied` is not what was asked for.
+    pub clamped: bool,
+    pub clips: Vec<Clip>,
+}
+
+impl EditOutcome {
+    fn new(requested: f64, applied: f64, clips: Vec<Clip>) -> Self {
+        Self {
+            requested,
+            applied,
+            clamped: num_changed(requested, applied),
+            clips,
+        }
+    }
+}
+
+/// How far an edit-mode op may go each way, in the units of its `delta`, and
+/// what stops it. The ops clamp to it, and a UI that drags one reads it to hold
+/// the pointer where the edit would go no further.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeltaRange {
+    /// Furthest it may go in the negative direction (≤ 0).
+    pub min: f64,
+    /// Furthest it may go in the positive direction (≥ 0).
+    pub max: f64,
+    why_min: String,
+    why_max: String,
+}
+
+impl DeltaRange {
+    fn open() -> Self {
+        Self {
+            min: f64::NEG_INFINITY,
+            max: f64::INFINITY,
+            why_min: String::new(),
+            why_max: String::new(),
+        }
+    }
+
+    /// Cap the positive direction at `room` seconds (a negative room is none).
+    fn up_to(mut self, room: f64, why: impl Into<String>) -> Self {
+        let room = room.max(0.0);
+        if room < self.max {
+            self.max = room;
+            self.why_max = why.into();
+        }
+        self
+    }
+
+    /// Cap the negative direction at `room` seconds (a magnitude).
+    fn down_to(mut self, room: f64, why: impl Into<String>) -> Self {
+        let room = -room.max(0.0);
+        if room > self.min {
+            self.min = room;
+            self.why_min = why.into();
+        }
+        self
+    }
+
+    /// `delta` held inside the range. When that leaves nothing to do it is an
+    /// error that names what stopped it, so an edit that would change nothing
+    /// never records a revision.
+    fn resolve(&self, delta: f64, verb: &str) -> Result<f64> {
+        let applied = delta.clamp(self.min, self.max);
+        if applied.abs() > DIFF_EPS {
+            return Ok(applied);
+        }
+        let (way, why) = if delta > 0.0 {
+            ("later", &self.why_max)
+        } else {
+            ("earlier", &self.why_min)
+        };
+        Err(Error::InvalidArgument(format!("cannot {verb} {way}: {why}")))
+    }
+}
+
+/// A `delta` is a finite, non-zero number of seconds.
+fn check_delta(delta: f64) -> Result<()> {
+    if !delta.is_finite() {
+        return Err(Error::InvalidArgument("delta must be a finite number of seconds".to_string()));
+    }
+    if delta.abs() <= DIFF_EPS {
+        return Err(Error::InvalidArgument("delta is zero — there is nothing to move".to_string()));
+    }
+    Ok(())
+}
+
+fn footage_of(footage: &SourceLimits, clip: &Clip) -> Result<f64> {
+    footage
+        .get(&clip.asset_id)
+        .copied()
+        .ok_or(Error::AssetNotFound(clip.asset_id))
+}
+
+/// One clip's cut in a group split-and-remove ([`Timeline::split_remove_clips`]):
+/// the clip and the timeline time it is cut at.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClipCut {
+    pub clip_id: Uuid,
+    /// Timeline seconds, inside the clip.
+    pub at: f64,
+}
+
+/// A slide's neighbour on one side: its index in the lane and whether it touches
+/// the clip.
+type Neighbour = Option<(usize, bool)>;
+
+/// Close a cut exactly. A roll or a slide computes one side of a cut from a source
+/// window (`start + (out - in) / speed`) and the other from `start + delta`, and the
+/// two disagree by a few ulps (±7e-15 s in about one case in thirteen): invisible to
+/// a render, but a strict overlap test — `Project::move_clip`'s — reads it as one
+/// clip lying on the next. So when `follower` starts where `leader` ends to within
+/// float noise ([`DIFF_EPS`]), it is set to start *exactly* at `leader.timeline_end()`,
+/// the very expression the overlap checks compare against. A genuine gap or overlap
+/// (a cut that was merely within [`ADJACENT_EPS`]) is real data and is left alone.
+fn weld(leader: &Clip, follower: &mut Clip) {
+    let end = leader.timeline_end();
+    if (follower.timeline_start - end).abs() <= DIFF_EPS {
+        follower.timeline_start = end;
+    }
+}
+
+/// [`weld`]'s mirror, for the edge the edit left where it was: `clip`'s far end
+/// meets a clip that did not move (it starts at `limit`), and the window arithmetic
+/// can leave `clip.timeline_end()` a few ulps *past* it (observed up to ~6e-14 s).
+/// That overshoot, if it is float noise ([`DIFF_EPS`]), is taken back by shortening the
+/// window point the end is written on by what it overshoots — and by a single ulp when
+/// that is too small to move the point — until the end is no longer past `limit`: a
+/// change of ~1e-14 s to the source window, on a clip whose neighbour cannot be moved
+/// to meet it. `looping` as in [`Clip::move_tail`].
+fn fit_end(clip: &mut Clip, limit: f64, looping: bool) {
+    for _ in 0..16 {
+        let over = clip.timeline_end() - limit;
+        if over <= 0.0 || over > DIFF_EPS {
+            return;
+        }
+        let by = over * clip.speed_mag();
+        if clip.is_reversed() && !looping {
+            // The end of a reversed clip is its in-point: raise it to shorten.
+            let moved = clip.source_in + by;
+            clip.source_in = if moved == clip.source_in {
+                clip.source_in.next_up()
+            } else {
+                moved
+            };
+        } else {
+            let moved = clip.source_out - by;
+            clip.source_out = if moved == clip.source_out {
+                clip.source_out.next_down()
+            } else {
+                moved
+            };
+        }
+    }
+}
+
+impl Timeline {
+    /// Find a clip for an edit: it must exist and its track must not be locked.
+    fn editable_clip(&self, clip_id: Uuid) -> Result<(usize, usize)> {
+        let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        if self.tracks[ti].locked {
+            return Err(Error::InvalidArgument(format!("track {} is locked", self.tracks[ti].name)));
+        }
+        Ok((ti, ci))
+    }
+
+    /// Where the first clip of lane `ti` that starts at or after `end` (less the
+    /// adjacency tolerance) starts, skipping the lane indices in `skip` — the clip an
+    /// edit's far edge runs into, which the edit did not move.
+    fn start_after(&self, ti: usize, end: f64, skip: &[usize]) -> Option<f64> {
+        self.tracks[ti]
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| !skip.contains(i) && c.timeline_start >= end - ADJACENT_EPS)
+            .map(|(_, c)| c.timeline_start)
+            .min_by(f64::total_cmp)
+    }
+
+    // ---- roll ---------------------------------------------------------------
+
+    /// Everything a roll needs, checked: the lane, the two clips' indices in it,
+    /// and how far the cut may move.
+    fn roll_plan(&self, clip_a: Uuid, clip_b: Uuid, footage: &SourceLimits) -> Result<(usize, usize, usize, DeltaRange)> {
+        if clip_a == clip_b {
+            return Err(Error::InvalidArgument("a cut lies between two different clips".to_string()));
+        }
+        let (ta, ia) = self.editable_clip(clip_a)?;
+        let (tb, ib) = self.editable_clip(clip_b)?;
+        if ta != tb {
+            return Err(Error::InvalidArgument(format!(
+                "clips are on different tracks ({} and {}) — a roll moves the cut between two clips of one track",
+                self.tracks[ta].name, self.tracks[tb].name
+            )));
+        }
+        let (a, b) = (&self.tracks[ta].clips[ia], &self.tracks[ta].clips[ib]);
+        let gap = b.timeline_start - a.timeline_end();
+        if gap.abs() >= ADJACENT_EPS {
+            return Err(Error::InvalidArgument(
+                if (a.timeline_start - b.timeline_end()).abs() < ADJACENT_EPS {
+                    "clip_a must be the earlier clip: a roll moves the cut where clip_a ends and clip_b begins".to_string()
+                } else if gap > 0.0 {
+                    format!("the clips are not adjacent — there is a {gap:.2}s gap between them, and a roll needs a shared cut")
+                } else {
+                    format!(
+                        "the clips are not adjacent — they overlap by {:.2}s, and a roll needs a shared cut",
+                        -gap
+                    )
+                },
+            ));
+        }
+        let (_, tail_a) = a.handles(footage_of(footage, a)?);
+        let (head_b, _) = b.handles(footage_of(footage, b)?);
+        let range = DeltaRange::open()
+            .up_to(tail_a, "the outgoing clip has no footage left to extend into")
+            .up_to(b.duration() - MIN_EDIT_CLIP, "the incoming clip would be shorter than 0.05s")
+            .down_to(a.duration() - MIN_EDIT_CLIP, "the outgoing clip would be shorter than 0.05s")
+            .down_to(head_b, "the incoming clip has no footage left to extend into");
+        Ok((ta, ia, ib, range))
+    }
+
+    /// How far the cut between `clip_a` and `clip_b` may move each way — the
+    /// bounds [`Timeline::roll_edit`] clamps to.
+    pub fn roll_range(&self, clip_a: Uuid, clip_b: Uuid, footage: &SourceLimits) -> Result<DeltaRange> {
+        self.roll_plan(clip_a, clip_b, footage).map(|plan| plan.3)
+    }
+
+    /// **Roll** the cut between two adjacent clips: `clip_a`'s end and `clip_b`'s
+    /// start both move by `delta` seconds (positive is later), so the pair covers
+    /// the same stretch of timeline and nothing after it moves. The footage
+    /// changes hands at the cut — one clip gains what the other gives up.
+    ///
+    /// `clip_a` must be the earlier clip and the two must touch (within
+    /// [`ADJACENT_EPS`]) on one unlocked track. The roll **clamps** rather than
+    /// refuses — to the footage each clip has left to extend into (honoring speed
+    /// and direction: a reversed clip's outgoing edge is its in-point, and a still
+    /// has footage without limit) and to [`MIN_EDIT_CLIP`] for the clip that
+    /// shrinks — and errors only when the clamp leaves nothing to move.
+    ///
+    /// Everything else about both clips is kept. `clip_b`'s head moves, so its
+    /// keyframes shift with the content (`Clip::rebase_animation`); `clip_a`'s
+    /// head does not, so its animation stays. Fades are held inside what is left
+    /// of a clip that shrank. A transition into `clip_b` stays with the cut it
+    /// blends. All or nothing: an error leaves the timeline untouched.
+    pub fn roll_edit(&mut self, clip_a: Uuid, clip_b: Uuid, delta: f64, footage: &SourceLimits) -> Result<EditOutcome> {
+        check_delta(delta)?;
+        let (ti, ia, ib, range) = self.roll_plan(clip_a, clip_b, footage)?;
+        let applied = range.resolve(delta, "roll the cut")?;
+        let (mut a, mut b) = (self.tracks[ti].clips[ia].clone(), self.tracks[ti].clips[ib].clone());
+        let (looping_a, looping_b) = (footage_of(footage, &a)?.is_infinite(), footage_of(footage, &b)?.is_infinite());
+        let far = b.timeline_end();
+        a.move_tail(applied, looping_a);
+        b.move_head(applied, looping_b);
+        weld(&a, &mut b);
+        if let Some(limit) = self.start_after(ti, far, &[ia, ib]) {
+            fit_end(&mut b, limit, looping_b);
+        }
+        a.clamp_fades();
+        b.clamp_fades();
+        self.tracks[ti].clips[ia] = a.clone();
+        self.tracks[ti].clips[ib] = b.clone();
+        Ok(EditOutcome::new(delta, applied, vec![a, b]))
+    }
+
+    // ---- slip ---------------------------------------------------------------
+
+    fn slip_plan(&self, clip_id: Uuid, footage: &SourceLimits) -> Result<(usize, usize, DeltaRange)> {
+        let (ti, ci) = self.editable_clip(clip_id)?;
+        let clip = &self.tracks[ti].clips[ci];
+        let limit = footage_of(footage, clip)?;
+        if limit.is_infinite() {
+            return Err(Error::InvalidArgument(
+                "a still image has no footage to slip — it looks the same at every moment".to_string(),
+            ));
+        }
+        // Source seconds the window could move earlier / later.
+        let earlier = clip.source_in.max(0.0);
+        let later = (limit - clip.source_out).max(0.0);
+        let (no_later, no_earlier) = (
+            "there is no footage left after the clip's out-point",
+            "there is no footage left before the clip's in-point",
+        );
+        // Positive `delta` is "starts later in its own footage", which is the
+        // *lower* source time for a reversed clip: the two directions swap.
+        let range = if clip.is_reversed() {
+            DeltaRange::open().up_to(earlier, no_earlier).down_to(later, no_later)
+        } else {
+            DeltaRange::open().up_to(later, no_later).down_to(earlier, no_earlier)
+        };
+        Ok((ti, ci, range))
+    }
+
+    /// How far `clip_id`'s footage may slip each way, in source seconds — the
+    /// bounds [`Timeline::slip_clip`] clamps to. Errors for a still, which has
+    /// nothing to slip.
+    pub fn slip_range(&self, clip_id: Uuid, footage: &SourceLimits) -> Result<DeltaRange> {
+        self.slip_plan(clip_id, footage).map(|plan| plan.2)
+    }
+
+    /// **Slip** a clip: change which part of its footage it shows without moving
+    /// it or changing its length. The source window (`source_in` / `source_out`)
+    /// shifts by `delta` **source** seconds — not timeline seconds, so at 2× speed
+    /// a 1 s slip moves the picture half a second — and nothing on the timeline
+    /// moves.
+    ///
+    /// Positive `delta` means the clip starts **later in its own footage**: you
+    /// see material that comes later. For a clip playing forward that moves the
+    /// window up (`source_in` and `source_out` both grow). A reversed clip plays
+    /// its window backwards, so later in its footage is *lower* source time: the
+    /// window moves the mirrored way (both shrink). The sign therefore always
+    /// means the same thing on screen, whichever way the clip plays.
+    ///
+    /// Clamps to the asset's footage (the window cannot leave `0..duration`) and
+    /// errors when that leaves nothing to move. A still has no footage to slip and
+    /// is an error. The keyframes (transform and reframe) are clip-local and the
+    /// timing is unchanged, so they stay exactly as they are; so do the fades.
+    pub fn slip_clip(&mut self, clip_id: Uuid, delta: f64, footage: &SourceLimits) -> Result<EditOutcome> {
+        check_delta(delta)?;
+        let (ti, ci, range) = self.slip_plan(clip_id, footage)?;
+        let applied = range.resolve(delta, "slip the footage")?;
+        let clip = &mut self.tracks[ti].clips[ci];
+        let shift = if clip.is_reversed() { -applied } else { applied };
+        clip.source_in += shift;
+        clip.source_out += shift;
+        Ok(EditOutcome::new(delta, applied, vec![clip.clone()]))
+    }
+
+    // ---- slide --------------------------------------------------------------
+
+    /// The clip's place in its lane — `(track, clip, previous, next)`, the
+    /// neighbours by start time and whether each touches the clip — and how far
+    /// it may slide.
+    fn slide_plan(&self, clip_id: Uuid, footage: &SourceLimits) -> Result<(usize, usize, Neighbour, Neighbour, DeltaRange)> {
+        let (ti, ci) = self.editable_clip(clip_id)?;
+        let clips = &self.tracks[ti].clips;
+        let clip = &clips[ci];
+        let mut order: Vec<usize> = (0..clips.len()).collect();
+        order.sort_by(|&a, &b| clips[a].timeline_start.total_cmp(&clips[b].timeline_start));
+        let pos = order.iter().position(|&i| i == ci).expect("the clip is in its own lane");
+        let prev = pos
+            .checked_sub(1)
+            .map(|p| order[p])
+            .map(|i| (i, (clip.timeline_start - clips[i].timeline_end()).abs() < ADJACENT_EPS));
+        let next = order
+            .get(pos + 1)
+            .map(|&i| (i, (clips[i].timeline_start - clip.timeline_end()).abs() < ADJACENT_EPS));
+
+        let mut range = DeltaRange::open();
+        // Later: a touching previous clip grows to fill what the clip leaves, a
+        // touching next clip is pushed back; a next clip across a gap is left alone.
+        if let Some((i, true)) = prev {
+            let (_, tail) = clips[i].handles(footage_of(footage, &clips[i])?);
+            range = range.up_to(tail, "the previous clip has no footage left to extend into");
+        }
+        match next {
+            Some((i, true)) => {
+                range = range.up_to(
+                    clips[i].duration() - MIN_EDIT_CLIP,
+                    "the next clip would be shorter than 0.05s",
+                );
+            }
+            Some((i, false)) => {
+                range = range.up_to(
+                    clips[i].timeline_start - clip.timeline_end(),
+                    "the next clip is not touching this one, so it is left alone and the clip can only use the free space before it",
+                );
+            }
+            None => {}
+        }
+        // Earlier: the mirror image.
+        match prev {
+            Some((i, true)) => {
+                range = range.down_to(
+                    clips[i].duration() - MIN_EDIT_CLIP,
+                    "the previous clip would be shorter than 0.05s",
+                );
+            }
+            Some((i, false)) => {
+                range = range.down_to(
+                    clip.timeline_start - clips[i].timeline_end(),
+                    "the previous clip is not touching this one, so it is left alone and the clip can only use the free space after it",
+                );
+            }
+            None => {
+                range = range.down_to(clip.timeline_start, "the clip is already at the start of the timeline");
+            }
+        }
+        if let Some((i, true)) = next {
+            let (head, _) = clips[i].handles(footage_of(footage, &clips[i])?);
+            range = range.down_to(head, "the next clip has no footage left to extend into");
+        }
+        Ok((ti, ci, prev, next, range))
+    }
+
+    /// How far `clip_id` may slide each way, in timeline seconds — the bounds
+    /// [`Timeline::slide_clip`] clamps to.
+    pub fn slide_range(&self, clip_id: Uuid, footage: &SourceLimits) -> Result<DeltaRange> {
+        self.slide_plan(clip_id, footage).map(|plan| plan.4)
+    }
+
+    /// **Slide** a clip along its track, keeping its content: it moves by `delta`
+    /// timeline seconds (positive is later) and the neighbours give way — the
+    /// previous clip's end and the next clip's start both move by `delta`, so the
+    /// clip's own source window, its length and the length of the stretch it and
+    /// its neighbours span are unchanged.
+    ///
+    /// The exact rules, for a lane with gaps:
+    ///
+    /// * A neighbour that **touches** the clip (within [`ADJACENT_EPS`]) follows
+    ///   its edge: sliding later extends the previous clip and trims the next;
+    ///   sliding earlier does the reverse. It is bounded by that neighbour's
+    ///   footage (`Clip::handles`, speed and direction honored, a still
+    ///   unbounded) when it grows and by [`MIN_EDIT_CLIP`] when it shrinks.
+    /// * A neighbour **across a gap** is never touched — the slide cannot trim a
+    ///   clip it is not touching. The clip moves through the free space and stops
+    ///   where it would meet that neighbour.
+    /// * With no previous clip the clip cannot go before 0; with no next clip it
+    ///   can slide later without limit — and then the track's end moves with it,
+    ///   the one case where the overall length changes, since there is no next
+    ///   clip to give way.
+    ///
+    /// Like the other modes it **clamps** and errors only when nothing can move.
+    /// The slid clip is only repositioned, so its keyframes and fades stay; a next
+    /// clip whose start moved has its keyframes shift with its content
+    /// (`Clip::rebase_animation`). All or nothing.
+    pub fn slide_clip(&mut self, clip_id: Uuid, delta: f64, footage: &SourceLimits) -> Result<EditOutcome> {
+        check_delta(delta)?;
+        let (ti, ci, prev, next, range) = self.slide_plan(clip_id, footage)?;
+        let applied = range.resolve(delta, "slide the clip")?;
+        let mut moved = self.tracks[ti].clips[ci].clone();
+        // Where the edit's far edge was — the end of the last clip it changes — and
+        // which clips are the edit's own, so what that edge runs into can be found.
+        let mut far = moved.timeline_end();
+        let mut skip = vec![ci];
+        moved.timeline_start += applied;
+        let mut prev_clip = None;
+        if let Some((i, true)) = prev {
+            let mut p = self.tracks[ti].clips[i].clone();
+            let looping = footage_of(footage, &p)?.is_infinite();
+            p.move_tail(applied, looping);
+            weld(&p, &mut moved);
+            p.clamp_fades();
+            skip.push(i);
+            prev_clip = Some((i, p));
+        }
+        let mut next_clip = None;
+        if let Some((i, true)) = next {
+            let mut n = self.tracks[ti].clips[i].clone();
+            let looping = footage_of(footage, &n)?.is_infinite();
+            far = n.timeline_end();
+            n.move_head(applied, looping);
+            weld(&moved, &mut n);
+            n.clamp_fades();
+            skip.push(i);
+            next_clip = Some((i, n, looping));
+        }
+        if let Some(limit) = self.start_after(ti, far, &skip) {
+            match next_clip.as_mut() {
+                Some((_, n, looping)) => fit_end(n, limit, *looping),
+                None => {
+                    let looping = footage.get(&moved.asset_id).is_some_and(|l| l.is_infinite());
+                    fit_end(&mut moved, limit, looping);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some((i, p)) = prev_clip {
+            self.tracks[ti].clips[i] = p.clone();
+            out.push(p);
+        }
+        self.tracks[ti].clips[ci] = moved.clone();
+        out.push(moved);
+        if let Some((i, n, _)) = next_clip {
+            self.tracks[ti].clips[i] = n.clone();
+            out.push(n);
+        }
+        Ok(EditOutcome::new(delta, applied, out))
+    }
+
+    // ---- split and remove ---------------------------------------------------
+
+    /// **Split and remove**: cut a clip at timeline time `at` and throw one half
+    /// away — "trim the start / end to the playhead" in one edit. Returns the
+    /// half that stays, which **keeps the clip's id** (so a selection survives and
+    /// [`Timeline::ripple_from`] reads the edit for what it is, an ordinary trim).
+    ///
+    /// Leaving `Right` shortens the clip at its end. Leaving `Left`, the clip's
+    /// start moves up to `at` so its end stays put — the same shape a left-edge
+    /// trim has — which leaves the gap where the removed half was; under ripple
+    /// mode the caller's `ripple_from` closes it, holding the clip's start and
+    /// pulling the rest of the track in (see [`Timeline::ripple_from`]).
+    ///
+    /// The clip keeps what belonged to the half that stayed and drops what
+    /// belonged to the half that went: a new hard edge carries no fade and no
+    /// transition, so removing the left drops `fade_in` and `transition_in` (the
+    /// transition blended the old start, which is gone — the same half a plain
+    /// split leaves it off), and removing the right drops `fade_out`; the other
+    /// fade is held inside what is left. Keyframes ride with the content when the
+    /// head moved. `at` must lie inside the clip and leave at least
+    /// [`MIN_EDIT_CLIP`] of it; the track must be unlocked.
+    pub fn split_remove(&mut self, clip_id: Uuid, at: f64, side: SplitSide) -> Result<Clip> {
+        if !at.is_finite() {
+            return Err(Error::InvalidArgument("the split point must be a finite time".to_string()));
+        }
+        let (ti, ci) = self.editable_clip(clip_id)?;
+        let mut clip = self.tracks[ti].clips[ci].clone();
+        let (start, end) = (clip.timeline_start, clip.timeline_end());
+        if at <= start + DIFF_EPS || at >= end - DIFF_EPS {
+            return Err(Error::InvalidArgument(format!(
+                "the split point {} is not inside the clip ({}–{})",
+                fmt_time(at),
+                fmt_time(start),
+                fmt_time(end)
+            )));
+        }
+        let kept = match side {
+            SplitSide::Left => end - at,
+            SplitSide::Right => at - start,
+        };
+        if kept < MIN_EDIT_CLIP - DIFF_EPS {
+            return Err(Error::InvalidArgument(format!(
+                "that would leave only {kept:.2}s of the clip — remove the clip instead"
+            )));
+        }
+        match side {
+            SplitSide::Left => {
+                clip.move_head(at - start, false);
+                clip.timeline_start = at;
+                clip.fade_in = 0.0;
+                clip.transition_in = None;
+            }
+            SplitSide::Right => {
+                clip.move_tail(at - end, false);
+                clip.fade_out = 0.0;
+            }
+        }
+        clip.clamp_fades();
+        self.tracks[ti].clips[ci] = clip.clone();
+        Ok(clip)
+    }
+}
+
+impl Timeline {
+    /// **Split and remove** on several clips at once — the playhead trim of a
+    /// selection, V1 and its A1 partner together — as one edit: every cut in `cuts`
+    /// is [`Timeline::split_remove`] with the same `side`, and the survivors come
+    /// back in request order.
+    ///
+    /// All or nothing: an unknown clip, a locked track, a cut outside its clip or
+    /// one that would leave under [`MIN_EDIT_CLIP`] refuses the whole group and the
+    /// timeline is exactly as it was. **At most one clip per track**, and a clip once:
+    /// a playhead is inside one clip of a lane, and under ripple mode a lane trimmed
+    /// at two places has no single edit point to hold still (see
+    /// [`Timeline::ripple_from`]) — so each track ripples on its own, from its own
+    /// one cut. Different tracks may be cut at different times.
+    pub fn split_remove_clips(&mut self, cuts: &[ClipCut], side: SplitSide) -> Result<Vec<Clip>> {
+        if cuts.is_empty() {
+            return Err(Error::InvalidArgument("no clips to cut".to_string()));
+        }
+        let mut seen_clips = HashSet::new();
+        let mut seen_tracks = HashSet::new();
+        for cut in cuts {
+            let (ti, _) = self.locate(cut.clip_id).ok_or(Error::ClipNotFound(cut.clip_id))?;
+            if !seen_clips.insert(cut.clip_id) {
+                return Err(Error::InvalidArgument(format!("clip {} appears more than once", cut.clip_id)));
+            }
+            if !seen_tracks.insert(ti) {
+                return Err(Error::InvalidArgument(format!(
+                    "two of the clips are on track {} — a group trim cuts one clip per track",
+                    self.tracks[ti].name
+                )));
+            }
+        }
+        // Cut a copy, so a refusal part-way through leaves the timeline untouched.
+        let mut scratch = self.clone();
+        let kept = cuts
+            .iter()
+            .map(|cut| scratch.split_remove(cut.clip_id, cut.at, side))
+            .collect::<Result<Vec<_>>>()?;
+        *self = scratch;
+        Ok(kept)
+    }
+}
+
 /// Lifecycle of a task in the agent queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3621,6 +4357,19 @@ pub(crate) fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0);
     let m = (s / 60.0).floor();
     format!("{}:{:04.1}", m as i64, s - m * 60.0)
+}
+
+/// A signed shift of footage at the precision a slip is made at — a frame is 0.03 s,
+/// which one decimal would print as `+0.0s` — and three decimals when even two would
+/// round a real shift to nothing.
+fn fmt_shift(secs: f64) -> String {
+    let secs = secs + 0.0; // -0.0 is 0
+    let places = if secs != 0.0 && (secs.abs() * 100.0).round() == 0.0 {
+        3
+    } else {
+        2
+    };
+    format!("{}{secs:.places$}s", if secs >= 0.0 { "+" } else { "" })
 }
 
 fn fmt_delta(secs: f64) -> String {
@@ -4174,19 +4923,34 @@ impl Timeline {
                 }
                 if num_changed(before_clip.source_in, clip.source_in) || num_changed(before_clip.source_out, clip.source_out) {
                     let (was, is) = (before_clip.source_duration(), clip.source_duration());
-                    clips.push(
-                        DiffEntry::new(
-                            DiffKind::ClipRetrimmed,
-                            format!(
-                                "Trimmed clip on {} at {} — {was:.1}s → {is:.1}s ({})",
-                                track.name,
-                                fmt_time(clip.timeline_start),
-                                fmt_delta(is - was)
-                            ),
+                    // A window that moved without changing length is a slip, not a
+                    // trim: "4.0s → 4.0s (+0.0s)" would read as nothing having happened.
+                    let summary = if num_changed(was, is) {
+                        format!(
+                            "Trimmed clip on {} at {} — {was:.1}s → {is:.1}s ({})",
+                            track.name,
+                            fmt_time(clip.timeline_start),
+                            fmt_delta(is - was)
                         )
-                        .on_track(track.id)
-                        .on_clip(clip.id)
-                        .at(clip.timeline_start),
+                    } else {
+                        // Signed as `slip_clip` documents it: + is *later in its own
+                        // footage*, which for a reversed clip is the window moving down.
+                        let moved = clip.source_in - before_clip.source_in;
+                        let later = if clip.is_reversed() { -moved } else { moved };
+                        format!(
+                            "Slipped clip on {} at {} — footage {} (in-point {:.2}s → {:.2}s)",
+                            track.name,
+                            fmt_time(clip.timeline_start),
+                            fmt_shift(later),
+                            before_clip.source_in,
+                            clip.source_in
+                        )
+                    };
+                    clips.push(
+                        DiffEntry::new(DiffKind::ClipRetrimmed, summary)
+                            .on_track(track.id)
+                            .on_clip(clip.id)
+                            .at(clip.timeline_start),
                     );
                 }
                 if let Some(detail) = clip_changes(before_clip, clip) {
@@ -6570,5 +7334,1201 @@ mod tests {
         assert_eq!(moved.clips_moved_since(&two), 1);
         moved.tracks[1].clips.push(rclip(0.0, 1.0));
         assert_eq!(moved.clips_moved_since(&two), 1, "an added clip is not a moved one");
+    }
+
+    // ---- edit modes: roll, slip, slide, split-and-remove ------------------------
+
+    /// Footage of `secs` for the asset every `sclip` / `rclip` points at.
+    fn footage(secs: f64) -> SourceLimits {
+        HashMap::from([(Uuid::nil(), secs)])
+    }
+
+    /// A clip of the shared test asset: source `[si, so)` placed at `start`.
+    fn sclip(si: f64, so: f64, start: f64) -> Clip {
+        Clip::new(Uuid::nil(), si, so, start)
+    }
+
+    fn window(c: &Clip) -> (f64, f64) {
+        (c.source_in, c.source_out)
+    }
+
+    fn near(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "{a} is not {b}");
+    }
+
+    /// The reason an op refused, with the timeline it was run on shown unchanged.
+    fn refused<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::InvalidArgument(why)) => why,
+            other => panic!("expected an InvalidArgument, got {other:?}"),
+        }
+    }
+
+    fn kf(time: f64, scale: f64) -> Keyframe {
+        Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        }
+    }
+
+    fn scales(c: &Clip) -> Vec<(f64, f64)> {
+        c.keyframes.iter().map(|k| (k.time, k.scale)).collect()
+    }
+
+    /// `a [0,4)` src 10..14 abutting `b [4,8)` src 20..24.
+    fn cut_pair() -> (Timeline, Uuid, Uuid) {
+        let (a, b) = (sclip(10.0, 14.0, 0.0), sclip(20.0, 24.0, 4.0));
+        let ids = (a.id, b.id);
+        (one_lane(vec![a, b]), ids.0, ids.1)
+    }
+
+    #[test]
+    fn a_roll_moves_the_cut_and_leaves_the_stretch_it_spans_alone() {
+        let (mut t, a, b) = cut_pair();
+        let out = t.roll_edit(a, b, 1.0, &footage(60.0)).unwrap();
+        assert_eq!((out.requested, out.applied, out.clamped), (1.0, 1.0, false));
+        assert_eq!(out.clips.len(), 2);
+        let (ca, cb) = (&t.tracks[0].clips[0], &t.tracks[0].clips[1]);
+        assert_eq!(window(ca), (10.0, 15.0), "the outgoing clip gained a second");
+        assert_eq!(window(cb), (21.0, 24.0), "the incoming one gave it up");
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 5.0), (5.0, 8.0)], "the pair still spans 0..8");
+
+        // And back past where it started: a negative delta rolls the cut earlier.
+        t.roll_edit(a, b, -2.5, &footage(60.0)).unwrap();
+        let (ca, cb) = (&t.tracks[0].clips[0], &t.tracks[0].clips[1]);
+        assert_eq!(window(ca), (10.0, 12.5));
+        assert_eq!(window(cb), (18.5, 24.0));
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 2.5), (2.5, 8.0)]);
+    }
+
+    #[test]
+    fn a_roll_clamps_to_the_footage_each_clip_has_left_and_says_so() {
+        // A 6 s asset: `a` (0..4) has 2 s after its out-point, `b` (1..5) has 1 s before its in-point.
+        let (a, b) = (sclip(0.0, 4.0, 0.0), sclip(1.0, 5.0, 4.0));
+        let (ia, ib) = (a.id, b.id);
+        let t = one_lane(vec![a, b]);
+
+        let mut later = t.clone();
+        let out = later.roll_edit(ia, ib, 5.0, &footage(6.0)).unwrap();
+        assert_eq!((out.requested, out.applied, out.clamped), (5.0, 2.0, true));
+        assert_eq!(window(&later.tracks[0].clips[0]), (0.0, 6.0), "all the footage `a` had left");
+        assert_eq!(later.tracks[0].clips[1].timeline_start, 6.0);
+
+        let mut earlier = t.clone();
+        let out = earlier.roll_edit(ia, ib, -5.0, &footage(6.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (-1.0, true));
+        assert_eq!(
+            window(&earlier.tracks[0].clips[1]),
+            (0.0, 5.0),
+            "all the footage `b` had before it"
+        );
+        assert_eq!(spans_of(&earlier, 0), vec![(0.0, 3.0), (3.0, 8.0)]);
+
+        // The range an interactive drag holds the pointer to is the same numbers.
+        let range = t.roll_range(ia, ib, &footage(6.0)).unwrap();
+        assert_eq!((range.min, range.max), (-1.0, 2.0));
+    }
+
+    #[test]
+    fn a_roll_never_leaves_a_clip_shorter_than_the_floor() {
+        let (a, b) = (sclip(10.0, 11.0, 0.0), sclip(20.0, 21.0, 1.0));
+        let (ia, ib) = (a.id, b.id);
+        let t = one_lane(vec![a, b]);
+
+        let mut later = t.clone();
+        near(later.roll_edit(ia, ib, 5.0, &footage(60.0)).unwrap().applied, 0.95);
+        near(later.tracks[0].clips[1].duration(), MIN_EDIT_CLIP);
+
+        let mut earlier = t;
+        near(earlier.roll_edit(ia, ib, -5.0, &footage(60.0)).unwrap().applied, -0.95);
+        near(earlier.tracks[0].clips[0].duration(), MIN_EDIT_CLIP);
+    }
+
+    #[test]
+    fn a_roll_honors_speed() {
+        // `a` runs at 2x over 0..8 (4 s on the timeline) in a 10 s asset: 2 source
+        // seconds left are 1 timeline second. `b` runs at half speed.
+        let mut a = sclip(0.0, 8.0, 0.0);
+        a.speed = 2.0;
+        let mut b = sclip(2.0, 3.0, 4.0); // 1 source s at 0.5x: 2 s long
+        b.speed = 0.5;
+        let (ia, ib) = (a.id, b.id);
+        let t = one_lane(vec![a, b]);
+
+        let mut later = t.clone();
+        let out = later.roll_edit(ia, ib, 3.0, &footage(10.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (1.0, true));
+        let (ca, cb) = (&later.tracks[0].clips[0], &later.tracks[0].clips[1]);
+        assert_eq!(window(ca), (0.0, 10.0), "one timeline second at 2x is two source seconds");
+        near(cb.source_in, 2.5); // one timeline second at 0.5x is half a source second
+        assert_eq!((cb.timeline_start, cb.duration()), (5.0, 1.0));
+
+        let mut earlier = t;
+        earlier.roll_edit(ia, ib, -1.0, &footage(10.0)).unwrap();
+        let (ca, cb) = (&earlier.tracks[0].clips[0], &earlier.tracks[0].clips[1]);
+        assert_eq!(window(ca), (0.0, 6.0));
+        near(cb.source_in, 1.5);
+        assert_eq!((cb.timeline_start, cb.duration()), (3.0, 3.0));
+    }
+
+    #[test]
+    fn a_roll_honors_reverse_the_outgoing_edge_is_the_in_point() {
+        // Both clips play backwards over 5..9. A reversed clip's *end* is its
+        // in-point, so `a` extends downwards (5 s of footage below it), and `b`'s
+        // start is its out-point.
+        let (mut a, mut b) = (sclip(5.0, 9.0, 0.0), sclip(5.0, 9.0, 4.0));
+        a.speed = -1.0;
+        b.speed = -1.0;
+        let (ia, ib) = (a.id, b.id);
+        let t = one_lane(vec![a, b]);
+
+        let mut later = t.clone();
+        let out = later.roll_edit(ia, ib, 2.0, &footage(60.0)).unwrap();
+        assert_eq!(out.applied, 2.0);
+        assert_eq!(window(&later.tracks[0].clips[0]), (3.0, 9.0), "a: in-point down by 2");
+        assert_eq!(window(&later.tracks[0].clips[1]), (5.0, 7.0), "b: out-point down by 2");
+        assert_eq!(spans_of(&later, 0), vec![(0.0, 6.0), (6.0, 8.0)]);
+
+        let mut earlier = t;
+        earlier.roll_edit(ia, ib, -2.0, &footage(60.0)).unwrap();
+        assert_eq!(window(&earlier.tracks[0].clips[0]), (7.0, 9.0), "a: in-point up by 2");
+        assert_eq!(window(&earlier.tracks[0].clips[1]), (5.0, 11.0), "b: out-point up by 2");
+
+        // The handle is the one on the *playing* side: here `a` has 1 s below its
+        // in-point and `b` only half a second above its out-point.
+        let (mut a, mut b) = (sclip(1.0, 5.0, 0.0), sclip(5.0, 59.5, 4.0));
+        a.speed = -1.0;
+        b.speed = -1.0;
+        let (ia, ib) = (a.id, b.id);
+        let t = one_lane(vec![a, b]);
+        let range = t.roll_range(ia, ib, &footage(60.0)).unwrap();
+        assert_eq!((range.min, range.max), (-0.5, 1.0));
+    }
+
+    #[test]
+    fn a_roll_through_a_still_has_footage_without_limit_and_never_a_negative_window() {
+        let still = Uuid::new_v4();
+        let limits: SourceLimits = HashMap::from([(Uuid::nil(), 60.0), (still, f64::INFINITY)]);
+
+        // The still is the incoming clip: rolling earlier lengthens it freely, written
+        // on its out-point so the window never reaches below 0.
+        let (a, b) = (sclip(10.0, 15.0, 0.0), Clip::new(still, 0.0, 5.0, 5.0));
+        let (ia, ib) = (a.id, b.id);
+        let mut t = one_lane(vec![a, b]);
+        t.roll_edit(ia, ib, -2.0, &limits).unwrap();
+        let cb = &t.tracks[0].clips[1];
+        assert_eq!((cb.timeline_start, cb.duration()), (3.0, 7.0));
+        assert_eq!(window(cb), (0.0, 7.0));
+
+        // The still is the outgoing clip: nothing stops it growing but the other clip.
+        let (a, b) = (Clip::new(still, 0.0, 5.0, 0.0), sclip(10.0, 15.0, 5.0));
+        let (ia, ib) = (a.id, b.id);
+        let mut t = one_lane(vec![a, b]);
+        near(t.roll_edit(ia, ib, 20.0, &limits).unwrap().applied, 4.95);
+        assert_eq!(window(&t.tracks[0].clips[0]).0, 0.0);
+    }
+
+    #[test]
+    fn a_roll_needs_two_adjacent_clips_in_order_on_one_unlocked_track() {
+        let (t, a, b) = cut_pair();
+        let f = footage(60.0);
+        let run = |name: &str, tl: &Timeline, ia: Uuid, ib: Uuid, delta: f64| {
+            let mut copy = tl.clone();
+            let why = refused(copy.roll_edit(ia, ib, delta, &f));
+            assert!(same_cut(&copy, tl), "{name}: a refused roll must change nothing");
+            why
+        };
+
+        assert!(run("swapped", &t, b, a, 1.0).contains("clip_a must be the earlier clip"));
+        assert!(run("itself", &t, a, a, 1.0).contains("two different clips"));
+        assert!(run("zero", &t, a, b, 0.0).contains("zero"));
+        assert!(run("nan", &t, a, b, f64::NAN).contains("finite"));
+
+        // A gap, an overlap.
+        let mut gapped = t.clone();
+        gapped.tracks[0].clips[1].timeline_start = 5.0;
+        assert!(run("gap", &gapped, a, b, 1.0).contains("1.00s gap"));
+        let mut overlapped = t.clone();
+        overlapped.tracks[0].clips[1].timeline_start = 3.5;
+        assert!(run("overlap", &overlapped, a, b, 1.0).contains("overlap by 0.50s"));
+
+        // Different tracks.
+        let two = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![t.tracks[0].clips[0].clone()]),
+                track(StreamKind::Video, "V2", vec![t.tracks[0].clips[1].clone()]),
+            ],
+            ..Timeline::new()
+        };
+        assert!(run("tracks", &two, a, b, 1.0).contains("different tracks (V1 and V2)"));
+
+        // Locked, and unknown ids.
+        let mut locked = t.clone();
+        locked.tracks[0].locked = true;
+        assert!(run("locked", &locked, a, b, 1.0).contains("V1 is locked"));
+        let mut copy = t.clone();
+        assert!(matches!(
+            copy.roll_edit(a, Uuid::new_v4(), 1.0, &f),
+            Err(Error::ClipNotFound(_))
+        ));
+
+        // An asset the footage table does not know cannot be clamped.
+        let mut copy = t;
+        assert!(matches!(
+            copy.roll_edit(a, b, 1.0, &SourceLimits::new()),
+            Err(Error::AssetNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_roll_that_clamps_to_nothing_is_an_error_that_says_why() {
+        // `a` already ends at the end of its asset; `b` starts at the start of its.
+        let (a, b) = (sclip(0.0, 6.0, 0.0), sclip(0.0, 3.0, 6.0));
+        let (ia, ib) = (a.id, b.id);
+        let mut t = one_lane(vec![a, b]);
+        let before = t.clone();
+        let why = refused(t.roll_edit(ia, ib, 1.0, &footage(6.0)));
+        assert!(
+            why.contains("cannot roll the cut later") && why.contains("outgoing clip has no footage left"),
+            "{why}"
+        );
+        let why = refused(t.roll_edit(ia, ib, -1.0, &footage(6.0)));
+        assert!(
+            why.contains("cannot roll the cut earlier") && why.contains("incoming clip has no footage left"),
+            "{why}"
+        );
+        assert!(same_cut(&t, &before));
+    }
+
+    #[test]
+    fn two_clips_a_hair_apart_still_share_a_cut() {
+        // The engine treats edges within a millisecond as touching (transition_fx).
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[1].timeline_start = 4.0005;
+        let out = t.roll_edit(a, b, 1.0, &footage(60.0)).unwrap();
+        assert_eq!(out.applied, 1.0);
+        near(t.tracks[0].clips[1].timeline_start, 5.0005);
+
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[1].timeline_start = 4.002;
+        assert!(refused(t.roll_edit(a, b, 1.0, &footage(60.0))).contains("not adjacent"));
+    }
+
+    #[test]
+    fn a_roll_carries_the_incoming_clips_animation_with_its_footage() {
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[0].keyframes = vec![kf(0.0, 1.0), kf(2.0, 3.0)];
+        t.tracks[0].clips[1].keyframes = vec![kf(0.0, 1.0), kf(2.0, 2.0)];
+        let mut rf = Reframe::new(Projection::Equirect);
+        rf.keyframes = vec![
+            ReframeKeyframe {
+                time: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                fov: 100.0,
+            },
+            ReframeKeyframe {
+                time: 2.0,
+                yaw: 90.0,
+                pitch: 0.0,
+                roll: 0.0,
+                fov: 100.0,
+            },
+        ];
+        t.tracks[0].clips[1].reframe = Some(rf);
+
+        // Rolled later, b loses its first second: the pose it now opens on is
+        // pinned at 0 and the later key moves up.
+        let mut later = t.clone();
+        later.roll_edit(a, b, 1.0, &footage(60.0)).unwrap();
+        assert_eq!(scales(&later.tracks[0].clips[1]), vec![(0.0, 1.5), (1.0, 2.0)]);
+        let rk: Vec<(f64, f64)> = later.tracks[0].clips[1]
+            .reframe
+            .as_ref()
+            .unwrap()
+            .keyframes
+            .iter()
+            .map(|k| (k.time, k.yaw))
+            .collect();
+        assert_eq!(rk, vec![(0.0, 45.0), (1.0, 90.0)], "the camera moves with the footage too");
+        assert_eq!(
+            scales(&later.tracks[0].clips[0]),
+            vec![(0.0, 1.0), (2.0, 3.0)],
+            "the outgoing clip's head did not move"
+        );
+
+        // Rolled earlier, b gains a second at its head: every key shifts later.
+        let mut earlier = t;
+        earlier.roll_edit(a, b, -1.0, &footage(60.0)).unwrap();
+        assert_eq!(scales(&earlier.tracks[0].clips[1]), vec![(1.0, 1.0), (3.0, 2.0)]);
+    }
+
+    #[test]
+    fn a_roll_keeps_fades_inside_a_clip_that_shrank_and_the_transition_on_the_cut() {
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[0].fade_out = 2.0;
+        t.tracks[0].clips[0].fade_in = 0.5;
+        t.tracks[0].clips[1].fade_in = 3.0;
+        let transition = Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        };
+        t.tracks[0].clips[1].transition_in = Some(transition);
+
+        t.roll_edit(a, b, -3.9, &footage(60.0)).unwrap(); // a is 0.1 s now
+        let (ca, cb) = (&t.tracks[0].clips[0], &t.tracks[0].clips[1]);
+        near(ca.fade_out, 0.1);
+        near(ca.fade_in, 0.1);
+        assert_eq!(cb.fade_in, 3.0, "b grew, so its fade stays");
+        assert_eq!(cb.transition_in, Some(transition));
+
+        t.roll_edit(a, b, 10.0, &footage(60.0)).unwrap(); // b shrinks to the floor
+        near(t.tracks[0].clips[1].fade_in, MIN_EDIT_CLIP);
+    }
+
+    #[test]
+    fn a_slip_moves_the_window_and_nothing_on_the_timeline() {
+        let mut c = sclip(10.0, 14.0, 3.0);
+        c.keyframes = vec![kf(0.0, 1.0), kf(2.0, 2.0)];
+        c.fade_in = 0.5;
+        let id = c.id;
+        let mut t = one_lane(vec![c.clone()]);
+
+        let out = t.slip_clip(id, 2.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (2.0, false));
+        let slipped = &t.tracks[0].clips[0];
+        assert_eq!(window(slipped), (12.0, 16.0));
+        assert_eq!((slipped.timeline_start, slipped.duration()), (3.0, 4.0));
+        // Clip-local animation and the fades are timed to the clip, not to the footage.
+        assert_eq!(slipped.keyframes, c.keyframes);
+        assert_eq!(slipped.fade_in, 0.5);
+
+        t.slip_clip(id, -5.0, &footage(60.0)).unwrap();
+        assert_eq!(window(&t.tracks[0].clips[0]), (7.0, 11.0));
+    }
+
+    #[test]
+    fn a_slip_clamps_to_the_asset_and_errors_at_the_edge() {
+        let c = sclip(10.0, 14.0, 0.0);
+        let id = c.id;
+        let t = one_lane(vec![c]);
+
+        let mut up = t.clone();
+        let out = up.slip_clip(id, 10.0, &footage(20.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (6.0, true));
+        assert_eq!(window(&up.tracks[0].clips[0]), (16.0, 20.0));
+        let why = refused(up.slip_clip(id, 1.0, &footage(20.0)));
+        assert!(
+            why.contains("cannot slip the footage later") && why.contains("after the clip's out-point"),
+            "{why}"
+        );
+
+        let mut down = t.clone();
+        near(down.slip_clip(id, -50.0, &footage(20.0)).unwrap().applied, -10.0);
+        assert_eq!(window(&down.tracks[0].clips[0]), (0.0, 4.0));
+        let why = refused(down.slip_clip(id, -1.0, &footage(20.0)));
+        assert!(
+            why.contains("cannot slip the footage earlier") && why.contains("before the clip's in-point"),
+            "{why}"
+        );
+
+        let range = t.slip_range(id, &footage(20.0)).unwrap();
+        assert_eq!((range.min, range.max), (-10.0, 6.0));
+    }
+
+    #[test]
+    fn a_slip_is_in_source_seconds_whatever_the_speed() {
+        let mut c = sclip(10.0, 14.0, 0.0);
+        c.speed = 2.0; // 4 source seconds in 2 timeline seconds
+        let id = c.id;
+        let mut t = one_lane(vec![c]);
+        t.slip_clip(id, 1.0, &footage(60.0)).unwrap();
+        let slipped = &t.tracks[0].clips[0];
+        assert_eq!(window(slipped), (11.0, 15.0), "one source second");
+        assert_eq!((slipped.timeline_start, slipped.timeline_end()), (0.0, 2.0));
+    }
+
+    #[test]
+    fn a_reversed_clip_slips_the_mirrored_way_so_the_sign_means_the_same_on_screen() {
+        // Positive = starts later in its own footage. A reversed clip's footage
+        // runs high to low, so "later" is the lower source time.
+        let mut c = sclip(10.0, 14.0, 0.0);
+        c.speed = -1.0;
+        let id = c.id;
+        let t = one_lane(vec![c]);
+
+        let mut later = t.clone();
+        later.slip_clip(id, 3.0, &footage(20.0)).unwrap();
+        assert_eq!(
+            window(&later.tracks[0].clips[0]),
+            (7.0, 11.0),
+            "positive moves the window down"
+        );
+        let mut earlier = t.clone();
+        earlier.slip_clip(id, -3.0, &footage(20.0)).unwrap();
+        assert_eq!(window(&earlier.tracks[0].clips[0]), (13.0, 17.0), "negative moves it up");
+
+        // The footage left is on the opposite side for each sign.
+        let range = t.slip_range(id, &footage(20.0)).unwrap();
+        assert_eq!((range.min, range.max), (-6.0, 10.0));
+        let mut clamped = t.clone();
+        near(clamped.slip_clip(id, 100.0, &footage(20.0)).unwrap().applied, 10.0);
+        assert_eq!(window(&clamped.tracks[0].clips[0]), (0.0, 4.0));
+        let mut clamped = t;
+        near(clamped.slip_clip(id, -100.0, &footage(20.0)).unwrap().applied, -6.0);
+        assert_eq!(window(&clamped.tracks[0].clips[0]), (16.0, 20.0));
+    }
+
+    #[test]
+    fn a_still_has_nothing_to_slip_and_the_other_refusals() {
+        let still = Uuid::new_v4();
+        let limits: SourceLimits = HashMap::from([(Uuid::nil(), 60.0), (still, f64::INFINITY)]);
+        let c = Clip::new(still, 0.0, 5.0, 0.0);
+        let id = c.id;
+        let mut t = one_lane(vec![c]);
+        assert!(refused(t.slip_clip(id, 1.0, &limits)).contains("still image"));
+        assert!(refused(t.slip_range(id, &limits).map(|_| ())).contains("still image"));
+
+        let (mut t, a, _) = cut_pair();
+        assert!(refused(t.slip_clip(a, 0.0, &footage(60.0))).contains("zero"));
+        assert!(refused(t.slip_clip(a, f64::INFINITY, &footage(60.0))).contains("finite"));
+        assert!(matches!(
+            t.slip_clip(Uuid::new_v4(), 1.0, &footage(60.0)),
+            Err(Error::ClipNotFound(_))
+        ));
+        t.tracks[0].locked = true;
+        assert!(refused(t.slip_clip(a, 1.0, &footage(60.0))).contains("V1 is locked"));
+    }
+
+    /// `p [0,4)` src 10..14, `c [4,7)` src 30..33, `n [7,12)` src 20..25, abutting.
+    fn three() -> (Timeline, [Uuid; 3]) {
+        let (p, c, n) = (sclip(10.0, 14.0, 0.0), sclip(30.0, 33.0, 4.0), sclip(20.0, 25.0, 7.0));
+        let ids = [p.id, c.id, n.id];
+        (one_lane(vec![p, c, n]), ids)
+    }
+
+    #[test]
+    fn a_slide_moves_the_clip_and_the_neighbours_give_way() {
+        let (t, [p, c, n]) = three();
+
+        let mut later = t.clone();
+        let out = later.slide_clip(c, 1.0, &footage(60.0)).unwrap();
+        assert_eq!((out.requested, out.applied, out.clamped), (1.0, 1.0, false));
+        assert_eq!(
+            out.clips.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![p, c, n],
+            "in timeline order"
+        );
+        assert_eq!(
+            spans_of(&later, 0),
+            vec![(0.0, 5.0), (5.0, 8.0), (8.0, 12.0)],
+            "the three still span 0..12"
+        );
+        let cl = &later.tracks[0].clips;
+        assert_eq!(window(&cl[0]), (10.0, 15.0), "the previous clip's out moved");
+        assert_eq!(window(&cl[1]), (30.0, 33.0), "the slid clip's content did not");
+        assert_eq!(window(&cl[2]), (21.0, 25.0), "the next clip's in moved");
+
+        let mut earlier = t;
+        earlier.slide_clip(c, -1.5, &footage(60.0)).unwrap();
+        assert_eq!(spans_of(&earlier, 0), vec![(0.0, 2.5), (2.5, 5.5), (5.5, 12.0)]);
+        let cl = &earlier.tracks[0].clips;
+        assert_eq!(window(&cl[0]), (10.0, 12.5));
+        assert_eq!(window(&cl[1]), (30.0, 33.0));
+        assert_eq!(window(&cl[2]), (18.5, 25.0));
+    }
+
+    #[test]
+    fn a_slide_clamps_to_the_neighbours_footage_and_floor() {
+        let (t, [_, c, _]) = three();
+
+        // Later: the next clip (5 s) may only shrink to the floor.
+        let mut later = t.clone();
+        let out = later.slide_clip(c, 10.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (4.95, true));
+        near(later.tracks[0].clips[2].duration(), MIN_EDIT_CLIP);
+        // Earlier: the previous clip (4 s) may only shrink to the floor.
+        let mut earlier = t.clone();
+        near(earlier.slide_clip(c, -10.0, &footage(60.0)).unwrap().applied, -3.95);
+        near(earlier.tracks[0].clips[0].duration(), MIN_EDIT_CLIP);
+
+        // A 14 s asset: the previous clip (10..14) has no footage after it to grow into.
+        let mut dry = t.clone();
+        let why = refused(dry.slide_clip(c, 1.0, &footage(14.0)));
+        assert!(
+            why.contains("cannot slide the clip later") && why.contains("previous clip has no footage left"),
+            "{why}"
+        );
+        // …but the other way is fine, and the next clip's footage before 20 is.
+        near(dry.slide_clip(c, -1.0, &footage(14.0)).unwrap().applied, -1.0);
+
+        // The next clip's head handle bounds the earlier direction too (n starts at source 20).
+        let (mut tight, ids) = three();
+        tight.tracks[0].clips[2].source_in = 0.5;
+        let out = tight.slide_clip(ids[1], -2.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (-0.5, true));
+        let range = t.slide_range(c, &footage(60.0)).unwrap();
+        assert_eq!((range.min, range.max), (-3.95, 4.95));
+    }
+
+    #[test]
+    fn a_slide_beside_a_gap_trims_only_the_neighbour_that_touches() {
+        // p [0,4) touches c [4,7); n starts at 9 — a 2 s gap after c.
+        let (p, c, n) = (sclip(10.0, 14.0, 0.0), sclip(30.0, 33.0, 4.0), sclip(20.0, 25.0, 9.0));
+        let ids = [p.id, c.id, n.id];
+        let t = one_lane(vec![p, c, n]);
+
+        let mut later = t.clone();
+        let out = later.slide_clip(ids[1], 1.0, &footage(60.0)).unwrap();
+        assert_eq!(
+            out.clips.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1]],
+            "n is not touched"
+        );
+        let cl = &later.tracks[0].clips;
+        assert_eq!(window(&cl[0]), (10.0, 15.0), "p grew to follow the clip");
+        assert_eq!(cl[1].timeline_start, 5.0);
+        assert_eq!(
+            (cl[2].timeline_start, window(&cl[2])),
+            (9.0, (20.0, 25.0)),
+            "n stayed exactly as it was"
+        );
+
+        // It stops where it would meet n, which it is not touching, rather than trimming it.
+        let mut far = t.clone();
+        let out = far.slide_clip(ids[1], 5.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (2.0, true));
+        assert_eq!(far.tracks[0].clips[2].timeline_start, 9.0);
+        assert_eq!(far.tracks[0].clips[1].timeline_end(), 9.0);
+
+        // The other way the gap just grows; p gives way as before.
+        let mut earlier = t;
+        earlier.slide_clip(ids[1], -1.0, &footage(60.0)).unwrap();
+        assert_eq!(spans_of(&earlier, 0), vec![(0.0, 3.0), (3.0, 6.0), (9.0, 14.0)]);
+    }
+
+    #[test]
+    fn a_slide_after_a_gap_leaves_the_previous_clip_alone() {
+        // p [0,3), a 1 s gap, c [4,7) touching n [7,12).
+        let (p, c, n) = (sclip(10.0, 13.0, 0.0), sclip(30.0, 33.0, 4.0), sclip(20.0, 25.0, 7.0));
+        let ids = [p.id, c.id, n.id];
+        let t = one_lane(vec![p, c, n]);
+
+        let mut earlier = t.clone();
+        let out = earlier.slide_clip(ids[1], -0.5, &footage(60.0)).unwrap();
+        assert_eq!(out.clips.iter().map(|x| x.id).collect::<Vec<_>>(), vec![ids[1], ids[2]]);
+        let cl = &earlier.tracks[0].clips;
+        assert_eq!((cl[0].timeline_end(), window(&cl[0])), (3.0, (10.0, 13.0)), "p untouched");
+        assert_eq!(cl[1].timeline_start, 3.5);
+        assert_eq!(
+            (cl[2].timeline_start, window(&cl[2])),
+            (6.5, (19.5, 25.0)),
+            "n extends earlier"
+        );
+
+        let mut far = t.clone();
+        let out = far.slide_clip(ids[1], -3.0, &footage(60.0)).unwrap();
+        assert_eq!(
+            (out.applied, out.clamped),
+            (-1.0, true),
+            "stops at p, which it is not touching"
+        );
+        assert_eq!(far.tracks[0].clips[1].timeline_start, 3.0);
+
+        // Later, the gap grows and n is trimmed.
+        let mut later = t;
+        later.slide_clip(ids[1], 1.0, &footage(60.0)).unwrap();
+        assert_eq!(spans_of(&later, 0), vec![(0.0, 3.0), (5.0, 8.0), (8.0, 12.0)]);
+    }
+
+    #[test]
+    fn a_slide_at_the_ends_of_a_track() {
+        // First clip: nothing before it, so it cannot go below 0…
+        let (c, n) = (sclip(30.0, 33.0, 2.0), sclip(20.0, 25.0, 5.0));
+        let ids = [c.id, n.id];
+        let mut t = one_lane(vec![c, n]);
+        let out = t.slide_clip(ids[0], -5.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clamped), (-2.0, true));
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 3.0), (3.0, 10.0)], "n extended earlier to follow");
+        let why = refused(t.slide_clip(ids[0], -1.0, &footage(60.0)));
+        assert!(why.contains("already at the start of the timeline"), "{why}");
+        // …and sliding it later opens a gap before it while n gives way.
+        t.slide_clip(ids[0], 1.0, &footage(60.0)).unwrap();
+        assert_eq!(spans_of(&t, 0), vec![(1.0, 4.0), (4.0, 10.0)]);
+
+        // Last clip: nothing after it to give way, so the track's end moves with it.
+        let (p, c) = (sclip(10.0, 14.0, 0.0), sclip(30.0, 33.0, 4.0));
+        let ids = [p.id, c.id];
+        let mut t = one_lane(vec![p, c]);
+        assert_eq!(t.duration(), 7.0);
+        let out = t.slide_clip(ids[1], 3.0, &footage(60.0)).unwrap();
+        assert_eq!(out.applied, 3.0);
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 7.0), (7.0, 10.0)]);
+        assert_eq!(t.duration(), 10.0);
+
+        // Free space on both sides: a plain move, bounded by what it would run into.
+        let (p, c, n) = (sclip(10.0, 11.0, 0.0), sclip(30.0, 33.0, 3.0), sclip(20.0, 21.0, 9.0));
+        let ids = [p.id, c.id, n.id];
+        let mut t = one_lane(vec![p, c, n]);
+        let out = t.slide_clip(ids[1], 5.0, &footage(60.0)).unwrap();
+        assert_eq!((out.applied, out.clips.len()), (3.0, 1));
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 1.0), (6.0, 9.0), (9.0, 10.0)]);
+    }
+
+    #[test]
+    fn a_slide_honors_the_neighbours_speed_and_direction() {
+        // p plays backwards (its end is its in-point), n at 2x.
+        let mut p = sclip(10.0, 14.0, 0.0);
+        p.speed = -1.0;
+        let c = sclip(30.0, 33.0, 4.0);
+        let mut n = sclip(20.0, 30.0, 7.0); // 10 source s at 2x: 5 s
+        n.speed = 2.0;
+        let ids = [p.id, c.id, n.id];
+        let mut t = one_lane(vec![p, c, n]);
+
+        t.slide_clip(ids[1], 2.0, &footage(60.0)).unwrap();
+        let cl = &t.tracks[0].clips;
+        assert_eq!(
+            window(&cl[0]),
+            (8.0, 14.0),
+            "the reversed clip's end is its in-point: down by 2"
+        );
+        assert_eq!(cl[1].timeline_start, 6.0);
+        assert_eq!(
+            (cl[2].timeline_start, window(&cl[2])),
+            (9.0, (24.0, 30.0)),
+            "2 timeline seconds at 2x is 4 source"
+        );
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 6.0), (6.0, 9.0), (9.0, 12.0)]);
+    }
+
+    #[test]
+    fn a_slide_moves_the_next_clips_animation_with_its_footage_and_not_the_slid_clips() {
+        let (mut t, [p, c, n]) = three();
+        for (id, keys) in [
+            (p, vec![kf(0.0, 1.0), kf(2.0, 3.0)]),
+            (c, vec![kf(0.0, 1.0), kf(1.0, 3.0)]),
+            (n, vec![kf(0.0, 1.0), kf(4.0, 4.0)]),
+        ] {
+            let (ti, ci) = t.locate(id).unwrap();
+            t.tracks[ti].clips[ci].keyframes = keys;
+        }
+        t.slide_clip(c, 1.0, &footage(60.0)).unwrap();
+        let cl = &t.tracks[0].clips;
+        assert_eq!(scales(&cl[0]), vec![(0.0, 1.0), (2.0, 3.0)]);
+        assert_eq!(
+            scales(&cl[1]),
+            vec![(0.0, 1.0), (1.0, 3.0)],
+            "the slid clip is only repositioned"
+        );
+        assert_eq!(scales(&cl[2]), vec![(0.0, 1.75), (3.0, 4.0)], "n lost its first second");
+    }
+
+    #[test]
+    fn a_slide_through_a_still_neighbour_extends_it_without_limit() {
+        let still = Uuid::new_v4();
+        let limits: SourceLimits = HashMap::from([(Uuid::nil(), 60.0), (still, f64::INFINITY)]);
+        // The still is the previous clip: it can grow as far as the slide goes.
+        let (p, c, n) = (
+            Clip::new(still, 0.0, 4.0, 0.0),
+            sclip(30.0, 33.0, 4.0),
+            sclip(20.0, 25.0, 7.0),
+        );
+        let ids = [p.id, c.id, n.id];
+        let mut t = one_lane(vec![p, c, n]);
+        near(t.slide_clip(ids[1], 10.0, &limits).unwrap().applied, 4.95);
+        assert_eq!(window(&t.tracks[0].clips[0]), (0.0, 8.95));
+
+        // The still is the next clip: pulled earlier it lengthens, keeping a window that starts at 0.
+        let (p, c, n) = (
+            sclip(10.0, 14.0, 0.0),
+            sclip(30.0, 33.0, 4.0),
+            Clip::new(still, 0.0, 5.0, 7.0),
+        );
+        let ids = [p.id, c.id, n.id];
+        let mut t = one_lane(vec![p, c, n]);
+        near(t.slide_clip(ids[1], -2.0, &limits).unwrap().applied, -2.0);
+        assert_eq!(window(&t.tracks[0].clips[2]), (0.0, 7.0));
+        assert_eq!(t.tracks[0].clips[2].timeline_start, 5.0);
+    }
+
+    #[test]
+    fn slide_errors() {
+        let (t, [_, c, _]) = three();
+        let mut copy = t.clone();
+        assert!(refused(copy.slide_clip(c, 0.0, &footage(60.0))).contains("zero"));
+        assert!(refused(copy.slide_clip(c, f64::NAN, &footage(60.0))).contains("finite"));
+        assert!(matches!(
+            copy.slide_clip(Uuid::new_v4(), 1.0, &footage(60.0)),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert!(matches!(
+            copy.slide_clip(c, 1.0, &SourceLimits::new()),
+            Err(Error::AssetNotFound(_))
+        ));
+        assert!(same_cut(&copy, &t), "none of them changed anything");
+        copy.tracks[0].locked = true;
+        assert!(refused(copy.slide_clip(c, 1.0, &footage(60.0))).contains("V1 is locked"));
+    }
+
+    #[test]
+    fn split_remove_right_shortens_the_clip_at_its_end() {
+        let mut c = sclip(10.0, 20.0, 5.0); // [5, 15)
+        c.fade_in = 1.0;
+        c.fade_out = 2.0;
+        let (id, keys) = (c.id, vec![kf(0.0, 1.0), kf(8.0, 3.0)]);
+        c.keyframes = keys.clone();
+        let mut t = one_lane(vec![c]);
+
+        let kept = t.split_remove(id, 9.0, SplitSide::Right).unwrap();
+        assert_eq!(kept.id, id, "the surviving half keeps the clip's identity");
+        assert_eq!(window(&kept), (10.0, 14.0));
+        assert_eq!((kept.timeline_start, kept.timeline_end()), (5.0, 9.0));
+        assert_eq!(kept.fade_in, 1.0);
+        assert_eq!(kept.fade_out, 0.0, "the fade belonged to the end that was removed");
+        assert_eq!(kept.keyframes, keys, "the head did not move, so the animation did not");
+        assert_eq!(t.tracks[0].clips.len(), 1);
+        assert_eq!(t.tracks[0].clips[0].timeline_end(), 9.0);
+    }
+
+    #[test]
+    fn split_remove_left_moves_the_start_up_and_drops_what_belonged_to_the_old_start() {
+        let mut c = sclip(10.0, 20.0, 5.0); // [5, 15)
+        c.fade_in = 1.0;
+        c.fade_out = 2.0;
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let id = c.id;
+        let mut t = one_lane(vec![c]);
+
+        let kept = t.split_remove(id, 9.0, SplitSide::Left).unwrap();
+        assert_eq!(kept.id, id);
+        assert_eq!(window(&kept), (14.0, 20.0));
+        assert_eq!(
+            (kept.timeline_start, kept.timeline_end()),
+            (9.0, 15.0),
+            "the right edge stays put"
+        );
+        assert_eq!(kept.fade_in, 0.0);
+        assert_eq!(kept.transition_in, None);
+        assert_eq!(kept.fade_out, 2.0, "the end is still the clip's own");
+    }
+
+    #[test]
+    fn split_remove_honors_speed_and_reverse() {
+        // A reversed clip at 2x over 10..20: 5 s on the timeline, starting at its out-point.
+        let mut c = sclip(10.0, 20.0, 0.0);
+        c.speed = -2.0;
+        let id = c.id;
+        let t = one_lane(vec![c]);
+
+        let mut left = t.clone();
+        let kept = left.split_remove(id, 2.0, SplitSide::Left).unwrap();
+        assert_eq!(
+            window(&kept),
+            (10.0, 16.0),
+            "2 timeline seconds at 2x is 4 source off the out-point"
+        );
+        assert_eq!((kept.timeline_start, kept.duration()), (2.0, 3.0));
+
+        let mut right = t;
+        let kept = right.split_remove(id, 2.0, SplitSide::Right).unwrap();
+        assert_eq!(window(&kept), (16.0, 20.0), "…and off the in-point for the end");
+        assert_eq!((kept.timeline_start, kept.duration()), (0.0, 2.0));
+    }
+
+    #[test]
+    fn split_remove_left_carries_the_animation_with_the_footage_that_stays() {
+        let mut c = sclip(0.0, 8.0, 0.0);
+        c.keyframes = vec![kf(0.0, 1.0), kf(4.0, 5.0)];
+        let id = c.id;
+        let mut t = one_lane(vec![c]);
+        let kept = t.split_remove(id, 1.0, SplitSide::Left).unwrap();
+        assert_eq!(
+            scales(&kept),
+            vec![(0.0, 2.0), (3.0, 5.0)],
+            "the pose at the cut is pinned, the rest shifts"
+        );
+    }
+
+    #[test]
+    fn split_remove_holds_the_fade_inside_what_is_left() {
+        let mut c = sclip(0.0, 4.0, 0.0);
+        c.fade_in = 3.0;
+        let id = c.id;
+        let mut t = one_lane(vec![c]);
+        let kept = t.split_remove(id, 1.0, SplitSide::Right).unwrap();
+        assert_eq!(kept.fade_in, 1.0, "a 3 s fade cannot outlast a 1 s clip");
+    }
+
+    #[test]
+    fn split_remove_only_cuts_inside_the_clip_and_leaves_something() {
+        let c = sclip(0.0, 4.0, 2.0); // [2, 6)
+        let id = c.id;
+        let t = one_lane(vec![c]);
+        let run = |at: f64, side: SplitSide| {
+            let mut copy = t.clone();
+            let why = refused(copy.split_remove(id, at, side));
+            assert!(same_cut(&copy, &t), "a refusal changes nothing");
+            why
+        };
+        assert!(run(1.0, SplitSide::Left).contains("not inside the clip (0:02.0–0:06.0)"));
+        assert!(run(7.0, SplitSide::Right).contains("not inside the clip"));
+        assert!(
+            run(2.0, SplitSide::Left).contains("not inside the clip"),
+            "the clip's own start is not a cut"
+        );
+        assert!(run(6.0, SplitSide::Right).contains("not inside the clip"));
+        assert!(run(f64::NAN, SplitSide::Left).contains("finite"));
+        assert!(run(5.99, SplitSide::Left).contains("only 0.01s of the clip"));
+        assert!(run(2.02, SplitSide::Right).contains("only 0.02s of the clip"));
+
+        // The part that goes can be as small as it likes; only what stays has a floor.
+        let mut copy = t.clone();
+        near(copy.split_remove(id, 2.02, SplitSide::Left).unwrap().duration(), 3.98);
+
+        let mut locked = t.clone();
+        locked.tracks[0].locked = true;
+        assert!(refused(locked.split_remove(id, 4.0, SplitSide::Left)).contains("V1 is locked"));
+        let mut copy = t;
+        assert!(matches!(
+            copy.split_remove(Uuid::new_v4(), 4.0, SplitSide::Left),
+            Err(Error::ClipNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_split_remove_under_ripple_closes_the_gap_through_the_standard_path() {
+        // `a [0,4)  b [5,8)  c [10,12)`, ripple applied the way `edit_timeline` does.
+        let (before, [_, b, _]) = gapped();
+        let (_, right) = rippled(&before, |t| {
+            t.split_remove(b, 6.0, SplitSide::Right).unwrap();
+        });
+        assert_eq!(
+            spans_of(&right, 0),
+            vec![(0.0, 4.0), (5.0, 6.0), (8.0, 10.0)],
+            "c followed the 2 s that went"
+        );
+
+        let (bare, left) = rippled(&before, |t| {
+            t.split_remove(b, 6.0, SplitSide::Left).unwrap();
+        });
+        assert_eq!(
+            spans_of(&bare, 0),
+            vec![(0.0, 4.0), (6.0, 8.0), (10.0, 12.0)],
+            "without ripple the gap stays"
+        );
+        assert_eq!(
+            spans_of(&left, 0),
+            vec![(0.0, 4.0), (5.0, 7.0), (9.0, 11.0)],
+            "with it b holds its start and the rest of the track closes in behind"
+        );
+    }
+
+    #[test]
+    fn a_range_slice_pins_the_pose_at_a_cut_front_the_way_a_head_move_does() {
+        // `Timeline::slice` shares `rebase_animation` with the edit modes: a clip cut
+        // at the front keeps its animated pose as a key at 0, later keys shift back,
+        // and the fade and transition that belonged to the lost head go.
+        let mut c = sclip(0.0, 8.0, 0.0);
+        c.keyframes = vec![kf(0.0, 1.0), kf(4.0, 5.0)];
+        c.fade_in = 1.0;
+        let t = one_lane(vec![c]);
+        let s = t.slice(1.0, 8.0);
+        let cut = &s.tracks[0].clips[0];
+        assert_eq!(scales(cut), vec![(0.0, 2.0), (3.0, 5.0)]);
+        assert_eq!((cut.timeline_start, cut.source_in, cut.fade_in), (0.0, 1.0, 0.0));
+    }
+
+    /// A tiny deterministic generator, so the fuzz below is the same on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        fn between(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.next()
+        }
+    }
+
+    /// A lane of `n` clips of random length, speed (and direction) and window in a
+    /// 600 s asset — the float values a real cut is made of, where `start + (out - in)
+    /// / speed` is not exact — laid end to end, with an occasional real gap.
+    fn random_lane(rng: &mut Lcg, n: usize) -> Timeline {
+        let mut clips = Vec::new();
+        let mut cursor = 0.0;
+        for _ in 0..n {
+            let mut c = sclip(0.0, 0.0, 0.0);
+            c.speed = [1.0, 1.0, 2.0, 0.5, 1.5, -1.0, -2.0, 0.37][(rng.next() * 8.0) as usize % 8];
+            c.source_in = rng.between(30.0, 400.0);
+            c.source_out = c.source_in + rng.between(0.4, 7.0) * c.speed_mag();
+            if rng.next() < 0.25 {
+                cursor += rng.between(0.2, 2.0);
+            }
+            c.timeline_start = cursor;
+            cursor = c.timeline_end();
+            clips.push(c);
+        }
+        one_lane(clips)
+    }
+
+    /// Every junction where a clip starts *before* the one ahead of it ends, by float
+    /// noise — what a strict overlap test (`Project::move_clip`'s) reads as one clip
+    /// lying on the next — as `(index of the later clip, how far)`.
+    fn noise_overlaps(t: &Timeline) -> Vec<(usize, f64)> {
+        let clips = &t.tracks[0].clips;
+        (1..clips.len())
+            .filter_map(|i| {
+                let over = clips[i - 1].timeline_end() - clips[i].timeline_start;
+                (over > 0.0 && over < ADJACENT_EPS).then_some((i, over))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn roll_and_slide_leave_no_float_residue_between_clips() {
+        // A roll or slide computes one side of a cut from a window and the other from
+        // `start + delta`; left alone they disagree by a few ulps (±6e-14 s) in a large
+        // share of cases, which a strict overlap test reads as clips lying on each other.
+        // Every junction of the lane — the cut itself and the edge the edit runs into —
+        // has to come out clean, for requests both inside the range and far past it.
+        let mut rng = Lcg(7);
+        let mut tried = 0;
+        for _ in 0..3000 {
+            let t = random_lane(&mut rng, 5);
+            assert!(noise_overlaps(&t).is_empty());
+            let ids: Vec<Uuid> = t.tracks[0].clips.iter().map(|c| c.id).collect();
+            let at = 1 + (rng.next() * 3.0) as usize;
+            let delta = if rng.next() < 0.3 {
+                rng.between(-9.0, 9.0)
+            } else {
+                rng.between(-1.5, 1.5)
+            };
+            for op in 0..2 {
+                let mut u = t.clone();
+                let out = if op == 0 {
+                    u.roll_edit(ids[at - 1], ids[at], delta, &footage(600.0))
+                } else {
+                    u.slide_clip(ids[at], delta, &footage(600.0))
+                };
+                let Ok(out) = out else { continue };
+                tried += 1;
+                assert!(noise_overlaps(&u).is_empty(), "op {op} by {delta}: {:?}", noise_overlaps(&u));
+                // …and nothing but noise moved to get there.
+                let (was, now) = (&t.tracks[0].clips, &u.tracks[0].clips);
+                for (w, n) in was.iter().zip(now) {
+                    let edited = out.clips.iter().any(|c| c.id == w.id);
+                    if !edited {
+                        assert_eq!(
+                            (w.timeline_start, w.source_in, w.source_out),
+                            (n.timeline_start, n.source_in, n.source_out)
+                        );
+                    }
+                }
+                if op == 0 {
+                    near(now[at].timeline_start, was[at].timeline_start + out.applied);
+                    near(now[at].timeline_end(), was[at].timeline_end());
+                    near(now[at - 1].timeline_end(), was[at - 1].timeline_end() + out.applied);
+                } else {
+                    near(now[at].timeline_start, was[at].timeline_start + out.applied);
+                    near(now[at].duration(), was[at].duration());
+                }
+            }
+        }
+        assert!(tried > 4000, "the fuzz should mostly be legal edits, got {tried}");
+    }
+
+    #[test]
+    fn a_cut_a_hair_apart_keeps_its_real_gap_and_only_float_noise_is_welded() {
+        // 0.5 ms is data (within the engine's tolerance for a touching cut), not noise.
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[1].timeline_start = 4.0005;
+        t.roll_edit(a, b, 1.0, &footage(60.0)).unwrap();
+        assert_eq!(t.tracks[0].clips[1].timeline_start, 5.0005);
+
+        // Exactly closed: starting where the leader's computed end is, bit for bit.
+        let (mut t, a, b) = cut_pair();
+        t.roll_edit(a, b, 0.1, &footage(60.0)).unwrap();
+        assert_eq!(t.tracks[0].clips[1].timeline_start, t.tracks[0].clips[0].timeline_end());
+    }
+
+    #[test]
+    fn a_slip_diff_has_the_precision_of_a_frame_and_the_sign_the_op_documents() {
+        let slip = |mut c: Clip, delta: f64| {
+            let id = c.id;
+            c.timeline_start = 3.0;
+            let before = one_lane(vec![c]);
+            let mut after = before.clone();
+            after.slip_clip(id, delta, &footage(60.0)).unwrap();
+            before.diff(&after).entries[0].summary.clone()
+        };
+        // One frame at 30 fps is 0.033 s: one decimal printed it as `footage -0.0s
+        // (in-point 10.0s → 10.0s)`, which says nothing happened.
+        let frame = 1.0 / 30.0;
+        let said = slip(sclip(10.0, 14.0, 0.0), frame);
+        assert!(said.contains("footage +0.03s (in-point 10.00s → 10.03s)"), "{said}");
+        let said = slip(sclip(10.0, 14.0, 0.0), -frame);
+        assert!(said.contains("footage -0.03s (in-point 10.00s → 9.97s)"), "{said}");
+        // Smaller than two decimals can show: three, rather than a zero.
+        let said = slip(sclip(10.0, 14.0, 0.0), 0.001);
+        assert!(said.contains("footage +0.001s"), "{said}");
+
+        // A reversed clip's positive slip is the window moving *down*, and is still
+        // the `+` the op documents (later in its own footage).
+        let mut reversed = sclip(10.0, 14.0, 0.0);
+        reversed.speed = -1.0;
+        let said = slip(reversed.clone(), 3.0);
+        assert!(said.contains("footage +3.00s (in-point 10.00s → 7.00s)"), "{said}");
+        let said = slip(reversed, -3.0);
+        assert!(said.contains("footage -3.00s (in-point 10.00s → 13.00s)"), "{said}");
+    }
+
+    #[test]
+    fn times_and_deltas_round_half_to_even_on_the_exact_value() {
+        // The TS mirror (`formatTime`) has to agree with this to the digit: Rust rounds
+        // an exact binary tie to the even digit and anything else by its exact value.
+        assert_eq!(fmt_time(4.25), "0:04.2");
+        assert_eq!(fmt_time(4.75), "0:04.8");
+        assert_eq!(fmt_time(0.25), "0:00.2");
+        assert_eq!(fmt_time(72.25), "1:12.2");
+        assert_eq!(fmt_time(0.35), "0:00.3", "0.35 is a hair under a tie");
+        assert_eq!(fmt_time(0.45), "0:00.5", "0.45 is a hair over one");
+        assert_eq!(fmt_delta(-0.25), "-0.2s");
+        assert_eq!(fmt_delta(0.75), "+0.8s");
+        assert_eq!(format!("{:.2}", 0.125), "0.12");
+        assert_eq!(format!("{:.2}", 0.375), "0.38");
+    }
+
+    /// V1 `v [0,6)` over A1 `a [1,7)` — a picture and its sound, not quite in step.
+    fn picture_and_sound() -> (Timeline, Uuid, Uuid) {
+        let (v, a) = (sclip(10.0, 16.0, 0.0), sclip(10.0, 16.0, 1.0));
+        let ids = (v.id, a.id);
+        let t = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![v]),
+                track(StreamKind::Audio, "A1", vec![a]),
+            ],
+            ..Timeline::new()
+        };
+        (t, ids.0, ids.1)
+    }
+
+    #[test]
+    fn a_group_split_remove_cuts_every_track_in_one_edit() {
+        let (mut t, v, a) = picture_and_sound();
+        let kept = t
+            .split_remove_clips(
+                &[ClipCut { clip_id: v, at: 3.0 }, ClipCut { clip_id: a, at: 3.0 }],
+                SplitSide::Left,
+            )
+            .unwrap();
+        assert_eq!(kept.iter().map(|c| c.id).collect::<Vec<_>>(), vec![v, a], "in request order");
+        assert_eq!((kept[0].timeline_start, kept[0].source_in), (3.0, 13.0));
+        assert_eq!((kept[1].timeline_start, kept[1].source_in), (3.0, 12.0));
+        assert_eq!(spans_of(&t, 0), vec![(3.0, 6.0)]);
+        assert_eq!(spans_of(&t, 1), vec![(3.0, 7.0)]);
+
+        // Each track is cut at its own time, and the other side works the same way.
+        let (mut t, v, a) = picture_and_sound();
+        t.split_remove_clips(
+            &[ClipCut { clip_id: v, at: 2.0 }, ClipCut { clip_id: a, at: 4.5 }],
+            SplitSide::Right,
+        )
+        .unwrap();
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 2.0)]);
+        assert_eq!(spans_of(&t, 1), vec![(1.0, 4.5)]);
+    }
+
+    #[test]
+    fn a_group_split_remove_is_all_or_nothing() {
+        let (t, v, a) = picture_and_sound();
+        let cut = |clip_id, at| ClipCut { clip_id, at };
+        let run = |name: &str, cuts: &[ClipCut]| {
+            let mut copy = t.clone();
+            let why = refused(copy.split_remove_clips(cuts, SplitSide::Left));
+            assert!(same_cut(&copy, &t), "{name}: a refused group changes nothing");
+            why
+        };
+        // The second cut is bad, the first would have been fine.
+        assert!(run("outside", &[cut(v, 3.0), cut(a, 0.5)]).contains("not inside the clip"));
+        assert!(run("floor", &[cut(v, 3.0), cut(a, 6.99)]).contains("only 0.01s"));
+        assert!(run("empty", &[]).contains("no clips"));
+        assert!(run("twice", &[cut(v, 3.0), cut(v, 4.0)]).contains("more than once"));
+
+        // One clip per track.
+        let mut crowded = t.clone();
+        let extra = sclip(0.0, 2.0, 7.0);
+        let extra_id = extra.id;
+        crowded.tracks[0].clips.push(extra);
+        let mut copy = crowded.clone();
+        let why = refused(copy.split_remove_clips(&[cut(v, 3.0), cut(extra_id, 7.5)], SplitSide::Right));
+        assert!(why.contains("one clip per track") && why.contains("V1"), "{why}");
+        assert!(same_cut(&copy, &crowded));
+
+        let mut locked = t.clone();
+        locked.tracks[1].locked = true;
+        let mut copy = locked.clone();
+        assert!(refused(copy.split_remove_clips(&[cut(v, 3.0), cut(a, 3.0)], SplitSide::Left)).contains("A1 is locked"));
+        assert!(same_cut(&copy, &locked), "the unlocked track was not cut either");
+
+        let mut copy = t.clone();
+        assert!(matches!(
+            copy.split_remove_clips(&[cut(v, 3.0), cut(Uuid::new_v4(), 3.0)], SplitSide::Left),
+            Err(Error::ClipNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_group_split_remove_ripples_each_track_on_its_own() {
+        // Behind each clip a follower: V1 `v [0,6) w [8,10)`, A1 `a [1,7) x [9,11)`.
+        let (mut before, v, a) = picture_and_sound();
+        before.tracks[0].clips.push(sclip(0.0, 2.0, 8.0));
+        before.tracks[1].clips.push(sclip(0.0, 2.0, 9.0));
+        let (after, ripple) = rippled(&before, |t| {
+            t.split_remove_clips(
+                &[ClipCut { clip_id: v, at: 2.0 }, ClipCut { clip_id: a, at: 5.0 }],
+                SplitSide::Left,
+            )
+            .unwrap();
+        });
+        // Without ripple the gaps stay; with it each track closes by what *it* lost
+        // (V1 2 s, A1 4 s) and the cut clips hold their own starts.
+        assert_eq!(spans_of(&after, 0), vec![(2.0, 6.0), (8.0, 10.0)]);
+        assert_eq!(spans_of(&ripple, 0), vec![(0.0, 4.0), (6.0, 8.0)]);
+        assert_eq!(spans_of(&after, 1), vec![(5.0, 7.0), (9.0, 11.0)]);
+        assert_eq!(spans_of(&ripple, 1), vec![(1.0, 3.0), (5.0, 7.0)]);
+    }
+
+    #[test]
+    fn a_slip_reads_as_a_slip_in_a_diff_not_a_zero_second_trim() {
+        let (t, a, _) = cut_pair();
+        let mut slipped = t.clone();
+        slipped.slip_clip(a, 2.0, &footage(60.0)).unwrap();
+        let diff = t.diff(&slipped);
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(diff.entries[0].kind, DiffKind::ClipRetrimmed);
+        assert!(
+            diff.entries[0].summary.contains("Slipped clip on V1 at 0:00.0"),
+            "{}",
+            diff.entries[0].summary
+        );
+        assert!(diff.entries[0].summary.contains("+2.00s"), "{}", diff.entries[0].summary);
+        assert!(
+            diff.entries[0].summary.contains("in-point 10.00s → 12.00s"),
+            "{}",
+            diff.entries[0].summary
+        );
+
+        let mut rolled = t.clone();
+        rolled.roll_edit(a, t.tracks[0].clips[1].id, 1.0, &footage(60.0)).unwrap();
+        assert!(t.diff(&rolled).entries.iter().any(|e| e.summary.starts_with("Trimmed clip")));
     }
 }

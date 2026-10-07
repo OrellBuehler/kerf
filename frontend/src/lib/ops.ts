@@ -3,8 +3,11 @@
 // but a notice.
 
 import { editor } from './state.svelte';
+import { ui } from './editor-ui.svelte';
 import { toast } from './notifications.svelte';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
+import { planPlayheadTrim, trimNotice } from './trim-tools';
+import type { SplitSide } from './types';
 
 export function errorMessage(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
@@ -51,4 +54,32 @@ export async function cutSelection(): Promise<void> {
 	} catch (e) {
 		toast.error(errorMessage(e));
 	}
+}
+
+/** Trim start / end to the playhead (Q / W, and the clip menu): cut every selected
+ *  clip the playhead is inside at the playhead and throw away the `left` or `right`
+ *  half. The backend does the cut — ONE revision for the whole selection (so a V1 clip
+ *  and its A1 partner undo together), each track rippling on its own under ripple mode,
+ *  the surviving halves keeping their clips' ids so the selection holds — and this
+ *  decides *what* to cut (`planPlayheadTrim`) and says so when there is nothing: a
+ *  keypress that does nothing silently is a key that seems broken. */
+export async function trimSelection(side: SplitSide): Promise<void> {
+	const selected = editor.selectedClipIds;
+	const plan = planPlayheadTrim(editor.timeline, selected, ui.time, editor.fps, side);
+	if (plan.trims.length === 0) {
+		toast.info(trimNotice(plan, selected.length, side));
+		return;
+	}
+	try {
+		await editor.splitRemoveClips(
+			plan.trims.map((t) => ({ clip_id: t.clipId, at: t.at })),
+			side
+		);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	// Some were cut and some could not be (a locked track, a clip too short): the
+	// edit that happened is visible, the one that did not needs a sentence.
+	if (plan.problems.length > 0) toast.warning(trimNotice({ ...plan, trims: [] }, selected.length, side));
 }
