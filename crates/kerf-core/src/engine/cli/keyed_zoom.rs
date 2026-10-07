@@ -1382,7 +1382,7 @@ fn hdr_footage_with_an_odd_fit_size_renders() {
         (f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
     };
     let run = |name: &str, clip: Clip| {
-        let tl = timeline_of(vec![video_track(vec![clip.clone()])]);
+        let tl = timeline_of(vec![video_track(vec![clip])]);
         let out = dir.join(format!("{name}.rgb"));
         let mut args = build_export_args(&tl, std::slice::from_ref(&hlg), "unused.mkv", &opts).unwrap();
         let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
