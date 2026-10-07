@@ -6,6 +6,7 @@
 //! timeline (EDL), and the operations that mutate it.
 
 pub mod analysis;
+pub mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod layer_geometry;

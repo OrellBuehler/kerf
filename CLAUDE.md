@@ -187,6 +187,16 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  **What a clip does in time is `clip_timing.rs`** (pure, unit-tested, outside
+  `cli`): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel, HDR,
+  head pad), `transition_fx`, `clip_source_window` / `clip_seek` and `ClipTiming`,
+  whose `window` / `fades` / `motion_keys` the builders *format* into `enable=`,
+  `fade=` and the `overlay` x/y expressions, and whose `visible(t)` / `motion_at(t)`
+  a frame renderer *evaluates* — one decision, two readers. `fades` is video-only
+  (`audio_clip_chain` composes the same `ClipFx` its own way and shares only the
+  duration, window and seek). Moving it changed no argv byte: the golden oracle
+  below is the proof, and the next change to these numbers has to go through it.
+  Shared test fixtures (assets, streams, clips, tracks) live in `engine/test_support.rs`.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**

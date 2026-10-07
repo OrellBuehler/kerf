@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use super::cpu;
 use super::ProbeResult;
+use crate::clip_timing::{clip_seek, clip_source_window, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint};
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
@@ -4805,7 +4806,7 @@ fn build_filter_complex(
             } else {
                 format!("vov{n}")
             };
-            let end = clip.timeline_end() + fx[*flat].tail;
+            let (start, end) = ClipTiming::new(clip, &fx[*flat]).window();
             // A slide / push adds its travel to whatever position the clip already
             // has, so a transition composes with a static offset or an animated one
             // instead of overriding it.
@@ -4830,13 +4831,9 @@ fn build_filter_complex(
                     "overlay=x={px}:y={py}:eof_action=pass:enable='between(t,{start},{end})'",
                     px = quote(format!("(W-w)/2+({px})*W"), true),
                     py = quote(format!("(H-h)/2+({py})*H"), true),
-                    start = clip.timeline_start,
                 )
             } else if clip.transform.is_identity() && motion.is_none() {
-                format!(
-                    "overlay=eof_action=pass:enable='between(t,{start},{end})'",
-                    start = clip.timeline_start
-                )
+                format!("overlay=eof_action=pass:enable='between(t,{start},{end})'")
             } else {
                 let t = &clip.transform;
                 let (px, py) = match &motion {
@@ -4847,7 +4844,6 @@ fn build_filter_complex(
                     "overlay=x={px}:y={py}:eof_action=pass:enable='between(t,{start},{end})'",
                     px = quote(format!("(W-w)/2+({px})*W"), motion.is_some()),
                     py = quote(format!("(H-h)/2+({py})*H"), motion.is_some()),
-                    start = clip.timeline_start,
                 )
             };
             chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
@@ -4959,176 +4955,6 @@ struct TrackMix {
     pan: (f64, f64),
 }
 
-/// Per-clip render adjustments derived from transitions. `tail` extends an
-/// outgoing clip so it keeps showing under the incoming one; `xfade_in` is the
-/// incoming clip's alpha dissolve; `black_in`/`black_out` and `white_in`/
-/// `white_out` are the dip fades on either side of a cut; `move_in`/`move_out`
-/// carry a clip across the frame for a slide or a push.
-#[derive(Clone, Copy, Default)]
-struct ClipFx {
-    tail: f64,
-    xfade_in: f64,
-    black_in: f64,
-    black_out: f64,
-    /// Dip-to-white fades: the same shape as `black_in`/`black_out`, through white.
-    white_in: f64,
-    white_out: f64,
-    /// How long the incoming clip's **sound** dissolves up. Equal to `xfade_in`
-    /// for a crossfade; a motion transition sets it too, because the picture
-    /// sliding is no reason for the audio to cut hard.
-    afade_in: f64,
-    /// Motion transitions, as `(dx, dy, seconds)` with the offsets in frame
-    /// widths and heights. `move_in` is where the incoming clip starts before
-    /// travelling to its position; `move_out` is where the outgoing clip is
-    /// carried to over its tail (a push only — a slide covers it where it sits).
-    move_in: Option<(f64, f64, f64)>,
-    move_out: Option<(f64, f64, f64)>,
-    /// The clip's source is HDR and its picture is tone-mapped to SDR in the
-    /// chain. `None` for SDR — and for a preview asset swapped to its proxy,
-    /// which was converted when it was encoded.
-    hdr: Option<Hdr>,
-    /// The clip's input is a head-padded proxy (see [`is_head_padded_proxy`]). Read
-    /// from the start with no seek, such an input opens with the pad's clone of the
-    /// first frame, which the original it stands for has no frame for.
-    head_pad: bool,
-}
-
-/// Compute the [`ClipFx`] for every clip (indexed by ffmpeg input index, i.e.
-/// track-then-clip order), resolving each `transition_in` against the clip that
-/// precedes it on the same track in timeline order.
-fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
-    let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
-    let mut fx = vec![ClipFx::default(); total_clips];
-    for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
-        let asset = assets.iter().find(|a| a.id == clip.asset_id);
-        fx[flat].hdr = asset.and_then(|a| a.hdr());
-        fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
-    }
-    let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
-    let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
-
-    let mut base = 0;
-    for track in &timeline.tracks {
-        let n = track.clips.len();
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
-        for w in 0..n {
-            let j = order[w];
-            let clip = &track.clips[j];
-            let Some(tr) = clip.transition_in else { continue };
-            let d = tr.duration.max(0.0);
-            if d <= 0.0 {
-                continue;
-            }
-            // The transition partner is the immediately preceding clip on the
-            // track — but only when it is actually adjacent (no gap before this
-            // clip); otherwise the transition resolves against black.
-            let prev = (w > 0)
-                .then(|| order[w - 1])
-                .filter(|&pj| (track.clips[pj].timeline_end() - clip.timeline_start).abs() < 1e-3);
-            match tr.kind.dip_color() {
-                // A dip happens either side of the cut — the two clips never share
-                // the screen, so neither needs a handle and neither is extended.
-                Some(color) => {
-                    let white = color == "white";
-                    let inn = (d / 2.0).min(clip.duration());
-                    if white {
-                        fx[base + j].white_in = inn;
-                    } else {
-                        fx[base + j].black_in = inn;
-                    }
-                    if let Some(pj) = prev {
-                        let p = &track.clips[pj];
-                        let out = (d / 2.0).min(p.duration());
-                        if white {
-                            fx[base + pj].white_out = fx[base + pj].white_out.max(out);
-                        } else {
-                            fx[base + pj].black_out = fx[base + pj].black_out.max(out);
-                        }
-                    }
-                }
-                // A dissolve or a motion transition plays both sides at once, so
-                // the outgoing clip keeps rolling underneath on its unused handle.
-                None => {
-                    let slide = tr.kind.slide_from();
-                    let overlap = match prev {
-                        Some(pj) => {
-                            let p = &track.clips[pj];
-                            // The tail borrows the outgoing clip's unused source: for a
-                            // forward clip that is the handle past source_out, for a
-                            // reversed clip the handle below source_in.
-                            // A still loops (`-loop 1`), so it never runs out
-                            // of source: its handle is unbounded, the same
-                            // reason the timeline lets a still extend freely.
-                            let avail = if is_still(p.asset_id) {
-                                f64::INFINITY
-                            } else if p.is_reversed() {
-                                p.source_in / p.speed_mag()
-                            } else {
-                                asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0) / p.speed_mag()
-                            };
-                            // Both sides share the achievable overlap so the transition
-                            // length matches the tail (no fade-from-black when there is
-                            // no handle — it just becomes a hard cut).
-                            let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
-                            fx[base + pj].tail = fx[base + pj].tail.max(overlap);
-                            if overlap > 0.0 && tr.kind.pushes() {
-                                if let Some((dx, dy)) = slide {
-                                    // The outgoing clip leaves the way the incoming one
-                                    // arrives: at rest, then a whole frame the other way.
-                                    fx[base + pj].move_out = Some((-dx, -dy, overlap));
-                                }
-                            }
-                            overlap
-                        }
-                        // No adjacent predecessor: dissolve up from black, or travel in
-                        // over it.
-                        None => d.min(clip.duration()),
-                    };
-                    if overlap <= 0.0 {
-                        continue;
-                    }
-                    match slide {
-                        Some((dx, dy)) => fx[base + j].move_in = Some((dx, dy, overlap)),
-                        None => fx[base + j].xfade_in = overlap,
-                    }
-                    fx[base + j].afade_in = overlap;
-                }
-            }
-        }
-        base += n;
-    }
-    fx
-}
-
-/// The source-time window `[start, end]` a clip needs from its asset, accounting
-/// for reverse playback and any crossfade tail (which borrows unused handle past
-/// `source_out`, or below `source_in` when reversed). The single source of truth
-/// for both the per-input `-ss` fast-seek and the in-graph `trim` / `atrim`, so
-/// the seek and the trim window can never drift out of lockstep.
-fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
-    let s = clip.speed_mag();
-    if clip.is_reversed() {
-        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
-    } else {
-        (clip.source_in, clip.source_out + fx.tail * s)
-    }
-}
-
-/// The input-side fast-seek for a clip's window start: seek there when it is past
-/// the head (so ffmpeg decodes from a nearby keyframe instead of t=0), else `0.0`
-/// for no seek — head clips keep byte-identical args. `SEEK_EPS` skips a
-/// pointless sub-millisecond seek. Callers must express the in-graph trim
-/// relative to this value.
-fn clip_seek(window_start: f64) -> f64 {
-    const SEEK_EPS: f64 = 1e-3;
-    if window_start > SEEK_EPS {
-        window_start
-    } else {
-        0.0
-    }
-}
-
 /// Format an f64 for an ffmpeg filter argument / expression (Rust's default
 /// `{}` avoids scientific notation for the ranges used here; `-0` is normalized).
 fn fnum(v: f64) -> String {
@@ -5145,35 +4971,13 @@ fn fnum(v: f64) -> String {
 /// when the clip does not move, which is what keeps every non-motion graph
 /// byte-identical.
 ///
-/// Both halves are ordinary keyframes, so this is [`keyframe_expr`] twice over
-/// rather than a second expression language: an incoming clip holds its starting
-/// offset before the transition and travels to zero, an outgoing clip sits at
-/// zero until its own end and then travels away over its tail.
+/// Both halves are ordinary keyframes ([`ClipTiming::motion_keys`] decides them),
+/// so this is [`keyframe_expr`] twice over rather than a second expression
+/// language.
 fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
-    let mut xs: Vec<(f64, f64)> = Vec::new();
-    let mut ys: Vec<(f64, f64)> = Vec::new();
-    if let Some((dx, dy, secs)) = fx.move_in {
-        xs.push((0.0, dx));
-        xs.push((secs, 0.0));
-        ys.push((0.0, dy));
-        ys.push((secs, 0.0));
-    }
-    if let Some((dx, dy, secs)) = fx.move_out {
-        let t0 = clip.duration();
-        if xs.is_empty() {
-            xs.push((0.0, 0.0));
-            ys.push((0.0, 0.0));
-        }
-        xs.push((t0, 0.0));
-        xs.push((t0 + secs, dx));
-        ys.push((t0, 0.0));
-        ys.push((t0 + secs, dy));
-    }
-    if xs.is_empty() {
-        return None;
-    }
+    let keys = ClipTiming::new(clip, fx).motion_keys()?;
     let start = clip.timeline_start;
-    Some((keyframe_expr(&xs, "t", start), keyframe_expr(&ys, "t", start)))
+    Some((keyframe_expr(&keys.x, "t", start), keyframe_expr(&keys.y, "t", start)))
 }
 
 /// The `geq` that cuts a clip to its [`Mask`]: the picture is passed through
@@ -5613,6 +5417,20 @@ fn reframe_commands(clip: &Clip, rf: &Reframe, target: &str, fps: f64, dur: f64)
     (!cmds.is_empty()).then(|| cmds.join(";"))
 }
 
+/// One `fade` of a clip's picture as ffmpeg spells it.
+fn fade_filter(step: &FadeStep) -> String {
+    let edge = match step.edge {
+        FadeEdge::In => "in",
+        FadeEdge::Out => "out",
+    };
+    let tint = match step.tint {
+        FadeTint::Black => "",
+        FadeTint::White => ":c=white",
+        FadeTint::Alpha => ":alpha=1",
+    };
+    format!("fade=t={edge}:st={}:d={}{tint}", step.st, step.d)
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -5637,7 +5455,8 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // chroma key, or a crossfade dissolve.
     let transform_alpha = (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
     let needs_alpha = transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some();
-    let dur = clip.duration() + fx.tail;
+    let timing = ClipTiming::new(clip, fx);
+    let dur = timing.duration();
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
     // tail is at the low end).
@@ -5833,31 +5652,12 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // `fade` reads the frame's pts, which `setpts` above already moved onto
     // the timeline, so a fade starts at the clip's timeline position and not
     // at 0 — clip-local times blacked out a later clip's fade-out entirely and
-    // made its fade-in / dip / dissolve land before the clip existed.
-    let t0 = clip.timeline_start;
-    let fi = clip.fade_in + fx.black_in;
-    let fo = clip.fade_out + fx.black_out;
-    if fi > 0.0 {
-        p.push(format!("fade=t=in:st={}:d={}", t0, fi.clamp(0.0, dur)));
-    }
-    if fo > 0.0 {
-        p.push(format!("fade=t=out:st={}:d={}", t0 + (dur - fo).max(0.0), fo.clamp(0.0, dur)));
-    }
-    // A dip through white is the same fade with a colour: it lands on the frame
-    // itself rather than on the alpha plane, so it needs no `format=yuva420p`.
-    if fx.white_in > 0.0 {
-        p.push(format!("fade=t=in:st={}:d={}:c=white", t0, fx.white_in.clamp(0.0, dur)));
-    }
-    if fx.white_out > 0.0 {
-        p.push(format!(
-            "fade=t=out:st={}:d={}:c=white",
-            t0 + (dur - fx.white_out).max(0.0),
-            fx.white_out.clamp(0.0, dur)
-        ));
-    }
-    if fx.xfade_in > 0.0 {
-        // The alpha plane is already established above (xfade implies needs_alpha).
-        p.push(format!("fade=t=in:st={}:d={}:alpha=1", t0, fx.xfade_in.clamp(0.0, dur)));
+    // made its fade-in / dip / dissolve land before the clip existed. A dip
+    // through white lands on the frame itself rather than on the alpha plane, so
+    // it needs no `format=yuva420p`; a dissolve's alpha ramp does, and
+    // `needs_alpha` above has already established it.
+    for step in timing.fades() {
+        p.push(fade_filter(&step));
     }
     if !needs_alpha {
         // Terminal pixel format — kept equal to argv `-pix_fmt` so a 10-bit /
@@ -6323,7 +6123,7 @@ fn still_overlay(t: &Transform) -> String {
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
 fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> String {
     let s = clip.speed_mag();
-    let dur = clip.duration() + fx.tail;
+    let dur = ClipTiming::new(clip, fx).duration();
     // Mirror the video crossfade tail (extends below source_in when reversed) and
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
@@ -6402,7 +6202,10 @@ mod golden;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_support::StatusBounded;
+    use crate::engine::test_support::{
+        audio_stream, audio_track, av_asset, image_stream, img_asset, make_clip, single, test_asset, timeline_of, video_stream,
+        video_track, StatusBounded,
+    };
     use crate::model::{Asset, Clip, Delivery, StreamInfo, StreamKind, Timeline, Track, TransitionKind};
 
     /// A track mix that changes nothing — what every test that is not about the
@@ -7107,79 +6910,6 @@ mod tests {
         }
     }
 
-    fn test_asset(streams: Vec<StreamInfo>) -> Asset {
-        Asset {
-            id: Uuid::new_v4(),
-            path: "/x.mp4".into(),
-            name: "x.mp4".into(),
-            duration: 100.0,
-            streams,
-            imported_at: Utc::now(),
-            source_paths: Vec::new(),
-            voiceover: None,
-        }
-    }
-
-    fn video_stream(w: u32, h: u32, fps: f64) -> StreamInfo {
-        StreamInfo {
-            index: 0,
-            kind: StreamKind::Video,
-            codec: "h264".into(),
-            width: Some(w),
-            height: Some(h),
-            fps: Some(fps),
-            sample_rate: None,
-            channels: None,
-            image: false,
-            projection: None,
-            rotation: 0,
-            color_transfer: None,
-            color_primaries: None,
-            pix_fmt: None,
-            color_space: None,
-        }
-    }
-
-    fn audio_stream(rate: u32, channels: u16) -> StreamInfo {
-        StreamInfo {
-            index: 1,
-            kind: StreamKind::Audio,
-            codec: "aac".into(),
-            width: None,
-            height: None,
-            fps: None,
-            sample_rate: Some(rate),
-            channels: Some(channels),
-            image: false,
-            projection: None,
-            rotation: 0,
-            color_transfer: None,
-            color_primaries: None,
-            pix_fmt: None,
-            color_space: None,
-        }
-    }
-
-    fn image_stream(w: u32, h: u32) -> StreamInfo {
-        StreamInfo {
-            index: 0,
-            kind: StreamKind::Video,
-            codec: "png".into(),
-            width: Some(w),
-            height: Some(h),
-            fps: None,
-            sample_rate: None,
-            channels: None,
-            image: true,
-            projection: None,
-            rotation: 0,
-            color_transfer: None,
-            color_primaries: None,
-            pix_fmt: None,
-            color_space: None,
-        }
-    }
-
     #[test]
     fn filter_complex_positions_and_overlays_clips() {
         // One clip with audio, one from a video-only asset, on one video track.
@@ -7364,38 +7094,6 @@ mod tests {
             !args.iter().any(|a| a.contains("proxies")),
             "export must not reference a proxy"
         );
-    }
-
-    fn make_clip(asset_id: uuid::Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
-        Clip::new(asset_id, source_in, source_out, timeline_start)
-    }
-
-    fn video_track(clips: Vec<Clip>) -> Track {
-        Track {
-            clips,
-            ..Track::new(StreamKind::Video, "V1")
-        }
-    }
-
-    fn audio_track(clips: Vec<Clip>) -> Track {
-        Track {
-            clips,
-            ..Track::new(StreamKind::Audio, "A1")
-        }
-    }
-
-    fn timeline_of(tracks: Vec<Track>) -> Timeline {
-        Timeline {
-            tracks,
-            overlays: Vec::new(),
-            markers: Vec::new(),
-            format: None,
-        }
-    }
-
-    /// A timeline with a single video track holding `clips`.
-    fn single(clips: Vec<Clip>) -> Timeline {
-        timeline_of(vec![video_track(clips)])
     }
 
     // ---- mute / solo / clip-enable gating ----------------------------------
@@ -8180,32 +7878,6 @@ mod tests {
         let timeline = single(vec![make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0)]);
         let result = build_export_args(&timeline, &[], "/out/result.mp4", &ExportOptions::default());
         assert!(matches!(result, Err(Error::AssetNotFound(_))));
-    }
-
-    fn av_asset(id: Uuid, duration: f64) -> Asset {
-        Asset {
-            id,
-            path: "/media/clip.mp4".into(),
-            name: "clip.mp4".into(),
-            duration,
-            streams: vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)],
-            imported_at: Utc::now(),
-            source_paths: Vec::new(),
-            voiceover: None,
-        }
-    }
-
-    fn img_asset(id: Uuid) -> Asset {
-        Asset {
-            id,
-            path: "/media/title.png".into(),
-            name: "title.png".into(),
-            duration: crate::model::DEFAULT_IMAGE_DURATION,
-            streams: vec![image_stream(1920, 1080)],
-            imported_at: Utc::now(),
-            source_paths: Vec::new(),
-            voiceover: None,
-        }
     }
 
     /// A raw Insta360 5.7K capture: one dual-fisheye video stream plus audio.
