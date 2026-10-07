@@ -20,6 +20,7 @@ import type {
 	EditSource,
 	ExportOptions,
 	ExportProgress,
+	Filmstrip,
 	ImportProgress,
 	Keyframe,
 	Projection,
@@ -56,6 +57,7 @@ import { rippleFrom } from './ripple';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
+import { sampleFilmstrip } from './sample-filmstrip';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
@@ -2027,6 +2029,26 @@ export async function getWaveformRange(
 		);
 	}
 	return invoke<WaveformRange>('get_waveform_range', { assetId, start, end, buckets: count });
+}
+
+/**
+ * An asset's **filmstrip** — the thumbnails a timeline clip's picture is drawn
+ * from: one strip per asset (96 px high, a thumbnail every 0.5 s for a short
+ * clip up to a minute or more for a long one, at most 300), tiled into a few
+ * JPEG sheets. Any source window is then a handful of thumbnails picked with
+ * `filmstrip-geometry.ts`'s `frameAt` / `locate`, at any zoom. The first call for
+ * an asset decodes it (the backend caches the result on disk and shares one
+ * decode between concurrent callers); later calls are a cache read. Rejects for
+ * an asset with no video stream. Outside the desktop app a deterministic strip of
+ * the same shape stands in, its sheets generated images.
+ */
+export async function getFilmstrip(assetId: string): Promise<Filmstrip> {
+	if (!inTauri()) {
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		return sampleFilmstrip(asset);
+	}
+	return invoke<Filmstrip>('get_filmstrip', { assetId });
 }
 
 /**

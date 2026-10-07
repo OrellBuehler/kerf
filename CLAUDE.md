@@ -340,7 +340,8 @@ so the feature is **only** activated through these forwards — which is what ma
   frame count, or a sheet that is missing / resized / not a JPEG of the promised size,
   is rebuilt, never trusted. `Filmstrip` serializes its geometry *without* the JPEG
   bytes (`#[serde(skip)]`) — a surface adds its own transport. No video stream is
-  `InvalidArgument`; `Project::decode_filmstrip` is the lock-free half.
+  `InvalidArgument`; `Project::decode_filmstrip` is the lock-free half, exposed as the
+  `get_filmstrip` Tauri command.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -925,6 +926,10 @@ time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `get_waveform_range` → a source-seconds window as min/max peaks per channel,
+`get_filmstrip` → an asset's thumbnail strip, the `Filmstrip` JSON with each sheet's
+JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
+and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
+`skim_asset` is how an agent looks at footage,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -1658,7 +1663,13 @@ is explorable in a plain browser via `bun run dev` (frames return `null` there �
 keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
 deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
 asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
-stretch so the clipping colour is visible). **Ripple in the harness is a port, not a
+stretch so the clipping colour is visible; `getFilmstrip` answers from
+`src/lib/sample-filmstrip.ts` with a strip of the engine's *shape* — generated SVG
+sheets labelled with each thumbnail's source time and index, black padding after the
+last one — whose geometry comes from `src/lib/filmstrip-geometry.ts`, the faithful,
+bun-tested mirror of the engine's interval ladder, thumbnail width, sheet layout, plan
+and `Filmstrip::frame_at` / `locate` (the lookups a consumer makes against a real strip
+too)). **Ripple in the harness is a port, not a
 lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
 `Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
 numbers, so a rule changed in kerf-core has to change there or a test names it) and

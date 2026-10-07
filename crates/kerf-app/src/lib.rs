@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, ClipMove, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask,
-    Project, Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff,
-    Transition, TransitionKind, VideoEffect, WaveformRange,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet,
+    Fit, Keyframe, Mask, Project, Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
+    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1493,6 +1493,77 @@ async fn get_waveform_range(
     .await
 }
 
+/// A [`Filmstrip`] as the webview receives it: the strip's own JSON (geometry
+/// only — the pixels are `#[serde(skip)]` in core) with each sheet carrying its
+/// JPEG as a base64 `data:` URL. `data:` rather than a `blob:` URL because the
+/// CSP admits `data:` images and nothing else; the strip is at most ~2 MB of
+/// JPEG, so the ~2.7 MB string is one IPC message, not a stream.
+#[derive(Serialize)]
+struct FilmstripPayload {
+    interval: f64,
+    frame_width: u32,
+    frame_height: u32,
+    frames: u32,
+    columns: u32,
+    sheets: Vec<FilmstripSheetPayload>,
+}
+
+/// One sheet of a [`FilmstripPayload`]: the core sheet's own fields (flattened,
+/// so a field added there reaches the webview without touching the adapter)
+/// plus its pixels.
+#[derive(Serialize)]
+struct FilmstripSheetPayload {
+    #[serde(flatten)]
+    sheet: FilmstripSheet,
+    /// `data:image/jpeg;base64,…` — `width` x `height` pixels, `count` thumbnails
+    /// side by side from the left.
+    data_url: String,
+}
+
+/// Transport only: the geometry is copied across untouched and the JPEG bytes
+/// are base64'd the way `get_frame`'s are.
+fn filmstrip_payload(strip: &Filmstrip) -> FilmstripPayload {
+    FilmstripPayload {
+        interval: strip.interval,
+        frame_width: strip.frame_width,
+        frame_height: strip.frame_height,
+        frames: strip.frames,
+        columns: strip.columns,
+        sheets: strip
+            .sheets
+            .iter()
+            .map(|sheet| FilmstripSheetPayload {
+                data_url: format!(
+                    "data:image/jpeg;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&sheet.jpeg)
+                ),
+                sheet: sheet.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// An asset's **filmstrip** — the thumbnails the timeline draws a video clip
+/// from: one sampled strip per asset, cached on disk by core, of which any
+/// source window is a few thumbnails (`Filmstrip::frame_at` / `locate`, mirrored
+/// by the webview's `filmstrip-geometry.ts`). The first call for an asset decodes
+/// it; later ones are a cache read. Rejects for an asset with no video stream.
+#[tauri::command]
+async fn get_filmstrip(state: State<'_, AppState>, asset_id: String) -> CmdResult<FilmstripPayload> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // Resolve the asset and its proxy (only if one is already ready — a
+        // filmstrip never waits for it) under the lock, then drop the guard before
+        // the decode: it reads the whole file the first time, and the timeline asks
+        // for every clip's strip at once. Same shape as `get_waveform_range`.
+        let (asset, proxy) = lock_user(&shared).filmstrip_inputs(id).map_err(|e| e.to_string())?;
+        let strip = Project::decode_filmstrip(&asset, proxy.as_deref()).map_err(|e| e.to_string())?;
+        Ok(filmstrip_payload(&strip))
+    })
+    .await
+}
+
 /// A window of an asset's audio as raw mono s16le PCM for the preview's Web
 /// Audio playback. Returns raw bytes rather than JSON — a minute of 32 kHz
 /// audio is ~3.8 MB, which a JSON number array would balloon ~5×.
@@ -2322,6 +2393,7 @@ pub fn run() {
             stop_playback,
             get_waveform,
             get_waveform_range,
+            get_filmstrip,
             get_audio,
             get_energy,
             list_tasks,
@@ -2353,7 +2425,12 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_arg, require_json_path, require_local_output_path, truncate_log, LogBudget, FRONTEND_LOG_PER_SEC};
+    use super::{
+        filmstrip_payload, project_arg, require_json_path, require_local_output_path, truncate_log, LogBudget,
+        FRONTEND_LOG_PER_SEC,
+    };
+    use base64::Engine as _;
+    use kerf_core::{Filmstrip, FilmstripSheet};
 
     #[test]
     fn truncate_log_keeps_short_and_cuts_on_a_char_boundary() {
@@ -2432,6 +2509,68 @@ mod tests {
         );
         // argv[0] is the binary, never a project.
         assert_eq!(project_arg(&argv(&["/opt/x.kerf"]), "/home/u"), None);
+    }
+
+    #[test]
+    fn a_filmstrip_reaches_the_webview_as_geometry_plus_a_data_url_per_sheet() {
+        let first: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        let second: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xD9, 0x00];
+        let strip = Filmstrip {
+            interval: 0.5,
+            frame_width: 170,
+            frame_height: 96,
+            frames: 3,
+            columns: 2,
+            sheets: vec![
+                FilmstripSheet {
+                    first_frame: 0,
+                    count: 2,
+                    width: 340,
+                    height: 96,
+                    jpeg: first.clone().into(),
+                },
+                FilmstripSheet {
+                    first_frame: 2,
+                    count: 1,
+                    width: 340,
+                    height: 96,
+                    jpeg: second.clone().into(),
+                },
+            ],
+        };
+        let json = serde_json::to_value(filmstrip_payload(&strip)).unwrap();
+
+        // The geometry is core's own serialization, unchanged...
+        let mut core = serde_json::to_value(&strip).unwrap();
+        for (sheet, core_sheet) in json["sheets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(core["sheets"].as_array_mut().unwrap())
+        {
+            // ...and each sheet is core's sheet plus exactly one key, `data_url`.
+            let mut sheet = sheet.clone();
+            let url = sheet.as_object_mut().unwrap().remove("data_url").unwrap();
+            assert_eq!(&sheet, core_sheet);
+            assert!(url.as_str().unwrap().starts_with("data:image/jpeg;base64,"), "{url}");
+        }
+        for key in ["interval", "frame_width", "frame_height", "frames", "columns"] {
+            assert_eq!(json[key], core[key], "{key}");
+        }
+        assert_eq!(json.as_object().unwrap().len(), 6, "geometry plus the sheets, nothing else");
+
+        // ...and the URL is the sheet's own bytes, base64.
+        let decode = |sheet: &serde_json::Value| {
+            let url = sheet["data_url"].as_str().unwrap();
+            base64::engine::general_purpose::STANDARD
+                .decode(url.strip_prefix("data:image/jpeg;base64,").unwrap())
+                .unwrap()
+        };
+        assert_eq!(decode(&json["sheets"][0]), first);
+        assert_eq!(decode(&json["sheets"][1]), second);
+        assert_eq!(json["sheets"][0]["data_url"], "data:image/jpeg;base64,/9j/2Q==");
+        assert_eq!(json["sheets"][0]["first_frame"], 0);
+        assert_eq!(json["sheets"][1]["first_frame"], 2);
     }
 
     #[test]
