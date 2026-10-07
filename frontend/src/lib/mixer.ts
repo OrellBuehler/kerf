@@ -13,6 +13,18 @@ export function panGains(pan: number): [number, number] {
 	return p < 0 ? [1, 1 + p] : [1 - p, 1];
 }
 
+/** A linear gain as dB; silence is `-Infinity`. */
+export const gainToDb = (v: number): number => (v > 0 ? 20 * Math.log10(v) : -Infinity);
+
+/** dB as a linear gain (`-Infinity` is silence). */
+export const dbToGain = (db: number): number => (db === -Infinity ? 0 : 10 ** (db / 20));
+
+/** What a clip's drawn (and heard) level is: its own gain through the track's
+ *  fader, multiplied — the fader rides each clip *after* the clip's gain, as the
+ *  export's graph does, so the two are one linear factor. Both default to unity. */
+export const effectiveGain = (clipVolume: number | undefined, trackVolume: number | undefined): number =>
+	Math.max(0, clipVolume ?? 1) * Math.max(0, trackVolume ?? 1);
+
 /** A track fader as dB — the unit a level is actually judged in. */
 export function gainLabel(v: number): string {
 	if (v <= 0.0001) return '−∞ dB';

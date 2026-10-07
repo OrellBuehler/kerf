@@ -1218,13 +1218,62 @@ of audio-track clips, confidence-gated, hidden when beats land closer than 4px �
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
 snapping and the browser harness's alignment all share, unit-tested with `bun test`)
 mapped from `AssetAnalysis` and
-real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
+real audio waveforms (below); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
 same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
 **edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
 a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the right edge
-stays put; stills extend freely since they loop). The ruler renders **in/out marks**
+stays put; stills extend freely since they loop).
+**Gestures are frame-quantized** (`src/lib/frames.ts`, bun-tested; keyframes stay in
+seconds): a trim, move, drop, razor cut and fade length land on a frame of the cut's
+rate — `editor.fps`, i.e. `timelineFps`, the first video clip's rate else 30, which is
+`export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
+`k / fps` from an integer `k`, so equal frames are equal doubles and nothing drifts over
+a long run of edits), the ghost and the commit use that one value, and a trim derives
+every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / beats
+/ clip edges) still wins, unrounded; frames are *not* a magnet and apply with snapping
+off too. A landing within 1 µs of a neighbour's edge *is* that edge (`welds`):
+`move_clip`'s overlap test is a strict float compare, and an edge computed as
+`start + length / speed` can sit an ULP past its frame. A razor cut keeps half a frame
+either side (`splitPoint`; a clip with no interior frame says so), the context menu's
+split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
+title drag.
+**Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
+plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
+canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
+source seconds through `source_in`/`source_out`, speed and reverse (a reversed clip is
+read through the mapping, mirrored, never flipped), the bucket width is the widest rung
+(the backend's 2 / 10 / 40 / 100 ms levels, then doubling) within 1.5 device pixels
+(DPR capped at 2), and what is fetched is fixed **tiles** of 2048 buckets aligned to the
+*source* clock — so a scroll, a trim, or a split's two halves land on cached tiles.
+`waveform-cache.ts` (injectable fetcher; the app's instance is `waveforms.ts`) caches by
+asset + window + bucket count, joins in-flight requests, runs three at a time newest
+interest first and drops queued tiles nobody wants any more, remembers a failed asset
+for 30 s (one notification, no re-request per scroll), and is LRU-bounded. The draw
+waits until every tile it needs is cached and until then leaves the old bitmap where it
+was, placed by clip-local *time* so a zoom or scroll shows it stretched, not blank.
+`waveform-draw.ts` fills one polygon per lane (not a line per sample), scaled by
+`effectiveGain` — clip volume through the track fader, as the export multiplies them —
+and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
+a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
+`settings.theme` change. A stereo clip gets two lanes when its clip is at least
+`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so track-height
+presets can drive it) and folds to one below that; the default 64 px track is stereo.
+`get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
+(dB scale −36…+12, the bottom edge is silence; a relative drag with a detent at exactly
+0 dB, since the export omits unity from the graph; double-click resets), **fade handles**
+at the top corners (picture and sound both fade, so every clip has them; the volume line
+is only for clips whose asset has audio; clamped to the clip and to each other,
+double-click clears), the fade ramps, **keyframe diamonds** (clip-local seconds; click
+seeks), and the **trim edges** with their halos. The top 14 px of a clip is the handles'
+alone and the line's travel stays below it; the edge strips and the line's grab band do
+not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
+razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s
+`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon), shows its
+value live (the waveform follows the volume line) and writes **one** edit on release,
+holding the live value until that edit settles. The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
 **J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
 `src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`
