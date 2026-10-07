@@ -1478,6 +1478,8 @@ mod tests {
             rotation: 0,
             color_transfer: None,
             color_primaries: None,
+            color_space: None,
+            pix_fmt: None,
         }
     }
 

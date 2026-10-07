@@ -25,6 +25,10 @@ export interface StreamInfo {
 	color_transfer?: string | null;
 	/** Colour primaries as ffprobe names them: `bt2020`, `bt709`, … */
 	color_primaries?: string | null;
+	/** ffprobe's pixel format (`yuv420p`, `yuva420p`, ...); absent on an asset probed before it was recorded. */
+	pix_fmt?: string | null;
+	/** The YCbCr matrix the stream declares, as ffprobe names it (`bt709`, `smpte170m`, `bt2020nc`, …); absent when it declares none. */
+	color_space?: string | null;
 }
 
 /**

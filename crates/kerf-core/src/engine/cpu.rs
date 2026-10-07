@@ -195,9 +195,14 @@ pub fn lease() -> Lease {
 /// `-threads` is a per-file codec option, so where it sits decides what it
 /// means. These are the *front* flags, which land in the first input's option
 /// group and so cap the decoder — the expensive half of every analysis pass.
-/// `force` writes them even at a full budget (see [`cap_args`]).
-fn head_flags(threads: usize, force: bool) -> Vec<String> {
-    if (!force && !limited()) || threads == 0 || threads >= cores() {
+fn head_flags(threads: usize) -> Vec<String> {
+    head_flags_with(threads, limited())
+}
+
+/// [`head_flags`] with the "is the budget on" decision made by the caller: `capped`
+/// writes the flags whatever the budget is (see [`cap_args`]).
+fn head_flags_with(threads: usize, capped: bool) -> Vec<String> {
+    if !capped || threads == 0 || threads >= cores() {
         return Vec::new();
     }
     let n = threads.to_string();
@@ -220,22 +225,25 @@ fn head_flags(threads: usize, force: bool) -> Vec<String> {
 /// which is what keeps the pure argument builders' tests describing exactly what
 /// ffmpeg is handed.
 pub fn limit_args(args: &mut Vec<String>, threads: usize) {
-    splice_caps(args, threads, false);
+    splice_caps(args, threads, limited());
 }
 
 /// [`limit_args`] that holds at **any** budget, 100% included.
 ///
-/// For the background jobs that run *beside* whatever has the heavy-job lease
-/// rather than behind it (a filmstrip decodes video while a proxy encode or an
-/// export owns the machine): "at 100% nothing is capped" describes a job the user
-/// asked for and is waiting on, and these are the opposite — their own cap is
-/// what keeps them out of that job's way, not the user's share of the machine.
+/// For the background jobs that run *beside* something else rather than behind
+/// it, where the cap is what keeps them out of the way and not the user's share of
+/// the machine: a filmstrip decodes video while a proxy encode or an export owns
+/// the heavy-job lease, and the GPU path's parallel layer decodes
+/// ([`limit_args_shared`]) would otherwise each ask for every core. "At 100%
+/// nothing is capped" describes a job the user asked for and is waiting on.
 pub fn cap_args(args: &mut Vec<String>, threads: usize) {
     splice_caps(args, threads, true);
 }
 
-fn splice_caps(args: &mut Vec<String>, threads: usize, force: bool) {
-    let head = head_flags(threads, force);
+/// The one place thread caps are written into an argv: the decode flags at the
+/// front and the encoder's `-threads` just before the sink, when `capped`.
+fn splice_caps(args: &mut Vec<String>, threads: usize, capped: bool) {
+    let head = head_flags_with(threads, capped);
     if head.is_empty() {
         return;
     }
@@ -245,11 +253,31 @@ fn splice_caps(args: &mut Vec<String>, threads: usize, force: bool) {
     args.splice(0..0, head);
 }
 
+/// The threads one of `share` processes running side by side may use: the
+/// budget's threads divided among them, at least one each.
+pub fn shared_threads(budget: usize, share: usize) -> usize {
+    (budget / share.max(1)).max(1)
+}
+
+/// Cap an argv for one of `share` ffmpeg processes that run side by side (the
+/// GPU path decodes every layer of a frame in parallel). A lone process is
+/// [`limit_args`] exactly — nothing at a full budget. With several, the budget's
+/// threads are *divided*, and the cap is written even at 100% ([`cap_args`]): left
+/// alone, N processes would each ask for every core, N times what the budget
+/// allows.
+pub fn limit_args_shared(args: &mut Vec<String>, share: usize) {
+    let threads = shared_threads(budget_threads(), share);
+    if share <= 1 {
+        return limit_args(args, threads);
+    }
+    cap_args(args, threads);
+}
+
 /// Cap a `Command` that is being built up fluently, before any of its own
 /// arguments are pushed. Only the decode side — a command assembled this way
 /// has no output sink to insert before yet.
 pub fn limit_cmd(cmd: &mut Command, threads: usize) {
-    let head = head_flags(threads, false);
+    let head = head_flags(threads);
     if !head.is_empty() {
         cmd.args(head);
     }
@@ -347,6 +375,35 @@ mod tests {
         // The encoder cap sits in the output group: after the last input,
         // immediately before the sink.
         assert_eq!(&args[args.len() - 3..], &["-threads", "1", "out.mp4"]);
+        set_cpu_percent(restore);
+    }
+
+    #[test]
+    fn side_by_side_processes_split_the_budget() {
+        assert_eq!(shared_threads(12, 1), 12);
+        assert_eq!(shared_threads(12, 3), 4);
+        assert_eq!(shared_threads(12, 5), 2);
+        // Never zero, and a share of zero is a share of one.
+        assert_eq!(shared_threads(4, 16), 1);
+        assert_eq!(shared_threads(4, 0), 4);
+    }
+
+    #[test]
+    fn shared_processes_are_capped_even_at_a_full_budget_but_a_lone_one_is_not() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        set_cpu_percent(100);
+        let original: Vec<String> = ["-i", "in.mp4", "out.mp4"].iter().map(|s| s.to_string()).collect();
+        let mut lone = original.clone();
+        limit_args_shared(&mut lone, 1);
+        assert_eq!(lone, original);
+        let mut shared = original;
+        limit_args_shared(&mut shared, 4);
+        if cores() > 1 {
+            let n = shared_threads(cores(), 4).to_string();
+            assert_eq!(&shared[..2], &["-threads", n.as_str()], "{shared:?}");
+            assert_eq!(&shared[shared.len() - 3..], &["-threads", n.as_str(), "out.mp4"]);
+        }
         set_cpu_percent(restore);
     }
 

@@ -474,6 +474,10 @@ cargo test  -p kerf-core --no-default-features split_and_remove_roundtrip   # si
 # engine or the export graph:
 cargo test -p kerf-core --no-default-features -- --ignored
 
+# The GPU compositor against FFmpeg's still (needs ffmpeg and an adapter — Mesa
+# lavapipe is enough; `mesa-vulkan-drivers` on Debian / Ubuntu):
+cargo test -p kerf-gpu --no-default-features -- --ignored
+
 # Everything a commit / a push checks (prek, see below)
 prek run --all-files
 prek run --all-files --hook-stage pre-push
@@ -528,7 +532,8 @@ Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 check commands, and a PostToolUse hook that rustfmt's every `.rs` file an agent
 writes, reporting parse errors back) and project subagents in `.claude/agents/`
 — `engine` (kerf-core), `frontend`, `surface` (wire a core op into the Tauri
-command + MCP tool + api.ts), and the read-only `reviewer` and `verifier`.
+command + MCP tool + api.ts), `gpu` (kerf-gpu and its parity harness), and the
+read-only `reviewer` and `verifier`.
 
 ## Architecture
 
@@ -668,6 +673,102 @@ no editing logic in the adapter.
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
   a render resizes away from the project frame.
+- `render_plan.rs` — **what one frame is made of**, shared by every renderer.
+  `RenderPlan::at(timeline, assets, opts, t, color)` is the canvas (the same
+  `export_format` the still uses, through `render_geometry`) plus the ordered video
+  layers visible at `t`: asset path, resolved source time (speed / reverse /
+  clamped), the `Transform` sampled at clip-local time, `Color`, the stream's
+  displayed size / rotation / transfer / pixel format / matrix. It is built on
+  `active_video_clips`, the very function `build_still_args` takes its inputs from,
+  so the FFmpeg still and the GPU compositor cannot disagree about which clip is
+  where in its source (a `cli.rs` test pins the argv against the plan); `still_size`
+  is the preview-size rule both use.
+  **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
+  its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
+  anything the compositor does not render exactly: video effects, masks, 360 reframe,
+  HDR, a live text overlay, a fade or transition in progress, a non-bicubic scaler, a
+  layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
+  steepest the scaler comparison measures), and the classes below. Pure + unit-tested
+  like the rest of the timeline math.
+  - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
+    `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
+    known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,
+    `vuya`, the `rgb32` aliases) cannot reach a compositor that would flatten its
+    alpha onto black. `pix_fmt: None` is the marker of an asset saved before it was
+    recorded — **its colour matrix is unknown**, because "no `color_space`" then means
+    *either* untagged *or* never probed, and a BT.709 clip of an old project must not
+    be taken for BT.601: such a layer is refused when translucent, and under
+    `BottomLayerTag` whenever it is in the stack.
+  - **The composite's matrix is a property of the FFmpeg, probed**
+    (`CompositeColorPolicy`, from `engine::composite_color_policy()`, a
+    once-per-process behavioural probe in `cli.rs` like `graph_script_flag` /
+    `zscale_available`). It builds a tiny raw-YUV clip tagged BT.709 and an untagged
+    twin, **checks with `ffprobe` that the tag survived into each** (a clip that lost
+    it would make the two measurements identical on any FFmpeg), runs both through the
+    *real* `build_still_args` graph and compares the middle pixel: the same picture
+    means the composite is untagged and read as BT.601 whatever the layers say
+    (`FixedBt601` — FFmpeg 6.1), a different one means colourspace is negotiated along
+    the overlay chain and the bottom layer's tag is the composite's (`BottomLayerTag` —
+    FFmpeg 9.0). **A probe that cannot tell is `Unknown`, never a guess** — an earlier
+    version fell back to `BottomLayerTag` as "the cautious one", which draws every
+    BT.709 / BT.2020 clip wrongly on FFmpeg 6 (30.5 dB, 31 levels): the two policies
+    differ on *exactly* that footage, so no answer for it is safe. `Unknown` draws only
+    the stacks they agree on (BT.601 throughout) and refuses the rest. It is not
+    remembered: a measured policy is kept for the process, a failed probe is retried
+    after a backoff (5 s, doubling to 5 min, so a broken ffmpeg is not respawned per
+    frame). The probe is bounded (`POLICY_PROBE_TIMEOUT` 15 s over six short runs, each
+    served from side threads, killed at the deadline) because every concurrent first
+    caller waits behind it; **the first call blocks 70–200 ms**, so call it from a
+    blocking thread. The policy is an *input* to `RenderPlan::at`, so tests pin any of
+    the three without an FFmpeg. Under `BottomLayerTag` a stack whose
+    layers share one matrix class (BT.709, BT.2020, BT.601 — `smpte170m`, `bt470bg`
+    and untagged are one class) is drawn with that matrix; **mixed matrices, an
+    unknown one, and an RGB picture in a stack that is not BT.601 are refused**,
+    because FFmpeg converts the other layers into the bottom layer's matrix with an
+    arithmetic that was not reproduced (float and fixed-point models of it were off by
+    up to 26 levels). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
+    one a translucent layer is taken out of YUV with.
+  - **What depends on the render size** is decided in the plan, before any decode
+    (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
+    translucent layer of odd size, **resizing a picture that is not 8/10-bit
+    4:2:0 or gray** (any scale stage that changes its size, in either direction) —
+    FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0
+    first, and the chroma is then interpolated from different samples: enlarging was
+    4:4:4 x1.5 27 levels off, 4:2:2 x2 17, BGR0 x2 51, PNG RGB x2 69, and even a shrink
+    as mild as 1.05-1.5x reads flat max 8-9 (4:2:2 at 0.9x is over the limit) with
+    edges up to 32 levels. No band of ratios is measured strictly inside the limits on
+    both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
+    drawn for every format — and **a crop of a picture whose chroma is finer than
+    4:2:0's**. Where a position rounds
+    depends on where in the graph it is (`RenderPlan::layer_geometry`): the first
+    `crop` runs on the picture as decoded and rounds to its **native** chroma grid
+    (`pix_fmt_subsampling`: even for 4:2:0, even columns for 4:2:2, nothing for 4:4:4,
+    gray or RGB — a table by pixel format whose every entry an `#[ignore]`d test
+    measures against the real `crop`). The chain converts to 4:2:0 in its **last**
+    `scale`, so `pad`, and the Cover crop of a chain with one `scale`, are on the 4:2:0
+    grid whatever the source was (the first version of this fix rounded those to the
+    native grid too and was 20 to 30 dB off at every odd letterbox), while a Cover crop
+    followed by the transform's own `scale` is still on the native grid (a gray layer
+    with that was 35 levels off). The
+    compositor's planes are 4:2:0, so luma lands exactly but the chroma of a 4:2:2 /
+    4:4:4 / RGB picture positioned between two 4:2:0 samples is a pixel off (30 to 38 dB
+    whole-frame): **refused**; gray, with no chroma to misplace, is drawn exactly, as
+    is a 4:2:0 picture or any position that is on both grids. A format whose grid is not
+    known (never recorded, or off the table) is refused wherever the grids disagree
+    (`LayerGeometry::resolve_any_grid`).
+  - **Range.** The decode converts a full-range picture (ffprobe names it `yuvj…`,
+    whatever the container) to limited range up front; FFmpeg 9 keeps it full range
+    through the graph (tagged `pc`) and runs `eq` and the overlay on it, converting
+    last. That agrees with no colour correction and disagrees with it by 34 to 44 dB
+    (every knob, measured on both an mjpeg file and full-range H.264), so **colour
+    correction on a `yuvj` picture is refused** (under any policy — FFmpeg 6 happened
+    to agree, but it is the decode order that is different), and so is **a graded layer
+    in a stack that holds one** wherever the composite's colour is negotiated or
+    unknown (the range, like the matrix, is the bottom layer's). An asset that never
+    recorded its pixel format is not known not to be full range, and is treated so.
+  What only the decode or the compositor can see is refused there instead
+  (`GpuError::Unsupported`): a picture that decodes at another size than probed, an
+  alpha channel found in the pixels of an asset that never recorded its format.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -779,6 +880,173 @@ no editing logic in the adapter.
   `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
+
+### kerf-gpu (`crates/kerf-gpu/`)
+
+The wgpu compositor — work package A0 of `.claude/plans/gpu-compositor-and-roadmap.md`,
+a feasibility spike **not linked into kerf-app yet**. It draws a `RenderPlan` headless
+(`Gpu::new(GpuOptions)`: instance / adapter / device, an `Err` rather than a panic
+when there is no adapter, `force_fallback_adapter` for the software one) and reads
+RGBA back. wgpu is built with the Vulkan / Metal / DX12 backends only — no GLES, no
+WebGL — so the CI target is a software adapter (Mesa **lavapipe** on Linux, WARP on
+Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is an
+error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
+internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
+`Compositor::new` and `composite` return `Result`, and a lost device is tracked — every
+later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
+`Compositor`** (the device is not recreated behind the caller's back).
+
+FFmpeg stays the decoder: `source::decode_layer` pipes one frame from the binary as
+`yuv4mpegpipe` 4:2:0 (the same `-ss` as the still graph), spawned through kerf-core's
+`ffmpeg_command()` (no console flash on Windows). **The decode states its own size**
+(the y4m header) and it is compared with the probe's: a JPEG with an EXIF orientation
+probes 480x270 and decodes 270x480, so a mismatch is `Unsupported` and that frame goes
+through FFmpeg. A `pix_fmt` that is not on the allow-list of known-opaque ones is refused (the plan
+does too); an asset with no recorded `pix_fmt` costs a second `yuva420p` decode that is
+refused if anything is transparent. A child is killed after 30 s or when it writes more than the probed size,
+and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still draws
+nothing for that layer, and so does the compositor. The layers of a frame decode in
+parallel, each given `budget / layers` threads even at a full CPU budget
+(`limit_ffmpeg_args(args, share)`). No cache, no proxy: that is A1.
+
+What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
+
+- **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and
+  the still converts the *result* to RGB. The canvas texture holds Y, U, V, A and the
+  blend acts per channel; an RGB-first design clamps each layer before blending and
+  composites out-of-gamut-but-legal footage (saturated patterns, super-whites)
+  differently. Chroma is replicated 2x2 at the final conversion, as swscale's unscaled
+  path does.
+- **The composite's matrix is the FFmpeg's, probed — not "always BT.601", and not the
+  stream's** (`PlanCanvas.matrix`, `CompositeColorPolicy`). FFmpeg 6.1 composites onto an
+  untagged black base, so the result is read as BT.601 whatever the layers were tagged
+  (bt709, bt601 and untagged convert identically — measured). FFmpeg 9.0 negotiates
+  colourspace along the overlay chain: the *bottom layer's* tag is the composite's, and a
+  layer tagged otherwise is converted into it by a scaler stage whose arithmetic was not
+  reproduced. An earlier version of this section said the matrix was fixed; that was true
+  of 6.1 only, and the pinned 9.0.2 build was 29.5 dB / 35 levels off on a single
+  BT.709 clip. So the policy is measured once per process from the real still graph
+  (`composite_color_policy`), the plan takes it as input, **stacks of one matrix are drawn
+  with it and stacks of mixed matrices are refused** (see `render_plan.rs` above), and the
+  CI parity job runs both builds. The consequence to know about: an *export* is untagged
+  `yuv420p` that a player shows as BT.709 for HD, so the FFmpeg preview already disagrees
+  with the file by a few levels on saturated colour. Fixing that is a decision for when
+  the GPU path replaces the FFmpeg preview. The stream's own matrix
+  (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
+  layer out of YUV in the round trip below and for choosing the composite's matrix.
+- **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
+  tables (the integer `process_c` path when gamma is 1, the `pow` table otherwise, its
+  `float` clamping, truncation) and the test suite checks them byte for byte against
+  FFmpeg. Kerf's "temperature" is a power function on the chroma planes.
+- **Scaler: swscale's bicubic, ported, not imitated** (`sws.rs`, `composite.wgsl`).
+  swscale's filter *table* has quirks a formula misses — the window start truncated
+  toward zero (so at the first pixels the tap at -1 is absent, not folded into pixel 0),
+  right-edge folding, near-zero tap trimming, 14- / 12-bit weights normalized by error
+  diffusion, the 16.16 step — and the shader does its integer arithmetic (15-bit
+  horizontal intermediate clipped at the top, vertical pass rounded at bit 19). Planes
+  are scaled independently at their own size and rounded to 8 bits between stages (the
+  fit scale and the transform's scale are two scalers in cascade). The first version
+  used a bicubic *formula* and was wrong by up to 20 levels along the borders of busy
+  footage; the committed test
+  (`the_scaler_matches_ffmpegs_scale_plane_by_plane`, `Compositor::composite_yuv`)
+  compares planes with `ffmpeg -vf scale`: **within one level up to about 4:1** (noise and
+  checkerboard included, up and down), within 2-3 levels (mean under 0.6) on the 8:1 to
+  20:1 downscales of noise and test patterns and within 5 at 40:1 (x86 swscale's vertical
+  scaler is not bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0.
+  **A shrink steeper than 40:1 (`MAX_SHRINK`) is refused by the plan** — a 58:1 shrink of
+  a 4K test pattern read 16 levels off in RGB. Scaling happens on the decoded 8-bit 4:2:0,
+  which is why resizing any other format — enlarging, or shrinking even by 1.05-1.5x (FFmpeg
+  scales its chroma from the full-resolution plane, the compositor from the averaged one;
+  flat max 8-9, edges up to 32 levels) — is refused by the plan too.
+- **Opacity below 1 is FFmpeg's RGB round trip** (`roundtrip.rs` is the scalar
+  reference, `roundtrip.wgsl` the passes): `colorchannelmixer` only takes RGB, so the
+  layer goes `yuva420p -> argb -> yuva420p` before `overlay`. Out of YUV is swscale's
+  C table converter with *the layer's own matrix* (a BT.709 stream converts as BT.709;
+  exact on random pictures); back is **the composite's matrix** (`Rgb2Yuv`: the RGB
+  frame in between carries no tag, so it takes the one the canvas is converted with —
+  BT.601 on a fixed-policy FFmpeg, the stack's on a negotiating one; BT.601's table is
+  swscale's explicit constants, the others its derivation; luma exact, chroma — pair
+  sums then a stretched vertical bicubic — within a level); the alpha plane is
+  `round(lrint(255 * op) * 256 / 255)` (50% is 129). Colour outside the RGB gamut comes
+  back clipped, luma a level or two lower — a blend that skipped this was 34 dB / 22
+  levels off on saturated bars. A translucent layer of **odd size is refused** (by the
+  plan): the chroma pairing reads uninitialised padding past an odd picture, an odd
+  height leaves swscale's unscaled path. So is a translucent layer whose matrix is
+  unknown. The tightest figure on 9.0.2 is a translucent BT.709 test pattern alone
+  (40.9 dB flat against the 40 dB floor, the GPU 1-3 levels bright from the final
+  conversion's truncation bias).
+- **A letterboxed layer is the whole frame.** `pad` emits a full-canvas frame, black
+  bars included, so an identity clip that does not fill the frame covers what is below
+  it, and `eq` grades the bars too (`LayerGeometry.matte`). `pad` also drops the last
+  odd row / column of the picture.
+- **An odd layer's last chroma block reaches one pixel past it** (`overlay` blends whole
+  chroma samples): the compositor writes that pixel's U and V with a second, chroma-only
+  pass.
+- **The decode asks for limited range explicitly** (`scale=out_range=tv`): FFmpeg 6.1
+  converts a full-range JPEG for `-pix_fmt yuva420p` alone, FFmpeg 9 hands the raw
+  full-range bytes back untouched — the first thing the pinned build found.
+- **Geometry is FFmpeg's integer geometry** (`layer_geometry.rs` in kerf-core, pure;
+  re-exported as `kerf_gpu::geometry`): the first `crop` rounds with `lrint` and then to
+  the picture's *native* chroma grid (`Subsampling`: even for 4:2:0, nothing for 4:4:4 —
+  see `render_plan.rs` above for which positions), the fit uses `av_rescale`, `pad`,
+  `overlay` and (unless the transform's own `scale` follows it) the Cover crop truncate
+  and round down to even (the 4:2:0 grid, whatever the source was), `rotate` rounds its box half-up and samples bilinear about the pixel-index
+  centres, chroma outside a rotated picture is clamped to its edge (FFmpeg leaves a few
+  green pixels there; the GPU does not copy them).
+
+**`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
+the pinned one** — the two compose colour differently, so a green run on one proves
+nothing about the other) renders each case at several times through `export_still` (a
+PNG at the full canvas) and through the GPU and compares them:
+**PSNR >= 40 dB and max per-channel error <= 8/255 outside the edge band**, where the
+band is every pixel within 2 px of a >24-level step in the *reference* (>12 for a case
+with a rotated layer, whose stair-stepped edge at a reduced opacity shows less contrast),
+**at least half the frame must be outside it** (a case that is edge everywhere — noise, a
+1-px checkerboard — takes `BUSY` limits: the whole image against the same error bounds),
+plus a whole-image PSNR floor (40 dB, 30 dB for a case with a rotated layer) that catches
+a layer a row off. Thresholds live as named constants at the top of the file with the
+reason for each and the measured numbers at the bottom; a case never relaxes them
+silently, and a new visual feature gets a case. Assets are made by the same probe an
+import uses (`Project::probe_asset`), so a stream says what the app would know — and the
+harness reads the policy the same way the product does (`composite_color_policy`), so
+each case is judged against what *this* FFmpeg does: a stack of one matrix is compared
+strictly, a stack the policy cannot draw (`check_mixed`: mixed tags on 9.0.2, where the
+same case is compared strictly on 6.1) is **asserted refused by the plan**. Cases:
+single clip (three sources), a gap, contain / cover into 9:16 / 16:9 and up / down
+scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scale + rotate
++ crop, odd-sized and off-canvas layers, **letterboxed layers over and under others** (bars
+cover, graded bars), **opacity** (several sources and roles, a graded fade),
+**matrices** (BT.709 and BT.2020 single and layered, mixed tags, an RGB PNG under and over
+tagged clips, translucent layers over tagged ones in both orders), colour (all four knobs,
+contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes,
+10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources
+(shrunk, fitted and **enlarged** — every resize of a non-4:2:0, non-gray format is
+asserted refused, the mild shrinks included, and the same formats at their own size drawn), **busy sources** scaled by non-integer ratios, a clip past the end of its
+footage (nothing drawn, like FFmpeg), the scaler plane by plane (including 8:1 to 20:1
+shrinks), a rotated grey with no colour fringe, an asset that never recorded its pixel
+format, **chroma-grid cases** (crops, Cover offsets and letterbox gaps chosen so the
+4:2:0 and the native rounding differ, on 4:2:0 / 4:2:2 / 4:4:4 / gray / BGR0 / RGB PNG —
+the crops of finer-chroma pictures that cannot be placed exactly are asserted refused),
+the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020 refused),
+the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
+one, refused; ungraded and limited-range controls drawn),
+and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
+format unrecorded, a translucent odd layer) — each of which FFmpeg still renders. 160
+renders in the table on FFmpeg 6.1.1 (150 compared and 10 asserted refused on the pinned
+9.0.2 the Windows and macOS bundles ship) plus the plane-level scaler runs, all passing
+strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
+(`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
+everything and fails nothing); every run writes `target/parity/report.txt`.
+`tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
+layers, decode apart from composite (`KERF_BENCH=1`). **The readback is bounded**: the
+wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
+than a caller blocked forever on a wedged device.
+
+```bash
+cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter
+KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
+KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
+```
 
 ### embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
@@ -1093,7 +1361,8 @@ and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
 upstream builds and rewrites the script's digests. CI's `engine` job runs the
 `#[ignore]`d binary tests against both the distro FFmpeg and the **pinned**
 one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
-up before a release needs it; a `libav` job compiles the `ffmpeg` /
+up before a release needs it; the `parity` job is the same pair on Linux (the
+GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
 
 **Publishing a release would open a gap in the feed**, so the workflow closes it:
