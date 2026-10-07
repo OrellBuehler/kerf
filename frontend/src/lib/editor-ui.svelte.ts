@@ -10,6 +10,18 @@ import { toast } from './notifications.svelte';
 import type { AnalysisProgress, CaptionStyle, TranscriptionStatus } from './types';
 import type { VoiceoverPrefill } from './voiceover';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
+import {
+	heightOf,
+	heightPx,
+	loadHeights,
+	loadMinimap,
+	saveHeights,
+	saveMinimap,
+	setAll,
+	setTrack,
+	type HeightPreset,
+	type TrackHeights
+} from './track-heights';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -71,6 +83,12 @@ class EditorUi {
 	 *  key handler) asks rather than computes. A counter, like `seekEpoch`: a
 	 *  repeated ask is a new event. */
 	fitEpoch = $state(0);
+	/** Track heights: a named preset per track (and the global one the titles lane
+	 *  follows), remembered per track id in `localStorage` — a viewer's choice, not
+	 *  part of the cut (`track-heights.ts` owns the shape and the storage). */
+	heights = $state<TrackHeights>(loadHeights());
+	/** Whether the minimap strip over the timeline is shown (also remembered). */
+	minimap = $state(loadMinimap());
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
@@ -99,6 +117,33 @@ class EditorUi {
 		this.deliverShapes = this.deliverShapes.includes(id)
 			? this.deliverShapes.filter((v) => v !== id)
 			: [...this.deliverShapes, id];
+	}
+
+	/** The height preset of one track. */
+	trackPreset(trackId: string): HeightPreset {
+		return heightOf(this.heights, trackId);
+	}
+
+	/** The lane height of one track, px. */
+	trackPx(trackId: string): number {
+		return heightPx(this.heights, trackId);
+	}
+
+	/** Set one track's height. */
+	setTrackHeight(trackId: string, preset: HeightPreset) {
+		this.heights = setTrack(this.heights, trackId, preset);
+		saveHeights(this.heights);
+	}
+
+	/** Set every track's height, and the titles lane's. */
+	setAllHeights(preset: HeightPreset) {
+		this.heights = setAll(this.heights, preset);
+		saveHeights(this.heights);
+	}
+
+	toggleMinimap() {
+		this.minimap = !this.minimap;
+		saveMinimap(this.minimap);
 	}
 
 	/** One step in (`1`) or out (`-1`) on the zoom; the timeline holds the playhead still. */

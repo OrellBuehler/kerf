@@ -67,12 +67,18 @@ so the feature is **only** activated through these forwards — which is what ma
   gain. Two moving parts: **one heavy job at a time** (`cpu::lease`, a reentrant
   gate — an export's second pass and a stitch inside an import must not queue
   behind themselves) and **a share of the cores for that job** (`cpu_percent`,
-  seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). Gated =
-  anything that reads a *whole file*: silence / scene / loudness detection, the
-  PCM decode behind rhythm and in-process whisper, transcription, proxy, stitch,
-  export. **Ungated** = anything that reads a *moment*: a scrubbed frame, the
-  composited still, a clip's audio, the preview stream, a waveform, a contact
-  sheet — the UI (and an agent *looking* at footage) must not wait out a render.
+  seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
+  a whole-file job whose *result* is wanted later and that nobody is looking at:
+  silence / scene / loudness detection, the PCM decode behind rhythm and in-process
+  whisper, transcription, proxy, stitch, export. **Ungated** = whatever the UI is
+  *drawing from* or an agent is *looking at*, which must not wait out a render:
+  the moment reads (a scrubbed frame, the composited still, a clip's audio, the
+  preview stream, a contact sheet) and the timeline's per-asset drawings — the
+  waveform pyramid and the filmstrip — which do read the whole file, once, and cache
+  it, but are what an opened project's clips are painted from. Ungated is not free:
+  those are still thread-capped and niced and run a couple at a time, and the
+  filmstrip, a *video* decode that runs beside the proxy encode of the very file it
+  samples, holds its own tighter cap (below).
   The share becomes `-threads` / `-filter_threads` / `-filter_complex_threads`,
   written in at **spawn** time (`cpu::limit_args` / `limit_cmd`) rather than in
   the pure argument builders, so those keep describing exactly what ffmpeg is
@@ -82,7 +88,11 @@ so the feature is **only** activated through these forwards — which is what ma
   priority (`cpu::background`, a creation flag on Windows / `nice` on unix),
   which is the half that actually keeps the desktop responsive. At **100%** none
   of the second half applies: no flags, no priority change, byte-identical
-  invocations to the ones Kerf always issued.
+  invocations to the ones Kerf always issued — for the jobs that were always
+  issued. The one exception is by design: the filmstrip decode uses `cpu::cap_args`
+  / `cpu::background_always`, which hold at every budget, because "at 100% leave
+  ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
+  job that must stay out of that job's way.
   Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
@@ -308,6 +318,60 @@ so the feature is **only** activated through these forwards — which is what ma
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
   are unchanged.
+- `filmstrip.rs` (always compiled, CLI only) is the video twin of `peaks.rs`: what the
+  timeline draws a clip's **thumbnails** from. An asset is sampled once into a
+  `Filmstrip` — 96 px-high frames (width from the *displayed* aspect, so rotation is
+  autorotate's; a 360 asset is its raw equirect frame), `tile`d into one-row JPEG
+  sheets of at most 8192 px, balanced so none is mostly padding (`sheet_layout`) — and
+  a window is a few thumbnails picked with `Filmstrip::frame_at(t)` / `locate(k)`.
+  **Thumbnail `k` is the frame on screen at source time `k * interval`** (the last
+  frame at or before it; 0 is the first frame): that is `fps=…:start_time=0:round=up`
+  — `fps`'s default `round=near` picks the frame half an interval *later*, and
+  without `start_time=0` a picture that starts after the sound numbers its samples
+  from its first frame's slot. The interval is the finest rung of 0.5 / 1 / 2 / 5 /
+  10 / 15 / 30 / 60 … s that keeps the strip within 300 thumbnails (`pick_interval`;
+  ~3-6 KB a frame); a still is one thumbnail. It decodes the **proxy when
+  `ready_proxy` has one, else the original** — resolved *inside* the lock-free
+  `Project::decode_filmstrip(&Asset)` and only on a cache miss (the proxy's path can
+  take an ffprobe for the HDR check, so nothing under the project lock may touch
+  the media: the surface holds the lock for `require_asset` alone) — and a failing
+  proxy falls back to the original, hardware decode to software. The cache key is
+  the **original's** identity (path + size + mtime + geometry + interval + version),
+  never the proxy's: the frames look the same and a proxy keeps frame times, so a
+  strip made before the proxy landed is the same entry after. HDR is tone-mapped
+  after the downscale from `source_hdr` of the file actually decoded (a proxy
+  converts nothing twice). **Keyframes for coarse originals:** from a 5 s interval
+  up (assets of ten minutes and more) an *original* is decoded with
+  `-skip_frame nokey`, so a thumbnail is the last *keyframe* at or before `k *
+  interval` — up to a GOP earlier, never later — instead of the frame itself; 90 s
+  of 1080p H.264 took 12.2 s every-frame and 0.8 s by keyframes. Never on the
+  all-intra proxy (moot there: every frame is a keyframe, so its strip is exact),
+  and never hardware-decoded (one frame in 60 is cheap in software); a keyframe pass
+  that comes up short is retried with every frame. **Two ffmpegs, one decode:** the
+  first streams *raw* thumbnails over a pipe — so the no-hang rule is per thumbnail
+  (silent for `max(60 s, 6 × interval)` and it is killed) and the count is exact
+  rather than inferred from tile padding — the second tiles and JPEG-encodes them
+  from memory. **Ungated** (no `cpu::lease`) although it reads the whole file: the
+  timeline draws from it, and gated it would sit behind the proxy encode and the
+  import's analysis while clips stay empty. But it is a video decode beside whatever
+  holds the lease, so it is capped at a quarter of the cores (one or two threads,
+  `decode_threads`) and niced at **every** budget, 100% included, two at a time;
+  concurrent asks for one asset share one decode. **A short decode is not cached:**
+  ffmpeg exits 0 on a file that goes bad halfway, so when fewer thumbnails arrive
+  than planned the video stream's own duration (ffprobe, only on a shortfall) says
+  how many to expect, and more than 2 short is returned and memoized for the session
+  but never written to disk (a video simply shorter than its container is complete
+  at its own length). Cached at
+  `<cache>/kerf/filmstrips/<hash>/` (`sheet-000.jpg …` + `manifest.json`) via a
+  `.part` directory and a rename; a manifest that is not the canonical layout for its
+  frame count, or a sheet that is missing / resized / not a JPEG of the promised size,
+  is rebuilt, never trusted. The thumbnail width is the *coded* aspect — `StreamInfo`
+  carries no sample aspect ratio, so an anamorphic source is not corrected (nor is it
+  anywhere else: the project frame, fit, preview and export all work in coded pixels).
+  `Filmstrip` serializes its geometry *without* the JPEG bytes (`#[serde(skip)]`) — a
+  surface adds its own transport. No video stream is `InvalidArgument`; the
+  `get_filmstrip` Tauri command is `require_asset` under the lock, then
+  `Project::decode_filmstrip` with it released.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -1160,6 +1224,10 @@ time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `get_waveform_range` → a source-seconds window as min/max peaks per channel,
+`get_filmstrip` → an asset's thumbnail strip, the `Filmstrip` JSON with each sheet's
+JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
+and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
+`skim_asset` is how an agent looks at footage,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -1655,9 +1723,55 @@ otherwise), and a redraw only assigns the canvas size when it changed.
 and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
 a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
 `settings.theme` change. A stereo clip gets two lanes when its clip is at least
-`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so track-height
-presets can drive it) and folds to one below that; the default 64 px track is stereo.
+`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so the track-height
+presets drive it) and folds to one below that; the default 64 px track is stereo.
 `get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**Filmstrips** are the video twin: one `<canvas>` per video clip over its on-screen part
+(`ClipFilmstrip.svelte`; the waveform's windowing, DPR cap and size discipline), blitted from
+the asset's `get_filmstrip` sheets. `filmstrip-view.ts` is the pure layout: a clip is a row of
+**slots**, each the thumbnail's aspect at the clip's height in whole px, the grid anchored at
+the clip's left edge (a scroll moves nothing on it); slot `i` shows the frame at the source
+time under the middle of its *visible* part, through `waveform-view.ts`'s `sourceAt` (trim /
+speed / reverse — a reversed clip's footage runs backwards, never flipped) and
+`filmstrip-geometry.ts`'s `frameAt` / `locate`; slot edges are rounded as *edges*, so
+neighbours never seam; a still is its one thumbnail repeated. `filmstrip-draw.ts` paints;
+`filmstrip-cache.ts` (injectable fetcher + decoder; the app's instance is `filmstrips.ts`,
+which decodes a sheet's `data:` URL through an `Image` then `createImageBitmap` — never
+`fetch`, `connect-src` refuses `data:`) keeps one decoded strip per **asset** (a split's two
+clips share it): one in-flight load per asset, two at a time newest interest first, queued
+loads nobody wants dropped, a failed asset held off with `backoff.ts`'s doubling cooldown (the
+waveform cache's rule; one warning toast), memory bounded **in bytes** (192 MB): LRU applies only to
+assets no visible clip holds (`hold`/`want` register a clip as owner, `release` drops it), so
+a held asset is never evicted and a working set over budget overshoots until it scrolls away
+rather than thrashing; `prune` and `clear` notify the owners of what they drop. A clip box under 28 px shows none and never fetches;
+until drawn the clip keeps its plain look, and once drawn its label moves to the foot on a
+scrim backing so a bright frame cannot swallow it.
+**Track heights** are three named presets (`track-heights.ts`): compact 32 / medium 64 (what
+it always was) / large 112 px of lane. Everything else is a function of the clip box the lane
+leaves, so nothing else knows about presets: compact (21 px) folds a stereo waveform to one
+lane, shows no thumbnails or clip grab handles, and drops the header's mixer strip; large
+(101 px) gives two readable lanes and near-native thumbnails. It is a viewer's choice, not
+part of the cut, so it is **UI-only** (`ui.heights`, per track id in `localStorage`
+`kerf.timeline.heights`; a `Track.height` field would be engine work for a per-viewer
+convenience): `all` is the global choice (what "all tracks" last set, what a track with no
+choice of its own is, and what the **titles lane** follows), a track set to it drops its
+override, "all tracks" clears every exception, and the table is capped at 256. The toolbar's
+three glyph buttons set all tracks (lit when every track agrees); a track header's name is its
+menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
+so they follow the heights. The compact titles lane is 27 px (`MIN_TITLE_LANE_PX`: the 26 px
+add button plus the lane's border).
+The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered) is
+the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
+merge, so blocks are bounded by the strip's width), the playhead, the in / out marks, and the
+visible window as a box. The box and the timeline's `scrollLeft` / zoom are one thing seen two
+ways (`windowRect` view -> box, `targetForRect` box -> view). Drag the body to scroll (the zoom
+is kept *exactly*, not re-derived from a box widened to its 8 px minimum), drag an edge to
+zoom (the other edge stays put, even after the zoom was clamped), press the bare strip to jump
+there (and keep dragging), double-click to move the playhead. Gestures are absolute from the
+press, Escape restores the view, and the timeline applies the result like a wheel zoom
+(`pendingScroll`). `rowLayout` always fits the strip (the gap gives first, then 1 px rows,
+then fractional rows), and the strip is `aria-hidden` on purpose: the timeline's own keys
+(scroll, zoom, ⇧Z, J/K/L) are the accessible path.
 **`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
 (dB scale −36 dB…`MAX_GAIN` (+6 dB, `mixer.ts`) — one ceiling shared with the Inspector's
 slider and the track fader, a clip set above it by an agent keeps its value and is drawn at
@@ -1894,7 +2008,13 @@ is explorable in a plain browser via `bun run dev` (frames return `null` there �
 keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
 deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
 asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
-stretch so the clipping colour is visible). **Ripple in the harness is a port, not a
+stretch so the clipping colour is visible; `getFilmstrip` answers from
+`src/lib/sample-filmstrip.ts` with a strip of the engine's *shape* — generated SVG
+sheets labelled with each thumbnail's source time and index, black padding after the
+last one — whose geometry comes from `src/lib/filmstrip-geometry.ts`, the faithful,
+bun-tested mirror of the engine's interval ladder, thumbnail width, sheet layout, plan
+and `Filmstrip::frame_at` / `locate` (the lookups a consumer makes against a real strip
+too)). **Ripple in the harness is a port, not a
 lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
 `Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
 numbers, so a rule changed in kerf-core has to change there or a test names it) and

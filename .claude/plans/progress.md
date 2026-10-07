@@ -4,14 +4,14 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 
 | WP | branch | PR | status | notes |
 |---|---|---|---|---|
-| A0 GPU feasibility spike | `feat/gpu-a0` | — | review | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
+| A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | — | — | todo | |
+| A1 Frame source + render plan | `feat/gpu-a1` | — | in-progress | Design note first (L-sized). |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
 | B3a Ripple + multi-select + zoom | `feat/timeline-editing` | — | merged (local) | `Timeline::ripple_from` (per-track, no sync lock), `move_clips`/`remove_clips`, marquee, group moves, zoom 0.05–2000 px/s. |
-| B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | in-progress | |
+| B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | merged (local) | Per-asset filmstrip (proxy preferred, keyframe sampling for long originals, capped + niced even at 100%), `get_filmstrip` (no MCP tool: `skim_asset` covers agents), height presets (UI-only), minimap. |
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
 | B4 Mixer | — | — | todo | |
@@ -76,6 +76,21 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   reading, without copying code; no third-party notice added (an algorithm is
   not covered by the LGPL).
 
+- **2026-10-07 — B3 split.** B3 landed as B3a (ripple, multi-select, group
+  moves, zoom) and B3b (filmstrips, heights, minimap): both rewrite
+  `Timeline.svelte`, so they ran in sequence.
+- **2026-10-07 — ripple scope.** Ripple is per track with no sync lock (until
+  B9's linked A/V); titles/markers don't move. The new multi-clip ops refuse
+  locked tracks while the older single-clip core ops still don't check locks
+  (only the GUI does) — a follow-up for B9.
+- **2026-10-07 — filmstrip is a side job.** Ungated (the timeline must not
+  wait behind a render) but thread-capped and niced even at a 100 % budget,
+  and keyframe-sampled on long originals.
+- **2026-10-07 — merge conflicts resolved on the WP branch.** Each WP merges
+  `local/main` into itself before landing (merge commits, no rebase), so the
+  eventual PRs merge cleanly in order.
+
 ## Needs a real machine
 
+- B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

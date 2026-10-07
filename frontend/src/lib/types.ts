@@ -416,6 +416,47 @@ export interface WaveformRange {
 	max: number[][];
 }
 
+/**
+ * One JPEG of a filmstrip (`get_filmstrip`): `count` thumbnails side by side,
+ * from the left. Mirrors `kerf_core::FilmstripSheet` plus the transport the app
+ * adds. `width` is always `columns * frame_width`, so the last sheet of a strip
+ * may be wider than `count * frame_width` — the tail is padding; trust `count`.
+ */
+export interface FilmstripSheet {
+	/** Index of the first thumbnail on this sheet. */
+	first_frame: number;
+	/** Thumbnails on this sheet. */
+	count: number;
+	/** Pixel width of the image. */
+	width: number;
+	/** Pixel height of the image: the strip's `frame_height`. */
+	height: number;
+	/** `data:image/jpeg;base64,…` — a `data:` URL because the CSP admits no `blob:`.
+	 *  (An SVG data URL in the browser harness, which has no decoder.) */
+	data_url: string;
+}
+
+/**
+ * An asset's thumbnails over time (`get_filmstrip`). Mirrors
+ * `kerf_core::Filmstrip`; `filmstrip-geometry.ts` is the mirror of its lookups.
+ * Thumbnail `k` is the frame on screen at source time `k * interval`.
+ */
+export interface Filmstrip {
+	/** Seconds of source between two thumbnails. */
+	interval: number;
+	/** Width of one thumbnail in pixels (even). */
+	frame_width: number;
+	/** Height of one thumbnail in pixels (96). */
+	frame_height: number;
+	/** Thumbnails in the strip: at least 1, at most 300. */
+	frames: number;
+	/** Thumbnails per sheet (the last may hold fewer): thumbnail `k` is on sheet
+	 *  `floor(k / columns)`, at `x = (k % columns) * frame_width`, `y = 0`. */
+	columns: number;
+	/** The sheets, in order; together they hold thumbnails `0..frames`. */
+	sheets: FilmstripSheet[];
+}
+
 export type EditSource = 'user' | 'agent' | 'system';
 
 export interface Revision {

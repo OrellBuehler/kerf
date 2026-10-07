@@ -3,7 +3,10 @@
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
+	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
+	import HeightGlyph from './HeightGlyph.svelte';
+	import Minimap from './Minimap.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -16,6 +19,17 @@
 	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
 	import { readPalette } from '$lib/waveform-draw';
+	import { filmstrips } from '$lib/filmstrips';
+	import {
+		HEIGHT_PRESETS,
+		MIXER_MIN_PX,
+		PRESET_LABEL,
+		PRESET_PX,
+		TITLE_METRICS,
+		titleLaneHeight,
+		uniformPreset
+	} from '$lib/track-heights';
+	import type { Target } from '$lib/minimap';
 	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
@@ -48,9 +62,10 @@
 		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 	}
 
-	function trackHeight(t: Track): string {
-		return t.kind === 'video' ? 'var(--track-h-video)' : 'var(--track-h-audio)';
-	}
+	/** A track's lane height: its preset's pixels (`track-heights.ts`). The waveform's
+	 *  lane count and whether a clip shows thumbnails both follow from what they
+	 *  measure of the clip, so nothing else here knows about presets. */
+	const trackHeight = (t: Track): string => `${ui.trackPx(t.id)}px`;
 
 	/** Assets that carry an audio stream, rebuilt only when the bin changes —
 	 *  hasSound runs per track on every timeline update, and a linear asset
@@ -189,6 +204,42 @@
 
 	/** A clip's volume while its line is dragged — the waveform follows it live. */
 	let liveVolume = $state<Record<string, number | null>>({});
+
+	/** The video clips whose thumbnails are on screen: their label gets a backing so
+	 *  it stays legible over a picture, and keeps the plain look until there is one. */
+	let filmReady = $state<Record<string, true>>({});
+
+	// An asset removed from the project frees its decoded sheets rather than
+	// waiting for the cache to age them out.
+	$effect(() => {
+		filmstrips.prune(editor.assets.map((a) => a.id));
+	});
+
+	/** The one height every track is at (the "all tracks" control lights that one),
+	 *  or null when they differ. */
+	const allHeight = $derived(
+		uniformPreset(
+			ui.heights,
+			editor.timeline.tracks.map((t) => t.id)
+		)
+	);
+
+	/** Open a track's height menu under its name button — anchored to the button, not
+	 *  the pointer, so it lands in the same place for a keyboard activation (whose
+	 *  click has no coordinates). */
+	function openHeightMenu(e: MouseEvent, t: Track) {
+		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), heightItems(t));
+	}
+
+	/** The height choices for one track, the current one ticked. */
+	const heightItems = (t: Track): MenuItem[] =>
+		HEIGHT_PRESETS.map((p) => ({
+			label: `${PRESET_LABEL[p]} height`,
+			icon: ui.trackPreset(t.id) === p ? 'check' : undefined,
+			shortcut: `${PRESET_PX[p]} px`,
+			action: () => ui.setTrackHeight(t.id, p)
+		}));
 
 	// ---- interaction: select / razor split / drag-to-move --------------------
 
@@ -871,6 +922,8 @@
 				action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
 			},
 			{ type: 'separator' },
+			...heightItems(t),
+			{ type: 'separator' },
 			{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }
 		];
 	}
@@ -1033,6 +1086,24 @@
 		ui.zoom = next;
 	}
 
+	/** Scroll and zoom the timeline to where the minimap asks. A zoom change goes
+	 *  through `pendingScroll` — the lane has to be re-widened before a scroll can
+	 *  land on it — exactly as a wheel zoom does; an unchanged zoom is just a scroll. */
+	function applyView(target: Target) {
+		const v = viewport();
+		if (!v) return;
+		const zoom = clampZoom(target.zoom, editor.duration);
+		const scroll = Math.max(0, target.scrollLeft);
+		if (zoom === ui.zoom) {
+			// A scroll already waiting on a zoom change is superseded, not raced.
+			if (pendingScroll !== null) pendingScroll = scroll;
+			else v.el.scrollLeft = scroll;
+			return;
+		}
+		pendingScroll = scroll;
+		ui.zoom = zoom;
+	}
+
 	/** Fit the whole cut in the visible width (⇧Z, or the button), from the left. */
 	function fitToWindow() {
 		const v = viewport();
@@ -1062,11 +1133,11 @@
 	// get a lane of their own rather than a section in the clip inspector.
 	// Overlapping items (a title over a run of captions) stack into rows.
 
-	const TITLE_ROW_H = 22;
-	const TITLE_LANE_PAD = 4;
+	// The titles lane is not a track, so it follows the global height choice.
+	const titleMetrics = $derived(TITLE_METRICS[ui.heights.all]);
 	const titleRows = $derived(packRows(editor.overlays));
 	const titleLaneH = $derived(
-		Math.max(1, ...[...titleRows.values()].map((r) => r + 1)) * TITLE_ROW_H + TITLE_LANE_PAD * 2
+		titleLaneHeight(ui.heights.all, Math.max(1, ...[...titleRows.values()].map((r) => r + 1)))
 	);
 
 	type TitleDrag = {
@@ -1393,6 +1464,37 @@
 			><Icon n="between-horizontal-start" s={12} />Ripple</button
 		>
 		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+		<!-- Track height, every track at once (each track's own name button sets just
+		     that one). Lit when every track is at that height. -->
+		<div role="group" aria-label="Track height, all tracks" style="display:inline-flex;align-items:center;gap:2px">
+			{#each HEIGHT_PRESETS as p (p)}
+				<button
+					title="All tracks {PRESET_LABEL[p].toLowerCase()} — {PRESET_PX[p]} px"
+					aria-label="All tracks {PRESET_LABEL[p].toLowerCase()}"
+					aria-pressed={allHeight === p}
+					onclick={() => ui.setAllHeights(p)}
+					style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {allHeight ===
+					p
+						? 'var(--kerf-400)'
+						: 'var(--border-strong)'};background:{allHeight === p ? 'var(--selection-fill)' : 'transparent'};color:{allHeight ===
+					p
+						? 'var(--kerf-300)'
+						: 'var(--text-disabled)'}"><HeightGlyph preset={p} /></button
+				>
+			{/each}
+		</div>
+		<button
+			title={ui.minimap ? 'Hide the overview strip' : 'Show the overview strip of the whole cut'}
+			aria-label="Toggle overview"
+			aria-pressed={ui.minimap}
+			onclick={() => ui.toggleMinimap()}
+			style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {ui.minimap
+				? 'var(--kerf-400)'
+				: 'var(--border-strong)'};background:{ui.minimap ? 'var(--selection-fill)' : 'transparent'};color:{ui.minimap
+				? 'var(--kerf-300)'
+				: 'var(--text-disabled)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
+		>
+		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 		<button
 			title="Add a video track"
 			onclick={() => onAddTrack('video')}
@@ -1406,6 +1508,37 @@
 			>+ A</button
 		>
 	</div>
+
+	<!-- The whole cut on one strip: where the view is, and a way to move it. A
+	     pointer overview, hidden from assistive tech on purpose: everything it does
+	     is already reachable from the keyboard (the scroller itself, the zoom
+	     buttons and + / -, ⇧Z to fit, J / K / L and the playhead's follow) — a
+	     second focusable widget with partial parity would be more to learn than
+	     to use. Its toggle in the toolbar stays labelled. -->
+	{#if ui.minimap && hasClips}
+		<div
+			aria-hidden="true"
+			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
+		>
+			<div
+				style="width:var(--track-header-w);flex:none;box-sizing:border-box;border-right:var(--line-width) solid var(--border-default);display:flex;align-items:center;padding:0 8px;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
+			>
+				Overview
+			</div>
+			<Minimap
+				tracks={editor.timeline.tracks}
+				duration={editor.duration}
+				scrollLeft={scrollX}
+				{viewW}
+				{pxPerSec}
+				time={ui.time}
+				markIn={ui.markIn}
+				markOut={ui.markOut}
+				onview={applyView}
+				onseek={(t) => ui.seek(t)}
+			/>
+		</div>
+	{/if}
 
 	<!-- One scroller for both columns, so headers and lanes cannot desync. The
 	     headers stick to the left, the ruler to the top, and their corner to
@@ -1464,10 +1597,15 @@
 					oncontextmenu={(e) => onTrackHeaderContextMenu(e, t)}
 					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;justify-content:center;gap:4px;padding:0 8px;overflow:hidden"
 				>
-				<div style="display:flex;align-items:center;gap:6px">
-					<span
-						style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary);flex:none"
-						>{t.name}</span
+				<div style="display:flex;align-items:center;gap:5px">
+					<!-- The name is the track's height menu (so is the header's right-click). -->
+					<button
+						title="{t.name} — {PRESET_LABEL[ui.trackPreset(t.id)]} height ({ui.trackPx(t.id)} px). Click to change."
+						aria-label="Track {t.name} height"
+						aria-haspopup="menu"
+						onclick={(e) => openHeightMenu(e, t)}
+						style="flex:none;display:inline-flex;align-items:center;gap:1px;min-height:26px;padding:0;background:none;border:none;cursor:pointer;font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary)"
+						>{t.name}<Icon n="chevron-down" s={10} color="var(--text-disabled)" /></button
 					>
 					<!-- No "Video"/"Audio" caption: the name (V1 / A1) and the eye vs
 					     speaker icon both already say the kind, and the row now carries
@@ -1526,7 +1664,7 @@
 						><Icon n="x" s={12} /></button
 					>
 				</div>
-					{#if hasSound(t)}
+					{#if hasSound(t) && ui.trackPx(t.id) >= MIXER_MIN_PX}
 						<!-- The mixer strip: a fader over every clip on the track, and its
 						     stereo placement. Balancing a music bed against a voice is the
 						     one audio move every cut needs, and doing it clip by clip is
@@ -1719,10 +1857,10 @@
 						oncontextmenu={(e) => onTitleContextMenu(e, o)}
 						onclick={(e) => e.stopPropagation()}
 						title="{o.generated ? 'Caption' : 'Title'}: {o.text}"
-						style="position:absolute;left:{o.start * pxPerSec}px;top:{TITLE_LANE_PAD + row * TITLE_ROW_H}px;height:{TITLE_ROW_H - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))' : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))' : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 					>
 						<span
-							style="position:relative;font-size:10px;font-weight:{o.generated ? 500 : 600};color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							style="position:relative;font-size:{titleMetrics.font}px;font-weight:{o.generated ? 500 : 600};color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 							>{o.text}</span
 						>
 						{#if width > 24}
@@ -1740,7 +1878,7 @@
 					</button>
 					{#if live}
 						<div
-							style="position:absolute;left:{live.start * pxPerSec}px;top:{TITLE_LANE_PAD + row * TITLE_ROW_H}px;height:{TITLE_ROW_H - 3}px;width:{Math.max(
+							style="position:absolute;left:{live.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{Math.max(
 								6,
 								(live.end - live.start) * pxPerSec
 							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
@@ -1811,6 +1949,19 @@
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
+							{:else}
+								<ClipFilmstrip
+									clip={c}
+									{width}
+									{pxPerSec}
+									{dpr}
+									{viewLo}
+									{viewHi}
+									onready={(ready) => {
+										if (ready) filmReady[c.id] = true;
+										else delete filmReady[c.id];
+									}}
+								/>
 							{/if}
 							{#if c.transition_in}
 								<span
@@ -1822,12 +1973,16 @@
 								></span>
 							{/if}
 							<!-- An audio clip's name sits at its foot: the middle belongs to the
-							     waveform (and the line between a stereo clip's lanes). -->
+							     waveform (and the line between a stereo clip's lanes). A video clip's
+							     does too once it has thumbnails, on a backing — a bright frame under
+							     white text is unreadable otherwise. -->
 							<span
 								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{t.kind ===
 								'audio'
 									? 'align-self:flex-end;margin-bottom:3px;text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
-									: ''}"
+									: filmReady[c.id]
+										? 'align-self:flex-end;margin:0 0 3px -4px;padding:1px 5px;border-radius:3px;background:color-mix(in srgb,var(--scrim) 55%,transparent);text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
+										: ''}"
 								>{editor.assetName(c.asset_id)}</span
 							>
 							{#if (c.speed ?? 1) !== 1}
