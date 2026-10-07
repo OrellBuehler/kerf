@@ -408,7 +408,7 @@ pub fn decode_layers(layers: &[PlanLayer]) -> Result<Vec<Option<YuvFrame>>, GpuE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kerf_core::{Color, LayerFx, PlanStream, PlanTiming, Transform};
+    use kerf_core::{Color, LayerFx, Pick, PlanSource, PlanStream, PlanTiming, Transform};
     use uuid::Uuid;
 
     fn layer(is_image: bool) -> PlanLayer {
@@ -417,6 +417,8 @@ mod tests {
             asset_id: Uuid::nil(),
             track: 0,
             path: "/m/a.mp4".into(),
+            source: PlanSource::ORIGINAL,
+            pick: Pick::AtOrAfter(7.0),
             is_image,
             source_time: 7.0,
             clip_time: 0.0,
