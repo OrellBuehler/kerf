@@ -40,18 +40,18 @@ pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
-    composite_color_policy, contact_sheet_times, download_speech_model, export_still, ffmpeg_command, ffmpeg_path, filmstrip_for,
-    generate_proxy, hw_encoders, insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants,
-    render_with, render_with_progress, seek_arg, set_speech_model, speech_model_names, stitch_insta360, stitched_path,
-    stream_preview, validate_export, voiceover_status, waveform_pyramid, waveform_range, waveform_range_of, Container,
-    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, PreviewFrame,
-    RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
-    WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED,
-    MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
+    composite_color_policy, contact_sheet_times, disable_decode_hwaccel, download_speech_model, export_still, ffmpeg_command,
+    ffmpeg_path, filmstrip_for, generate_proxy, hw_encoders, insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path,
+    proxy_width, render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity,
+    speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export, voiceover_status, waveform_pyramid,
+    waveform_range, waveform_range_of, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip,
+    FilmstripSheet, Fit, ImageFormat, PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress,
+    VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE,
+    FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
-pub use frame_pick::{fps_pick, FpsPick, Pick, SourceFrames};
+pub use frame_pick::{fps_pick, FpsPick, Pick, PickProgress, SourceFrames};
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
