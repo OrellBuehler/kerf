@@ -1,14 +1,20 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
+	import ClipOverlays from './ClipOverlays.svelte';
+	import ClipWaveform from './ClipWaveform.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
-	import { gainLabel, panLabel } from '$lib/mixer';
+	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
+	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
+	import { readPalette } from '$lib/waveform-draw';
+	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
 	import { transitionLabel } from '$lib/transitions';
@@ -118,27 +124,44 @@
 	}
 
 	// ---- waveforms -----------------------------------------------------------
+	//
+	// Each audio clip draws its own canvas over only the part of it that is on
+	// screen (`ClipWaveform`), so what the timeline owes it is the viewport — how far
+	// it has scrolled, how wide it is, the pixel ratio — the colours of the active
+	// theme, and the audio length of every asset.
 
-	const WAVE_BUCKETS = 240;
-	// Resolved peaks per asset (reactive). In-flight requests are tracked in a
-	// plain Set, not written into `waveforms`, so the fetch effect doesn't
-	// re-trigger itself by mutating the very state it reads.
-	let waveforms = $state<Record<string, number[]>>({});
-	const inflight = new Set<string>();
+	let scrollX = $state(0);
+	let viewW = $state(1200);
+	let dpr = $state(typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
+
+	function syncView() {
+		const v = viewport();
+		if (!v) return;
+		scrollX = v.el.scrollLeft;
+		viewW = v.viewW;
+		dpr = window.devicePixelRatio || 1;
+	}
 
 	$effect(() => {
-		for (const t of editor.timeline.tracks) {
-			if (t.kind !== 'audio') continue;
-			for (const c of t.clips) {
-				const id = c.asset_id;
-				if (waveforms[id] || inflight.has(id)) continue;
-				inflight.add(id);
-				editor.waveform(id, WAVE_BUCKETS).then((peaks) => {
-					inflight.delete(id);
-					waveforms = { ...waveforms, [id]: peaks };
-				});
-			}
-		}
+		const el = scroller;
+		if (!el) return;
+		syncView();
+		const ro = new ResizeObserver(syncView);
+		ro.observe(el);
+		return () => ro.disconnect();
+	});
+
+	// Two primitives rather than one object: a scroll tick that does not cross a
+	// quantum changes neither, so no clip's waveform is touched by it.
+	const viewLo = $derived(visibleLaneRange(scrollX, viewW).lo);
+	const viewHi = $derived(visibleLaneRange(scrollX, viewW).hi);
+
+	/** A canvas cannot read `var(--waveform)`, so the tokens are resolved here, once
+	 *  per theme change: every theme edit replaces `settings.theme`, and does so
+	 *  right after `applyTheme` has written the tokens this reads back. */
+	const palette = $derived.by(() => {
+		void settings.theme;
+		return readPalette();
 	});
 
 	const assetDuration = $derived.by(() => {
@@ -147,28 +170,8 @@
 		return m;
 	});
 
-	/** Peaks for a clip's source range, down-sampled to about one bar per rendered
-	 *  pixel (max-aggregated so loud transients survive at low zoom). Without this
-	 *  a clip emits up to WAVE_BUCKETS spans regardless of how wide it actually is. */
-	function clipPeaks(c: Clip, width: number): number[] {
-		const all = waveforms[c.asset_id];
-		const dur = assetDuration.get(c.asset_id) ?? 0;
-		if (!all || all.length === 0 || dur <= 0) return [];
-		const lo = Math.floor((c.source_in / dur) * all.length);
-		const hi = Math.max(lo + 1, Math.ceil((c.source_out / dur) * all.length));
-		const slice = all.slice(lo, Math.min(hi, all.length));
-		const target = Math.max(1, Math.min(Math.ceil(width), slice.length));
-		if (target >= slice.length) return slice;
-		const out = new Array<number>(target);
-		for (let i = 0; i < target; i++) {
-			const start = Math.floor((i / target) * slice.length);
-			const end = Math.max(start + 1, Math.floor(((i + 1) / target) * slice.length));
-			let peak = 0;
-			for (let j = start; j < end && j < slice.length; j++) peak = Math.max(peak, slice[j]);
-			out[i] = peak;
-		}
-		return out;
-	}
+	/** A clip's volume while its line is dragged — the waveform follows it live. */
+	let liveVolume = $state<Record<string, number | null>>({});
 
 	// ---- interaction: select / razor split / drag-to-move --------------------
 
@@ -181,9 +184,15 @@
 		dur: number;
 		start: number; // current ghost start (seconds)
 		trackId: string; // current ghost destination track
+		downX: number; // where the pointer went down, px: "moved" is judged on this
 		moved: boolean;
 	};
 	let drag = $state<Drag | null>(null);
+
+	/** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
+	 *  the pointer itself, never on the quantized position: at high zoom one pixel
+	 *  is under a frame, so a 1 px jitter of a click can round to the next frame. */
+	const DRAG_SLOP = 3;
 
 	// ---- edge-dragging trim ---------------------------------------------------
 
@@ -196,6 +205,8 @@
 		origStart: number;
 		origEnd: number;
 		pos: number; // current ghost position of the dragged edge
+		downX: number; // where the pointer went down, px
+		grab: number; // pointer's offset from the edge it grabbed (seconds): the edge follows the pointer, not jumps to it
 		moved: boolean;
 	};
 	let trimDrag = $state<TrimDrag | null>(null);
@@ -209,6 +220,8 @@
 		e.stopPropagation();
 		editor.selectClip(c.id);
 		void editor.select(c.asset_id);
+		const laneLeft =
+			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		// A still image loops, so its source window can grow without limit.
 		const still = asset?.streams.some((s) => s.image) ?? false;
@@ -246,6 +259,8 @@
 			origStart: start,
 			origEnd: end,
 			pos: edge === 'l' ? start : end,
+			downX: e.clientX,
+			grab: laneTime(e.clientX, laneLeft) - (edge === 'l' ? start : end),
 			moved: false
 		};
 		capturePointer(e);
@@ -255,9 +270,11 @@
 		if (!trimDrag) return;
 		const lane = document.querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
-		const pos = Math.min(trimDrag.max, Math.max(trimDrag.min, snapPoint(laneTime(e.clientX, laneLeft), trimDrag.trackId, trimDrag.clipId)));
-		const orig = trimDrag.edge === 'l' ? trimDrag.origStart : trimDrag.origEnd;
-		const moved = trimDrag.moved || Math.abs(pos - orig) >= 2 / pxPerSec;
+		// Where the pointer says the edge is (it keeps the offset it grabbed it at),
+		// rounded once: that is the ghost, and the commit.
+		const raw = laneTime(e.clientX, laneLeft) - trimDrag.grab;
+		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), trimDrag.min, trimDrag.max);
+		const moved = trimDrag.moved || Math.abs(e.clientX - trimDrag.downX) >= DRAG_SLOP;
 		trimDrag = { ...trimDrag, pos, moved };
 	}
 
@@ -266,43 +283,40 @@
 		const d = trimDrag;
 		trimDrag = null;
 		if (!d.moved) return;
+		// A drag that ended on the frame the edge was already on writes nothing.
+		if (Math.abs(d.pos - (d.edge === 'l' ? d.origStart : d.origEnd)) < 1e-9) return;
 		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
 		if (!clip) return;
-		const sp = clip.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
-		if (d.edge === 'r') {
-			const newDur = d.pos - clip.timeline_start;
-			// The end of playback maps to source_out forward, source_in reversed.
-			if (sp < 0) void editor.trim(d.clipId, clip.source_out - newDur * mag, undefined).catch(err);
-			else void editor.trim(d.clipId, undefined, clip.source_in + newDur * mag).catch(err);
-		} else {
-			const delta = (d.pos - d.origStart) * mag; // > 0 shortens from the left
-			if (sp < 0) void editor.trim(d.clipId, undefined, clip.source_out - delta, d.pos).catch(err);
-			else void editor.trim(d.clipId, clip.source_in + delta, undefined, d.pos).catch(err);
-		}
+		// `d.pos` is the gesture's one rounded position (the ghost drew it too); every
+		// field the trim writes comes from it.
+		const e = trimEdit(clip, d.edge, d.pos);
+		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start).catch(err);
 	}
 
-	/** Snap a time point to 0, the playhead, a beat, or another clip's edges. */
-	function snapPoint(time: number, trackId: string, clipId: string): number {
-		if (!ui.snap) return time;
-		const threshold = 8 / pxPerSec;
-		const cands: number[] = [0, ui.time, ...beatTimes];
-		const track = editor.timeline.tracks.find((t) => t.id === trackId);
-		if (track)
-			for (const c of track.clips) {
-				if (c.id === clipId) continue;
-				cands.push(c.timeline_start, c.timeline_start + clipDuration(c));
-			}
-		let best = time;
-		let bestD = threshold;
-		for (const cand of cands) {
-			const d = Math.abs(cand - time);
-			if (d < bestD) {
-				bestD = d;
-				best = cand;
-			}
+	/** The frame rate gestures are quantized to — the cut's own (`export_format`'s). */
+	const fps = $derived(editor.fps);
+
+	/** Every clip edge on a track but `exceptId`'s own: what a placement butts against. */
+	function clipEdges(trackId: string, exceptId: string): number[] {
+		const out: number[] = [];
+		for (const c of editor.timeline.tracks.find((t) => t.id === trackId)?.clips ?? []) {
+			if (c.id !== exceptId) out.push(c.timeline_start, c.timeline_start + clipDuration(c));
 		}
-		return best;
+		return out;
+	}
+
+	/** Where a dragged edge (or a cut) lands: a magnet within reach — 0, the
+	 *  playhead, a beat, a clip edge — when snapping is on, otherwise the nearest
+	 *  frame. Frames are not a magnet: they apply with snapping off too. A landing
+	 *  within a hair of a neighbour's edge is that edge exactly, magnet or not. */
+	function snapPoint(time: number, trackId: string, clipId: string): number {
+		const edges = clipEdges(trackId, clipId);
+		return quantizeTime(time, {
+			fps,
+			magnets: ui.snap ? [0, ui.time, ...beatTimes, ...edges] : [],
+			threshold: 8 / pxPerSec,
+			welds: edges
+		});
 	}
 
 	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
@@ -326,8 +340,15 @@
 		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
-			const at = Math.max(c.timeline_start + 0.05, laneTime(e.clientX, laneLeft));
-			void editor.split(c.id, at).catch(err);
+			// Snapped like any other placement, then held half a frame inside the clip.
+			const at = splitPoint(
+				snapPoint(laneTime(e.clientX, laneLeft), t.id, ''),
+				c.timeline_start,
+				c.timeline_start + clipDuration(c),
+				fps
+			);
+			if (at === null) toast.error('That clip is too short to cut on a frame');
+			else void editor.split(c.id, at).catch(err);
 			return;
 		}
 		editor.selectClip(c.id, mode);
@@ -346,6 +367,7 @@
 			dur: clipDuration(c),
 			start: c.timeline_start,
 			trackId: t.id,
+			downX: e.clientX,
 			moved: false
 		};
 		capturePointer(e);
@@ -358,31 +380,20 @@
 		return null;
 	}
 
-	/** Snap a candidate start to 0, the playhead, a beat, or another clip's edges. */
+	/** Where a clip of `dur` seconds placed near `start` lands: a magnet — 0, the
+	 *  playhead, a beat, a clip edge, either of its own edges against any of them —
+	 *  when snapping is on, otherwise the nearest frame for its start. */
 	function snapStart(start: number, trackId: string, clipId: string, dur: number): number {
-		const clamped = Math.max(0, start);
-		if (!ui.snap) return clamped;
-		const threshold = 8 / pxPerSec;
-		const cands: number[] = [0, ui.time];
-		for (const b of beatTimes) cands.push(b, b - dur); // land either edge on a beat
-		const track = editor.timeline.tracks.find((t) => t.id === trackId);
-		if (track)
-			for (const c of track.clips) {
-				if (c.id === clipId) continue;
-				const cs = c.timeline_start;
-				const ce = c.timeline_start + clipDuration(c);
-				cands.push(cs, ce, cs - dur); // align heads, butt after, butt before
-			}
-		let best = clamped;
-		let bestD = threshold;
-		for (const cand of cands) {
-			const d = Math.abs(cand - start);
-			if (d < bestD) {
-				bestD = d;
-				best = Math.max(0, cand);
-			}
+		const edges = clipEdges(trackId, clipId);
+		const magnets: number[] = [];
+		if (ui.snap) {
+			magnets.push(0, ui.time);
+			for (const b of beatTimes) magnets.push(b, b - dur); // land either edge on a beat
+			// align heads, butt after, butt before
+			// `startBefore`, not `edge - dur`: the latter can end an ULP past the edge it butts.
+			for (let i = 0; i < edges.length; i += 2) magnets.push(edges[i], edges[i + 1], startBefore(edges[i], dur));
 		}
-		return best;
+		return quantizeSpanStart(start, dur, { fps, magnets, threshold: 8 / pxPerSec, welds: edges });
 	}
 
 	// A lost pointerup (released outside the window, over a native dialog, an
@@ -485,7 +496,7 @@
 		}
 		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.clipId, drag.dur);
 		const movedEnough =
-			drag.moved || trackId !== drag.origTrackId || Math.abs(start - drag.origStart) >= 3 / pxPerSec;
+			drag.moved || trackId !== drag.origTrackId || Math.abs(e.clientX - drag.downX) >= DRAG_SLOP;
 		drag = { ...drag, start: movedEnough ? start : drag.start, trackId, moved: movedEnough };
 	}
 
@@ -675,7 +686,12 @@
 				icon: 'Scissors',
 				shortcut: 'C',
 				disabled: !within || !!t.locked,
-				action: () => void editor.split(c.id, ui.time).catch(err)
+				action: () => {
+					// The playhead can be anywhere between frames; the cut is on one.
+					const at = splitPoint(quantizeTime(ui.time, { fps }), c.timeline_start, c.timeline_start + clipDuration(c), fps);
+					if (at === null) toast.error('That clip is too short to cut on a frame');
+					else void editor.split(c.id, at).catch(err);
+				}
 			},
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
@@ -1020,8 +1036,10 @@
 	onpointerup={onPointerUp}
 	onpointercancel={onPointerCancel}
 	onblur={onWindowBlur}
+	onresize={syncView}
 	onkeydown={(e) => {
-		if (e.key === 'Escape' && titleDrag) resetDragState();
+		// Escape gives a clip, edge or title drag up without writing anything.
+		if (e.key === 'Escape' && (drag || trimDrag || titleDrag)) resetDragState();
 	}}
 />
 
@@ -1122,6 +1140,7 @@
 	<div
 		bind:this={scroller}
 		onwheel={onWheel}
+		onscroll={syncView}
 		style="flex:1;min-height:0;overflow:auto;position:relative;display:flex;align-items:flex-start"
 	>
 		<!-- track headers -->
@@ -1225,7 +1244,7 @@
 							<input
 								type="range"
 								min="0"
-								max={Math.max(2, t.volume ?? 1)}
+								max={Math.max(MAX_GAIN, t.volume ?? 1)}
 								step="0.01"
 								value={t.volume ?? 1}
 								disabled={editor.busy}
@@ -1451,10 +1470,11 @@
 						{@const dragging = drag?.moved && drag.clipId === c.id}
 						{@const off = c.enabled === false || !renders(t)}
 						<button
+							class="kclip"
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 							onclick={(e) => e.stopPropagation()}
-							style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
+							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
 								? 'grayscale(1)'
 								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{t.locked
 								? 'not-allowed'
@@ -1469,36 +1489,24 @@
 									: 'none'}"
 						>
 							{#if t.kind === 'audio'}
-								{@const peaks = clipPeaks(c, width)}
-								{#if peaks.length}
-									<div style="position:absolute;inset:0;display:flex;align-items:center;gap:1px;padding:0 2px;opacity:.5">
-										{#each peaks as p, i (i)}
-											<span style="flex:1;height:{Math.max(6, p * 100)}%;background:var(--waveform);border-radius:1px"></span>
-										{/each}
-									</div>
-								{:else}
-									<div
-										style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, var(--waveform) 0 1px, transparent 1px 3px);opacity:.35;mask-image:linear-gradient(transparent 28%, #000 28%, #000 72%, transparent 72%)"
-									></div>
-								{/if}
+								<ClipWaveform
+									clip={c}
+									{width}
+									{pxPerSec}
+									{dpr}
+									{viewLo}
+									{viewHi}
+									trackVolume={t.volume ?? 1}
+									liveVolume={liveVolume[c.id] ?? null}
+									duration={assetDuration.get(c.asset_id) ?? c.source_out}
+									{palette}
+								/>
 								{#each silenceRegions(c) as r (r.left)}
 									<span
 										title="Detected silence"
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
-							{/if}
-							{#if c.fade_in > 0}
-								<span
-									title="Fade in {c.fade_in.toFixed(2)}s"
-									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
-								></span>
-							{/if}
-							{#if c.fade_out > 0}
-								<span
-									title="Fade out {c.fade_out.toFixed(2)}s"
-									style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
-								></span>
 							{/if}
 							{#if c.transition_in}
 								<span
@@ -1509,8 +1517,13 @@
 									)}px;background:linear-gradient(to right, color-mix(in srgb,var(--drag-ghost) 55%,transparent), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
 								></span>
 							{/if}
+							<!-- An audio clip's name sits at its foot: the middle belongs to the
+							     waveform (and the line between a stereo clip's lanes). -->
 							<span
-								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{t.kind ===
+								'audio'
+									? 'align-self:flex-end;margin-bottom:3px;text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
+									: ''}"
 								>{editor.assetName(c.asset_id)}</span
 							>
 							{#if (c.speed ?? 1) !== 1}
@@ -1521,18 +1534,27 @@
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
 							{/if}
-							{#if ui.tool === 'pointer' && width > 24}
-								<span
-									role="presentation"
-									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'l')}
-									style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-								></span>
-								<span
-									role="presentation"
-									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'r')}
-									style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-								></span>
-							{/if}
+							<ClipOverlays
+								clip={c}
+								{width}
+								{pxPerSec}
+								{fps}
+								sound={audibleAssets.has(c.asset_id)}
+								{selected}
+								locked={!!t.locked}
+								razor={ui.tool === 'razor'}
+								trimEdge={trimDrag?.clipId === c.id ? trimDrag.edge : null}
+								onlive={(v) => (liveVolume[c.id] = v)}
+								onselect={() => {
+									editor.selectClip(c.id);
+									void editor.select(c.asset_id);
+								}}
+								onvolume={(v) => editor.setVolume(c.id, v).catch(err)}
+								onfade={(which, v) =>
+									(which === 'in' ? editor.setFade(c.id, v) : editor.setFade(c.id, undefined, v)).catch(err)}
+								onseek={(time) => ui.seek(time)}
+								onedge={(e, edge) => onEdgePointerDown(e, c, t, edge)}
+							/>
 						</button>
 					{/each}
 					{#if drag?.moved && drag.trackId === t.id}

@@ -22,7 +22,6 @@ import {
 	getAssetMetadata,
 	getHistory,
 	getTimeline,
-	getWaveform,
 	importAsset,
 	listAssets,
 	addTrack,
@@ -152,7 +151,6 @@ class EditorState {
 	importProgress = $state<number | null>(null);
 	error = $state<string | null>(null);
 
-	#waveforms = new Map<string, number[] | Promise<number[]>>();
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline: Timeline | null = null;
 	/** Snapshot guard over `timeline` — every writer bumps it (via `#setTimeline`)
@@ -534,28 +532,6 @@ class EditorState {
 			this.selectedMetadata = { ...this.selectedMetadata, analysis };
 		}
 		return analysis;
-	}
-
-	/** Cached waveform peaks for an asset's audio. Single-flight: concurrent
-	 *  callers for the same asset share one in-flight request instead of each
-	 *  kicking off their own whole-file decode. */
-	waveform(assetId: string, buckets: number): Promise<number[]> {
-		const key = `${assetId}:${buckets}`;
-		const cached = this.#waveforms.get(key);
-		if (cached) return Promise.resolve(cached);
-		const pending = getWaveform(assetId, buckets).then(
-			(peaks) => {
-				this.#waveforms.set(key, peaks);
-				return peaks;
-			},
-			() => {
-				// Transient failure: drop the entry so a later caller retries.
-				this.#waveforms.delete(key);
-				return [];
-			}
-		);
-		this.#waveforms.set(key, pending);
-		return pending;
 	}
 
 	// ---- editing actions (apply backend result to local timeline) -----------

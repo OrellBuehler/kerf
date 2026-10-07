@@ -44,13 +44,15 @@ import type {
 	VoiceoverProgress,
 	VoiceoverRequest,
 	VoiceoverResult,
-	VoiceoverStatus
+	VoiceoverStatus,
+	WaveformRange
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
+import { synthWaveformRange } from './sample-waveform';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
@@ -1894,6 +1896,48 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 		});
 	}
 	return invoke<number[]>('get_waveform', { assetId, buckets });
+}
+
+/**
+ * `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
+ * peak pairs per channel, `[channel][bucket]` in -1..1 — what a clip's waveform
+ * is drawn from. Served from a peak pyramid the backend caches per file, so the
+ * first call for a file decodes it and every later window at any zoom is cheap;
+ * the backend caps `buckets` at 4096 and `buckets` in the answer is what came
+ * back. Part of the window outside the media reads 0 / 0. Rejects for an asset
+ * with no audio stream. Outside the desktop app a deterministic synthetic
+ * waveform stands in, with a clipped stretch so the clipping colour shows.
+ */
+export async function getWaveformRange(
+	assetId: string,
+	start: number,
+	end: number,
+	buckets: number
+): Promise<WaveformRange> {
+	// The backend takes a `usize`: a fractional pixel width would be an opaque
+	// deserialize error rather than a slightly different column count.
+	const count = Math.max(0, Math.round(buckets));
+	if (!inTauri()) {
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		const audio = asset.streams.find((st) => st.kind === 'audio');
+		if (!audio) throw new Error(`invalid argument: asset ${assetId} has no audio stream`);
+		const analysis = sampleAnalysis[assetId];
+		return synthWaveformRange(
+			{
+				id: asset.id,
+				duration: asset.duration,
+				channels: audio.channels ?? 2,
+				silence: analysis?.silence_segments,
+				kind: analysis?.audio_class?.class === 'music' ? 'music' : 'speech',
+				bpm: analysis?.tempo?.bpm
+			},
+			start,
+			end,
+			count
+		);
+	}
+	return invoke<WaveformRange>('get_waveform_range', { assetId, start, end, buckets: count });
 }
 
 /**

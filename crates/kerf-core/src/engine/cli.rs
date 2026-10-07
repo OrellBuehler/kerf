@@ -83,7 +83,7 @@ pub(super) fn ffmpeg_bin() -> String {
     std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
 }
 
-fn ffprobe_bin() -> String {
+pub(super) fn ffprobe_bin() -> String {
     std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
 }
 
@@ -1538,7 +1538,7 @@ pub fn proxy_width(projection: Option<Projection>) -> u32 {
 /// FNV-1a over `s`. A small, dependency-free, deterministic hash for naming a
 /// source's proxy file — stability across sessions is what lets a re-import
 /// reuse the cached proxy (a non-deterministic hasher would orphan it).
-fn fnv1a(s: &str) -> u64 {
+pub(super) fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
         h ^= *b as u64;
@@ -1550,8 +1550,9 @@ fn fnv1a(s: &str) -> u64 {
 /// A content key for `src` that changes whenever the file is replaced: its path
 /// plus size and modified time. Hashed into a cache file name so re-imports of
 /// the same source reuse the cached artifact, while a swapped-out source
-/// regenerates one. Shared by the proxy cache and the Insta360 stitch cache.
-fn source_key(src: &Path) -> String {
+/// regenerates one. Shared by the proxy cache, the Insta360 stitch cache and
+/// the waveform peak cache.
+pub(super) fn source_key(src: &Path) -> String {
     let meta = std::fs::metadata(src).ok();
     let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = meta

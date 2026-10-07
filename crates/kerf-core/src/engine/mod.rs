@@ -23,6 +23,14 @@ pub struct ProbeResult {
 
 mod cli;
 
+// Waveform peak pyramids and the windows read out of them: one decode per file,
+// cached, drawn from at any zoom. Also CLI-only, so it works in every build.
+mod peaks;
+pub use peaks::{
+    waveform_pyramid, waveform_range, waveform_range_of, WaveformLevel, WaveformPyramid, WaveformRange,
+    MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
+};
+
 /// Test-only: run the ffmpeg commands that synthesize media under a deadline, so
 /// a wedged binary fails the test with its command line instead of holding the
 /// suite until the CI job's own timeout cancels it.

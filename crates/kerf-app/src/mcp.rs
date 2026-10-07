@@ -767,6 +767,24 @@ struct WaveformParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WaveformRangeParams {
+    #[schemars(description = "UUID of the asset (it must have an audio stream)")]
+    asset_id: String,
+    #[schemars(
+        description = "Start of the window in SOURCE seconds — time within the asset's own audio, from 0 at the start of the file, not timeline time. Part of the window before 0 reads as silence."
+    )]
+    start: f64,
+    #[schemars(
+        description = "End of the window in SOURCE seconds; must be greater than start. Part of the window past the end of the audio reads as silence."
+    )]
+    end: f64,
+    #[schemars(
+        description = "Number of buckets to split the window into (1–4096, capped). A few hundred shows the shape of a whole file; to see exactly where a word or beat begins, ask for a short window instead of more buckets."
+    )]
+    buckets: usize,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct FrameParams {
     #[schemars(description = "UUID of the asset")]
     asset_id: String,
@@ -2259,6 +2277,29 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Read what an asset's audio looks like over a window: the lowest and highest sample value in each of `buckets` equal slices of source time [start, end), per channel. Unlike get_waveform (one unsigned magnitude per bucket across the whole file) it is signed, one lane per channel (stereo gives two, mono one) and zoomable: ask for the whole asset in a few hundred buckets to find the loud, quiet and silent stretches, then ask again for a short window around one of them to find the exact moment a word, beat or click starts — the way to pick a cut point. Returns compact JSON {channels, buckets, duration, peaks_per_second, min, max}. `min` and `max` are each an array of `channels` arrays of `buckets` numbers in -1.0..1.0; bucket j covers source time start + j * (end - start) / buckets. `duration` is the length of the audio in seconds: a bucket before 0 or past it reads 0.0 / 0.0, so use `duration` to tell where the audio ends from silence. A value of exactly 1.0 or -1.0 is a clipped sample, and a run of them is distortion already baked into the source. `peaks_per_second` is the stored resolution the buckets were read from (10, 25, 100 or 500); when it is below buckets / (end - start) the request was finer than the stored 500 per second and neighbouring buckets repeat, so a shorter window will not reveal more. An asset with no audio stream (video-only footage, a still image) is rejected. The first call for a long file decodes it once, which can take seconds; every later window of that file is instant."
+    )]
+    async fn get_waveform_range(&self, Parameters(p): Parameters<WaveformRangeParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        require_window(p.start, p.end)?;
+        let (start, end) = (p.start, p.end);
+        let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
+        let project = self.project.clone();
+        let range = blocking(move || {
+            // Resolve under the lock, read the pyramid with it released — the
+            // first call for a file decodes all of its audio, which must not
+            // stall the GUI's commands on the shared mutex.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            Project::decode_waveform_range(&asset, start, end, count).map_err(core_err)
+        })
+        .await?;
+        // Compact, not `json()`'s pretty print: that puts every number of
+        // four 4096-long arrays on its own indented line, roughly doubling
+        // what the model has to read for the same peaks.
+        serde_json::to_string(&range).map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
         description = "Get an RMS energy envelope (0.0–1.0 per bucket) for an asset's first audio stream — a perceptual loudness-over-time curve. Unlike the peak waveform, it tracks how loud each slice feels, so use it to find quiet/loud passages and match cut pacing to musical energy."
     )]
     async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
@@ -2872,6 +2913,22 @@ fn track_gaps(track: &kerf_core::Track) -> Vec<Gap> {
     gaps
 }
 
+/// A window of source time a tool can read. The engine answers an empty,
+/// inverted or non-finite one with `buckets` silent buckets — right for the
+/// timeline, whose windows are clips it already holds, but to a model a wall of
+/// zeros reads as "this part is silent", so a swapped `start` and `end` is
+/// reported as the mistake it is.
+fn require_window(start: f64, end: f64) -> Result<(), McpError> {
+    if start.is_finite() && end.is_finite() && end > start {
+        Ok(())
+    } else {
+        Err(McpError::invalid_params(
+            format!("the window must have end greater than start, got start={start}, end={end}"),
+            None,
+        ))
+    }
+}
+
 /// Refuse to silently clobber an existing file. A model that hallucinates or
 /// mis-remembers a path would otherwise destroy whatever is already there with
 /// no recourse — this is the write side of `require_local_output_path`.
@@ -2905,8 +2962,8 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite, router,
-        server_identity, track_gaps,
+        allowed_hosts, core_err, describe_server_error, fmt_ts, image_result, log_tool_error, refuse_overwrite, require_window,
+        router, server_identity, track_gaps,
     };
 
     #[test]
@@ -3213,5 +3270,52 @@ mod tests {
             .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         assert_eq!(required, ["path"]);
+    }
+
+    /// The window is the whole point of `get_waveform_range`, so all four
+    /// arguments are required and the schema has to say what they are in terms a
+    /// model that has never seen the timeline can act on (source seconds, not
+    /// timeline time).
+    #[test]
+    fn the_waveform_range_tool_takes_a_source_window() {
+        let tools = router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "get_waveform_range")
+            .expect("get_waveform_range is registered");
+        let mut required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        required.sort_unstable();
+        assert_eq!(required, ["asset_id", "buckets", "end", "start"]);
+
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("input schema has properties");
+        for name in ["start", "end"] {
+            let described = properties[name]
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            assert!(described.contains("SOURCE seconds"), "{name}: {described}");
+        }
+    }
+
+    /// A swapped or empty window is a mistake the model can fix, not a silent
+    /// stretch of audio — the engine's answer to one is a row of zeros.
+    #[test]
+    fn a_waveform_window_must_run_forwards() {
+        use rmcp::model::ErrorCode;
+        assert!(require_window(0.0, 1.0).is_ok());
+        assert!(require_window(-2.0, 0.5).is_ok(), "a window may begin before the media");
+        for (start, end) in [(5.0, 1.0), (3.0, 3.0), (0.0, f64::NAN), (f64::INFINITY, 1.0)] {
+            let e = require_window(start, end).expect_err("not a forward window");
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{start}..{end}");
+        }
     }
 }

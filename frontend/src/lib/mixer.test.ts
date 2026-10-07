@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { gainLabel, isUnityMix, panGains, panLabel } from './mixer';
+import { dbToGain, effectiveGain, gainLabel, gainToDb, isUnityMix, panGains, panLabel } from './mixer';
 
 describe('panGains', () => {
 	test('centre is exactly unity on both sides', () => {
@@ -47,5 +47,37 @@ describe('isUnityMix', () => {
 		expect(isUnityMix(1, 0)).toBe(true);
 		expect(isUnityMix(0.5, 0)).toBe(false);
 		expect(isUnityMix(1, -0.2)).toBe(false);
+	});
+});
+
+describe('dB and linear gain', () => {
+	test('round-trip, with silence at -Infinity', () => {
+		expect(gainToDb(1)).toBe(0);
+		expect(gainToDb(0.5)).toBeCloseTo(-6.0206, 4);
+		expect(gainToDb(2)).toBeCloseTo(6.0206, 4);
+		expect(gainToDb(0)).toBe(-Infinity);
+		expect(dbToGain(-Infinity)).toBe(0);
+		expect(dbToGain(0)).toBe(1);
+		for (const v of [0.01, 0.25, 0.7, 1, 1.9, 3.9]) expect(dbToGain(gainToDb(v))).toBeCloseTo(v, 12);
+	});
+
+	test('agrees with the label a fader reads', () => {
+		expect(gainLabel(dbToGain(-12))).toBe('-12.0 dB');
+		expect(gainLabel(dbToGain(3))).toBe('+3.0 dB');
+	});
+});
+
+describe('effectiveGain', () => {
+	test('is the clip gain through the track fader, both unity by default', () => {
+		expect(effectiveGain(undefined, undefined)).toBe(1);
+		expect(effectiveGain(0.5, 0.5)).toBe(0.25);
+		expect(effectiveGain(2, 0.5)).toBe(1);
+		expect(effectiveGain(1, undefined)).toBe(1);
+		expect(effectiveGain(undefined, 0.8)).toBe(0.8);
+	});
+
+	test('never negative', () => {
+		expect(effectiveGain(-1, 1)).toBe(0);
+		expect(effectiveGain(1, -2)).toBe(0);
 	});
 });
