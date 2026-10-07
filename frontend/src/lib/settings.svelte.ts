@@ -13,6 +13,16 @@ import { exportThemeFile, getSettings, importThemeFile, setSettings } from './ap
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
+import { singleFlight } from './single-flight';
+import {
+	defaultWorkspaces,
+	libraryTabFor,
+	parseWorkspaces,
+	withLibraryTab,
+	type LibraryTab,
+	type WorkspaceId,
+	type WorkspacesState
+} from './workspaces';
 import type { AppSettings, SettingsView } from './types';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -55,8 +65,17 @@ class SettingsStore {
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
-	/** The saved workspace arrangement, read once when the dock is built. */
-	layout = $state<unknown>(null);
+	/** The workspaces — which is active, how each is arranged, the library
+	 *  rail's tabs and collapsed state. Read once when the dock is built; from
+	 *  then on this is the live copy (a view coming back from a write never
+	 *  replaces it) and every change is written through, newest wins. Replaced,
+	 *  never mutated, so the dockview JSON inside is not proxied. */
+	workspaces = $state.raw<WorkspacesState>(defaultWorkspaces());
+	private workspacesRead = false;
+	/** Writes `workspaces` one at a time, reading it as each starts. */
+	private writeWorkspaces = singleFlight(async () => {
+		await this.write({ workspaces: this.workspaces }, 'workspace layout');
+	});
 	theme = $state<Theme>(PRESETS['kerf-dark']);
 	/** Color edits apply at once and are written a moment later; while one is
 	 *  pending, a view coming back from another write must not overwrite the
@@ -82,7 +101,10 @@ class SettingsStore {
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
-		this.layout = view.layout;
+		if (!this.workspacesRead) {
+			this.workspaces = parseWorkspaces(view.workspaces, view.layout);
+			this.workspacesRead = true;
+		}
 		if (!this.themeDirty) {
 			this.theme = parseTheme(view.theme) ?? PRESETS['kerf-dark'];
 			applyTheme(this.theme);
@@ -97,6 +119,7 @@ class SettingsStore {
 			// Not worth a toast at launch: the dialog just shows the defaults.
 			console.error('could not read settings', e);
 		} finally {
+			this.workspacesRead = true;
 			this.loaded = true;
 		}
 	}
@@ -138,10 +161,54 @@ class SettingsStore {
 		await this.write({ safe_areas: on }, 'safe-area setting');
 	}
 
-	/** Remember the workspace arrangement. */
-	async setLayout(layout: unknown) {
-		this.layout = layout;
-		await this.write({ layout }, 'layout');
+	/** The tab the library shows in the active workspace. Each workspace keeps
+	 *  its own, so picking Transcript while editing does not follow you to Color. */
+	get libraryTab(): LibraryTab {
+		return libraryTabFor(this.workspaces, this.workspaces.active);
+	}
+
+	get libraryCollapsed(): boolean {
+		return this.workspaces.library.collapsed;
+	}
+
+	/** Change the live workspaces and write them through (see `singleFlight`: a
+	 *  dock save, a rail click and a switch can overlap). */
+	private changeWorkspaces(next: WorkspacesState) {
+		this.workspaces = next;
+		this.writeWorkspaces.request();
+	}
+
+	/** Make `id` the workspace the app opens on. */
+	setActiveWorkspace(id: WorkspaceId) {
+		if (id === this.workspaces.active) return;
+		this.changeWorkspaces({ ...this.workspaces, active: id });
+	}
+
+	/** Remember how `id` is arranged now. */
+	saveWorkspaceLayout(id: WorkspaceId, layout: unknown) {
+		this.changeWorkspaces({
+			...this.workspaces,
+			layouts: { ...this.workspaces.layouts, [id]: layout as WorkspacesState['layouts'][WorkspaceId] }
+		});
+	}
+
+	/** Forget how `id` was arranged, so it is its preset again. */
+	clearWorkspaceLayout(id: WorkspaceId) {
+		if (!(id in this.workspaces.layouts)) return;
+		const layouts = { ...this.workspaces.layouts };
+		delete layouts[id];
+		this.changeWorkspaces({ ...this.workspaces, layouts });
+	}
+
+	/** Pick the library's tab for the active workspace. */
+	setLibraryTab(tab: LibraryTab) {
+		if (tab === this.libraryTab) return;
+		this.changeWorkspaces(withLibraryTab(this.workspaces, this.workspaces.active, tab));
+	}
+
+	setLibraryCollapsed(collapsed: boolean) {
+		if (collapsed === this.workspaces.library.collapsed) return;
+		this.changeWorkspaces({ ...this.workspaces, library: { ...this.workspaces.library, collapsed } });
 	}
 
 	/** Put a theme into force now and save it shortly — a color picker fires

@@ -667,11 +667,16 @@ export interface AppSettings {
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;
-	/** The workspace arrangement (dockview's serialized layout), validated by
-	 *  `layout.ts` on the way back in. */
+	/** The single dock arrangement saved before there were workspaces (dockview's
+	 *  serialized layout). Read only to migrate it into the Edit workspace when
+	 *  `workspaces` is absent; nothing writes it any more. */
 	layout: unknown | null;
 	/** The color theme, validated by `theme.ts` on the way back in. */
 	theme: unknown | null;
+	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> },
+	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
+	 *  back in. Opaque to the backend. */
+	workspaces: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

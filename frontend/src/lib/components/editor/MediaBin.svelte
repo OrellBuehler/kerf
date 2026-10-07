@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
@@ -10,6 +11,7 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { getFrame, inTauri, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { thumbnails } from '$lib/thumbnails';
 	import { analysisFacts, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
 
@@ -22,31 +24,34 @@
 	);
 
 	// One decoded frame per asset, so a row shows the footage rather than an icon.
-	// Cached across mounts (the panel is dockable, and a re-dock would otherwise
-	// re-decode every asset); `null` in the browser harness, where the icon stays.
-	const thumbCache = new Map<string, string | null>();
+	// The frames live in `thumbnails`, outside this component: the library remounts
+	// the bin on every tab switch, unfold and workspace switch, and each remount
+	// would otherwise decode every asset again. `null` in the browser harness,
+	// where the icon stays. A remount starts from what is already cached, so the
+	// rows never flash back to icons.
+	let thumbs = $state<Record<string, string>>(
+		Object.fromEntries(
+			untrack(() => editor.assets).flatMap((a) => {
+				const url = thumbnails.peek(a.id);
+				return url ? [[a.id, url]] : [];
+			})
+		)
+	);
 	const requested = new Set<string>();
-	let thumbs = $state<Record<string, string>>({});
 
 	$effect(() => {
+		// Frames of assets that were removed are dropped with them.
+		thumbnails.prune(assets.map((a) => a.asset.id));
 		for (const { asset, info } of assets) {
 			if (requested.has(asset.id)) continue;
 			requested.add(asset.id);
-			const cached = thumbCache.get(asset.id);
-			if (cached !== undefined) {
-				if (cached) thumbs[asset.id] = cached;
-				continue;
-			}
 			if (info.kind === 'audio') {
-				thumbCache.set(asset.id, null);
+				thumbnails.none(asset.id);
 				continue;
 			}
-			void getFrame(asset.id, thumbTime(asset.duration), 160, false)
-				.then((url) => {
-					thumbCache.set(asset.id, url);
-					if (url) thumbs[asset.id] = url;
-				})
-				.catch(() => thumbCache.set(asset.id, null));
+			void thumbnails.load(asset.id, () => getFrame(asset.id, thumbTime(asset.duration), 160, false)).then((url) => {
+				if (url) thumbs[asset.id] = url;
+			});
 		}
 	});
 

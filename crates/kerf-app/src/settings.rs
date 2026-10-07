@@ -42,6 +42,12 @@ pub struct Settings {
     /// The color theme. Opaque for the same reason — the frontend owns the
     /// token list, presets and the JSON file format.
     pub theme: Option<serde_json::Value>,
+    /// The workspaces: which one is active, the saved arrangement of each, and
+    /// the state of the library rail. Opaque like `layout` and `theme` — the
+    /// frontend owns the shape, validates it on the way back in and falls back
+    /// to its presets. `layout` is kept as the pre-workspaces arrangement the
+    /// frontend migrates into the Edit workspace when this is absent.
+    pub workspaces: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -52,6 +58,7 @@ impl Default for Settings {
             safe_areas: false,
             layout: None,
             theme: None,
+            workspaces: None,
         }
     }
 }
@@ -82,14 +89,15 @@ pub struct SettingsView {
     pub cpu_min_percent: u8,
     pub layout: Option<serde_json::Value>,
     pub theme: Option<serde_json::Value>,
+    pub workspaces: Option<serde_json::Value>,
 }
 
 impl SettingsView {
     /// The engine-held preferences read straight from the engine rather than
     /// from the stored file, so what the dialog shows is what is actually in
     /// force — including an environment override the user set outside the
-    /// app. The layout and theme only exist in the file, so those come from
-    /// `stored`.
+    /// app. The layout, theme and workspaces only exist in the file, so those
+    /// come from `stored`.
     pub fn current(stored: &Settings) -> Self {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
@@ -100,6 +108,7 @@ impl SettingsView {
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
             layout: stored.layout.clone(),
             theme: stored.theme.clone(),
+            workspaces: stored.workspaces.clone(),
         }
     }
 }
@@ -111,7 +120,7 @@ impl SettingsView {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`].
-const KEYS: [&str; 5] = ["cpu_percent", "transcribe", "safe_areas", "layout", "theme"];
+const KEYS: [&str; 6] = ["cpu_percent", "transcribe", "safe_areas", "layout", "theme", "workspaces"];
 
 fn path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|dir| dir.join("settings.json"))
@@ -191,8 +200,8 @@ fn save_to(file: &Path, settings: &Settings) -> Result<(), String> {
 }
 
 /// Merge a patch — a JSON object holding only the fields that changed — into
-/// `settings`. A field present with `null` clears it (the layout and theme are
-/// nullable); a field left out is untouched.
+/// `settings`. A field present with `null` clears it (the layout, theme and
+/// workspaces are nullable); a field left out is untouched.
 fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, String> {
     let serde_json::Value::Object(patch) = patch else {
         return Err("a settings patch must be an object".to_string());
@@ -268,6 +277,7 @@ mod tests {
         assert!(s.transcribe);
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
+        assert!(s.workspaces.is_none());
     }
 
     #[test]
@@ -282,6 +292,46 @@ mod tests {
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.layout, Some(layout));
         assert_eq!(back.theme, Some(theme));
+    }
+
+    #[test]
+    fn workspaces_round_trip_untouched_beside_the_legacy_layout() {
+        let layout = serde_json::json!({"grid": {"root": {"type": "leaf"}}, "panels": {}});
+        let workspaces = serde_json::json!({
+            "active": "color",
+            "layouts": {"edit": {"grid": {}, "panels": {}}},
+            "library": {"tab": "effects", "collapsed": true}
+        });
+        let s = Settings {
+            layout: Some(layout.clone()),
+            workspaces: Some(workspaces.clone()),
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.workspaces, Some(workspaces.clone()));
+        assert_eq!(back.layout, Some(layout));
+        // And it is what the webview is handed back.
+        assert_eq!(SettingsView::current(&back).workspaces, Some(workspaces));
+    }
+
+    #[test]
+    fn a_workspaces_patch_changes_only_that_field() {
+        let base = Settings {
+            cpu_percent: 40,
+            layout: Some(serde_json::json!({"grid": 1})),
+            theme: Some(serde_json::json!({"name": "Mine"})),
+            workspaces: Some(serde_json::json!({"active": "edit"})),
+            ..Settings::default()
+        };
+        let next = serde_json::json!({"active": "audio", "library": {"tab": "audio", "collapsed": false}});
+        let merged = merge(&base, &serde_json::json!({ "workspaces": next })).unwrap();
+        assert_eq!(merged.workspaces, Some(next));
+        assert_eq!(merged.cpu_percent, 40);
+        assert_eq!(merged.layout, base.layout);
+        assert_eq!(merged.theme, base.theme);
+        // A null clears it, back to "never customized".
+        let cleared = merge(&merged, &serde_json::json!({"workspaces": null})).unwrap();
+        assert!(cleared.workspaces.is_none());
     }
 
     fn scratch() -> PathBuf {
