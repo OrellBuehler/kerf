@@ -57,7 +57,14 @@ import {
 	TriangleAlert,
 	Lightbulb,
 	ExternalLink,
-	Bell
+	Bell,
+	Type,
+	Sparkles,
+	Blend,
+	FileText,
+	ChevronLeft,
+	ChevronRight,
+	PackageCheck
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -119,7 +126,14 @@ export const icons: Record<string, LucideIcon> = {
 	'alert-triangle': TriangleAlert,
 	'lightbulb': Lightbulb,
 	'bell': Bell,
-	'settings': Settings
+	'settings': Settings,
+	'type': Type,
+	'sparkles': Sparkles,
+	'blend': Blend,
+	'file-text': FileText,
+	'chevron-left': ChevronLeft,
+	'chevron-right': ChevronRight,
+	'package-check': PackageCheck
 };
 
 export type IconName = keyof typeof icons;

@@ -43,7 +43,7 @@
 			return { title: ui.analysisLabel ?? 'analyzing', body: ui.analysisStage?.detail ?? undefined };
 		}
 		if (!editor.selectedAssetId) {
-			return { title: 'No media selected', body: 'Pick a clip in the Media panel to see its transcript.' };
+			return { title: 'No media selected', body: 'Pick a clip in the Media tab of the Library to see its transcript.' };
 		}
 		if (st && !st.available) {
 			return { title: 'Transcription unavailable', body: st.reason ?? undefined };

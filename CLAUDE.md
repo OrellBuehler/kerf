@@ -813,11 +813,13 @@ the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
-The file also carries the **workspace layout** and the **color theme** as two
-opaque `serde_json::Value`s — the frontend owns their shape and validates them
-on the way back in, so `get_settings` re-reads the file for those where the
-engine-held values are read live). **`set_settings` takes a patch**, not the
-whole object — only the fields that changed (`{layout}`, `{theme}`,
+The file also carries the **workspaces** (which one is active, each one's
+dock arrangement, the library rail's tab and folded state), the **color theme**
+and `layout` — the single arrangement from before there were workspaces, now only
+migrated from — as opaque `serde_json::Value`s: the frontend owns their shape and
+validates them on the way back in, so `get_settings` re-reads the file for those
+where the engine-held values are read live). **`set_settings` takes a patch**,
+not the whole object — only the fields that changed (`{workspaces}`, `{theme}`,
 `{cpu_percent}`), merged into the file under a mutex, and only those fields are
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
@@ -994,25 +996,107 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting six panels — `MediaBin`, `TranscriptPanel`,
-`Preview`, `Timeline`, `Inspector`, `AgentPanel` — each a Svelte component
+it follows the theme) hosting six panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
-and closable; the toolbar's **Panels** menu reopens one beside the active group
-or resets the arrangement. `src/lib/layout.ts` is the pure, bun-tested side:
-the panel registry (titles, minimum sizes — the Inspector's px-tuned controls
-need ~250), `DEFAULT_LAYOUT` (bin | preview | inspector-with-agent-tabbed over a
-**full-width timeline** — the cut is what an editor looks at most, and a
-timeline squeezed between two side panels showed thirty seconds of it; a saved
-custom layout is left as it was) and `sanitizeLayout`, which turns a stored layout into one that can
-be trusted (known panel ids, each shown once, titles/minimums re-taken from the
-registry, floating groups dropped) or `null` so the default is used. The
-arrangement is saved through `settings.setLayout` (debounced off
-`onDidLayoutChange`) into `Settings.layout`, and `+page.svelte` mounts the dock
-only once the settings are loaded so it restores rather than rebuilds;
-`workspace.svelte.ts` is the runes singleton the menu drives. Panels own no
-width: their roots are `flex:1;min-height:0`, and a panel's minimum comes from
-the registry. The `Inspector` is **mounted whether or not a clip is selected**:
+and closable; the toolbar's **Panels** menu reopens one (the library left of the
+preview, the deliver panel right of it, the rest beside the active group) or
+resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
+grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
+to point a tablist at; a pointer click blurs the button, because a focused button
+swallows Space and the transport shortcut would stop working) — are full dockview
+presets. `src/lib/layout.ts` is
+the pure, bun-tested side: the panel registry (titles, minimum sizes — the
+Inspector's px-tuned controls need ~250), `PRESET_LAYOUTS` (each a row of panels
+over a **full-width timeline** — the cut is what an editor looks at most, and a
+timeline squeezed between two side panels showed thirty seconds of it; the agent
+is a tab beside the inspector, or the deliver panel, in every one, so a proposal
+that lands has somewhere to appear) and `sanitizeLayout`, which turns a stored
+layout into one that can be trusted (known panel ids, each shown once,
+titles/minimums re-taken from the registry, floating groups dropped) or `null` so
+the preset is used. It also **migrates** a layout saved when the media bin and
+transcript were panels of their own: the first of `media` / `bin` / `transcript`
+found becomes `library`, the others drop, and an emptied group or branch is
+pruned (a branch left with one child collapses into it). What is stored is
+**`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
+{<workspace>: <layout>}, library: {tabs: {<workspace>: <tab>}, collapsed}}`, parsed
+field by field — one bad layout costs that workspace its arrangement, not the
+other four — with the old `layout` becoming Edit only when there is *no*
+`workspaces` value at all (a reset Edit must not be brought back by a layout from
+the old build), and the old single `library.tab` becoming the active workspace's
+own. `settings.svelte.ts` holds it as the live copy and writes it through
+`single-flight.ts` — **one write in flight, newest wins**, the follow-up reading
+the state when it starts (a dock save, a rail click and a switch overlap, and two
+racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
+is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
+layout and shows the library tab that workspace last had (each remembers its own;
+until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
+Motion → Transitions, Edit and Deliver → Media), and **touches no project state**
+— cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
+rebuilds the panels, so a panel's own scroll starts over). **A layout is written
+only if it was rearranged**: dockview reports layout changes for a great deal
+that is not one (a restore, the library folding, a click that moves the active
+group, a window resize), and writing each marked every workspace merely visited
+as customised and brought a just-reset one straight back. So after a restore the
+singleton waits two frames for the layout to settle, takes that as the reference,
+and `shouldPersistLayout` (pure, bun-tested) writes only a layout that
+`sameArrangement` finds different from it — same groups, panels and order, same
+*shares* of each branch within 0.4 % (a dozen-pixel nudge of a sash counts; pixel
+sizes, the active group and the active tab do not) — and, with no entry yet, from
+the preset. What was written becomes the new reference; Reset clears the entry
+and leaves none. A window resize can move shares too (where a group's minimum
+binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
+the layout events the resize causes, and retakes the reference once the window has
+held still for 150 ms — otherwise the next unrelated event, a click on a tab,
+would write a layout nobody arranged. After
+every `fromJSON` it forces `api.layout()` at the host's real size: a layout
+is built at the size it was saved at and the dock learns its real one a frame
+later, and a constraint changed in that gap makes dockview re-split the whole
+grid evenly. `+page.svelte` mounts the dock only once the settings are loaded so
+it restores rather than rebuilds. Panels own no width: their roots are
+`flex:1;min-height:0`, and a panel's minimum comes from the registry.
+The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
+group with an icon **rail** (36 px icons in a 40 px column, tooltips and
+`aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click
+choose; a pointer click does not leave focus on the rail): Media (`MediaBin`, whose
+decoded thumbnails live in `thumbnails.ts` rather than the component — the library
+remounts it on every tab switch, unfold and workspace switch, and each remount
+used to decode every asset again; it keeps answers, including "no frame", but not
+a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
+video effects), Transitions (the grouped picker), Audio (audio effects + the
+voiceover entry point), Transcript (`TranscriptPanel`). Effects, Transitions and
+Audio act on the selected clip and say why they are off when none is; they own no
+value (a look is a `Color`, an effect an entry in the clip's chain), so the
+Inspector stays where you tune — the presets are `effect-presets.ts`, shared with
+its pickers. Titles is the same component as the Inspector's *Titles lane*
+section, which stays (a folded library must not make titles unreachable), over
+`title-actions.ts`; the caption look they share is `ui.captionStyle`. Clicking the
+active icon **folds** the content to the rail (`library.collapsed`, persisted and
+shared by every workspace — the rail is a tool, not part of an arrangement) and
+the panel gives its width back: the registry minimum is the rail's 40 px, an open
+library raises its group's to 240 and a folded one pins min = max = 40 through
+`group.api.setConstraints` — a group's explicit constraints win over its active
+panel's minimum, which is set when the panel is created, and the *panel*-level
+`setConstraints` has no listener on a dockview panel and does nothing — hides the
+group's tab strip, and hands the width it frees or takes to the group beside it
+(dockview would give it to the last group in the row). Folding from the header's
+chevron by keyboard moves focus to the rail's active tab, since the chevron
+unmounts with the content. A library sharing a group with another panel cannot
+fold — it has no width of its own to give back.
+The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
+verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
+`SectionHead` which the dialog uses too — no fork. The shape choice and the
+smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
+places edit them (session-global, so a shape ticked in the panel is ticked when the
+dialog opens), and both components re-judge on every `editor.timeline` change
+(docked beside a timeline being edited, a verdict cached at tick time goes
+stale), keeping the newest answer. Shapes are for a picture, so the panel hides
+them, and the button never says "Export N files", for a cut with no video clip
+(`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
+(`ui.openExport()`); the panel shows its progress and Stop while one runs.
+The `Inspector` is **mounted whether or not a clip is selected**:
 its Text overlays section belongs to the timeline rather than to any one clip, so
 gating the panel on a selection made titles and captions unreachable until you
 clicked a clip. Its sections are `InspectorSection`s — native `<details>`
@@ -1192,7 +1276,7 @@ per-file readiness line judged at that file's frame (`platformCheck([w, h])`),
 in place of the single panel — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`. The
-**Transcript panel** (`TranscriptPanel.svelte`, over the pure, bun-tested
+**Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
