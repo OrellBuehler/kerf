@@ -1302,6 +1302,49 @@ offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
 title drag.
+**Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
+a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
+project flag — read in `load()` (so launch, New and Open) and again on the
+`ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
+the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
+`aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
+ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
+All the rippling is the backend's. *Selection* is a set: `selection.ts` holds every way of
+changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
+with several selected it shows an "N clips selected" note, since its sections act on that
+one): a click replaces, Ctrl/Cmd toggles, Shift extends along the primary's track (adds
+the clip when the primary is elsewhere), and a **marquee** (pointer tool; a drag from empty
+lane, the titles lane or the space under the tracks) selects every clip its rectangle
+touches — Shift adds, Ctrl/Cmd toggles — recomputed from the selection as the press found
+it so the rectangle can shrink (`marqueeSelect`; `marquee.ts` tests the rectangle, in lane
+space, against lane boxes measured from the DOM since the heights are CSS). Clips on a
+locked track are not swept up (locking guards edits, and the selection is what every edit
+acts on) but stay clickable. Escape mid-drag restores the selection; the click that ends a
+marquee is swallowed so it does not seek and deselect; Escape otherwise clears (the page's
+handler — the timeline's and the preview's abandon-a-gesture handlers run in the capture
+phase and stop the event, so abandoning a drag never also clears). `#setTimeline` prunes
+ids another edit removed. *Group move*: pressing a selected clip of several keeps them
+(a click that never drags narrows to it), and dragging moves them all by the grabbed
+clip's Δt — its start is the one snapped and frame-quantized, its group's own edges being
+no magnet — plus one **lane offset applied within each kind's lanes** (`multi-move.ts`,
+`planMove`). Its checks are `Timeline::move_clips`' (group as a group, before 0 refused not
+clamped, locked or missing lane refused) and a property test replays random drags against
+`multi-edit.ts`'s mirror, so the verdict drawn while dragging is the backend's: one ghost
+per clip, red with the reason beside the pointer when refused (letting go then does
+nothing), and a valid drop is ONE `editor.moveClips` — one revision, one undo. Delete is
+`removeClips(ids)` (one revision; ripple follows the project's mode) and Shift+Delete
+forces ripple; a clip on a locked track is left alone and stays selected. *Zoom*
+(`zoom.ts`): 0.05–2000 px/s, `ui.zoom` still px/s but stepped by ratio (+/-, buttons ×1.25)
+and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
+holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has
+been rewidened); **⇧Z / the fit button** fits the cut (`ui.zoomToFit()` bumps `fitEpoch`,
+since only the timeline knows its width). The ceiling comes down for a very long cut so the
+lane stays under 8 M px — the one thing a browser cannot lay out. Nothing else assumed a
+range: the waveform rung choice scales to any px/s (bottoming out at the engine's 2 ms
+bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
+label step follow the zoom and renders only the ticks in the visible window (hundreds,
+not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
+frame.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to

@@ -576,6 +576,17 @@
 		{#if overlay}
 			{@render overlayEditor(overlay)}
 		{:else if clip}
+			{#if editor.selectedClips.length > 1}
+				<!-- Several clips are selected but an edit here acts on one. Say which,
+				     rather than let a fader look like it moves them all. -->
+				<div
+					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
+				>
+					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
+					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
+					them all; Delete removes them all.
+				</div>
+			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
 					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
