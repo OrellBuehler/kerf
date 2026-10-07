@@ -1,0 +1,54 @@
+name: apt install
+description: >-
+  `apt-get update` + `apt-get install -y` that cannot eat a job's timeout. A
+  hung connection to the runner's Ubuntu mirror used to sit until the job was
+  cancelled (twenty minutes of nothing, reported as a cancelled job rather than
+  an error), so every request gets an inactivity timeout and apt's own retries,
+  and the whole step is bounded and tried again a couple of times.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get install
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+          'Acquire::Retries "3";' \
+          'Acquire::http::Timeout "30";' \
+          'Acquire::https::Timeout "30";' \
+          | sudo tee /etc/apt/apt.conf.d/80-ci-timeouts >/dev/null
+        read -ra pkgs <<< "$PACKAGES"
+        # `timeout` runs *inside* sudo, and `-k` follows up with SIGKILL: apt-get
+        # does not die of the SIGTERM alone while a download trickles (a 27 MB
+        # package at a few KB/s outlived a 600 s timeout by minutes), and a KILL
+        # sent to sudo is not relayed, which would orphan apt-get holding the lock.
+        # A retry keeps the .debs already fetched, so each attempt gets further.
+        for attempt in 1 2 3; do
+          if sudo timeout -k 15 120 apt-get update \
+            && sudo timeout -k 15 360 apt-get install -y "${pkgs[@]}"; then
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+          sudo dpkg --configure -a || true
+          # The runner's mirror list puts azure.archive.ubuntu.com first; when it
+          # is the mirror that stalls (every attempt dying in `update` right after
+          # it answers `Ign`), retrying through it again only stalls again. The
+          # rest of the list (archive / security.ubuntu.com) still serves.
+          if [ -f /etc/apt/apt-mirrors.txt ] \
+            && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt \
+            && grep -qv 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+            echo "::notice::dropped the Azure Ubuntu mirror for the retry"
+          fi
+          sleep $((attempt * 10))
+        done
+        echo "::error::apt-get failed three times"
+        exit 1
