@@ -13,6 +13,7 @@
 	import type { TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
+	import { MAX_GAIN } from '$lib/mixer';
 	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
 	import { addTextHere, dropCaptions, makeCaptions } from '$lib/title-actions';
 	import { needsCrop } from '$lib/smart-crop';
@@ -616,7 +617,7 @@
 					<input
 						type="range"
 						min="0"
-						max="2"
+						max={MAX_GAIN}
 						step="0.05"
 						value={clip.volume}
 						disabled={editor.busy}

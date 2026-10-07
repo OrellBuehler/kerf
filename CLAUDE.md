@@ -274,6 +274,40 @@ so the feature is **only** activated through these forwards — which is what ma
   a stripped-tag phone file does not abort the graph with "no path between
   colorspaces". Assets saved before these fields existed deserialize as SDR with
   the coded size; re-importing the file re-probes it.
+- `peaks.rs` (always compiled, CLI only) is what the timeline draws a clip's **waveform**
+  from, and it answers a different question than `waveform` (N peaks for a whole
+  file, 8 kHz, kept as it was): a clip shows a *window* at a zoom that never stops
+  changing, so a file is decoded **once** into a `WaveformPyramid` — min/max peak
+  pairs at 500 / 100 / 25 / 10 buckets per second, per channel (stereo when the
+  source has two or more channels, mono otherwise) — and any window is then a slice
+  read, `waveform_range(pyramid, start, end, buckets)` (pure + unit-tested; `start` /
+  `end` in **source** seconds). It picks the *coarsest* level that still has a source
+  bucket per requested one, partitions source buckets among the requested ones by
+  where each begins (a peak lands in one column, never smeared across two; when the
+  request is finer than the source it reads the bucket under each column's midpoint),
+  leaves the part of a window outside the media as 0/0 buckets so the caller's
+  time-to-column mapping stays linear, and caps `buckets` at 4096. The decode is
+  **48 kHz f32** on purpose: 96 samples is exactly one 2 ms bucket, every coarser
+  level is a whole multiple, and 48 kHz is what video audio already is, so no
+  resampler runs and the peaks are the real samples' — at 8 kHz the low-pass smears
+  transients and rings around a clipped plateau, so a flat-topped 1.0 would not read
+  as full scale. Peaks are stored as `i16` (±32767 = full scale, so a clipped sample
+  is recognizable; ~18 MB per hour of stereo) and the PCM is folded into buckets as
+  it streams off the pipe, so memory is the pyramid, never the file. Like every read
+  the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
+  niced, at most two decodes at once (a freshly opened project asks for every clip
+  at the same instant), concurrent requests for one file share one decode
+  (`shared_pyramid`), and the pipe is read on a side thread so a decode silent for
+  60 s is killed. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
+  by path + size + mtime + a format version, written to a temp file and renamed; a
+  file that is short, long, the wrong version, inconsistent with its own frame count
+  or has a bucket whose min exceeds its max is recomputed, never trusted — and the
+  size is checked before anything is allocated. Loaded pyramids sit in a
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
+  op (an asset with no audio stream is `InvalidArgument`), exposed as the
+  `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
+  are unchanged.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -554,7 +588,7 @@ no editing logic in the adapter.
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
   opens a `.kerf` file to populate it.
-  `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
+  `analyze_asset`, `frame_at`, `waveform` and `waveform_range` delegate to the engine; editing ops are
   unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects
   every asset's cached `Tempo`, builds the grid and aligns one track (or every
   unlocked video track) to it, defaulting the tolerance to half a beat so each cut
@@ -711,9 +745,14 @@ it never watches the cut. `core_err` splits the caller's mistakes (a stale id, a
 out-of-range value, a stale staged edit) out as `invalid_params`: reported as
 `internal_error`, a mistyped uuid reads to a model as a broken server rather than
 as something it can fix and retry. Sizes an agent picks out of a schema
-description — `get_waveform`/`get_energy` buckets, `get_frame`/`preview_timeline`
-widths — are clamped rather than trusted, the way `skim_asset` already clamps its
-grid. `set_speech_model` is the write side of `transcription_status`
+description — `get_waveform`/`get_energy`/`get_waveform_range` buckets,
+`get_frame`/`preview_timeline` widths — are clamped rather than trusted, the way `skim_asset` already clamps its
+grid. `get_waveform_range` reads an asset's audio as signed min/max peaks per
+channel over a **source-seconds** window (the cached peak pyramid, so the first call
+per file decodes and every later window is a slice); it answers in *compact* JSON
+(pretty-printing puts each of up to 16k numbers on its own line) and rejects a window
+with `end <= start` as `invalid_params`, since the engine reads one as a row of
+zeros and a model would take that for silence. `set_speech_model` is the write side of `transcription_status`
 (`download_speech_model` only fills the cache; transcription uses whichever model
 is *selected*, so downloading without selecting was a silent no-op) — it makes
 both writes the GUI picker makes, though the picker itself only re-reads at
@@ -789,6 +828,7 @@ time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`get_waveform_range` → a source-seconds window as min/max peaks per channel,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -864,7 +904,8 @@ blocking pool via the `blocking()` helper — resolving inputs under the shared
 project lock and **releasing it before the slow part** (see `lock_user`; the
 lock-free `Project::decode_*` statics exist for exactly this). The MCP server's
 heavy tools (`analyze_asset`, `get_frame`, `skim_asset`, `preview_timeline`,
-`get_waveform`/`get_energy`, `export`) follow the same shape with `lock_agent`.
+`get_waveform`/`get_energy`/`get_waveform_range`, `export`) follow the same shape
+with `lock_agent`.
 Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
@@ -1177,13 +1218,76 @@ of audio-track clips, confidence-gated, hidden when beats land closer than 4px �
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
 snapping and the browser harness's alignment all share, unit-tested with `bun test`)
 mapped from `AssetAnalysis` and
-real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
+real audio waveforms (below); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
 same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
 **edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
 a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the right edge
-stays put; stills extend freely since they loop). The ruler renders **in/out marks**
+stays put; stills extend freely since they loop).
+**Gestures are frame-quantized** (`src/lib/frames.ts`, bun-tested; keyframes stay in
+seconds): a trim, move, drop, razor cut and fade length land on a frame of the cut's
+rate — `editor.fps`, i.e. `timelineFps`, the first video clip's rate else 30, which is
+`export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
+`k / fps` from an integer `k`, so equal frames are equal doubles and nothing drifts over
+a long run of edits), the ghost and the commit use that one value, and a trim derives
+every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / beats
+/ clip edges) still wins, unrounded; frames are *not* a magnet and apply with snapping
+off too. A landing within 1 µs of a neighbour's edge *is* that edge (`welds`):
+`move_clip`'s overlap test is a strict float compare, and an edge computed as
+`start + length / speed` can sit an ULP past its frame — so a tail butted against a
+neighbour is placed by `startBefore` (the latest start whose `start + duration` does not
+pass it, in the backend's own arithmetic; `tail - dur` is an ULP too high about as often
+as not). Whether a press became a drag is judged on pointer travel (3 px), never on the
+quantized position (one pixel is under a frame at high zoom), and an edge keeps the
+offset it was grabbed at. A razor cut keeps half a frame
+either side (`splitPoint`; a clip with no interior frame says so), the context menu's
+split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
+title drag.
+**Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
+plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
+canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
+source seconds through `source_in`/`source_out`, speed and reverse (a reversed clip is
+read through the mapping, mirrored, never flipped), the bucket width is the widest rung
+(the backend's 2 / 10 / 40 / 100 ms levels, then doubling) within 1.5 device pixels
+(DPR capped at 2), and what is fetched is fixed **tiles** of 2048 buckets aligned to the
+*source* clock — so a scroll, a trim, or a split's two halves land on cached tiles.
+`waveform-cache.ts` (injectable fetcher; the app's instance is `waveforms.ts`) caches by
+asset + window + bucket count, joins in-flight requests, runs three at a time newest
+interest first and drops queued tiles nobody wants any more, remembers a failed asset
+(one notification, no re-request per scroll; held off 30 s, doubling per failure in a row
+up to 10 min, cleared by a tile arriving), and is LRU-bounded. `want` tells its owner
+(microtask) when everything it asked for was already cached or the asset is held off,
+because nothing else would — a clip that looked a moment before another clip's request
+landed the same tiles would otherwise stay unpainted. The draw waits until every tile it
+needs is cached and until then leaves the old bitmap where it was, placed by clip-local
+*time* so a zoom or scroll shows it stretched, not blank; a clip scrolled out of range
+releases its tiles and shrinks its canvas to 1x1 (a canvas keeps its whole backing store
+otherwise), and a redraw only assigns the canvas size when it changed.
+`waveform-draw.ts` fills one polygon per lane (not a line per sample), scaled by
+`effectiveGain` — clip volume through the track fader, as the export multiplies them —
+and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
+a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
+`settings.theme` change. A stereo clip gets two lanes when its clip is at least
+`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so track-height
+presets can drive it) and folds to one below that; the default 64 px track is stereo.
+`get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
+(dB scale −36 dB…`MAX_GAIN` (+6 dB, `mixer.ts`) — one ceiling shared with the Inspector's
+slider and the track fader, a clip set above it by an agent keeps its value and is drawn at
+the top; the bottom edge is silence; a drag is relative to the clip's *real* level, so a
+small drag moves a 6x clip from 6x instead of collapsing it, with a detent at exactly 0 dB,
+since the export omits unity from the graph; double-click resets), **fade handles**
+at the top corners (picture and sound both fade, so every clip has them; the volume line
+is only for clips whose asset has audio; clamped to the clip and to each other,
+double-click clears), the fade ramps, **keyframe diamonds** (clip-local seconds; click
+seeks), and the **trim edges** with their halos. The top 14 px of a clip is the handles'
+alone and the line's travel stays below it; the edge strips and the line's grab band do
+not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
+razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s
+`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon), shows its
+value live (the waveform follows the volume line) and writes **one** edit on release,
+holding the live value until that edit settles. The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
 **J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
 `src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`
@@ -1401,7 +1505,10 @@ all project data renders from the real backend.
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
 **seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform
 is explorable in a plain browser via `bun run dev` (frames return `null` there → Preview
-keeps its placeholder). This browser sample is a **dev harness only** — the desktop app always
+keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
+deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
+asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
+stretch so the clipping colour is visible). This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
