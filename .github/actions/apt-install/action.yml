@@ -26,12 +26,18 @@ runs:
           'Acquire::https::Timeout "30";' \
           | sudo tee /etc/apt/apt.conf.d/80-ci-timeouts >/dev/null
         read -ra pkgs <<< "$PACKAGES"
+        # `timeout` runs *inside* sudo, and `-k` follows up with SIGKILL: apt-get
+        # does not die of the SIGTERM alone while a download trickles (a 27 MB
+        # package at a few KB/s outlived a 600 s timeout by minutes), and a KILL
+        # sent to sudo is not relayed, which would orphan apt-get holding the lock.
+        # A retry keeps the .debs already fetched, so each attempt gets further.
         for attempt in 1 2 3; do
-          if timeout 240 sudo apt-get update \
-            && timeout 600 sudo apt-get install -y "${pkgs[@]}"; then
+          if sudo timeout -k 15 120 apt-get update \
+            && sudo timeout -k 15 360 apt-get install -y "${pkgs[@]}"; then
             exit 0
           fi
           echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+          sudo dpkg --configure -a || true
           sleep $((attempt * 10))
         done
         echo "::error::apt-get failed three times"
