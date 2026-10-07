@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::clip_timing::FadeEdge;
+use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::VideoEffect;
 use crate::render_plan::{YuvMatrix, MAX_SHRINK};
 
@@ -131,6 +131,13 @@ pub enum Unsupported {
     Delivery(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
+    /// The canvas and each clip's `fps` filter parse the delivery rate to different rationals
+    /// (`canvas`, `clips`), so a clip's frame slots are not the canvas's frames: the pick
+    /// assumes one grid.
+    PickRate {
+        canvas: Rational,
+        clips: Rational,
+    },
     Hdr(LayerRef),
     /// The probed pixel format carries alpha.
     AlphaPicture(LayerRef, String),
@@ -191,6 +198,11 @@ impl fmt::Display for Unsupported {
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
             Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
+            Self::PickRate { canvas, clips } => write!(
+                f,
+                "the delivery rate is {}/{} on the canvas and {}/{} on a clip's fps filter, which are different frame grids",
+                canvas.num, canvas.den, clips.num, clips.den
+            ),
             Self::Hdr(l) => write!(f, "{l}: HDR footage needs tone mapping"),
             Self::AlphaPicture(l, pf) => write!(f, "{l}: the picture has an alpha channel ({pf})"),
             Self::NotKnownOpaque(l, pf) => {

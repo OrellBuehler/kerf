@@ -10,7 +10,9 @@ pub mod captions_import;
 mod clip_timing;
 pub mod error;
 pub mod fonts;
+pub mod frame_pick;
 pub mod layer_geometry;
+pub mod media;
 pub mod model;
 pub mod plan_caps;
 pub mod planner;
@@ -49,6 +51,8 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
+pub use frame_pick::{fps_pick, FpsPick, Pick, SourceFrames};
+pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
     ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, DiffEntry, DiffKind, EditOutcome, EditSource, Framing, Keyframe,
@@ -58,13 +62,13 @@ pub use model::{
     MIN_EDIT_CLIP,
 };
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
-pub use planner::{PlanRequest, Planner};
+pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, VOICEOVER_TRACK};
 pub use render_plan::{
-    Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanStream, PlanText, PlanTiming,
-    ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
+    Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
+    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
 };
