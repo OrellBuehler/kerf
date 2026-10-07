@@ -13,12 +13,13 @@
 //!
 //! **What this does and does not say.** It checks the *grammar*: that the text the builders
 //! write, evaluated at the output frame's time, is the curve the plan samples. It does not say
-//! the graph reads each expression at that time. The zoom (`scale eval=frame`) is read at the
-//! *source* frame's time and is not always shown at all (`rendered.rs`,
-//! `a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it_still`),
-//! which is why a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`) however well
-//! the zoom expression agrees here. That the *pictures* agree is `rendered.rs`'s and the
-//! parity harness's to say.
+//! the graph reads each expression at that time, or that what follows a filter keeps up with
+//! it; that the *pictures* agree is `rendered.rs`'s and `keyed_zoom.rs`'s (every output frame of
+//! a keyed zoom against `transform_at`) and the parity harness's to say. (The zoom
+//! (`scale eval=frame`) used to be read at the *source* frame's time and not always shown at
+//! all, and a Motion plan still refuses a moving zoom, `Unsupported::KeyedZoom`: the export
+//! has since been fixed (`video_clip_chain` puts the zoom after `fps` and last), and lifting
+//! that refusal is for the compositor that would draw it.)
 
 use std::f64::consts::PI;
 
@@ -183,11 +184,18 @@ fn parse_options(body: &str) -> Vec<(String, String)> {
 /// The options of the first filter called `name` in `chain` (a pad label after the last
 /// filter is not part of its options).
 fn options(chain: &str, name: &str) -> Option<Vec<(String, String)>> {
+    all_options(chain, name).into_iter().next()
+}
+
+/// The options of every filter called `name` in `chain`, in order: a chain has more than one
+/// `scale` (the fit, and a zoom), and the first is not the one that zooms.
+fn all_options(chain: &str, name: &str) -> Vec<Vec<(String, String)>> {
     let chain = chain.rsplit_once('[').map_or(chain, |(f, _)| f);
     split_outside_quotes(chain, ',')
         .into_iter()
-        .find_map(|f| f.strip_prefix(&format!("{name}=")))
+        .filter_map(|f| f.strip_prefix(&format!("{name}=")))
         .map(parse_options)
+        .collect()
 }
 
 fn opt<'a>(opts: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -268,11 +276,14 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
     cuts
 }
 
+/// How many (layer, frame) pairs of the sweep carry a zoom expression to evaluate.
+const ZOOMS_AT_LEAST: usize = 1_000;
+
 #[test]
 fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_output_frame_time() {
     let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
     let assets = [asset];
-    let (mut layers_checked, mut titles_checked, mut moved) = (0, 0, 0);
+    let (mut layers_checked, mut titles_checked, mut moved, mut zooms_checked) = (0, 0, 0, 0);
     for (name, tl) in cuts(&assets[0]) {
         for (fps, (num, den)) in [
             (24.0, (24, 1)),
@@ -332,11 +343,16 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                     }
                     let chain = chain_of(flat);
                     let tf = layer.transform;
-                    if let Some(z) = options(chain, "scale").filter(|o| opt(o, "eval") == Some("frame")) {
-                        // The expression's grammar at the output frame's time; the graph itself
-                        // reads it at the source frame's (see the module docs).
+                    // (`options` would give the first `scale`, the fit, which never has `eval`.)
+                    if let Some(z) = all_options(chain, "scale")
+                        .into_iter()
+                        .find(|o| opt(o, "eval") == Some("frame"))
+                    {
+                        // The expression's grammar at the output frame's time, which is the
+                        // time the graph reads it at (the zoom follows `fps`).
                         let zoom = eval(opt(&z, "w").unwrap(), &[("t", t), ("iw", 1.0)]);
                         assert!((zoom - tf.scale).abs() < 1e-9, "{at}: zoom {zoom} vs {}", tf.scale);
+                        zooms_checked += 1;
                     }
                     if let Some(r) = options(chain, "rotate") {
                         let rad = eval(opt(&r, "a").unwrap(), &[("t", t), ("PI", PI)]);
@@ -382,6 +398,9 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
         layers_checked > 3_000 && moved > 2_000 && titles_checked > 500,
         "{layers_checked} {moved} {titles_checked}"
     );
+    // ... and the zoom's own `scale eval=frame` has to have been found among the clip's
+    // scales and evaluated (the check used to take the first `scale`, and never ran).
+    assert!(zooms_checked > ZOOMS_AT_LEAST, "{zooms_checked} zoom expressions evaluated");
 }
 
 #[test]

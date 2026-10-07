@@ -60,7 +60,10 @@ impl EffectKinds {
 /// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity` and
 /// `keyed_zoom` are about the export graph and apply to [`PlanMode::Motion`] plans only:
 /// the FFmpeg still draws no fades and a still plan has no tail layers, so a *still* plan
-/// inside a fade, a travel or a tail is refused whatever these say. `mask`, `text`,
+/// inside a fade, a travel or a tail is refused whatever these say. (`keyed_zoom` also
+/// holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
+/// export does: with a grade, rotation, opacity, mask or effect in front of it the still is
+/// refused unless the compositor says it orders them that way.) `mask`, `text`,
 /// `reframe`, `hdr` and `effects` hold for both, since both graphs draw them.
 ///
 /// `#[non_exhaustive]`: another crate starts from [`GpuCaps::A0`] and sets the fields it
@@ -81,8 +84,9 @@ pub struct GpuCaps {
     /// Keyframed opacity (a `geq` alpha, a different arithmetic from the RGB round
     /// trip a constant opacity takes).
     pub keyed_opacity: bool,
-    /// Keyframed zoom, which FFmpeg reads at the source frame's time and, depending on the
-    /// filters after it, may hold at its first size (see `Animated`).
+    /// Keyframed zoom: FFmpeg runs it as the last stage of the clip's chain (see
+    /// `Animated`), so a compositor that sets this draws the effects, mask, rotation and
+    /// grade at the fit size first and the zoom after them.
     pub keyed_zoom: bool,
     pub mask: bool,
     pub text: bool,
@@ -148,8 +152,11 @@ pub enum Unsupported {
     /// A still plan's clip whose tail window is open: the export draws it, the plan has no layer.
     StillTail(LayerRef),
     KeyedOpacity(LayerRef),
-    /// A keyframed zoom, which the export reads at the source frame's time and may hold still.
+    /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
+    /// A moving zoom in a still, with a grade, a rotation or a fade of opacity in front of it:
+    /// FFmpeg applies those to the picture at its fit size and magnifies the result.
+    ZoomBehind(LayerRef),
     /// A text overlay is live.
     Text,
     /// A live text overlay names no font file the compositor can draw with.
@@ -209,7 +216,11 @@ impl fmt::Display for Unsupported {
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
             Self::KeyedZoom(l) => write!(
                 f,
-                "{l}: keyframed zoom (FFmpeg reads it at the source frame's time, and a filter after it may hold the picture at its first size)"
+                "{l}: keyframed zoom (FFmpeg draws it as the last stage of the clip's chain, after the effects, mask and rotation)"
+            ),
+            Self::ZoomBehind(l) => write!(
+                f,
+                "{l}: a moving zoom with a grade, rotation or opacity ahead of it (FFmpeg applies those at the fit size and magnifies the result)"
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),
