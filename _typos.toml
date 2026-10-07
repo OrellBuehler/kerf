@@ -16,3 +16,7 @@ fo = "fo"
 mis = "mis"
 # "PNGs" splits as PN + Gs
 PN = "PN"
+
+[files]
+# argv digests of the golden oracle: 16-hex FNV hashes, not words
+extend-exclude = ["crates/kerf-core/src/engine/cli/golden/*.txt"]

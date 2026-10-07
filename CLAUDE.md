@@ -769,6 +769,24 @@ no editing logic in the adapter.
   What only the decode or the compositor can see is refused there instead
   (`GpuError::Unsupported`): a picture that decodes at another size than probed, an
   alpha channel found in the pixels of an asset that never recorded its format.
+- `engine/cli/golden.rs` — **the golden argv oracle** (test-only, a child of `cli` so it
+  reaches the private builders). 4000 seeded timelines (every transition kind with / without
+  a source handle / across a gap, fades, speed, reverse, stills, keyframes, masks, effects,
+  chroma, reframe, HDR, overlays, delivery format and fit, export options, the audio mix)
+  have their `build_export_args_phase`, `build_still_args` and `build_preview_args_with`
+  argv reduced to FNV-1a digests, committed as 40 block digests each in
+  `engine/cli/golden/{export,still,preview}.txt`. A refactor of the graph builders must leave
+  all three untouched; an intended argv change re-blesses **its own** file only
+  (`KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden`, then review the
+  diff). It is **machine-independent**: the builders read the machine in three places and each
+  is pinned (the preview's `decode_hwaccel()` through `build_preview_args_with`,
+  `zscale_available()` through a `cfg(test)` thread-local override with every HDR case built
+  both ways, `drawtext`'s resolved font path by naming no font), and the digests were blessed
+  with `KERF_HWACCEL` unset, `none` and `auto`, identical. A coverage table (`family needle`
+  lines, plus the branch `transition_fx` took) fails the test if a branch family hits fewer
+  than 20 cases, so it cannot quietly stop covering one. `KERF_GOLDEN_CASES=<file>` writes a
+  digest per case (diff base vs change to find the case in a failing block),
+  `KERF_GOLDEN_DUMP=<n>` prints one case's argv.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
