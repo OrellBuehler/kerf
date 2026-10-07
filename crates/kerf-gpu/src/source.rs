@@ -136,7 +136,9 @@ pub fn decode_args(layer: &PlanLayer, alpha: bool) -> Vec<String> {
         .collect();
     if !layer.is_image {
         args.push("-ss".into());
-        args.push(format!("{:.3}", layer.source_time));
+        // The one spelling the FFmpeg still uses too, so both decode the same frame
+        // on a fine time base (milliseconds skip one).
+        args.push(kerf_core::seek_arg(layer.source_time));
     }
     args.extend(["-i".to_string(), layer.path.clone()]);
     // `out_range=tv` states the range the shader assumes (limited) instead of
@@ -437,10 +439,63 @@ mod tests {
     #[test]
     fn a_video_frame_is_seeked_like_the_still_graph_does() {
         let a = decode_args(&layer(false), false).join(" ");
-        assert!(a.contains("-ss 7.000 -i /m/a.mp4"), "{a}");
+        assert!(a.contains("-ss 7.000000 -i /m/a.mp4"), "{a}");
         assert!(
             a.ends_with("-vf scale=out_range=tv -f yuv4mpegpipe -pix_fmt yuv420p pipe:1"),
             "{a}"
+        );
+    }
+
+    /// A frame at 1.0006 s: `-ss 1.0006` returns it, the old `{:.3}` spelling
+    /// (`1.001`) the frame after. A 10 fps ramp (frame `n` is luma `16 + 8n`) whose
+    /// frames from the 10th on sit 0.6 ms late, on a 1/10000 time base the encoder
+    /// and the mp4 both keep.
+    ///
+    /// `cargo test -p kerf-gpu --no-default-features -- --ignored fine_time_base`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_decode_on_a_fine_time_base_lands_on_the_frame_at_the_second_not_the_next() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-fine-ss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("ramp.mp4");
+        let made = std::process::Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(
+                "color=c=gray:s=64x64:r=10:d=2,format=yuv420p,geq=lum='16+8*N':cb=128:cr=128,\
+                 settb=1/10000,setpts='PTS+if(gte(N,10),6,0)'",
+            )
+            .args(["-c:v", "libx264", "-qp", "0", "-g", "1", "-bf", "0", "-pix_fmt", "yuv420p"])
+            .args([
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base",
+                "1/10000",
+                "-video_track_timescale",
+                "10000",
+            ])
+            .arg(&media)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("run ffmpeg");
+        assert!(made.success());
+
+        let mut l = layer(false);
+        l.path = media.to_string_lossy().into_owned();
+        l.stream.width = 64;
+        l.stream.height = 64;
+        l.source_time = 1.0006;
+        let frame = decode_layer(&l).expect("decode").expect("a frame");
+        // The premise, on this ffmpeg: the millisecond spelling of that second (`1.001`,
+        // what `{:.3}` made of it) lands on the frame after.
+        l.source_time = 1.001;
+        let next = decode_layer(&l).expect("decode").expect("a frame");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(next.y[0], 16 + 8 * 11, "this ffmpeg does not skip a frame on `-ss 1.001`");
+        assert_eq!(
+            frame.y[0],
+            16 + 8 * 10,
+            "ramp frame {} is not the one at 1.0006 s",
+            (frame.y[0] - 16) / 8
         );
     }
 

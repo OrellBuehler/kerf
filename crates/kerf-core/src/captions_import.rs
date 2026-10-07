@@ -1187,15 +1187,18 @@ mod tests {
         );
     }
 
-    /// Run `f`, and fail if it took a second or more. The inputs below were
-    /// quadratic before their scans were bounded — 400 KB of `<` took 6 s and a
-    /// full 5 MiB file about seventeen minutes — so even in an unoptimized build a
-    /// linear parse is a small fraction of this limit.
+    /// Run `f`, and fail if it took ten seconds or more. The inputs below were
+    /// quadratic before their scans were bounded — 400 KB of `<` took 6 s, 1 MB
+    /// about 40 s, and a full 5 MiB file about seventeen minutes — while a linear
+    /// parse takes a fraction of a second even unoptimized. The margin is wide on
+    /// purpose: the suite runs tests in parallel on a busy machine (the golden
+    /// oracle alone takes every core for seconds), and a wall-clock limit must
+    /// only ever catch the algorithm, never the load.
     fn within_a_second<T>(what: &str, f: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
         let out = f();
         let took = started.elapsed();
-        assert!(took < std::time::Duration::from_secs(1), "{what} took {took:?}");
+        assert!(took < std::time::Duration::from_secs(10), "{what} took {took:?}");
         out
     }
 

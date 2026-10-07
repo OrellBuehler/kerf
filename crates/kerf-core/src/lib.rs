@@ -7,6 +7,7 @@
 
 pub mod analysis;
 pub mod captions_import;
+mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod layer_geometry;
@@ -36,12 +37,12 @@ pub use engine::cpu::{
 pub use engine::{
     composite_color_policy, contact_sheet_times, download_speech_model, export_still, ffmpeg_command, ffmpeg_path, filmstrip_for,
     generate_proxy, hw_encoders, insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants,
-    render_with, render_with_progress, set_speech_model, speech_model_names, stitch_insta360, stitched_path, stream_preview,
-    validate_export, voiceover_status, waveform_pyramid, waveform_range, waveform_range_of, Container, DownloadProgress,
-    ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, PreviewFrame, RateControl, Region,
-    RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange,
-    DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS,
-    MIN_VOICE_SPEED,
+    render_with, render_with_progress, seek_arg, set_speech_model, speech_model_names, stitch_insta360, stitched_path,
+    stream_preview, validate_export, voiceover_status, waveform_pyramid, waveform_range, waveform_range_of, Container,
+    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, PreviewFrame,
+    RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
+    WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED,
+    MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

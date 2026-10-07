@@ -5960,13 +5960,16 @@ mod tests {
 
     #[test]
     fn a_thousand_word_cue_in_word_punch_places_quickly() {
-        // 100 cues of a thousand one-letter words, each over a few seconds: every
+        // 400 cues of a thousand one-letter words, each over a few seconds: every
         // word is a flicker and has to be merged. The old timer rebuilt (and
-        // cloned) every chunk per merge — about three seconds for exactly this.
+        // cloned) every chunk per merge — about three seconds per hundred such
+        // cues, so about twelve here, against well under two now. The limit is
+        // wide because tests run in parallel on a busy machine: it has to catch
+        // the algorithm, never the load.
         let asset = Uuid::new_v4();
-        let timeline = cut_of(asset, 1_000.0);
+        let timeline = cut_of(asset, 4_000.0);
         let thousand = vec!["a"; 1000].join(" ");
-        let cues: Vec<TranscriptSegment> = (0..100)
+        let cues: Vec<TranscriptSegment> = (0..400)
             .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &thousand))
             .collect();
         let started = std::time::Instant::now();
@@ -5976,12 +5979,12 @@ mod tests {
             CaptionOptions::styled(CaptionStyle::WordPunch),
         );
         let took = started.elapsed();
-        assert!(took < std::time::Duration::from_secs(1), "placing took {took:?}");
-        accounted(&p, 100);
-        assert_eq!(p.placed, 100);
+        assert!(took < std::time::Duration::from_secs(8), "placing took {took:?}");
+        accounted(&p, 400);
+        assert_eq!(p.placed, 400);
         // Nothing was lost to the merging: every word is still there.
         let words: usize = p.overlays.iter().map(|o| o.text.split_whitespace().count()).sum();
-        assert_eq!(words, 100 * 1000);
+        assert_eq!(words, 400 * 1000);
     }
 
     #[test]
