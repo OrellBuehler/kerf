@@ -325,13 +325,13 @@ pub struct Animated {
     pub rotates: bool,
     /// Some key is below full opacity (so the graph has a `geq` alpha).
     pub opacity: bool,
-    /// The keys' scales differ: the zoom moves. The graph's `scale eval=frame` sits before
-    /// `fps`, so it is read at the *source* frame's time (a slower source holds each size for
-    /// several output frames), and FFmpeg does not reliably show it at all: a filter after it
-    /// that cannot take a mid-stream size change holds the first frame's size (`geq`,
-    /// `colorchannelmixer`, and the converter in front of `overlay` for a chain without an
-    /// alpha plane; see `rendered.rs`). Nothing here decides which, so a moving zoom in an
-    /// export frame is refused.
+    /// The keys' scales differ ([`Clip::zoom_animated`]): the zoom moves. The export (and
+    /// the playback stream) then runs the clip's `scale eval=frame` **last**, after `fps`
+    /// and after every effect, mask, `rotate` and fade, which act on the picture at its fit
+    /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
+    /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
+    /// rest" as it does a constant one, so a moving zoom in an export frame is refused until
+    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it.
     pub zooms: bool,
 }
 
@@ -748,8 +748,18 @@ impl RenderPlan {
             if keyed && layer.animated.is_some_and(|a| a.opacity) && !caps.keyed_opacity {
                 out.push(Unsupported::KeyedOpacity(at()));
             }
-            if keyed && layer.animated.is_some_and(|a| a.zooms) && !caps.keyed_zoom {
-                out.push(Unsupported::KeyedZoom(at()));
+            if layer.animated.is_some_and(|a| a.zooms) && !caps.keyed_zoom {
+                if keyed {
+                    out.push(Unsupported::KeyedZoom(at()));
+                } else if !layer.color.is_identity()
+                    || layer.transform.rotation != 0.0
+                    || layer.transform.opacity < 1.0
+                    || layer.mask.is_some()
+                    || !layer.effects.is_empty()
+                {
+                    // A still's moving zoom is only the one stage when nothing follows it.
+                    out.push(Unsupported::ZoomBehind(at()));
+                }
             }
         }
         if !self.overlays.is_empty() {
