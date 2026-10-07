@@ -7,8 +7,9 @@ import { editor } from './state.svelte';
 import { cancelAnalysis, downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
-import type { AnalysisProgress, TranscriptionStatus } from './types';
+import type { AnalysisProgress, CaptionStyle, TranscriptionStatus } from './types';
 import type { VoiceoverPrefill } from './voiceover';
+import { ZOOM_DEFAULT, stepZoom } from './zoom';
 
 export type Tool = 'pointer' | 'razor';
 
@@ -40,6 +41,20 @@ class EditorUi {
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
 	voiceoverDialog = $state<{ prefill: VoiceoverPrefill | null } | null>(null);
+	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
+	exportDialog = $state(false);
+	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
+	 *  export, and whether each shot is framed for each of them first. Held here
+	 *  rather than in the export dialog because the Deliver panel edits the same
+	 *  choice — it would otherwise be lost on the way to the dialog. */
+	deliverShapes = $state<string[]>([]);
+	deliverSmartCrop = $state(true);
+	/** The look the caption button generates in. Not derived from the captions
+	 *  already on the timeline: a caption's style is not recoverable from the
+	 *  text it carries, and guessing from the word count would flip the choice
+	 *  every time a sentence happened to be short. Shared by every place that
+	 *  offers the button (the Inspector and the library's Titles tab). */
+	captionStyle = $state<CaptionStyle>('lines');
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
@@ -49,8 +64,13 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
-	/** Timeline zoom, pixels per second. */
-	zoom = $state(36);
+	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). */
+	zoom = $state(ZOOM_DEFAULT);
+	/** Bumped to ask the timeline to fit the whole cut in its window. Only the
+	 *  timeline knows how wide that is, so the shortcut (which lives in the page's
+	 *  key handler) asks rather than computes. A counter, like `seekEpoch`: a
+	 *  repeated ask is a new event. */
+	fitEpoch = $state(0);
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
@@ -65,6 +85,30 @@ class EditorUi {
 
 	closeVoiceover() {
 		this.voiceoverDialog = null;
+	}
+
+	openExport() {
+		this.exportDialog = true;
+	}
+
+	closeExport() {
+		this.exportDialog = false;
+	}
+
+	toggleDeliverShape(id: string) {
+		this.deliverShapes = this.deliverShapes.includes(id)
+			? this.deliverShapes.filter((v) => v !== id)
+			: [...this.deliverShapes, id];
+	}
+
+	/** One step in (`1`) or out (`-1`) on the zoom; the timeline holds the playhead still. */
+	zoomBy(dir: 1 | -1) {
+		this.zoom = stepZoom(this.zoom, dir, editor.duration);
+	}
+
+	/** Zoom so the whole cut fits the timeline's width (⇧Z). */
+	zoomToFit() {
+		this.fitEpoch++;
 	}
 
 	/** Fetch the installed system fonts once at startup. */

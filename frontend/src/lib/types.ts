@@ -339,6 +339,15 @@ export const DEFAULT_REFRAME: Reframe = {
 	fov: 100
 };
 
+/** One clip's destination in a group move (`move_clips`): where it starts
+ *  afterwards (absolute seconds) and, optionally, another track of the same
+ *  kind. Omitted, the clip stays on its track. */
+export interface ClipMove {
+	clip_id: string;
+	timeline_start: number;
+	track_id?: string;
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;
@@ -387,6 +396,24 @@ export interface Timeline {
 export interface AssetMetadata {
 	asset: Asset;
 	analysis: AssetAnalysis | null;
+}
+
+/**
+ * A window of an asset's audio as min/max peaks (`get_waveform_range`).
+ * Mirrors `kerf_core::WaveformRange`. `min` / `max` are `[channel][bucket]`,
+ * each `buckets` long and in -1..1; a bucket outside the media is 0 / 0.
+ */
+export interface WaveformRange {
+	/** Lanes: 1 (mono) or 2 (stereo). */
+	channels: number;
+	/** Buckets per channel actually returned — the request, capped at 4096. */
+	buckets: number;
+	/** Length of the decoded audio in seconds. */
+	duration: number;
+	/** Resolution of the pyramid level served (10, 25, 100 or 500). */
+	peaks_per_second: number;
+	min: number[][];
+	max: number[][];
 }
 
 export type EditSource = 'user' | 'agent' | 'system';
@@ -671,11 +698,16 @@ export interface AppSettings {
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;
-	/** The workspace arrangement (dockview's serialized layout), validated by
-	 *  `layout.ts` on the way back in. */
+	/** The single dock arrangement saved before there were workspaces (dockview's
+	 *  serialized layout). Read only to migrate it into the Edit workspace when
+	 *  `workspaces` is absent; nothing writes it any more. */
 	layout: unknown | null;
 	/** The color theme, validated by `theme.ts` on the way back in. */
 	theme: unknown | null;
+	/** The workspaces: `{ active, layouts: { <workspace>: <dockview layout> },
+	 *  library: { tab, collapsed } }`, validated by `workspaces.ts` on the way
+	 *  back in. Opaque to the backend. */
+	workspaces: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings

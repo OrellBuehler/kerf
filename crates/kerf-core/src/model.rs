@@ -3,8 +3,10 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
+
+use crate::error::{Error, Result};
 
 /// Kind of an elementary media stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2940,6 +2942,368 @@ impl Timeline {
     }
 }
 
+// ---- ripple ----------------------------------------------------------------
+
+impl Timeline {
+    /// The cut after a **ripple edit**: `self` is what an edit left behind and
+    /// `before` is what it started from. Clips are matched by id, the way
+    /// [`Timeline::diff`] matches them, and each track is looked at on its own.
+    ///
+    /// The one idea is that an edit which changes how much footage sits ahead of
+    /// a clip should carry that clip along, with every gap in front of it kept.
+    /// The track's *followers* — clips the edit left starting where they started
+    /// (same id, same start; a clip trimmed in place follows what was done ahead
+    /// of it too) — are shifted by the net change in length of what the edit did
+    /// ahead of them:
+    ///
+    /// | the edit… | followers at or after… | move by |
+    /// |---|---|---|
+    /// | changes a clip's length (right trim, speed, a left trim) | its old end | the change in its length |
+    /// | removes a clip from the timeline | its old end | minus its length |
+    /// | adds a clip onto footage that was there | the new clip's start | the new clip's length |
+    ///
+    /// Everything else is deliberately left alone:
+    ///
+    /// * **A left-edge trim keeps the clip's start.** A left trim is committed as
+    ///   a new `source_in` *and* a later `timeline_start`, so that the right edge
+    ///   stays put (the non-ripple behaviour). In a ripple edit the conventional
+    ///   thing happens instead: the clip stays where it started, its length
+    ///   changes, and the followers move by that change — so the result is the
+    ///   same whether or not the caller moved `timeline_start`. This only applies
+    ///   when the trim is the *whole* edit on the track; a bulk edit that moves
+    ///   several clips has no single edit point to hold still.
+    /// * **An add that fits is not an insert.** A clip put onto free space — the
+    ///   end of the track, a gap it fits in — moves nothing. Only a clip that
+    ///   lands on footage that was there pushes it: that footage and everything
+    ///   after it moves right by the new clip's length (adjacent adds count as
+    ///   one). A clip that lands in the *middle* of another cannot be resolved
+    ///   without splitting it, which ripple never does, so that track is left as
+    ///   the edit made it.
+    /// * **Splits do not shift.** The cut-off half is an add over the footage the
+    ///   shortened half just gave up, and the two cancel exactly.
+    /// * **Moves do not ripple**, within a track or across tracks: a clip
+    ///   arriving from or leaving for another track, or merely changing its
+    ///   start, is not a change in how much footage sits ahead of anything.
+    /// * **An edit that already rippled is not rippled twice.** A clip the edit
+    ///   itself moved is not a follower, so `ripple_delete` and `cut_clip_range`
+    ///   (whose later clips are all moved) come back unchanged.
+    /// * **Tracks are independent** — a ripple on `V1` never moves `A1`, there
+    ///   is no sync lock — and a **locked** track never moves (an edit to it is
+    ///   left as made). **Overlays and markers do not move** either; they are
+    ///   timeline-level, not track-level, and rippling titles can come later.
+    ///
+    /// **It never produces an overlap.** If shifting the followers (or restoring
+    /// a left-trimmed start) would leave a clip the edit or the ripple touched
+    /// overlapping another, or starting before 0, that track is returned exactly
+    /// as the edit made it — no ripple for that track, rather than a broken lane.
+    /// Overlaps between two clips nothing touched (an old project) are not this
+    /// function's business and block nothing.
+    ///
+    /// Pure, and the identity when nothing about any track's timing changed.
+    pub fn ripple_from(&self, before: &Timeline) -> Timeline {
+        let in_before: HashSet<Uuid> = before.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
+        let in_after: HashSet<Uuid> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
+        let mut out = self.clone();
+        for track in &mut out.tracks {
+            let Some(prior) = before.track(track.id) else {
+                continue;
+            };
+            if track.locked || prior.locked {
+                continue;
+            }
+            if let Some(rippled) = ripple_track(track, prior, &in_before, &in_after) {
+                *track = rippled;
+            }
+        }
+        out
+    }
+}
+
+/// The rippled version of one track, or `None` when there is nothing to do or
+/// the ripple would leave the lane illegal. `in_before` / `in_after` hold every
+/// clip id on any track of each timeline, which is what tells a clip that left
+/// (or arrived) from one that was deleted (or created).
+fn ripple_track(after: &Track, before: &Track, in_before: &HashSet<Uuid>, in_after: &HashSet<Uuid>) -> Option<Track> {
+    let prior: HashMap<Uuid, &Clip> = before.clips.iter().map(|c| (c.id, c)).collect();
+    let here: HashSet<Uuid> = after.clips.iter().map(|c| c.id).collect();
+
+    // Clips the edit left starting where they started: they follow whatever the
+    // edit did ahead of them, whether or not their own length changed too.
+    // `(index in `after`, where it stood, whether it is untouched)`.
+    let mut anchored: Vec<(usize, f64, bool)> = Vec::new();
+    let mut resized: Vec<(usize, &Clip)> = Vec::new(); // same id, new length (and the old clip)
+    let mut added: Vec<usize> = Vec::new();
+    let mut other_edits = 0usize; // moves, arrivals, departures
+
+    for (i, clip) in after.clips.iter().enumerate() {
+        match prior.get(&clip.id) {
+            Some(was) => {
+                let same_start = !num_changed(was.timeline_start, clip.timeline_start);
+                let same_length = !num_changed(was.duration(), clip.duration());
+                if same_start {
+                    anchored.push((i, was.timeline_start, same_length));
+                }
+                match (same_start, same_length) {
+                    (_, false) => resized.push((i, was)),
+                    (false, true) => other_edits += 1,
+                    (true, true) => {}
+                }
+            }
+            None if !in_before.contains(&clip.id) => added.push(i),
+            None => other_edits += 1,
+        }
+    }
+    let removed: Vec<&Clip> = before.clips.iter().filter(|c| !in_after.contains(&c.id)).collect();
+    other_edits += before
+        .clips
+        .iter()
+        .filter(|c| in_after.contains(&c.id) && !here.contains(&c.id))
+        .count();
+
+    // What the edit did to the amount of footage ahead of the clips after it:
+    // `(where, by how much)`, in before-timeline terms.
+    let mut events: Vec<(f64, f64)> = Vec::new();
+    for (i, was) in &resized {
+        events.push((was.timeline_end(), after.clips[*i].duration() - was.duration()));
+    }
+    for clip in &removed {
+        events.push((clip.timeline_end(), -clip.duration()));
+    }
+    // Adjacent adds are one insertion; it only counts when it landed on footage
+    // that was there (a clip that fits in free space moves nothing).
+    let mut spans: Vec<(f64, f64)> = added
+        .iter()
+        .map(|&i| (after.clips[i].timeline_start, after.clips[i].timeline_end()))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut chains: Vec<(f64, f64)> = Vec::new();
+    for (start, end) in spans {
+        match chains.last_mut() {
+            Some(last) if start <= last.1 + DIFF_EPS => last.1 = last.1.max(end),
+            _ => chains.push((start, end)),
+        }
+    }
+    for (lo, hi) in chains {
+        if before
+            .clips
+            .iter()
+            .any(|c| spans_overlap((lo, hi), (c.timeline_start, c.timeline_end())))
+        {
+            events.push((lo, hi - lo));
+        }
+    }
+
+    let mut clips = after.clips.clone();
+    // Untouched clips are pristine until shifted; everything else the edit
+    // touched is not.
+    let mut pristine = vec![false; clips.len()];
+    let mut changed = false;
+
+    // A left-edge trim that held the right edge still: the clip keeps its start.
+    // Only when it is the whole edit — see `ripple_from`.
+    if let [(i, was)] = resized.as_slice() {
+        let sole = removed.is_empty() && added.is_empty() && other_edits == 0;
+        if sole && !num_changed(was.timeline_end(), clips[*i].timeline_end()) {
+            clips[*i].timeline_start = was.timeline_start;
+            changed = true;
+        }
+    }
+
+    for (i, stood, untouched) in anchored {
+        pristine[i] = untouched;
+        let shift: f64 = events
+            .iter()
+            .filter(|(at, _)| *at <= stood + DIFF_EPS)
+            .map(|(_, by)| by)
+            .sum();
+        if shift.abs() > DIFF_EPS {
+            clips[i].timeline_start += shift;
+            pristine[i] = false;
+            changed = true;
+        }
+    }
+    if !changed || !lane_is_legal(&clips, &pristine) {
+        return None;
+    }
+    let mut track = Track { clips, ..after.clone() };
+    track.sort_by_start();
+    Some(track)
+}
+
+/// Whether a lane is fit to keep after a ripple: nothing the edit or the ripple
+/// touched starts before 0 or overlaps another clip. Two `pristine` clips
+/// overlapping is old news and does not count.
+fn lane_is_legal(clips: &[Clip], pristine: &[bool]) -> bool {
+    if clips
+        .iter()
+        .zip(pristine)
+        .any(|(c, pristine)| !pristine && c.timeline_start < -DIFF_EPS)
+    {
+        return false;
+    }
+    let mut order: Vec<usize> = (0..clips.len()).collect();
+    order.sort_by(|&a, &b| clips[a].timeline_start.total_cmp(&clips[b].timeline_start));
+    for (pos, &i) in order.iter().enumerate() {
+        let end = clips[i].timeline_end();
+        for &j in &order[pos + 1..] {
+            if clips[j].timeline_start >= end - DIFF_EPS {
+                break;
+            }
+            if !pristine[i] || !pristine[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Do two spans share any time? Touching end-to-start is not an overlap, and a
+/// microsecond of float noise from a JSON round-trip does not count either.
+fn spans_overlap(a: (f64, f64), b: (f64, f64)) -> bool {
+    a.0 < b.1 - DIFF_EPS && b.0 < a.1 - DIFF_EPS
+}
+
+// ---- multi-clip edits --------------------------------------------------------
+
+/// One clip's destination in a group move ([`Timeline::move_clips`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClipMove {
+    pub clip_id: Uuid,
+    /// Where the clip starts afterwards (seconds) — absolute, not a delta, so a
+    /// caller that snaps to frames or beats decides the exact landing spot.
+    pub timeline_start: f64,
+    /// The track it lands on, which must be the same kind as the one it leaves.
+    /// Omitted, the clip stays on its track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<Uuid>,
+}
+
+impl Timeline {
+    /// Move several clips at once, **all or nothing**: every destination is
+    /// checked before anything moves, so an error leaves the timeline as it was.
+    ///
+    /// The group is checked as a group. Clips moving together never collide with
+    /// the places they are leaving (nudging abutting clips by a second is legal,
+    /// where moving them one at a time would trip over each other), but they must
+    /// not overlap each other or any clip that is *not* moving, on whichever
+    /// track they land. A clip may change track only to another of the same
+    /// kind, a locked track — as source or destination — refuses the whole move,
+    /// and a clip may appear once. A start before 0 is an error rather than a
+    /// clamp: clamping each clip separately would quietly reshape the group, and
+    /// the caller knows how far the group may slide.
+    ///
+    /// Returns the moved clips in request order. Moves never ripple.
+    pub fn move_clips(&mut self, moves: &[ClipMove]) -> Result<Vec<Clip>> {
+        if moves.is_empty() {
+            return Err(Error::InvalidArgument("no clips to move".to_string()));
+        }
+        // (clip, destination track index, start, duration) — resolved up front.
+        let mut plan: Vec<(Uuid, usize, f64, f64)> = Vec::with_capacity(moves.len());
+        let mut moving: HashSet<Uuid> = HashSet::with_capacity(moves.len());
+        for m in moves {
+            if !moving.insert(m.clip_id) {
+                return Err(Error::InvalidArgument(format!("clip {} appears more than once", m.clip_id)));
+            }
+            if !m.timeline_start.is_finite() {
+                return Err(Error::InvalidArgument("timeline_start must be a finite number".to_string()));
+            }
+            if m.timeline_start < -DIFF_EPS {
+                return Err(Error::InvalidArgument(format!(
+                    "clip {} would start before the beginning of the timeline",
+                    m.clip_id
+                )));
+            }
+            let (from, ci) = self.locate(m.clip_id).ok_or(Error::ClipNotFound(m.clip_id))?;
+            let to = match m.track_id {
+                Some(id) => self.tracks.iter().position(|t| t.id == id).ok_or(Error::TrackNotFound(id))?,
+                None => from,
+            };
+            if self.tracks[to].kind != self.tracks[from].kind {
+                return Err(Error::InvalidArgument(
+                    "cannot move a clip to a track of a different kind".to_string(),
+                ));
+            }
+            for ti in [from, to] {
+                if self.tracks[ti].locked {
+                    return Err(Error::InvalidArgument(format!("track {} is locked", self.tracks[ti].name)));
+                }
+            }
+            plan.push((
+                m.clip_id,
+                to,
+                m.timeline_start.max(0.0),
+                self.tracks[from].clips[ci].duration(),
+            ));
+        }
+
+        // Where everything lands: the moved clips against the ones staying put,
+        // and against each other.
+        for (i, (_, to, start, duration)) in plan.iter().enumerate() {
+            let span = (*start, *start + *duration);
+            let track = &self.tracks[*to];
+            let hits_staying = track
+                .clips
+                .iter()
+                .any(|c| !moving.contains(&c.id) && spans_overlap(span, (c.timeline_start, c.timeline_end())));
+            let hits_moving = plan
+                .iter()
+                .enumerate()
+                .any(|(j, (_, other_to, other_start, other_duration))| {
+                    j != i && other_to == to && spans_overlap(span, (*other_start, *other_start + *other_duration))
+                });
+            if hits_staying || hits_moving {
+                return Err(Error::InvalidArgument(format!(
+                    "moved clips would overlap on track {} at {}",
+                    track.name,
+                    fmt_time(*start)
+                )));
+            }
+        }
+
+        // Everything checks out: lift the clips, set them down, re-order the lanes.
+        let mut lifted: HashMap<Uuid, Clip> = HashMap::with_capacity(plan.len());
+        for track in &mut self.tracks {
+            let (take, keep): (Vec<Clip>, Vec<Clip>) = std::mem::take(&mut track.clips)
+                .into_iter()
+                .partition(|c| moving.contains(&c.id));
+            track.clips = keep;
+            lifted.extend(take.into_iter().map(|c| (c.id, c)));
+        }
+        let mut landed = Vec::with_capacity(plan.len());
+        for (id, to, start, _) in &plan {
+            let mut clip = lifted.remove(id).expect("every planned clip was located above");
+            clip.timeline_start = *start;
+            landed.push(clip.clone());
+            self.tracks[*to].clips.push(clip);
+        }
+        for (_, to, _, _) in &plan {
+            self.tracks[*to].sort_by_start();
+        }
+        Ok(landed)
+    }
+
+    /// Remove several clips at once, all or nothing: an unknown id, or a clip on
+    /// a locked track, refuses the lot. A clip named twice is removed once.
+    /// Leaves gaps — under ripple mode the caller's [`Timeline::ripple_from`]
+    /// closes them, per track. Returns how many clips were removed.
+    pub fn remove_clips(&mut self, ids: &[Uuid]) -> Result<usize> {
+        if ids.is_empty() {
+            return Err(Error::InvalidArgument("no clips to remove".to_string()));
+        }
+        for id in ids {
+            let (ti, _) = self.locate(*id).ok_or(Error::ClipNotFound(*id))?;
+            if self.tracks[ti].locked {
+                return Err(Error::InvalidArgument(format!("track {} is locked", self.tracks[ti].name)));
+            }
+        }
+        let doomed: HashSet<Uuid> = ids.iter().copied().collect();
+        for track in &mut self.tracks {
+            track.clips.retain(|c| !doomed.contains(&c.id));
+        }
+        Ok(doomed.len())
+    }
+}
+
 /// Lifecycle of a task in the agent queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3412,6 +3776,24 @@ fn fmt_delivery(d: &Delivery) -> String {
 }
 
 impl Timeline {
+    /// How many clips stand somewhere else here than in `before`: a different
+    /// start on their track, or a different track. Matched by id, so a clip that
+    /// exists on only one side is not counted. This is how a caller learns whether
+    /// an edit *rippled* — ripple is the only thing that moves a clip a remove or a
+    /// retime did not touch — rather than assuming it did because ripple mode was
+    /// on: a locked track never moves, and a ripple that would leave a lane
+    /// overlapping is declined, both silently.
+    pub fn clips_moved_since(&self, before: &Timeline) -> usize {
+        let was = clip_index(before);
+        clip_index(self)
+            .into_iter()
+            .filter(|(id, (track, clip))| {
+                was.get(id)
+                    .is_some_and(|(t, c)| t.id != track.id || num_changed(c.timeline_start, clip.timeline_start))
+            })
+            .count()
+    }
+
     /// What changed between this timeline and `after`, phrased for a human
     /// reviewing a cut.
     ///
@@ -4874,5 +5256,554 @@ mod tests {
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 3.0, "only once")]);
         assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    // ---- ripple ---------------------------------------------------------------
+
+    /// A clip of `dur` seconds placed at `start`, cut from `[0, dur)` of nothing
+    /// in particular.
+    fn rclip(start: f64, dur: f64) -> Clip {
+        Clip::new(Uuid::nil(), 0.0, dur, start)
+    }
+
+    /// One video track `V1` holding `clips`.
+    fn one_lane(clips: Vec<Clip>) -> Timeline {
+        Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", clips)],
+            ..Timeline::new()
+        }
+    }
+
+    /// Each clip of track `ti` as `(start, end)`, in lane order.
+    fn spans_of(timeline: &Timeline, ti: usize) -> Vec<(f64, f64)> {
+        timeline.tracks[ti]
+            .clips
+            .iter()
+            .map(|c| (c.timeline_start, c.timeline_end()))
+            .collect()
+    }
+
+    fn same_cut(a: &Timeline, b: &Timeline) -> bool {
+        serde_json::to_string(a).unwrap() == serde_json::to_string(b).unwrap()
+    }
+
+    /// Run `edit` on a copy of `before` and ripple the result.
+    fn rippled(before: &Timeline, edit: impl FnOnce(&mut Timeline)) -> (Timeline, Timeline) {
+        let mut after = before.clone();
+        edit(&mut after);
+        let out = after.ripple_from(before);
+        (after, out)
+    }
+
+    /// `a [0,4)  b [5,8)  c [10,12)` — a gap of 1 before `b` and 2 before `c`.
+    fn gapped() -> (Timeline, [Uuid; 3]) {
+        let (a, b, c) = (rclip(0.0, 4.0), rclip(5.0, 3.0), rclip(10.0, 2.0));
+        let ids = [a.id, b.id, c.id];
+        (one_lane(vec![a, b, c]), ids)
+    }
+
+    fn clip_mut(t: &mut Timeline, id: Uuid) -> &mut Clip {
+        let (ti, ci) = t.locate(id).unwrap();
+        &mut t.tracks[ti].clips[ci]
+    }
+
+    #[test]
+    fn a_right_trim_that_shortens_pulls_later_clips_left_and_keeps_every_gap() {
+        let (before, [a, ..]) = gapped();
+        let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 3.0), (4.0, 7.0), (9.0, 11.0)]);
+    }
+
+    #[test]
+    fn a_right_trim_that_lengthens_pushes_later_clips_right() {
+        let (before, [a, ..]) = gapped();
+        let (after, out) = rippled(&before, |t| clip_mut(t, a).source_out = 6.0);
+        // Un-rippled, the lengthened clip would sit on top of `b`.
+        assert_eq!(spans_of(&after, 0)[1], (5.0, 8.0));
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 6.0), (7.0, 10.0), (12.0, 14.0)]);
+    }
+
+    #[test]
+    fn a_left_trim_keeps_the_clips_start_whether_or_not_the_right_edge_was_held() {
+        let (before, [_, b, _]) = gapped();
+        // The GUI's left-edge trim: later in-point, and a later start so the right
+        // edge (8.0) stays put. Ripple keeps the *start* and pulls the rest in.
+        let (after, held) = rippled(&before, |t| {
+            let c = clip_mut(t, b);
+            c.source_in = 1.0;
+            c.timeline_start = 6.0;
+        });
+        assert_eq!(spans_of(&after, 0)[1], (6.0, 8.0));
+        assert_eq!(spans_of(&held, 0), vec![(0.0, 4.0), (5.0, 7.0), (9.0, 11.0)]);
+
+        // The same trim without moving the start gives the same cut.
+        let (_, unmoved) = rippled(&before, |t| clip_mut(t, b).source_in = 1.0);
+        assert!(same_cut(&held, &unmoved));
+    }
+
+    #[test]
+    fn a_left_trim_that_lengthens_also_keeps_the_start() {
+        // `b` is cut from [2, 5) of its source, so it has a second of handle on the left.
+        let (a, b, c) = (rclip(0.0, 4.0), Clip::new(Uuid::nil(), 2.0, 5.0, 5.0), rclip(10.0, 2.0));
+        let b_id = b.id;
+        let before = one_lane(vec![a, b, c]);
+        let (after, out) = rippled(&before, |t| {
+            let c = clip_mut(t, b_id);
+            c.source_in = 1.0;
+            c.timeline_start = 4.0; // right edge held at 8.0
+        });
+        assert_eq!(spans_of(&after, 0)[1], (4.0, 8.0), "un-rippled it would sit on `a`");
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (5.0, 9.0), (11.0, 13.0)]);
+    }
+
+    #[test]
+    fn a_speed_change_is_a_length_change() {
+        let (before, [_, b, _]) = gapped();
+        let (_, out) = rippled(&before, |t| clip_mut(t, b).speed = 2.0); // 3.0s -> 1.5s
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (5.0, 6.5), (8.5, 10.5)]);
+    }
+
+    #[test]
+    fn removing_a_clip_closes_its_span_and_keeps_the_gaps_either_side() {
+        let (before, [_, b, _]) = gapped();
+        let (_, out) = rippled(&before, |t| t.tracks[0].clips.retain(|c| c.id != b));
+        // 1s of gap before `b` and 2s after it: 3s between `a` and `c`, as there was.
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (7.0, 9.0)]);
+    }
+
+    #[test]
+    fn removing_several_clips_closes_each_span_once() {
+        let clips = vec![rclip(0.0, 2.0), rclip(2.0, 2.0), rclip(6.0, 2.0), rclip(10.0, 2.0)];
+        let (a, c) = (clips[0].id, clips[2].id);
+        let before = one_lane(clips);
+        let (_, out) = rippled(&before, |t| t.tracks[0].clips.retain(|k| k.id != a && k.id != c));
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 2.0), (6.0, 8.0)]);
+    }
+
+    #[test]
+    fn a_clip_added_onto_footage_pushes_it_and_everything_after_right() {
+        let clips = vec![rclip(0.0, 4.0), rclip(4.0, 4.0), rclip(8.0, 4.0)];
+        let before = one_lane(clips);
+        // Dropped at the cut between `a` and `b`: a 2s insert.
+        let (after, out) = rippled(&before, |t| t.tracks[0].clips.push(rclip(4.0, 2.0)));
+        assert_eq!(after.tracks[0].clips[1].timeline_start, 4.0, "un-rippled it overlaps `b`");
+        assert_eq!(
+            spans_of(&out, 0),
+            vec![(0.0, 4.0), (4.0, 6.0), (6.0, 10.0), (10.0, 14.0)],
+            "kept in lane order, nothing overlapping"
+        );
+    }
+
+    #[test]
+    fn a_clip_added_over_the_head_of_a_clip_in_a_gap_pushes_by_its_whole_length() {
+        let before = one_lane(vec![rclip(0.0, 2.0), rclip(10.0, 2.0), rclip(14.0, 2.0)]);
+        // 5s at 8.0 runs into the head of the clip at 10.0.
+        let (_, out) = rippled(&before, |t| t.tracks[0].clips.push(rclip(8.0, 5.0)));
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 2.0), (8.0, 13.0), (15.0, 17.0), (19.0, 21.0)]);
+    }
+
+    #[test]
+    fn a_clip_that_fits_moves_nothing() {
+        let before = one_lane(vec![rclip(0.0, 2.0), rclip(10.0, 2.0)]);
+        // Into the gap, and onto the end of the track.
+        let (after, out) = rippled(&before, |t| {
+            t.tracks[0].clips.push(rclip(4.0, 2.0));
+            t.tracks[0].clips.push(rclip(12.0, 3.0));
+        });
+        assert!(same_cut(&after, &out));
+    }
+
+    #[test]
+    fn a_clip_added_inside_another_clip_is_left_as_the_edit_made_it() {
+        // Resolving it would take a split, which ripple never does.
+        let before = one_lane(vec![rclip(0.0, 10.0), rclip(10.0, 4.0)]);
+        let (after, out) = rippled(&before, |t| t.tracks[0].clips.push(rclip(4.0, 2.0)));
+        assert!(same_cut(&after, &out), "no ripple for the track — not half of one");
+    }
+
+    #[test]
+    fn adjacent_adds_push_once_by_their_combined_length() {
+        let before = one_lane(vec![rclip(0.0, 4.0), rclip(4.0, 4.0)]);
+        let (_, out) = rippled(&before, |t| {
+            t.tracks[0].clips.push(rclip(4.0, 2.0));
+            t.tracks[0].clips.push(rclip(6.0, 3.0));
+        });
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (4.0, 6.0), (6.0, 9.0), (9.0, 13.0)]);
+    }
+
+    #[test]
+    fn replacing_a_clip_in_place_moves_nothing() {
+        let (before, [_, b, _]) = gapped();
+        let (after, out) = rippled(&before, |t| {
+            t.tracks[0].clips.retain(|c| c.id != b);
+            t.tracks[0].clips.insert(1, rclip(5.0, 3.0));
+        });
+        assert!(same_cut(&after, &out), "-3s for the removal and +3s for the add cancel");
+    }
+
+    #[test]
+    fn a_split_shifts_nothing() {
+        let (before, [a, ..]) = gapped();
+        let (after, out) = rippled(&before, |t| {
+            // What `Project::split_at` does at 1.5.
+            let left = clip_mut(t, a);
+            let mut right = left.clone();
+            right.id = Uuid::new_v4();
+            right.timeline_start = 1.5;
+            right.source_in = 1.5;
+            left.source_out = 1.5;
+            t.tracks[0].clips.insert(1, right);
+        });
+        assert_eq!(after.tracks[0].clips.len(), 4);
+        assert!(same_cut(&after, &out));
+    }
+
+    #[test]
+    fn a_move_does_not_ripple_within_a_track_or_across_tracks() {
+        let (mut before, [a, b, _]) = gapped();
+        before
+            .tracks
+            .insert(1, track(StreamKind::Video, "V2", vec![rclip(20.0, 2.0)]));
+
+        // Within the track: `a` slides into the gap.
+        let (after, out) = rippled(&before, |t| clip_mut(t, a).timeline_start = 0.5);
+        assert!(same_cut(&after, &out));
+
+        // Across tracks: `b` goes up to V2. V1 does not close behind it.
+        let (after, out) = rippled(&before, |t| {
+            let (ti, ci) = t.locate(b).unwrap();
+            let moved = t.tracks[ti].clips.remove(ci);
+            t.tracks[1].clips.insert(0, moved);
+        });
+        assert!(same_cut(&after, &out));
+    }
+
+    #[test]
+    fn tracks_ripple_independently() {
+        let (a, b, c) = (rclip(0.0, 4.0), rclip(5.0, 3.0), rclip(10.0, 2.0));
+        let a_id = a.id;
+        let audio = vec![rclip(0.0, 4.0), rclip(5.0, 3.0), rclip(10.0, 2.0)];
+        let before = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![a, b, c]),
+                track(StreamKind::Audio, "A1", audio),
+            ],
+            ..Timeline::new()
+        };
+        let (_, out) = rippled(&before, |t| clip_mut(t, a_id).source_out = 3.0);
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 3.0), (4.0, 7.0), (9.0, 11.0)]);
+        assert_eq!(spans_of(&out, 1), spans_of(&before, 1), "no sync lock: the audio stays put");
+    }
+
+    #[test]
+    fn a_locked_track_never_moves() {
+        let (mut before, [a, ..]) = gapped();
+        before.tracks[0].locked = true;
+        let (after, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
+        assert!(same_cut(&after, &out));
+    }
+
+    #[test]
+    fn an_edit_that_already_rippled_is_not_rippled_twice() {
+        let (before, [_, b, _]) = gapped();
+        // `Project::ripple_delete` of `b`: removed, and `c` closed up by 3.
+        let (after, out) = rippled(&before, |t| {
+            t.tracks[0].clips.retain(|c| c.id != b);
+            t.tracks[0].clips[1].timeline_start -= 3.0;
+        });
+        assert_eq!(spans_of(&after, 0), vec![(0.0, 4.0), (7.0, 9.0)]);
+        assert!(same_cut(&after, &out));
+
+        // `Project::cut_clip_range` of the middle second of `a`: the head keeps
+        // the id, the tail is a new clip, and everything later is moved left 1s.
+        let (before, [a, ..]) = gapped();
+        let (after, out) = rippled(&before, |t| {
+            let head = clip_mut(t, a);
+            let mut tail = head.clone();
+            head.source_out = 1.0;
+            tail.id = Uuid::new_v4();
+            tail.source_in = 2.0;
+            tail.timeline_start = 1.0;
+            t.tracks[0].clips.insert(1, tail);
+            for c in t.tracks[0].clips.iter_mut().skip(2) {
+                c.timeline_start -= 1.0;
+            }
+        });
+        assert_eq!(spans_of(&after, 0), vec![(0.0, 1.0), (1.0, 3.0), (4.0, 7.0), (9.0, 11.0)]);
+        assert!(same_cut(&after, &out));
+    }
+
+    #[test]
+    fn two_trims_in_one_edit_accumulate_down_the_track() {
+        let (before, [a, b, _]) = gapped();
+        let (_, out) = rippled(&before, |t| {
+            clip_mut(t, a).source_out = 3.0; // -1s
+            clip_mut(t, b).source_out = 2.0; // -1s, and `b` itself follows `a`
+        });
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 3.0), (4.0, 6.0), (8.0, 10.0)]);
+    }
+
+    #[test]
+    fn a_ripple_that_would_overlap_is_not_applied() {
+        // V1: a [0,4)  r [4,6)  f [6,8).  The edit deletes `r` and drops a clip
+        // from V2 into its place. Closing `f` up behind `r` would land it on top.
+        let (a, r, f) = (rclip(0.0, 4.0), rclip(4.0, 2.0), rclip(6.0, 2.0));
+        let (r_id, m) = (r.id, rclip(0.0, 2.0));
+        let m_id = m.id;
+        let before = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![a, r, f]),
+                track(StreamKind::Video, "V2", vec![m]),
+            ],
+            ..Timeline::new()
+        };
+        let (after, out) = rippled(&before, |t| {
+            t.tracks[0].clips.retain(|c| c.id != r_id);
+            let mut moved = t.tracks[1].clips.remove(0);
+            assert_eq!(moved.id, m_id);
+            moved.timeline_start = 4.0;
+            t.tracks[0].clips.insert(1, moved);
+        });
+        assert!(same_cut(&after, &out), "left exactly as the edit made it");
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (4.0, 6.0), (6.0, 8.0)]);
+    }
+
+    #[test]
+    fn a_ripple_that_would_start_a_clip_before_zero_is_not_applied() {
+        // An old project with overlapping clips: deleting both `r1` and `r2` would
+        // close `f` up by 8s, which is more than there is room for.
+        let (r1, r2, f) = (rclip(0.0, 4.0), rclip(1.0, 4.0), rclip(5.0, 2.0));
+        let (r1_id, r2_id) = (r1.id, r2.id);
+        let before = one_lane(vec![r1, r2, f]);
+        let (after, out) = rippled(&before, |t| t.tracks[0].clips.retain(|c| c.id != r1_id && c.id != r2_id));
+        assert!(same_cut(&after, &out));
+        assert_eq!(spans_of(&out, 0), vec![(5.0, 7.0)]);
+    }
+
+    #[test]
+    fn an_old_overlap_elsewhere_in_the_track_blocks_nothing() {
+        // `a` and `a2` already overlap and nothing touches them.
+        let (a, a2, b, c) = (rclip(0.0, 4.0), rclip(2.0, 4.0), rclip(10.0, 2.0), rclip(14.0, 2.0));
+        let b_id = b.id;
+        let before = one_lane(vec![a, a2, b, c]);
+        let (_, out) = rippled(&before, |t| t.tracks[0].clips.retain(|k| k.id != b_id));
+        assert_eq!(spans_of(&out, 0), vec![(0.0, 4.0), (2.0, 6.0), (12.0, 14.0)]);
+    }
+
+    #[test]
+    fn overlays_and_markers_stay_where_they_were() {
+        let (mut before, [a, ..]) = gapped();
+        before.overlays.push(TextOverlay::new("title", 6.0, 9.0));
+        before.markers.push(Marker {
+            id: Uuid::new_v4(),
+            time: 7.0,
+            name: "beat".to_string(),
+            color: None,
+        });
+        let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
+        assert_eq!(out.overlays[0].start, 6.0);
+        assert_eq!(out.markers[0].time, 7.0);
+        assert_eq!(spans_of(&out, 0)[1], (4.0, 7.0), "while the clips did move");
+    }
+
+    #[test]
+    fn an_edit_that_changes_no_timing_comes_back_untouched() {
+        let (before, [a, ..]) = gapped();
+        let (after, out) = rippled(&before, |t| {
+            clip_mut(t, a).volume = 0.4;
+            t.tracks[0].muted = true;
+        });
+        assert!(same_cut(&after, &out));
+        assert!(same_cut(&before.ripple_from(&before), &before));
+    }
+
+    #[test]
+    fn rippling_twice_is_rippling_once() {
+        let (before, [_, b, _]) = gapped();
+        let (after, once) = rippled(&before, |t| clip_mut(t, b).source_out = 1.0);
+        let twice = once.ripple_from(&before);
+        assert!(same_cut(&once, &twice));
+        assert!(!same_cut(&after, &once));
+    }
+
+    // ---- multi-clip moves and removals ------------------------------------------
+
+    fn mv(clip: &Clip, start: f64) -> ClipMove {
+        ClipMove {
+            clip_id: clip.id,
+            timeline_start: start,
+            track_id: None,
+        }
+    }
+
+    fn invalid(result: Result<Vec<Clip>>) -> String {
+        match result {
+            Err(Error::InvalidArgument(why)) => why,
+            other => panic!("expected an InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_group_moves_together_and_may_pass_through_the_places_it_is_leaving() {
+        // Three abutting clips nudged by a second: each lands on its neighbour's
+        // old spot, which moving them one at a time would reject.
+        let clips = vec![rclip(0.0, 2.0), rclip(2.0, 2.0), rclip(4.0, 2.0)];
+        let mut t = one_lane(clips.clone());
+        let moved = t
+            .move_clips(&[mv(&clips[2], 5.0), mv(&clips[0], 1.0), mv(&clips[1], 3.0)])
+            .unwrap();
+        assert_eq!(
+            moved.iter().map(|c| c.timeline_start).collect::<Vec<_>>(),
+            vec![5.0, 1.0, 3.0],
+            "reported in request order"
+        );
+        assert_eq!(spans_of(&t, 0), vec![(1.0, 3.0), (3.0, 5.0), (5.0, 7.0)], "lane re-sorted");
+    }
+
+    #[test]
+    fn clips_can_swap_places() {
+        let clips = vec![rclip(0.0, 2.0), rclip(2.0, 2.0)];
+        let mut t = one_lane(clips.clone());
+        t.move_clips(&[mv(&clips[0], 2.0), mv(&clips[1], 0.0)]).unwrap();
+        assert_eq!(t.tracks[0].clips[0].id, clips[1].id);
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 2.0), (2.0, 4.0)]);
+    }
+
+    #[test]
+    fn a_group_can_change_tracks_of_the_same_kind() {
+        let a = rclip(0.0, 2.0);
+        let mut t = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![a.clone()]),
+                track(StreamKind::Video, "V2", vec![rclip(0.0, 1.0)]),
+                track(StreamKind::Audio, "A1", vec![]),
+            ],
+            ..Timeline::new()
+        };
+        let (v2, a1) = (t.tracks[1].id, t.tracks[2].id);
+
+        let up = ClipMove {
+            track_id: Some(v2),
+            ..mv(&a, 1.0)
+        };
+        t.move_clips(&[up]).unwrap();
+        assert!(t.tracks[0].clips.is_empty());
+        assert_eq!(spans_of(&t, 1), vec![(0.0, 1.0), (1.0, 3.0)]);
+
+        let wrong_kind = ClipMove {
+            track_id: Some(a1),
+            ..mv(&a, 1.0)
+        };
+        assert!(invalid(t.move_clips(&[wrong_kind])).contains("different kind"));
+    }
+
+    #[test]
+    fn a_move_that_cannot_land_refuses_the_whole_group_and_changes_nothing() {
+        let clips = vec![rclip(0.0, 2.0), rclip(2.0, 2.0), rclip(10.0, 2.0)];
+        let mut t = one_lane(clips.clone());
+        let untouched = t.clone();
+        let nowhere = Uuid::new_v4();
+
+        // One good move and one that lands on the clip that is staying.
+        let why = invalid(t.move_clips(&[mv(&clips[0], 5.0), mv(&clips[1], 9.5)]));
+        assert!(why.contains("overlap") && why.contains("V1"), "{why}");
+        // Two moved clips on top of each other.
+        assert!(invalid(t.move_clips(&[mv(&clips[0], 5.0), mv(&clips[1], 6.0)])).contains("overlap"));
+        // The same clip twice, a start before 0, a start that is not a number.
+        assert!(invalid(t.move_clips(&[mv(&clips[0], 5.0), mv(&clips[0], 6.0)])).contains("more than once"));
+        assert!(invalid(t.move_clips(&[mv(&clips[0], -1.0)])).contains("before the beginning"));
+        assert!(invalid(t.move_clips(&[mv(&clips[0], f64::NAN)])).contains("finite"));
+        assert!(invalid(t.move_clips(&[])).contains("no clips"));
+        // An unknown clip and an unknown track.
+        assert!(matches!(
+            t.move_clips(&[mv(&clips[0], 5.0), mv(&rclip(0.0, 1.0), 6.0)]),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert!(matches!(
+            t.move_clips(&[ClipMove {
+                track_id: Some(nowhere),
+                ..mv(&clips[0], 5.0)
+            }]),
+            Err(Error::TrackNotFound(id)) if id == nowhere
+        ));
+        // A locked track, as the source…
+        let mut locked_lane = t.clone();
+        locked_lane.tracks[0].locked = true;
+        assert!(invalid(locked_lane.move_clips(&[mv(&clips[0], 5.0)])).contains("locked"));
+        // …and as the destination.
+        let mut two = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![clips[0].clone()]),
+                Track {
+                    locked: true,
+                    ..Track::new(StreamKind::Video, "V2")
+                },
+            ],
+            ..Timeline::new()
+        };
+        let v2 = two.tracks[1].id;
+        let to_locked = ClipMove {
+            track_id: Some(v2),
+            ..mv(&clips[0], 0.0)
+        };
+        assert!(invalid(two.move_clips(&[to_locked])).contains("V2 is locked"));
+
+        assert!(same_cut(&t, &untouched), "every refusal left the lane exactly as it was");
+    }
+
+    #[test]
+    fn removing_several_clips_is_all_or_nothing() {
+        let clips = vec![rclip(0.0, 2.0), rclip(2.0, 2.0), rclip(4.0, 2.0)];
+        let mut t = one_lane(clips.clone());
+
+        // A clip named twice goes once.
+        assert_eq!(t.remove_clips(&[clips[0].id, clips[2].id, clips[0].id]).unwrap(), 2);
+        assert_eq!(spans_of(&t, 0), vec![(2.0, 4.0)], "gaps are left");
+
+        // One unknown id refuses the lot.
+        let before = t.clone();
+        assert!(matches!(
+            t.remove_clips(&[clips[1].id, Uuid::new_v4()]),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert!(same_cut(&t, &before));
+        assert!(matches!(t.remove_clips(&[]), Err(Error::InvalidArgument(_))));
+
+        // So does a locked track.
+        t.tracks[0].locked = true;
+        assert!(matches!(t.remove_clips(&[clips[1].id]), Err(Error::InvalidArgument(why)) if why.contains("locked")));
+        assert!(t.tracks[0].locked && t.tracks[0].clips.len() == 1);
+    }
+
+    #[test]
+    fn clips_moved_since_says_whether_an_edit_rippled() {
+        let (t, [a, b, c]) = gapped();
+        assert_eq!(t.clips_moved_since(&t), 0);
+
+        // A bare remove leaves a gap; ripple closes it and b and c follow.
+        let (bare, out) = rippled(&t, |tl| tl.tracks[0].clips.retain(|x| x.id != a));
+        assert_eq!(bare.clips_moved_since(&t), 0);
+        assert_eq!(out.clips_moved_since(&t), 2);
+
+        // Removing the last clip has nothing after it to move: ripple on, nothing rippled.
+        let (_, out) = rippled(&t, |tl| tl.tracks[0].clips.retain(|x| x.id != c));
+        assert_eq!(out.clips_moved_since(&t), 0);
+
+        // A locked track never moves, so the same removal moves nothing there.
+        let mut locked = t.clone();
+        locked.tracks[0].locked = true;
+        let (_, out) = rippled(&locked, |tl| tl.tracks[0].clips.retain(|x| x.id != a));
+        assert_eq!(out.clips_moved_since(&locked), 0);
+
+        // A clip on another track counts, a clip that exists on one side only does not.
+        let mut two = t;
+        two.tracks.push(track(StreamKind::Video, "V2", vec![]));
+        let mut moved = two.clone();
+        let clip = moved.tracks[0].clips.remove(1);
+        assert_eq!(clip.id, b);
+        moved.tracks[1].clips.push(clip);
+        assert_eq!(moved.clips_moved_since(&two), 1);
+        moved.tracks[1].clips.push(rclip(0.0, 1.0));
+        assert_eq!(moved.clips_moved_since(&two), 1, "an added clip is not a moved one");
     }
 }

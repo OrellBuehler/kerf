@@ -12,6 +12,7 @@ import type {
 	AudioEffect,
 	CaptionOptions,
 	Clip,
+	ClipMove,
 	Mask,
 	Color,
 	Delivery,
@@ -44,13 +45,17 @@ import type {
 	VoiceoverProgress,
 	VoiceoverRequest,
 	VoiceoverResult,
-	VoiceoverStatus
+	VoiceoverStatus,
+	WaveformRange
 } from './types';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { formatTime as fmtTime } from './diff';
+import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
+import { rippleFrom } from './ripple';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
+import { synthWaveformRange } from './sample-waveform';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
@@ -241,6 +246,28 @@ function assetById(id: string): Asset | undefined {
 function trackForAsset(tl: Timeline, assetId: string): Track {
 	const hasVideo = assetById(assetId)?.streams.some((s) => s.kind === 'video');
 	return tl.tracks.find((t) => t.kind === (hasVideo ? 'video' : 'audio')) ?? tl.tracks[0];
+}
+
+// ---- ripple mode (browser dev fallback) -----------------------------------
+// The project's ripple flag lives in the harness's project state, as it lives in
+// the `.kerf` file's meta. Every harness edit that can change how much footage
+// sits ahead of a clip runs through `devEdit`, which is `Project::edit_timeline`
+// in miniature: with ripple on it snapshots the timeline, runs the edit and
+// stores `rippleFrom(after, before)` — the faithful mirror in `ripple.ts`.
+// Edits that decide their own layout (move, reorder, ripple delete, cut range,
+// the beat snap, paste) never go through it, exactly as in the core.
+
+let devRippleMode = false;
+
+/** Run one harness edit with ripple applied after it when it is on: the project's
+ *  flag, or `ripple` for this call (`Project::with_ripple`). A throwing edit has
+ *  changed nothing, so the timeline is only replaced once it returns. */
+function devEdit<R>(ripple: boolean | undefined, run: () => R): R {
+	if (!(ripple ?? devRippleMode)) return run();
+	const before = snapshot();
+	const result = run();
+	devTimeline = rippleFrom(devTimeline, before);
+	return result;
 }
 
 // ---- read ------------------------------------------------------------------
@@ -673,21 +700,23 @@ export async function generateVoiceover(opts: VoiceoverRequest): Promise<Voiceov
 			tempo: null,
 			audio_class: { class: 'speech', confidence: 1 }
 		};
-		let track = opts.trackId ? devTimeline.tracks.find((t) => t.id === opts.trackId) : undefined;
-		track ??= devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'VO');
-		if (!track) {
-			track = { id: uid(), kind: 'audio', name: 'VO', clips: [] };
-			devTimeline.tracks.push(track);
-		}
-		track.clips.push({
-			id: uid(),
-			asset_id: id,
-			source_in: 0,
-			source_out: asset.duration,
-			timeline_start: opts.timelineStart ?? trackEnd(track),
-			volume: 1,
-			fade_in: 0,
-			fade_out: 0
+		devEdit(undefined, () => {
+			let track = opts.trackId ? devTimeline.tracks.find((t) => t.id === opts.trackId) : undefined;
+			track ??= devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'VO');
+			if (!track) {
+				track = { id: uid(), kind: 'audio', name: 'VO', clips: [] };
+				devTimeline.tracks.push(track);
+			}
+			track.clips.push({
+				id: uid(),
+				asset_id: id,
+				source_in: 0,
+				source_out: asset.duration,
+				timeline_start: opts.timelineStart ?? trackEnd(track),
+				volume: 1,
+				fade_in: 0,
+				fade_out: 0
+			});
 		});
 		recordDev('Add voiceover');
 		const timeline = opts.captions ? await generateCaptions(opts.captions) : snapshot();
@@ -722,12 +751,32 @@ export async function onVoiceoverProgress(cb: (p: VoiceoverProgress) => void): P
 	return listen<VoiceoverProgress>('voiceover-progress', (e) => cb(e.payload));
 }
 
+// ---- ripple mode -----------------------------------------------------------
+
+/** Whether the project edits in ripple mode (off until someone turns it on). */
+export async function getRippleMode(): Promise<boolean> {
+	if (!inTauri()) return devRippleMode;
+	return invoke<boolean>('get_ripple_mode');
+}
+
+/** Turn ripple mode on or off for the project; resolves to what is stored. A
+ *  setting, not an edit — no revision, and the timeline does not move. */
+export async function setRippleMode(on: boolean): Promise<boolean> {
+	if (!inTauri()) {
+		devRippleMode = on;
+		return devRippleMode;
+	}
+	return invoke<boolean>('set_ripple_mode', { on });
+}
+
 // ---- timeline editing (each resolves to the refreshed timeline) ------------
 
 export async function cutClip(assetId: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
-		const track = trackForAsset(devTimeline, assetId);
-		track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
+		devEdit(undefined, () => {
+			const track = trackForAsset(devTimeline, assetId);
+			track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
+		});
 		recordDev('Add clip');
 		return snapshot();
 	}
@@ -742,9 +791,11 @@ export async function addClip(
 	timelineStart?: number
 ): Promise<Timeline> {
 	if (!inTauri()) {
-		const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
-		const start = timelineStart ?? trackEnd(track);
-		track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
+		devEdit(undefined, () => {
+			const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
+			const start = timelineStart ?? trackEnd(track);
+			track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
+		});
 		recordDev('Add clip');
 		return snapshot();
 	}
@@ -753,26 +804,28 @@ export async function addClip(
 
 export async function splitClip(clipId: string, at: number): Promise<Timeline> {
 	if (!inTauri()) {
-		const found = locate(devTimeline, clipId);
-		if (found) {
-			const [track, ci] = found;
-			const clip = track.clips[ci];
-			if (at > clip.timeline_start && at < clip.timeline_start + clipDuration(clip)) {
-				const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
-				const offset = (at - clip.timeline_start) * mag;
-				const right: Clip = { ...clip, id: uid(), timeline_start: at, transition_in: null };
-				if ((clip.speed ?? 1) < 0) {
-					const splitSrc = clip.source_out - offset;
-					right.source_out = splitSrc;
-					clip.source_in = splitSrc;
-				} else {
-					const splitSrc = clip.source_in + offset;
-					right.source_in = splitSrc;
-					clip.source_out = splitSrc;
+		devEdit(undefined, () => {
+			const found = locate(devTimeline, clipId);
+			if (found) {
+				const [track, ci] = found;
+				const clip = track.clips[ci];
+				if (at > clip.timeline_start && at < clip.timeline_start + clipDuration(clip)) {
+					const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
+					const offset = (at - clip.timeline_start) * mag;
+					const right: Clip = { ...clip, id: uid(), timeline_start: at, transition_in: null };
+					if ((clip.speed ?? 1) < 0) {
+						const splitSrc = clip.source_out - offset;
+						right.source_out = splitSrc;
+						clip.source_in = splitSrc;
+					} else {
+						const splitSrc = clip.source_in + offset;
+						right.source_in = splitSrc;
+						clip.source_out = splitSrc;
+					}
+					track.clips.splice(ci + 1, 0, right);
 				}
-				track.clips.splice(ci + 1, 0, right);
 			}
-		}
+		});
 		recordDev('Split clip');
 		return snapshot();
 	}
@@ -786,16 +839,23 @@ export async function trimClip(
 	timelineStart?: number
 ): Promise<Timeline> {
 	if (!inTauri()) {
-		const found = locate(devTimeline, clipId);
-		if (found) {
-			const clip = found[0].clips[found[1]];
-			if (sourceIn != null) clip.source_in = sourceIn;
-			if (sourceOut != null) clip.source_out = sourceOut;
-			if (timelineStart != null) {
-				clip.timeline_start = Math.max(0, timelineStart);
-				found[0].clips.sort((a, b) => a.timeline_start - b.timeline_start);
+		// With ripple on the later clips follow the clip's change in length and a
+		// left-edge trim keeps the clip's start, so the timeline handed back
+		// carries the clip as it ended up — as the backend's does.
+		devEdit(undefined, () => {
+			const found = locate(devTimeline, clipId);
+			if (found) {
+				const clip = found[0].clips[found[1]];
+				if ((sourceOut ?? clip.source_out) <= (sourceIn ?? clip.source_in))
+					throw new Error('invalid argument: source_out must be greater than source_in');
+				if (sourceIn != null) clip.source_in = sourceIn;
+				if (sourceOut != null) clip.source_out = sourceOut;
+				if (timelineStart != null) {
+					clip.timeline_start = Math.max(0, timelineStart);
+					found[0].clips.sort((a, b) => a.timeline_start - b.timeline_start);
+				}
 			}
-		}
+		});
 		recordDev('Trim clip');
 		return snapshot();
 	}
@@ -867,12 +927,28 @@ export async function duplicateClips(clipIds: string[], at: number): Promise<Tim
 
 export async function removeClip(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
-		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips.splice(found[1], 1);
+		devEdit(undefined, () => {
+			const found = locate(devTimeline, clipId);
+			if (found) found[0].clips.splice(found[1], 1);
+		});
 		recordDev('Remove clip');
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clip', { clipId });
+}
+
+/** Remove several clips as **one** edit — all or nothing, one history step. With
+ *  `ripple` true every track closes up behind what it lost (a multi-select ripple
+ *  delete, Shift+Delete); omitted, the project's ripple mode decides. */
+export async function removeClips(clipIds: string[], ripple?: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const rippled = ripple ?? devRippleMode;
+		const n = new Set(clipIds).size;
+		devEdit(ripple, () => removeClipsLocal(devTimeline, clipIds));
+		recordDev(n === 1 ? (rippled ? 'Ripple delete' : 'Remove clip') : `${rippled ? 'Ripple delete' : 'Remove'} ${n} clips`);
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_clips', { clipIds, ripple });
 }
 
 /** Move a clip to a new timeline position, optionally onto another same-kind track. */
@@ -900,6 +976,19 @@ export async function moveClip(clipId: string, timelineStart: number, trackId?: 
 		return snapshot();
 	}
 	return invoke<Timeline>('move_clip', { clipId, timelineStart, trackId });
+}
+
+/** Move several clips as **one** edit — a marquee selection dragged together.
+ *  Each move is a clip, an absolute start and optionally another same-kind track;
+ *  the group is checked as a group and an illegal one changes nothing (the promise
+ *  rejects). Never ripples. */
+export async function moveClips(moves: ClipMove[]): Promise<Timeline> {
+	if (!inTauri()) {
+		moveClipsLocal(devTimeline, moves);
+		recordDev(moves.length === 1 ? 'Move clip' : `Move ${moves.length} clips`);
+		return snapshot();
+	}
+	return invoke<Timeline>('move_clips', { moves });
 }
 
 /** Remove a clip and close the gap (later clips on its track shift left). */
@@ -1134,8 +1223,10 @@ export async function setFade(clipId: string, fadeIn?: number, fadeOut?: number)
 /** Set a clip's playback speed (1.0 = normal, negative = reverse). */
 export async function setSpeed(clipId: string, speed: number): Promise<Timeline> {
 	if (!inTauri()) {
-		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips[found[1]].speed = speed;
+		devEdit(undefined, () => {
+			const found = locate(devTimeline, clipId);
+			if (found) found[0].clips[found[1]].speed = speed;
+		});
 		recordDev('Set speed');
 		return snapshot();
 	}
@@ -1897,6 +1988,48 @@ export async function getWaveform(assetId: string, buckets: number): Promise<num
 }
 
 /**
+ * `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
+ * peak pairs per channel, `[channel][bucket]` in -1..1 — what a clip's waveform
+ * is drawn from. Served from a peak pyramid the backend caches per file, so the
+ * first call for a file decodes it and every later window at any zoom is cheap;
+ * the backend caps `buckets` at 4096 and `buckets` in the answer is what came
+ * back. Part of the window outside the media reads 0 / 0. Rejects for an asset
+ * with no audio stream. Outside the desktop app a deterministic synthetic
+ * waveform stands in, with a clipped stretch so the clipping colour shows.
+ */
+export async function getWaveformRange(
+	assetId: string,
+	start: number,
+	end: number,
+	buckets: number
+): Promise<WaveformRange> {
+	// The backend takes a `usize`: a fractional pixel width would be an opaque
+	// deserialize error rather than a slightly different column count.
+	const count = Math.max(0, Math.round(buckets));
+	if (!inTauri()) {
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		const audio = asset.streams.find((st) => st.kind === 'audio');
+		if (!audio) throw new Error(`invalid argument: asset ${assetId} has no audio stream`);
+		const analysis = sampleAnalysis[assetId];
+		return synthWaveformRange(
+			{
+				id: asset.id,
+				duration: asset.duration,
+				channels: audio.channels ?? 2,
+				silence: analysis?.silence_segments,
+				kind: analysis?.audio_class?.class === 'music' ? 'music' : 'speech',
+				bpm: analysis?.tempo?.bpm
+			},
+			start,
+			end,
+			count
+		);
+	}
+	return invoke<WaveformRange>('get_waveform_range', { assetId, start, end, buckets: count });
+}
+
+/**
  * A window of an asset's audio as raw mono s16le PCM at `sampleRate`, for the
  * preview's Web Audio playback. `null` outside the desktop app (the browser
  * demo has no real media to decode).
@@ -2064,7 +2197,8 @@ export async function getSettings(): Promise<SettingsView> {
 			transcribe: readBrowserTranscribe(),
 			safe_areas: readBrowserSafeAreas(),
 			layout: readBrowserJson(LAYOUT_KEY),
-			theme: readBrowserJson(THEME_KEY)
+			theme: readBrowserJson(THEME_KEY),
+			workspaces: readBrowserJson(WORKSPACES_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -2073,7 +2207,7 @@ export async function getSettings(): Promise<SettingsView> {
 /**
  * Persist the fields that changed and put them into force; returns the resolved
  * view. Only the fields in `patch` are written — the backend merges them into
- * the stored file, so a layout write cannot carry a stale copy of the theme.
+ * the stored file, so a workspaces write cannot carry a stale copy of the theme.
  */
 export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
 	if (!inTauri()) {
@@ -2086,6 +2220,7 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
+			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -2099,6 +2234,7 @@ const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
+const WORKSPACES_KEY = 'kerf.settings.workspaces';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 

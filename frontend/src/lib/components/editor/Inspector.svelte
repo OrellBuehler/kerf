@@ -4,6 +4,7 @@
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
+	import TitlesControls from './TitlesControls.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -11,20 +12,13 @@
 	import { MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
 	import type { TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
-	import { CAPTION_LOOKS, COLOR_LOOKS, TEXT_STYLES, activeLook } from '$lib/style-presets';
+	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
+	import { MAX_GAIN } from '$lib/mixer';
+	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
+	import { addTextHere, dropCaptions, makeCaptions } from '$lib/title-actions';
 	import { needsCrop } from '$lib/smart-crop';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
-	import type { TextStyle } from '$lib/style-presets';
-	import type {
-		AudioEffect,
-		CaptionStyle,
-		Mask,
-		Projection,
-		Reframe,
-		Transform,
-		TransitionKind,
-		VideoEffect
-	} from '$lib/types';
+	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 
 	const clip = $derived(editor.selectedClip);
@@ -144,22 +138,6 @@
 	const overlays = $derived(editor.overlays);
 	const overlay = $derived(editor.selectedOverlay);
 
-	const VIDEO_FX: Record<string, VideoEffect> = {
-		blur: { type: 'blur', sigma: 6 },
-		sharpen: { type: 'sharpen', amount: 1 },
-		grayscale: { type: 'grayscale' },
-		invert: { type: 'invert' },
-		vignette: { type: 'vignette' },
-		chroma_key: { type: 'chroma_key', color: 'green', similarity: 0.15, blend: 0.1 }
-	};
-	const AUDIO_FX: Record<string, AudioEffect> = {
-		highpass: { type: 'highpass', hz: 80 },
-		lowpass: { type: 'lowpass', hz: 12000 },
-		equalizer: { type: 'equalizer', hz: 3000, width: 1000, gain_db: 3 },
-		compressor: { type: 'compressor', threshold_db: -18, ratio: 3, attack_ms: 20, release_ms: 250, makeup_db: 6 },
-		gate: { type: 'gate', threshold_db: -45 }
-	};
-
 	function addVideoFx(kindKey: string) {
 		const c = clip;
 		if (!c || !kindKey) return;
@@ -201,66 +179,11 @@
 		if (!c) return;
 		void run(() => editor.setKeyframes(c.id, keyframes.filter((_, j) => j !== i)));
 	}
-	function addOverlayHere() {
-		const at = Math.max(0, ui.time);
-		void run(() => editor.addTitle('Text', at, at + 3));
-	}
-	/** Pick a title from the lane's list, and bring the playhead into its span so
-	 *  the preview has it on screen to move and resize. */
-	function pickOverlay(o: TextOverlay) {
-		if (editor.selectedOverlayId === o.id) {
-			editor.selectOverlay(null);
-			return;
-		}
-		editor.selectOverlay(o.id);
-		if (ui.time < o.start || ui.time > o.end) ui.seek(o.start);
-	}
 	function removeOverlayKeyframe(o: TextOverlay, i: number) {
 		const left = (o.keyframes ?? []).filter((_, j) => j !== i).map((k) => ({ ...k }));
 		void run(() => editor.setOverlayKeyframes(o.id, left));
 	}
-	/** Add a preset-styled overlay at the playhead: create, style, then (for
-	 *  faded styles) keyframe the opacity in and out. */
-	function addStyledOverlay(s: TextStyle) {
-		const at = Math.max(0, ui.time);
-		void run(async () => {
-			await editor.addOverlay(s.text, at, at + s.duration);
-			const created = editor.overlays[editor.overlays.length - 1];
-			if (!created) return;
-			const { bg, ...rest } = s.style;
-			await editor.updateOverlay(created.id, bg == null ? rest : { ...rest, bg });
-			if (s.fade > 0) {
-				const kf = (time: number, opacity: number) => ({ time, pos_x: s.style.pos_x, pos_y: s.style.pos_y, opacity });
-				await editor.setOverlayKeyframes(created.id, [
-					kf(0, 0),
-					kf(s.fade, 1),
-					kf(s.duration - s.fade, 1),
-					kf(s.duration, 0)
-				]);
-			}
-			editor.selectOverlay(created.id);
-		});
-	}
-	/** Captions are placed in timeline time, so they follow the cut — which also
-	 *  means a later trim moves the words out from under them. Re-running
-	 *  replaces the generated set, so the button stays the same after the first
-	 *  press and only its label admits what it is doing. */
 	const hasCaptions = $derived(overlays.some((o) => o.generated));
-	// Which look the button generates in. Not derived from the overlays already
-	// on the timeline: a caption's style is not recoverable from the text it
-	// carries, and guessing it from the word count would flip the selection
-	// every time a sentence happened to be short.
-	let captionStyle = $state<CaptionStyle>('lines');
-	function makeCaptions() {
-		if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
-			toast.error('Put a clip on the timeline first');
-			return;
-		}
-		void run(() => editor.generateCaptions({ style: captionStyle }));
-	}
-	function dropCaptions() {
-		void run(() => editor.clearCaptions());
-	}
 
 	// While a slider is being dragged, show its live value (keyed by row label)
 	// without committing to the backend on every input event — commit happens on
@@ -333,7 +256,7 @@
 			);
 		}
 		items.push(
-			{ label: 'Add text overlay', icon: 'captions', action: addOverlayHere },
+			{ label: 'Add text overlay', icon: 'captions', action: addTextHere },
 			{ label: hasCaptions ? 'Regenerate captions' : 'Generate captions', icon: 'captions', action: makeCaptions }
 		);
 		if (hasCaptions) {
@@ -639,58 +562,8 @@
 
 {#snippet overlaysSection()}
 	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length, 'item')} open>
-	<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-bottom:6px">
-		Titles sit on their own lane in the timeline, apart from the clips.
-	</div>
-	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
-		{#each TEXT_STYLES as s (s.id)}
-			<button style={chip(false)} disabled={editor.busy} onclick={() => addStyledOverlay(s)}>+ {s.label}</button>
-		{/each}
-	</div>
-	<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px">
-		<span style="font-size:12px;color:var(--text-muted)">Caption style</span>
-		{#each CAPTION_LOOKS as c (c.id)}
-			<button style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (captionStyle = c.id)}>
-				{c.label}
-			</button>
-		{/each}
-	</div>
-	<div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:6px">
-		<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addOverlayHere}>+ Text</Btn>
-		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={makeCaptions}>
-			{hasCaptions ? 'Recaption' : 'Captions'}
-		</Btn>
-		{#if hasCaptions}
-			<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={dropCaptions}>Clear</Btn>
-		{/if}
-		<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
-			>Voiceover…</Btn
-		>
-	</div>
-	{#if overlays.length === 0}
-		<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
-			No titles or captions yet. Add text, or caption the whole cut from the transcripts of the clips on
-			the timeline — captions land on the words that survived your edit.
-		</div>
-	{/if}
-	{#each overlays as o (o.id)}
-		<div style="display:flex;align-items:center;gap:6px;padding:3px 0">
-			<button
-				onclick={() => pickOverlay(o)}
-				style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:{editor.selectedOverlayId === o.id ? 'var(--kerf-300)' : 'var(--text-secondary)'};padding:0"
-			>
-				<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					>{o.text || '(empty)'}</span
-				>
-				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
-			</button>
-			<button onclick={() => run(() => editor.removeOverlay(o.id))} disabled={editor.busy} title="Remove" style={xBtn}
-				>×</button
-			>
-		</div>
-	{/each}
+		<TitlesControls />
 	</InspectorSection>
-
 {/snippet}
 
 <div
@@ -703,6 +576,17 @@
 		{#if overlay}
 			{@render overlayEditor(overlay)}
 		{:else if clip}
+			{#if editor.selectedClips.length > 1}
+				<!-- Several clips are selected but an edit here acts on one. Say which,
+				     rather than let a fader look like it moves them all. -->
+				<div
+					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
+				>
+					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
+					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
+					them all; Delete removes them all.
+				</div>
+			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
 					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
@@ -744,7 +628,7 @@
 					<input
 						type="range"
 						min="0"
-						max="2"
+						max={MAX_GAIN}
 						step="0.05"
 						value={clip.volume}
 						disabled={editor.busy}

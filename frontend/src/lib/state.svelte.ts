@@ -21,12 +21,13 @@ import {
 	extractAudio,
 	getAssetMetadata,
 	getHistory,
+	getRippleMode,
 	getTimeline,
-	getWaveform,
 	importAsset,
 	listAssets,
 	addTrack,
 	moveClip,
+	moveClips,
 	removeOverlay,
 	setAudioEffects,
 	setKeyframes,
@@ -42,6 +43,7 @@ import {
 	projectPath,
 	redo as apiRedo,
 	removeClip,
+	removeClips,
 	removeSilence,
 	snapToBeats,
 	smartCrop,
@@ -72,6 +74,7 @@ import {
 	saveProjectAs as apiSaveProjectAs,
 	setColor,
 	setFade,
+	setRippleMode,
 	setSpeed,
 	setTransform,
 	setTransition,
@@ -82,6 +85,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	ClipMove,
 	ExportProgress,
 	Asset,
 	AssetAnalysis,
@@ -113,6 +117,7 @@ import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { Generation } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
+import { clickSelect, normalize, pruneSelection, type PickMode } from './selection';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -121,8 +126,15 @@ class EditorState {
 	/** The clip the Inspector edits — the primary of the selection. */
 	selectedClipId = $state<string | null>(null);
 	/** The whole selection. Always contains `selectedClipId` when that is set;
-	 *  most edits act on the primary, but delete acts on all of these. */
+	 *  most edits act on the primary, but delete and a drag act on all of these.
+	 *  Every change goes through `selection.ts`, so a click, a Shift-click and a
+	 *  marquee agree on what they leave behind. */
 	selectedClipIds = $state<string[]>([]);
+	/** Ripple mode: with it on, an edit that changes how much footage sits ahead
+	 *  of a clip (a trim, a delete, a speed change) pulls the later clips on that
+	 *  track along. A property of the project, held by the backend; this is the
+	 *  copy the toolbar reads. */
+	rippleMode = $state(false);
 	/** The title being edited. Exclusive with the clip selection: a title is its
 	 *  own item on the titles lane, not a property of whichever clip is selected. */
 	selectedOverlayId = $state<string | null>(null);
@@ -152,7 +164,6 @@ class EditorState {
 	importProgress = $state<number | null>(null);
 	error = $state<string | null>(null);
 
-	#waveforms = new Map<string, number[] | Promise<number[]>>();
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline: Timeline | null = null;
 	/** Snapshot guard over `timeline` — every writer bumps it (via `#setTimeline`)
@@ -165,6 +176,13 @@ class EditorState {
 		this.timeline = tl;
 		if (this.selectedOverlayId && !(tl.overlays ?? []).some((o) => o.id === this.selectedOverlayId)) {
 			this.selectedOverlayId = null;
+		}
+		// A clip another edit removed (an undo, an agent) is no longer selected —
+		// the Inspector would otherwise keep a clip that is not there.
+		if (this.selectedClipIds.length > 0) {
+			const here = new Set(tl.tracks.flatMap((t) => t.clips.map((c) => c.id)));
+			const now = pruneSelection(this.#selection(), (id) => here.has(id));
+			if (now.ids.length !== this.selectedClipIds.length) this.#setSelection(now);
 		}
 		this.#timelineGen.advance();
 	}
@@ -196,36 +214,40 @@ class EditorState {
 		return this.selectedClipIds.includes(clipId);
 	}
 
+	#selection() {
+		return { ids: this.selectedClipIds, primary: this.selectedClipId };
+	}
+
+	#setSelection(sel: { ids: readonly string[]; primary: string | null }) {
+		this.selectedClipIds = [...sel.ids];
+		this.selectedClipId = sel.primary;
+	}
+
 	/**
 	 * Select a clip. `replace` (a plain click) drops the rest, `toggle`
-	 * (ctrl/cmd-click) adds or removes it, and `range` (shift-click) takes
-	 * everything between the primary and this clip on the same track.
+	 * (ctrl/cmd-click) adds or removes it, and `range` (shift-click) extends the
+	 * selection with everything between the primary and this clip on the same
+	 * track (just the clip, when the primary is elsewhere).
 	 */
-	selectClip(clipId: string, mode: 'replace' | 'toggle' | 'range' = 'replace') {
+	selectClip(clipId: string, mode: PickMode = 'replace') {
 		this.selectedOverlayId = null;
-		if (mode === 'toggle') {
-			const has = this.selectedClipIds.includes(clipId);
-			this.selectedClipIds = has
-				? this.selectedClipIds.filter((id) => id !== clipId)
-				: [...this.selectedClipIds, clipId];
-			// Dropping the primary hands the Inspector whatever is left.
-			if (has && this.selectedClipId === clipId) this.selectedClipId = this.selectedClipIds.at(-1) ?? null;
-			else if (!has) this.selectedClipId = clipId;
-			return;
-		}
-		if (mode === 'range' && this.selectedClipId) {
-			const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
-			const anchor = track?.clips.findIndex((c) => c.id === this.selectedClipId) ?? -1;
-			const to = track?.clips.findIndex((c) => c.id === clipId) ?? -1;
-			if (track && anchor >= 0 && to >= 0) {
-				const [lo, hi] = anchor <= to ? [anchor, to] : [to, anchor];
-				this.selectedClipIds = track.clips.slice(lo, hi + 1).map((c) => c.id);
-				this.selectedClipId = clipId;
-				return;
-			}
-		}
-		this.selectedClipId = clipId;
-		this.selectedClipIds = [clipId];
+		const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
+		this.#setSelection(
+			clickSelect(this.#selection(), clipId, mode, track ? track.clips.map((c) => c.id) : null)
+		);
+	}
+
+	/** Replace the whole selection (what a marquee ends on). The primary stays a
+	 *  member: `primary` when it is one, else the last. */
+	selectClips(ids: readonly string[], primary: string | null = null) {
+		this.selectedOverlayId = null;
+		this.#setSelection(normalize(ids, primary));
+	}
+
+	/** Hand the Inspector another clip of the selection, leaving the set alone. A
+	 *  clip that is not selected is ignored. */
+	setPrimary(clipId: string) {
+		if (this.selectedClipIds.includes(clipId)) this.selectedClipId = clipId;
 	}
 
 	/** Select every clip on every unlocked track. */
@@ -251,14 +273,23 @@ class EditorState {
 		}
 	}
 
-	/** Delete every selected clip as one user gesture. Ripple deletes run
-	 *  right-to-left so each removal cannot shift the ones still to come. */
-	async removeSelected(ripple: boolean): Promise<number> {
-		const ids = ripple ? this.selectedClips.map((c) => c.id).reverse() : this.selectedClips.map((c) => c.id);
-		if (ids.length === 0) return 0;
-		this.clearSelection();
-		for (const id of ids) await (ripple ? this.rippleDelete(id) : this.remove(id));
-		return ids.length;
+	/**
+	 * Delete every selected clip as ONE edit (`remove_clips`: one revision, so one
+	 * undo). `ripple` closes the gap behind what was removed on every track it
+	 * touched (Shift+Delete); without it the project's ripple mode decides, as for
+	 * any other delete. A clip on a locked track is left where it is — and stays
+	 * selected — rather than refusing the rest, and is counted in `skipped`.
+	 */
+	async removeSelected(ripple: boolean): Promise<{ removed: number; skipped: number }> {
+		const locked = new Set(this.timeline.tracks.filter((t) => t.locked).flatMap((t) => t.clips.map((c) => c.id)));
+		const clips = this.selectedClips;
+		const ids = clips.filter((c) => !locked.has(c.id)).map((c) => c.id);
+		const skipped = clips.length - ids.length;
+		if (ids.length === 0) return { removed: 0, skipped };
+		const kept = clips.filter((c) => locked.has(c.id)).map((c) => c.id);
+		this.selectClips(kept, kept.includes(this.selectedClipId ?? '') ? this.selectedClipId : null);
+		await this.#apply(removeClips(ids, ripple ? true : undefined));
+		return { removed: ids.length, skipped };
 	}
 
 	get overlays(): TextOverlay[] {
@@ -338,11 +369,16 @@ class EditorState {
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
+			// The ripple flag is the project's, saved in its file: a project that was
+			// saved with ripple on has to open that way, and a new one has to reset
+			// the toggle, so it is read with everything else every load. (It never
+			// rejects — a failed read keeps what was showing.)
 			const [assets, timeline, history, currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
 				getHistory(),
-				projectPath()
+				projectPath(),
+				this.loadRippleMode()
 			]);
 			this.assets = assets;
 			this.#setTimeline(timeline);
@@ -536,28 +572,6 @@ class EditorState {
 		return analysis;
 	}
 
-	/** Cached waveform peaks for an asset's audio. Single-flight: concurrent
-	 *  callers for the same asset share one in-flight request instead of each
-	 *  kicking off their own whole-file decode. */
-	waveform(assetId: string, buckets: number): Promise<number[]> {
-		const key = `${assetId}:${buckets}`;
-		const cached = this.#waveforms.get(key);
-		if (cached) return Promise.resolve(cached);
-		const pending = getWaveform(assetId, buckets).then(
-			(peaks) => {
-				this.#waveforms.set(key, peaks);
-				return peaks;
-			},
-			() => {
-				// Transient failure: drop the entry so a later caller retries.
-				this.#waveforms.delete(key);
-				return [];
-			}
-		);
-		this.#waveforms.set(key, pending);
-		return pending;
-	}
-
 	// ---- editing actions (apply backend result to local timeline) -----------
 
 	async #apply(op: Promise<Timeline>) {
@@ -595,6 +609,41 @@ class EditorState {
 	move(clipId: string, timelineStart: number, trackId?: string) {
 		return this.#apply(moveClip(clipId, timelineStart, trackId));
 	}
+	/** Move several clips as ONE edit — a dragged selection. All or nothing: the
+	 *  promise rejects, and nothing has moved, if the group does not fit. */
+	moveClips(moves: ClipMove[]) {
+		return this.#apply(moveClips(moves));
+	}
+
+	// ---- ripple mode ----------------------------------------------------------
+
+	/** Read the project's ripple flag — at launch, after New / Open (`load`), and
+	 *  when an agent flips it (`ripple-mode-changed`). Resolves to whether it
+	 *  differs from what was showing. A failed read leaves what was there. */
+	async loadRippleMode(): Promise<boolean> {
+		try {
+			const on = await getRippleMode();
+			const changed = on !== this.rippleMode;
+			this.rippleMode = on;
+			return changed;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Turn ripple mode on or off. The toolbar flips at once; if the backend
+	 *  refuses it goes back and the error is thrown. It is a setting, not an
+	 *  edit: no revision, and the timeline does not move. */
+	async setRippleMode(on: boolean) {
+		const was = this.rippleMode;
+		this.rippleMode = on;
+		try {
+			this.rippleMode = await setRippleMode(on);
+		} catch (e) {
+			this.rippleMode = was;
+			throw e;
+		}
+	}
 	/**
 	 * The clipboard holds clip *snapshots*, not ids, so cut-then-paste still
 	 * works once the sources are gone — and the same clipboard can be pasted
@@ -602,11 +651,17 @@ class EditorState {
 	 */
 	clipboard = $state<Placement[]>([]);
 
-	copySelection(): number {
+	/** Copy the selection to the clipboard; resolves to how many clips. With
+	 *  `editableOnly`, clips on a locked track are left out — what a cut may take —
+	 *  and a selection with nothing left leaves the clipboard as it was. */
+	copySelection(editableOnly = false): number {
 		const want = new Set(this.selectedClipIds);
 		const out: Placement[] = [];
-		for (const t of this.timeline.tracks)
+		for (const t of this.timeline.tracks) {
+			if (editableOnly && t.locked) continue;
 			for (const c of t.clips) if (want.has(c.id)) out.push({ track_id: t.id, clip: $state.snapshot(c) as Clip });
+		}
+		if (editableOnly && out.length === 0) return 0;
 		this.clipboard = out.sort((a, b) => a.clip.timeline_start - b.clip.timeline_start);
 		return this.clipboard.length;
 	}
@@ -636,9 +691,14 @@ class EditorState {
 		return this.#apply(rippleDelete(clipId));
 	}
 
+	/** Drop a clip from the selection; the primary falls to what is left. */
 	#forget(clipId: string) {
-		if (this.selectedClipId === clipId) this.selectedClipId = null;
-		this.selectedClipIds = this.selectedClipIds.filter((id) => id !== clipId);
+		this.#setSelection(
+			normalize(
+				this.selectedClipIds.filter((id) => id !== clipId),
+				this.selectedClipId === clipId ? null : this.selectedClipId
+			)
+		);
 	}
 	cutRange(clipId: string, from: number, to: number) {
 		return this.#apply(cutClipRange(clipId, from, to));

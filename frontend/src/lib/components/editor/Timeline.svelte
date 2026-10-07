@@ -1,34 +1,45 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
+	import ClipOverlays from './ClipOverlays.svelte';
+	import ClipWaveform from './ClipWaveform.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { deleteSelection } from '$lib/ops';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
-	import { gainLabel, panLabel } from '$lib/mixer';
+	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
+	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
+	import { readPalette } from '$lib/waveform-draw';
+	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
 	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
 	import { transitionLabel } from '$lib/transitions';
+	import { marqueeMode, marqueeSelect, pickMode, sameIds, type Selection } from '$lib/selection';
+	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
+	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
+	import { frameTicksIn, rulerStep, tickLabel, ticksIn } from '$lib/ruler';
+	import { MIN_CLIP, rippleTrimPreview, trimBounds } from '$lib/ripple-trim';
+	import {
+		clampZoom,
+		fitZoom,
+		laneWidth,
+		scrollFor,
+		sliderToZoom,
+		wheelZoomFactor,
+		zoomAround,
+		zoomLabel,
+		zoomToSlider
+	} from '$lib/zoom';
 
 	const pxPerSec = $derived(ui.zoom);
 	const duration = $derived(Math.max(editor.duration, 8));
-	const contentW = $derived(Math.max(760, Math.ceil(duration * pxPerSec) + 48));
-	// Tick spacing follows zoom for label density, but also steps up so the total
-	// tick count stays bounded on long timelines (otherwise a 1h cut at high zoom
-	// would render ~3600 spans, twice — ruler labels + grid lines).
-	const TICK_CAP = 240;
-	const tickStep = $derived.by(() => {
-		const base = pxPerSec >= 60 ? 2 : pxPerSec >= 28 ? 5 : 10;
-		const ladder = [2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
-		for (const step of ladder) {
-			if (step >= base && duration / step <= TICK_CAP) return step;
-		}
-		return ladder[ladder.length - 1];
-	});
-	const ticks = $derived(Array.from({ length: Math.floor(duration / tickStep) + 1 }, (_, i) => i * tickStep));
+	const contentW = $derived(laneWidth(editor.duration, pxPerSec));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 
 	function fmt(s: number): string {
@@ -118,27 +129,56 @@
 	}
 
 	// ---- waveforms -----------------------------------------------------------
+	//
+	// Each audio clip draws its own canvas over only the part of it that is on
+	// screen (`ClipWaveform`), so what the timeline owes it is the viewport — how far
+	// it has scrolled, how wide it is, the pixel ratio — the colours of the active
+	// theme, and the audio length of every asset.
 
-	const WAVE_BUCKETS = 240;
-	// Resolved peaks per asset (reactive). In-flight requests are tracked in a
-	// plain Set, not written into `waveforms`, so the fetch effect doesn't
-	// re-trigger itself by mutating the very state it reads.
-	let waveforms = $state<Record<string, number[]>>({});
-	const inflight = new Set<string>();
+	let scrollX = $state(0);
+	let viewW = $state(1200);
+	let dpr = $state(typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
+
+	function syncView() {
+		const v = viewport();
+		if (!v) return;
+		scrollX = v.el.scrollLeft;
+		viewW = v.viewW;
+		dpr = window.devicePixelRatio || 1;
+	}
 
 	$effect(() => {
-		for (const t of editor.timeline.tracks) {
-			if (t.kind !== 'audio') continue;
-			for (const c of t.clips) {
-				const id = c.asset_id;
-				if (waveforms[id] || inflight.has(id)) continue;
-				inflight.add(id);
-				editor.waveform(id, WAVE_BUCKETS).then((peaks) => {
-					inflight.delete(id);
-					waveforms = { ...waveforms, [id]: peaks };
-				});
-			}
-		}
+		const el = scroller;
+		if (!el) return;
+		syncView();
+		const ro = new ResizeObserver(syncView);
+		ro.observe(el);
+		return () => ro.disconnect();
+	});
+
+	// Two primitives rather than one object: a scroll tick that does not cross a
+	// quantum changes neither, so no clip's waveform is touched by it.
+	const viewLo = $derived(visibleLaneRange(scrollX, viewW).lo);
+	const viewHi = $derived(visibleLaneRange(scrollX, viewW).hi);
+
+	// ---- ruler ---------------------------------------------------------------
+	//
+	// The label step follows the zoom, and only the ticks in (or near) the visible
+	// part of the lane exist: at the deep end of the zoom range an hour of cut is
+	// far too many to draw, and at the shallow end a fixed step is all gap.
+
+	const tickStep = $derived(rulerStep(pxPerSec));
+	const visibleSec = $derived([viewLo / pxPerSec, Math.min(viewHi, contentW) / pxPerSec] as const);
+	const ticks = $derived(ticksIn(visibleSec[0], visibleSec[1], tickStep));
+	/** A mark per frame, once a frame is wide enough to tell apart. */
+	const frameTicks = $derived(frameTicksIn(visibleSec[0], visibleSec[1], editor.fps, pxPerSec));
+
+	/** A canvas cannot read `var(--waveform)`, so the tokens are resolved here, once
+	 *  per theme change: every theme edit replaces `settings.theme`, and does so
+	 *  right after `applyTheme` has written the tokens this reads back. */
+	const palette = $derived.by(() => {
+		void settings.theme;
+		return readPalette();
 	});
 
 	const assetDuration = $derived.by(() => {
@@ -147,43 +187,48 @@
 		return m;
 	});
 
-	/** Peaks for a clip's source range, down-sampled to about one bar per rendered
-	 *  pixel (max-aggregated so loud transients survive at low zoom). Without this
-	 *  a clip emits up to WAVE_BUCKETS spans regardless of how wide it actually is. */
-	function clipPeaks(c: Clip, width: number): number[] {
-		const all = waveforms[c.asset_id];
-		const dur = assetDuration.get(c.asset_id) ?? 0;
-		if (!all || all.length === 0 || dur <= 0) return [];
-		const lo = Math.floor((c.source_in / dur) * all.length);
-		const hi = Math.max(lo + 1, Math.ceil((c.source_out / dur) * all.length));
-		const slice = all.slice(lo, Math.min(hi, all.length));
-		const target = Math.max(1, Math.min(Math.ceil(width), slice.length));
-		if (target >= slice.length) return slice;
-		const out = new Array<number>(target);
-		for (let i = 0; i < target; i++) {
-			const start = Math.floor((i / target) * slice.length);
-			const end = Math.max(start + 1, Math.floor(((i + 1) / target) * slice.length));
-			let peak = 0;
-			for (let j = start; j < end && j < slice.length; j++) peak = Math.max(peak, slice[j]);
-			out[i] = peak;
-		}
-		return out;
-	}
+	/** A clip's volume while its line is dragged — the waveform follows it live. */
+	let liveVolume = $state<Record<string, number | null>>({});
 
 	// ---- interaction: select / razor split / drag-to-move --------------------
 
 	type Drag = {
-		clipId: string;
+		clipId: string; // the clip the pointer grabbed
 		kind: StreamKind;
 		origTrackId: string;
 		origStart: number;
 		grabSec: number; // pointer offset within the clip (seconds)
 		dur: number;
-		start: number; // current ghost start (seconds)
-		trackId: string; // current ghost destination track
+		/** Every clip that moves with it: the selection when the press was on one of
+		 *  several selected clips, else just the clip itself. Fixed at the press. */
+		members: ReadonlySet<string>;
+		/** The press was on one of several selected clips — a click without a drag
+		 *  then narrows the selection to it, as a click always does. */
+		group: boolean;
+		start: number; // the grabbed clip's ghost start (seconds)
+		trackId: string; // the grabbed clip's ghost destination track
+		/** Where the whole group would land, and whether it may. */
+		plan: MovePlan | null;
+		/** The pointer, in lane space — where the refusal's reason is written. */
+		nx: number;
+		ny: number;
+		downX: number; // where the pointer went down, px: "moved" is judged on this
 		moved: boolean;
 	};
 	let drag = $state<Drag | null>(null);
+
+	/** The ghosts of the drag in progress, by the track each lands on. */
+	const ghostsByTrack = $derived.by(() => {
+		const m = new Map<string, Ghost[]>();
+		for (const g of drag?.moved ? (drag.plan?.ghosts ?? []) : []) m.set(g.trackId, [...(m.get(g.trackId) ?? []), g]);
+		return m;
+	});
+	const dropRefused = $derived(!!drag?.moved && !!drag.plan && !drag.plan.ok);
+
+	/** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
+	 *  the pointer itself, never on the quantized position: at high zoom one pixel
+	 *  is under a frame, so a 1 px jitter of a click can round to the next frame. */
+	const DRAG_SLOP = 3;
 
 	// ---- edge-dragging trim ---------------------------------------------------
 
@@ -191,17 +236,34 @@
 		clipId: string;
 		trackId: string;
 		edge: 'l' | 'r';
-		min: number; // dragged-edge bounds, timeline seconds
+		min: number; // dragged-edge bounds, timeline seconds: stopped by the neighbours...
 		max: number;
+		rMin: number; // ...and with ripple on, which pushes the neighbours along instead
+		rMax: number;
 		origStart: number;
 		origEnd: number;
 		pos: number; // current ghost position of the dragged edge
+		downX: number; // where the pointer went down, px
+		grab: number; // pointer's offset from the edge it grabbed (seconds): the edge follows the pointer, not jumps to it
 		moved: boolean;
 	};
 	let trimDrag = $state<TrimDrag | null>(null);
 
-	/** Shortest a clip may get when edge-trimming, seconds. */
-	const MIN_CLIP = 0.05;
+	/** The bounds in force: ripple lifts the neighbour clamps (it pushes them along),
+	 *  and the mode is the project's, so it is asked again at every move and at the
+	 *  release rather than trusted from the press. */
+	const trimLimits = (d: TrimDrag) => (editor.rippleMode ? { min: d.rMin, max: d.rMax } : { min: d.min, max: d.max });
+
+	/** What the trim in progress leaves on its track under ripple: the clip and every
+	 *  clip it moves, where each lands (`ripple-trim.ts`, over the faithful port of
+	 *  the backend's `ripple_from`) — not the clip with its edge dragged, because a
+	 *  left-edge trim keeps the clip's start. Null without ripple or a moving drag. */
+	const trimPreview = $derived.by(() => {
+		const d = trimDrag;
+		if (!d?.moved || !editor.rippleMode) return null;
+		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
+		return track ? rippleTrimPreview(track, d.clipId, d.edge, d.pos) : null;
+	});
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
@@ -209,43 +271,31 @@
 		e.stopPropagation();
 		editor.selectClip(c.id);
 		void editor.select(c.asset_id);
+		const laneLeft =
+			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		// A still image loops, so its source window can grow without limit.
 		const still = asset?.streams.some((s) => s.image) ?? false;
-		const sp = c.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
 		const start = c.timeline_start;
 		const end = start + clipDuration(c);
 		const clips = [...(editor.timeline.tracks.find((tr) => tr.id === t.id)?.clips ?? [])].sort(
 			(a, b) => a.timeline_start - b.timeline_start
 		);
-		const i = clips.findIndex((x) => x.id === c.id);
-		// Unused source on the side being extended: a forward clip's left edge
-		// draws on the handle below source_in, its right edge on the handle past
-		// source_out; a reversed clip plays backwards, so the sides swap.
-		const headHandle = sp < 0 ? Math.max(0, (asset?.duration ?? c.source_out) - c.source_out) : c.source_in;
-		const tailHandle = sp < 0 ? c.source_in : Math.max(0, (asset?.duration ?? c.source_out) - c.source_out);
-		let min: number;
-		let max: number;
-		if (edge === 'l') {
-			const prev = i > 0 ? clips[i - 1] : null;
-			const prevEnd = prev ? prev.timeline_start + clipDuration(prev) : 0;
-			min = Math.max(0, prevEnd, still ? 0 : start - headHandle / mag);
-			max = end - MIN_CLIP;
-		} else {
-			const nextStart = i >= 0 && i < clips.length - 1 ? clips[i + 1].timeline_start : Infinity;
-			min = start + MIN_CLIP;
-			max = Math.min(nextStart, still ? Infinity : end + tailHandle / mag);
-		}
+		const strict = trimBounds(c, edge, clips, asset?.duration, still, false);
+		const loose = trimBounds(c, edge, clips, asset?.duration, still, true);
 		trimDrag = {
 			clipId: c.id,
 			trackId: t.id,
 			edge,
-			min,
-			max,
+			min: strict.min,
+			max: strict.max,
+			rMin: loose.min,
+			rMax: loose.max,
 			origStart: start,
 			origEnd: end,
 			pos: edge === 'l' ? start : end,
+			downX: e.clientX,
+			grab: laneTime(e.clientX, laneLeft) - (edge === 'l' ? start : end),
 			moved: false
 		};
 		capturePointer(e);
@@ -255,9 +305,12 @@
 		if (!trimDrag) return;
 		const lane = document.querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
-		const pos = Math.min(trimDrag.max, Math.max(trimDrag.min, snapPoint(laneTime(e.clientX, laneLeft), trimDrag.trackId, trimDrag.clipId)));
-		const orig = trimDrag.edge === 'l' ? trimDrag.origStart : trimDrag.origEnd;
-		const moved = trimDrag.moved || Math.abs(pos - orig) >= 2 / pxPerSec;
+		// Where the pointer says the edge is (it keeps the offset it grabbed it at),
+		// rounded once: that is the ghost, and the commit.
+		const raw = laneTime(e.clientX, laneLeft) - trimDrag.grab;
+		const { min, max } = trimLimits(trimDrag);
+		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), min, max);
+		const moved = trimDrag.moved || Math.abs(e.clientX - trimDrag.downX) >= DRAG_SLOP;
 		trimDrag = { ...trimDrag, pos, moved };
 	}
 
@@ -266,43 +319,52 @@
 		const d = trimDrag;
 		trimDrag = null;
 		if (!d.moved) return;
-		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
-		if (!clip) return;
-		const sp = clip.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
-		if (d.edge === 'r') {
-			const newDur = d.pos - clip.timeline_start;
-			// The end of playback maps to source_out forward, source_in reversed.
-			if (sp < 0) void editor.trim(d.clipId, clip.source_out - newDur * mag, undefined).catch(err);
-			else void editor.trim(d.clipId, undefined, clip.source_in + newDur * mag).catch(err);
-		} else {
-			const delta = (d.pos - d.origStart) * mag; // > 0 shortens from the left
-			if (sp < 0) void editor.trim(d.clipId, undefined, clip.source_out - delta, d.pos).catch(err);
-			else void editor.trim(d.clipId, clip.source_in + delta, undefined, d.pos).catch(err);
-		}
+		// The mode can flip mid-drag (the R key, an agent): the position is held to
+		// what is legal now, as the ghost was.
+		const limits = trimLimits(d);
+		const pos = clampEdge(d.pos, limits.min, limits.max);
+		// A drag that ended on the frame the edge was already on writes nothing.
+		if (Math.abs(pos - (d.edge === 'l' ? d.origStart : d.origEnd)) < 1e-9) return;
+		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
+		const clip = track?.clips.find((c) => c.id === d.clipId);
+		if (!track || !clip) return;
+		// Under ripple the neighbours are pushed along — unless the backend would
+		// decline to (it hands the edit back as made), which would leave this clip
+		// over its neighbour: the ghost was red, and letting go changes nothing.
+		if (editor.rippleMode && !rippleTrimPreview(track, d.clipId, d.edge, pos)?.ok) return;
+		// `pos` is the gesture's one rounded position (the ghost drew it too); every
+		// field the trim writes comes from it.
+		const e = trimEdit(clip, d.edge, pos);
+		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start).catch(err);
 	}
 
-	/** Snap a time point to 0, the playhead, a beat, or another clip's edges. */
-	function snapPoint(time: number, trackId: string, clipId: string): number {
-		if (!ui.snap) return time;
-		const threshold = 8 / pxPerSec;
-		const cands: number[] = [0, ui.time, ...beatTimes];
-		const track = editor.timeline.tracks.find((t) => t.id === trackId);
-		if (track)
-			for (const c of track.clips) {
-				if (c.id === clipId) continue;
-				cands.push(c.timeline_start, c.timeline_start + clipDuration(c));
-			}
-		let best = time;
-		let bestD = threshold;
-		for (const cand of cands) {
-			const d = Math.abs(cand - time);
-			if (d < bestD) {
-				bestD = d;
-				best = cand;
-			}
+	/** The frame rate gestures are quantized to — the cut's own (`export_format`'s). */
+	const fps = $derived(editor.fps);
+
+	/** Every clip edge on a track but the excepted clips' own — the one being moved,
+	 *  or all of a dragged group, which travel with it and so are nothing to butt
+	 *  against: what a placement butts against. */
+	function clipEdges(trackId: string, except: string | ReadonlySet<string>): number[] {
+		const skip = typeof except === 'string' ? (id: string) => id === except : (id: string) => except.has(id);
+		const out: number[] = [];
+		for (const c of editor.timeline.tracks.find((t) => t.id === trackId)?.clips ?? []) {
+			if (!skip(c.id)) out.push(c.timeline_start, c.timeline_start + clipDuration(c));
 		}
-		return best;
+		return out;
+	}
+
+	/** Where a dragged edge (or a cut) lands: a magnet within reach — 0, the
+	 *  playhead, a beat, a clip edge — when snapping is on, otherwise the nearest
+	 *  frame. Frames are not a magnet: they apply with snapping off too. A landing
+	 *  within a hair of a neighbour's edge is that edge exactly, magnet or not. */
+	function snapPoint(time: number, trackId: string, clipId: string): number {
+		const edges = clipEdges(trackId, clipId);
+		return quantizeTime(time, {
+			fps,
+			magnets: ui.snap ? [0, ui.time, ...beatTimes, ...edges] : [],
+			threshold: 8 / pxPerSec,
+			welds: edges
+		});
 	}
 
 	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
@@ -315,7 +377,7 @@
 		if (e.button !== 0) return;
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
-		const mode = e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace';
+		const mode = pickMode(e);
 		if (t.locked) {
 			// Still selectable and seekable — locking guards the edit, not the view.
 			e.stopPropagation();
@@ -326,11 +388,23 @@
 		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
-			const at = Math.max(c.timeline_start + 0.05, laneTime(e.clientX, laneLeft));
-			void editor.split(c.id, at).catch(err);
+			// Snapped like any other placement, then held half a frame inside the clip.
+			const at = splitPoint(
+				snapPoint(laneTime(e.clientX, laneLeft), t.id, ''),
+				c.timeline_start,
+				c.timeline_start + clipDuration(c),
+				fps
+			);
+			if (at === null) toast.error('That clip is too short to cut on a frame');
+			else void editor.split(c.id, at).catch(err);
 			return;
 		}
-		editor.selectClip(c.id, mode);
+		// Pressing a clip that is one of several selected keeps them all: it is the
+		// start of a group drag. (A click that never becomes one narrows the
+		// selection to the clip when the button comes up.)
+		const group = mode === 'replace' && editor.isSelected(c.id) && editor.selectedClipIds.length > 1;
+		if (group) editor.setPrimary(c.id);
+		else editor.selectClip(c.id, mode);
 		void editor.select(c.asset_id);
 		// A modifier click is a selection gesture, not the start of a drag.
 		if (mode !== 'replace') {
@@ -344,8 +418,14 @@
 			origStart: c.timeline_start,
 			grabSec: laneTime(e.clientX, laneLeft) - c.timeline_start,
 			dur: clipDuration(c),
+			members: new Set(group ? editor.selectedClipIds : [c.id]),
+			group,
 			start: c.timeline_start,
 			trackId: t.id,
+			plan: null,
+			nx: 0,
+			ny: 0,
+			downX: e.clientX,
 			moved: false
 		};
 		capturePointer(e);
@@ -358,31 +438,20 @@
 		return null;
 	}
 
-	/** Snap a candidate start to 0, the playhead, a beat, or another clip's edges. */
-	function snapStart(start: number, trackId: string, clipId: string, dur: number): number {
-		const clamped = Math.max(0, start);
-		if (!ui.snap) return clamped;
-		const threshold = 8 / pxPerSec;
-		const cands: number[] = [0, ui.time];
-		for (const b of beatTimes) cands.push(b, b - dur); // land either edge on a beat
-		const track = editor.timeline.tracks.find((t) => t.id === trackId);
-		if (track)
-			for (const c of track.clips) {
-				if (c.id === clipId) continue;
-				const cs = c.timeline_start;
-				const ce = c.timeline_start + clipDuration(c);
-				cands.push(cs, ce, cs - dur); // align heads, butt after, butt before
-			}
-		let best = clamped;
-		let bestD = threshold;
-		for (const cand of cands) {
-			const d = Math.abs(cand - start);
-			if (d < bestD) {
-				bestD = d;
-				best = Math.max(0, cand);
-			}
+	/** Where a clip of `dur` seconds placed near `start` lands: a magnet — 0, the
+	 *  playhead, a beat, a clip edge, either of its own edges against any of them —
+	 *  when snapping is on, otherwise the nearest frame for its start. */
+	function snapStart(start: number, trackId: string, except: string | ReadonlySet<string>, dur: number): number {
+		const edges = clipEdges(trackId, except);
+		const magnets: number[] = [];
+		if (ui.snap) {
+			magnets.push(0, ui.time);
+			for (const b of beatTimes) magnets.push(b, b - dur); // land either edge on a beat
+			// align heads, butt after, butt before
+			// `startBefore`, not `edge - dur`: the latter can end an ULP past the edge it butts.
+			for (let i = 0; i < edges.length; i += 2) magnets.push(edges[i], edges[i + 1], startBefore(edges[i], dur));
 		}
-		return best;
+		return quantizeSpanStart(start, dur, { fps, magnets, threshold: 8 / pxPerSec, welds: edges });
 	}
 
 	// A lost pointerup (released outside the window, over a native dialog, an
@@ -431,6 +500,15 @@
 		scrubbing = false;
 		markDrag = null;
 		markerDrag = null;
+		// A marquee abandoned gives the selection back as it found it — and the click
+		// that still follows when the button comes up is not a click on the lane
+		// (it would seek, and clear what was just restored).
+		if (marquee) {
+			const { base } = marquee;
+			marquee = null;
+			editor.selectClips(base.ids, base.primary);
+			swallowClick = true;
+		}
 		releaseCapture();
 	}
 
@@ -445,7 +523,7 @@
 	function onPointerMove(e: PointerEvent) {
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
-		if ((drag || trimDrag || titleDrag || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
+		if ((drag || trimDrag || titleDrag || marquee || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
 			resetDragState();
 			return;
 		}
@@ -472,6 +550,10 @@
 			onTrimMove(e);
 			return;
 		}
+		if (marquee) {
+			onMarqueeMove(e.clientX, e.clientY);
+			return;
+		}
 		if (!drag) return;
 		const lane = laneUnder(e.clientX, e.clientY);
 		let trackId = drag.trackId;
@@ -483,10 +565,23 @@
 			const cur = document.querySelector(`[data-lane][data-track-id="${trackId}"]`) as HTMLElement | null;
 			laneLeft = cur?.getBoundingClientRect().left ?? 0;
 		}
-		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.clipId, drag.dur);
+		// The grabbed clip is snapped and frame-quantized exactly as a lone clip is
+		// (its group's own edges are no magnet: they move with it); the rest of the
+		// group keeps its offsets from it, and the plan says whether that all fits.
+		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.members, drag.dur);
 		const movedEnough =
-			drag.moved || trackId !== drag.origTrackId || Math.abs(start - drag.origStart) >= 3 / pxPerSec;
-		drag = { ...drag, start: movedEnough ? start : drag.start, trackId, moved: movedEnough };
+			drag.moved || trackId !== drag.origTrackId || Math.abs(e.clientX - drag.downX) >= DRAG_SLOP;
+		const plan = movedEnough ? planMove(moveTracks(editor.timeline), drag.members, drag.clipId, start, trackId) : null;
+		const box = lanesEl?.getBoundingClientRect();
+		drag = {
+			...drag,
+			start: movedEnough ? start : drag.start,
+			trackId,
+			moved: movedEnough,
+			plan,
+			nx: box ? e.clientX - box.left : 0,
+			ny: box ? e.clientY - box.top : 0
+		};
 	}
 
 	function onPointerUp() {
@@ -514,19 +609,137 @@
 			onTrimUp();
 			return;
 		}
+		if (marquee) {
+			onMarqueeUp();
+			return;
+		}
 		if (!drag) return;
 		const d = drag;
 		drag = null;
 		if (!d.moved) {
+			// A click on one clip of a selection narrows it to that clip.
+			if (d.group) editor.selectClip(d.clipId);
 			ui.seek(d.origStart + d.grabSec); // a plain click on the clip seeks there
 			return;
 		}
-		const trackArg = d.trackId !== d.origTrackId ? d.trackId : undefined;
-		if (trackArg === undefined && Math.abs(d.start - d.origStart) < 1e-6) return; // no-op
-		void editor.move(d.clipId, d.start, trackArg).catch(err);
+		// A refused drop — an overlap, before 0, a locked or missing lane — was red
+		// all the way; letting go changes nothing. A drop that moves nothing too.
+		const plan = d.plan;
+		if (!plan || !plan.ok || plan.noop) return;
+		// The group lands as ONE edit: one revision, one undo.
+		void editor.moveClips(plan.moves).catch(err);
+	}
+
+	// ---- marquee: drag on empty space to select what the rectangle touches ----
+
+	type Marquee = {
+		from: 'lane' | 'canvas';
+		/** Where the drag began and where the pointer is now, in lane space. */
+		ax: number;
+		ay: number;
+		x: number;
+		y: number;
+		/** The pointer in client px — so a scroll can re-evaluate without a move. */
+		cx: number;
+		cy: number;
+		downX: number;
+		downY: number;
+		mode: ReturnType<typeof marqueeMode>;
+		/** The selection as the press found it; every update is computed from this. */
+		base: Selection;
+		moved: boolean;
+	};
+	let marquee = $state<Marquee | null>(null);
+	let lanesEl = $state<HTMLElement | null>(null);
+	/** The click that ends a marquee is not a click on the lane it ends on: it
+	 *  would seek and clear the selection the drag just made (or just gave back).
+	 *  Held until that click arrives or the next press, which always comes first —
+	 *  not on a timer: an Escape mid-drag abandons the marquee long before the
+	 *  button comes up. */
+	let swallowClick = false;
+
+	/** Where each track's lane sits in lane space — measured, because the heights
+	 *  are CSS. */
+	function laneBoxes(): LaneBox[] {
+		const out: LaneBox[] = [];
+		for (const el of lanesEl?.querySelectorAll<HTMLElement>('[data-lane]') ?? []) {
+			const trackId = el.dataset.trackId!;
+			out.push({ trackId, top: el.offsetTop, height: el.offsetHeight, locked: isLocked(trackId) });
+		}
+		return out;
+	}
+
+	function trackSpans(): Map<string, SpanClip[]> {
+		return new Map(
+			editor.timeline.tracks.map((t) => [
+				t.id,
+				t.clips.map((c) => ({ id: c.id, start: c.timeline_start, end: c.timeline_start + clipDuration(c) }))
+			])
+		);
+	}
+
+	function onCanvasPointerDown(e: PointerEvent, from: 'lane' | 'canvas') {
+		swallowClick = false;
+		// Only a press on the empty surface itself: a clip, a title, the ruler, a
+		// marker all have their own gestures and are children of what this is on.
+		if (e.button !== 0 || ui.tool !== 'pointer' || e.target !== e.currentTarget) return;
+		const box = lanesEl?.getBoundingClientRect();
+		if (!box) return;
+		const x = e.clientX - box.left;
+		const y = e.clientY - box.top;
+		marquee = {
+			from,
+			ax: x,
+			ay: y,
+			x,
+			y,
+			cx: e.clientX,
+			cy: e.clientY,
+			downX: e.clientX,
+			downY: e.clientY,
+			mode: marqueeMode(e),
+			base: { ids: [...editor.selectedClipIds], primary: editor.selectedClipId },
+			moved: false
+		};
+		capturePointer(e);
+	}
+
+	function onMarqueeMove(clientX: number, clientY: number) {
+		const m = marquee;
+		const box = lanesEl?.getBoundingClientRect();
+		if (!m || !box) return;
+		const x = Math.min(Math.max(clientX - box.left, 0), box.width);
+		const y = Math.min(Math.max(clientY - box.top, 0), box.height);
+		const moved = m.moved || Math.hypot(clientX - m.downX, clientY - m.downY) >= DRAG_SLOP;
+		marquee = { ...m, x, y, cx: clientX, cy: clientY, moved };
+		if (!moved) return;
+		const hits = marqueeHits({ x0: m.ax, y0: m.ay, x1: x, y1: y }, laneBoxes(), trackSpans(), pxPerSec);
+		const sel = marqueeSelect(m.base, hits, m.mode);
+		// Only a change is written: most moves of the pointer touch the same clips.
+		if (!sameIds(sel.ids, editor.selectedClipIds) || sel.primary !== editor.selectedClipId) {
+			editor.selectClips(sel.ids, sel.primary);
+		}
+	}
+
+	function onMarqueeUp() {
+		const m = marquee;
+		marquee = null;
+		if (!m) return;
+		if (m.moved) {
+			swallowClick = true;
+			const primary = editor.selectedClip;
+			if (primary) void editor.select(primary.asset_id);
+		} else if (m.from === 'canvas' && m.mode === 'replace') {
+			// A click on the bare space under the tracks: nothing there, so nothing selected.
+			editor.clearSelection();
+		}
 	}
 
 	function onLaneSeek(e: MouseEvent) {
+		if (swallowClick) {
+			swallowClick = false;
+			return;
+		}
 		const x = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
 		ui.seek(x / pxPerSec);
 		// Empty lane space is the only way to deselect; clips stopPropagation.
@@ -623,15 +836,15 @@
 
 	// ---- context menus -------------------------------------------------------
 
-	/** Delete the whole selection when the clicked clip is part of it. */
+	/** Delete the whole selection (as one edit) when the clicked clip is part of it. */
 	function removeClip(id: string, ripple: boolean) {
-		const many = editor.isSelected(id) && editor.selectedClipIds.length > 1;
-		const done = many
-			? editor.removeSelected(ripple)
-			: (ripple ? editor.rippleDelete(id) : editor.remove(id)).then(() => 1);
-		void done
-			.then((n) =>
-				toast(n === 1 ? 'Clip removed' : `${n} clips removed`, {
+		if (editor.isSelected(id) && editor.selectedClipIds.length > 1) {
+			void deleteSelection(ripple);
+			return;
+		}
+		void (ripple ? editor.rippleDelete(id) : editor.remove(id))
+			.then(() =>
+				toast('Clip removed', {
 					action: { label: 'Undo', onClick: () => void editor.undo() }
 				})
 			)
@@ -675,7 +888,12 @@
 				icon: 'Scissors',
 				shortcut: 'C',
 				disabled: !within || !!t.locked,
-				action: () => void editor.split(c.id, ui.time).catch(err)
+				action: () => {
+					// The playhead can be anywhere between frames; the cut is on one.
+					const at = splitPoint(quantizeTime(ui.time, { fps }), c.timeline_start, c.timeline_start + clipDuration(c), fps);
+					if (at === null) toast.error('That clip is too short to cut on a frame');
+					else void editor.split(c.id, at).catch(err);
+				}
 			},
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
@@ -738,9 +956,6 @@
 	let headersEl = $state<HTMLElement | null>(null);
 	let rulerEl = $state<HTMLElement | null>(null);
 
-	const ZOOM_MIN = 8;
-	const ZOOM_MAX = 96;
-
 	/** The visible lane window. The header column is sticky, so it covers the
 	 *  first `headerW` px of the scroller — which makes `scrollLeft` index the
 	 *  lane-x sitting at the left edge of the *uncovered* area exactly. */
@@ -765,13 +980,15 @@
 	});
 
 	// Hold one point in time still across a zoom change, so zooming in on a
-	// distant clip doesn't sweep it off screen. The anchor is the playhead unless
-	// the wheel handler overrode it with the time under the cursor. `$effect.pre`
+	// distant clip doesn't sweep it off screen. A wheel zoom or a fit says where the
+	// scroller should end up (`pendingScroll`, worked out by `zoom.ts`); any other
+	// change (the slider, the buttons, the keys) holds the playhead. `$effect.pre`
 	// samples the scroll position *before* the DOM is patched (i.e. at the old
-	// zoom); the paired `$effect` applies it after the content has been rewidened.
+	// zoom); the paired `$effect` applies the result after the lane has been
+	// rewidened.
 	let lastZoom = ui.zoom;
 	let preScroll = 0;
-	let zoomAnchor: { time: number; offset: number } | null = null;
+	let pendingScroll: number | null = null;
 
 	$effect.pre(() => {
 		void ui.zoom;
@@ -788,29 +1005,56 @@
 		if (z === lastZoom) return;
 		const prev = lastZoom;
 		lastZoom = z;
-		const a = zoomAnchor;
-		zoomAnchor = null;
-		const time = a ? a.time : ui.time;
-		// A playhead anchor that was off screen would otherwise be preserved off
-		// screen; clamp it into the window first.
-		const offset = a ? a.offset : Math.min(Math.max(time * prev - preScroll, 0), v.viewW);
-		v.el.scrollLeft = Math.max(0, time * z - offset);
+		if (pendingScroll !== null) {
+			v.el.scrollLeft = pendingScroll;
+			pendingScroll = null;
+			return;
+		}
+		// A playhead that was off screen would otherwise be preserved off screen;
+		// clamp it into the window first.
+		const offset = Math.min(Math.max(ui.time * prev - preScroll, 0), v.viewW);
+		v.el.scrollLeft = scrollFor(ui.time, offset, z);
 	});
 
-	/** ⌘/Ctrl + wheel zooms around the cursor. Plain and shift wheel are left to
-	 *  the browser's native vertical / horizontal scrolling, which now matters. */
+	/** ⌘/Ctrl + wheel zooms around the cursor: the time under the pointer stays
+	 *  under it. Plain and shift wheel are left to the browser's native vertical /
+	 *  horizontal scrolling, which now matters. */
 	function onWheel(e: WheelEvent) {
 		if (!e.ctrlKey && !e.metaKey) return;
 		e.preventDefault();
 		const v = viewport();
 		if (!v) return;
-		const offset = e.clientX - v.el.getBoundingClientRect().left - v.headerW;
-		const time = (v.el.scrollLeft + offset) / pxPerSec;
-		const next = Math.round(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, ui.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15))));
+		// Over the sticky track headers the pointer is not over any time: anchor on
+		// the nearest edge of the lanes instead.
+		const offset = Math.min(Math.max(e.clientX - v.el.getBoundingClientRect().left - v.headerW, 0), v.viewW);
+		const next = clampZoom(ui.zoom * wheelZoomFactor(e.deltaY, e.deltaMode), editor.duration);
 		if (next === ui.zoom) return;
-		zoomAnchor = { time, offset };
+		pendingScroll = zoomAround({ zoom: ui.zoom, scrollLeft: v.el.scrollLeft }, offset, next).scrollLeft;
 		ui.zoom = next;
 	}
+
+	/** Fit the whole cut in the visible width (⇧Z, or the button), from the left. */
+	function fitToWindow() {
+		const v = viewport();
+		const next = v ? fitZoom(editor.duration, v.viewW) : null;
+		if (!v || next === null) return;
+		if (next === ui.zoom) {
+			v.el.scrollLeft = 0;
+			return;
+		}
+		pendingScroll = 0;
+		ui.zoom = next;
+	}
+
+	// The shortcut lives in the page's key handler, which cannot know how wide the
+	// timeline is, so it asks by bumping a counter. The first run is not an ask.
+	let lastFit = ui.fitEpoch;
+	$effect(() => {
+		const epoch = ui.fitEpoch;
+		if (epoch === lastFit) return;
+		lastFit = epoch;
+		untrack(fitToWindow);
+	});
 
 	// ---- titles lane: titles / lower-thirds / captions are their own items -----
 	//
@@ -1010,6 +1254,19 @@
 				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
 				icon: 'magnet',
 				action: () => (ui.snap = !ui.snap)
+			},
+			{
+				label: editor.rippleMode ? 'Turn ripple mode off' : 'Turn ripple mode on',
+				icon: 'between-horizontal-start',
+				shortcut: 'R',
+				action: () => void editor.setRippleMode(!editor.rippleMode).catch(err)
+			},
+			{
+				label: 'Zoom to fit',
+				icon: 'fold-horizontal',
+				shortcut: '⇧Z',
+				disabled: !hasClips,
+				action: () => ui.zoomToFit()
 			}
 		]);
 	}
@@ -1020,8 +1277,15 @@
 	onpointerup={onPointerUp}
 	onpointercancel={onPointerCancel}
 	onblur={onWindowBlur}
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && titleDrag) resetDragState();
+	onresize={syncView}
+	onkeydowncapture={(e) => {
+		// Escape gives a clip, edge, title or marquee drag up without writing
+		// anything — and that is all it does: the page's Escape (clear the
+		// selection) must not also fire.
+		if (e.key === 'Escape' && (drag || trimDrag || titleDrag || marquee)) {
+			resetDragState();
+			e.stopPropagation();
+		}
 	}}
 />
 
@@ -1039,6 +1303,12 @@
 		>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
 		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
+		{#if editor.selectedClips.length > 1}
+			<span
+				title="Drag any of them to move them all; Delete removes them all"
+				style="font-size:10px;color:var(--kerf-300)">{editor.selectedClips.length} selected</span
+			>
+		{/if}
 		{#if editor.selectedClip}
 			{@const sc = editor.selectedClip}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
@@ -1067,26 +1337,35 @@
 		<button
 			title="Zoom out"
 			aria-label="Zoom out"
-			onclick={() => (ui.zoom = Math.max(ZOOM_MIN, ui.zoom - 8))}
+			onclick={() => ui.zoomBy(-1)}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-out" s={14} /></button
 		>
 		<input
 			type="range"
-			min={ZOOM_MIN}
-			max={ZOOM_MAX}
-			step="1"
-			bind:value={ui.zoom}
-			title="Zoom — {ui.zoom} px/s (⌘/Ctrl + wheel zooms at the cursor)"
+			min="0"
+			max="1"
+			step="0.001"
+			value={zoomToSlider(ui.zoom)}
+			oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
+			title="Zoom — {zoomLabel(ui.zoom)} (⌘/Ctrl + wheel zooms at the cursor)"
 			aria-label="Timeline zoom"
 			style="width:90px;height:24px;"
 		/>
 		<button
 			title="Zoom in"
 			aria-label="Zoom in"
-			onclick={() => (ui.zoom = Math.min(ZOOM_MAX, ui.zoom + 8))}
+			onclick={() => ui.zoomBy(1)}
 			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
 			><Icon n="zoom-in" s={14} /></button
+		>
+		<button
+			title="Zoom to fit the whole cut (⇧Z)"
+			aria-label="Zoom to fit"
+			disabled={!hasClips}
+			onclick={() => ui.zoomToFit()}
+			style="background:none;border:none;cursor:{hasClips ? 'pointer' : 'default'};color:var(--text-muted);opacity:{hasClips ? 1 : 0.4};display:grid;place-items:center"
+			><Icon n="fold-horizontal" s={14} /></button
 		>
 		<button
 			title={ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable'}
@@ -1096,6 +1375,22 @@
 				? 'var(--surface-hover)'
 				: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
 			>{ui.snap ? 'snap on' : 'snap off'}</button
+		>
+		<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
+		     delete and a speed change do everywhere (and an agent can flip it). So it
+		     is lit while on, with a second cue in the ruler corner. -->
+		<button
+			title={editor.rippleMode
+				? 'Ripple on (R) — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own: there is no sync lock yet, so linked audio and video do not move together.'
+				: 'Ripple off (R) — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own (no sync lock yet).'}
+			aria-pressed={editor.rippleMode}
+			onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
+			style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode
+				? 'var(--kerf-400)'
+				: 'var(--border-strong)'};background:{editor.rippleMode
+				? 'var(--selection-fill)'
+				: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+			><Icon n="between-horizontal-start" s={12} />Ripple</button
 		>
 		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 		<button
@@ -1122,6 +1417,11 @@
 	<div
 		bind:this={scroller}
 		onwheel={onWheel}
+		onscroll={() => {
+			syncView();
+			// A scroll moves the lanes under a pointer that has not moved.
+			if (marquee) onMarqueeMove(marquee.cx, marquee.cy);
+		}}
 		style="flex:1;min-height:0;overflow:auto;position:relative;display:flex;align-items:flex-start"
 	>
 		<!-- track headers -->
@@ -1130,8 +1430,18 @@
 			style="width:var(--track-header-w);flex:none;min-height:100%;position:sticky;left:0;z-index:40;border-right:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 		>
 			<div
-				style="height:var(--ruler-h);border-bottom:var(--line-width) solid var(--border-subtle);position:sticky;top:0;z-index:50;background:var(--surface-app)"
-			></div>
+				style="height:var(--ruler-h);border-bottom:var(--line-width) solid {editor.rippleMode
+					? 'var(--kerf-500)'
+					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;padding:0 8px"
+			>
+				{#if editor.rippleMode}
+					<span
+						title="Ripple mode is on — edits pull the later clips on their track along"
+						style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--kerf-300)"
+						>Ripple</span
+					>
+				{/if}
+			</div>
 			<div
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
 			>
@@ -1225,7 +1535,7 @@
 							<input
 								type="range"
 								min="0"
-								max={Math.max(2, t.volume ?? 1)}
+								max={Math.max(MAX_GAIN, t.volume ?? 1)}
 								step="0.01"
 								value={t.volume ?? 1}
 								disabled={editor.busy}
@@ -1256,8 +1566,10 @@
 
 		<!-- lanes -->
 		<div
+			bind:this={lanesEl}
 			role="presentation"
 			oncontextmenu={onTimelineContextMenu}
+			onpointerdown={(e) => onCanvasPointerDown(e, 'canvas')}
 			style="width:{contentW}px;flex:none;min-height:100%;position:relative"
 		>
 			<!-- ruler — sticky under the playhead (z 30) but over the drag ghosts (z 25) -->
@@ -1265,13 +1577,20 @@
 				bind:this={rulerEl}
 				role="presentation"
 				onpointerdown={onRulerPointerDown}
-				style="height:var(--ruler-h);border-bottom:var(--line-width) solid var(--border-subtle);position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
+				style="height:var(--ruler-h);border-bottom:var(--line-width) solid {editor.rippleMode
+					? 'var(--kerf-500)'
+					: 'var(--border-subtle)'};position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
 			>
-				{#each ticks as t (t)}
+				{#each ticks as t (t.k)}
 					<span
-						style="position:absolute;left:{t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
-						>{fmt(t)}</span
+						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);pointer-events:none"
+						>{tickLabel(t.k, tickStep)}</span
 					>
+				{/each}
+				{#each frameTicks as f (f.k)}
+					<span
+						style="position:absolute;left:{f.t * pxPerSec}px;bottom:0;width:var(--line-width);height:4px;background:var(--text-disabled);opacity:.45;pointer-events:none"
+					></span>
 				{/each}
 				{#each sceneXs as x (x)}
 					<span
@@ -1358,9 +1677,9 @@
 
 			<!-- grid lines -->
 			{#if hasClips}
-				{#each ticks as t, i (t)}
+				{#each ticks as t (t.k)}
 					<span
-						style="position:absolute;left:{t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:var(--line-width);background:{i % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
+						style="position:absolute;left:{t.t * pxPerSec}px;top:var(--ruler-h);bottom:0;width:var(--line-width);pointer-events:none;background:{t.k % 2 ? 'var(--timeline-grid)' : 'var(--timeline-grid-major)'}"
 					></span>
 				{/each}
 			{/if}
@@ -1380,6 +1699,7 @@
 				role="presentation"
 				data-title-lane
 				onclick={onLaneSeek}
+				onpointerdown={(e) => onCanvasPointerDown(e, 'lane')}
 				oncontextmenu={onTitleLaneContextMenu}
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);position:relative"
 			>
@@ -1437,6 +1757,7 @@
 					data-track-id={t.id}
 					data-kind={t.kind}
 					onclick={onLaneSeek}
+					onpointerdown={(e) => onCanvasPointerDown(e, 'lane')}
 					oncontextmenu={(e) => onLaneContextMenu(e, t)}
 					ondragover={(e) => onLaneDragOver(e, t)}
 					ondragleave={(e) => onLaneDragLeave(e, t)}
@@ -1448,20 +1769,23 @@
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
 						{@const primary = editor.selectedClipId === c.id}
-						{@const dragging = drag?.moved && drag.clipId === c.id}
+						{@const dragging = (drag?.moved && drag.members.has(c.id)) || !!trimPreview?.shifted.has(c.id)}
 						{@const off = c.enabled === false || !renders(t)}
 						<button
+							class="kclip"
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 							onclick={(e) => e.stopPropagation()}
-							style="position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
+							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
 								? 'grayscale(1)'
 								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{t.locked
 								? 'not-allowed'
 								: ui.tool === 'razor'
 									? 'crosshair'
 									: drag
-										? 'grabbing'
+										? dropRefused
+											? 'not-allowed'
+											: 'grabbing'
 										: 'grab'};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
 								? '0 0 0 1px var(--kerf-500)'
 								: selected
@@ -1469,36 +1793,24 @@
 									: 'none'}"
 						>
 							{#if t.kind === 'audio'}
-								{@const peaks = clipPeaks(c, width)}
-								{#if peaks.length}
-									<div style="position:absolute;inset:0;display:flex;align-items:center;gap:1px;padding:0 2px;opacity:.5">
-										{#each peaks as p, i (i)}
-											<span style="flex:1;height:{Math.max(6, p * 100)}%;background:var(--waveform);border-radius:1px"></span>
-										{/each}
-									</div>
-								{:else}
-									<div
-										style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, var(--waveform) 0 1px, transparent 1px 3px);opacity:.35;mask-image:linear-gradient(transparent 28%, #000 28%, #000 72%, transparent 72%)"
-									></div>
-								{/if}
+								<ClipWaveform
+									clip={c}
+									{width}
+									{pxPerSec}
+									{dpr}
+									{viewLo}
+									{viewHi}
+									trackVolume={t.volume ?? 1}
+									liveVolume={liveVolume[c.id] ?? null}
+									duration={assetDuration.get(c.asset_id) ?? c.source_out}
+									{palette}
+								/>
 								{#each silenceRegions(c) as r (r.left)}
 									<span
 										title="Detected silence"
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
-							{/if}
-							{#if c.fade_in > 0}
-								<span
-									title="Fade in {c.fade_in.toFixed(2)}s"
-									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(c.fade_in * pxPerSec, width)}px;background:linear-gradient(to right, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
-								></span>
-							{/if}
-							{#if c.fade_out > 0}
-								<span
-									title="Fade out {c.fade_out.toFixed(2)}s"
-									style="position:absolute;right:0;top:0;bottom:0;width:{Math.min(c.fade_out * pxPerSec, width)}px;background:linear-gradient(to left, color-mix(in srgb,var(--scrim) 70%,transparent), transparent);pointer-events:none"
-								></span>
 							{/if}
 							{#if c.transition_in}
 								<span
@@ -1509,8 +1821,13 @@
 									)}px;background:linear-gradient(to right, color-mix(in srgb,var(--drag-ghost) 55%,transparent), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
 								></span>
 							{/if}
+							<!-- An audio clip's name sits at its foot: the middle belongs to the
+							     waveform (and the line between a stereo clip's lanes). -->
 							<span
-								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{t.kind ===
+								'audio'
+									? 'align-self:flex-end;margin-bottom:3px;text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
+									: ''}"
 								>{editor.assetName(c.asset_id)}</span
 							>
 							{#if (c.speed ?? 1) !== 1}
@@ -1521,29 +1838,55 @@
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
 							{/if}
-							{#if ui.tool === 'pointer' && width > 24}
-								<span
-									role="presentation"
-									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'l')}
-									style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-								></span>
-								<span
-									role="presentation"
-									onpointerdown={(e) => onEdgePointerDown(e, c, t, 'r')}
-									style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
-								></span>
-							{/if}
+							<ClipOverlays
+								clip={c}
+								{width}
+								{pxPerSec}
+								{fps}
+								sound={audibleAssets.has(c.asset_id)}
+								{selected}
+								locked={!!t.locked}
+								razor={ui.tool === 'razor'}
+								trimEdge={trimDrag?.clipId === c.id ? trimDrag.edge : null}
+								onlive={(v) => (liveVolume[c.id] = v)}
+								onselect={() => {
+									editor.selectClip(c.id);
+									void editor.select(c.asset_id);
+								}}
+								onvolume={(v) => editor.setVolume(c.id, v).catch(err)}
+								onfade={(which, v) =>
+									(which === 'in' ? editor.setFade(c.id, v) : editor.setFade(c.id, undefined, v)).catch(err)}
+								onseek={(time) => ui.seek(time)}
+								onedge={(e, edge) => onEdgePointerDown(e, c, t, edge)}
+							/>
 						</button>
 					{/each}
-					{#if drag?.moved && drag.trackId === t.id}
+					<!-- One ghost per clip of the dragged group, where it would land: red
+					     all over when the group cannot (the drop then does nothing). -->
+					{#each ghostsByTrack.get(t.id) ?? [] as g (g.clipId)}
 						<div
-							style="position:absolute;left:{drag.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+							style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
 								6,
-								drag.dur * pxPerSec
-							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
+								g.dur * pxPerSec
+							)}px;border:1.5px dashed {dropRefused ? 'var(--red-500)' : 'var(--kerf-400)'};border-radius:2px;background:{dropRefused
+								? 'var(--danger-surface)'
+								: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
 						></div>
-					{/if}
-					{#if trimDrag?.moved && trimDrag.trackId === t.id}
+					{/each}
+					{#if trimPreview && trimDrag?.trackId === t.id}
+						<!-- Ripple: where the trimmed clip and everything it moves would be — a
+						     left edge keeps the clip's start, so this is not the edge dragged. -->
+						{#each trimPreview.ghosts as g (g.id)}
+							<div
+								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									2,
+									g.dur * pxPerSec
+								)}px;border:1.5px dashed {trimPreview.ok ? 'var(--kerf-400)' : 'var(--red-500)'};border-radius:2px;background:{trimPreview.ok
+									? 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'
+									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
+							></div>
+						{/each}
+					{:else if trimDrag?.moved && trimDrag.trackId === t.id}
 						{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
 						{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
 						<div
@@ -1567,6 +1910,24 @@
 					{/if}
 				</div>
 			{/each}
+
+			<!-- the marquee: what a drag on empty space is selecting -->
+			{#if marquee?.moved}
+				{@const r = normalizeRect({ x0: marquee.ax, y0: marquee.ay, x1: marquee.x, y1: marquee.y })}
+				<div
+					style="position:absolute;left:{r.x0}px;top:{r.y0}px;width:{r.x1 - r.x0}px;height:{r.y1 - r.y0}px;border:var(--line-width) solid var(--kerf-400);background:var(--selection-fill);pointer-events:none;z-index:24"
+				></div>
+			{/if}
+
+			<!-- why a group drag is red, while it is still a drag -->
+			{#if drag?.moved && dropRefused && drag.plan?.reason}
+				<div
+					role="status"
+					style="position:absolute;left:{drag.nx + 14}px;top:{drag.ny + 18}px;z-index:35;pointer-events:none;max-width:280px;padding:3px 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--red-500);background:var(--surface-raised);color:var(--text-primary);font-size:11px;line-height:1.35"
+				>
+					{drag.plan.reason}
+				</div>
+			{/if}
 
 			<!-- playhead -->
 			<div

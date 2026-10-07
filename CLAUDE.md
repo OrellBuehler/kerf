@@ -274,6 +274,40 @@ so the feature is **only** activated through these forwards — which is what ma
   a stripped-tag phone file does not abort the graph with "no path between
   colorspaces". Assets saved before these fields existed deserialize as SDR with
   the coded size; re-importing the file re-probes it.
+- `peaks.rs` (always compiled, CLI only) is what the timeline draws a clip's **waveform**
+  from, and it answers a different question than `waveform` (N peaks for a whole
+  file, 8 kHz, kept as it was): a clip shows a *window* at a zoom that never stops
+  changing, so a file is decoded **once** into a `WaveformPyramid` — min/max peak
+  pairs at 500 / 100 / 25 / 10 buckets per second, per channel (stereo when the
+  source has two or more channels, mono otherwise) — and any window is then a slice
+  read, `waveform_range(pyramid, start, end, buckets)` (pure + unit-tested; `start` /
+  `end` in **source** seconds). It picks the *coarsest* level that still has a source
+  bucket per requested one, partitions source buckets among the requested ones by
+  where each begins (a peak lands in one column, never smeared across two; when the
+  request is finer than the source it reads the bucket under each column's midpoint),
+  leaves the part of a window outside the media as 0/0 buckets so the caller's
+  time-to-column mapping stays linear, and caps `buckets` at 4096. The decode is
+  **48 kHz f32** on purpose: 96 samples is exactly one 2 ms bucket, every coarser
+  level is a whole multiple, and 48 kHz is what video audio already is, so no
+  resampler runs and the peaks are the real samples' — at 8 kHz the low-pass smears
+  transients and rings around a clipped plateau, so a flat-topped 1.0 would not read
+  as full scale. Peaks are stored as `i16` (±32767 = full scale, so a clipped sample
+  is recognizable; ~18 MB per hour of stereo) and the PCM is folded into buckets as
+  it streams off the pipe, so memory is the pyramid, never the file. Like every read
+  the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
+  niced, at most two decodes at once (a freshly opened project asks for every clip
+  at the same instant), concurrent requests for one file share one decode
+  (`shared_pyramid`), and the pipe is read on a side thread so a decode silent for
+  60 s is killed. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
+  by path + size + mtime + a format version, written to a temp file and renamed; a
+  file that is short, long, the wrong version, inconsistent with its own frame count
+  or has a bucket whose min exceeds its max is recomputed, never trusted — and the
+  size is checked before anything is allocated. Loaded pyramids sit in a
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
+  op (an asset with no audio stream is `InvalidArgument`), exposed as the
+  `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
+  are unchanged.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -532,7 +566,31 @@ no editing logic in the adapter.
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
   per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, and its diff).
+  labels, `stale`, and its diff). **Ripple** is here too, pure + unit-tested:
+  `Timeline::ripple_from(before)` takes what an edit left behind and the cut it
+  started from and, per track, matched by **id** like `diff`, shifts the clips the
+  edit left *starting where they started* by the net change in length of what it
+  did ahead of them — a clip's length change (right trim, speed) or removal, or an
+  add that landed **on footage that was there** (an add that fits in free space,
+  and every append, moves nothing). It carries the rules that were bugs waiting:
+  a **left-edge trim keeps the clip's start** (the GUI commits it as `source_in`
+  *plus* a later `timeline_start` to hold the right edge; ripple keeps the start
+  and follows the length, so both forms give one result — only when the trim is
+  the whole edit on the track); a **split shifts nothing** (the new half is an add
+  over the footage the other half gave up, and they cancel); **moves never ripple**
+  (a clip that merely changed its start or track is not "footage ahead");
+  **clips the edit itself moved are not followers**, so an op that already closes
+  the gap is not shifted twice; tracks are **independent** (no sync lock — a V1
+  ripple leaves A1 where it is, which is why linked A/V is its own backlog item),
+  a **locked track never moves**, and overlays / markers do not move. It **never
+  produces an overlap**: if shifting would leave a touched clip overlapping
+  another or before 0 (an add that lands *inside* a clip would need a split), that
+  track is returned as the edit made it. `Timeline::move_clips` /
+  `remove_clips` are the pure, all-or-nothing multi-clip edits behind the
+  marquee: a `ClipMove` is a clip, an **absolute** start and an optional
+  same-kind track; the group is checked as a group (moving clips pass through the
+  places they are leaving, never onto each other or a clip that stays), and a
+  locked track, a start before 0 or a clip named twice refuses the lot.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -651,11 +709,26 @@ no editing logic in the adapter.
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
+  **Ripple mode** is a project flag (`ripple_mode` / `set_ripple_mode`, in `meta`
+  like `speech_model`: persisted with the file, default off, not an edit) that
+  `edit_timeline` honors for every op — it snapshots the timeline, runs the op,
+  and stores `after.ripple_from(&before)`, on the staged path too (so the review
+  diff shows the clips that followed). It is applied there, not per op, so a new
+  op ripples with no code of its own; with the flag off nothing is cloned and
+  nothing changes. `Project::with_ripple(Option<bool>, |p| ..)` forces it on/off
+  for the calls inside (`None` inherits) — how a tool takes an optional `ripple`
+  argument; `ripple_active()` is the effective answer. The ops that decide their
+  own layout go through `edit_timeline_exact` and never ripple: `ripple_delete`,
+  `cut_clip_range`, the beat snap, `reorder`, `move_clip(s)`, `insert_clips`.
+  `trim` re-reads its clip afterwards because a ripple can move it. A forced-on
+  `remove_clips` is the multi-select ripple delete. `move_clips` / `remove_clips`
+  are single revisions (`Move N clips` / `Remove N clips`), and — unlike the
+  single-clip ops, which leave locks to the GUI — refuse clips on a locked track.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
   opens a `.kerf` file to populate it.
-  `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
+  `analyze_asset`, `frame_at`, `waveform` and `waveform_range` delegate to the engine; editing ops are
   unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects
   every asset's cached `Tempo`, builds the grid and aligns one track (or every
   unlocked video track) to it, defaulting the tolerance to half a beat so each cut
@@ -968,7 +1041,27 @@ live in the GUI — that order matters, because the re-fetch the event triggers
 takes the same lock. `set_speech_model` emits `speech-model-changed` instead,
 which the webview listens for to re-read the transcription status: it reads that
 once at launch, and `project-changed` would re-fetch the timeline, history and
-task queue, none of which moved. Because agent edits **stage**, "live in the GUI" now means the
+task queue, none of which moved. `set_ripple_mode` is the same shape (it emits
+`ripple-mode-changed`, not `project-changed`: a flag, not an edit). **Ripple over
+MCP**: `get_ripple_mode` / `set_ripple_mode` read and write the project flag
+(the tool description warns that the latter flips the *user's* toolbar setting —
+a call that wants one different answer passes `ripple` instead), `move_clips`
+(`moves: [{clip_id, timeline_start, track_id?}]`, ids parsed by `clip_moves`) and
+`remove_clips` (`clip_ids`, answering `{removed, ripple_active, rippled,
+clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the clips
+standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
+attempt, skipped on a locked track and declined for a lane the shift would leave
+overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
+`remove_clips`, `add_clip_to_timeline`, `split_at`, `generate_voiceover`'s
+placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
+around the core call (omitted follows the project; `false` is the escape hatch); their
+descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
+the overlap.
+The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
+`snap_to_beats`, `move_clip`, `move_clips`, `reorder`, `duplicate_clips`) take
+none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+pins against the generated schemas. The server `instructions` carry the ripple
+paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
@@ -979,9 +1072,14 @@ it never watches the cut. `core_err` splits the caller's mistakes (a stale id, a
 out-of-range value, a stale staged edit) out as `invalid_params`: reported as
 `internal_error`, a mistyped uuid reads to a model as a broken server rather than
 as something it can fix and retry. Sizes an agent picks out of a schema
-description — `get_waveform`/`get_energy` buckets, `get_frame`/`preview_timeline`
-widths — are clamped rather than trusted, the way `skim_asset` already clamps its
-grid. `set_speech_model` is the write side of `transcription_status`
+description — `get_waveform`/`get_energy`/`get_waveform_range` buckets,
+`get_frame`/`preview_timeline` widths — are clamped rather than trusted, the way `skim_asset` already clamps its
+grid. `get_waveform_range` reads an asset's audio as signed min/max peaks per
+channel over a **source-seconds** window (the cached peak pyramid, so the first call
+per file decodes and every later window is a slice); it answers in *compact* JSON
+(pretty-printing puts each of up to 16k numbers on its own line) and rejects a window
+with `end <= start` as `invalid_params`, since the engine reads one as a row of
+zeros and a model would take that for silence. `set_speech_model` is the write side of `transcription_status`
 (`download_speech_model` only fills the cache; transcription uses whichever model
 is *selected*, so downloading without selecting was a silent no-op) — it makes
 both writes the GUI picker makes, though the picker itself only re-reads at
@@ -1037,15 +1135,19 @@ Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an objec
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
 `analysis-progress` per step), speech-to-text (`transcription_status`,
-`set_speech_model`, `download_speech_model` → emits `model-progress`), voiceover
+`set_speech_model`, `download_speech_model` → emits `model-progress`), ripple mode
+(`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
+that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
 `voiceover-progress`, `cancel_voiceover`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
-`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+`move_clips { moves }` (a group, one revision, all or nothing), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
-width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
+width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
+(one revision; `ripple: true` is the multi-select ripple delete, via
+`with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
@@ -1057,6 +1159,7 @@ time), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio`, `concatenate` — each returns the
 refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`get_waveform_range` → a source-seconds window as min/max peaks per channel,
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -1081,11 +1184,13 @@ the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
-The file also carries the **workspace layout** and the **color theme** as two
-opaque `serde_json::Value`s — the frontend owns their shape and validates them
-on the way back in, so `get_settings` re-reads the file for those where the
-engine-held values are read live). **`set_settings` takes a patch**, not the
-whole object — only the fields that changed (`{layout}`, `{theme}`,
+The file also carries the **workspaces** (which one is active, each one's
+dock arrangement, the library rail's tab and folded state), the **color theme**
+and `layout` — the single arrangement from before there were workspaces, now only
+migrated from — as opaque `serde_json::Value`s: the frontend owns their shape and
+validates them on the way back in, so `get_settings` re-reads the file for those
+where the engine-held values are read live). **`set_settings` takes a patch**,
+not the whole object — only the fields that changed (`{workspaces}`, `{theme}`,
 `{cpu_percent}`), merged into the file under a mutex, and only those fields are
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
@@ -1130,7 +1235,8 @@ blocking pool via the `blocking()` helper — resolving inputs under the shared
 project lock and **releasing it before the slow part** (see `lock_user`; the
 lock-free `Project::decode_*` statics exist for exactly this). The MCP server's
 heavy tools (`analyze_asset`, `get_frame`, `skim_asset`, `preview_timeline`,
-`get_waveform`/`get_energy`, `export`) follow the same shape with `lock_agent`.
+`get_waveform`/`get_energy`/`get_waveform_range`, `export`) follow the same shape
+with `lock_agent`.
 Tauri auto-converts JS camelCase args to Rust
 snake_case (`{ assetId }` → `asset_id`). Config: `tauri.conf.json` points
 `frontendDist` at `../../frontend/build` (resolved relative to the config file). The
@@ -1263,25 +1369,107 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting six panels — `MediaBin`, `TranscriptPanel`,
-`Preview`, `Timeline`, `Inspector`, `AgentPanel` — each a Svelte component
+it follows the theme) hosting six panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
-and closable; the toolbar's **Panels** menu reopens one beside the active group
-or resets the arrangement. `src/lib/layout.ts` is the pure, bun-tested side:
-the panel registry (titles, minimum sizes — the Inspector's px-tuned controls
-need ~250), `DEFAULT_LAYOUT` (bin | preview | inspector-with-agent-tabbed over a
-**full-width timeline** — the cut is what an editor looks at most, and a
-timeline squeezed between two side panels showed thirty seconds of it; a saved
-custom layout is left as it was) and `sanitizeLayout`, which turns a stored layout into one that can
-be trusted (known panel ids, each shown once, titles/minimums re-taken from the
-registry, floating groups dropped) or `null` so the default is used. The
-arrangement is saved through `settings.setLayout` (debounced off
-`onDidLayoutChange`) into `Settings.layout`, and `+page.svelte` mounts the dock
-only once the settings are loaded so it restores rather than rebuilds;
-`workspace.svelte.ts` is the runes singleton the menu drives. Panels own no
-width: their roots are `flex:1;min-height:0`, and a panel's minimum comes from
-the registry. The `Inspector` is **mounted whether or not a clip is selected**:
+and closable; the toolbar's **Panels** menu reopens one (the library left of the
+preview, the deliver panel right of it, the rest beside the active group) or
+resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
+grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
+to point a tablist at; a pointer click blurs the button, because a focused button
+swallows Space and the transport shortcut would stop working) — are full dockview
+presets. `src/lib/layout.ts` is
+the pure, bun-tested side: the panel registry (titles, minimum sizes — the
+Inspector's px-tuned controls need ~250), `PRESET_LAYOUTS` (each a row of panels
+over a **full-width timeline** — the cut is what an editor looks at most, and a
+timeline squeezed between two side panels showed thirty seconds of it; the agent
+is a tab beside the inspector, or the deliver panel, in every one, so a proposal
+that lands has somewhere to appear) and `sanitizeLayout`, which turns a stored
+layout into one that can be trusted (known panel ids, each shown once,
+titles/minimums re-taken from the registry, floating groups dropped) or `null` so
+the preset is used. It also **migrates** a layout saved when the media bin and
+transcript were panels of their own: the first of `media` / `bin` / `transcript`
+found becomes `library`, the others drop, and an emptied group or branch is
+pruned (a branch left with one child collapses into it). What is stored is
+**`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
+{<workspace>: <layout>}, library: {tabs: {<workspace>: <tab>}, collapsed}}`, parsed
+field by field — one bad layout costs that workspace its arrangement, not the
+other four — with the old `layout` becoming Edit only when there is *no*
+`workspaces` value at all (a reset Edit must not be brought back by a layout from
+the old build), and the old single `library.tab` becoming the active workspace's
+own. `settings.svelte.ts` holds it as the live copy and writes it through
+`single-flight.ts` — **one write in flight, newest wins**, the follow-up reading
+the state when it starts (a dock save, a rail click and a switch overlap, and two
+racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
+is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
+layout and shows the library tab that workspace last had (each remembers its own;
+until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
+Motion → Transitions, Edit and Deliver → Media), and **touches no project state**
+— cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
+rebuilds the panels, so a panel's own scroll starts over). **A layout is written
+only if it was rearranged**: dockview reports layout changes for a great deal
+that is not one (a restore, the library folding, a click that moves the active
+group, a window resize), and writing each marked every workspace merely visited
+as customised and brought a just-reset one straight back. So after a restore the
+singleton waits two frames for the layout to settle, takes that as the reference,
+and `shouldPersistLayout` (pure, bun-tested) writes only a layout that
+`sameArrangement` finds different from it — same groups, panels and order, same
+*shares* of each branch within 0.4 % (a dozen-pixel nudge of a sash counts; pixel
+sizes, the active group and the active tab do not) — and, with no entry yet, from
+the preset. What was written becomes the new reference; Reset clears the entry
+and leaves none. A window resize can move shares too (where a group's minimum
+binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
+the layout events the resize causes, and retakes the reference once the window has
+held still for 150 ms — otherwise the next unrelated event, a click on a tab,
+would write a layout nobody arranged. After
+every `fromJSON` it forces `api.layout()` at the host's real size: a layout
+is built at the size it was saved at and the dock learns its real one a frame
+later, and a constraint changed in that gap makes dockview re-split the whole
+grid evenly. `+page.svelte` mounts the dock only once the settings are loaded so
+it restores rather than rebuilds. Panels own no width: their roots are
+`flex:1;min-height:0`, and a panel's minimum comes from the registry.
+The **library** (`LibraryPanel.svelte`) replaces the old Media | Transcript tab
+group with an icon **rail** (36 px icons in a 40 px column, tooltips and
+`aria-label`s, a roving-tabindex tablist: arrows move focus, Enter / Space / click
+choose; a pointer click does not leave focus on the rail): Media (`MediaBin`, whose
+decoded thumbnails live in `thumbnails.ts` rather than the component — the library
+remounts it on every tab switch, unfold and workspace switch, and each remount
+used to decode every asset again; it keeps answers, including "no frame", but not
+a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
+video effects), Transitions (the grouped picker), Audio (audio effects + the
+voiceover entry point), Transcript (`TranscriptPanel`). Effects, Transitions and
+Audio act on the selected clip and say why they are off when none is; they own no
+value (a look is a `Color`, an effect an entry in the clip's chain), so the
+Inspector stays where you tune — the presets are `effect-presets.ts`, shared with
+its pickers. Titles is the same component as the Inspector's *Titles lane*
+section, which stays (a folded library must not make titles unreachable), over
+`title-actions.ts`; the caption look they share is `ui.captionStyle`. Clicking the
+active icon **folds** the content to the rail (`library.collapsed`, persisted and
+shared by every workspace — the rail is a tool, not part of an arrangement) and
+the panel gives its width back: the registry minimum is the rail's 40 px, an open
+library raises its group's to 240 and a folded one pins min = max = 40 through
+`group.api.setConstraints` — a group's explicit constraints win over its active
+panel's minimum, which is set when the panel is created, and the *panel*-level
+`setConstraints` has no listener on a dockview panel and does nothing — hides the
+group's tab strip, and hands the width it frees or takes to the group beside it
+(dockview would give it to the last group in the row). Folding from the header's
+chevron by keyboard moves focus to the rail's active tab, since the chevron
+unmounts with the content. A library sharing a group with another panel cannot
+fold — it has no width of its own to give back.
+The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
+verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
+`SectionHead` which the dialog uses too — no fork. The shape choice and the
+smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
+places edit them (session-global, so a shape ticked in the panel is ticked when the
+dialog opens), and both components re-judge on every `editor.timeline` change
+(docked beside a timeline being edited, a verdict cached at tick time goes
+stale), keeping the newest answer. Shapes are for a picture, so the panel hides
+them, and the button never says "Export N files", for a cut with no video clip
+(`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
+(`ui.openExport()`); the panel shows its progress and Stop while one runs.
+The `Inspector` is **mounted whether or not a clip is selected**:
 its Text overlays section belongs to the timeline rather than to any one clip, so
 gating the panel on a selection made titles and captions unreachable until you
 clicked a clip. Its sections are `InspectorSection`s — native `<details>`
@@ -1362,13 +1550,130 @@ of audio-track clips, confidence-gated, hidden when beats land closer than 4px �
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
 snapping and the browser harness's alignment all share, unit-tested with `bun test`)
 mapped from `AssetAnalysis` and
-real audio waveforms (`get_waveform`); the razor tool splits, Delete removes, Shift+Delete
+real audio waveforms (below); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
 same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
 **edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
 a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the right edge
-stays put; stills extend freely since they loop). The ruler renders **in/out marks**
+stays put; stills extend freely since they loop).
+**Gestures are frame-quantized** (`src/lib/frames.ts`, bun-tested; keyframes stay in
+seconds): a trim, move, drop, razor cut and fade length land on a frame of the cut's
+rate — `editor.fps`, i.e. `timelineFps`, the first video clip's rate else 30, which is
+`export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
+`k / fps` from an integer `k`, so equal frames are equal doubles and nothing drifts over
+a long run of edits), the ghost and the commit use that one value, and a trim derives
+every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / beats
+/ clip edges) still wins, unrounded; frames are *not* a magnet and apply with snapping
+off too. A landing within 1 µs of a neighbour's edge *is* that edge (`welds`):
+`move_clip`'s overlap test is a strict float compare, and an edge computed as
+`start + length / speed` can sit an ULP past its frame — so a tail butted against a
+neighbour is placed by `startBefore` (the latest start whose `start + duration` does not
+pass it, in the backend's own arithmetic; `tail - dur` is an ULP too high about as often
+as not). Whether a press became a drag is judged on pointer travel (3 px), never on the
+quantized position (one pixel is under a frame at high zoom), and an edge keeps the
+offset it was grabbed at. A razor cut keeps half a frame
+either side (`splitPoint`; a clip with no interior frame says so), the context menu's
+split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
+title drag.
+**Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
+a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
+project flag — read in `load()` (so launch, New and Open) and again on the
+`ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
+the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
+`aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
+ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
+All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
+no longer stopped by its neighbours (it pushes them — only the source's footage, the
+0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
+*outcome* (`rippleTrimPreview`: the trim applied to a scratch copy of the track, then
+`ripple.ts`'s `rippleFrom`), because a left-edge trim keeps the clip's start rather than
+holding the right edge — one ghost per clip it moves, the moved clips dimmed, red and
+inert if the backend would decline the ripple. The bounds are asked again at every move
+and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
+load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
+changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
+with several selected it shows an "N clips selected" note, since its sections act on that
+one): a click replaces, Ctrl/Cmd toggles, Shift extends along the primary's track (adds
+the clip when the primary is elsewhere), and a **marquee** (pointer tool; a drag from empty
+lane, the titles lane or the space under the tracks) selects every clip its rectangle
+touches — Shift adds, Ctrl/Cmd toggles — recomputed from the selection as the press found
+it so the rectangle can shrink (`marqueeSelect`; `marquee.ts` tests the rectangle, in lane
+space, against lane boxes measured from the DOM since the heights are CSS). Clips on a
+locked track are not swept up (locking guards edits, and the selection is what every edit
+acts on) but stay clickable. Escape mid-drag restores the selection; the click that ends (or follows an abandoned)
+marquee is swallowed — held until it arrives or the next press, not on a timer — so it
+does not seek and deselect; Escape otherwise clears (the page's
+handler — the timeline's and the preview's abandon-a-gesture handlers run in the capture
+phase and stop the event, so abandoning a drag never also clears). `#setTimeline` prunes
+ids another edit removed. *Group move*: pressing a selected clip of several keeps them
+(a click that never drags narrows to it), and dragging moves them all by the grabbed
+clip's Δt — its start is the one snapped and frame-quantized, its group's own edges being
+no magnet — plus one **lane offset applied within each kind's lanes** (`multi-move.ts`,
+`planMove`). Its checks are `Timeline::move_clips`' (group as a group, before 0 refused not
+clamped, locked or missing lane refused) and a property test replays random drags against
+`multi-edit.ts`'s mirror, so the verdict drawn while dragging is the backend's: one ghost
+per clip, red with the reason beside the pointer when refused (letting go then does
+nothing), and a valid drop is ONE `editor.moveClips` — one revision, one undo. Delete is
+`removeClips(ids)` (one revision; ripple follows the project's mode) and Shift+Delete
+forces ripple; a clip on a locked track is left alone and stays selected, and Cut
+(⌘/Ctrl+X) copies only what it can remove and says so when that is nothing (`ops.ts`
+`deleteSelection` / `cutSelection`). *Zoom*
+(`zoom.ts`): 0.05–2000 px/s, `ui.zoom` still px/s but stepped by ratio (+/-, buttons ×1.25)
+and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
+holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has
+been rewidened); **⇧Z / the fit button** fits the cut (`ui.zoomToFit()` bumps `fitEpoch`,
+since only the timeline knows its width). The ceiling comes down for a very long cut so the
+lane stays under 8 M px — the one thing a browser cannot lay out. Nothing else assumed a
+range: the waveform rung choice scales to any px/s (bottoming out at the engine's 2 ms
+bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
+label step follow the zoom and renders only the ticks in the visible window (hundreds,
+not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
+frame.
+**Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
+plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
+canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
+source seconds through `source_in`/`source_out`, speed and reverse (a reversed clip is
+read through the mapping, mirrored, never flipped), the bucket width is the widest rung
+(the backend's 2 / 10 / 40 / 100 ms levels, then doubling) within 1.5 device pixels
+(DPR capped at 2), and what is fetched is fixed **tiles** of 2048 buckets aligned to the
+*source* clock — so a scroll, a trim, or a split's two halves land on cached tiles.
+`waveform-cache.ts` (injectable fetcher; the app's instance is `waveforms.ts`) caches by
+asset + window + bucket count, joins in-flight requests, runs three at a time newest
+interest first and drops queued tiles nobody wants any more, remembers a failed asset
+(one notification, no re-request per scroll; held off 30 s, doubling per failure in a row
+up to 10 min, cleared by a tile arriving), and is LRU-bounded. `want` tells its owner
+(microtask) when everything it asked for was already cached or the asset is held off,
+because nothing else would — a clip that looked a moment before another clip's request
+landed the same tiles would otherwise stay unpainted. The draw waits until every tile it
+needs is cached and until then leaves the old bitmap where it was, placed by clip-local
+*time* so a zoom or scroll shows it stretched, not blank; a clip scrolled out of range
+releases its tiles and shrinks its canvas to 1x1 (a canvas keeps its whole backing store
+otherwise), and a redraw only assigns the canvas size when it changed.
+`waveform-draw.ts` fills one polygon per lane (not a line per sample), scaled by
+`effectiveGain` — clip volume through the track fader, as the export multiplies them —
+and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
+a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
+`settings.theme` change. A stereo clip gets two lanes when its clip is at least
+`STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so track-height
+presets can drive it) and folds to one below that; the default 64 px track is stereo.
+`get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
+(dB scale −36 dB…`MAX_GAIN` (+6 dB, `mixer.ts`) — one ceiling shared with the Inspector's
+slider and the track fader, a clip set above it by an agent keeps its value and is drawn at
+the top; the bottom edge is silence; a drag is relative to the clip's *real* level, so a
+small drag moves a 6x clip from 6x instead of collapsing it, with a detent at exactly 0 dB,
+since the export omits unity from the graph; double-click resets), **fade handles**
+at the top corners (picture and sound both fade, so every clip has them; the volume line
+is only for clips whose asset has audio; clamped to the clip and to each other,
+double-click clears), the fade ramps, **keyframe diamonds** (clip-local seconds; click
+seeks), and the **trim edges** with their halos. The top 14 px of a clip is the handles'
+alone and the line's travel stays below it; the edge strips and the line's grab band do
+not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
+razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s
+`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon), shows its
+value live (the waveform follows the volume line) and writes **one** edit on release,
+holding the live value until that edit settles. The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is
 **J/K/L shuttle** (repeat taps double to ±8×) plus Space; playback is **audible**:
 `src/lib/audio.ts` is a Web Audio engine that fetches clip PCM windows over `get_audio`
@@ -1461,7 +1766,7 @@ per-file readiness line judged at that file's frame (`platformCheck([w, h])`),
 in place of the single panel — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`. The
-**Transcript panel** (`TranscriptPanel.svelte`, over the pure, bun-tested
+**Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
 (`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
@@ -1586,7 +1891,22 @@ all project data renders from the real backend.
 `src/lib/api.ts` is the backend bridge: `inTauri()` decides between `invoke(...)` and a
 **seeded in-memory sample with working local timeline ops**, so every edit/analysis/waveform
 is explorable in a plain browser via `bun run dev` (frames return `null` there → Preview
-keeps its placeholder). This browser sample is a **dev harness only** — the desktop app always
+keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
+deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
+asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
+stretch so the clipping colour is visible). **Ripple in the harness is a port, not a
+lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
+`Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
+numbers, so a rule changed in kerf-core has to change there or a test names it) and
+`src/lib/multi-edit.ts` the same for `Timeline::move_clips` / `remove_clips` (same
+checks, same messages). `api.ts` keeps the project's ripple flag in the harness state
+(`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
+that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
+voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
+`rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
+beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
+reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
