@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask, Project,
-    Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff,
-    Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask,
+    Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
+    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -778,6 +778,18 @@ fn split_remove(state: State<'_, AppState>, clip_id: String, at: f64, side: Stri
     let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
     let project = state.project();
     project.split_remove(id, at, side).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Split and remove on several clips as **one** revision — the playhead trim of a
+/// selection, V1 and its A1 partner together, undone in one step. Each cut names a
+/// clip and its time; `side` is the same for all. All or nothing, one clip per track;
+/// follows ripple mode, each track on its own.
+#[tauri::command(async)]
+fn split_remove_clips(state: State<'_, AppState>, cuts: Vec<ClipCut>, side: String) -> CmdResult<Timeline> {
+    let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
+    let project = state.project();
+    project.split_remove_clips(&cuts, side).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2726,6 +2738,7 @@ pub fn run() {
             slip_clip,
             slide_clip,
             split_remove,
+            split_remove_clips,
             add_track,
             remove_track,
             set_track_duck,

@@ -150,7 +150,7 @@ frame at full source detail.
 <details>
 <summary><b>Cut & arrange</b></summary>
 
-`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `trim` · `roll_edit` ·
+`cut_clip` · `add_clip_to_timeline` · `split_at` · `split_remove` · `split_remove_clips` · `trim` · `roll_edit` ·
 `slip_clip` · `slide_clip` · `reorder` · `move_clip` ·
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·

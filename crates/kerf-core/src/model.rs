@@ -3797,9 +3797,67 @@ fn footage_of(footage: &SourceLimits, clip: &Clip) -> Result<f64> {
         .ok_or(Error::AssetNotFound(clip.asset_id))
 }
 
+/// One clip's cut in a group split-and-remove ([`Timeline::split_remove_clips`]):
+/// the clip and the timeline time it is cut at.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClipCut {
+    pub clip_id: Uuid,
+    /// Timeline seconds, inside the clip.
+    pub at: f64,
+}
+
 /// A slide's neighbour on one side: its index in the lane and whether it touches
 /// the clip.
 type Neighbour = Option<(usize, bool)>;
+
+/// Close a cut exactly. A roll or a slide computes one side of a cut from a source
+/// window (`start + (out - in) / speed`) and the other from `start + delta`, and the
+/// two disagree by a few ulps (±7e-15 s in about one case in thirteen): invisible to
+/// a render, but a strict overlap test — `Project::move_clip`'s — reads it as one
+/// clip lying on the next. So when `follower` starts where `leader` ends to within
+/// float noise ([`DIFF_EPS`]), it is set to start *exactly* at `leader.timeline_end()`,
+/// the very expression the overlap checks compare against. A genuine gap or overlap
+/// (a cut that was merely within [`ADJACENT_EPS`]) is real data and is left alone.
+fn weld(leader: &Clip, follower: &mut Clip) {
+    let end = leader.timeline_end();
+    if (follower.timeline_start - end).abs() <= DIFF_EPS {
+        follower.timeline_start = end;
+    }
+}
+
+/// [`weld`]'s mirror, for the edge the edit left where it was: `clip`'s far end
+/// meets a clip that did not move (it starts at `limit`), and the window arithmetic
+/// can leave `clip.timeline_end()` a few ulps *past* it (observed up to ~6e-14 s).
+/// That overshoot, if it is float noise ([`DIFF_EPS`]), is taken back by shortening the
+/// window point the end is written on by what it overshoots — and by a single ulp when
+/// that is too small to move the point — until the end is no longer past `limit`: a
+/// change of ~1e-14 s to the source window, on a clip whose neighbour cannot be moved
+/// to meet it. `looping` as in [`Clip::move_tail`].
+fn fit_end(clip: &mut Clip, limit: f64, looping: bool) {
+    for _ in 0..16 {
+        let over = clip.timeline_end() - limit;
+        if over <= 0.0 || over > DIFF_EPS {
+            return;
+        }
+        let by = over * clip.speed_mag();
+        if clip.is_reversed() && !looping {
+            // The end of a reversed clip is its in-point: raise it to shorten.
+            let moved = clip.source_in + by;
+            clip.source_in = if moved == clip.source_in {
+                clip.source_in.next_up()
+            } else {
+                moved
+            };
+        } else {
+            let moved = clip.source_out - by;
+            clip.source_out = if moved == clip.source_out {
+                clip.source_out.next_down()
+            } else {
+                moved
+            };
+        }
+    }
+}
 
 impl Timeline {
     /// Find a clip for an edit: it must exist and its track must not be locked.
@@ -3809,6 +3867,19 @@ impl Timeline {
             return Err(Error::InvalidArgument(format!("track {} is locked", self.tracks[ti].name)));
         }
         Ok((ti, ci))
+    }
+
+    /// Where the first clip of lane `ti` that starts at or after `end` (less the
+    /// adjacency tolerance) starts, skipping the lane indices in `skip` — the clip an
+    /// edit's far edge runs into, which the edit did not move.
+    fn start_after(&self, ti: usize, end: f64, skip: &[usize]) -> Option<f64> {
+        self.tracks[ti]
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| !skip.contains(i) && c.timeline_start >= end - ADJACENT_EPS)
+            .map(|(_, c)| c.timeline_start)
+            .min_by(f64::total_cmp)
     }
 
     // ---- roll ---------------------------------------------------------------
@@ -3882,8 +3953,13 @@ impl Timeline {
         let applied = range.resolve(delta, "roll the cut")?;
         let (mut a, mut b) = (self.tracks[ti].clips[ia].clone(), self.tracks[ti].clips[ib].clone());
         let (looping_a, looping_b) = (footage_of(footage, &a)?.is_infinite(), footage_of(footage, &b)?.is_infinite());
+        let far = b.timeline_end();
         a.move_tail(applied, looping_a);
         b.move_head(applied, looping_b);
+        weld(&a, &mut b);
+        if let Some(limit) = self.start_after(ti, far, &[ia, ib]) {
+            fit_end(&mut b, limit, looping_b);
+        }
         a.clamp_fades();
         b.clamp_fades();
         self.tracks[ti].clips[ia] = a.clone();
@@ -4056,23 +4132,50 @@ impl Timeline {
         check_delta(delta)?;
         let (ti, ci, prev, next, range) = self.slide_plan(clip_id, footage)?;
         let applied = range.resolve(delta, "slide the clip")?;
-        let mut out = Vec::new();
+        let mut moved = self.tracks[ti].clips[ci].clone();
+        // Where the edit's far edge was — the end of the last clip it changes — and
+        // which clips are the edit's own, so what that edge runs into can be found.
+        let mut far = moved.timeline_end();
+        let mut skip = vec![ci];
+        moved.timeline_start += applied;
+        let mut prev_clip = None;
         if let Some((i, true)) = prev {
             let mut p = self.tracks[ti].clips[i].clone();
             let looping = footage_of(footage, &p)?.is_infinite();
             p.move_tail(applied, looping);
+            weld(&p, &mut moved);
             p.clamp_fades();
-            self.tracks[ti].clips[i] = p.clone();
-            out.push(p);
+            skip.push(i);
+            prev_clip = Some((i, p));
         }
-        let clip = &mut self.tracks[ti].clips[ci];
-        clip.timeline_start += applied;
-        out.push(clip.clone());
+        let mut next_clip = None;
         if let Some((i, true)) = next {
             let mut n = self.tracks[ti].clips[i].clone();
             let looping = footage_of(footage, &n)?.is_infinite();
+            far = n.timeline_end();
             n.move_head(applied, looping);
+            weld(&moved, &mut n);
             n.clamp_fades();
+            skip.push(i);
+            next_clip = Some((i, n, looping));
+        }
+        if let Some(limit) = self.start_after(ti, far, &skip) {
+            match next_clip.as_mut() {
+                Some((_, n, looping)) => fit_end(n, limit, *looping),
+                None => {
+                    let looping = footage.get(&moved.asset_id).is_some_and(|l| l.is_infinite());
+                    fit_end(&mut moved, limit, looping);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some((i, p)) = prev_clip {
+            self.tracks[ti].clips[i] = p.clone();
+            out.push(p);
+        }
+        self.tracks[ti].clips[ci] = moved.clone();
+        out.push(moved);
+        if let Some((i, n, _)) = next_clip {
             self.tracks[ti].clips[i] = n.clone();
             out.push(n);
         }
@@ -4139,6 +4242,48 @@ impl Timeline {
         clip.clamp_fades();
         self.tracks[ti].clips[ci] = clip.clone();
         Ok(clip)
+    }
+}
+
+impl Timeline {
+    /// **Split and remove** on several clips at once — the playhead trim of a
+    /// selection, V1 and its A1 partner together — as one edit: every cut in `cuts`
+    /// is [`Timeline::split_remove`] with the same `side`, and the survivors come
+    /// back in request order.
+    ///
+    /// All or nothing: an unknown clip, a locked track, a cut outside its clip or
+    /// one that would leave under [`MIN_EDIT_CLIP`] refuses the whole group and the
+    /// timeline is exactly as it was. **At most one clip per track**, and a clip once:
+    /// a playhead is inside one clip of a lane, and under ripple mode a lane trimmed
+    /// at two places has no single edit point to hold still (see
+    /// [`Timeline::ripple_from`]) — so each track ripples on its own, from its own
+    /// one cut. Different tracks may be cut at different times.
+    pub fn split_remove_clips(&mut self, cuts: &[ClipCut], side: SplitSide) -> Result<Vec<Clip>> {
+        if cuts.is_empty() {
+            return Err(Error::InvalidArgument("no clips to cut".to_string()));
+        }
+        let mut seen_clips = HashSet::new();
+        let mut seen_tracks = HashSet::new();
+        for cut in cuts {
+            let (ti, _) = self.locate(cut.clip_id).ok_or(Error::ClipNotFound(cut.clip_id))?;
+            if !seen_clips.insert(cut.clip_id) {
+                return Err(Error::InvalidArgument(format!("clip {} appears more than once", cut.clip_id)));
+            }
+            if !seen_tracks.insert(ti) {
+                return Err(Error::InvalidArgument(format!(
+                    "two of the clips are on track {} — a group trim cuts one clip per track",
+                    self.tracks[ti].name
+                )));
+            }
+        }
+        // Cut a copy, so a refusal part-way through leaves the timeline untouched.
+        let mut scratch = self.clone();
+        let kept = cuts
+            .iter()
+            .map(|cut| scratch.split_remove(cut.clip_id, cut.at, side))
+            .collect::<Result<Vec<_>>>()?;
+        *self = scratch;
+        Ok(kept)
     }
 }
 
@@ -4212,6 +4357,19 @@ pub(crate) fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0);
     let m = (s / 60.0).floor();
     format!("{}:{:04.1}", m as i64, s - m * 60.0)
+}
+
+/// A signed shift of footage at the precision a slip is made at — a frame is 0.03 s,
+/// which one decimal would print as `+0.0s` — and three decimals when even two would
+/// round a real shift to nothing.
+fn fmt_shift(secs: f64) -> String {
+    let secs = secs + 0.0; // -0.0 is 0
+    let places = if secs != 0.0 && (secs.abs() * 100.0).round() == 0.0 {
+        3
+    } else {
+        2
+    };
+    format!("{}{secs:.places$}s", if secs >= 0.0 { "+" } else { "" })
 }
 
 fn fmt_delta(secs: f64) -> String {
@@ -4775,11 +4933,15 @@ impl Timeline {
                             fmt_delta(is - was)
                         )
                     } else {
+                        // Signed as `slip_clip` documents it: + is *later in its own
+                        // footage*, which for a reversed clip is the window moving down.
+                        let moved = clip.source_in - before_clip.source_in;
+                        let later = if clip.is_reversed() { -moved } else { moved };
                         format!(
-                            "Slipped clip on {} at {} — footage {} (in-point {:.1}s → {:.1}s)",
+                            "Slipped clip on {} at {} — footage {} (in-point {:.2}s → {:.2}s)",
                             track.name,
                             fmt_time(clip.timeline_start),
-                            fmt_delta(clip.source_in - before_clip.source_in),
+                            fmt_shift(later),
                             before_clip.source_in,
                             clip.source_in
                         )
@@ -8082,6 +8244,266 @@ mod tests {
         assert_eq!((cut.timeline_start, cut.source_in, cut.fade_in), (0.0, 1.0, 0.0));
     }
 
+    /// A tiny deterministic generator, so the fuzz below is the same on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        fn between(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.next()
+        }
+    }
+
+    /// A lane of `n` clips of random length, speed (and direction) and window in a
+    /// 600 s asset — the float values a real cut is made of, where `start + (out - in)
+    /// / speed` is not exact — laid end to end, with an occasional real gap.
+    fn random_lane(rng: &mut Lcg, n: usize) -> Timeline {
+        let mut clips = Vec::new();
+        let mut cursor = 0.0;
+        for _ in 0..n {
+            let mut c = sclip(0.0, 0.0, 0.0);
+            c.speed = [1.0, 1.0, 2.0, 0.5, 1.5, -1.0, -2.0, 0.37][(rng.next() * 8.0) as usize % 8];
+            c.source_in = rng.between(30.0, 400.0);
+            c.source_out = c.source_in + rng.between(0.4, 7.0) * c.speed_mag();
+            if rng.next() < 0.25 {
+                cursor += rng.between(0.2, 2.0);
+            }
+            c.timeline_start = cursor;
+            cursor = c.timeline_end();
+            clips.push(c);
+        }
+        one_lane(clips)
+    }
+
+    /// Every junction where a clip starts *before* the one ahead of it ends, by float
+    /// noise — what a strict overlap test (`Project::move_clip`'s) reads as one clip
+    /// lying on the next — as `(index of the later clip, how far)`.
+    fn noise_overlaps(t: &Timeline) -> Vec<(usize, f64)> {
+        let clips = &t.tracks[0].clips;
+        (1..clips.len())
+            .filter_map(|i| {
+                let over = clips[i - 1].timeline_end() - clips[i].timeline_start;
+                (over > 0.0 && over < ADJACENT_EPS).then_some((i, over))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn roll_and_slide_leave_no_float_residue_between_clips() {
+        // A roll or slide computes one side of a cut from a window and the other from
+        // `start + delta`; left alone they disagree by a few ulps (±6e-14 s) in a large
+        // share of cases, which a strict overlap test reads as clips lying on each other.
+        // Every junction of the lane — the cut itself and the edge the edit runs into —
+        // has to come out clean, for requests both inside the range and far past it.
+        let mut rng = Lcg(7);
+        let mut tried = 0;
+        for _ in 0..3000 {
+            let t = random_lane(&mut rng, 5);
+            assert!(noise_overlaps(&t).is_empty());
+            let ids: Vec<Uuid> = t.tracks[0].clips.iter().map(|c| c.id).collect();
+            let at = 1 + (rng.next() * 3.0) as usize;
+            let delta = if rng.next() < 0.3 {
+                rng.between(-9.0, 9.0)
+            } else {
+                rng.between(-1.5, 1.5)
+            };
+            for op in 0..2 {
+                let mut u = t.clone();
+                let out = if op == 0 {
+                    u.roll_edit(ids[at - 1], ids[at], delta, &footage(600.0))
+                } else {
+                    u.slide_clip(ids[at], delta, &footage(600.0))
+                };
+                let Ok(out) = out else { continue };
+                tried += 1;
+                assert!(noise_overlaps(&u).is_empty(), "op {op} by {delta}: {:?}", noise_overlaps(&u));
+                // …and nothing but noise moved to get there.
+                let (was, now) = (&t.tracks[0].clips, &u.tracks[0].clips);
+                for (w, n) in was.iter().zip(now) {
+                    let edited = out.clips.iter().any(|c| c.id == w.id);
+                    if !edited {
+                        assert_eq!(
+                            (w.timeline_start, w.source_in, w.source_out),
+                            (n.timeline_start, n.source_in, n.source_out)
+                        );
+                    }
+                }
+                if op == 0 {
+                    near(now[at].timeline_start, was[at].timeline_start + out.applied);
+                    near(now[at].timeline_end(), was[at].timeline_end());
+                    near(now[at - 1].timeline_end(), was[at - 1].timeline_end() + out.applied);
+                } else {
+                    near(now[at].timeline_start, was[at].timeline_start + out.applied);
+                    near(now[at].duration(), was[at].duration());
+                }
+            }
+        }
+        assert!(tried > 4000, "the fuzz should mostly be legal edits, got {tried}");
+    }
+
+    #[test]
+    fn a_cut_a_hair_apart_keeps_its_real_gap_and_only_float_noise_is_welded() {
+        // 0.5 ms is data (within the engine's tolerance for a touching cut), not noise.
+        let (mut t, a, b) = cut_pair();
+        t.tracks[0].clips[1].timeline_start = 4.0005;
+        t.roll_edit(a, b, 1.0, &footage(60.0)).unwrap();
+        assert_eq!(t.tracks[0].clips[1].timeline_start, 5.0005);
+
+        // Exactly closed: starting where the leader's computed end is, bit for bit.
+        let (mut t, a, b) = cut_pair();
+        t.roll_edit(a, b, 0.1, &footage(60.0)).unwrap();
+        assert_eq!(t.tracks[0].clips[1].timeline_start, t.tracks[0].clips[0].timeline_end());
+    }
+
+    #[test]
+    fn a_slip_diff_has_the_precision_of_a_frame_and_the_sign_the_op_documents() {
+        let slip = |mut c: Clip, delta: f64| {
+            let id = c.id;
+            c.timeline_start = 3.0;
+            let before = one_lane(vec![c]);
+            let mut after = before.clone();
+            after.slip_clip(id, delta, &footage(60.0)).unwrap();
+            before.diff(&after).entries[0].summary.clone()
+        };
+        // One frame at 30 fps is 0.033 s: one decimal printed it as `footage -0.0s
+        // (in-point 10.0s → 10.0s)`, which says nothing happened.
+        let frame = 1.0 / 30.0;
+        let said = slip(sclip(10.0, 14.0, 0.0), frame);
+        assert!(said.contains("footage +0.03s (in-point 10.00s → 10.03s)"), "{said}");
+        let said = slip(sclip(10.0, 14.0, 0.0), -frame);
+        assert!(said.contains("footage -0.03s (in-point 10.00s → 9.97s)"), "{said}");
+        // Smaller than two decimals can show: three, rather than a zero.
+        let said = slip(sclip(10.0, 14.0, 0.0), 0.001);
+        assert!(said.contains("footage +0.001s"), "{said}");
+
+        // A reversed clip's positive slip is the window moving *down*, and is still
+        // the `+` the op documents (later in its own footage).
+        let mut reversed = sclip(10.0, 14.0, 0.0);
+        reversed.speed = -1.0;
+        let said = slip(reversed.clone(), 3.0);
+        assert!(said.contains("footage +3.00s (in-point 10.00s → 7.00s)"), "{said}");
+        let said = slip(reversed, -3.0);
+        assert!(said.contains("footage -3.00s (in-point 10.00s → 13.00s)"), "{said}");
+    }
+
+    #[test]
+    fn times_and_deltas_round_half_to_even_on_the_exact_value() {
+        // The TS mirror (`formatTime`) has to agree with this to the digit: Rust rounds
+        // an exact binary tie to the even digit and anything else by its exact value.
+        assert_eq!(fmt_time(4.25), "0:04.2");
+        assert_eq!(fmt_time(4.75), "0:04.8");
+        assert_eq!(fmt_time(0.25), "0:00.2");
+        assert_eq!(fmt_time(72.25), "1:12.2");
+        assert_eq!(fmt_time(0.35), "0:00.3", "0.35 is a hair under a tie");
+        assert_eq!(fmt_time(0.45), "0:00.5", "0.45 is a hair over one");
+        assert_eq!(fmt_delta(-0.25), "-0.2s");
+        assert_eq!(fmt_delta(0.75), "+0.8s");
+        assert_eq!(format!("{:.2}", 0.125), "0.12");
+        assert_eq!(format!("{:.2}", 0.375), "0.38");
+    }
+
+    /// V1 `v [0,6)` over A1 `a [1,7)` — a picture and its sound, not quite in step.
+    fn picture_and_sound() -> (Timeline, Uuid, Uuid) {
+        let (v, a) = (sclip(10.0, 16.0, 0.0), sclip(10.0, 16.0, 1.0));
+        let ids = (v.id, a.id);
+        let t = Timeline {
+            tracks: vec![
+                track(StreamKind::Video, "V1", vec![v]),
+                track(StreamKind::Audio, "A1", vec![a]),
+            ],
+            ..Timeline::new()
+        };
+        (t, ids.0, ids.1)
+    }
+
+    #[test]
+    fn a_group_split_remove_cuts_every_track_in_one_edit() {
+        let (mut t, v, a) = picture_and_sound();
+        let kept = t
+            .split_remove_clips(
+                &[ClipCut { clip_id: v, at: 3.0 }, ClipCut { clip_id: a, at: 3.0 }],
+                SplitSide::Left,
+            )
+            .unwrap();
+        assert_eq!(kept.iter().map(|c| c.id).collect::<Vec<_>>(), vec![v, a], "in request order");
+        assert_eq!((kept[0].timeline_start, kept[0].source_in), (3.0, 13.0));
+        assert_eq!((kept[1].timeline_start, kept[1].source_in), (3.0, 12.0));
+        assert_eq!(spans_of(&t, 0), vec![(3.0, 6.0)]);
+        assert_eq!(spans_of(&t, 1), vec![(3.0, 7.0)]);
+
+        // Each track is cut at its own time, and the other side works the same way.
+        let (mut t, v, a) = picture_and_sound();
+        t.split_remove_clips(
+            &[ClipCut { clip_id: v, at: 2.0 }, ClipCut { clip_id: a, at: 4.5 }],
+            SplitSide::Right,
+        )
+        .unwrap();
+        assert_eq!(spans_of(&t, 0), vec![(0.0, 2.0)]);
+        assert_eq!(spans_of(&t, 1), vec![(1.0, 4.5)]);
+    }
+
+    #[test]
+    fn a_group_split_remove_is_all_or_nothing() {
+        let (t, v, a) = picture_and_sound();
+        let cut = |clip_id, at| ClipCut { clip_id, at };
+        let run = |name: &str, cuts: &[ClipCut]| {
+            let mut copy = t.clone();
+            let why = refused(copy.split_remove_clips(cuts, SplitSide::Left));
+            assert!(same_cut(&copy, &t), "{name}: a refused group changes nothing");
+            why
+        };
+        // The second cut is bad, the first would have been fine.
+        assert!(run("outside", &[cut(v, 3.0), cut(a, 0.5)]).contains("not inside the clip"));
+        assert!(run("floor", &[cut(v, 3.0), cut(a, 6.99)]).contains("only 0.01s"));
+        assert!(run("empty", &[]).contains("no clips"));
+        assert!(run("twice", &[cut(v, 3.0), cut(v, 4.0)]).contains("more than once"));
+
+        // One clip per track.
+        let mut crowded = t.clone();
+        let extra = sclip(0.0, 2.0, 7.0);
+        let extra_id = extra.id;
+        crowded.tracks[0].clips.push(extra);
+        let mut copy = crowded.clone();
+        let why = refused(copy.split_remove_clips(&[cut(v, 3.0), cut(extra_id, 7.5)], SplitSide::Right));
+        assert!(why.contains("one clip per track") && why.contains("V1"), "{why}");
+        assert!(same_cut(&copy, &crowded));
+
+        let mut locked = t.clone();
+        locked.tracks[1].locked = true;
+        let mut copy = locked.clone();
+        assert!(refused(copy.split_remove_clips(&[cut(v, 3.0), cut(a, 3.0)], SplitSide::Left)).contains("A1 is locked"));
+        assert!(same_cut(&copy, &locked), "the unlocked track was not cut either");
+
+        let mut copy = t.clone();
+        assert!(matches!(
+            copy.split_remove_clips(&[cut(v, 3.0), cut(Uuid::new_v4(), 3.0)], SplitSide::Left),
+            Err(Error::ClipNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_group_split_remove_ripples_each_track_on_its_own() {
+        // Behind each clip a follower: V1 `v [0,6) w [8,10)`, A1 `a [1,7) x [9,11)`.
+        let (mut before, v, a) = picture_and_sound();
+        before.tracks[0].clips.push(sclip(0.0, 2.0, 8.0));
+        before.tracks[1].clips.push(sclip(0.0, 2.0, 9.0));
+        let (after, ripple) = rippled(&before, |t| {
+            t.split_remove_clips(
+                &[ClipCut { clip_id: v, at: 2.0 }, ClipCut { clip_id: a, at: 5.0 }],
+                SplitSide::Left,
+            )
+            .unwrap();
+        });
+        // Without ripple the gaps stay; with it each track closes by what *it* lost
+        // (V1 2 s, A1 4 s) and the cut clips hold their own starts.
+        assert_eq!(spans_of(&after, 0), vec![(2.0, 6.0), (8.0, 10.0)]);
+        assert_eq!(spans_of(&ripple, 0), vec![(0.0, 4.0), (6.0, 8.0)]);
+        assert_eq!(spans_of(&after, 1), vec![(5.0, 7.0), (9.0, 11.0)]);
+        assert_eq!(spans_of(&ripple, 1), vec![(1.0, 3.0), (5.0, 7.0)]);
+    }
+
     #[test]
     fn a_slip_reads_as_a_slip_in_a_diff_not_a_zero_second_trim() {
         let (t, a, _) = cut_pair();
@@ -8095,7 +8517,12 @@ mod tests {
             "{}",
             diff.entries[0].summary
         );
-        assert!(diff.entries[0].summary.contains("+2.0s"), "{}", diff.entries[0].summary);
+        assert!(diff.entries[0].summary.contains("+2.00s"), "{}", diff.entries[0].summary);
+        assert!(
+            diff.entries[0].summary.contains("in-point 10.00s → 12.00s"),
+            "{}",
+            diff.entries[0].summary
+        );
 
         let mut rolled = t.clone();
         rolled.roll_edit(a, t.tracks[0].clips[1].id, 1.0, &footage(60.0)).unwrap();

@@ -401,6 +401,13 @@ export interface ClipMove {
 	track_id?: string;
 }
 
+/** One clip's cut in a group `split_remove_clips`: the clip and the timeline time it
+ *  is cut at (inside it). */
+export interface ClipCut {
+	clip_id: string;
+	at: number;
+}
+
 /** Which half of a split `split_remove` throws away: everything before the cut
  *  (`left` — trim the start to it) or everything after it (`right`). */
 export type SplitSide = 'left' | 'right';

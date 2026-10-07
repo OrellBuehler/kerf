@@ -41,6 +41,9 @@
 			url = sampleFrameUrl(cell.time);
 			return;
 		}
+		// A drag re-derives the cell on every pointer move, but within one frame the
+		// source time is the same number: asking again would decode the same picture.
+		if (cell.assetId === wanted.assetId && cell.time === wanted.time) return;
 		wanted = { assetId: cell.assetId, time: cell.time };
 		flight.request();
 	});

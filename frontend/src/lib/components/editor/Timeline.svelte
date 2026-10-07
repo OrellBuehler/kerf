@@ -33,6 +33,7 @@
 		slideMembers,
 		slipDelta,
 		sourceLimits,
+		subjectsPresent,
 		type EditPreview,
 		type GestureEdit,
 		type TrimTool
@@ -751,8 +752,16 @@
 	};
 	let tg = $state<TrimGesture | null>(null);
 	let cancelTrimTool: (() => void) | null = null;
-	// A clip removed (or the panel closed) mid-gesture gives the gesture up.
+	// The panel closing gives a gesture up (this cleanup runs once, at teardown)…
 	$effect(() => () => cancelTrimTool?.());
+	// …and so does a clip leaving the timeline under it — an agent's edit, an undo, Delete
+	// pressed mid-drag. Abandoned, nothing is written and the ghost goes; left to run, the
+	// release would ask the backend for an edit on a clip that is gone and answer with an
+	// error toast for a drag the user never finished.
+	$effect(() => {
+		const edit = tg?.edit;
+		if (edit && !subjectsPresent(editor.timeline, edit)) cancelTrimTool?.();
+	});
 
 	/** How far each asset's footage reaches: what every edit mode clamps to. */
 	const footage = $derived(sourceLimits(editor.assets));
@@ -1167,13 +1176,13 @@
 				}
 			},
 			{
-				label: 'Trim start to playhead',
+				label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
 				shortcut: settings.shortcut('edit.trimStart'),
 				disabled: !within || !!t.locked,
 				action: () => void trimSelection('left')
 			},
 			{
-				label: 'Trim end to playhead',
+				label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
 				shortcut: settings.shortcut('edit.trimEnd'),
 				disabled: !within || !!t.locked,
 				action: () => void trimSelection('right')

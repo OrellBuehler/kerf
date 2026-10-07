@@ -22,8 +22,19 @@
 // follows the project's ripple mode like any trim.
 
 import { formatTime } from './diff';
+import { toFixedEven } from './format-fixed';
 import { DIFF_EPS } from './ripple';
-import type { Clip, EditOutcome, Keyframe, Reframe, ReframeKeyframe, SplitSide, Timeline, Transform } from './types';
+import type {
+	Clip,
+	ClipCut,
+	EditOutcome,
+	Keyframe,
+	Reframe,
+	ReframeKeyframe,
+	SplitSide,
+	Timeline,
+	Transform
+} from './types';
 import { clipDuration, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 
 /** Shortest a clip an edit-mode op may leave behind, seconds — the edge-trim floor too. */
@@ -134,6 +145,57 @@ function clampFades(clip: Clip) {
 	const d = clipDuration(clip);
 	clip.fade_in = Math.min(clip.fade_in, d);
 	clip.fade_out = Math.min(clip.fade_out, d);
+}
+
+/** The float next above / below `v` (JS has no `Math.nextUp`), for the window points an edit steps. */
+function nextAfter(v: number, up: boolean): number {
+	if (!Number.isFinite(v)) return v;
+	if (v === 0) return up ? Number.MIN_VALUE : -Number.MIN_VALUE;
+	const view = new DataView(new ArrayBuffer(8));
+	view.setFloat64(0, v);
+	// For a positive float the bit pattern grows with the value; for a negative one it shrinks.
+	view.setBigUint64(0, view.getBigUint64(0) + (up === v > 0 ? 1n : -1n));
+	return view.getFloat64(0);
+}
+
+/** Close a cut exactly (`weld` in kerf-core): when `follower` starts where `leader` ends
+ *  to within float noise (`DIFF_EPS`), it is set to start *exactly* at the leader's
+ *  computed end — the expression a strict overlap test compares against. A genuine gap
+ *  or overlap (a cut merely within `ADJACENT_EPS`) is data and is left alone. */
+function weld(leader: Clip, follower: Clip) {
+	const end = endOf(leader);
+	if (Math.abs(follower.timeline_start - end) <= DIFF_EPS) follower.timeline_start = end;
+}
+
+/** `weld`'s mirror for the edge the edit left where it was (`fit_end` in kerf-core):
+ *  `clip`'s far end meets a clip that did not move, and the window arithmetic can leave
+ *  its end a few ulps past that clip's start (`limit`). Float noise of that kind is taken
+ *  back by shortening the window point the end is written on — by the overshoot, and by
+ *  one ulp when that is too small to move the point — until it is no longer past. */
+function fitEnd(clip: Clip, limit: number, looping: boolean) {
+	for (let i = 0; i < 16; i++) {
+		const over = endOf(clip) - limit;
+		if (over <= 0 || over > DIFF_EPS) return;
+		const by = over * speedOf(clip);
+		if (reversed(clip) && !looping) {
+			const moved = clip.source_in + by;
+			clip.source_in = moved === clip.source_in ? nextAfter(clip.source_in, true) : moved;
+		} else {
+			const moved = clip.source_out - by;
+			clip.source_out = moved === clip.source_out ? nextAfter(clip.source_out, false) : moved;
+		}
+	}
+}
+
+/** Where the first clip of lane `track` that starts at or after `end` (less the adjacency
+ *  tolerance) starts, skipping the lane indices in `skip`: what an edit's far edge runs into. */
+function startAfter(clips: readonly Clip[], end: number, skip: readonly number[]): number | undefined {
+	let best: number | undefined;
+	clips.forEach((c, i) => {
+		if (skip.includes(i) || c.timeline_start < end - ADJACENT_EPS) return;
+		if (best === undefined || c.timeline_start < best) best = c.timeline_start;
+	});
+	return best;
 }
 
 /** Re-time a clip's animation after its start moved by `by` timeline seconds:
@@ -285,8 +347,8 @@ function rollPlan(timeline: Timeline, clipA: string, clipB: string, footage: Sou
 			throw invalid('clip_a must be the earlier clip: a roll moves the cut where clip_a ends and clip_b begins');
 		throw invalid(
 			gap > 0
-				? `the clips are not adjacent — there is a ${gap.toFixed(2)}s gap between them, and a roll needs a shared cut`
-				: `the clips are not adjacent — they overlap by ${(-gap).toFixed(2)}s, and a roll needs a shared cut`
+				? `the clips are not adjacent — there is a ${toFixedEven(gap, 2)}s gap between them, and a roll needs a shared cut`
+				: `the clips are not adjacent — they overlap by ${toFixedEven(-gap, 2)}s, and a roll needs a shared cut`
 		);
 	}
 	const [, tailA] = handles(a, footageOf(footage, a));
@@ -327,8 +389,13 @@ export function rollEdit(
 	const track = timeline.tracks[ti];
 	const a = structuredClone(track.clips[ia]);
 	const b = structuredClone(track.clips[ib]);
-	moveTail(a, applied, !Number.isFinite(footageOf(footage, a)));
-	moveHead(b, applied, !Number.isFinite(footageOf(footage, b)));
+	const [loopingA, loopingB] = [!Number.isFinite(footageOf(footage, a)), !Number.isFinite(footageOf(footage, b))];
+	const far = endOf(b);
+	moveTail(a, applied, loopingA);
+	moveHead(b, applied, loopingB);
+	weld(a, b);
+	const limit = startAfter(track.clips, far, [ia, ib]);
+	if (limit !== undefined) fitEnd(b, limit, loopingB);
 	clampFades(a);
 	clampFades(b);
 	track.clips[ia] = a;
@@ -470,23 +537,52 @@ export function slideClip(timeline: Timeline, clipId: string, delta: number, foo
 	const applied = resolve(range, delta, 'slide the clip');
 	const clips = timeline.tracks[ti].clips;
 	// Everything that can still throw is read before anything is written.
-	const prevClip = prev?.[1] ? structuredClone(clips[prev[0]]) : null;
-	const nextClip = next?.[1] ? structuredClone(clips[next[0]]) : null;
-	const prevLooping = prevClip ? !Number.isFinite(footageOf(footage, prevClip)) : false;
-	const nextLooping = nextClip ? !Number.isFinite(footageOf(footage, nextClip)) : false;
+	const moved = structuredClone(clips[ci]);
+	let prevClip: Clip | null = null;
+	let nextClip: Clip | null = null;
+	let nextLooping = false;
+	let prevLooping = false;
+	if (prev?.[1]) {
+		prevClip = structuredClone(clips[prev[0]]);
+		prevLooping = !Number.isFinite(footageOf(footage, prevClip));
+	}
+	if (next?.[1]) {
+		nextClip = structuredClone(clips[next[0]]);
+		nextLooping = !Number.isFinite(footageOf(footage, nextClip));
+	}
+
+	// Where the edit's far edge was — the end of the last clip it changes — and which
+	// clips are the edit's own, so what that edge runs into can be found.
+	let far = endOf(moved);
+	const skip = [ci];
+	moved.timeline_start += applied;
+	if (prevClip && prev) {
+		moveTail(prevClip, applied, prevLooping);
+		weld(prevClip, moved);
+		clampFades(prevClip);
+		skip.push(prev[0]);
+	}
+	if (nextClip && next) {
+		far = endOf(nextClip);
+		moveHead(nextClip, applied, nextLooping);
+		weld(moved, nextClip);
+		clampFades(nextClip);
+		skip.push(next[0]);
+	}
+	const limit = startAfter(clips, far, skip);
+	if (limit !== undefined) {
+		if (nextClip) fitEnd(nextClip, limit, nextLooping);
+		else fitEnd(moved, limit, (footage.get(moved.asset_id) ?? 0) === Infinity);
+	}
 
 	const out: Clip[] = [];
 	if (prevClip && prev) {
-		moveTail(prevClip, applied, prevLooping);
-		clampFades(prevClip);
 		clips[prev[0]] = prevClip;
 		out.push(structuredClone(prevClip));
 	}
-	clips[ci].timeline_start += applied;
-	out.push(structuredClone(clips[ci]));
+	clips[ci] = moved;
+	out.push(structuredClone(moved));
 	if (nextClip && next) {
-		moveHead(nextClip, applied, nextLooping);
-		clampFades(nextClip);
 		clips[next[0]] = nextClip;
 		out.push(structuredClone(nextClip));
 	}
@@ -516,7 +612,7 @@ export function splitRemove(timeline: Timeline, clipId: string, at: number, side
 		throw invalid(`the split point ${formatTime(at)} is not inside the clip (${formatTime(start)}–${formatTime(end)})`);
 	const kept = side === 'left' ? end - at : at - start;
 	if (kept < MIN_EDIT_CLIP - DIFF_EPS)
-		throw invalid(`that would leave only ${kept.toFixed(2)}s of the clip — remove the clip instead`);
+		throw invalid(`that would leave only ${toFixedEven(kept, 2)}s of the clip — remove the clip instead`);
 	if (side === 'left') {
 		moveHead(clip, at - start, false);
 		clip.timeline_start = at;
@@ -529,4 +625,34 @@ export function splitRemove(timeline: Timeline, clipId: string, at: number, side
 	clampFades(clip);
 	timeline.tracks[ti].clips[ci] = clip;
 	return structuredClone(clip);
+}
+
+/**
+ * **Split and remove** on several clips as one edit (`Timeline::split_remove_clips`): the
+ * playhead trim of a selection — a picture and its sound together. Every cut is
+ * `splitRemove` with the same `side`; the survivors come back in request order. All or
+ * nothing: an unknown clip, a locked track, a cut outside its clip or one that would leave
+ * under `MIN_EDIT_CLIP` refuses the group and the timeline is untouched. At most one clip
+ * per track, and a clip once: under ripple a lane trimmed at two places has no single edit
+ * point to hold still, so each track ripples on its own, from its own one cut. Mutates
+ * `timeline`.
+ */
+export function splitRemoveClips(timeline: Timeline, cuts: readonly ClipCut[], side: SplitSide): Clip[] {
+	if (cuts.length === 0) throw invalid('no clips to cut');
+	const seenClips = new Set<string>();
+	const seenTracks = new Set<number>();
+	for (const cut of cuts) {
+		const ti = timeline.tracks.findIndex((t) => t.clips.some((c) => c.id === cut.clip_id));
+		if (ti < 0) throw new Error(`clip not found: ${cut.clip_id}`);
+		if (seenClips.has(cut.clip_id)) throw invalid(`clip ${cut.clip_id} appears more than once`);
+		seenClips.add(cut.clip_id);
+		if (seenTracks.has(ti))
+			throw invalid(`two of the clips are on track ${timeline.tracks[ti].name} — a group trim cuts one clip per track`);
+		seenTracks.add(ti);
+	}
+	// Cut a copy, so a refusal part-way through leaves the timeline untouched.
+	const scratch: Timeline = structuredClone(timeline);
+	const kept = cuts.map((cut) => splitRemove(scratch, cut.clip_id, cut.at, side));
+	timeline.tracks = scratch.tracks;
+	return kept;
 }

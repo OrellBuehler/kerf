@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipMove, Delivery,
+    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
     EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, SplitSide,
     StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
@@ -394,6 +394,32 @@ struct SplitRemoveParams {
     side: SplitSide,
     #[schemars(
         description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the track close the gap the removed half leaves (a left removal keeps the clip's own start and pulls the rest in); false leaves the gap, as after a plain split and delete. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping is kept as the edit made it."
+    )]
+    ripple: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ClipCutParams {
+    #[schemars(description = "UUID of the clip to cut")]
+    clip_id: String,
+    #[schemars(
+        description = "Timeline time to cut it at (seconds); must lie inside the clip and leave at least 0.05s of the half you keep"
+    )]
+    at: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SplitRemoveClipsParams {
+    #[schemars(
+        description = "The clips to cut and where. At most one clip per track, each clip once; different tracks may be cut at different times (usually the same time: a picture and its sound)."
+    )]
+    cuts: Vec<ClipCutParams>,
+    #[schemars(
+        description = "Which half to REMOVE from every clip: \"left\" (everything before its `at`) or \"right\" (everything after it)"
+    )]
+    side: SplitSide,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, each track closes the gap its own clip leaves (a left removal keeps the clip's own start); tracks ripple independently. false leaves the gaps."
     )]
     ripple: Option<bool>,
 }
@@ -1395,6 +1421,25 @@ impl KerfMcp {
         self.edit(|project| {
             let out = project
                 .with_ripple(p.ripple, |project| project.split_remove(clip_id, p.at, p.side))
+                .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Split and REMOVE one half of SEVERAL clips as ONE edit (one revision, one undo step) — trim \
+                       the starts (side \"left\") or the ends (side \"right\") of, say, a video clip and its audio \
+                       to the same time. Each cut is split_remove's: the half that stays keeps its clip's id and \
+                       loses what belonged to the removed half. All or nothing — an unknown clip, a locked track, a \
+                       cut outside its clip or one that would leave under 0.05s refuses the whole call and changes \
+                       nothing — and at most one clip per track. In ripple mode (get_ripple_mode, or pass `ripple`) \
+                       each track closes its own gap. Returns the clips that remain, in the order given."
+    )]
+    fn split_remove_clips(&self, Parameters(p): Parameters<SplitRemoveClipsParams>) -> Result<String, McpError> {
+        let cuts = clip_cuts(&p.cuts)?;
+        self.edit(|project| {
+            let out = project
+                .with_ripple(p.ripple, |project| project.split_remove_clips(&cuts, p.side))
                 .map_err(core_err)?;
             json(&out)
         })
@@ -3001,11 +3046,12 @@ impl ServerHandler for KerfMcp {
              adjacent clips (both shift, the pair's length is unchanged), \
              slip_clip shows other footage in the same place and length, \
              slide_clip moves a clip between its neighbours (they give way), \
-             and split_remove trims a clip's start or end to a time — the first \
+             and split_remove trims a clip's start or end to a time (split_remove_clips \
+             does that to a picture and its sound as one revision) — the first \
              three clamp to the footage and report `applied`, and never ripple. \
              The project may be in ripple mode, so check get_ripple_mode before you trim, \
              remove or retime: with it on, trim / set_speed / remove / \
-             split_remove / add_clip_to_timeline onto footage / \
+             split_remove(_clips) / add_clip_to_timeline onto footage / \
              generate_voiceover carry the \
              later clips on that track along by the change in length, gaps kept \
              (track by track — a V1 ripple leaves A1 where it is), and with it \
@@ -3213,6 +3259,19 @@ fn clip_moves(moves: &[ClipMoveParams]) -> Result<Vec<ClipMove>, McpError> {
                 clip_id: parse_id(&m.clip_id)?,
                 timeline_start: m.timeline_start,
                 track_id: m.track_id.as_deref().map(parse_id).transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// The group cut a tool call asked for, with its ids parsed: a mistyped uuid is the
+/// caller's, and says which one.
+fn clip_cuts(cuts: &[ClipCutParams]) -> Result<Vec<ClipCut>, McpError> {
+    cuts.iter()
+        .map(|c| {
+            Ok(ClipCut {
+                clip_id: parse_id(&c.clip_id)?,
+                at: c.at,
             })
         })
         .collect()
@@ -3576,6 +3635,7 @@ mod tests {
         assert_eq!(required("roll_edit").0, ["clip_a", "clip_b", "delta"]);
         assert_eq!(required("slip_clip").0, ["clip_id", "delta"]);
         assert_eq!(required("slide_clip").0, ["clip_id", "delta"]);
+        assert_eq!(required("split_remove_clips").0, ["cuts", "side"]);
         let (split, schema) = required("split_remove");
         assert_eq!(split, ["at", "clip_id", "side"]);
         assert!(schema.contains("left") && schema.contains("right"), "{schema}");
@@ -3622,6 +3682,7 @@ mod tests {
             "add_clip_to_timeline",
             "split_at",
             "split_remove",
+            "split_remove_clips",
             "generate_voiceover",
         ] {
             let (properties, required) = schema(name);
@@ -3679,6 +3740,24 @@ mod tests {
         assert!(e.message.contains("not-a-uuid"), "{}", e.message);
         let e = clip_moves(&[item(clip.to_string(), Some("nope".to_string()))]).unwrap_err();
         assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// The group cut reaches the core with every id parsed; one mistyped uuid refuses
+    /// the lot and is the caller's to fix.
+    #[test]
+    fn a_group_cut_parses_its_ids_and_names_the_bad_one() {
+        use super::{clip_cuts, ClipCutParams};
+        use rmcp::model::ErrorCode;
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let item = |clip_id: String, at: f64| ClipCutParams { clip_id, at };
+        let cuts = clip_cuts(&[item(a.to_string(), 2.5), item(b.to_string(), 3.0)]).unwrap();
+        assert_eq!(
+            cuts.iter().map(|c| (c.clip_id, c.at)).collect::<Vec<_>>(),
+            vec![(a, 2.5), (b, 3.0)]
+        );
+        let e = clip_cuts(&[item(a.to_string(), 1.0), item("not-a-uuid".to_string(), 1.0)]).unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(e.message.contains("not-a-uuid"), "{}", e.message);
     }
 
     /// The default bind is loopback, which rmcp's own defaults already cover.

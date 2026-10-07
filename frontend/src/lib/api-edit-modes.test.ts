@@ -11,6 +11,7 @@ import {
 	slideClip,
 	slipClip,
 	splitRemove,
+	splitRemoveClips,
 	undo
 } from './api';
 import type { Timeline } from './types';
@@ -87,6 +88,7 @@ describe('roll / slip / slide (browser harness)', () => {
 		await expect(slipClip('c1', 1)).rejects.toThrow('V1 is locked');
 		await expect(slideClip('c1', 1)).rejects.toThrow('V1 is locked');
 		await expect(splitRemove('c1', 5, 'left')).rejects.toThrow('V1 is locked');
+		await expect(splitRemoveClips([{ clip_id: 'c1', at: 5 }], 'left')).rejects.toThrow('V1 is locked');
 	});
 });
 
@@ -111,6 +113,36 @@ describe('split and remove (browser harness)', () => {
 		expect(clip(t, 'c2').timeline_start).toBe(12.5);
 		expect(starts(t, 0)).toEqual([0, 12.5, 20]);
 		expect(starts(t, 1)).toEqual([0]); // no sync lock
+	});
+
+	test('a group cut is ONE revision, undone in one step, and a refused one records nothing', async () => {
+		// c1 [0,12.5) on V1 over c3 [0,120) on A1: a picture and its sound.
+		const before = await headSeq();
+		const t = await splitRemoveClips(
+			[
+				{ clip_id: 'c1', at: 5 },
+				{ clip_id: 'c3', at: 5 }
+			],
+			'left'
+		);
+		expect([clip(t, 'c1').timeline_start, clip(t, 'c3').timeline_start]).toEqual([5, 5]);
+		expect(await headSeq()).toBe(before + 1);
+		expect((await getHistory()).at(-1)!.label).toBe('Split and remove left (2 clips)');
+		const undone = await undo();
+		expect([clip(undone, 'c1').timeline_start, clip(undone, 'c3').timeline_start]).toEqual([0, 0]);
+
+		const seq = await headSeq();
+		await expect(
+			splitRemoveClips(
+				[
+					{ clip_id: 'c1', at: 5 },
+					{ clip_id: 'c3', at: 500 }
+				],
+				'right'
+			)
+		).rejects.toThrow('not inside the clip');
+		expect(await headSeq()).toBe(seq);
+		expect(clip(await getTimeline(), 'c1').source_out).toBe(12.5);
 	});
 
 	test('a cut outside the clip is refused', async () => {

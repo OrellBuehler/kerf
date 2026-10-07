@@ -20,6 +20,7 @@ import {
 	slideNeighbours,
 	slipDelta,
 	sourceLimits,
+	subjectsPresent,
 	trimNotice,
 	type GestureEdit
 } from './trim-tools';
@@ -640,6 +641,30 @@ describe('trim to the playhead', () => {
 		const near_ = planPlayheadTrim(t, [v.id], 9.98, 30, 'left');
 		expect(near_.trims).toEqual([]);
 		expect(near_.problems[0]).toContain('V1: that would leave only');
+	});
+
+	test('one clip per track: a lane with two selected clips under the playhead cuts one and says so', () => {
+		// An old project that overlaps itself. The backend's group trim takes one clip per
+		// track, so the plan sends the first and reports the second rather than failing the lot.
+		const [first, second] = [sclip(0, 10, 0), sclip(0, 10, 2)];
+		const partner = sclip(0, 10, 0);
+		const t: Timeline = { tracks: [track('V1', [first, second]), track('A1', [partner], {}, 'audio')] };
+		const plan = planPlayheadTrim(t, [first.id, second.id, partner.id], 5, 30, 'left');
+		expect(plan.trims.map((x) => x.clipId)).toEqual([first.id, partner.id]);
+		expect(plan.problems).toEqual(['V1: two selected clips are under the playhead — trim them one at a time']);
+		expect(plan.under).toBe(3);
+	});
+
+	test('a gesture is given up when a clip it edits is gone', () => {
+		const { t, a, b } = cutPair();
+		const roll: GestureEdit = { tool: 'roll', a: a.id, b: b.id };
+		expect(subjectsPresent(t, roll)).toBe(true);
+		expect(subjectsPresent(t, { tool: 'slide', clipId: b.id })).toBe(true);
+		const without = lane([a]);
+		expect(subjectsPresent(without, roll)).toBe(false); // one side of the cut removed
+		expect(subjectsPresent(without, { tool: 'slip', clipId: b.id })).toBe(false);
+		expect(subjectsPresent(without, { tool: 'slide', clipId: a.id })).toBe(true);
+		expect(subjectsPresent({ tracks: [] }, roll)).toBe(false);
 	});
 
 	test('what to say when there is nothing to cut', () => {

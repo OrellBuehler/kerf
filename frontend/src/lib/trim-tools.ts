@@ -30,6 +30,7 @@ import {
 	type DeltaRange,
 	type SourceLimits
 } from './edit-modes';
+import { toFixedEven } from './format-fixed';
 import { quantizeTime, snapToFrame, splitPoint } from './frames';
 import { DIFF_EPS } from './ripple';
 import { formatTimecode } from './timecode';
@@ -159,6 +160,14 @@ export function slideMembers(track: Track, clipId: string): Set<string> {
 	if (n?.prev && n.prevTouches) members.add(n.prev.id);
 	if (n?.next && n.nextTouches) members.add(n.next.id);
 	return members;
+}
+
+/** Whether every clip a gesture edits is still on the timeline. A drag whose clip is
+ *  removed under it (an agent's edit, an undo, Delete) has nothing left to write and is
+ *  abandoned rather than finished into an error. */
+export function subjectsPresent(timeline: Timeline, edit: GestureEdit): boolean {
+	const ids = edit.tool === 'roll' ? [edit.a, edit.b] : [edit.clipId];
+	return ids.every((id) => timeline.tracks.some((t) => t.clips.some((c) => c.id === id)));
 }
 
 // ---- range, preview ---------------------------------------------------------
@@ -382,7 +391,7 @@ export function playheadCut(clip: Clip, time: number, fps: number, side: SplitSi
 	if (at === null) return { why: 'that clip is too short to cut on a frame' };
 	const kept = side === 'left' ? end - at : at - start;
 	if (kept < MIN_EDIT_CLIP - DIFF_EPS)
-		return { why: `that would leave only ${kept.toFixed(2)}s of the clip — remove the clip instead` };
+		return { why: `that would leave only ${toFixedEven(kept, 2)}s of the clip — remove the clip instead` };
 	return { at };
 }
 
@@ -393,7 +402,8 @@ export interface PlayheadTrim {
 }
 
 export interface TrimPlan {
-	/** The selected clips under the playhead that can be cut, in timeline order of the tracks. */
+	/** The selected clips under the playhead that can be cut, in timeline order of the
+	 *  tracks — at most one per track, which is what the backend's group trim takes. */
 	trims: PlayheadTrim[];
 	/** Selected clips under the playhead that cannot, each with the reason. */
 	problems: string[];
@@ -412,6 +422,7 @@ export function planPlayheadTrim(timeline: Timeline, selected: readonly string[]
 	const want = new Set(selected);
 	const plan: TrimPlan = { trims: [], problems: [], under: 0 };
 	for (const track of timeline.tracks) {
+		let cutHere = false;
 		for (const clip of track.clips) {
 			if (!want.has(clip.id) || !(time > clip.timeline_start && time < endOf(clip))) continue;
 			plan.under++;
@@ -421,7 +432,13 @@ export function planPlayheadTrim(timeline: Timeline, selected: readonly string[]
 			}
 			const cut = playheadCut(clip, time, fps, side);
 			if ('why' in cut) plan.problems.push(`${track.name}: ${cut.why}`);
-			else plan.trims.push({ clipId: clip.id, trackName: track.name, at: cut.at });
+			// A lane with two clips under one playhead (an old project that overlaps itself):
+			// the backend trims one clip per track in a group, so the second is said, not sent.
+			else if (cutHere) plan.problems.push(`${track.name}: two selected clips are under the playhead — trim them one at a time`);
+			else {
+				plan.trims.push({ clipId: clip.id, trackName: track.name, at: cut.at });
+				cutHere = true;
+			}
 		}
 	}
 	return plan;

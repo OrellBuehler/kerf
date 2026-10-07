@@ -15,6 +15,7 @@ import type {
 	CaptionImportResult,
 	CaptionOptions,
 	Clip,
+	ClipCut,
 	ClipMove,
 	Mask,
 	Color,
@@ -64,6 +65,7 @@ import {
 	slideClip as slideClipLocal,
 	slipClip as slipClipLocal,
 	splitRemove as splitRemoveLocal,
+	splitRemoveClips as splitRemoveClipsLocal,
 	type SourceLimits
 } from './edit-modes';
 import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
@@ -1155,6 +1157,20 @@ export async function splitRemove(clipId: string, at: number, side: SplitSide): 
 		return snapshot();
 	}
 	return invoke<Timeline>('split_remove', { clipId, at, side });
+}
+
+/** `splitRemove` on several clips as **one** edit — the playhead trim of a selection,
+ *  a picture and its sound together, one revision and so one undo. Each cut names a
+ *  clip and its time; `side` is the same for all. All or nothing (the promise rejects
+ *  and nothing changed), one clip per track; ripple mode closes each track's own gap. */
+export async function splitRemoveClips(cuts: ClipCut[], side: SplitSide): Promise<Timeline> {
+	if (!inTauri()) {
+		devEdit(undefined, () => splitRemoveClipsLocal(devTimeline, cuts, side));
+		const what = side === 'left' ? 'Split and remove left' : 'Split and remove right';
+		recordDev(cuts.length > 1 ? `${what} (${cuts.length} clips)` : what);
+		return snapshot();
+	}
+	return invoke<Timeline>('split_remove_clips', { cuts, side });
 }
 
 /** Append a new empty track (video tracks above audio); auto-named when omitted. */

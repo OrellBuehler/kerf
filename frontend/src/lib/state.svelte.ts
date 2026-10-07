@@ -71,6 +71,7 @@ import {
 	slipClip,
 	slideClip,
 	splitRemove,
+	splitRemoveClips,
 	revertTo as apiRevertTo,
 	revisionDiff as apiRevisionDiff,
 	applyStagedEdit,
@@ -91,6 +92,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	ClipCut,
 	ClipMove,
 	SplitSide,
 	ExportProgress,
@@ -645,6 +647,10 @@ class EditorState {
 	/** Split a clip at `at` and remove the `left` or `right` half; follows ripple mode. */
 	splitRemove(clipId: string, at: number, side: SplitSide) {
 		return this.#apply(splitRemove(clipId, at, side));
+	}
+	/** Split and remove on several clips as ONE edit (one revision, one undo). */
+	splitRemoveClips(cuts: ClipCut[], side: SplitSide) {
+		return this.#apply(splitRemoveClips(cuts, side));
 	}
 
 	// ---- ripple mode ----------------------------------------------------------

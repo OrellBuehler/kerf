@@ -15,10 +15,10 @@ use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipMove, CropFrame, Delivery,
-    EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, SourceLimits,
-    SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
-    TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
+    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
+    Delivery, EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision,
+    SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
+    Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -1655,19 +1655,38 @@ impl Project {
     /// surviving half keeps the clip's id; see [`Timeline::split_remove`].
     /// Returns it as it ended up on the timeline.
     pub fn split_remove(&self, clip_id: Uuid, at: f64, side: SplitSide) -> Result<Clip> {
-        let label = match side {
+        let mut kept = self.split_remove_clips(&[ClipCut { clip_id, at }], side)?;
+        Ok(kept.remove(0))
+    }
+
+    /// [`Self::split_remove`] on several clips as **one** revision — the playhead
+    /// trim of a selection, V1 and its A1 partner together, which undoes in one
+    /// step. Each cut names a clip and the time it is cut at; `side` is the same for
+    /// all. All or nothing, one clip per track (see
+    /// [`Timeline::split_remove_clips`]); each track then ripples on its own, from its
+    /// own one cut, when ripple mode is on. The label is `Split and remove left` /
+    /// `… right`, with `(N clips)` appended for a group. Returns the surviving
+    /// clips, in request order, as they ended up on the timeline.
+    pub fn split_remove_clips(&self, cuts: &[ClipCut], side: SplitSide) -> Result<Vec<Clip>> {
+        let what = match side {
             SplitSide::Left => "Split and remove left",
             SplitSide::Right => "Split and remove right",
         };
-        let clip = self.edit_timeline(label, |timeline| timeline.split_remove(clip_id, at, side))?;
-        // As `trim`: ripple can move the surviving half itself (a left removal
-        // keeps its start), so hand back what is on the timeline.
+        let label = match cuts.len() {
+            0 | 1 => what.to_string(),
+            n => format!("{what} ({n} clips)"),
+        };
+        let kept = self.edit_timeline(&label, |timeline| timeline.split_remove_clips(cuts, side))?;
+        // As `trim`: ripple can move a surviving half itself (a left removal keeps
+        // its start), so hand back what is on the timeline.
         if self.ripple_active()? {
-            if let Some(current) = self.working_timeline()?.clip(clip.id) {
-                return Ok(current.clone());
-            }
+            let now = self.working_timeline()?;
+            return Ok(kept
+                .into_iter()
+                .map(|clip| now.clip(clip.id).cloned().unwrap_or(clip))
+                .collect());
         }
-        Ok(clip)
+        Ok(kept)
     }
 
     /// Insert `placements` — each a `(track_id, clip)` pair — so the earliest
@@ -6931,6 +6950,99 @@ mod tests {
             "slipped by 1, then the slide trimmed half a second off its head"
         );
         assert!(!staged.diff.is_empty(), "the review card has something to show");
+    }
+
+    #[test]
+    fn a_group_split_remove_is_one_revision_and_undoes_in_one_step() {
+        let (project, asset) = project_with_video_asset();
+        let tracks = project.timeline().unwrap().tracks;
+        let (v1, a1) = (tracks[0].id, tracks[1].id);
+        let v = project.add_clip_to_timeline(asset, Some(v1), 10.0, 16.0, Some(0.0)).unwrap();
+        let a = project.add_clip_to_timeline(asset, Some(a1), 10.0, 16.0, Some(1.0)).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        let cuts = [ClipCut { clip_id: v.id, at: 3.0 }, ClipCut { clip_id: a.id, at: 3.0 }];
+        let kept = project.split_remove_clips(&cuts, SplitSide::Left).unwrap();
+        assert_eq!(kept.iter().map(|c| c.id).collect::<Vec<_>>(), vec![v.id, a.id]);
+        let tl = project.timeline().unwrap();
+        assert_eq!(
+            (tl.clip(v.id).unwrap().timeline_start, tl.clip(a.id).unwrap().timeline_start),
+            (3.0, 3.0)
+        );
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1, "one revision for both tracks");
+        assert_eq!(history.last().unwrap().label, "Split and remove left (2 clips)");
+
+        let undone = project.undo().unwrap();
+        assert_eq!(
+            (
+                undone.clip(v.id).unwrap().timeline_start,
+                undone.clip(a.id).unwrap().timeline_start
+            ),
+            (0.0, 1.0)
+        );
+
+        // A single cut keeps the single label, and is the same code path.
+        project.split_remove_clips(&cuts[..1], SplitSide::Right).unwrap();
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Split and remove right");
+    }
+
+    #[test]
+    fn a_refused_group_split_remove_records_nothing_and_ripple_is_per_track() {
+        let (project, asset) = project_with_video_asset();
+        let tracks = project.timeline().unwrap().tracks;
+        let (v1, a1) = (tracks[0].id, tracks[1].id);
+        let v = project.add_clip_to_timeline(asset, Some(v1), 10.0, 16.0, Some(0.0)).unwrap();
+        let w = project.add_clip_to_timeline(asset, Some(v1), 0.0, 2.0, Some(8.0)).unwrap();
+        let a = project.add_clip_to_timeline(asset, Some(a1), 10.0, 16.0, Some(1.0)).unwrap();
+        let x = project.add_clip_to_timeline(asset, Some(a1), 0.0, 2.0, Some(9.0)).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        let bad = [ClipCut { clip_id: v.id, at: 3.0 }, ClipCut { clip_id: a.id, at: 50.0 }];
+        assert!(matches!(
+            project.split_remove_clips(&bad, SplitSide::Left),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), revisions);
+        assert_eq!(project.timeline().unwrap().clip(v.id).unwrap().timeline_start, 0.0);
+
+        // Ripple on: each lane closes by what it lost — V1 by 2 s, A1 by 4 s.
+        project.set_ripple_mode(true).unwrap();
+        let cuts = [ClipCut { clip_id: v.id, at: 2.0 }, ClipCut { clip_id: a.id, at: 5.0 }];
+        let kept = project.split_remove_clips(&cuts, SplitSide::Left).unwrap();
+        assert_eq!(
+            kept.iter().map(|c| c.timeline_start).collect::<Vec<_>>(),
+            vec![0.0, 1.0],
+            "handed back as they ended up"
+        );
+        let tl = project.timeline().unwrap();
+        assert_eq!(
+            (tl.clip(w.id).unwrap().timeline_start, tl.clip(x.id).unwrap().timeline_start),
+            (6.0, 5.0)
+        );
+    }
+
+    #[test]
+    fn an_agents_group_split_remove_is_staged() {
+        let (mut project, asset) = project_with_video_asset();
+        let tracks = project.timeline().unwrap().tracks;
+        let v = project
+            .add_clip_to_timeline(asset, Some(tracks[0].id), 10.0, 16.0, Some(0.0))
+            .unwrap();
+        let a = project
+            .add_clip_to_timeline(asset, Some(tracks[1].id), 10.0, 16.0, Some(0.0))
+            .unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        let cuts = [ClipCut { clip_id: v.id, at: 2.0 }, ClipCut { clip_id: a.id, at: 2.0 }];
+        project.split_remove_clips(&cuts, SplitSide::Right).unwrap();
+        assert_eq!(
+            project.timeline().unwrap().clip(v.id).unwrap().duration(),
+            6.0,
+            "the live cut is untouched"
+        );
+        assert_eq!(project.working_timeline().unwrap().clip(v.id).unwrap().duration(), 2.0);
+        assert_eq!(project.staged().unwrap().unwrap().edits, ["Split and remove right (2 clips)"]);
     }
 
     #[test]

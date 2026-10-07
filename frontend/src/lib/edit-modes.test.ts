@@ -9,6 +9,7 @@ import {
 	slipClip,
 	slipRange,
 	splitRemove,
+	splitRemoveClips,
 	type SourceLimits
 } from './edit-modes';
 import { rippleFrom } from './ripple';
@@ -725,5 +726,166 @@ describe('splitRemove', () => {
 			[5, 7],
 			[9, 11]
 		]);
+	});
+});
+
+// ---- no float residue between touching clips ------------------------------------------
+
+/** mulberry32 — a small deterministic generator, so the fuzz is the same on every run. */
+function rng(seed: number) {
+	let a = seed >>> 0;
+	return () => {
+		a = (a + 0x6d2b79f5) >>> 0;
+		let t = a;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** A lane of `n` clips of random length, speed (and direction) and window in a 600 s
+ *  asset laid end to end — the float values a real cut is made of — with an occasional real gap. */
+function randomLane(next: () => number, n: number): Timeline {
+	const between = (lo: number, hi: number) => lo + (hi - lo) * next();
+	const speeds = [1, 1, 2, 0.5, 1.5, -1, -2, 0.37];
+	const clips: Clip[] = [];
+	let cursor = 0;
+	for (let i = 0; i < n; i++) {
+		const speed = speeds[Math.floor(next() * speeds.length) % speeds.length];
+		const si = between(30, 400);
+		const so = si + between(0.4, 7) * Math.max(Math.abs(speed), 0.01);
+		if (next() < 0.25) cursor += between(0.2, 2);
+		const c = sclip(si, so, cursor, { speed });
+		cursor = c.timeline_start + clipDuration(c);
+		clips.push(c);
+	}
+	return oneLane(clips);
+}
+
+/** Junctions where a clip starts *before* the one ahead of it ends, by float noise —
+ *  what a strict overlap test reads as one clip lying on the next. */
+function noiseOverlaps(t: Timeline): [number, number][] {
+	const clips = t.tracks[0].clips;
+	const out: [number, number][] = [];
+	for (let i = 1; i < clips.length; i++) {
+		const over = clips[i - 1].timeline_start + clipDuration(clips[i - 1]) - clips[i].timeline_start;
+		if (over > 0 && over < ADJACENT_EPS) out.push([i, over]);
+	}
+	return out;
+}
+
+describe('roll and slide leave no float residue between clips', () => {
+	test('every junction of the lane comes out clean, for requests inside the range and past it', () => {
+		const next = rng(7);
+		const between = (lo: number, hi: number) => lo + (hi - lo) * next();
+		let tried = 0;
+		for (let k = 0; k < 3000; k++) {
+			const t = randomLane(next, 5);
+			expect(noiseOverlaps(t)).toEqual([]);
+			const ids = t.tracks[0].clips.map((c) => c.id);
+			const at = 1 + Math.floor(next() * 3);
+			const delta = next() < 0.3 ? between(-9, 9) : between(-1.5, 1.5);
+			for (const op of [0, 1]) {
+				const u = clone(t);
+				let out;
+				try {
+					out = op === 0 ? rollEdit(u, ids[at - 1], ids[at], delta, footage(600)) : slideClip(u, ids[at], delta, footage(600));
+				} catch {
+					continue;
+				}
+				tried++;
+				expect(noiseOverlaps(u)).toEqual([]);
+				// …and nothing but noise moved to get there.
+				const [was, now] = [t.tracks[0].clips, u.tracks[0].clips];
+				was.forEach((w, i) => {
+					if (!out.clips.some((c) => c.id === w.id))
+						expect([now[i].timeline_start, now[i].source_in, now[i].source_out]).toEqual([w.timeline_start, w.source_in, w.source_out]);
+				});
+				near(now[at].timeline_start, was[at].timeline_start + out.applied);
+				if (op === 0) {
+					near(now[at].timeline_start + clipDuration(now[at]), was[at].timeline_start + clipDuration(was[at]));
+					near(now[at - 1].timeline_start + clipDuration(now[at - 1]), was[at - 1].timeline_start + clipDuration(was[at - 1]) + out.applied);
+				} else {
+					near(clipDuration(now[at]), clipDuration(was[at]));
+				}
+			}
+		}
+		expect(tried).toBeGreaterThan(4000);
+	});
+
+	test('a cut a hair apart keeps its real gap; only float noise is welded', () => {
+		const [t, a, b] = cutPair();
+		t.tracks[0].clips[1].timeline_start = 4.0005;
+		rollEdit(t, a, b, 1, footage(60));
+		expect(t.tracks[0].clips[1].timeline_start).toBe(5.0005);
+
+		const [u, ua, ub] = cutPair();
+		rollEdit(u, ua, ub, 0.1, footage(60));
+		expect(u.tracks[0].clips[1].timeline_start).toBe(u.tracks[0].clips[0].timeline_start + clipDuration(u.tracks[0].clips[0]));
+	});
+});
+
+// ---- split and remove on a group --------------------------------------------------------
+
+/** V1 `v [0,6)` over A1 `a [1,7)` — a picture and its sound, not quite in step. */
+function pictureAndSound(): [Timeline, string, string] {
+	const [v, a] = [sclip(10, 16, 0), sclip(10, 16, 1)];
+	return [{ tracks: [track('V1', [v]), { ...track('A1', [a]), kind: 'audio' as StreamKind }] }, v.id, a.id];
+}
+
+describe('splitRemoveClips', () => {
+	test('cuts every track in one edit, the survivors in request order', () => {
+		const [t, v, a] = pictureAndSound();
+		const kept = splitRemoveClips(t, [{ clip_id: v, at: 3 }, { clip_id: a, at: 3 }], 'left');
+		expect(kept.map((c) => c.id)).toEqual([v, a]);
+		expect([kept[0].timeline_start, kept[0].source_in]).toEqual([3, 13]);
+		expect([kept[1].timeline_start, kept[1].source_in]).toEqual([3, 12]);
+		expect(spans(t, 0)).toEqual([[3, 6]]);
+		expect(spans(t, 1)).toEqual([[3, 7]]);
+
+		const [u, uv, ua] = pictureAndSound();
+		splitRemoveClips(u, [{ clip_id: uv, at: 2 }, { clip_id: ua, at: 4.5 }], 'right');
+		expect(spans(u, 0)).toEqual([[0, 2]]);
+		expect(spans(u, 1)).toEqual([[1, 4.5]]);
+	});
+
+	test('is all or nothing, one clip per track', () => {
+		const [t, v, a] = pictureAndSound();
+		const cut = (clip_id: string, at: number) => ({ clip_id, at });
+		const refused = (name: string, tl: Timeline, cuts: { clip_id: string; at: number }[]) => {
+			const copy = clone(tl);
+			const why = refusal(() => splitRemoveClips(copy, cuts, 'left'));
+			expect(copy).toEqual(tl); // a refused group changes nothing
+			return why;
+		};
+		expect(refused('outside', t, [cut(v, 3), cut(a, 0.5)])).toContain('not inside the clip');
+		expect(refused('floor', t, [cut(v, 3), cut(a, 6.99)])).toContain('only 0.01s');
+		expect(refused('empty', t, [])).toContain('no clips');
+		expect(refused('twice', t, [cut(v, 3), cut(v, 4)])).toContain('more than once');
+
+		const crowded = clone(t);
+		const extra = sclip(0, 2, 7);
+		crowded.tracks[0].clips.push(extra);
+		const why = refused('crowded', crowded, [cut(v, 3), cut(extra.id, 7.5)]);
+		expect(why).toContain('one clip per track');
+		expect(why).toContain('V1');
+
+		const locked = clone(t);
+		locked.tracks[1].locked = true;
+		expect(refused('locked', locked, [cut(v, 3), cut(a, 3)])).toContain('A1 is locked'); // V1 was not cut either
+		expect(() => splitRemoveClips(clone(t), [cut(v, 3), cut('nope', 3)], 'left')).toThrow('clip not found: nope');
+	});
+
+	test('under ripple each track closes on its own', () => {
+		const [before, v, a] = pictureAndSound();
+		before.tracks[0].clips.push(sclip(0, 2, 8));
+		before.tracks[1].clips.push(sclip(0, 2, 9));
+		const after = clone(before);
+		splitRemoveClips(after, [{ clip_id: v, at: 2 }, { clip_id: a, at: 5 }], 'left');
+		const rippled = rippleFrom(after, before);
+		expect(spans(after, 0)).toEqual([[2, 6], [8, 10]]);
+		expect(spans(rippled, 0)).toEqual([[0, 4], [6, 8]]);
+		expect(spans(after, 1)).toEqual([[5, 7], [9, 11]]);
+		expect(spans(rippled, 1)).toEqual([[1, 3], [5, 7]]);
 	});
 });

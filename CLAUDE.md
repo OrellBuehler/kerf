@@ -784,7 +784,22 @@ no editing logic in the adapter.
   slip/slide of the clip itself leaves them clip-local; fades are clamped into a
   clip that shrank; a still's window is only ever written on its out-point (no
   negative `source_in`); locked tracks refuse; every op validates before it
-  mutates. A same-length window shift diffs as `Slipped clip …`, not a `+0.0s` trim.
+  mutates. **Float residue is welded**: a roll or slide computes one side of a cut
+  from a window and the other from `start + delta`, which disagree by a few ulps
+  (±6e-14 s, in a large share of cases) — invisible to a render, but read as an
+  overlap by a strict test like `Project::move_clip`'s. So the cut the edit made is
+  closed *exactly* (`weld`: the follower starts at `leader.timeline_end()`, the
+  expression the overlap checks use) and the far edge, where the edit runs into a
+  clip it did not move, is pulled back off that clip by shortening its window point
+  by the overshoot (`fit_end`) — both only for float noise (`DIFF_EPS`), never a real
+  sub-millisecond gap, which is data. A fuzz test asserts no junction of the lane
+  overlaps afterwards. **`split_remove_clips(&[ClipCut{clip_id, at}], side)`** is
+  `split_remove` on a selection as one edit — all or nothing, **at most one clip per
+  track** (a lane trimmed at two places has no single edit point for `ripple_from` to
+  hold still), each track rippling on its own. A same-length window shift diffs as
+  `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
+  if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
+  its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -949,7 +964,9 @@ no editing logic in the adapter.
   clip`, one revision each, `source_limits()` read before the edit) are
   `edit_timeline_exact` — they move no length, only where footage changes hands;
   `split_remove` (`Split and remove left|right`) goes through `edit_timeline` and
-  follows the mode, re-reading its clip like `trim`. All four refuse a locked track.
+  follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
+  for a group — one revision (`Split and remove left (2 clips)`), the single-clip
+  `split_remove` being a group of one. All of them refuse a locked track.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
@@ -1292,7 +1309,9 @@ seconds, positive = later in its own footage) and `slide_clip` answer the
 `EditOutcome` JSON (`applied` / `clamped` say how far a clamp let it go; a clamp to
 nothing is `invalid_params` naming the limit), and `split_remove` (`side` is the
 `SplitSide` enum in the schema, so a typo is rejected at the schema) answers the
-surviving clip; the server `instructions` mention all four. The server `instructions` carry the ripple
+surviving clip, `split_remove_clips { cuts: [{clip_id, at}], side, ripple? }` does it
+to several clips as one revision (a picture and its sound; ids parsed by `clip_cuts`);
+the server `instructions` mention them all. The server `instructions` carry the ripple
 paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
@@ -1384,7 +1403,8 @@ left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip
 `move_clips { moves }` (a group, one revision, all or nothing), `roll_edit { clipA, clipB,
 delta }` / `slip_clip { clipId, delta }` / `slide_clip { clipId, delta }` (clamping edit
 modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`; follows
-ripple mode), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, one revision),
+`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
@@ -1932,12 +1952,22 @@ with the timeline, not the `EditOutcome`. Meanwhile the Preview shows the **trim
 (`ui.trimMonitor`, `TrimMonitor` / `TrimFrame`): `monitorFor` picks the frames either side
 (a roll's outgoing last + incoming first, a slip's new in + out, a slide's two changed
 neighbour edges; none on an audio track) and `getFrame` decodes them from the *source*,
-single-flight, newest wins (the harness draws its stamped stand-in frames).
+single-flight, newest wins, and a request for the `{assetId, time}` already asked for is
+skipped (a drag re-derives the cell on every pointer move; within one frame it is the same
+picture) — the harness draws its stamped stand-in frames. A clip removed under a live
+gesture (an agent's edit, an undo, Delete) abandons it (`subjectsPresent`, an effect in
+`Timeline.svelte`): nothing is written and the ghost goes.
 `ClipOverlays`' hit areas (`tooled`) are inert under any tool but Select; none of the
 three ripples. **Trim start / end to playhead** (`Q` / `W`, the clip menu; `ops.ts` `trimSelection`) is `split_remove` on
 every *selected* clip the playhead is inside (`planPlayheadTrim`: the razor's frame rule,
-the 0.05 s floor as a sentence, locked tracks reported) — one revision per clip, following
-ripple mode, with a toast saying why when there is nothing to cut.
+the 0.05 s floor as a sentence, locked tracks reported, one clip per track) as ONE
+`split_remove_clips` — one revision, so a V1 clip and its A1 partner undo together —
+following ripple mode (each track on its own), with a toast saying why when there is
+nothing to cut; the clip menu's labels go plural (`Trim starts to playhead`) when several
+clips are selected. The TS mirrors print numbers as the backend does: `format-fixed.ts`'s
+`toFixedEven` rounds an exact binary tie to the even digit like Rust's `{:.N}` (JS's
+`toFixed` takes the larger: 4.25 → `4.3` vs `4.2`), used by `formatTime` and the
+refusals' `0.12s`.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -2347,7 +2377,7 @@ checks, same messages), and `src/lib/edit-modes.ts` for the edit modes
 (`rollEdit` / `slipClip` / `slideClip` / `splitRemove` plus their `*Range`
 functions — the clamp a drag holds the pointer to — replaying the Rust tests, messages
 included; `api.ts` runs them in the harness, `editor.roll` / `slip` / `slide` /
-`splitRemove` are the thin actions over them). `api.ts` keeps the project's ripple flag in the harness state
+`splitRemove` / `splitRemoveClips` are the thin actions over them). `api.ts` keeps the project's ripple flag in the harness state
 (`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
 that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
 voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,

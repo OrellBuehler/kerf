@@ -5,17 +5,19 @@
 // differently. Keeping the arithmetic here (and tested) is what stops the card
 // from disagreeing with the numbers the agent reports.
 
+import { toFixedEven } from './format-fixed';
 import type { DiffEntry, DiffKind, TimelineDiff } from './types';
 
-/** `m:ss.d`, the way an editor reads a timeline position. */
+/** `m:ss.d`, the way an editor reads a timeline position. The tenth rounds as Rust's
+ *  `{:04.1}` does — an exact tie (4.25) to the even digit (`0:04.2`), not up. */
 export function formatTime(secs: number): string {
 	const s = Math.max(0, secs);
 	const m = Math.floor(s / 60);
-	return `${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`;
+	return `${m}:${toFixedEven(s - m * 60, 1).padStart(4, '0')}`;
 }
 
 function delta(secs: number): string {
-	return `${secs >= 0 ? '+' : ''}${secs.toFixed(1)}s`;
+	return `${secs >= 0 ? '+' : ''}${toFixedEven(secs, 1)}s`;
 }
 
 const ADDED: DiffKind[] = ['track_added', 'clip_added', 'overlay_added', 'marker_added'];
