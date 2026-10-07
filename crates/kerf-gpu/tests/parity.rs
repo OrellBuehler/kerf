@@ -123,6 +123,13 @@
 //!   FFmpegs for busy chroma, so none is claimed
 //!   (`resizing_a_picture_ffmpeg_scales_in_another_format_is_refused`). A picture left
 //!   at its size is drawn for every format.
+//! * **A moving zoom with a rotation, a grade or a fade of opacity in front of it** is
+//!   refused (`refused/moving-zoom-behind-*`): FFmpeg, the still and the export alike, runs a
+//!   moving zoom as the *last* stage of the clip's chain, so those act on the picture at its
+//!   fit size and are magnified with it, an order the compositor does not have. The same
+//!   keys with nothing in front of the zoom are drawn (`time/keyframes`, a zoom and a
+//!   position moving), as are a rotation and an opacity moving over a zoom that holds
+//!   (`time/keyframes+rotation+opacity`).
 //! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
 //!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
 //!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
@@ -1503,29 +1510,35 @@ fn source_time_speed_reverse_and_keyframes() {
     let tl = timeline(vec![vec![rev]], None);
     check("time/reversed", &tl, std::slice::from_ref(&m.testsrc), &[0.3, 1.1], STRICT);
 
-    // Keyframed transform: sampled at the same clip time by both renderers.
+    // Keyframed transform: sampled at the same clip time by both renderers. The zoom moves and
+    // so does the position, with nothing in front of the zoom (a moving zoom is the *last*
+    // stage of FFmpeg's chain, so a grade, a rotation or a fade of opacity is applied to the
+    // picture at its fit size and magnified; the plan refuses that, see below).
+    let key = |time: f64, scale: f64, pos: (f64, f64), rotation: f64, opacity: f64| Keyframe {
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation,
+        opacity,
+    };
     let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
-    kf.keyframes = vec![
-        Keyframe {
-            time: 0.0,
-            scale: 1.0,
-            pos_x: 0.0,
-            pos_y: 0.0,
-            rotation: 0.0,
-            opacity: 1.0,
-        },
-        Keyframe {
-            time: 1.5,
-            scale: 0.5,
-            pos_x: 0.2,
-            pos_y: -0.1,
-            rotation: 10.0,
-            opacity: 0.6,
-        },
-    ];
+    kf.keyframes = vec![key(0.0, 1.0, (0.0, 0.0), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 0.0, 1.0)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
     check(
         "time/keyframes",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[0.5, 1.25, 2.0],
+        STRICT,
+    );
+    // The rotation and the opacity keyed too, over a zoom that holds still: both are sampled at
+    // the clip's time and the order is the one the GPU has.
+    let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
+    kf.keyframes = vec![key(0.0, 0.5, (0.0, 0.0), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 10.0, 0.6)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
+    check(
+        "time/keyframes+rotation+opacity",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         &[0.5, 1.25, 2.0],
@@ -1799,6 +1812,39 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         &[m.gradient.clone(), m.testsrc.clone()],
         0.5,
         Refusal::Plan("odd size"),
+    );
+    // A moving zoom with a rotation, a grade or a fade of opacity in front of it: FFmpeg (the
+    // still and the export alike) runs the zoom last, so those act on the picture at its fit
+    // size and are magnified with it, an order the compositor does not have. The same keys
+    // at an instant where all of them are neutral are drawn (`time/keyframes`).
+    let key = |time: f64, scale: f64, rotation: f64, opacity: f64| Keyframe {
+        time,
+        scale,
+        pos_x: 0.0,
+        pos_y: 0.0,
+        rotation,
+        opacity,
+    };
+    let mut zoom = clip(&m.testsrc, 0.0, 2.0, 0.5);
+    zoom.keyframes = vec![key(0.0, 1.0, 0.0, 1.0), key(1.5, 0.5, 10.0, 0.6)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![zoom]], None);
+    check_refused(
+        "refused/moving-zoom-behind-rotation",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        1.25,
+        Refusal::Plan("moving zoom"),
+    );
+    let mut graded = clip(&m.testsrc, 0.0, 2.0, 0.5);
+    graded.keyframes = vec![key(0.0, 1.0, 0.0, 1.0), key(1.5, 0.5, 0.0, 1.0)];
+    graded.color.contrast = 1.3;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![graded]], None);
+    check_refused(
+        "refused/moving-zoom-behind-a-grade",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        1.25,
+        Refusal::Plan("moving zoom"),
     );
 }
 
@@ -3079,9 +3125,12 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
 // still/pip-over-video                             1   640x360 |    46.4 dB        5 |    45.6 dB       17 |  9.4% 48.0 / 5
 // still/png-under-video-pip                        1   640x360 |    47.6 dB        5 |    47.6 dB        5 | 13.5%    =
-// time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%    =
-// time/keyframes                                1.25   640x360 |    48.2 dB        5 |    34.3 dB      217 | 25.9%    =
-// time/keyframes                                   2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
+// time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// time/keyframes                                1.25   640x360 |    50.3 dB        4 |    49.9 dB        5 | 18.4%    =
+// time/keyframes                                   2   640x360 |    56.2 dB        4 |    54.3 dB        5 |  9.5%    =
+// time/keyframes+rotation+opacity                0.5   640x360 |    50.6 dB        4 |    50.1 dB        5 | 16.3%    =
+// time/keyframes+rotation+opacity               1.25   640x360 |    48.8 dB        5 |    35.4 dB      206 | 19.6%    =
+// time/keyframes+rotation+opacity                  2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
 // time/reversed                                  0.3   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =
 // time/reversed                                  1.1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.1%    =
 // time/speed-2x-offset                             1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =

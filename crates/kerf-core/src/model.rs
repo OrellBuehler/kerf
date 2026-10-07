@@ -446,6 +446,17 @@ impl Asset {
         self.streams.iter().find_map(|s| s.hdr())
     }
 
+    /// Whether this asset's picture carries an alpha channel, by the probed pixel format of
+    /// its first video stream. `false` for a format that was never recorded (assets saved
+    /// before the field existed): nothing is assumed transparent that was never seen to be.
+    pub fn has_alpha(&self) -> bool {
+        self.streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(|s| s.pix_fmt.as_deref())
+            .is_some_and(pix_fmt_has_alpha)
+    }
+
     /// This asset as seen through its generated preview proxy: same metadata
     /// (so the composite geometry matches the export) but SDR, because the
     /// proxy was tone-mapped when it was encoded and must not be converted a
@@ -2167,6 +2178,24 @@ impl Clip {
     /// True when the clip carries transform keyframes (i.e. is animated).
     pub fn is_animated(&self) -> bool {
         !self.keyframes.is_empty()
+    }
+
+    /// True when the keyframes move the clip's *scale*, i.e. the picture the
+    /// export hands to `overlay` changes size from one frame to the next.
+    ///
+    /// That is a different thing from [`Clip::is_animated`]: a clip keyed only on
+    /// position, rotation or opacity keeps a constant picture size, which every
+    /// filter in its chain can be built around. A zoom that actually moves cannot
+    /// be: most filters read the frame size once, when the graph is configured, so
+    /// the export restructures the chain around it (`video_clip_chain` puts the
+    /// size-changing `scale` last). The test is on the keyed values, not on the
+    /// expression the engine writes.
+    pub fn zoom_animated(&self) -> bool {
+        // Against the first key *in time*, which is the one the engine's expression holds
+        // before the clip's first moment (the stored order is not guaranteed to be sorted).
+        let keys = self.sorted_keyframes();
+        keys.first()
+            .is_some_and(|first| keys.iter().any(|k| (k.scale - first.scale).abs() > 1e-9))
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -5279,6 +5308,43 @@ mod tests {
             clips,
             ..Track::new(kind, name)
         }
+    }
+
+    #[test]
+    fn a_zoom_is_animated_only_when_the_keyed_scale_moves() {
+        let key = |time: f64, scale: f64, pos_x: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let mut clip = clip_at(0.0, 4.0);
+        // Nothing keyed, and one key (a held pose): the picture never changes size.
+        assert!(!clip.zoom_animated());
+        clip.keyframes = vec![key(0.0, 1.5, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Position moves, scale does not: animated, but not a zoom.
+        clip.keyframes = vec![key(0.0, 0.5, -0.2), key(2.0, 0.5, 0.2)];
+        assert!(clip.is_animated() && !clip.zoom_animated());
+        // Float noise is not a zoom (it cannot change the size by a pixel).
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1e-12, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Any key off the first one is, wherever it sits and whatever the order.
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(1.0, 0.5, 0.0), key(2.0, 0.75, 0.0)];
+        assert!(clip.zoom_animated());
+        clip.keyframes = vec![key(2.0, 0.75, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(clip.zoom_animated());
+        // Held against the first key in *time*: a stored order that puts a later key first
+        // gives the same answer, at the edge of the tolerance too.
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1.6e-9, 0.0)];
+        assert!(
+            clip.zoom_animated(),
+            "1.6e-9 from the first key in time, though 0.8e-9 from the stored first"
+        );
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(!clip.zoom_animated());
     }
 
     #[test]

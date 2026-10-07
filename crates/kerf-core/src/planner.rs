@@ -28,8 +28,8 @@
 //! 4. a keyframed clip is never padded and always runs `scale eval=frame`
 //!    ([`Placement`](crate::layer_geometry::Placement));
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
-//!    zoom is read at the *source* frame's time and not always shown at all
-//!    ([`Animated`]);
+//!    zoom is the **last** stage of the clip's chain, after `fps` and after every effect,
+//!    mask and rotation ([`Animated`]);
 //! 6. a text overlay is on `between(t,start,end)`, end included;
 //! 7. the source frame is the `fps` filter's pick (carried as [`PlanTiming`], decided
 //!    by `Pick` in the next slice — until then a Motion plan holds **candidates** at a
@@ -231,7 +231,7 @@ impl Planner {
                 animated: clip.is_animated().then(|| Animated {
                     rotates: kf.iter().any(|k| k.rotation != 0.0),
                     opacity: kf.iter().any(|k| k.opacity < 1.0),
-                    zooms: kf.iter().any(|k| k.scale != kf[0].scale),
+                    zooms: clip.zoom_animated(),
                 }),
                 effects,
             });
@@ -957,7 +957,8 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
-        // A zoom that moves is another thing the export does its own way (`rendered.rs`).
+        // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
+        // the compositor does not order that way yet.
         let mut zoom = make_clip(assets[0].id, 0.0, 4.0, 0.0);
         zoom.keyframes = vec![keyed(0.0, 1.0, 0.0), keyed(2.0, 0.5, 0.0)];
         let zoomed = single(vec![zoom]);
@@ -968,6 +969,54 @@ mod tests {
             u,
             Unsupported::KeyedZoom(_)
         )));
+        // A still runs a moving zoom last too, so it is drawn when nothing is in front of the
+        // zoom (the order is then the one the compositor has) and refused when a grade, a
+        // rotation or a fade of opacity is: those act on the picture before it is zoomed.
+        let still = |clip: crate::model::Clip, caps: &GpuCaps| {
+            let plan = planner(&single(vec![clip]), &assets, PlanMode::Still, &opts(30.0))
+                .at_frame(15)
+                .unwrap();
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        let zoom = zoomed.tracks[0].clips[0].clone();
+        let behind = |u: &Unsupported| matches!(u, Unsupported::ZoomBehind(_));
+        assert!(!has(&still(zoom.clone(), &GpuCaps::A0), behind));
+        let mut graded = zoom.clone();
+        graded.color.contrast = 1.3;
+        let mut turning = zoom.clone();
+        turning.keyframes = vec![
+            Keyframe {
+                rotation: 10.0,
+                ..keyed(0.0, 1.0, 0.0)
+            },
+            Keyframe {
+                rotation: 10.0,
+                ..keyed(2.0, 0.5, 0.0)
+            },
+        ];
+        let mut fading = zoom.clone();
+        fading.keyframes = vec![
+            Keyframe {
+                opacity: 0.6,
+                ..keyed(0.0, 1.0, 0.0)
+            },
+            Keyframe {
+                opacity: 0.6,
+                ..keyed(2.0, 0.5, 0.0)
+            },
+        ];
+        for clip in [graded, turning, fading] {
+            assert!(has(&still(clip.clone(), &GpuCaps::A0), behind));
+            let ordered = GpuCaps {
+                keyed_zoom: true,
+                ..GpuCaps::A0
+            };
+            assert!(!has(&still(clip, &ordered), behind));
+        }
+        // A rotation or a grade with no zoom to move has nothing to be ordered against.
+        let mut steady = tl.tracks[0].clips[0].clone();
+        steady.color.contrast = 1.3;
+        assert!(!has(&still(steady, &GpuCaps::A0), behind));
         // Keys that never change the scale have no zoom to flag.
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(15).unwrap();
         assert!(!plan.layers[0].animated.unwrap().zooms);

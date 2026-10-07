@@ -92,6 +92,11 @@ pub struct ClipFx {
     /// chain. `None` for SDR — and for a preview asset swapped to its proxy,
     /// which was converted when it was encoded.
     pub hdr: Option<Hdr>,
+    /// The clip's source carries an alpha channel (a transparent PNG, an FFV1 or ProRes
+    /// 4444 clip, a GIF: the probed pixel format says so), which the chain keeps to its
+    /// end instead of flattening the picture onto black. `false` when the format was
+    /// never recorded: an unknown picture is treated as it always was.
+    pub alpha: bool,
     /// The clip's input is a head-padded proxy (see `is_head_padded_proxy`). Read
     /// from the start with no seek, such an input opens with the pad's clone of the
     /// first frame, which the original it stands for has no frame for.
@@ -114,6 +119,7 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
         let asset = assets.iter().find(|a| a.id == clip.asset_id);
         fx[flat].hdr = asset.and_then(|a| a.hdr());
+        fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
     }
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);

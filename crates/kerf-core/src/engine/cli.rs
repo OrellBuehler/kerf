@@ -5004,6 +5004,41 @@ fn mask_keep_expr(mask: &Mask) -> String {
     }
 }
 
+/// A scale below this is one a picture can be truncated to nothing by: `scale` reads a
+/// width or height that evaluates to 0 as "unset" and keeps the *input's* size, so a clip
+/// zoomed to 0.0004 of a frame would snap to full size instead of vanishing. The scale
+/// expressions only say `max(1, ...)` below it, so every ordinary graph is as it was.
+const TINY_SCALE: f64 = 0.01;
+
+/// The `scale` that zooms a clip's picture by `factor`: a plain number for a constant zoom,
+/// else (`keyed`) an expression in `t` that is re-evaluated every frame.
+///
+/// `tiny` (a factor that can reach [`TINY_SCALE`]) keeps both sides at 1 px or more, and
+/// `even` (a tone-map follows: `zscale` refuses an odd size in 4:2:0) rounds them down to
+/// an even number of pixels. Neither is written when it is not needed.
+fn zoom_scale(factor: &str, keyed: bool, tiny: bool, even: bool, sf: &str) -> String {
+    let side = |axis: &str| {
+        let e = if keyed {
+            format!("{axis}*({factor})")
+        } else {
+            format!("{axis}*{factor}")
+        };
+        match (even, tiny) {
+            (true, _) => format!("max(2,2*trunc(({e})/2))"),
+            (false, true) => format!("max(1,{e})"),
+            (false, false) => e,
+        }
+    };
+    let (w, h) = (side("iw"), side("ih"));
+    if keyed {
+        format!("scale=w='{w}':h='{h}':eval=frame{sf}")
+    } else if even || tiny {
+        format!("scale=w='{w}':h='{h}'{sf}")
+    } else {
+        format!("scale={w}:{h}{sf}")
+    }
+}
+
 /// Build a piecewise-linear ffmpeg expression over **clip-local time** for a
 /// channel of keyframes. `points` are `(seconds_from_clip_start, value)` and are
 /// sorted here. `tvar` is the time variable the target filter exposes (`t` for
@@ -5433,6 +5468,21 @@ fn fade_filter(step: &FadeStep) -> String {
 /// effects, keyframe animation, fades and transition alpha. With all properties
 /// at their defaults this reduces to the original fit-and-letterbox chain.
 ///
+/// **A keyframed zoom is the one stage that changes the picture's size from frame
+/// to frame**, and almost nothing downstream of it can follow: `format`
+/// negotiation inserts a fixed-size converter, `eq` / `geq` / `rotate` /
+/// `gblur` read the frame size once when the graph is configured, and a filter
+/// that does is pinned to the *first* frame's size for the whole clip (a zoom
+/// that never showed, an opacity ramp or rotation that stayed at the first
+/// frame's geometry). So when [`Clip::zoom_animated`] the zoom `scale` is the
+/// **last** stage of the chain — everything else runs at the constant fit size —
+/// and it sits after `fps`, so it is evaluated at the *output* frame's time
+/// rather than at the source frame's (a 10 fps clip in a 30 fps export zoomed in
+/// three-frame steps). Only `overlay` follows, and it reads each picture's own
+/// size every frame (`(W-w)/2` centres it as it grows). The chain then ends in
+/// `yuva420p`, the format `overlay` takes natively, so no converter is inserted
+/// between them. Every other clip keeps the chain it always had.
+///
 /// `instance` is the clip's unique flat index, used to name its `v360` so
 /// `sendcmd` can address it; it is unused for clips that do not reframe.
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
@@ -5446,6 +5496,10 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // drives the geometry; rotation / opacity additionally need an alpha plane.
     let anim_rotation = anim && kf.iter().any(|k| k.rotation != 0.0);
     let anim_opacity = anim && kf.iter().any(|k| k.opacity < 1.0);
+    // A zoom that really moves: the picture changes size per frame, so its `scale`
+    // goes last (see above). A keyed clip whose scale holds still keeps the chain
+    // it always had — its picture never changes size, so nothing can be pinned.
+    let zoom_keyed = clip.zoom_animated();
     let chroma = clip.effects.iter().any(|e| e.produces_alpha());
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
@@ -5525,6 +5579,10 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         p.extend(crop);
     }
     let sf = fmt.scale_flags();
+    // `zscale` (the tone-map, which follows the geometry) refuses a picture whose size is
+    // not a multiple of its chroma subsampling, and a Contain fit of 4:3 footage into a
+    // 9:16 frame is 405 rows high. Every size ahead of it is made even for HDR footage.
+    let tone_mapped = fx.hdr.is_some();
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
@@ -5533,9 +5591,10 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         // the overlay lands on a complete canvas.
         Fit::Contain => {
             p.push(format!(
-                "scale={w}:{h}:force_original_aspect_ratio=decrease{sf}",
+                "scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}",
                 w = fmt.width,
-                h = fmt.height
+                h = fmt.height,
+                even = if tone_mapped { ":force_divisible_by=2" } else { "" }
             ));
             if geom_identity {
                 p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
@@ -5554,6 +5613,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         }
     }
     // A transformed clip's own zoom rides on top of that base fit.
+    let mut late_zoom: Option<String> = None;
     if !geom_identity {
         if anim {
             // Per-frame zoom: re-evaluate the scale expression every frame.
@@ -5562,9 +5622,23 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
                 "t",
                 clip.timeline_start,
             );
-            p.push(format!("scale=w='iw*({expr})':h='ih*({expr})':eval=frame{sf}"));
+            let tiny = kf.iter().any(|k| k.scale < TINY_SCALE);
+            // A moving zoom runs after the tone-map, at the end of the chain: even sizes
+            // only matter ahead of `zscale`.
+            let zoom = zoom_scale(&expr, true, tiny, tone_mapped && !zoom_keyed, &sf);
+            if zoom_keyed {
+                late_zoom = Some(zoom);
+            } else {
+                p.push(zoom);
+            }
         } else if (t.scale - 1.0).abs() > 1e-9 {
-            p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = t.scale));
+            p.push(zoom_scale(
+                &t.scale.to_string(),
+                false,
+                t.scale < TINY_SCALE,
+                tone_mapped,
+                &sf,
+            ));
         }
     }
     p.push("setsar=1".to_string());
@@ -5632,6 +5706,14 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
     // rotate. Animated rotation uses a fixed bounding box (the frame diagonal).
+    //
+    // The animated fill is `black@0`, not `none`: `none` means "do not fill", and
+    // `rotate` then leaves whatever its output buffer last held outside the
+    // picture. A constant angle rewrites the same footprint every frame, so the
+    // corners stay as the zeroed buffer was allocated (transparent) and nobody
+    // sees it; an angle that moves leaves each earlier frame's footprint behind
+    // in every buffer it reuses, and the picture grows into the union of every
+    // pose it has had (the "erratic" rotation, on 6.1 and 9.0 alike).
     if anim_rotation {
         let expr = keyframe_expr(
             &kf.iter().map(|k| (k.time, k.rotation)).collect::<Vec<_>>(),
@@ -5639,7 +5721,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             clip.timeline_start,
         );
         p.push(format!(
-            "rotate=a='({expr})*PI/180':fillcolor=none:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
+            "rotate=a='({expr})*PI/180':fillcolor=black@0:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
         ));
     } else if !anim && t.rotation != 0.0 {
         let rad = t.rotation.to_radians();
@@ -5655,7 +5737,21 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     for step in timing.fades() {
         p.push(fade_filter(&step));
     }
-    if !needs_alpha {
+    if let Some(zoom) = late_zoom {
+        // The one size-changing stage, after `fps` (output-frame time) and after
+        // every filter that has to see a constant size. `overlay` takes only
+        // `yuva420p` for its picture, so say so here: a different terminal format
+        // would get a fixed-size converter inserted between this and the overlay,
+        // pinning the size right back.
+        p.push(zoom);
+        p.push("format=yuva420p".to_string());
+    } else if fx.alpha && !needs_alpha {
+        // A source with an alpha channel keeps it to the overlay: the terminal pixel
+        // format below has none, and `overlay` takes a `yuva420p` picture natively, so
+        // flattening here put a transparent sticker's cut-out on black while the still,
+        // which has no terminal format, kept it.
+        p.push("format=yuva420p".to_string());
+    } else if !needs_alpha {
         // Terminal pixel format — kept equal to argv `-pix_fmt` so a 10-bit /
         // 4:2:2 selection isn't silently bottlenecked back through 8-bit.
         p.push(format!("format={}", fmt.pix_fmt));
@@ -5984,7 +6080,15 @@ fn build_still_args(
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
-            chain = still_clip_chain(&tf, &clip.color, &clip.effects, rf.as_ref(), &canvas, clip.mask.as_ref())
+            chain = still_clip_chain(
+                &tf,
+                &clip.color,
+                &clip.effects,
+                rf.as_ref(),
+                &canvas,
+                clip.mask.as_ref(),
+                clip.zoom_animated()
+            )
         ));
         let out = format!("ov{n}");
         chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
@@ -6032,6 +6136,12 @@ struct StillCanvas {
 /// The still pipeline has no timeline clock to run `sendcmd` against, so an
 /// animated reframe resolves to a constant here — which is exactly what the
 /// export chain's commands will have set `v360` to at the same timestamp.
+///
+/// `zoom_last` is [`Clip::zoom_animated`]: the export runs a moving zoom as the **last**
+/// stage of the chain (see [`video_clip_chain`]), so its blur, mask, rotation and grade
+/// act on the picture at its fit size and are magnified with it. The still follows, or
+/// the frame you scrub to would be sharper than the file at a zoom-in and softer at a
+/// zoom-out. Every other clip zooms first, as it always did.
 fn still_clip_chain(
     tf: &Transform,
     color: &Color,
@@ -6039,6 +6149,7 @@ fn still_clip_chain(
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
     mask: Option<&Mask>,
+    zoom_last: bool,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -6071,6 +6182,7 @@ fn still_clip_chain(
             p.push(format!("crop={ow}:{oh}"));
         }
     }
+    let mut late_zoom: Option<String> = None;
     if tf.is_identity() {
         // Cover already fills the frame; padding it would be a no-op that still
         // costs a filter, so only the letterboxed path needs it.
@@ -6078,7 +6190,12 @@ fn still_clip_chain(
             p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 {
-        p.push(format!("scale=iw*{sc}:ih*{sc}{sf}", sc = tf.scale));
+        let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
+        if zoom_last {
+            late_zoom = Some(zoom);
+        } else {
+            p.push(zoom);
+        }
     }
     p.push("setsar=1".to_string());
     if !color.is_identity() {
@@ -6107,6 +6224,7 @@ fn still_clip_chain(
         let rad = tf.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
+    p.extend(late_zoom);
     p.join(",")
 }
 
@@ -6209,6 +6327,11 @@ mod rendered;
 /// The export plan against the *evaluated* export graph, on a grid of frames.
 #[cfg(test)]
 mod sweep;
+
+/// A keyframed zoom with every other feature of a clip, measured per output frame
+/// against `transform_at` and the scrubbed still (`#[ignore]`d).
+#[cfg(test)]
+mod keyed_zoom;
 
 #[cfg(test)]
 mod tests {
@@ -7266,6 +7389,472 @@ mod tests {
         assert!(
             g.filter.contains("overlay=x='(W-w)/2+(if(lt((t-2)"),
             "animated overlay x: {}",
+            g.filter
+        );
+    }
+
+    /// A key at clip-local `time` carrying the given channels.
+    fn key(time: f64, scale: f64, pos_x: f64, rotation: f64, opacity: f64) -> crate::model::Keyframe {
+        crate::model::Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation,
+            opacity,
+        }
+    }
+
+    /// Everything after the zoom's `scale ... eval=frame` in a chain: the scaler
+    /// flags are part of the `scale` itself, so what is left starts at the next filter.
+    fn after_zoom(chain: &str) -> &str {
+        let at = chain.find("eval=frame").expect("a keyed zoom has an eval=frame scale");
+        chain[at..].split_once(',').map_or("", |(_, rest)| rest)
+    }
+
+    /// The structural half of the keyed-zoom fix, over every feature a clip's chain can
+    /// carry: the zoom is the **last** thing in the chain, after `fps`, and ends in the
+    /// format `overlay` takes, because every filter after a size-changing `scale` is
+    /// pinned to the first frame's size (the picture stops growing, the opacity ramp or
+    /// the rotation runs at the first frame's geometry). The rendered tests
+    /// (`cli/keyed_zoom.rs`) are what show ffmpeg agrees; this is what keeps a later
+    /// edit of the chain from putting a filter back behind the zoom.
+    #[test]
+    fn a_keyed_zoom_is_the_last_stage_of_its_chain() {
+        use crate::model::{Mask, MaskShape, VideoEffect};
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let base = || {
+            let mut clip = make_clip(asset.id, 0.0, 8.0, 2.0);
+            clip.keyframes = vec![key(0.0, 0.4, 0.0, 0.0, 1.0), key(3.0, 1.6, 0.0, 0.0, 1.0)];
+            clip
+        };
+        let mask = Mask {
+            shape: MaskShape::Ellipse,
+            ..Mask::default()
+        };
+        let cases: Vec<(&str, Clip, ExportFormat, ClipFx, bool)> = {
+            let plain = ExportFormat::default();
+            let mut out = vec![("scale only", base(), plain.clone(), ClipFx::default(), false)];
+            let mut c = base();
+            c.keyframes = vec![key(0.0, 0.4, -0.2, 0.0, 1.0), key(3.0, 1.6, 0.2, 0.0, 1.0)];
+            out.push(("scale + position", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.keyframes = vec![key(0.0, 0.4, 0.0, 0.0, 1.0), key(3.0, 1.6, 0.0, 0.0, 0.5)];
+            out.push(("scale + opacity", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.keyframes = vec![key(0.0, 0.4, 0.0, 0.0, 1.0), key(3.0, 1.6, 0.0, 40.0, 1.0)];
+            out.push(("scale + rotation", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.keyframes = vec![key(0.0, 0.4, -0.2, 0.0, 1.0), key(3.0, 1.6, 0.2, 40.0, 0.5)];
+            out.push(("everything keyed", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.transform.crop_left = 0.1;
+            c.transform.crop_top = 0.2;
+            out.push(("crop", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.mask = Some(mask);
+            out.push(("mask", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.mask = Some(mask);
+            c.keyframes = vec![key(0.0, 0.4, 0.0, 0.0, 1.0), key(3.0, 1.6, 0.0, 0.0, 0.5)];
+            out.push(("mask + opacity", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.effects = vec![
+                VideoEffect::Blur { sigma: 3.0 },
+                VideoEffect::Vignette,
+                VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.3,
+                    blend: 0.1,
+                },
+            ];
+            out.push(("effects + chroma key", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.color.brightness = 0.1;
+            c.color.temperature = 0.3;
+            out.push(("colour", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.speed = 2.0;
+            out.push(("speed", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.speed = -0.5;
+            out.push(("reverse", c, plain.clone(), ClipFx::default(), false));
+            let mut c = base();
+            c.fade_in = 0.5;
+            c.fade_out = 0.5;
+            out.push(("fades", c, plain.clone(), ClipFx::default(), false));
+            let fx = ClipFx {
+                xfade_in: 0.5,
+                tail: 0.5,
+                black_out: 0.3,
+                ..ClipFx::default()
+            };
+            out.push(("dissolve + dip", base(), plain.clone(), fx, false));
+            let hdr = ClipFx {
+                hdr: Some(crate::model::Hdr::Hlg),
+                ..ClipFx::default()
+            };
+            out.push(("hdr", base(), plain.clone(), hdr, false));
+            let cover = ExportFormat {
+                fit: Fit::Cover,
+                scaler: Some("lanczos".into()),
+                ..ExportFormat::default()
+            };
+            out.push(("cover + scaler flag", base(), cover, ClipFx::default(), false));
+            out.push(("still image", base(), plain.clone(), ClipFx::default(), true));
+            let mut c = base();
+            c.reframe = Some(crate::model::Reframe::new(crate::model::Projection::Equirect));
+            out.push(("360 reframe", c, plain, ClipFx::default(), false));
+            out
+        };
+        for (name, clip, fmt, fx, image) in cases {
+            assert!(clip.zoom_animated(), "{name}: the case has to zoom");
+            let chain = video_clip_chain(&clip, &fmt, &fx, image, "c0");
+            assert_eq!(chain.matches("eval=frame").count(), 1, "{name}: one zoom: {chain}");
+            // Nothing follows the zoom but the format `overlay` takes natively.
+            assert_eq!(after_zoom(&chain), "format=yuva420p", "{name}: {chain}");
+            // Every filter that reads the frame's size or its time is ahead of it, at
+            // the constant size, and `fps` is ahead of all of them so they and the zoom
+            // run on *output* frames.
+            let zoom = chain.find("eval=frame").unwrap();
+            let fps = chain.find("fps=").unwrap_or_else(|| panic!("{name}: no fps: {chain}"));
+            assert!(fps < zoom, "{name}: the zoom is evaluated after fps: {chain}");
+            for needle in [
+                "geq=",
+                "rotate=",
+                "eq=",
+                "gblur=",
+                "vignette",
+                "chromakey=",
+                "fade=",
+                "zscale",
+                "colorspace=",
+            ] {
+                if let Some(at) = chain.find(needle) {
+                    assert!(at < zoom, "{name}: `{needle}` runs behind the zoom: {chain}");
+                    // ...and after the output rate is set (the 360 path hoists `fps`
+                    // above `v360`, which is earlier still).
+                    assert!(fps < at, "{name}: `{needle}` before fps: {chain}");
+                }
+            }
+            // The old terminal pixel format is what pinned the size.
+            assert!(!chain.ends_with("format=yuv420p"), "{name}: {chain}");
+        }
+    }
+
+    /// `rotate`'s `fillcolor=none` means "do not fill": the corners keep whatever the
+    /// buffer last held, which a rotation that moves turns into every earlier pose. A
+    /// keyed rotation fills with transparent black; a constant one, whose footprint
+    /// never changes, keeps the chain it always had.
+    #[test]
+    fn a_keyed_rotation_fills_transparent_and_a_constant_one_keeps_its_chain() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let fmt = ExportFormat::default();
+        let mut keyed = make_clip(asset.id, 0.0, 8.0, 2.0);
+        keyed.keyframes = vec![key(0.0, 1.0, 0.0, 0.0, 1.0), key(3.0, 1.0, 0.0, 40.0, 1.0)];
+        assert!(!keyed.zoom_animated(), "the rotation alone moves");
+        let chain = video_clip_chain(&keyed, &fmt, &ClipFx::default(), false, "c0");
+        assert!(chain.contains(":fillcolor=black@0:ow='hypot(iw,ih)'"), "{chain}");
+        assert!(!chain.contains("fillcolor=none"), "{chain}");
+        let mut zoomed = keyed;
+        zoomed.keyframes = vec![key(0.0, 0.5, 0.0, 0.0, 1.0), key(3.0, 1.5, 0.0, 40.0, 1.0)];
+        let chain = video_clip_chain(&zoomed, &fmt, &ClipFx::default(), false, "c0");
+        assert!(chain.contains(":fillcolor=black@0:ow='hypot(iw,ih)'"), "{chain}");
+        // A constant rotation is untouched.
+        let mut fixed = make_clip(asset.id, 0.0, 8.0, 2.0);
+        fixed.transform.rotation = 30.0;
+        let chain = video_clip_chain(&fixed, &fmt, &ClipFx::default(), false, "c0");
+        assert!(chain.contains(":fillcolor=none:ow=rotw("), "{chain}");
+    }
+
+    /// A keyed clip whose scale holds still never changes the picture's size, so it
+    /// keeps the chain it always had — and so does every unkeyed clip.
+    #[test]
+    fn a_keyed_clip_whose_scale_holds_keeps_the_chain_it_always_had() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let mut clip = make_clip(asset.id, 0.0, 8.0, 2.0);
+        clip.keyframes = vec![key(0.0, 0.5, -0.2, 0.0, 1.0), key(3.0, 0.5, 0.2, 0.0, 1.0)];
+        assert!(clip.is_animated() && !clip.zoom_animated());
+        let chain = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false, "c0");
+        // The (constant-valued) per-frame scale stays where it was: before `setsar`
+        // and `fps`, with the clip's own pixel format at the end.
+        let zoom = chain.find("eval=frame").unwrap();
+        assert!(
+            zoom < chain.find("setsar=1").unwrap() && zoom < chain.find("fps=").unwrap(),
+            "{chain}"
+        );
+        assert!(chain.ends_with(",format=yuv420p"), "{chain}");
+        assert!(!chain.contains("format=yuva420p"), "{chain}");
+        // An unkeyed zoom is a plain `scale=iw*..` and gains nothing.
+        let mut plain = make_clip(asset.id, 0.0, 8.0, 2.0);
+        plain.transform.scale = 0.5;
+        let chain = video_clip_chain(&plain, &ExportFormat::default(), &ClipFx::default(), false, "c0");
+        assert!(!chain.contains("eval=frame") && chain.ends_with(",format=yuv420p"), "{chain}");
+    }
+
+    fn still_canvas(fit: Fit) -> StillCanvas {
+        StillCanvas {
+            w: 640,
+            h: 360,
+            fit,
+            sf: String::new(),
+        }
+    }
+
+    /// The still follows the export for a moving zoom: its zoom is the last stage, behind the
+    /// grade, the effects, the mask, the opacity and the rotation, which then act on the
+    /// picture at its fit size. Every other clip's still zooms first, as it always did.
+    #[test]
+    fn the_still_of_a_moving_zoom_runs_the_zoom_last_and_every_other_still_zooms_first() {
+        use crate::model::{Mask, VideoEffect};
+        let tf = Transform {
+            scale: 1.4,
+            pos_x: 0.1,
+            rotation: 20.0,
+            opacity: 0.7,
+            ..Transform::default()
+        };
+        let color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        };
+        let effects = [VideoEffect::Blur { sigma: 3.0 }];
+        let mask = Mask::default();
+        let canvas = still_canvas(Fit::Contain);
+        let last = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), true);
+        let first = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), false);
+        let zoom = "scale=iw*1.4:ih*1.4";
+        // Last: after the rotation, with nothing behind it, and only once.
+        assert!(last.ends_with(zoom), "{last}");
+        assert_eq!(last.matches(zoom).count(), 1, "{last}");
+        for before in ["eq=", "gblur=", "geq=", "colorchannelmixer=", "rotate="] {
+            assert!(last.find(before).unwrap() < last.find(zoom).unwrap(), "{before}: {last}");
+        }
+        // First: ahead of `setsar` and all of them, and the chain otherwise the same.
+        assert!(first.find(zoom).unwrap() < first.find("setsar=1").unwrap(), "{first}");
+        assert!(!first.ends_with(zoom), "{first}");
+        let strip = |c: &str| c.replace(&format!(",{zoom}"), "");
+        assert_eq!(strip(&last), strip(&first), "only the zoom's place differs");
+        // A moving zoom that has no zoom at the sampled instant has none to move.
+        let at_rest = Transform { scale: 1.0, ..tf };
+        assert_eq!(
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true),
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false)
+        );
+    }
+
+    /// Through the whole still graph: the moving-zoom clip's chain ends in the zoom, the same
+    /// keys at a constant scale zoom first.
+    #[test]
+    fn a_still_of_a_moving_zoom_clip_ends_its_chain_in_the_zoom() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let blurred = |first: f64, last: f64| {
+            let mut c = make_clip(asset.id, 0.0, 4.0, -0.5); // the still at 1 s is 1.5 s in
+            c.keyframes = vec![key(0.0, first, 0.0, 30.0, 1.0), key(2.0, last, 0.0, 30.0, 1.0)];
+            c.effects = vec![crate::model::VideoEffect::Blur { sigma: 4.0 }];
+            c
+        };
+        let chain_of = |clip: Clip| {
+            let tl = single(vec![clip]);
+            let args = build_timeline_frame_args(&tl, &assets, &ExportOptions::default(), 1.0, 640, 4).unwrap();
+            let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+            graph.split(';').find(|c| c.ends_with("[v0]")).unwrap().to_string()
+        };
+        // 0.5 to 1.5 over two seconds is 1.25 at 1.5 s.
+        let moving = chain_of(blurred(0.5, 1.5));
+        assert!(moving.ends_with(",scale=iw*1.25:ih*1.25[v0]"), "{moving}");
+        assert!(
+            moving.find("gblur=").unwrap() < moving.find("scale=iw*1.25").unwrap(),
+            "{moving}"
+        );
+        // Held at 1.25 the whole way: zoom first, as ever.
+        let held = chain_of(blurred(1.25, 1.25));
+        assert!(
+            !held.ends_with("[v0]") || !held.contains(",scale=iw*1.25:ih*1.25[v0]"),
+            "{held}"
+        );
+        assert!(held.find("scale=iw*1.25").unwrap() < held.find("gblur=").unwrap(), "{held}");
+    }
+
+    /// `scale` reads a size that evaluates to 0 as "keep the input's", so a picture zoomed
+    /// to a fraction of a pixel snapped to full size. Below `TINY_SCALE` the sizes are held
+    /// at 1 px, in the export, the playback and the still, for a constant zoom and a keyed
+    /// one; above it, no graph has changed by a character.
+    #[test]
+    fn a_tiny_scale_keeps_a_pixel_instead_of_snapping_to_full_size() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let fmt = ExportFormat::default();
+        let chain = |clip: &Clip| video_clip_chain(clip, &fmt, &ClipFx::default(), false, "c0");
+        // A constant scale.
+        let mut tiny = make_clip(asset.id, 0.0, 4.0, 0.0);
+        tiny.transform.scale = 0.0004;
+        let c = chain(&tiny);
+        assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
+        let mut small = tiny.clone();
+        small.transform.scale = 0.5;
+        assert!(chain(&small).contains(",scale=iw*0.5:ih*0.5,"), "{}", chain(&small));
+        // A keyed one, moving or not, clamps when any key is tiny.
+        for last in [1.0, 0.0004] {
+            let mut keyed = make_clip(asset.id, 0.0, 4.0, 0.0);
+            keyed.keyframes = vec![key(0.0, 0.0004, 0.0, 0.0, 1.0), key(2.0, last, 0.0, 0.0, 1.0)];
+            let c = chain(&keyed);
+            assert!(c.contains("scale=w='max(1,iw*(") && c.contains("eval=frame"), "{c}");
+            assert!(c.contains("':h='max(1,ih*("), "{c}");
+        }
+        let mut keyed = make_clip(asset.id, 0.0, 4.0, 0.0);
+        keyed.keyframes = vec![key(0.0, 0.3, 0.0, 0.0, 1.0), key(2.0, 1.6, 0.0, 0.0, 1.0)];
+        assert!(!chain(&keyed).contains("max(1,"), "{}", chain(&keyed));
+        // The still.
+        let canvas = still_canvas(Fit::Contain);
+        let tf = Transform {
+            scale: 0.0004,
+            ..Transform::default()
+        };
+        let c = still_clip_chain(&tf, &Color::default(), &[], None, &canvas, None, false);
+        assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
+        let c = still_clip_chain(
+            &Transform { scale: 0.5, ..tf },
+            &Color::default(),
+            &[],
+            None,
+            &canvas,
+            None,
+            false,
+        );
+        assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
+    }
+
+    /// `zscale` refuses an odd size in 4:2:0, so for HDR footage (tone-mapped after the
+    /// geometry) the fit and a constant zoom come out even; a moving zoom runs after the
+    /// tone-map and needs nothing; and SDR footage is byte-for-byte what it was.
+    #[test]
+    fn the_sizes_ahead_of_a_tone_map_are_even() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let hlg = ClipFx {
+            hdr: Some(crate::model::Hdr::Hlg),
+            ..ClipFx::default()
+        };
+        let fmt = ExportFormat::default();
+        let mut clip = make_clip(asset.id, 0.0, 4.0, 0.0);
+        clip.transform.scale = 0.45;
+        let sdr = video_clip_chain(&clip, &fmt, &ClipFx::default(), false, "c0");
+        let hdr = video_clip_chain(&clip, &fmt, &hlg, false, "c0");
+        assert!(!sdr.contains("force_divisible_by") && !sdr.contains("trunc("), "{sdr}");
+        assert!(
+            hdr.contains(":force_original_aspect_ratio=decrease:force_divisible_by=2"),
+            "the fit: {hdr}"
+        );
+        assert!(
+            hdr.contains("scale=w='max(2,2*trunc((iw*0.45)/2))':h='max(2,2*trunc((ih*0.45)/2))'"),
+            "the zoom: {hdr}"
+        );
+        // Both sit ahead of the tone-map.
+        let tone = hdr.find("zscale").or_else(|| hdr.find("colorspace")).unwrap();
+        assert!(
+            hdr.find("force_divisible_by").unwrap() < tone && hdr.find("trunc(").unwrap() < tone,
+            "{hdr}"
+        );
+        // Cover crops to the (even) frame; its intermediate size never reaches `zscale`.
+        let cover = ExportFormat {
+            fit: Fit::Cover,
+            ..ExportFormat::default()
+        };
+        assert!(!video_clip_chain(&clip, &cover, &hlg, false, "c0").contains("force_divisible_by"));
+        // A moving zoom is the last stage, after the tone-map: its sizes are not made even.
+        clip.keyframes = vec![key(0.0, 0.3, 0.0, 0.0, 1.0), key(2.0, 1.6, 0.0, 0.0, 1.0)];
+        let moving = video_clip_chain(&clip, &fmt, &hlg, false, "c0");
+        assert!(!moving.contains("trunc("), "{moving}");
+        assert!(moving.contains("force_divisible_by=2"), "the fit is still even: {moving}");
+        // The still tone-maps the source before any geometry: nothing to do there.
+        let still = still_clip_chain(
+            &clip.transform,
+            &Color::default(),
+            &[],
+            None,
+            &still_canvas(Fit::Contain),
+            None,
+            false,
+        );
+        assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
+    }
+
+    /// A source with an alpha channel keeps it to the overlay (the terminal `format=` of a
+    /// non-alpha chain flattened a transparent sticker onto black), and an unrecorded or
+    /// opaque pixel format keeps the chain it always had.
+    #[test]
+    fn a_source_with_alpha_ends_its_chain_in_an_alpha_format() {
+        let mut sticker = img_asset(Uuid::new_v4());
+        sticker.streams[0].pix_fmt = Some("rgba".into());
+        let mut clip = make_clip(sticker.id, 0.0, 3.0, 0.0);
+        clip.transform.scale = 0.5;
+        let timeline = single(vec![clip.clone()]);
+        let fx = transition_fx(&timeline, std::slice::from_ref(&sticker));
+        assert!(fx[0].alpha, "the probed format says rgba");
+        let fmt = ExportFormat::default();
+        let chain = video_clip_chain(&clip, &fmt, &fx[0], true, "c0");
+        assert!(chain.ends_with(",format=yuva420p"), "{chain}");
+        assert!(!chain.contains("format=yuv420p"), "{chain}");
+        // Opaque, and never recorded: today's chain.
+        for pix_fmt in [Some("rgb24"), Some("yuv420p"), None] {
+            sticker.streams[0].pix_fmt = pix_fmt.map(String::from);
+            let fx = transition_fx(&timeline, std::slice::from_ref(&sticker));
+            assert!(!fx[0].alpha, "{pix_fmt:?}");
+            let chain = video_clip_chain(&clip, &fmt, &fx[0], true, "c0");
+            assert!(chain.ends_with(",format=yuv420p"), "{pix_fmt:?}: {chain}");
+        }
+        // The names that carry alpha, by `pix_fmt_has_alpha`.
+        for pix_fmt in ["rgba", "bgra", "yuva420p", "yuva444p10le", "gbrap", "pal8", "ya8"] {
+            sticker.streams[0].pix_fmt = Some(pix_fmt.into());
+            assert!(transition_fx(&timeline, std::slice::from_ref(&sticker))[0].alpha, "{pix_fmt}");
+        }
+        // A chain that is already alpha, or a moving zoom, ends in the one `format=yuva420p`.
+        let alpha = ClipFx {
+            alpha: true,
+            ..ClipFx::default()
+        };
+        let mut faded = clip.clone();
+        faded.transform.opacity = 0.5;
+        let chain = video_clip_chain(&faded, &fmt, &alpha, true, "c0");
+        assert!(chain.ends_with("colorchannelmixer=aa=0.5"), "{chain}");
+        let mut moving = clip.clone();
+        moving.keyframes = vec![key(0.0, 0.3, 0.0, 0.0, 1.0), key(2.0, 1.6, 0.0, 0.0, 1.0)];
+        let chain = video_clip_chain(&moving, &fmt, &alpha, true, "c0");
+        assert!(
+            chain.ends_with(",format=yuva420p") && chain.matches("format=yuva420p").count() == 1,
+            "{chain}"
+        );
+    }
+
+    /// The clip's picture reaches `overlay` straight from the zoom's `format`, with no
+    /// label in between that a converter could be spliced into, and the overlay
+    /// centres it by the picture's own `w` / `h` — which change every frame.
+    #[test]
+    fn a_keyed_zoom_feeds_overlay_directly_and_centres_by_the_pictures_own_size() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let mut clip = make_clip(asset.id, 0.0, 4.0, 1.0);
+        clip.keyframes = vec![key(0.0, 0.4, -0.2, 0.0, 1.0), key(2.0, 1.6, 0.2, 0.0, 1.0)];
+        let timeline = single(vec![clip]);
+        let g = build_filter_complex(
+            &timeline,
+            &assets,
+            &ExportFormat::default(),
+            timeline.duration(),
+            &ExportOptions::default(),
+            true,
+            false,
+            &plan_inputs(&timeline, &assets, &transition_fx(&timeline, &assets)),
+        );
+        let zoomed = g
+            .filter
+            .split(';')
+            .find(|c| c.starts_with("[0:v]"))
+            .expect("the clip's chain");
+        assert!(zoomed.ends_with(",format=yuva420p[v0]"), "{zoomed}");
+        assert!(
+            g.filter.contains("[vbase][v0]overlay=x='(W-w)/2+(if(lt((t-1)"),
+            "{}",
             g.filter
         );
     }
@@ -9523,11 +10112,20 @@ mod tests {
             None,
             &canvas(Fit::Contain),
             None,
+            false,
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
 
-        let covered = still_clip_chain(&Transform::default(), &Color::default(), &[], None, &canvas(Fit::Cover), None);
+        let covered = still_clip_chain(
+            &Transform::default(),
+            &Color::default(),
+            &[],
+            None,
+            &canvas(Fit::Cover),
+            None,
+            false,
+        );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
         assert!(!covered.contains("pad="), "and never letterboxes: {covered}");

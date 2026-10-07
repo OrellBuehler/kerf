@@ -28,7 +28,9 @@
 //! files of the builders you changed should move. To find the case behind a failing
 //! block, run the test on the base and on the change with `KERF_GOLDEN_CASES=<file>`
 //! (one digest line per case) and diff the two files; `KERF_GOLDEN_DUMP=<case>` then
-//! prints that case's argv (`KERF_GOLDEN_COVERAGE=1` prints the thinnest families).
+//! prints that case's argv (`KERF_GOLDEN_COVERAGE=1` prints the thinnest families, and
+//! `KERF_GOLDEN_FAMILIES=<file>` writes the families each case hit, one line per case,
+//! which is how to say *which kind* of case a moved digest belongs to).
 //! The files are identical under any `KERF_HWACCEL` and
 //! with `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4`.
 //!
@@ -71,9 +73,18 @@ reverse ,reverse,
 speed setpts=(PTS-STARTPTS)/
 scale-static scale=iw*
 scale-keyed eval=frame
+hdr-even-fit force_divisible_by=2
+tiny-scale max(1,iw*
+still-tiny-scale max(1,iw*
+preview-tiny-scale max(1,iw*
+hdr-even-zoom 2*trunc((iw*
+preview-hdr-even-fit force_divisible_by=2
+preview-hdr-even-zoom 2*trunc((iw*
 crop crop=w=iw*
 rotate-static :fillcolor=none:ow=rotw(
 rotate-keyed rotate=a='(
+rotate-keyed-transparent :fillcolor=black@0:ow='hypot(
+preview-rotate-keyed-transparent :fillcolor=black@0:ow='hypot(
 opacity-static colorchannelmixer=aa=
 opacity-keyed a='(if(lt((T-
 mask-rect max(abs(
@@ -296,6 +307,30 @@ fn pool() -> Vec<Asset> {
             ..original
         });
     }
+    // Footage with an alpha channel (a transparent sticker PNG, an FFV1 and a ProRes-4444-like
+    // clip) and a 4:3 HLG clip whose fit into a delivery is odd-sized more often than not:
+    // the twins of `still`, `wide`, `interview` and `hdr-hlg`, reached only by
+    // [`retarget_alpha`] and [`retarget_hdr43`].
+    let alpha = |name: &str, pix_fmt: &str| {
+        let original = pool.iter().find(|a| a.name == name).unwrap().clone();
+        let streams = original
+            .streams
+            .iter()
+            .cloned()
+            .map(|s| if s.kind == StreamKind::Video { StreamInfo { pix_fmt: Some(pix_fmt.into()), ..s } } else { s })
+            .collect();
+        Asset { id: Uuid::from_u128(200 + original.id.as_u128()), path: format!("/golden/{name}-alpha.mov"), name: format!("{name}-alpha"), streams, ..original }
+    };
+    let twins = [alpha("still", "rgba"), alpha("wide", "yuva420p"), alpha("interview", "yuva444p10le")];
+    pool.extend(twins);
+    let hlg = pool.iter().find(|a| a.name == "hdr-hlg").unwrap().clone();
+    let streams = hlg
+        .streams
+        .iter()
+        .cloned()
+        .map(|s| if s.kind == StreamKind::Video { StreamInfo { width: Some(1440), height: Some(1080), ..s } } else { s })
+        .collect();
+    pool.push(Asset { id: Uuid::from_u128(300), path: "/golden/hdr-hlg-43.mp4".into(), name: "hdr-hlg-43".into(), streams, ..hlg });
     pool
 }
 
@@ -317,6 +352,57 @@ fn retarget(tl: &mut Timeline, i: usize, assets: &[Asset]) {
                 .find(|a| a.name.strip_suffix("-padded") == Some(&original.name))
             {
                 clip.asset_id = twin.id;
+            }
+        }
+    }
+}
+
+/// Every eleventh case, about half of the clips whose footage has an alpha twin are cut
+/// from it instead (no dice of its own: the clip's id decides, so every other case is
+/// what it was) — what puts `ClipFx.alpha` and a transparent source in the oracle.
+fn retarget_alpha(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 11 != 5 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        let Some(original) = assets[..LIBRARY].iter().find(|a| a.id == clip.asset_id) else {
+            continue;
+        };
+        if (clip.id.as_u128() >> 1) % 2 == 0 {
+            if let Some(twin) = assets[LIBRARY..]
+                .iter()
+                .find(|a| a.name.strip_suffix("-alpha") == Some(&original.name))
+            {
+                clip.asset_id = twin.id;
+            }
+        }
+    }
+}
+
+/// Every thirteenth case, a third of the HDR clips are cut from the 4:3 HLG twin.
+fn retarget_hdr43(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 13 != 8 {
+        return;
+    }
+    let twin = assets.iter().find(|a| a.name == "hdr-hlg-43").unwrap().id;
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        if assets[..LIBRARY].iter().any(|a| a.id == clip.asset_id && a.hdr().is_some()) && clip.id.as_u128() % 3 == 0 {
+            clip.asset_id = twin;
+        }
+    }
+}
+
+/// Every seventeenth case, a third of the clips are scaled to a size that is under a
+/// pixel (0.0004 of a frame): the first key of a keyed clip, else its own scale.
+fn retarget_tiny(tl: &mut Timeline, i: usize) {
+    if i % 17 != 4 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        if clip.id.as_u128() % 3 == 0 {
+            match clip.keyframes.first_mut() {
+                Some(key) => key.scale = 0.0004,
+                None => clip.transform.scale = 0.0004,
             }
         }
     }
@@ -545,6 +631,9 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     let mut r = Rng::new(i as u64 + 1);
     let mut timeline = timeline(&mut r, &assets[..LIBRARY]);
     retarget(&mut timeline, i, assets);
+    retarget_alpha(&mut timeline, i, assets);
+    retarget_hdr43(&mut timeline, i, assets);
+    retarget_tiny(&mut timeline, i);
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
         .flat_map(|c| [c.timeline_start, c.timeline_end(), c.timeline_end() - 1e-3, c.timeline_start + 1e-4])
@@ -678,7 +767,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 11] = [
+const STRUCTURAL: [&str; 19] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -690,6 +779,14 @@ const STRUCTURAL: [&str; 11] = [
     "reframe-single-keyframe",
     "reframe-held",
     "time-negative",
+    "zoom-keyed",
+    "zoom-keyed-constant",
+    "still-zoom-last",
+    "alpha-source",
+    "zoom-keyed-last",
+    "preview-zoom-keyed-last",
+    "alpha-kept",
+    "preview-alpha-kept",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -706,9 +803,65 @@ fn expected(table: &[(&str, &str)]) -> Vec<String> {
     f
 }
 
+/// Whether a clip chain of the still graph **ends** in the zoom (`scale=iw*S:ih*S`): only a
+/// moving zoom is run last, every other clip zooms first and ends on `setsar` or later.
+fn still_zoom_last(still: &str) -> bool {
+    still.split(';').any(|segment| {
+        let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
+            return false;
+        };
+        label.starts_with('v')
+            && label.ends_with(']')
+            && head.rsplit(',').next().is_some_and(|last| last.starts_with("scale=iw*"))
+    })
+}
+
+/// Splits `s` at the commas outside single quotes (an expression's own commas are quoted).
+fn filters(s: &str) -> Vec<&str> {
+    let (mut out, mut quoted, mut from) = (Vec::new(), false, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&s[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[from..]);
+    out
+}
+
+/// How the clip chains of an export or preview graph end: `(zoom last, alpha kept)`. A chain
+/// ending `format=yuva420p` is either a moving zoom (the `scale ... eval=frame` right before
+/// it) or a source whose alpha channel the chain keeps; an ordinary one ends in the
+/// delivery's own format, or in whatever the last effect is.
+fn chain_tails(graph: &str) -> (bool, bool) {
+    let (mut zoom, mut alpha) = (false, false);
+    for segment in graph.split(';') {
+        let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
+            continue;
+        };
+        if !(label.starts_with('v') && label.ends_with(']') && label[1..label.len() - 1].chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let f = filters(head);
+        if f.last() == Some(&"format=yuva420p") && f.len() >= 2 {
+            let before = f[f.len() - 2];
+            if before.starts_with("scale=w=") && before.contains(":eval=frame") {
+                zoom = true;
+            } else {
+                alpha = true;
+            }
+        }
+    }
+    (zoom, alpha)
+}
+
 /// The families a case hits: its transition branches, the table entries whose text is
 /// in the argv they are about (see [`FAMILIES`]), and what only the structure shows.
-fn families(c: &Case, text: &[String; 3], table: &[(&str, &str)], transitions: Vec<String>) -> Vec<String> {
+fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str)], transitions: Vec<String>) -> Vec<String> {
     let flat = text.each_ref().map(|t| t.replace(['\0', '\u{1}'], " "));
     let mut f = transitions;
     for (name, needle) in table {
@@ -767,6 +920,27 @@ fn families(c: &Case, text: &[String; 3], table: &[(&str, &str)], transitions: V
             "reframe-single-keyframe",
         ),
         (times.iter().any(|t| *t < 0.0), "time-negative"),
+        // A keyed clip whose scale moves is the one the export restructures; one
+        // whose scale holds still (position / rotation / opacity keys only) keeps
+        // the chain it always had, so both are covered.
+        (clips().any(Clip::zoom_animated), "zoom-keyed"),
+        (clips().any(|k| k.is_animated() && !k.zoom_animated()), "zoom-keyed-constant"),
+        (still_zoom_last(&flat[1]), "still-zoom-last"),
+        (chain_tails(&flat[0]).0, "zoom-keyed-last"),
+        (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
+        (chain_tails(&flat[0]).1, "alpha-kept"),
+        (chain_tails(&flat[2]).1, "preview-alpha-kept"),
+        (
+            clips().any(|k| {
+                assets.iter().any(|a| {
+                    a.id == k.asset_id
+                        && a.streams.iter().any(|s| {
+                            s.kind == StreamKind::Video && s.pix_fmt.as_deref().is_some_and(crate::model::pix_fmt_has_alpha)
+                        })
+                })
+            }),
+            "alpha-source",
+        ),
         (
             tl.overlays.iter().any(|o| times.contains(&o.start) || times.contains(&o.end)),
             "time-at-overlay-edge",
@@ -797,7 +971,7 @@ type Done = ([u64; 3], Vec<String>);
 fn run(i: usize, assets: &[Asset], table: &[(&str, &str)]) -> Done {
     let c = case(i, assets);
     let (text, transitions) = build(&c, assets);
-    let mut hit = families(&c, &text, table, transitions);
+    let mut hit = families(&c, assets, &text, table, transitions);
     hit.sort();
     hit.dedup();
     (text.each_ref().map(|t| fnv1a(t)), hit)
@@ -845,9 +1019,10 @@ fn the_argv_builders_still_produce_the_golden_digests() {
 
     let mut seen: BTreeMap<String, usize> = expected(&table).into_iter().map(|f| (f, 0)).collect();
     let mut digests: [Vec<u64>; 3] = Default::default();
-    let mut per_case = String::new();
+    let (mut per_case, mut per_case_families) = (String::new(), String::new());
     for (i, (h, hit)) in &results {
         per_case += &format!("{i} {:016x} {:016x} {:016x}\n", h[0], h[1], h[2]);
+        per_case_families += &format!("{i} {}\n", hit.join(","));
         h.iter().zip(&mut digests).for_each(|(h, d)| d.push(*h));
         for f in hit {
             *seen
@@ -857,6 +1032,9 @@ fn the_argv_builders_still_produce_the_golden_digests() {
     }
     if let Some(path) = std::env::var_os("KERF_GOLDEN_CASES") {
         std::fs::write(path, per_case).unwrap();
+    }
+    if let Some(path) = std::env::var_os("KERF_GOLDEN_FAMILIES") {
+        std::fs::write(path, per_case_families).unwrap();
     }
 
     // The digests first, so a moved block is reported even when coverage fails too.

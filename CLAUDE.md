@@ -218,13 +218,69 @@ so the feature is **only** activated through these forwards — which is what ma
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **Known limit, measured and not fixed (it
-  would change argv): the animated zoom is not what that text says.** It sits before
-  `fps`, so it is read at the *source* frame's time, and a filter after it that
-  cannot take a mid-stream size change holds the first frame's size for the whole clip
-  — the converter `overlay` gets for a chain with no alpha format (scale-only keys) and
-  `geq` (keyed opacity) do, so the zoom never shows there; `rotate` after it is
-  erratic (`a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it_still`).
+  `keyframe_expr` over clip-local time). **The keyframed zoom is the one stage that changes a
+  picture's size from frame to frame, and almost nothing after it can follow**:
+  `format` negotiation inserts a fixed-size converter (`overlay` takes `yuva420p`
+  only, so a chain ending `format=yuv420p` got one), and `geq` / `rotate` / `eq` /
+  `gblur` / `zscale` read the frame size once, when the graph is configured — a filter
+  after a `scale eval=frame` was pinned to the *first* frame's size for the whole clip, so
+  a scale-only zoom never showed, a keyed opacity ramp and a keyed rotation ran at the
+  first frame's geometry, and the zoom itself sat before `fps` and was read at the
+  *source* frame's time (a 10 fps clip in a 30 fps export zoomed in three-frame steps).
+  So when `Clip::zoom_animated()` (the keyed scale actually moves; position / rotation /
+  opacity-only keys keep their chain, bar the rotation's fill below) `video_clip_chain` puts the zoom **last**: crop,
+  fit, `setsar`, **`fps`**, tone-map, `eq`, effects, `format=yuva420p`, chroma key,
+  mask / opacity `geq`, `rotate`, fades — all at the constant fit size — then the
+  `scale ... eval=frame`, then `format=yuva420p`, then `overlay`, which reads every
+  picture's own `w`/`h` per frame (`(W-w)/2` centres it as it grows) and takes the
+  yuva format natively, so nothing sits between. The zoom is therefore evaluated at the
+  **output** frame's time, on both FFmpegs. Two costs of that order, both bounded: an
+  effect, mask or `rotate` now acts on the picture at fit size and the zoom magnifies the
+  result (a blur grows with the zoom, as in an NLE's effect-then-motion order; a hard mask
+  edge is as soft as the zoom is large), and those filters run on the fit-size picture even
+  when the zoom shrinks it (`geq` is ~150 ms a frame at 1080p, so a keyed-opacity clip zoomed
+  out pays what the fit-size clip would — `KERF_ZOOM_COST=1` times it, `keyed_zoom_cost`).
+  **The scrubbed still follows the same order** (`still_clip_chain(.., zoom_last)`, fed
+  `Clip::zoom_animated()`): it used to zoom first, so its blur was the same softness at every
+  zoom while the export's grew with it (a sigma-6 edge was 26 px wide in the still and 18 in
+  the file at a zoom of 0.5; the two now agree: 18 and 18 there, 56 and 56 at 1.6). Every other clip's still, and every other
+  clip's export, zooms first as ever, so **there is a step where the keys stop being equal**
+  (1.6 to 1.6000001): a blur or a hard mask edge is a zoom's factor softer on one side of it
+  than the other, because "unkeyed or held" and "moving" are two orders and an effect's size is
+  defined by where in the order it sits. It is inherent to leaving every held and unkeyed clip
+  byte-identical; moving the held keyed clips across too would only move the step to the first
+  keyframe. **`rotate=…:fillcolor=none` is not
+  transparent**: `none` means "do not fill", the corners keep whatever the buffer `rotate`
+  reuses held, and a rotation that *moves* leaves every earlier pose behind (the "erratic"
+  rotation; the opaque footprint of a rigidly turning rectangle grew 44k → 64k pixels on
+  6.1 and 9.0 alike), so the keyed rotation fills `black@0`; the static rotation, whose
+  footprint never changes, keeps `none` and its argv. The rendered tests
+  (`engine/cli/keyed_zoom.rs`, `#[ignore]`d, both FFmpegs) measure the picture and the
+  blue box inside it on **every output frame** against `Clip::transform_at` and every
+  eighth against the scrubbed still, for the zoom alone and with position, opacity,
+  rotation, crop, mask, effects, grade, fades, HLG, Cover, a still, speed, reverse, every
+  transition, a range export, every frame rate, a slow source, a shared input and the
+  playback stream (`KERF_ZOOM_KEEP` keeps what they rendered, `KERF_ZOOM_VERBOSE` prints
+  the frames worth a look); `rendered.rs`'s `a_keyframed_zoom_is_read_at_the_output_frame_…`
+  is the mechanism, straight off the filter. The plan (`render_plan`) mirrors the order by
+  refusing: a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`, until
+  `GpuCaps::keyed_zoom`), and a Still plan refuses one with a grade, rotation, fade of opacity,
+  mask or effect in front of it (`Unsupported::ZoomBehind`) — a pure zoom, whose two orders are
+  one chain, is still drawn; `Animated.zooms` is `Clip::zoom_animated()` itself, which holds every
+  key against the first one *in time*. Three more graph bugs of the same shape are fixed beside
+  it. **A tiny scale snapped to full size**: `scale` reads a width or height that evaluates to 0
+  as "unset" and keeps the input's, so 0.0004 of a frame drew at 100%; below `TINY_SCALE` (0.01,
+  on the static zoom, any key of a keyed one, and the still) the sizes are `max(1, ...)`
+  (`zoom_scale`), and above it no graph has changed. **HDR footage aborted on an odd size**:
+  `zscale` (the tone-map, which follows the geometry) refuses a size not divisible by its
+  subsampling, and 4:3 footage Contain-fitted into 9:16 is 405 rows high, so for an HDR clip the
+  Contain fit says `force_divisible_by=2` and a constant zoom is `max(2,2*trunc(x/2))` (a moving
+  zoom runs after the tone-map and needs neither; SDR is byte-identical). **Alpha sources were
+  flattened**: a chain with no alpha plane of its own ended in `format=<pix_fmt>`, which has none,
+  so a transparent PNG sticker or an FFV1 clip cut-out drew as a whole rectangle where the still
+  (no terminal format) kept the cut-out, and a moving zoom (terminal `yuva420p`) flipped it back;
+  `ClipFx.alpha` (`Asset::has_alpha`: the probed pixel format of the first video stream is an
+  alpha one; an unrecorded format is not) ends such a chain in `format=yuva420p`.
   **Any such expression must be quoted in
   the filter value** — it contains commas, and an unquoted comma is where the
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
@@ -921,8 +977,8 @@ no editing logic in the adapter.
   `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the
   layer's `origin`, travel and all, a title's position and `between`, five frame rates)
   — parsing `enable=` back out of the graph would only restate what the builder printed.
-  It checks the *grammar* at the output frame's time, not the graph's clock: the zoom is
-  read at the source frame's time and not always shown (above). **A7 concern**: a Motion
+  It checks the *grammar* at the output frame's time, not the graph's clock (that the zoom is
+  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern**: a Motion
   plan decides the composite's matrix per frame from the layers on it
   (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
   over a cut whose bottom layer changes the matrix the export converts with may not be the
@@ -934,7 +990,8 @@ no editing logic in the adapter.
   `Display` is the message the plan has always given — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
   cases. A Motion plan is refused as a whole until `caps.motion`, and in Motion a moving
-  keyframed zoom (it is read at the source frame's time and not always shown at all) and
+  keyframed zoom (the export draws it at the output frame's time now, but no compositor has been
+  held to it yet) and
   keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
   gif are refused. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
@@ -1061,6 +1118,29 @@ no editing logic in the adapter.
   dice of its own — so all three files re-blessed but only 428 of the 4000 per-case digests
   moved (`KERF_GOLDEN_CASES` before / after) and the rest are byte-identical. Raising
   `LIBRARY` (a new generated asset) moves the draws of every case; a new twin moves none.
+  The **keyed-zoom fix** (zoom last in the chain, `rotate` filling `black@0` when keyed)
+  re-blessed `export.txt` and `preview.txt` and left `still.txt` alone: 2027 export and 1507
+  preview of 4000 cases moved, exactly the ones whose graph holds a moving zoom (1814 / 1298,
+  the `zoom-keyed-last` families) or a keyed rotation (1748 / 1249, `rotate-keyed-transparent`,
+  213 / 209 of them with no moving zoom: the fill fix is the one change not confined to a
+  zoom), and with the fix compiled out the argv equals the committed digests. `KERF_GOLDEN_FAMILIES=<file>`
+  writes the families each case hit, which is how a moved set is tied to a kind of case; a
+  keyed clip whose scale holds still is byte-identical unless it also rotates (of the 482
+  cases that carry only such clips, the 196 that moved are exactly the ones with a keyed
+  rotation). The second round (the still following the export's order, the tiny-scale clamp,
+  even sizes ahead of a tone-map, alpha sources kept) went in **one change at a time with
+  `KERF_GOLDEN_CASES` between**, each moved set tied to its family: the generator's own
+  inputs first (three no-dice retargets like the padded twins — `-alpha` twins of `still` /
+  `wide` / `interview`, `i % 11 == 5`; a 4:3 HLG twin, `i % 13 == 8`; a 0.0004 scale,
+  `i % 17 == 4` — moved 477 export / 171 still / 310 preview cases, all of them retargeted
+  ones), then the still's zoom (still only: 616, exactly `still-zoom-last`, a chain that ends
+  in the zoom), the clamp (138 / 66 / 116 = `tiny-scale`), the even sizes (export and
+  preview 1733 / 1442 = `hdr-even-fit` or `hdr-even-zoom`; the still has no tone-map after
+  the geometry) and the alpha chain (98 / 68 = `alpha-kept`: a clip chain whose last filter is
+  `format=yuva420p` and not a zoom). Against the digests committed before the round 1920
+  export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
+  `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
+  zoom and of an alpha source's terminal format is the same `format=yuva420p`).
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -1318,7 +1398,8 @@ scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scal
 cover, graded bars), **opacity** (several sources and roles, a graded fade),
 **matrices** (BT.709 and BT.2020 single and layered, mixed tags, an RGB PNG under and over
 tagged clips, translucent layers over tagged ones in both orders), colour (all four knobs,
-contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes,
+contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
+and a position moving; a rotation and an opacity moving over a held zoom),
 10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources
 (shrunk, fitted and **enlarged** — every resize of a non-4:2:0, non-gray format is
 asserted refused, the mild shrinks included, and the same formats at their own size drawn), **busy sources** scaled by non-integer ratios, a clip past the end of its
@@ -1331,7 +1412,8 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer) — each of which FFmpeg still renders. 160
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
+each of which FFmpeg still renders. 160
 renders in the table on FFmpeg 6.1.1 (150 compared and 10 asserted refused on the pinned
 9.0.2 the Windows and macOS bundles ship) plus the plane-level scaler runs, all passing
 strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
