@@ -1,18 +1,85 @@
 <script lang="ts">
 	// Titles, lower thirds and captions: style chips that add one at the playhead,
-	// the caption button (and which look it generates in), and the lane's list of
-	// what is there. The content of the Inspector's "Titles lane" section and of
-	// the library's Titles tab — one component, so the two cannot drift.
+	// the caption button (and which look it generates in), importing captions from
+	// a subtitle file, and the lane's list of what is there. The content of the
+	// Inspector's "Titles lane" section and of the library's Titles tab — one
+	// component, so the two cannot drift.
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { CAPTION_LOOKS, TEXT_STYLES } from '$lib/style-presets';
-	import { addStyledTitle, addTextHere, dropCaptions, makeCaptions, pickTitle } from '$lib/title-actions';
+	import { addStyledTitle, addTextHere, dropCaptions, importCaptionFile, makeCaptions, pickTitle } from '$lib/title-actions';
+	import {
+		CAPTION_EXTENSIONS,
+		CAPTION_HINT,
+		IMPORT_BASES,
+		NO_SOURCE_HINT,
+		OFFSET_HINT,
+		baseHint,
+		clearHint,
+		generatedCount,
+		importableAssets,
+		keepLinesHint,
+		keepLinesOn,
+		recaptionHint,
+		resolveChoice
+	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
 	import { chip } from '$lib/chip';
 
+	const uid = $props.id();
+
+	// The list below is what is *shown* (a staged proposal while one is being
+	// reviewed); every button here acts on the live cut, and so does the count of
+	// captions an import or a recaption would replace.
 	const overlays = $derived(editor.overlays);
-	const hasCaptions = $derived(overlays.some((o) => o.generated));
+	const captionCount = $derived(generatedCount(editor.liveTimeline.overlays));
+	const hasCaptions = $derived(captionCount > 0);
+
+	// ---- importing captions from a subtitle file ----------------------------
+	// The options row opens under the buttons; the file is picked from inside it, so
+	// the timing is settled before the picker opens (the lane's menu, which has no
+	// room for options, offers the same import with the timing in the label).
+	let importOpen = $state(false);
+
+	/** The assets a file can be timed to: those a clip of the cut shows. */
+	const offered = $derived(importableAssets(editor.timeline, editor.assets));
+	/** Until an asset is picked the selected clip's is the default. */
+	const choice = $derived(
+		resolveChoice(ui.captionImportBase, ui.captionImportAsset, offered, [editor.selectedClip?.asset_id])
+	);
+	const choiceAsset = $derived(offered.find((a) => a.id === choice.assetId));
+	const lookLabel = $derived(CAPTION_LOOKS.find((c) => c.id === ui.captionStyle)?.label ?? ui.captionStyle);
+	/** The delivery frame an import is laid out for: it decides whether keeping the
+	 *  file's lines is on until the box is touched. */
+	const frame = $derived(editor.liveTimeline.format);
+	const keepLines = $derived(keepLinesOn(ui.captionImportKeepLines, ui.captionStyle, frame));
+
+	// The Inspector scrolls: keep the options (and the Choose file button under them)
+	// in view when they open, and when picking a clip makes them taller.
+	$effect(() => {
+		if (!importOpen) return;
+		void choice.base;
+		document.getElementById(`${uid}-import`)?.scrollIntoView({ block: 'nearest' });
+	});
+
+	async function chooseFile() {
+		if (await importCaptionFile(choice)) closeImport(true);
+	}
+
+	function closeImport(refocus: boolean) {
+		importOpen = false;
+		if (refocus) document.getElementById(`${uid}-toggle`)?.focus();
+	}
+
+	/** Escape folds the options away and hands focus back to the button that opened
+	 *  them; the page's own Escape (clear the selection) does not also fire. */
+	function onImportKey(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		e.preventDefault();
+		e.stopPropagation();
+		closeImport(true);
+	}
 
 	/** Minutes:seconds.centiseconds — a title's start in the lane's list. */
 	function tc(s: number): string {
@@ -22,6 +89,10 @@
 		const cs = Math.floor((t % 1) * 100);
 		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${cs.toString().padStart(2, '0')}`;
 	}
+
+	const selectCss =
+		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
+	const fieldLabel = 'font-size:12px;color:var(--text-muted)';
 
 	const xBtn =
 		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
@@ -38,27 +109,138 @@
 <div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
 	<span style="font-size:12px;color:var(--text-muted)">Caption style</span>
 	{#each CAPTION_LOOKS as c (c.id)}
-		<button style={chip(ui.captionStyle === c.id)} title={c.hint} onclick={() => (ui.captionStyle = c.id)}>
+		<button
+			style={chip(ui.captionStyle === c.id)}
+			title={c.hint}
+			aria-pressed={ui.captionStyle === c.id}
+			onclick={() => (ui.captionStyle = c.id)}
+		>
 			{c.label}
 		</button>
 	{/each}
 </div>
 <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:6px">
 	<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={() => void addTextHere()}>+ Text</Btn>
-	<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={() => void makeCaptions()}>
+	<Btn
+		size="sm"
+		variant="ghost"
+		disabled={editor.busy}
+		title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
+		onclick={() => void makeCaptions()}
+	>
 		{hasCaptions ? 'Recaption' : 'Captions'}
 	</Btn>
 	{#if hasCaptions}
-		<Btn size="sm" variant="ghost" disabled={editor.busy} onclick={() => void dropCaptions()}>Clear</Btn>
+		<Btn size="sm" variant="ghost" disabled={editor.busy} title={clearHint(captionCount)} onclick={() => void dropCaptions()}>Clear</Btn>
 	{/if}
 	<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
 		>Voiceover…</Btn
 	>
+	<Btn
+		id="{uid}-toggle"
+		size="sm"
+		variant={importOpen ? 'secondary' : 'ghost'}
+		icon="file-text"
+		aria-expanded={importOpen}
+		aria-controls="{uid}-import"
+		title="Caption the cut from a .srt or .ass subtitle file"
+		onclick={() => (importOpen = !importOpen)}>Import captions…</Btn
+	>
 </div>
+{#if importOpen}
+	<!-- The Escape handler is a convenience for the fields inside; every control it
+	     covers is a real button / select that Tab already reaches. -->
+	<div role="presentation" onkeydown={onImportKey}>
+		<div
+			id="{uid}-import"
+			role="group"
+			aria-label="Import captions"
+			style="margin-bottom:8px;padding:9px 10px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);display:flex;flex-direction:column;gap:7px"
+		>
+			<div style="font-size:12px;font-weight:600;color:var(--text-primary)">Import captions from a subtitle file</div>
+			<div style="display:flex;flex-direction:column;gap:5px">
+				<span style={fieldLabel}>Timing</span>
+				<div role="group" aria-label="Timing" style="display:flex;gap:5px;flex-wrap:wrap">
+					{#each IMPORT_BASES as b (b.id)}
+						{@const unavailable = b.id === 'source' && offered.length === 0}
+						<button
+							style={chip(choice.base === b.id) + (unavailable ? ';opacity:0.5;cursor:default' : '')}
+							aria-pressed={choice.base === b.id}
+							disabled={unavailable}
+							onclick={() => (ui.captionImportBase = b.id)}
+						>
+							{b.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+			{#if choice.base === 'source'}
+				<label style="display:flex;align-items:center;gap:8px">
+					<span style="{fieldLabel};flex:none">Clip</span>
+					<select
+						value={choice.assetId ?? ''}
+						onchange={(e) => (ui.captionImportAsset = e.currentTarget.value)}
+						style="{selectCss};flex:1;min-width:0"
+					>
+						{#each offered as a (a.id)}
+							<option value={a.id}>{a.label}{a.clips > 1 ? ` · ${a.clips} clips` : ''}</option>
+						{/each}
+					</select>
+				</label>
+			{/if}
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+				{offered.length === 0 ? NO_SOURCE_HINT : baseHint(choice, choiceAsset?.label)}
+			</div>
+			<label style="display:flex;align-items:flex-start;gap:8px;cursor:{ui.captionStyle === 'lines' ? 'pointer' : 'default'}">
+				<input
+					type="checkbox"
+					checked={keepLines}
+					disabled={ui.captionStyle !== 'lines'}
+					onchange={(e) => (ui.captionImportKeepLines = e.currentTarget.checked)}
+					style="accent-color:var(--kerf-500);width:15px;height:15px;margin-top:1px;flex:none"
+				/>
+				<span style="display:flex;flex-direction:column;gap:2px">
+					<span style="font-size:12px;color:var(--text-primary)">Keep the file's lines</span>
+					<span style="font-size:12px;color:var(--text-muted);line-height:1.4"
+						>{keepLinesHint(ui.captionStyle, keepLines, frame)}</span
+					>
+				</span>
+			</label>
+			<label style="display:flex;align-items:center;gap:8px">
+				<span style="{fieldLabel};flex:none">Shift times</span>
+				<input
+					type="number"
+					step="0.1"
+					bind:value={ui.captionImportOffset}
+					placeholder="0"
+					aria-label="Shift every time in the file by this many seconds"
+					style="{selectCss};width:84px;min-width:0"
+				/>
+				<span style={fieldLabel}>seconds</span>
+			</label>
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">{OFFSET_HINT}</div>
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+				Look: <span style="color:var(--text-secondary)">{lookLabel}</span>, from Caption style above. Fonts, colors and
+				positions in the file are ignored. {captionCount > 0
+					? `The ${captionCount} caption${captionCount === 1 ? '' : 's'} already on the cut will be replaced.`
+					: ''}
+			</div>
+			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
+				<Btn size="sm" variant="primary" icon="file-text" disabled={editor.busy} onclick={() => void chooseFile()}
+					>Choose file…</Btn
+				>
+				<Btn size="sm" variant="ghost" onclick={() => closeImport(true)}>Cancel</Btn>
+				<span style="font-size:12px;color:var(--text-muted)"
+					>{CAPTION_EXTENSIONS.map((e) => `.${e}`).join(' ')}</span
+				>
+			</div>
+		</div>
+	</div>
+{/if}
 {#if overlays.length === 0}
 	<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
-		No titles or captions yet. Add text, or caption the whole cut from the transcripts of the clips on
-		the timeline — captions land on the words that survived your edit.
+		No titles or captions yet. Add text, caption the whole cut from the transcripts of the clips on
+		the timeline (captions land on the words that survived your edit), or import a subtitle file.
 	</div>
 {/if}
 {#each overlays as o (o.id)}

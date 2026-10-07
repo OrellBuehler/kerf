@@ -9,6 +9,8 @@ import {
 	analyzeAsset,
 	generateCaptions,
 	clearCaptions,
+	importCaptions,
+	importCaptionsText,
 	clearKeyframes,
 	clearReframe,
 	concatenate,
@@ -91,6 +93,10 @@ import type {
 	AssetAnalysis,
 	AssetMetadata,
 	AudioEffect,
+	CaptionFormat,
+	CaptionImportRequest,
+	CaptionImportResult,
+	CaptionImportSummary,
 	CaptionOptions,
 	Clip,
 	Color,
@@ -165,7 +171,12 @@ class EditorState {
 	error = $state<string | null>(null);
 
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
-	#liveTimeline: Timeline | null = null;
+	#liveTimeline = $state.raw<Timeline | null>(null);
+	/** The cut an edit lands on: the live one even while a proposal is on screen
+	 *  (every edit drops the preview first). `timeline` is what is *shown*. */
+	get liveTimeline(): Timeline {
+		return this.#liveTimeline ?? this.timeline;
+	}
 	/** Snapshot guard over `timeline` — every writer bumps it (via `#setTimeline`)
 	 *  so a `refreshTimeline()` fetch that started earlier can tell a newer write
 	 *  already landed while it was waiting and skip clobbering it. */
@@ -879,6 +890,26 @@ class EditorState {
 	}
 	clearCaptions() {
 		return this.#apply(clearCaptions());
+	}
+	/** Caption the cut from a subtitle file on disk (`.srt` / `.ass` / `.ssa`).
+	 *  One `Import captions` revision that replaces the generated / imported
+	 *  captions; resolves to what the import did (see `describeImport`). */
+	importCaptions(path: string, req?: CaptionImportRequest) {
+		return this.#applyImport(importCaptions(path, req));
+	}
+	/** `importCaptions` for text already in hand (a file input, a paste). */
+	importCaptionsText(text: string, req?: CaptionImportRequest & { format?: CaptionFormat }) {
+		return this.#applyImport(importCaptionsText(text, req));
+	}
+	async #applyImport(op: Promise<CaptionImportResult>): Promise<CaptionImportSummary> {
+		let summary: CaptionImportSummary | undefined;
+		await this.#apply(
+			op.then((r) => {
+				summary = r.summary;
+				return r.timeline;
+			})
+		);
+		return summary as CaptionImportSummary;
 	}
 	/** Write the asset's transcript to `.srt`; returns the path (no timeline change). */
 	exportSrt(assetId: string, outputPath: string) {

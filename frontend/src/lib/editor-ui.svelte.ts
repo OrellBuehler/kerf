@@ -7,7 +7,7 @@ import { editor } from './state.svelte';
 import { cancelAnalysis, downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
-import type { AnalysisProgress, CaptionStyle, TranscriptionStatus } from './types';
+import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, TranscriptionStatus } from './types';
 import type { VoiceoverPrefill } from './voiceover';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import {
@@ -61,12 +61,25 @@ class EditorUi {
 	 *  choice — it would otherwise be lost on the way to the dialog. */
 	deliverShapes = $state<string[]>([]);
 	deliverSmartCrop = $state(true);
-	/** The look the caption button generates in. Not derived from the captions
+	/** The look the caption button generates in, and the one an imported subtitle
+	 *  file is laid out in. Not derived from the captions
 	 *  already on the timeline: a caption's style is not recoverable from the
 	 *  text it carries, and guessing from the word count would flip the choice
 	 *  every time a sentence happened to be short. Shared by every place that
 	 *  offers the button (the Inspector and the library's Titles tab). */
 	captionStyle = $state<CaptionStyle>('lines');
+	/** What the Titles controls' *Import captions* options say: whether a subtitle
+	 *  file's times are the finished cut's (`timeline`) or one clip's own footage
+	 *  (`source`, with the asset picked here). Held beside `captionStyle` so the two
+	 *  copies of the controls agree. `caption-import-ui.ts` resolves them against
+	 *  the cut — an asset it no longer shows, or no clip to time to, falls back. */
+	captionImportBase = $state<CaptionTimeBase>('timeline');
+	captionImportAsset = $state<string | null>(null);
+	/** "Keep the file's lines": `null` until the box is touched, so it follows the
+	 *  delivery frame (`keepLinesDefault`); true / false once the user has chosen. */
+	captionImportKeepLines = $state<boolean | null>(null);
+	/** Seconds the imported cues are shifted by, as typed (`null` = empty). */
+	captionImportOffset = $state<number | null>(null);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.

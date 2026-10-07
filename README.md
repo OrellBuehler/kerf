@@ -165,7 +165,7 @@ frame at full source detail.
 `set_keyframes` · `add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
-`generate_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
+`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
 </details>
 
