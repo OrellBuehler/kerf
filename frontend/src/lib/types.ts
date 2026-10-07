@@ -401,6 +401,22 @@ export interface ClipMove {
 	track_id?: string;
 }
 
+/** Which half of a split `split_remove` throws away: everything before the cut
+ *  (`left` — trim the start to it) or everything after it (`right`). */
+export type SplitSide = 'left' | 'right';
+
+/** What a roll, slip or slide did (`roll_edit` / `slip_clip` / `slide_clip` over MCP;
+ *  the Tauri commands answer with the refreshed timeline): how far it was asked to
+ *  go, how far it went (it clamps to the footage and the neighbours), and the clips
+ *  it changed as they stand afterwards, in timeline order. */
+export interface EditOutcome {
+	requested: number;
+	applied: number;
+	/** `applied` is not what was asked for. */
+	clamped: boolean;
+	clips: Clip[];
+}
+
 export interface Track {
 	id: string;
 	kind: StreamKind;

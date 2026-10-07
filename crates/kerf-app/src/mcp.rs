@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipMove, Delivery,
-    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, StreamKind,
-    TextKeyframe, Transition, TransitionKind, VideoEffect,
+    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, SplitSide,
+    StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -346,6 +346,56 @@ struct CutClipRangeParams {
     from: f64,
     #[schemars(description = "Source-time end of the span to remove (seconds)")]
     to: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RollEditParams {
+    #[schemars(description = "UUID of the EARLIER clip of the pair — the one whose end is the cut")]
+    clip_a: String,
+    #[schemars(
+        description = "UUID of the LATER clip of the pair, on the same track and touching clip_a — the one whose start is the cut"
+    )]
+    clip_b: String,
+    #[schemars(
+        description = "Seconds to move the cut: positive moves it later (clip_a gains footage at its end, clip_b loses it at its start), negative earlier. Clamped to the footage each clip has left and to 0.05s for the clip that shrinks; the reply's `applied` is how far it really went."
+    )]
+    delta: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SlipClipParams {
+    #[schemars(description = "UUID of the clip to slip")]
+    clip_id: String,
+    #[schemars(
+        description = "Source-footage seconds (NOT timeline seconds — at 2x speed 1 second of slip moves the picture half a second): positive makes the clip start later in its own footage, so you see material that comes later; negative earlier. A reversed clip is mirrored for you (positive moves its source window down). Clamped to the asset's footage; the reply's `applied` is how far it really went."
+    )]
+    delta: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SlideClipParams {
+    #[schemars(description = "UUID of the clip to slide")]
+    clip_id: String,
+    #[schemars(
+        description = "Timeline seconds to move the clip: positive later, negative earlier. A neighbour that touches the clip gives way (previous clip's end and next clip's start move by the same amount); one across a gap is left alone and the clip stops where it would meet it. Clamped to the neighbours' footage and a 0.05s floor, and to 0 at the start of the track; the reply's `applied` is how far it really went."
+    )]
+    delta: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SplitRemoveParams {
+    #[schemars(description = "UUID of the clip to cut")]
+    clip_id: String,
+    #[schemars(
+        description = "Timeline time to cut at (seconds); must lie inside the clip and leave at least 0.05s of the half you keep"
+    )]
+    at: f64,
+    #[schemars(description = "Which half to REMOVE: \"left\" (everything before `at`) or \"right\" (everything after it)")]
+    side: SplitSide,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the track close the gap the removed half leaves (a left removal keeps the clip's own start and pulls the rest in); false leaves the gap, as after a plain split and delete. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping is kept as the edit made it."
+    )]
+    ripple: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1275,6 +1325,78 @@ impl KerfMcp {
         self.edit(|project| {
             let pieces = project.cut_clip_range(clip_id, p.from, p.to).map_err(core_err)?;
             json(&pieces)
+        })
+    }
+
+    #[tool(
+        description = "ROLL an edit: move the cut between two adjacent clips of one track (clip_a ends where clip_b \
+                       begins) by `delta` seconds, positive = later. Both clips' footage shifts with it — clip_a's end \
+                       and clip_b's start move together — so the pair covers the same stretch of timeline and nothing \
+                       after it moves. Use it to adjust where a cut falls without touching the length of the cut. \
+                       Clamps (does not fail) to the footage each clip has left and to a 0.05s floor for the clip that \
+                       shrinks; `applied` in the reply says how far it went and `clamped` whether that is short of \
+                       `delta`. Errors if the clips are not adjacent, on different tracks, in the wrong order, or the \
+                       track is locked. One revision. Never ripples, whatever the ripple mode."
+    )]
+    fn roll_edit(&self, Parameters(p): Parameters<RollEditParams>) -> Result<String, McpError> {
+        let (a, b) = (parse_id(&p.clip_a)?, parse_id(&p.clip_b)?);
+        self.edit(|project| {
+            let out = project.roll_edit(a, b, p.delta).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "SLIP a clip: show a different part of its footage without moving it or changing its length — \
+                       the clip keeps its place and duration on the timeline and only its source window shifts. \
+                       `delta` is in SOURCE seconds; positive makes the clip start later in its own footage, negative \
+                       earlier (a reversed clip is mirrored for you). Clamps to the asset's footage — `applied` says how \
+                       far it went — and errors when there is none left, for a still image (nothing to slip) or a \
+                       locked track. Keyframes and fades are timed to the clip, so they stay put. One revision. Never \
+                       ripples."
+    )]
+    fn slip_clip(&self, Parameters(p): Parameters<SlipClipParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let out = project.slip_clip(clip_id, p.delta).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "SLIDE a clip along its track, keeping its content: it moves by `delta` timeline seconds \
+                       (positive = later) while the clips touching it give way — the previous clip's end and the next \
+                       clip's start move by the same amount, so the clip's footage and the overall length of the three \
+                       are unchanged. A neighbour across a gap is not touched: with a gap on one side only the touching \
+                       neighbour is trimmed (or extended), and the clip stops where it would meet a clip it is not \
+                       touching. The last clip of a track has no next clip to give way, so sliding it later extends the \
+                       track. Clamps (does not fail) to the neighbours' footage and a 0.05s floor, and to 0 at the start \
+                       of the track; `applied` says how far it went. Errors if nothing can move or the track is locked. \
+                       One revision. Never ripples."
+    )]
+    fn slide_clip(&self, Parameters(p): Parameters<SlideClipParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let out = project.slide_clip(clip_id, p.delta).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Split a clip at a timeline time and REMOVE one half in a single edit — trim the start (side \
+                       \"left\") or the end (side \"right\") to that time. The half that stays keeps the clip's id, and \
+                       loses what belonged to the removed half: removing the left drops fade_in and the transition into \
+                       it, removing the right drops fade_out. In ripple mode (get_ripple_mode, or pass `ripple`) the \
+                       later clips on the track close the gap; otherwise the gap stays. Returns the clip that remains. \
+                       Errors if `at` is not inside the clip or would leave under 0.05s, or the track is locked."
+    )]
+    fn split_remove(&self, Parameters(p): Parameters<SplitRemoveParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let out = project
+                .with_ripple(p.ripple, |project| project.split_remove(clip_id, p.at, p.side))
+                .map_err(core_err)?;
+            json(&out)
         })
     }
 
@@ -2874,10 +2996,17 @@ impl ServerHandler for KerfMcp {
              cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
              (move_clip frees a clip to any position or same-kind track; \
              ripple_delete closes the gap; move_clips / remove_clips do the \
-             same to several clips as one revision, all or nothing). The project \
-             may be in ripple mode, so check get_ripple_mode before you trim, \
+             same to several clips as one revision, all or nothing). To adjust \
+             a cut rather than build one: roll_edit moves the cut between two \
+             adjacent clips (both shift, the pair's length is unchanged), \
+             slip_clip shows other footage in the same place and length, \
+             slide_clip moves a clip between its neighbours (they give way), \
+             and split_remove trims a clip's start or end to a time — the first \
+             three clamp to the footage and report `applied`, and never ripple. \
+             The project may be in ripple mode, so check get_ripple_mode before you trim, \
              remove or retime: with it on, trim / set_speed / remove / \
-             add_clip_to_timeline onto footage / generate_voiceover carry the \
+             split_remove / add_clip_to_timeline onto footage / \
+             generate_voiceover carry the \
              later clips on that track along by the change in length, gaps kept \
              (track by track — a V1 ripple leaves A1 where it is), and with it \
              off they leave the later clips where they were. Those tools take an \
@@ -3424,6 +3553,40 @@ mod tests {
         }
     }
 
+    /// The edit modes are documented in the units a model can act on: deltas in
+    /// seconds, and the half to remove a closed set — a typo in `side` is the
+    /// caller's to fix at the schema, not a silent default.
+    #[test]
+    fn the_edit_mode_tools_take_a_delta_and_a_closed_side() {
+        let tools = router().list_all();
+        let required = |name: &str| {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let mut required: Vec<String> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            required.sort();
+            (required, serde_json::to_string(&*tool.input_schema).unwrap())
+        };
+        assert_eq!(required("roll_edit").0, ["clip_a", "clip_b", "delta"]);
+        assert_eq!(required("slip_clip").0, ["clip_id", "delta"]);
+        assert_eq!(required("slide_clip").0, ["clip_id", "delta"]);
+        let (split, schema) = required("split_remove");
+        assert_eq!(split, ["at", "clip_id", "side"]);
+        assert!(schema.contains("left") && schema.contains("right"), "{schema}");
+
+        let ok = |side: &str| {
+            serde_json::from_value::<super::SplitRemoveParams>(serde_json::json!({ "clip_id": "x", "at": 1.0, "side": side }))
+        };
+        assert!(ok("left").is_ok() && ok("right").is_ok());
+        assert!(ok("middle").is_err());
+    }
+
     /// The per-call `ripple` override belongs on the edits that follow the
     /// project's ripple mode and on none that decide their own layout — an
     /// override on `move_clip` or `ripple_delete` would promise something the
@@ -3458,6 +3621,7 @@ mod tests {
             "remove_clips",
             "add_clip_to_timeline",
             "split_at",
+            "split_remove",
             "generate_voiceover",
         ] {
             let (properties, required) = schema(name);
@@ -3470,6 +3634,9 @@ mod tests {
             "snap_to_beats",
             "move_clip",
             "move_clips",
+            "roll_edit",
+            "slip_clip",
+            "slide_clip",
             "reorder",
             "duplicate_clips",
         ] {

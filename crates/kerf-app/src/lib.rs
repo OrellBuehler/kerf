@@ -23,8 +23,8 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask, Project,
-    Projection, ReframeKeyframe, Revision, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff, Transition,
-    TransitionKind, VideoEffect, WaveformRange,
+    Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline, TimelineDiff,
+    Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -734,6 +734,50 @@ fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f6
     let id = id(&clip_id)?;
     let project = state.project();
     project.cut_clip_range(id, from, to).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Roll the cut between two adjacent clips of one track: `clip_a`'s end and
+/// `clip_b`'s start move together by `delta` seconds (positive is later), clamped
+/// to each clip's footage and a 0.05 s floor. Never ripples.
+#[tauri::command(async)]
+fn roll_edit(state: State<'_, AppState>, clip_a: String, clip_b: String, delta: f64) -> CmdResult<Timeline> {
+    let (a, b) = (id(&clip_a)?, id(&clip_b)?);
+    let project = state.project();
+    project.roll_edit(a, b, delta).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Slip a clip: show a different part of its footage in the same place and for
+/// the same length. `delta` is in **source** seconds, positive = starts later in
+/// its own footage (mirrored window for a reversed clip). Clamped to the footage.
+/// Never ripples.
+#[tauri::command(async)]
+fn slip_clip(state: State<'_, AppState>, clip_id: String, delta: f64) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.slip_clip(id, delta).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Slide a clip along its track by `delta` timeline seconds, the neighbours that
+/// touch it giving way. Clamped to their footage and a 0.05 s floor. Never ripples.
+#[tauri::command(async)]
+fn slide_clip(state: State<'_, AppState>, clip_id: String, delta: f64) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.slide_clip(id, delta).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Split a clip at timeline time `at` and remove one half (`side` is `"left"` or
+/// `"right"`): trim the start / end to the playhead. Follows ripple mode.
+#[tauri::command(async)]
+fn split_remove(state: State<'_, AppState>, clip_id: String, at: f64, side: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
+    let project = state.project();
+    project.split_remove(id, at, side).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2678,6 +2722,10 @@ pub fn run() {
             move_clips,
             ripple_delete,
             cut_clip_range,
+            roll_edit,
+            slip_clip,
+            slide_clip,
+            split_remove,
             add_track,
             remove_track,
             set_track_duck,

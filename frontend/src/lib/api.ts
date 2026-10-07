@@ -33,6 +33,7 @@ import type {
 	Revision,
 	AppSettings,
 	SettingsView,
+	SplitSide,
 	StagedEdit,
 	StreamKind,
 	Task,
@@ -58,6 +59,13 @@ import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
 import { baseName, CAPTION_EXTENSIONS } from './caption-import-ui';
 import { formatTime as fmtTime } from './diff';
+import {
+	rollEdit as rollEditLocal,
+	slideClip as slideClipLocal,
+	slipClip as slipClipLocal,
+	splitRemove as splitRemoveLocal,
+	type SourceLimits
+} from './edit-modes';
 import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
 import { rippleFrom } from './ripple';
 import { checkAll } from './platforms';
@@ -1083,6 +1091,69 @@ export async function cutClipRange(clipId: string, from: number, to: number): Pr
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip_range', { clipId, from, to });
+}
+
+// ---- edit modes: roll, slip, slide, split-and-remove ----------------------
+// The harness runs the faithful mirror in `edit-modes.ts`; the desktop app asks the
+// backend, which clamps to each clip's footage and its neighbours (and says so by
+// moving less than asked). Roll, slip and slide never ripple; split-and-remove
+// follows the project's ripple mode like any trim.
+
+/** What each harness asset's footage reaches — `Project::source_limits`: its
+ *  duration, or `Infinity` for a still (it loops). */
+function devSourceLimits(): SourceLimits {
+	return new Map(sampleAssets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]));
+}
+
+/** Roll the cut between two adjacent clips of one track by `delta` seconds
+ *  (positive is later): `clipA` (the earlier clip) loses or gains at its end what
+ *  `clipB` gains or loses at its start, so the pair keeps its span. Clamped to each
+ *  clip's footage and a 0.05 s floor; rejects when the clips are not adjacent or
+ *  the track is locked. */
+export async function rollEdit(clipA: string, clipB: string, delta: number): Promise<Timeline> {
+	if (!inTauri()) {
+		rollEditLocal(devTimeline, clipA, clipB, delta, devSourceLimits());
+		recordDev('Roll edit');
+		return snapshot();
+	}
+	return invoke<Timeline>('roll_edit', { clipA, clipB, delta });
+}
+
+/** Slip a clip: show a different part of its footage in the same place and for the
+ *  same length. `delta` is in **source** seconds; positive starts the clip later in
+ *  its own footage (mirrored for a reversed clip). Clamped to the footage; a still
+ *  has none to slip. */
+export async function slipClip(clipId: string, delta: number): Promise<Timeline> {
+	if (!inTauri()) {
+		slipClipLocal(devTimeline, clipId, delta, devSourceLimits());
+		recordDev('Slip clip');
+		return snapshot();
+	}
+	return invoke<Timeline>('slip_clip', { clipId, delta });
+}
+
+/** Slide a clip along its track by `delta` timeline seconds (positive is later);
+ *  the neighbours that touch it give way. Clamped to their footage and a 0.05 s
+ *  floor. */
+export async function slideClip(clipId: string, delta: number): Promise<Timeline> {
+	if (!inTauri()) {
+		slideClipLocal(devTimeline, clipId, delta, devSourceLimits());
+		recordDev('Slide clip');
+		return snapshot();
+	}
+	return invoke<Timeline>('slide_clip', { clipId, delta });
+}
+
+/** Split a clip at timeline time `at` and remove one half — trim the start (`left`)
+ *  or the end (`right`) to the playhead. The half that stays keeps the clip's id.
+ *  Follows the project's ripple mode: on, the later clips close the gap. */
+export async function splitRemove(clipId: string, at: number, side: SplitSide): Promise<Timeline> {
+	if (!inTauri()) {
+		devEdit(undefined, () => splitRemoveLocal(devTimeline, clipId, at, side));
+		recordDev(side === 'left' ? 'Split and remove left' : 'Split and remove right');
+		return snapshot();
+	}
+	return invoke<Timeline>('split_remove', { clipId, at, side });
 }
 
 /** Append a new empty track (video tracks above audio); auto-named when omitted. */

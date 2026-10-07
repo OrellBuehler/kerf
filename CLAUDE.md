@@ -757,6 +757,34 @@ no editing logic in the adapter.
   same-kind track; the group is checked as a group (moving clips pass through the
   places they are leaving, never onto each other or a clip that stays), and a
   locked track, a start before 0 or a clip named twice refuses the lot.
+  **Edit modes** are here too, pure + unit-tested, and each *clamps and reports*
+  rather than refusing (`EditOutcome {requested, applied, clamped, clips}`; it
+  errors only when the clamp leaves nothing to move, so a no-op records no
+  revision) — to the footage (`SourceLimits`: `Asset::source_limit`, infinite for a
+  still) and to a 0.05 s floor (`MIN_EDIT_CLIP`); each has a `*_range` returning
+  the `DeltaRange` it clamps to, which is what a drag reads. **Roll**
+  (`roll_edit(a, b, delta)`): `a`'s end and `b`'s start move together, so the
+  pair's span and everything after it are unchanged; the clips must touch within
+  `ADJACENT_EPS` (1 ms — the engine's own transition-partner test) with `a`
+  first. **Slip** (`slip_clip`): the source window shifts, position and length do
+  not; `delta` is **source** seconds, and *positive means the clip starts later in
+  its own footage*, so a reversed clip's window moves the mirrored way and the
+  sign always means the same on screen; a still is an error. **Slide**
+  (`slide_clip`): the clip moves, the neighbours that *touch* it give way (the
+  previous one's end and the next one's start move by `delta`); a neighbour across
+  a gap is never trimmed — the clip stops where it would meet it — and the last
+  clip, with no next to give way, extends the track. **Split and remove**
+  (`split_remove(clip, at, Left|Right)`): the surviving half keeps the clip's id,
+  so `ripple_from` reads it as the ordinary trim it is (a left removal holds the
+  clip's start and closes the track under ripple, leaves the gap otherwise); it
+  drops what belonged to the removed half (`fade_in` + `transition_in` on the
+  left, `fade_out` on the right). Shared rules: a *head* move re-times the clip's
+  keyframes and reframe keyframes with its content (`Clip::rebase_animation` — the
+  same pose-pinning `Timeline::slice` does, which now calls it), a tail move or a
+  slip/slide of the clip itself leaves them clip-local; fades are clamped into a
+  clip that shrank; a still's window is only ever written on its out-point (no
+  negative `source_in`); locked tracks refuse; every op validates before it
+  mutates. A same-length window shift diffs as `Slipped clip …`, not a `+0.0s` trim.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -917,6 +945,11 @@ no editing logic in the adapter.
   `remove_clips` is the multi-select ripple delete. `move_clips` / `remove_clips`
   are single revisions (`Move N clips` / `Remove N clips`), and — unlike the
   single-clip ops, which leave locks to the GUI — refuse clips on a locked track.
+  `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
+  clip`, one revision each, `source_limits()` read before the edit) are
+  `edit_timeline_exact` — they move no length, only where footage changes hands;
+  `split_remove` (`Split and remove left|right`) goes through `edit_timeline` and
+  follows the mode, re-reading its clip like `trim`. All four refuse a locked track.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
@@ -1245,15 +1278,21 @@ clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the 
 standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
 attempt, skipped on a locked track and declined for a lane the shift would leave
 overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
-`remove_clips`, `add_clip_to_timeline`, `split_at`, `generate_voiceover`'s
+`remove_clips`, `add_clip_to_timeline`, `split_at`, `split_remove`, `generate_voiceover`'s
 placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
 around the core call (omitted follows the project; `false` is the escape hatch); their
 descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
 the overlap.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
-`snap_to_beats`, `move_clip`, `move_clips`, `reorder`, `duplicate_clips`) take
-none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
-pins against the generated schemas. The server `instructions` carry the ripple
+`snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
+`reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+pins against the generated schemas. **Edit modes over MCP**: `roll_edit` (`clip_a`
+the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
+seconds, positive = later in its own footage) and `slide_clip` answer the
+`EditOutcome` JSON (`applied` / `clamped` say how far a clamp let it go; a clamp to
+nothing is `invalid_params` naming the limit), and `split_remove` (`side` is the
+`SplitSide` enum in the schema, so a typo is rejected at the schema) answers the
+surviving clip; the server `instructions` mention all four. The server `instructions` carry the ripple
 paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
@@ -1342,7 +1381,10 @@ that records no revision and returns no timeline), voiceover
 `voiceover-progress`, `cancel_voiceover`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
-`move_clips { moves }` (a group, one revision, all or nothing), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+`move_clips { moves }` (a group, one revision, all or nothing), `roll_edit { clipA, clipB,
+delta }` / `slip_clip { clipId, delta }` / `slide_clip { clipId, delta }` (clamping edit
+modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`; follows
+ripple mode), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
@@ -2270,7 +2312,11 @@ lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
 `Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
 numbers, so a rule changed in kerf-core has to change there or a test names it) and
 `src/lib/multi-edit.ts` the same for `Timeline::move_clips` / `remove_clips` (same
-checks, same messages). `api.ts` keeps the project's ripple flag in the harness state
+checks, same messages), and `src/lib/edit-modes.ts` for the edit modes
+(`rollEdit` / `slipClip` / `slideClip` / `splitRemove` plus their `*Range`
+functions — the clamp a drag holds the pointer to — replaying the Rust tests, messages
+included; `api.ts` runs them in the harness, `editor.roll` / `slip` / `slide` /
+`splitRemove` are the thin actions over them). `api.ts` keeps the project's ripple flag in the harness state
 (`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
 that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
 voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,

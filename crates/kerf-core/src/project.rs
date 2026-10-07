@@ -16,9 +16,9 @@ use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipMove, CropFrame, Delivery,
-    EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, StagedEdit, StreamInfo,
-    StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment,
-    Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
+    EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision, SourceLimits,
+    SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
 };
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -1598,6 +1598,76 @@ impl Project {
             _ => format!("Move {} clips", moves.len()),
         };
         self.edit_timeline_exact(&label, |timeline| timeline.move_clips(moves))
+    }
+
+    // ---- edit modes: roll, slip, slide, split-and-remove ---------------------
+
+    /// How far each asset's footage reaches — what roll, slip and slide clamp a
+    /// clip's source window to ([`crate::model::Asset::source_limit`]: the
+    /// duration, infinite for a still).
+    pub fn source_limits(&self) -> Result<SourceLimits> {
+        Ok(self
+            .list_assets()?
+            .into_iter()
+            .map(|asset| (asset.id, asset.source_limit()))
+            .collect())
+    }
+
+    /// **Roll** the cut between two adjacent clips of one track by `delta`
+    /// seconds (positive is later): `clip_a`'s end and `clip_b`'s start move
+    /// together, so the pair covers the same stretch and nothing after it moves.
+    /// Clamped to each clip's footage and a 0.05 s floor; the outcome says how far
+    /// it really went. One `Roll edit` revision. See [`Timeline::roll_edit`] for
+    /// every rule. Never ripples — it moves no length, only where footage changes
+    /// hands — whatever the ripple mode.
+    pub fn roll_edit(&self, clip_a: Uuid, clip_b: Uuid, delta: f64) -> Result<EditOutcome> {
+        let footage = self.source_limits()?;
+        self.edit_timeline_exact("Roll edit", |timeline| timeline.roll_edit(clip_a, clip_b, delta, &footage))
+    }
+
+    /// **Slip** a clip: show a different part of its footage in the same place
+    /// and for the same length. `delta` is in *source* seconds; positive starts
+    /// the clip later in its own footage (the mirrored window for a reversed
+    /// clip). Clamped to the footage; a still has none to slip. One `Slip clip`
+    /// revision. See [`Timeline::slip_clip`]. Never ripples.
+    pub fn slip_clip(&self, clip_id: Uuid, delta: f64) -> Result<EditOutcome> {
+        let footage = self.source_limits()?;
+        self.edit_timeline_exact("Slip clip", |timeline| timeline.slip_clip(clip_id, delta, &footage))
+    }
+
+    /// **Slide** a clip along its track by `delta` timeline seconds, the
+    /// neighbours that touch it giving way (the previous clip's end and the next
+    /// clip's start move with it), so its content and the stretch the three span
+    /// are unchanged. Clamped to the neighbours' footage and a 0.05 s floor. One
+    /// `Slide clip` revision. See [`Timeline::slide_clip`] for the rules with
+    /// gaps. Never ripples.
+    pub fn slide_clip(&self, clip_id: Uuid, delta: f64) -> Result<EditOutcome> {
+        let footage = self.source_limits()?;
+        self.edit_timeline_exact("Slide clip", |timeline| timeline.slide_clip(clip_id, delta, &footage))
+    }
+
+    /// **Split and remove**: cut a clip at timeline time `at` and drop the
+    /// `side` half, in one `Split and remove left` / `… right` revision. Unlike
+    /// the three above this *does* follow ripple mode, because it changes a clip's
+    /// length like any trim: with it on, the later clips on the track close the
+    /// gap (a left removal keeps the clip's own start and pulls the rest in); with
+    /// it off the gap stays, exactly as after a plain split and delete. The
+    /// surviving half keeps the clip's id; see [`Timeline::split_remove`].
+    /// Returns it as it ended up on the timeline.
+    pub fn split_remove(&self, clip_id: Uuid, at: f64, side: SplitSide) -> Result<Clip> {
+        let label = match side {
+            SplitSide::Left => "Split and remove left",
+            SplitSide::Right => "Split and remove right",
+        };
+        let clip = self.edit_timeline(label, |timeline| timeline.split_remove(clip_id, at, side))?;
+        // As `trim`: ripple can move the surviving half itself (a left removal
+        // keeps its start), so hand back what is on the timeline.
+        if self.ripple_active()? {
+            if let Some(current) = self.working_timeline()?.clip(clip.id) {
+                return Ok(current.clone());
+            }
+        }
+        Ok(clip)
     }
 
     /// Insert `placements` — each a `(track_id, clip)` pair — so the earliest
@@ -6696,5 +6766,243 @@ mod tests {
             Err(Error::InvalidArgument(why)) if why.contains("locked")
         ));
         assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    // ---- edit modes: roll, slip, slide, split-and-remove -------------------------
+
+    /// V1 holding `a [0,4)` src 10..14, `b [4,8)` src 20..24 and `c [8,12)` src
+    /// 30..34, all abutting, of a 60 s asset.
+    fn abutting_project() -> (Project, Uuid, [Clip; 3]) {
+        let (project, asset) = project_with_video_asset();
+        let a = project.add_clip_to_timeline(asset, None, 10.0, 14.0, Some(0.0)).unwrap();
+        let b = project.add_clip_to_timeline(asset, None, 20.0, 24.0, Some(4.0)).unwrap();
+        let c = project.add_clip_to_timeline(asset, None, 30.0, 34.0, Some(8.0)).unwrap();
+        (project, asset, [a, b, c])
+    }
+
+    /// Each clip of V1 as `(start, source_in, source_out)`, in lane order.
+    fn v1_layout(project: &Project) -> Vec<(f64, f64, f64)> {
+        project.timeline().unwrap().tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.timeline_start, c.source_in, c.source_out))
+            .collect()
+    }
+
+    #[test]
+    fn roll_slip_and_slide_are_one_labelled_revision_each() {
+        let (project, _, [a, b, c]) = abutting_project();
+        let revisions = project.history().unwrap().len();
+
+        let rolled = project.roll_edit(a.id, b.id, 1.0).unwrap();
+        assert_eq!((rolled.requested, rolled.applied, rolled.clamped), (1.0, 1.0, false));
+        assert_eq!(rolled.clips.iter().map(|x| x.id).collect::<Vec<_>>(), vec![a.id, b.id]);
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 15.0), (5.0, 21.0, 24.0), (8.0, 30.0, 34.0)]
+        );
+
+        let slipped = project.slip_clip(c.id, -2.0).unwrap();
+        assert_eq!(slipped.applied, -2.0);
+        assert_eq!(v1_layout(&project)[2], (8.0, 28.0, 32.0));
+
+        // `b` is now [5,8) and touches both neighbours.
+        let slid = project.slide_clip(b.id, 1.0).unwrap();
+        assert_eq!(slid.clips.iter().map(|x| x.id).collect::<Vec<_>>(), vec![a.id, b.id, c.id]);
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 16.0), (6.0, 21.0, 24.0), (9.0, 29.0, 32.0)]
+        );
+
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 3, "one revision per op");
+        let labels: Vec<_> = history[revisions..].iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Roll edit", "Slip clip", "Slide clip"]);
+    }
+
+    #[test]
+    fn the_three_exact_edit_modes_never_ripple_whatever_the_mode() {
+        let run = |ripple: bool| {
+            let (project, _, [a, b, c]) = abutting_project();
+            project.set_ripple_mode(ripple).unwrap();
+            project.roll_edit(a.id, b.id, -1.5).unwrap();
+            project.slip_clip(a.id, 3.0).unwrap();
+            // The last clip slid later carries the end of the track with it — the
+            // one place a ripple of the following clips could have been mistaken.
+            project.slide_clip(c.id, 2.0).unwrap();
+            project.slide_clip(b.id, -0.5).unwrap();
+            v1_layout(&project)
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn a_refused_edit_mode_records_no_revision() {
+        let (project, _, [a, b, c]) = abutting_project();
+        let revisions = project.history().unwrap().len();
+        let before = serde_json::to_string(&project.timeline().unwrap()).unwrap();
+
+        assert!(
+            matches!(project.roll_edit(a.id, c.id, 1.0), Err(Error::InvalidArgument(_))),
+            "not adjacent"
+        );
+        assert!(matches!(
+            project.roll_edit(a.id, Uuid::new_v4(), 1.0),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert!(matches!(project.slip_clip(a.id, 0.0), Err(Error::InvalidArgument(_))));
+        // `b` starts 20 s into a 60 s asset; a slip later that clamps to nothing is no edit.
+        project.slip_clip(b.id, 100.0).unwrap();
+        let revisions = revisions + 1;
+        assert!(matches!(project.slip_clip(b.id, 1.0), Err(Error::InvalidArgument(why)) if why.contains("no footage left")));
+        assert!(matches!(
+            project.split_remove(a.id, 50.0, SplitSide::Left),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), revisions);
+        assert_ne!(
+            serde_json::to_string(&project.timeline().unwrap()).unwrap(),
+            before,
+            "only the one slip landed"
+        );
+    }
+
+    #[test]
+    fn a_locked_track_refuses_every_edit_mode() {
+        let (project, _, [a, b, _]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        let revisions = project.history().unwrap().len();
+        let why = |r: Result<()>| match r {
+            Err(Error::InvalidArgument(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(why(project.roll_edit(a.id, b.id, 1.0).map(|_| ())).contains("locked"));
+        assert!(why(project.slip_clip(a.id, 1.0).map(|_| ())).contains("locked"));
+        assert!(why(project.slide_clip(b.id, 1.0).map(|_| ())).contains("locked"));
+        assert!(why(project.split_remove(a.id, 2.0, SplitSide::Left).map(|_| ())).contains("locked"));
+        assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    #[test]
+    fn edit_modes_clamp_a_still_to_nothing_but_the_neighbours() {
+        let (project, asset) = project_with_video_asset();
+        let mut image = project.require_asset(asset).unwrap();
+        image.id = Uuid::new_v4();
+        image.path = "/x.png".into();
+        image.name = "x.png".into();
+        image.duration = 5.0;
+        image.streams[0].image = true;
+        project.insert_asset(&image).unwrap();
+        let limits = project.source_limits().unwrap();
+        assert_eq!(limits[&asset], 60.0);
+        assert!(limits[&image.id].is_infinite());
+
+        let video = project.add_clip_to_timeline(asset, None, 10.0, 15.0, Some(0.0)).unwrap();
+        let still = project.add_clip_to_timeline(image.id, None, 0.0, 5.0, Some(5.0)).unwrap();
+        assert!(matches!(project.slip_clip(still.id, 1.0), Err(Error::InvalidArgument(why)) if why.contains("still")));
+        // Rolled earlier the still grows, its window staying at 0.
+        let out = project.roll_edit(video.id, still.id, -2.0).unwrap();
+        assert_eq!(out.applied, -2.0);
+        assert_eq!(v1_layout(&project)[1], (3.0, 0.0, 7.0));
+    }
+
+    #[test]
+    fn an_agents_edit_modes_are_staged_like_any_other_edit() {
+        let (mut project, _, [a, b, c]) = abutting_project();
+        let live = v1_layout(&project);
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project.roll_edit(a.id, b.id, 1.0).unwrap();
+        project.slip_clip(c.id, 1.0).unwrap();
+        project.slide_clip(b.id, 0.5).unwrap();
+        project.split_remove(c.id, 10.0, SplitSide::Right).unwrap();
+
+        assert_eq!(v1_layout(&project), live, "the live cut is untouched");
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(
+            staged.edits,
+            ["Roll edit", "Slip clip", "Slide clip", "Split and remove right"]
+        );
+        let proposal = project.working_timeline().unwrap();
+        assert_eq!(
+            proposal.clip(c.id).unwrap().source_in,
+            31.5,
+            "slipped by 1, then the slide trimmed half a second off its head"
+        );
+        assert!(!staged.diff.is_empty(), "the review card has something to show");
+    }
+
+    #[test]
+    fn a_staged_slip_alone_still_shows_up_in_the_review_diff() {
+        // A slip changes no timing at all, only which footage shows: a diff that
+        // missed it would read as an empty proposal and `apply_staged` would drop it.
+        let (mut project, _, [a, ..]) = abutting_project();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project.slip_clip(a.id, 2.0).unwrap();
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.diff.entries.len(), 1);
+        assert!(
+            staged.diff.summary().contains("Slipped clip on V1"),
+            "{}",
+            staged.diff.summary()
+        );
+    }
+
+    #[test]
+    fn split_remove_follows_ripple_mode_like_a_trim_and_keeps_the_clips_identity() {
+        let revisions = |project: &Project| project.history().unwrap().len();
+
+        // Off: a plain split-and-delete — the gap stays where the half was.
+        let (project, _, [a, b, c]) = abutting_project();
+        let before = revisions(&project);
+        let kept = project.split_remove(b.id, 6.0, SplitSide::Right).unwrap();
+        assert_eq!(kept.id, b.id);
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 14.0), (4.0, 20.0, 22.0), (8.0, 30.0, 34.0)]
+        );
+        assert_eq!(revisions(&project), before + 1);
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Split and remove right");
+        let _ = (a, c);
+
+        let (project, _, [_, b, _]) = abutting_project();
+        let kept = project.split_remove(b.id, 6.0, SplitSide::Left).unwrap();
+        assert_eq!((kept.timeline_start, kept.source_in), (6.0, 22.0));
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 14.0), (6.0, 22.0, 24.0), (8.0, 30.0, 34.0)]
+        );
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Split and remove left");
+
+        // On: the track closes up, and a left removal keeps the clip's own start.
+        let (project, _, [_, b, _]) = abutting_project();
+        project.set_ripple_mode(true).unwrap();
+        project.split_remove(b.id, 6.0, SplitSide::Right).unwrap();
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 14.0), (4.0, 20.0, 22.0), (6.0, 30.0, 34.0)]
+        );
+
+        let (project, _, [_, b, _]) = abutting_project();
+        project.set_ripple_mode(true).unwrap();
+        let kept = project.split_remove(b.id, 6.0, SplitSide::Left).unwrap();
+        assert_eq!(
+            kept.timeline_start, 4.0,
+            "handed back as it ended up, not as the edit alone made it"
+        );
+        assert_eq!(
+            v1_layout(&project),
+            vec![(0.0, 10.0, 14.0), (4.0, 22.0, 24.0), (6.0, 30.0, 34.0)]
+        );
+
+        // A per-call override, as every ripple-following edit takes.
+        let (project, _, [_, b, _]) = abutting_project();
+        project.set_ripple_mode(true).unwrap();
+        project
+            .with_ripple(Some(false), |p| p.split_remove(b.id, 6.0, SplitSide::Right))
+            .unwrap();
+        assert_eq!(v1_layout(&project)[2].0, 8.0);
     }
 }
