@@ -64,7 +64,9 @@ import {
 	FileText,
 	ChevronLeft,
 	ChevronRight,
-	PackageCheck
+	PackageCheck,
+	FoldHorizontal,
+	BetweenHorizontalStart
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -133,7 +135,9 @@ export const icons: Record<string, LucideIcon> = {
 	'file-text': FileText,
 	'chevron-left': ChevronLeft,
 	'chevron-right': ChevronRight,
-	'package-check': PackageCheck
+	'package-check': PackageCheck,
+	'fold-horizontal': FoldHorizontal,
+	'between-horizontal-start': BetweenHorizontalStart
 };
 
 export type IconName = keyof typeof icons;

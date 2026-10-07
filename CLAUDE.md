@@ -561,7 +561,31 @@ no editing logic in the adapter.
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
   per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, and its diff).
+  labels, `stale`, and its diff). **Ripple** is here too, pure + unit-tested:
+  `Timeline::ripple_from(before)` takes what an edit left behind and the cut it
+  started from and, per track, matched by **id** like `diff`, shifts the clips the
+  edit left *starting where they started* by the net change in length of what it
+  did ahead of them — a clip's length change (right trim, speed) or removal, or an
+  add that landed **on footage that was there** (an add that fits in free space,
+  and every append, moves nothing). It carries the rules that were bugs waiting:
+  a **left-edge trim keeps the clip's start** (the GUI commits it as `source_in`
+  *plus* a later `timeline_start` to hold the right edge; ripple keeps the start
+  and follows the length, so both forms give one result — only when the trim is
+  the whole edit on the track); a **split shifts nothing** (the new half is an add
+  over the footage the other half gave up, and they cancel); **moves never ripple**
+  (a clip that merely changed its start or track is not "footage ahead");
+  **clips the edit itself moved are not followers**, so an op that already closes
+  the gap is not shifted twice; tracks are **independent** (no sync lock — a V1
+  ripple leaves A1 where it is, which is why linked A/V is its own backlog item),
+  a **locked track never moves**, and overlays / markers do not move. It **never
+  produces an overlap**: if shifting would leave a touched clip overlapping
+  another or before 0 (an add that lands *inside* a clip would need a split), that
+  track is returned as the edit made it. `Timeline::move_clips` /
+  `remove_clips` are the pure, all-or-nothing multi-clip edits behind the
+  marquee: a `ClipMove` is a clip, an **absolute** start and an optional
+  same-kind track; the group is checked as a group (moving clips pass through the
+  places they are leaving, never onto each other or a clip that stays), and a
+  locked track, a start before 0 or a clip named twice refuses the lot.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -584,6 +608,21 @@ no editing logic in the adapter.
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
   edits go through `edit_timeline(|tl| ...)` which loads → mutates → saves the blob.
+  **Ripple mode** is a project flag (`ripple_mode` / `set_ripple_mode`, in `meta`
+  like `speech_model`: persisted with the file, default off, not an edit) that
+  `edit_timeline` honors for every op — it snapshots the timeline, runs the op,
+  and stores `after.ripple_from(&before)`, on the staged path too (so the review
+  diff shows the clips that followed). It is applied there, not per op, so a new
+  op ripples with no code of its own; with the flag off nothing is cloned and
+  nothing changes. `Project::with_ripple(Option<bool>, |p| ..)` forces it on/off
+  for the calls inside (`None` inherits) — how a tool takes an optional `ripple`
+  argument; `ripple_active()` is the effective answer. The ops that decide their
+  own layout go through `edit_timeline_exact` and never ripple: `ripple_delete`,
+  `cut_clip_range`, the beat snap, `reorder`, `move_clip(s)`, `insert_clips`.
+  `trim` re-reads its clip afterwards because a ripple can move it. A forced-on
+  `remove_clips` is the multi-select ripple delete. `move_clips` / `remove_clips`
+  are single revisions (`Move N clips` / `Remove N clips`), and — unlike the
+  single-clip ops, which leave locks to the GUI — refuse clips on a locked track.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
@@ -734,7 +773,27 @@ live in the GUI — that order matters, because the re-fetch the event triggers
 takes the same lock. `set_speech_model` emits `speech-model-changed` instead,
 which the webview listens for to re-read the transcription status: it reads that
 once at launch, and `project-changed` would re-fetch the timeline, history and
-task queue, none of which moved. Because agent edits **stage**, "live in the GUI" now means the
+task queue, none of which moved. `set_ripple_mode` is the same shape (it emits
+`ripple-mode-changed`, not `project-changed`: a flag, not an edit). **Ripple over
+MCP**: `get_ripple_mode` / `set_ripple_mode` read and write the project flag
+(the tool description warns that the latter flips the *user's* toolbar setting —
+a call that wants one different answer passes `ripple` instead), `move_clips`
+(`moves: [{clip_id, timeline_start, track_id?}]`, ids parsed by `clip_moves`) and
+`remove_clips` (`clip_ids`, answering `{removed, ripple_active, rippled,
+clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the clips
+standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
+attempt, skipped on a locked track and declined for a lane the shift would leave
+overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
+`remove_clips`, `add_clip_to_timeline`, `split_at`, `generate_voiceover`'s
+placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
+around the core call (omitted follows the project; `false` is the escape hatch); their
+descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
+the overlap.
+The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
+`snap_to_beats`, `move_clip`, `move_clips`, `reorder`, `duplicate_clips`) take
+none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
+pins against the generated schemas. The server `instructions` carry the ripple
+paragraph (check `get_ripple_mode` before trimming or removing). Because agent edits **stage**, "live in the GUI" now means the
 proposal appears for review, not that the cut changes: the read tools
 (`get_timeline_state`, `timeline_summary`, `preview_timeline`, `export`) go through
 `working_timeline`, so the agent sees the cut it is building, and
@@ -808,15 +867,19 @@ Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an objec
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
 `analysis-progress` per step), speech-to-text (`transcription_status`,
-`set_speech_model`, `download_speech_model` → emits `model-progress`), voiceover
+`set_speech_model`, `download_speech_model` → emits `model-progress`), ripple mode
+(`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
+that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
 `voiceover-progress`, `cancel_voiceover`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
-`ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
+`move_clips { moves }` (a group, one revision, all or nothing), `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
-width/height to clear it), `remove_clip`, `set_volume`, `set_fade`,
+width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
+(one revision; `ripple: true` is the multi-select ripple delete, via
+`with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
@@ -1244,6 +1307,60 @@ offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
 title drag.
+**Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
+a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
+project flag — read in `load()` (so launch, New and Open) and again on the
+`ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
+the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
+`aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
+ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
+All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
+no longer stopped by its neighbours (it pushes them — only the source's footage, the
+0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
+*outcome* (`rippleTrimPreview`: the trim applied to a scratch copy of the track, then
+`ripple.ts`'s `rippleFrom`), because a left-edge trim keeps the clip's start rather than
+holding the right edge — one ghost per clip it moves, the moved clips dimmed, red and
+inert if the backend would decline the ripple. The bounds are asked again at every move
+and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
+load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
+changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
+with several selected it shows an "N clips selected" note, since its sections act on that
+one): a click replaces, Ctrl/Cmd toggles, Shift extends along the primary's track (adds
+the clip when the primary is elsewhere), and a **marquee** (pointer tool; a drag from empty
+lane, the titles lane or the space under the tracks) selects every clip its rectangle
+touches — Shift adds, Ctrl/Cmd toggles — recomputed from the selection as the press found
+it so the rectangle can shrink (`marqueeSelect`; `marquee.ts` tests the rectangle, in lane
+space, against lane boxes measured from the DOM since the heights are CSS). Clips on a
+locked track are not swept up (locking guards edits, and the selection is what every edit
+acts on) but stay clickable. Escape mid-drag restores the selection; the click that ends (or follows an abandoned)
+marquee is swallowed — held until it arrives or the next press, not on a timer — so it
+does not seek and deselect; Escape otherwise clears (the page's
+handler — the timeline's and the preview's abandon-a-gesture handlers run in the capture
+phase and stop the event, so abandoning a drag never also clears). `#setTimeline` prunes
+ids another edit removed. *Group move*: pressing a selected clip of several keeps them
+(a click that never drags narrows to it), and dragging moves them all by the grabbed
+clip's Δt — its start is the one snapped and frame-quantized, its group's own edges being
+no magnet — plus one **lane offset applied within each kind's lanes** (`multi-move.ts`,
+`planMove`). Its checks are `Timeline::move_clips`' (group as a group, before 0 refused not
+clamped, locked or missing lane refused) and a property test replays random drags against
+`multi-edit.ts`'s mirror, so the verdict drawn while dragging is the backend's: one ghost
+per clip, red with the reason beside the pointer when refused (letting go then does
+nothing), and a valid drop is ONE `editor.moveClips` — one revision, one undo. Delete is
+`removeClips(ids)` (one revision; ripple follows the project's mode) and Shift+Delete
+forces ripple; a clip on a locked track is left alone and stays selected, and Cut
+(⌘/Ctrl+X) copies only what it can remove and says so when that is nothing (`ops.ts`
+`deleteSelection` / `cutSelection`). *Zoom*
+(`zoom.ts`): 0.05–2000 px/s, `ui.zoom` still px/s but stepped by ratio (+/-, buttons ×1.25)
+and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
+holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has
+been rewidened); **⇧Z / the fit button** fits the cut (`ui.zoomToFit()` bumps `fitEpoch`,
+since only the timeline knows its width). The ceiling comes down for a very long cut so the
+lane stays under 8 M px — the one thing a browser cannot lay out. Nothing else assumed a
+range: the waveform rung choice scales to any px/s (bottoming out at the engine's 2 ms
+bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
+label step follow the zoom and renders only the ticks in the visible window (hundreds,
+not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
+frame.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -1508,7 +1625,19 @@ is explorable in a plain browser via `bun run dev` (frames return `null` there �
 keeps its placeholder; `getWaveformRange` answers from `src/lib/sample-waveform.ts`, a
 deterministic stand-in shaped like the engine's pyramid read — stereo or mono per the
 asset, zeros outside the media, the analysis's silences as a noise floor, and a clipped
-stretch so the clipping colour is visible). This browser sample is a **dev harness only** — the desktop app always
+stretch so the clipping colour is visible). **Ripple in the harness is a port, not a
+lookalike**: `src/lib/ripple.ts` is the *faithful*, bun-tested mirror of
+`Timeline::ripple_from` (its test replays the Rust tests case for case, same clips and
+numbers, so a rule changed in kerf-core has to change there or a test names it) and
+`src/lib/multi-edit.ts` the same for `Timeline::move_clips` / `remove_clips` (same
+checks, same messages). `api.ts` keeps the project's ripple flag in the harness state
+(`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
+that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
+voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
+`rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
+beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
+reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
