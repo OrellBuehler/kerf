@@ -249,6 +249,84 @@ pub fn pix_fmt_layout(name: &str) -> Option<PixLayout> {
     }
 }
 
+/// The chroma subsampling of a picture's **native** pixel format, as base-2 shifts —
+/// the grid FFmpeg's `crop`, `pad` and Cover crop round a position to, because they
+/// run on the picture as it is (the conversion to 4:2:0 comes after them in the
+/// graph): even in both directions for 4:2:0, in width only for 4:2:2, and not at
+/// all for 4:4:4, gray or RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subsampling {
+    pub log2_w: u8,
+    pub log2_h: u8,
+}
+
+impl Subsampling {
+    /// 4:2:0 — what the compositor's planes are, and what most footage is.
+    pub const YUV420: Self = Self { log2_w: 1, log2_h: 1 };
+    /// No chroma subsampling (4:4:4, gray, RGB).
+    pub const NONE: Self = Self { log2_w: 0, log2_h: 0 };
+    /// Every grid a pixel format might have (4:1:1 and 4:1:0 included), for a
+    /// picture whose format is not known well enough to say which it is.
+    pub const ALL: [Self; 6] = [
+        Self::NONE,
+        Self { log2_w: 1, log2_h: 0 },
+        Self { log2_w: 0, log2_h: 1 },
+        Self::YUV420,
+        Self { log2_w: 2, log2_h: 0 },
+        Self { log2_w: 2, log2_h: 2 },
+    ];
+
+    /// `v` rounded down to a whole chroma column.
+    pub fn round_w(self, v: i64) -> i64 {
+        v & !((1i64 << self.log2_w) - 1)
+    }
+
+    /// `v` rounded down to a whole chroma row.
+    pub fn round_h(self, v: i64) -> i64 {
+        v & !((1i64 << self.log2_h) - 1)
+    }
+}
+
+/// The native chroma grid of a pixel format — what the first `crop` rounds its
+/// window to. It is a property of FFmpeg's pixel format descriptor, so the table is
+/// by name: planar YCbCr and gray / planar RGB at 8 to 16 bits, the semi-planar
+/// `nv*` / `p*` families, and byte-aligned packed RGB (`rgb24`, `bgr0`, ...). `None`
+/// for everything else — bit-packed and palettised RGB, packed YCbCr, alpha formats,
+/// a name nobody here has seen — where `crop` does more than round to a chroma grid,
+/// or nobody checked. `the_subsampling_table_matches_ffmpegs_crop` (an `#[ignore]`d
+/// test against the real binary) measures the table.
+pub fn pix_fmt_subsampling(name: &str) -> Option<Subsampling> {
+    let n = name.to_ascii_lowercase();
+    let t = n.strip_suffix("le").or_else(|| n.strip_suffix("be")).unwrap_or(&n);
+    // The semi-planar high-depth names carry their depth in the name itself.
+    match t {
+        "p010" | "p012" | "p016" => return Some(Subsampling::YUV420),
+        "p210" | "p212" | "p216" => return Some(Subsampling { log2_w: 1, log2_h: 0 }),
+        "p410" | "p412" | "p416" => return Some(Subsampling::NONE),
+        _ => {}
+    }
+    let digits = t.chars().rev().take_while(char::is_ascii_digit).count();
+    let (stem, tail) = t.split_at(t.len() - digits);
+    let (base, bits) = match tail.parse::<u32>() {
+        Ok(b) if stem.ends_with('p') || stem == "gray" => (stem, b),
+        _ => (t, 8),
+    };
+    let planar_depth = matches!(bits, 8 | 9 | 10 | 12 | 14 | 16);
+    match base {
+        "yuv420p" | "yuvj420p" if planar_depth => Some(Subsampling::YUV420),
+        "nv12" | "nv21" => Some(Subsampling::YUV420),
+        "yuv422p" | "yuvj422p" if planar_depth => Some(Subsampling { log2_w: 1, log2_h: 0 }),
+        "nv16" => Some(Subsampling { log2_w: 1, log2_h: 0 }),
+        "yuv440p" | "yuvj440p" if planar_depth => Some(Subsampling { log2_w: 0, log2_h: 1 }),
+        "yuv411p" | "yuvj411p" => Some(Subsampling { log2_w: 2, log2_h: 0 }),
+        "yuv410p" => Some(Subsampling { log2_w: 2, log2_h: 2 }),
+        "yuv444p" | "yuvj444p" | "gray" | "gbrp" if planar_depth => Some(Subsampling::NONE),
+        "nv24" | "nv42" => Some(Subsampling::NONE),
+        "rgb24" | "bgr24" | "rgb0" | "bgr0" | "0rgb" | "0bgr" | "rgb48" | "bgr48" => Some(Subsampling::NONE),
+        _ => None,
+    }
+}
+
 impl StreamInfo {
     /// Whether the picture has an alpha channel, when the probe recorded the
     /// pixel format: `Some(true)` for a format that carries one, `Some(false)` for
@@ -3603,6 +3681,49 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chroma_grid_follows_the_pixel_format() {
+        let sub = |w, h| Some(Subsampling { log2_w: w, log2_h: h });
+        for (name, want) in [
+            ("yuv420p", sub(1, 1)),
+            ("yuvj420p", sub(1, 1)),
+            ("yuv420p10le", sub(1, 1)),
+            ("yuv420p16le", sub(1, 1)),
+            ("nv12", sub(1, 1)),
+            ("p010le", sub(1, 1)),
+            ("yuv422p", sub(1, 0)),
+            ("yuv422p10le", sub(1, 0)),
+            ("nv16", sub(1, 0)),
+            ("p210le", sub(1, 0)),
+            ("yuv440p", sub(0, 1)),
+            ("yuv411p", sub(2, 0)),
+            ("yuv410p", sub(2, 2)),
+            ("yuv444p", sub(0, 0)),
+            ("yuv444p12le", sub(0, 0)),
+            ("p410le", sub(0, 0)),
+            ("gray", sub(0, 0)),
+            ("gray10le", sub(0, 0)),
+            ("gbrp", sub(0, 0)),
+            ("rgb24", sub(0, 0)),
+            ("bgr0", sub(0, 0)),
+            ("rgb48le", sub(0, 0)),
+            // Not byte-aligned, palettised, packed YCbCr, alpha, nonsense: not known.
+            ("rgb565le", None),
+            ("rgb4", None),
+            ("pal8", None),
+            ("uyvy422", None),
+            ("yuva420p", None),
+            ("yuv420p11le", None),
+            ("", None),
+        ] {
+            assert_eq!(pix_fmt_subsampling(name), want, "{name}");
+        }
+        // The rounding itself: down to a whole chroma sample.
+        assert_eq!((Subsampling::YUV420.round_w(11), Subsampling::YUV420.round_h(7)), (10, 6));
+        assert_eq!((Subsampling::NONE.round_w(11), Subsampling::NONE.round_h(7)), (11, 7));
+        assert_eq!(Subsampling { log2_w: 2, log2_h: 0 }.round_w(11), 8);
+    }
 
     #[test]
     fn the_pixel_format_allow_list_knows_opaque_formats_and_nothing_else() {

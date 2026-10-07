@@ -750,7 +750,10 @@ impl Compositor {
                     frame.width, frame.height, layer.stream.width, layer.stream.height
                 )));
             }
-            let geom = LayerGeometry::resolve((frame.width, frame.height), size, plan.canvas.fit, &layer.transform)
+            // The stream's size is the frame's (checked above), so the plan's own
+            // geometry — rounded to the picture's native chroma grid — is the one.
+            let geom = plan
+                .layer_geometry(layer, size)
                 .map_err(|e| GpuError::Unsupported(format!("layer {n}: {e}")))?;
             // wgpu raises a validation error for a texture over the device's
             // limit — a 10x zoom of a 4K layer would be one. Refuse it instead,
@@ -1134,8 +1137,11 @@ struct PlaneFilters {
 }
 
 /// A scale stage as one plane sees it. The chroma planes are half the size
-/// (rounded up) and are scaled on their own grid: the crop and Cover offsets are
-/// even by construction, so they halve exactly.
+/// (rounded up) and are scaled on their own grid. A crop or Cover offset is a whole
+/// chroma sample only for a 4:2:0 picture; for 4:2:2, 4:4:4, gray or RGB (rounded to
+/// their own, finer grid) it can be odd, and the chroma window then starts a luma
+/// pixel early (half a chroma sample): luma is placed exactly, chroma within that
+/// half sample — the decode has already averaged those pictures' chroma to 4:2:0.
 fn plane_stage(stage: &ScaleStage, chroma: bool) -> PlaneStage {
     if !chroma {
         return PlaneStage {

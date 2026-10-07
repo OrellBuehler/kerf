@@ -21,7 +21,9 @@ use uuid::Uuid;
 use crate::engine::{render_geometry, ExportOptions, Fit};
 use crate::error::{Error, Result};
 use crate::layer_geometry::LayerGeometry;
-use crate::model::{pix_fmt_layout, Asset, Clip, Color, PixLayout, StreamInfo, StreamKind, Timeline, Transform};
+use crate::model::{
+    pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, PixLayout, StreamInfo, StreamKind, Subsampling, Timeline, Transform,
+};
 
 /// A video clip visible at a timeline time, paired with where in its source the
 /// frame comes from.
@@ -138,6 +140,14 @@ pub enum CompositeColorPolicy {
     /// does not reproduce, so such a stack is refused. The matrix of a stack whose
     /// layers all agree follows their tag.
     BottomLayerTag,
+    /// The probe could not tell which of the two this FFmpeg is (it would not run,
+    /// timed out, or answered something unreadable) — and no guess is safe: the
+    /// two disagree exactly on BT.709 and BT.2020 footage, so drawing it under
+    /// either would be wrong on the FFmpeg the other describes. What both agree on
+    /// is a stack whose layers are all BT.601-class (BT.601, SMPTE 170M, BT.470 BG,
+    /// untagged, RGB): that is drawn, as BT.601, and **everything else is
+    /// refused**, so the frame goes through FFmpeg.
+    Unknown,
 }
 
 /// The steepest shrink of one scale stage the compositor claims to match: swscale's
@@ -225,6 +235,22 @@ impl PlanStream {
         }
     }
 
+    /// The native chroma grid `crop`, `pad` and the Cover crop round to for this
+    /// picture ([`pix_fmt_subsampling`]); `None` when the pixel format was never
+    /// recorded or is not one whose rounding was measured.
+    pub fn subsampling(&self) -> Option<Subsampling> {
+        self.pix_fmt.as_deref().and_then(pix_fmt_subsampling)
+    }
+
+    /// Whether the picture may be full range: ffprobe names every full-range 4:2:0 /
+    /// 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`),
+    /// and an asset that never recorded its format is not known not to be.
+    pub fn maybe_full_range(&self) -> bool {
+        self.pix_fmt
+            .as_deref()
+            .is_none_or(|f| f.to_ascii_lowercase().starts_with("yuvj"))
+    }
+
     /// An RGB-family picture (see [`PixLayout::Rgb`]).
     pub fn is_rgb(&self) -> bool {
         self.layout() == Some(PixLayout::Rgb)
@@ -286,6 +312,8 @@ pub struct RenderPlan {
 /// matrices are refused, as is a layer whose matrix is unknown, and an RGB picture
 /// in a stack that is not BT.601 (the converter that makes it YCbCr takes whatever
 /// matrix the neighbours negotiated, and the result depends on the order).
+/// [`CompositeColorPolicy::Unknown`] draws only what those two agree on — a stack
+/// that is BT.601 throughout — and refuses a stack of any other matrix.
 fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsupported: &mut Vec<String>) -> YuvMatrix {
     if policy == CompositeColorPolicy::FixedBt601 {
         return YuvMatrix::Bt601;
@@ -316,6 +344,11 @@ fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsuppor
         );
     }
     let matrix = shared.unwrap_or(YuvMatrix::Bt601);
+    if policy == CompositeColorPolicy::Unknown && matrix != YuvMatrix::Bt601 {
+        unsupported.push(format!(
+            "a {matrix:?} stack, and this FFmpeg's composite colour policy could not be measured (FFmpeg 6 and 9 convert BT.709 and BT.2020 footage differently)"
+        ));
+    }
     if rgb && matrix != YuvMatrix::Bt601 {
         unsupported.push(format!(
             "an RGB picture in a {matrix:?} stack: FFmpeg converts it with the stack's matrix, which is not reproduced"
@@ -389,6 +422,21 @@ impl RenderPlan {
                     }
                 ));
             }
+            // Colour correction (`eq`) runs on the picture as it is in the graph. FFmpeg 9
+            // hands it a full-range picture's raw values and converts the range later;
+            // the compositor converts to limited range first, as the decode does. The
+            // results differ (34 to 42 dB on a graded `yuvj420p` clip, in every knob),
+            // so a full-range picture is not graded on the GPU — and a picture whose
+            // format was never recorded is not known not to be full-range.
+            if !clip.color.is_identity() && stream.maybe_full_range() {
+                unsupported.push(format!(
+                    "{label}: colour correction on {}",
+                    match stream.pix_fmt.as_deref() {
+                        Some(f) => format!("a full-range picture ({f}), which FFmpeg grades before converting its range"),
+                        None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
+                    }
+                ));
+            }
             if !clip.effects.is_empty() {
                 unsupported.push(format!("{label}: video effects"));
             }
@@ -442,6 +490,20 @@ impl RenderPlan {
         }
 
         let matrix = composite_matrix(&layers, color, &mut unsupported);
+        // FFmpeg 9 negotiates the *range* along the overlay chain as it does the matrix:
+        // the bottom layer's decides, and a graded layer above a full-range picture is
+        // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
+        // the composite's colour is negotiated, or not known, grading in a stack that
+        // holds a full-range picture is FFmpeg's.
+        if color != CompositeColorPolicy::FixedBt601 && layers.iter().any(|l| l.stream.maybe_full_range()) {
+            for (n, layer) in layers.iter().enumerate() {
+                if !layer.color.is_identity() && !layer.stream.maybe_full_range() {
+                    unsupported.push(format!(
+                        "layer {n}: colour correction in a stack with a full-range picture, whose range FFmpeg negotiates across the layers"
+                    ));
+                }
+            }
+        }
 
         Ok(RenderPlan {
             time: t,
@@ -460,7 +522,7 @@ impl RenderPlan {
     /// Whether the compositor draws this frame exactly, **judged without the render
     /// size**. `false` means "render it through FFmpeg"; [`RenderPlan::unsupported_reasons`]
     /// says why. A `true` is necessary, not sufficient: what depends on the size the
-    /// frame is rendered at (an enlargement of a picture whose chroma is not 4:2:0, a
+    /// frame is rendered at (a resize of a picture whose chroma is not 4:2:0, a
     /// translucent layer of odd size, a crop that leaves nothing) is
     /// [`RenderPlan::gpu_supported_at`]'s.
     pub fn gpu_supported(&self) -> bool {
@@ -473,20 +535,23 @@ impl RenderPlan {
     pub fn unsupported_reasons_at(&self, size: (u32, u32)) -> Vec<String> {
         let mut reasons = self.unsupported.clone();
         for (n, layer) in self.layers.iter().enumerate() {
-            let src = (layer.stream.width, layer.stream.height);
-            let geom = match LayerGeometry::resolve(src, size, self.canvas.fit, &layer.transform) {
+            let geom = match self.layer_geometry(layer, size) {
                 Ok(g) => g,
                 Err(e) => {
                     reasons.push(format!("layer {n}: {e}"));
                     continue;
                 }
             };
-            // FFmpeg scales a picture in the format it has; the compositor scales
-            // the 8-bit 4:2:0 a decode reduces it to. Shrinking agrees (the chroma
-            // that is thrown away is thrown away either way); enlarging does not —
-            // FFmpeg interpolates real chroma where the compositor interpolates
-            // chroma that was already averaged away (a 2x enlargement of 4:4:4 is 27
-            // levels off, of RGB 69). An unrecorded format is not known to be 4:2:0.
+            // FFmpeg scales a picture in the format it has; the compositor scales the
+            // 8-bit 4:2:0 a decode reduces it to, which is the same picture only when
+            // that is what it already was (or gray, which has no chroma). For anything
+            // else the chroma is interpolated from different samples — FFmpeg's real
+            // ones, the compositor's already averaged away: a 2x enlargement of 4:4:4
+            // is 27 levels off, of RGB 69, and a shrink as mild as 1.05-1.5x still
+            // reads flat max 8-9 (4:2:2 at 0.9x is over the limit) and 32 levels on
+            // edges. No band of ratios was measured strictly inside the limits on both
+            // FFmpegs for busy chroma, so none is claimed: any resize is FFmpeg's. An
+            // unrecorded format is not known to be 4:2:0.
             if let Some(stage) = geom
                 .stages
                 .iter()
@@ -497,11 +562,11 @@ impl RenderPlan {
                     stage.src.w, stage.src.h, stage.scaled.0, stage.scaled.1
                 ));
             }
-            let enlarging = geom.stages.iter().find(|s| s.scaled.0 > s.src.w || s.scaled.1 > s.src.h);
-            if let Some(stage) = enlarging.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
+            let resizing = geom.stages.iter().find(|s| s.scaled != (s.src.w, s.src.h));
+            if let Some(stage) = resizing.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
             {
                 reasons.push(format!(
-                    "layer {n}: enlarges a {}x{} picture to {}x{}, and its format ({}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales natively",
+                    "layer {n}: scales a {}x{} picture to {}x{}, and its format ({}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales in its own format",
                     stage.src.w,
                     stage.src.h,
                     stage.scaled.0,
@@ -511,6 +576,43 @@ impl RenderPlan {
             }
         }
         reasons
+    }
+
+    /// Where a layer's picture lands when the frame is rendered at `size`, worked out
+    /// the way FFmpeg's `crop` / `scale` / `pad` / `overlay` work it out.
+    ///
+    /// The first `crop` rounds to the picture's **native** chroma grid
+    /// ([`PlanStream::subsampling`]), and so does the Cover crop when the transform's
+    /// own `scale` follows it; the chain converts to 4:2:0 in its last `scale`, so
+    /// `pad` and the Cover crop of a single-`scale` chain are on the 4:2:0 grid. The
+    /// compositor's planes are 4:2:0, so a layer whose chroma is finer than that can
+    /// be placed exactly only where the two grids agree: luma is always
+    /// exact, but a crop window that starts or ends between two 4:2:0 chroma samples
+    /// of a 4:2:2, 4:4:4 or RGB picture puts its chroma a pixel off (measured 30 to
+    /// 38 dB over the whole frame) — refused, unless the picture is gray and has no
+    /// chroma to misplace. A picture whose grid is not known is accepted only where
+    /// every grid gives the same geometry ([`LayerGeometry::resolve_any_grid`]).
+    pub fn layer_geometry(
+        &self,
+        layer: &PlanLayer,
+        size: (u32, u32),
+    ) -> std::result::Result<LayerGeometry, crate::layer_geometry::GeometryError> {
+        let src = (layer.stream.width, layer.stream.height);
+        let (fit, tf) = (self.canvas.fit, &layer.transform);
+        let Some(native) = layer.stream.subsampling() else {
+            return LayerGeometry::resolve_any_grid(src, size, fit, tf);
+        };
+        let geom = LayerGeometry::resolve(src, size, fit, tf, native)?;
+        if native != Subsampling::YUV420
+            && layer.stream.layout() != Some(PixLayout::Gray)
+            && geom != LayerGeometry::resolve(src, size, fit, tf, Subsampling::YUV420)?
+        {
+            return Err(crate::layer_geometry::GeometryError(format!(
+                "its crop window or Cover offset starts or ends between two 4:2:0 chroma samples of a picture whose chroma is finer ({}), which the compositor's 4:2:0 planes cannot place",
+                layer.stream.pix_fmt.as_deref().unwrap_or("?")
+            )));
+        }
+        Ok(geom)
     }
 
     /// Whether the compositor draws this frame exactly when rendered at `size`.
@@ -969,6 +1071,49 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_that_could_not_be_measured_draws_only_what_every_ffmpeg_agrees_on() {
+        use CompositeColorPolicy::Unknown as U;
+        // FFmpeg 6 and 9 both convert a BT.601-class stack as BT.601: drawn.
+        for tag in [None, Some("smpte170m"), Some("bt470bg")] {
+            let p = stack(U, &[("yuv420p", tag), ("yuv444p", tag), ("rgb24", None), ("gray", tag)]);
+            assert_eq!(
+                (p.canvas.matrix, p.gpu_supported()),
+                (YuvMatrix::Bt601, true),
+                "{tag:?}: {:?}",
+                p.unsupported_reasons()
+            );
+        }
+        // BT.709 and BT.2020 are what the two disagree on, so no guess is safe: a
+        // single such layer sends the frame to FFmpeg, whichever FFmpeg it is.
+        for tag in ["bt709", "bt2020nc"] {
+            let p = stack(U, &[("yuv420p", Some(tag))]);
+            assert!(!p.gpu_supported(), "{tag}");
+            assert!(
+                p.unsupported_reasons().iter().any(|r| r.contains("could not be measured")),
+                "{tag}: {:?}",
+                p.unsupported_reasons()
+            );
+            let p = stack(U, &[("yuv420p", None), ("yuv420p", Some(tag))]);
+            assert!(!p.gpu_supported(), "{tag} over untagged");
+            let p = stack(U, &[("yuv420p", Some(tag)), ("yuv420p", None)]);
+            assert!(!p.gpu_supported(), "{tag} under untagged");
+        }
+        // The same stacks that are drawn under the policy that is measured.
+        let p = stack(CompositeColorPolicy::FixedBt601, &[("yuv420p", Some("bt709"))]);
+        assert!(p.gpu_supported());
+        // An asset that never recorded its tags is not known to be BT.601.
+        let (ok, why) = {
+            let mut v = video(640, 360);
+            v.pix_fmt = None;
+            let a = asset("a", 20.0, vec![v]);
+            let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            let p = RenderPlan::at(&tl, &[a], &ExportOptions::default(), 1.0, U).unwrap();
+            (p.gpu_supported(), p.unsupported_reasons().to_vec())
+        };
+        assert!(!ok && why.iter().any(|r| r.contains("matrix is unknown")), "{why:?}");
+    }
+
+    #[test]
     fn an_asset_that_never_recorded_its_pixel_format_has_an_unknown_matrix() {
         // `color_space: None` means "untagged" for a recorded asset and "not read
         // yet" for an old one: BT.709 footage from an old project at opacity < 1
@@ -1017,8 +1162,9 @@ mod tests {
             let tl = timeline(vec![vec![c]]);
             plan(&tl, std::slice::from_ref(&a), 1.0)
         };
-        // Enlarging a picture FFmpeg scales natively in another format is refused;
-        // 4:2:0 and gray are not, and shrinking is not, whatever the format.
+        // Resizing a picture FFmpeg scales in another format is refused — enlarging
+        // and shrinking alike, a mild shrink included; 4:2:0 and gray are not, and
+        // neither is a picture left at its size, whatever the format.
         for (fmt, scale, refused) in [
             ("yuv420p", 2.0, false),
             ("yuv420p10le", 2.0, false),
@@ -1029,18 +1175,27 @@ mod tests {
             ("rgb24", 2.0, true),
             ("yuv420p12le", 2.0, true),
             ("yuv444p", 1.0, false),
-            ("yuv444p", 0.5, false),
-            ("rgb24", 0.5, false),
+            ("yuv444p", 0.5, true),
+            ("yuv444p", 0.9, true),
+            ("yuv422p", 0.9, true),
+            ("rgb24", 0.5, true),
+            ("yuv420p", 0.5, false),
+            ("yuv420p10le", 0.9, false),
+            ("gray", 0.5, false),
         ] {
             let p = with_fmt(Some(fmt), scale, 1.0);
             let why = p.unsupported_reasons_at(p.size(u32::MAX));
             assert_eq!(!why.is_empty(), refused, "{fmt} x{scale}: {why:?}");
         }
-        // A format that was never recorded is not known to be 4:2:0.
-        let p = with_fmt(None, 2.0, 1.0);
-        assert!(!p.gpu_supported_at(p.size(u32::MAX)));
-        // The size decides: the same 640x360 source into a 1920x1080 frame is an
-        // enlargement at full size and a plain copy at preview width 640.
+        // A format that was never recorded is not known to be 4:2:0, in either direction.
+        for scale in [2.0, 0.5] {
+            let p = with_fmt(None, scale, 1.0);
+            assert!(!p.gpu_supported_at(p.size(u32::MAX)), "x{scale}");
+        }
+        let p = with_fmt(None, 1.0, 1.0);
+        assert!(p.gpu_supported_at(p.size(u32::MAX)));
+        // The size decides: the same 640x360 source into a 1920x1080 frame is a
+        // resize at full size and a plain copy at preview width 640.
         let a = {
             let mut v = video(640, 360);
             v.pix_fmt = Some("yuv444p".into());
@@ -1067,6 +1222,116 @@ mod tests {
         assert!(why.iter().any(|r| r.contains("odd size")), "{why:?}");
         let p = with_fmt(Some("yuv420p"), 0.5, 0.5);
         assert!(p.gpu_supported_at(p.size(u32::MAX)));
+    }
+
+    #[test]
+    fn colour_correction_on_a_full_range_picture_is_refused() {
+        let graded = |fmt: Option<&str>, grade: bool| {
+            supported_with(|tl, a| {
+                a.streams[0].pix_fmt = fmt.map(Into::into);
+                if grade {
+                    tl.tracks[0].clips[0].color.gamma = 1.4;
+                }
+            })
+        };
+        // A graded `yuvj420p` clip (a JPEG, an mjpeg or full-range H.264 file — ffprobe
+        // names all of them so) is FFmpeg's: 34 to 42 dB off on FFmpeg 9.
+        let (ok, why) = graded(Some("yuvj420p"), true);
+        assert!(!ok && why.iter().any(|r| r.contains("full-range")), "{why:?}");
+        // Ungraded, it is drawn (the compositor converts the range as the decode does)...
+        let (ok, why) = graded(Some("yuvj420p"), false);
+        assert!(ok, "{why:?}");
+        // ...and a graded limited-range clip is.
+        let (ok, why) = graded(Some("yuv420p"), true);
+        assert!(ok, "{why:?}");
+        // An asset that never recorded its format is not known not to be full range.
+        let (ok, why) = graded(None, true);
+        assert!(!ok && why.iter().any(|r| r.contains("never recorded")), "{why:?}");
+        let (ok, why) = graded(None, false);
+        assert!(ok, "{why:?}");
+    }
+
+    #[test]
+    fn grading_in_a_stack_with_a_full_range_picture_is_refused_where_range_is_negotiated() {
+        let stacked = |policy: CompositeColorPolicy, bottom: &str, top: &str, graded_top: bool| {
+            let mut vb = video(640, 360);
+            vb.pix_fmt = Some(bottom.into());
+            let mut vt = video(640, 360);
+            vt.pix_fmt = Some(top.into());
+            let (ab, at) = (asset("b", 20.0, vec![vb]), asset("t", 20.0, vec![vt]));
+            let mut ct = Clip::new(at.id, 0.0, 10.0, 0.0);
+            if graded_top {
+                ct.color.gamma = 1.4;
+            }
+            let tl = timeline(vec![vec![Clip::new(ab.id, 0.0, 10.0, 0.0)], vec![ct]]);
+            let p = RenderPlan::at(&tl, &[ab, at], &ExportOptions::default(), 1.0, policy).unwrap();
+            p.unsupported_reasons().to_vec()
+        };
+        let refused = |why: &[String]| why.iter().any(|r| r.contains("stack with a full-range picture"));
+        use CompositeColorPolicy::{BottomLayerTag, FixedBt601, Unknown};
+        // FFmpeg 9: a graded limited-range layer above (or below) a full-range one.
+        assert!(refused(&stacked(BottomLayerTag, "yuvj420p", "yuv420p", true)));
+        assert!(refused(&stacked(Unknown, "yuvj420p", "yuv420p", true)));
+        // ...exact where nothing is graded, and where nothing is full range.
+        assert!(!refused(&stacked(BottomLayerTag, "yuvj420p", "yuv420p", false)));
+        assert!(!refused(&stacked(BottomLayerTag, "yuv420p", "yuv420p", true)));
+        // FFmpeg 6 does not negotiate it: measured exact.
+        assert!(!refused(&stacked(FixedBt601, "yuvj420p", "yuv420p", true)));
+    }
+
+    #[test]
+    fn a_crop_between_420_chroma_samples_of_a_finer_picture_is_refused() {
+        let planned = |fmt: Option<&str>, crop: (f64, f64)| {
+            let mut v = video(640, 360);
+            v.pix_fmt = fmt.map(Into::into);
+            let a = asset("a", 20.0, vec![v]);
+            let mut c = Clip::new(a.id, 0.0, 10.0, 0.0);
+            // Windows of 640 x 360 starting at (crop.0, crop.1) pixels; the right
+            // and bottom edges are left alone, so the window is as odd as its origin.
+            c.transform.crop_left = crop.0 / 640.0;
+            c.transform.crop_top = crop.1 / 360.0;
+            let mut tl = timeline(vec![vec![c]]);
+            tl.format = Some(crate::model::Delivery::new(320, 180, Fit::Contain));
+            let p = plan(&tl, std::slice::from_ref(&a), 1.0);
+            p.unsupported_reasons_at(p.size(u32::MAX))
+        };
+        let refused = |why: &[String]| why.iter().any(|r| r.contains("4:2:0 chroma samples"));
+        // (format, x odd?, y odd?) -> refused? A picture is placed exactly where
+        // FFmpeg's native rounding and the 4:2:0 planes agree.
+        for (fmt, odd_x, odd_y, want) in [
+            ("yuv420p", true, true, false),
+            ("yuv420p10le", true, true, false),
+            // 4:2:2 rounds columns to even like 4:2:0, and keeps odd rows.
+            ("yuv422p", true, false, false),
+            ("yuv422p", false, true, true),
+            ("yuv422p", true, true, true),
+            ("yuv444p", true, false, true),
+            ("yuv444p", false, true, true),
+            ("bgr0", true, true, true),
+            ("rgb24", false, true, true),
+            // Gray has no chroma to misplace: luma is exact on any window.
+            ("gray", true, true, false),
+            // Nothing odd, nothing to round: drawn whatever the format.
+            ("yuv444p", false, false, false),
+            ("rgb24", false, false, false),
+        ] {
+            let why = planned(Some(fmt), (if odd_x { 11.0 } else { 10.0 }, if odd_y { 7.0 } else { 6.0 }));
+            assert_eq!(refused(&why), want, "{fmt} odd_x={odd_x} odd_y={odd_y}: {why:?}");
+        }
+        // A format that was never recorded, or whose rounding was not measured, is
+        // refused wherever the grids disagree.
+        let why = planned(None, (11.0, 7.0));
+        assert!(why.iter().any(|r| r.contains("rounds differently")), "{why:?}");
+        // (A format off the table: bit-packed RGB has more to its crop than a grid.)
+        let why = planned(Some("rgb565le"), (11.0, 7.0));
+        assert!(why.iter().any(|r| r.contains("rounds differently")), "{why:?}");
+        // 10-bit 4:4:4 is on it, and is refused as the 8-bit one is.
+        let why = planned(Some("yuv444p10le"), (11.0, 7.0));
+        assert!(refused(&why), "{why:?}");
+        // (The frame is a resize of the picture, which is refused for another reason;
+        // what is asserted is that nothing about the crop is.)
+        let why = planned(None, (0.0, 0.0));
+        assert!(!why.iter().any(|r| r.contains("rounds differently")), "{why:?}");
     }
 
     #[test]

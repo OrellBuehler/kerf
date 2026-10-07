@@ -73,6 +73,14 @@
 //!   mixed tags are asserted **refused by the plan** (`check_mixed`), because the
 //!   conversion FFmpeg makes of the other layers is not reproduced.
 //!
+//! * **`Unknown`** is what the probe answers when it could not read the FFmpeg (it
+//!   would not run, timed out, or its probe clip lost its tag): neither policy is a
+//!   safe guess, because they differ on exactly BT.709 and BT.2020 footage. The plan
+//!   then draws only stacks that are BT.601 throughout and refuses the rest. The
+//!   harness never runs against it by accident — `policy()` stops if the probe
+//!   comes back `Unknown` — and forces it where it is the subject
+//!   (`an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on`).
+//!
 //! Either way the case is *judged*: a figure that is not FFmpeg's is a failure
 //! when the plan said it could draw the frame, and a refusal is asserted rather
 //! than assumed.
@@ -89,11 +97,32 @@
 //!   once the render size is known): FFmpeg's chroma pairing reads uninitialised
 //!   padding past an odd picture. A translucent layer whose matrix is unknown (an
 //!   asset that never recorded its pixel format) is refused too.
-//! * **Enlarging a picture that is not 4:2:0** (4:2:2, 4:4:4, RGB, 12-bit) is
-//!   refused: FFmpeg scales in the format the picture has, the decode reduces it
-//!   to 8-bit 4:2:0 first, and the two disagree by 15 to 69 levels on an
-//!   enlargement (`enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused`).
-//!   Shrinking and 1:1 agree for every format.
+//! * **A crop of a picture whose chroma is finer than 4:2:0's** is placed exactly
+//!   only where the two grids agree. The first `crop` rounds to the picture's
+//!   *native* chroma grid (even for 4:2:0, even columns for 4:2:2, nothing for 4:4:4,
+//!   gray or RGB); the chain converts to 4:2:0 in its *last* `scale`, so `pad` and the
+//!   Cover crop of a one-`scale` chain are on the 4:2:0 grid for every source, while a
+//!   Cover crop followed by the transform's own `scale` is on the native one
+//!   (`crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one`). The
+//!   compositor's planes are 4:2:0: luma lands exactly, but the chroma of a 4:2:2,
+//!   4:4:4 or RGB picture positioned between two 4:2:0 samples is a pixel off (30 to
+//!   38 dB over the frame), so the plan refuses it. Gray has no chroma to misplace
+//!   and is drawn exactly.
+//! * **Colour correction and full range.** The decode converts a full-range
+//!   (`yuvj420p`) picture to limited range first; FFmpeg 9 grades the raw full-range
+//!   values and converts last (34 to 44 dB apart, every knob; FFmpeg 6 agrees). A
+//!   graded `yuvj` picture is refused, as is a graded layer in a stack with one under
+//!   a negotiating policy (`grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn`).
+//! * **Resizing a picture that is not 4:2:0 (8/10-bit) or gray** (4:2:2, 4:4:4, RGB,
+//!   12-bit, or a format never recorded) is refused, in both directions. FFmpeg scales
+//!   in the format the picture has, the decode reduces it to 8-bit 4:2:0 first, and the
+//!   chroma is then interpolated from different samples: enlarging was 15 to 69 levels
+//!   off, and a *shrink* as mild as 1.05x to 1.5x reads flat max 8 to 9 (4:2:2 at 0.9x
+//!   is over the limit) and up to 32 levels on edges, the kernels differing most near
+//!   a ratio of 1. No band of ratios was measured strictly inside the limits on both
+//!   FFmpegs for busy chroma, so none is claimed
+//!   (`resizing_a_picture_ffmpeg_scales_in_another_format_is_refused`). A picture left
+//!   at its size is drawn for every format.
 //! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
 //!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
 //!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
@@ -118,8 +147,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use kerf_core::{
     export_still, Asset, Clip, Color, CompositeColorPolicy, Delivery, ExportOptions, Fit, ImageFormat, Keyframe, Project,
-    RenderPlan, StreamKind, Timeline, Track, Transform,
+    RenderPlan, StreamKind, Subsampling, Timeline, Track, Transform,
 };
+use kerf_gpu::geometry::LayerGeometry;
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
 
 // ---- thresholds (final values; the recorded numbers are at the bottom) ------
@@ -156,8 +186,8 @@ const PSNR_ALL_MIN_ROTATED: f64 = 30.0;
 
 /// The least share of a frame that must lie outside the edge band, so the strict
 /// flat check judges at least half of every ordinary case. The recorded cases sit
-/// between 70% and 100% flat (the busiest, a shrink to 320x180, 70.1%); a case
-/// below this is [`BUSY`] and says so.
+/// between 57% and 100% flat (the busiest, the 202x100 Cover frames of the `grid/`
+/// cases, 56.9%); a case below this is [`BUSY`] and says so.
 const FLAT_SHARE_MIN: f64 = 0.5;
 
 /// The scaler comparison's bounds, on the planes themselves (levels of 255). Up to
@@ -247,9 +277,36 @@ fn compositor() -> &'static Compositor {
     C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
 }
 
+thread_local! {
+    /// A policy a test forces on its own thread (see [`with_policy`]).
+    static FORCED_POLICY: std::cell::Cell<Option<CompositeColorPolicy>> = const { std::cell::Cell::new(None) };
+}
+
 /// How this FFmpeg picks the composite's matrix (probed from the real graph, once).
+/// The harness never runs against a guess: if the probe could not read this FFmpeg,
+/// every case would be judged against `Unknown`'s refusals rather than against the
+/// behaviour under test, so it stops here instead (a test that wants `Unknown`
+/// forces it with [`with_policy`]).
 fn policy() -> CompositeColorPolicy {
-    kerf_core::composite_color_policy()
+    if let Some(forced) = FORCED_POLICY.with(std::cell::Cell::get) {
+        return forced;
+    }
+    let measured = kerf_core::composite_color_policy();
+    assert_ne!(
+        measured,
+        CompositeColorPolicy::Unknown,
+        "the composite colour probe could not read this FFmpeg ({}): the parity cases would be judged against a guess",
+        kerf_core::ffmpeg_path()
+    );
+    measured
+}
+
+/// Run `f` with `policy` in force on this thread, whatever the FFmpeg is.
+fn with_policy<T>(forced: CompositeColorPolicy, f: impl FnOnce() -> T) -> T {
+    let before = FORCED_POLICY.with(|p| p.replace(Some(forced)));
+    let out = f();
+    FORCED_POLICY.with(|p| p.set(before));
+    out
 }
 
 fn target_dir() -> PathBuf {
@@ -1379,22 +1436,44 @@ fn still_images() {
     // composite works in (FFmpeg does it in the graph; the decode does it here).
     let tl = timeline(vec![vec![clip(&m.jpeg, 0.0, 5.0, 0.0)]], None);
     check("still/jpeg", &tl, std::slice::from_ref(&m.jpeg), &[1.0], STRICT);
-    // On top of video, scaled (a 640x360 PNG: a smaller one fitted into this frame
-    // would be an enlargement of an RGB picture, which is refused).
-    let mut pic = clip(&m.png640, 0.0, 5.0, 0.0);
-    pic.transform = Transform {
+    // On top of video, scaled: a JPEG (4:2:0). A PNG is RGB, and resizing a picture
+    // that is not 4:2:0 is refused — so a PNG goes *under* the video, at its own size,
+    // and a PNG pip is asserted refused.
+    let pip = Transform {
         scale: 0.5,
         pos_x: -0.2,
         pos_y: -0.2,
         ..Transform::default()
     };
+    let mut pic = clip(&m.jpeg, 0.0, 5.0, 0.0);
+    pic.transform = pip;
     let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pic]], None);
     check(
         "still/pip-over-video",
         &tl,
-        &[m.gradient.clone(), m.png640.clone()],
+        &[m.gradient.clone(), m.jpeg.clone()],
         &[1.0],
         STRICT,
+    );
+    let mut video_pip = clip(&m.gradient, 0.0, 2.0, 0.0);
+    video_pip.transform = pip;
+    let tl = timeline(vec![vec![clip(&m.png640, 0.0, 5.0, 0.0)], vec![video_pip]], None);
+    check(
+        "still/png-under-video-pip",
+        &tl,
+        &[m.png640.clone(), m.gradient.clone()],
+        &[1.0],
+        STRICT,
+    );
+    let mut png_pip = clip(&m.png640, 0.0, 5.0, 0.0);
+    png_pip.transform = pip;
+    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![png_pip]], None);
+    check_refused(
+        "still/png-pip-over-video",
+        &tl,
+        &[m.gradient.clone(), m.png640.clone()],
+        1.0,
+        Refusal::Plan("scales a"),
     );
 }
 
@@ -1699,6 +1778,7 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
             0.5,
             Refusal::Plan("matrix is unknown"),
         ),
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
     // A translucent layer with an odd side (0.33 of a 640x360 is 211x118): FFmpeg's
     // RGB round trip reads uninitialised padding past the picture there.
@@ -1757,6 +1837,7 @@ fn check_mixed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reaso
         CompositeColorPolicy::BottomLayerTag => {
             check_refused(&format!("{case} (negotiated)"), tl, assets, times[0], Refusal::Plan(reason));
         }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
 }
 
@@ -1820,21 +1901,22 @@ fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
         let tl = timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
         check_mixed(name, &tl, &[base.clone(), top.clone()], &[0.5], "different YCbCr matrices");
     }
-    // An RGB picture (a PNG) among untagged layers is nothing special; among tagged
+    // An RGB picture (a PNG, at its own size: it is under the pip, since resizing an
+    // RGB picture is refused) among untagged layers is nothing special; among tagged
     // ones FFmpeg converts it with the negotiated matrix.
-    let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip(&m.png640)]], None);
+    let tl = timeline(vec![vec![clip(&m.png640, 0.0, 2.0, 0.0)], vec![pip(&m.gradient)]], None);
     check(
-        "matrix/rgb-png-over-untagged",
+        "matrix/rgb-png-under-untagged",
         &tl,
-        &[m.gradient.clone(), m.png640.clone()],
+        &[m.png640.clone(), m.gradient.clone()],
         &[0.5],
         STRICT,
     );
-    let tl = timeline(vec![vec![clip(&m.gradient709, 0.0, 2.0, 0.0)], vec![pip(&m.png640)]], None);
+    let tl = timeline(vec![vec![clip(&m.png640, 0.0, 2.0, 0.0)], vec![pip(&m.gradient709)]], None);
     check_mixed(
-        "matrix/rgb-png-over-709",
+        "matrix/rgb-png-under-709",
         &tl,
-        &[m.gradient709.clone(), m.png640.clone()],
+        &[m.png640.clone(), m.gradient709.clone()],
         &[0.5],
         "RGB picture",
     );
@@ -1917,13 +1999,377 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
     }
 }
 
+/// Where a layer's picture lands depends on which grid each filter rounds to, and
+/// they are not the same grid. The first `crop` runs on the picture as decoded, so it
+/// rounds to its *native* chroma grid: even for 4:2:0, even columns only for 4:2:2,
+/// nothing for 4:4:4, gray or RGB. The chain converts to 4:2:0 in its *last* `scale`:
+/// with one `scale` (an identity transform, or one that does not resize) the Cover
+/// crop and `pad` that follow are on the 4:2:0 grid whatever the source was, and
+/// with the transform's own `scale` after a Cover crop that crop is still on the
+/// native grid. A layer placed on the 4:2:0 grid throughout is a whole pixel off for
+/// every other layout with an odd crop (measured 20 dB over the whole frame on 4:4:4),
+/// one placed on the native grid throughout is a pixel off at every odd letterbox and
+/// Cover offset (20 to 30 dB: the first version of this fix did exactly that), and a
+/// Cover offset followed by a resize needs the native grid again (a gray layer 35
+/// levels off, found by fuzzing).
+///
+/// The compositor's planes are 4:2:0, so it can place a layer exactly only where the
+/// two grids agree; luma is always exact, but the chroma of a 4:2:2 / 4:4:4 / RGB
+/// picture positioned between two 4:2:0 chroma samples is a pixel off (30 to 38 dB).
+/// Those are **refused** (FFmpeg draws them); gray, which has no chroma to misplace,
+/// is drawn exactly. Every case is chosen so that the 4:2:0 and the native geometry
+/// *differ* or are *equal* as stated, so a regression to one shared rounding cannot
+/// pass by landing on the same pixels.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused() {
+fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
     let m = media();
-    // FFmpeg scales the picture in the format it has; the compositor in the 8-bit
-    // 4:2:0 a decode reduces it to. Shrinking agrees. Enlarging a 4:4:4 picture was
-    // 27 levels off, 4:2:2 15, RGB video 51, an RGB PNG 69.
+    // (name, asset, native chroma grid, has chroma finer than 4:2:0, gray).
+    let layouts: [(&str, &Asset, Subsampling, bool, bool); 6] = [
+        ("yuv420p", &m.testsrc, Subsampling::YUV420, false, false),
+        ("yuv422p", &m.yuv422, Subsampling { log2_w: 1, log2_h: 0 }, true, false),
+        ("yuv444p", &m.yuv444, Subsampling::NONE, true, false),
+        ("gray", &m.gray, Subsampling::NONE, false, true),
+        ("bgr0", &m.bgr0, Subsampling::NONE, true, false),
+        ("rgb24-png", &m.png640, Subsampling::NONE, true, false),
+    ];
+    // A crop of the 640x360 picture: (left, top, right, bottom) in pixels.
+    let cropped = |l: f64, t: f64, r: f64, b: f64| Transform {
+        crop_left: l / 640.0,
+        crop_top: t / 360.0,
+        crop_right: r / 640.0,
+        crop_bottom: b / 360.0,
+        ..Transform::default()
+    };
+    let small = (320, 180);
+    // Cases with a crop: (name, frame, fit, transform, x odd, y odd).
+    type CropCase = (&'static str, (u32, u32), Fit, Transform, bool, bool);
+    // The transform's own `scale` after a Cover crop is a second `scale` in the chain,
+    // and the picture is converted to 4:2:0 by the last one: the Cover crop before it
+    // still rounds to the native grid.
+    let rescaled = Transform {
+        scale: 0.8,
+        ..Transform::default()
+    };
+    let crops: [CropCase; 8] = [
+        ("odd-crop", small, Fit::Contain, cropped(11.0, 7.0, 6.0, 6.0), true, true),
+        ("odd-x-crop", small, Fit::Contain, cropped(11.0, 6.0, 0.0, 0.0), true, false),
+        ("odd-y-crop", small, Fit::Contain, cropped(10.0, 7.0, 0.0, 0.0), false, true),
+        ("even-crop", small, Fit::Contain, cropped(64.0, 18.0, 0.0, 0.0), false, false),
+        (
+            "odd-crop-cover",
+            (90, 162),
+            Fit::Cover,
+            cropped(11.0, 7.0, 0.0, 0.0),
+            true,
+            true,
+        ),
+        ("cover-odd-x-then-scale", (90, 162), Fit::Cover, rescaled, true, false),
+        ("cover-odd-y-then-scale", (202, 100), Fit::Cover, rescaled, false, true),
+        (
+            "odd-crop-behind-a-pip",
+            small,
+            Fit::Contain,
+            cropped(11.0, 7.0, 6.0, 6.0),
+            true,
+            true,
+        ),
+    ];
+    // Cases with no crop, where the grid after the first `scale` decides: the Cover
+    // overhang and the letterbox gap are odd, and land on the 4:2:0 grid for every
+    // source. (The two letterbox frames that leave the picture at its own size are the
+    // only ones drawn for a picture that is not 4:2:0 or gray: the rest resize it.)
+    let uncropped: [(&str, (u32, u32), Fit); 5] = [
+        ("cover-odd-x", (90, 162), Fit::Cover),
+        ("cover-odd-y", (202, 100), Fit::Cover),
+        ("pad-odd-y", (640, 366), Fit::Contain),
+        ("pad-odd-x", (646, 360), Fit::Contain),
+        ("letterbox-9x16", (360, 640), Fit::Contain),
+    ];
+    for (layout, asset, native, finer, gray) in layouts {
+        let assets = std::slice::from_ref(asset);
+        let dur = asset.duration.min(2.0);
+        let src = (asset.streams[0].width.unwrap(), asset.streams[0].height.unwrap());
+        let geometry =
+            |frame: (u32, u32), fit, tf: &Transform, sub| LayerGeometry::resolve(src, frame, fit, tf, sub).expect("geometry");
+        for (shape, frame, fit, tf, odd_x, odd_y) in &crops {
+            let case = format!("grid/{layout}-{shape}");
+            let mut c = clip(asset, 0.0, dur, 0.0);
+            c.transform = *tf;
+            let tl = if *shape == "odd-crop-behind-a-pip" {
+                // The same crop on the top layer of a stack: the layer below is
+                // untouched, and the crop must land on the top one alone.
+                let mut top = c;
+                top.transform.scale = 0.9;
+                timeline(
+                    vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![top]],
+                    Some(Delivery::new(frame.0, frame.1, *fit)),
+                )
+            } else {
+                timeline(vec![vec![c]], Some(Delivery::new(frame.0, frame.1, *fit)))
+            };
+            let assets: Vec<Asset> = if *shape == "odd-crop-behind-a-pip" {
+                vec![m.testsrc.clone(), asset.clone()]
+            } else {
+                assets.to_vec()
+            };
+            // Is this geometry rounded differently on the native grid than on 4:2:0's?
+            let differs_here = geometry(*frame, *fit, tf, native) != geometry(*frame, *fit, tf, Subsampling::YUV420);
+            // ...which it is exactly when the crop is odd along an axis the layout
+            // does not subsample (the "pip" case scales the picture afterwards, so only
+            // the crop itself is compared).
+            let expect_differs = (*odd_x && native.log2_w == 0) || (*odd_y && native.log2_h == 0);
+            if *shape != "odd-crop-behind-a-pip" {
+                assert_eq!(
+                    differs_here, expect_differs,
+                    "{case}: the case does not exercise what it says"
+                );
+            }
+            // A picture that is not 4:2:0 or gray is FFmpeg's whenever it is resized (and
+            // every crop frame here resizes it), and also — said first — when its crop
+            // lands between two 4:2:0 chroma samples: luma is exact and chroma is not.
+            if finer && !gray {
+                let why = if differs_here { "4:2:0 chroma samples" } else { "scales a" };
+                check_refused(&case, &tl, &assets, 0.5, Refusal::Plan(why));
+            } else {
+                check(&case, &tl, &assets, &[0.5], STRICT);
+            }
+        }
+        for (shape, frame, fit) in &uncropped {
+            let case = format!("grid/{layout}-{shape}");
+            let tl = timeline(
+                vec![vec![clip(asset, 0.0, dur, 0.0)]],
+                Some(Delivery::new(frame.0, frame.1, *fit)),
+            );
+            let tf = Transform::default();
+            assert_eq!(
+                geometry(*frame, *fit, &tf, native),
+                geometry(*frame, *fit, &tf, Subsampling::YUV420),
+                "{case}: only a crop sees the native grid"
+            );
+            // Only the letterbox gaps that leave the picture at its own size are drawn
+            // for a picture that is not 4:2:0 or gray; the Cover frames and the 9:16
+            // letterbox resize it.
+            let resized = geometry(*frame, *fit, &tf, native)
+                .stages
+                .iter()
+                .any(|s| s.scaled != (s.src.w, s.src.h));
+            if finer && !gray && resized {
+                check_refused(&case, &tl, assets, 0.5, Refusal::Plan("scales a"));
+            } else {
+                check(&case, &tl, assets, &[0.5], STRICT);
+            }
+        }
+    }
+}
+
+/// When the probe cannot tell which FFmpeg this is, the plan draws only what FFmpeg 6
+/// and 9 both do the same way — a stack that is BT.601 throughout — and refuses
+/// every other matrix. Forced here on whatever FFmpeg the harness runs against, so
+/// the untagged cases hold on both and the tagged ones are asserted refused (with
+/// FFmpeg rendering them).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on() {
+    let m = media();
+    with_policy(CompositeColorPolicy::Unknown, || {
+        // BT.601-class: drawn, and equal to FFmpeg's own still.
+        let single = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)]], None);
+        check(
+            "unknown/untagged-bars",
+            &single,
+            std::slice::from_ref(&m.bars),
+            &[0.5],
+            STRICT,
+        );
+        let mut top = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        top.transform = Transform {
+            scale: 0.5,
+            opacity: 0.6,
+            ..Transform::default()
+        };
+        let layered = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None);
+        check(
+            "unknown/untagged-translucent-pip",
+            &layered,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            STRICT,
+        );
+        // BT.709 and BT.2020: the two FFmpegs disagree, so the frame is FFmpeg's.
+        for (name, a) in [("bt709", &m.bars709), ("bt2020", &m.bars2020)] {
+            let tl = timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None);
+            check_refused(
+                &format!("unknown/{name}-bars"),
+                &tl,
+                std::slice::from_ref(a),
+                0.5,
+                Refusal::Plan("could not be measured"),
+            );
+        }
+        // ...in a stack of its own, on top of a BT.601 one, or under it.
+        for (name, layers) in [
+            ("709-over-untagged", [&m.bars, &m.testsrc709]),
+            ("untagged-over-709", [&m.testsrc709, &m.bars]),
+        ] {
+            let tl = timeline(layers.iter().map(|a| vec![clip(a, 0.0, 2.0, 0.0)]).collect(), None);
+            let assets: Vec<Asset> = layers.iter().map(|a| (*a).clone()).collect();
+            let reasons = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy())
+                .expect("plan")
+                .unsupported_reasons()
+                .join("; ");
+            assert!(!reasons.is_empty(), "unknown/{name}: the plan should refuse");
+        }
+    });
+}
+
+/// `eq` on a full-range (`yuvj420p`) picture: FFmpeg 9 grades its raw full-range values
+/// and converts the range afterwards, while the decode behind the compositor converts to
+/// limited range first. The two read 34 to 42 dB apart on FFmpeg 9.0.2 for every knob
+/// (brightness 36.7, contrast max 18, saturation 38.0, gamma 34.2, temperature 41.8),
+/// and agree on FFmpeg 6.1 — so the plan does not grade full range on the GPU on any
+/// FFmpeg, and an ungraded full-range clip (no `eq`) is still drawn and compared.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
+    let m = media();
+    assert_eq!(m.fullrange.streams[0].pix_fmt.as_deref(), Some("yuvj420p"));
+    let graded = |a: &Asset, color: Color| {
+        let mut c = clip(a, 0.0, a.duration.min(2.0), 0.0);
+        c.color = color;
+        timeline(vec![vec![c]], None)
+    };
+    for (name, color) in [
+        (
+            "brightness",
+            Color {
+                brightness: 0.1,
+                ..Color::default()
+            },
+        ),
+        (
+            "contrast",
+            Color {
+                contrast: 1.3,
+                ..Color::default()
+            },
+        ),
+        (
+            "saturation",
+            Color {
+                saturation: 1.5,
+                ..Color::default()
+            },
+        ),
+        (
+            "gamma",
+            Color {
+                gamma: 1.4,
+                ..Color::default()
+            },
+        ),
+        (
+            "temperature",
+            Color {
+                temperature: 0.5,
+                ..Color::default()
+            },
+        ),
+    ] {
+        check_refused(
+            &format!("refused/graded-full-range-{name}"),
+            &graded(&m.fullrange, color),
+            std::slice::from_ref(&m.fullrange),
+            0.5,
+            Refusal::Plan("full-range"),
+        );
+    }
+    check(
+        "full-range/ungraded",
+        &graded(&m.fullrange, Color::default()),
+        std::slice::from_ref(&m.fullrange),
+        &[0.5],
+        STRICT,
+    );
+    // The same limited-range picture, graded, is drawn and compared.
+    check(
+        "full-range/limited-range-control-graded",
+        &graded(
+            &m.testsrc,
+            Color {
+                gamma: 1.4,
+                ..Color::default()
+            },
+        ),
+        std::slice::from_ref(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
+    // A graded layer in a stack with a full-range one: where the range is negotiated
+    // along the overlay chain (FFmpeg 9) it is 40 to 44 dB off, so that is FFmpeg's
+    // there; FFmpeg 6 reads it exactly and it is compared strictly.
+    // (A PNG is RGB, which cannot be resized: it goes in translucent, at its own size.)
+    let shifted = Transform {
+        scale: 0.5,
+        pos_x: 0.2,
+        pos_y: -0.1,
+        ..Transform::default()
+    };
+    let faded = Transform {
+        opacity: 0.6,
+        ..Transform::default()
+    };
+    for (name, bottom, top, transform) in [
+        ("limited-over-full", &m.fullrange, &m.testsrc, shifted),
+        ("translucent-png-over-full", &m.fullrange, &m.png640, faded),
+    ] {
+        let mut pip = clip(top, 0.0, 2.0, 0.0);
+        pip.transform = transform;
+        pip.color = Color {
+            gamma: 1.4,
+            ..Color::default()
+        };
+        let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![pip]], None);
+        check_mixed(
+            &format!("range/graded-{name}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            &[0.5],
+            "stack with a full-range picture",
+        );
+    }
+    // A picture that never recorded its format is not known to be limited range.
+    let mut old = m.testsrc.clone();
+    for s in &mut old.streams {
+        s.pix_fmt = None;
+    }
+    check_refused(
+        "refused/graded-asset-without-a-recorded-format",
+        &graded(
+            &old,
+            Color {
+                gamma: 1.4,
+                ..Color::default()
+            },
+        ),
+        std::slice::from_ref(&old),
+        0.5,
+        Refusal::Plan("never recorded"),
+    );
+}
+
+/// FFmpeg scales a picture in the format it has; the compositor in the 8-bit 4:2:0 a
+/// decode reduces it to. Enlarging a 4:4:4 picture was 27 levels off, 4:2:2 15, RGB
+/// video 51, an RGB PNG 69 — and a *shrink* as mild as 1.05-1.5x still reads flat max
+/// 8-9 (4:2:2 at 0.9x is over the limit) and up to 32 levels on edges, because the
+/// chroma kernel differs most near a ratio of 1. No band of ratios was measured
+/// strictly inside the limits on both FFmpegs for busy chroma, so none is claimed:
+/// every resize of a picture that is not 4:2:0 (8/10-bit) or gray is FFmpeg's, and a
+/// picture left at its size is drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
+    let m = media();
     let scaled = |a: &Asset, scale: f64, fit: Option<Delivery>| {
         let dur = a.duration.min(2.0);
         let mut c = clip(a, 0.0, dur, 0.0);
@@ -1943,7 +2389,7 @@ fn enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused() {
                 &scaled(a, scale, None),
                 assets,
                 0.5,
-                Refusal::Plan("enlarges"),
+                Refusal::Plan("scales a"),
             );
         }
         check_refused(
@@ -1951,21 +2397,33 @@ fn enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused() {
             &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
             assets,
             0.5,
-            Refusal::Plan("enlarges"),
+            Refusal::Plan("scales a"),
         );
-        // ...and what is not an enlargement is drawn, held to the strict limits.
-        check(&format!("shrink/{name}-x0.5"), &scaled(a, 0.5, None), assets, &[0.5], STRICT);
-        check(
-            &format!("shrink/{name}-fit-to-320x180"),
-            &scaled(a, 1.0, Some(Delivery::new(320, 180, Fit::Contain))),
-            assets,
-            &[0.5],
-            STRICT,
-        );
+        // Shrinks, the mild ones that read worst included.
+        for scale in [0.95, 0.9, 0.75, 0.5] {
+            check_refused(
+                &format!("shrink/{name}-x{scale}"),
+                &scaled(a, scale, None),
+                assets,
+                0.5,
+                Refusal::Plan("scales a"),
+            );
+        }
+        for (w, h) in [(576u32, 324u32), (320, 180)] {
+            check_refused(
+                &format!("shrink/{name}-fit-to-{w}x{h}"),
+                &scaled(a, 1.0, Some(Delivery::new(w, h, Fit::Contain))),
+                assets,
+                0.5,
+                Refusal::Plan("scales a"),
+            );
+        }
+        // ...and a picture left at its size is drawn, held to the strict limits.
         check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5], STRICT);
     }
-    // 4:2:0 and gray are what the compositor works in: enlarging them is fine —
-    // including 10 bit (FFmpeg scales it at 10 bits and dithers once at the end).
+    // 4:2:0 and gray are what the compositor works in: resizing them is fine in both
+    // directions — including 10 bit (FFmpeg scales it at 10 bits and dithers once at the
+    // end).
     for (name, a) in [
         ("yuv420p10le", &m.tenbit),
         ("gray", &m.gray),
@@ -1984,6 +2442,15 @@ fn enlarging_a_picture_ffmpeg_scales_in_another_format_is_refused() {
             &format!("enlarge-ok/{name}-fit-to-960x540"),
             &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
             assets,
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (name, a) in [("yuv420p", &m.testsrc), ("gray", &m.gray)] {
+        check(
+            &format!("shrink-ok/{name}-fit-to-576x324"),
+            &scaled(a, 1.0, Some(Delivery::new(576, 324, Fit::Contain))),
+            std::slice::from_ref(a),
             &[0.5],
             STRICT,
         );
@@ -2321,9 +2788,9 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
 // never recorded its pixel format), asserted refused rather than compared. Both
 // runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
-// The smallest flat share of any non-busy case is 70.1% (the `shrink/` cases to
-// 320x180, band 29.9%); the largest band among the cases judged strictly is that
-// one. Every run rewrites `target/parity/report.txt` (these columns plus the
+// The smallest flat share of any non-busy case is 56.9% (`grid/yuv420p-cover-odd-y-then-
+// scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
+// largest band among the cases judged strictly is that one. Every run rewrites `target/parity/report.txt` (these columns plus the
 // decode / composite time of the GPU path and the scaler lines).
 //
 // case                                             t    canvas | flat PSNR flat max |  all PSNR  all max |  band 9.0.2
@@ -2357,12 +2824,48 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // enlarge-ok/yuv420p10le-x1.5                    0.5   640x360 |    46.7 dB        5 |    46.4 dB        5 | 17.8%    =
 // enlarge-ok/yuvj420p-jpeg-fit-to-960x540        0.5   960x540 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // enlarge-ok/yuvj420p-jpeg-x1.5                  0.5   480x270 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
+// full-range/limited-range-control-graded        0.5   640x360 |    48.3 dB        3 |    48.2 dB        3 | 15.6%    =
+// full-range/ungraded                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 15.6% 52.8 / 3
 // gap                                            1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // geometry/crop-then-cover                       0.5   360x640 |    48.2 dB        5 |    48.0 dB        5 | 13.0%    =
 // geometry/fully-off-canvas                      0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // geometry/odd-rotated-box                       0.5   640x360 |    46.4 dB        3 |    36.9 dB      254 |  7.1%    =
 // geometry/odd-sized-layer                       0.5   640x360 |    46.3 dB        3 |    46.4 dB        5 |  5.5%    =
 // geometry/zoom-off-canvas                       0.5   640x360 |    48.1 dB        4 |    48.0 dB        5 |  9.5%    =
+// grid/bgr0-pad-odd-x                            0.5   646x360 |    48.4 dB        3 |    48.3 dB        3 | 17.2%    =
+// grid/bgr0-pad-odd-y                            0.5   640x366 |    48.4 dB        3 |    48.4 dB        3 | 18.2%    =
+// grid/gray-cover-odd-x                          0.5    90x162 |    47.6 dB        4 |    47.4 dB        4 | 18.1%    =
+// grid/gray-cover-odd-x-then-scale               0.5    90x162 |    53.2 dB        2 |    52.3 dB        2 | 28.5%    =
+// grid/gray-cover-odd-y                          0.5   202x100 |    49.0 dB        4 |    48.6 dB        4 | 31.5%    =
+// grid/gray-cover-odd-y-then-scale               0.5   202x100 |    54.0 dB        2 |    52.3 dB        2 | 36.2%    =
+// grid/gray-even-crop                            0.5   320x180 |    51.9 dB        3 |    51.3 dB        4 | 24.8%    =
+// grid/gray-letterbox-9x16                       0.5   360x640 |    57.2 dB        2 |    56.1 dB        2 |  8.4%    =
+// grid/gray-odd-crop                             0.5   320x180 |    51.3 dB        2 |    51.0 dB        2 | 25.4%    =
+// grid/gray-odd-crop-behind-a-pip                0.5   320x180 |    51.2 dB        3 |    50.6 dB        5 | 31.1%    =
+// grid/gray-odd-crop-cover                       0.5    90x162 |    51.1 dB        3 |    50.7 dB        4 | 18.8%    =
+// grid/gray-odd-x-crop                           0.5   320x180 |    51.2 dB        3 |    50.8 dB        4 | 23.1%    =
+// grid/gray-odd-y-crop                           0.5   320x180 |    50.4 dB        4 |    50.1 dB        4 | 25.0%    =
+// grid/gray-pad-odd-x                            0.5   646x360 |    51.4 dB        1 |    51.3 dB        1 | 15.1%    =
+// grid/gray-pad-odd-y                            0.5   640x366 |    51.4 dB        1 |    51.3 dB        1 | 16.2%    =
+// grid/rgb24-png-pad-odd-x                       0.5   646x360 |    48.3 dB        3 |    48.3 dB        3 | 15.9%    =
+// grid/rgb24-png-pad-odd-y                       0.5   640x366 |    48.4 dB        3 |    48.3 dB        3 | 16.9%    =
+// grid/yuv420p-cover-odd-x                       0.5    90x162 |    46.4 dB        3 |    46.5 dB        4 | 23.4%    =
+// grid/yuv420p-cover-odd-x-then-scale            0.5    90x162 |    48.6 dB        3 |    48.7 dB        4 | 31.5%    =
+// grid/yuv420p-cover-odd-y                       0.5   202x100 |    49.0 dB        3 |    48.6 dB        5 | 40.6%    =
+// grid/yuv420p-cover-odd-y-then-scale            0.5   202x100 |    52.0 dB        3 |    50.3 dB        4 | 43.1%    =
+// grid/yuv420p-even-crop                         0.5   320x180 |    48.7 dB        4 |    48.5 dB        5 | 32.3%    =
+// grid/yuv420p-letterbox-9x16                    0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
+// grid/yuv420p-odd-crop                          0.5   320x180 |    48.8 dB        3 |    48.5 dB        5 | 32.2%    =
+// grid/yuv420p-odd-crop-behind-a-pip             0.5   320x180 |    49.1 dB        5 |    48.4 dB        5 | 30.0%    =
+// grid/yuv420p-odd-crop-cover                    0.5    90x162 |    46.5 dB        3 |    46.8 dB        4 | 22.4%    =
+// grid/yuv420p-odd-x-crop                        0.5   320x180 |    48.8 dB        4 |    48.5 dB        5 | 31.1%    =
+// grid/yuv420p-odd-y-crop                        0.5   320x180 |    48.8 dB        4 |    48.3 dB        5 | 31.8%    =
+// grid/yuv420p-pad-odd-x                         0.5   646x360 |    48.8 dB        3 |    48.8 dB        3 | 17.1%    =
+// grid/yuv420p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 18.2%    =
+// grid/yuv422p-pad-odd-x                         0.5   646x360 |    48.9 dB        3 |    48.8 dB        3 | 17.7%    =
+// grid/yuv422p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 18.8%    =
+// grid/yuv444p-pad-odd-x                         0.5   646x360 |    48.9 dB        3 |    48.7 dB        3 | 19.4%    =
+// grid/yuv444p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 20.4%    =
 // letterbox/graded-over-gradient                 0.5   640x360 |    65.6 dB        3 |    59.5 dB        6 | 10.9%    =
 // letterbox/graded-single-clip                   0.5   640x360 |    54.8 dB        3 |    53.0 dB        5 | 12.1%    =
 // letterbox/landscape-over-portrait-9x16         0.5   360x640 |    55.8 dB        3 |    54.4 dB        5 |  8.3%    =
@@ -2379,8 +2882,8 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // matrix/mixed-709-over-2020                     0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
 // matrix/mixed-709-over-untagged                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
 // matrix/mixed-untagged-over-709                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
-// matrix/rgb-png-over-709                        0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2% refused
-// matrix/rgb-png-over-untagged                   0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2%    =
+// matrix/rgb-png-under-709                       0.5   640x360 |    47.1 dB        5 |    47.1 dB        5 | 12.8% refused
+// matrix/rgb-png-under-untagged                  0.5   640x360 |    47.1 dB        5 |    47.1 dB        5 | 12.8%    =
 // old-asset/opaque                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7% refused
 // opacity/0.3+scale+rotate                       0.5   640x360 |    46.6 dB        5 |    43.5 dB       66 | 14.2%    =
 // opacity/0.5                                      0   640x360 |    43.4 dB        4 |    43.5 dB        5 | 21.8%    =
@@ -2396,18 +2899,14 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // pip/odd-361x203-in-722x640                     0.5   722x640 |    48.4 dB        5 |    48.3 dB        5 |  7.7%    =
 // pip/scaled+offset                                0   640x360 |    49.4 dB        3 |    49.3 dB        5 | 15.9%    =
 // pip/scaled+offset                                1   640x360 |    49.4 dB        5 |    49.3 dB        5 | 16.0%    =
+// range/graded-limited-over-full                 0.5   640x360 |    48.5 dB        4 |    48.3 dB        5 | 21.1% refused
+// range/graded-translucent-png-over-full         0.5   640x360 |    44.8 dB        5 |    44.8 dB        5 | 18.6% refused
 // same-size/bgr0                                 0.5   640x360 |    48.4 dB        3 |    48.3 dB        3 | 15.7%    =
 // same-size/rgb24-png                            0.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // same-size/yuv422p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.3%    =
 // same-size/yuv444p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
-// shrink/bgr0-fit-to-320x180                     0.5   320x180 |    46.9 dB        4 |    46.3 dB        5 | 29.9%    =
-// shrink/bgr0-x0.5                               0.5   640x360 |    54.2 dB        4 |    52.4 dB        5 |  9.8%    =
-// shrink/rgb24-png-fit-to-320x180                0.5   320x180 |    46.6 dB        5 |    46.4 dB        6 | 27.8%    =
-// shrink/rgb24-png-x0.5                          0.5   480x270 |    54.3 dB        4 |    52.3 dB        5 | 11.7%    =
-// shrink/yuv422p-fit-to-320x180                  0.5   320x180 |    48.9 dB        4 |    48.1 dB        5 | 29.4%    =
-// shrink/yuv422p-x0.5                            0.5   640x360 |    56.2 dB        4 |    54.1 dB        5 |  9.7%    =
-// shrink/yuv444p-fit-to-320x180                  0.5   320x180 |    48.9 dB        3 |    48.0 dB        6 | 29.9%    =
-// shrink/yuv444p-x0.5                            0.5   640x360 |    56.3 dB        3 |    54.0 dB        6 |  9.8%    =
+// shrink-ok/gray-fit-to-576x324                  0.5   576x324 |    51.4 dB        2 |    51.1 dB        2 | 15.2%    =
+// shrink-ok/yuv420p-fit-to-576x324               0.5   576x324 |    48.9 dB        4 |    48.7 dB        5 | 18.9%    =
 // single/gradient                                  0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // single/gradient                                  1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // single/smptehdbars                               0   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
@@ -2423,7 +2922,8 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // still/alone                                      0   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // still/alone                                    2.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
-// still/pip-over-video                             1   640x360 |    46.5 dB        5 |    46.4 dB        5 |  9.2%    =
+// still/pip-over-video                             1   640x360 |    46.4 dB        5 |    45.6 dB       17 |  9.4% 48.0 / 5
+// still/png-under-video-pip                        1   640x360 |    47.6 dB        5 |    47.6 dB        5 | 13.5%    =
 // time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.5%    =
 // time/keyframes                                1.25   640x360 |    48.2 dB        5 |    34.3 dB      217 | 25.9%    =
 // time/keyframes                                   2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
@@ -2452,6 +2952,8 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // translucent/yuv420p10le                        0.5   640x360 |    48.3 dB        5 |    47.7 dB        5 | 15.6%    =
 // translucent/yuv422p                            0.5   640x360 |    48.4 dB        5 |    47.8 dB        5 | 16.2%    =
 // translucent/yuv444p                            0.5   640x360 |    48.4 dB        5 |    47.6 dB        5 | 16.4%    =
+// unknown/untagged-bars                          0.5   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
+// unknown/untagged-translucent-pip               0.5   640x360 |    49.0 dB        4 |    48.2 dB        5 | 17.9%    =
 // scaler (plane by plane vs `ffmpeg -vf scale`; worst plane per source, FFmpeg 6.1.1;
 // every source is at most 1 level off up to ~4:1, the 2-5 are the 8:1 to 40:1 shrinks)
 //   bars       max 2  worst mean 0.493

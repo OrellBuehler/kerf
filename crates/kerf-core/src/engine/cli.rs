@@ -663,29 +663,101 @@ fn zscale_available() -> bool {
 // ---- the composite's colour policy ---------------------------------------------
 
 /// How this ffmpeg picks the matrix of a composite — see [`CompositeColorPolicy`].
-/// Probed once per process by **running the still graph** twice on the same
-/// picture, once in a clip tagged BT.709 and once in an untagged one, and seeing
-/// whether the finished composites differ: FFmpeg 6 hands the encoder an untagged
-/// frame (BT.601 whatever the clip was, so the two agree); FFmpeg 9 negotiates the
+/// Probed by **running the still graph** twice on the same picture, once in a
+/// clip tagged BT.709 and once in an untagged one, and seeing whether the
+/// finished composites differ: FFmpeg 6 hands the encoder an untagged frame
+/// (BT.601 whatever the clip was, so the two agree); FFmpeg 9 negotiates the
 /// colourspace across the overlay chain, so the tagged clip's composite is
-/// converted as BT.709 and the two differ. Measured, not read off a version string.
+/// converted as BT.709 and the two differ. Measured, not read off a version
+/// string — and the probe checks that the tag **survived** into the clip it
+/// measures (an `ffprobe` of it), because a tag that was lost on the way would
+/// read as "FFmpeg 6" on any build.
 ///
-/// If the probe cannot run or reads something it does not understand it answers
-/// [`CompositeColorPolicy::BottomLayerTag`], the cautious one: it draws only stacks
-/// whose layers agree on a matrix, which are the stacks every policy renders
-/// alike.
+/// **A probe that could not tell is [`CompositeColorPolicy::Unknown`], not a
+/// guess.** FFmpeg 6 and 9 disagree precisely on BT.709 and BT.2020 footage, so
+/// no answer is safe for it: `Unknown` mirrors only the stacks both agree on
+/// (all BT.601-class) and refuses the rest. It is not remembered — a measured
+/// policy is kept for the process, a failed probe is retried on a later call, at
+/// most once per backoff period (5 s, doubling to 5 min) so a broken ffmpeg is
+/// not respawned for every frame. The whole probe is bounded
+/// ([`POLICY_PROBE_TIMEOUT`]): a hung ffmpeg cannot hold a caller for longer.
+///
+/// **The first call blocks** — 70 to 200 ms where ffmpeg works (six short runs,
+/// two at a time; 70 ms measured on a static build, 200 on a distro one) and up
+/// to the timeout where it does not — and concurrent first callers wait behind it,
+/// so call it from a blocking thread, not an async task or the UI's. Later calls
+/// are a lock and a read.
 pub fn composite_color_policy() -> CompositeColorPolicy {
-    static POLICY: OnceLock<CompositeColorPolicy> = OnceLock::new();
-    *POLICY.get_or_init(|| {
-        let measured = measure_composite_color_policy();
-        let policy = measured.unwrap_or(CompositeColorPolicy::BottomLayerTag);
-        tracing::debug!(
-            ?policy,
-            measured = measured.is_some(),
-            "probed ffmpeg's composite colour policy"
-        );
-        policy
+    static PROBE: Mutex<PolicyProbe> = Mutex::new(PolicyProbe::new());
+    cached_policy(&PROBE, Instant::now(), || {
+        measure_composite_color_policy(&ffmpeg_bin(), &ffprobe_bin(), POLICY_PROBE_TIMEOUT)
     })
+}
+
+/// The longest the whole policy probe may take. It is six short runs of a
+/// 64x64 clip, anything near this is a wedged ffmpeg, and every other caller of
+/// [`composite_color_policy`] waits behind it.
+const POLICY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What the process knows about its ffmpeg's composite colour policy.
+struct PolicyProbe {
+    /// The measured policy, once there is one: kept for good.
+    measured: Option<CompositeColorPolicy>,
+    /// Failed probes in a row, and the earliest time the next one may run.
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl PolicyProbe {
+    const fn new() -> Self {
+        Self {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+        }
+    }
+}
+
+/// The wait before the probe may run again after `failures` failures in a row:
+/// 5 s, doubling, capped at 5 minutes.
+fn policy_probe_backoff(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))
+}
+
+/// The policy in `state`, measuring it with `measure` if nothing is known yet and
+/// the backoff after the last failure has passed. Holds the lock while it
+/// measures, so concurrent first callers wait for one probe rather than each
+/// running their own; the probe is bounded, so the wait is.
+fn cached_policy(
+    state: &Mutex<PolicyProbe>,
+    now: Instant,
+    measure: impl FnOnce() -> Option<CompositeColorPolicy>,
+) -> CompositeColorPolicy {
+    let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(policy) = s.measured {
+        return policy;
+    }
+    if s.retry_at.is_some_and(|t| now < t) {
+        return CompositeColorPolicy::Unknown;
+    }
+    match measure() {
+        Some(policy) => {
+            tracing::debug!(?policy, "probed ffmpeg's composite colour policy");
+            s.measured = Some(policy);
+            policy
+        }
+        None => {
+            s.failures += 1;
+            let wait = policy_probe_backoff(s.failures);
+            s.retry_at = Some(Instant::now() + wait);
+            tracing::warn!(
+                failures = s.failures,
+                retry_in_secs = wait.as_secs(),
+                "could not measure ffmpeg's composite colour policy; only BT.601-class stacks are drawn on the GPU until it can"
+            );
+            CompositeColorPolicy::Unknown
+        }
+    }
 }
 
 /// The probe picture: a flat YCbCr whose red the two matrices convert to values
@@ -693,7 +765,8 @@ pub fn composite_color_policy() -> CompositeColorPolicy {
 const POLICY_PROBE_YUV: (u8, u8, u8) = (60, 128, 230);
 
 /// Which policy two measured reds say: the same red from the tagged and the
-/// untagged clip means the tag did not reach the conversion.
+/// untagged clip means the tag did not reach the conversion. A difference between
+/// the two readings is not a result.
 fn policy_from_reds(tagged: u8, untagged: u8) -> Option<CompositeColorPolicy> {
     match tagged.abs_diff(untagged) {
         0..=3 => Some(CompositeColorPolicy::FixedBt601),
@@ -702,18 +775,67 @@ fn policy_from_reds(tagged: u8, untagged: u8) -> Option<CompositeColorPolicy> {
     }
 }
 
-fn measure_composite_color_policy() -> Option<CompositeColorPolicy> {
-    let tagged = probe_composite_red(true)?;
-    let untagged = probe_composite_red(false)?;
+/// Measure the policy of `ffmpeg` (with `ffprobe` to check the probe clips), or
+/// `None` when it cannot be read: a binary that will not run, a run that fails or
+/// outlasts `timeout`, a tag that did not survive, readings that do not decide.
+fn measure_composite_color_policy(ffmpeg: &str, ffprobe: &str, timeout: std::time::Duration) -> Option<CompositeColorPolicy> {
+    let deadline = Instant::now() + timeout;
+    // The two clips are independent, so they are measured side by side.
+    let (tagged, untagged) = std::thread::scope(|scope| {
+        let tagged = scope.spawn(|| probe_composite_red(ffmpeg, ffprobe, true, deadline));
+        let untagged = probe_composite_red(ffmpeg, ffprobe, false, deadline);
+        (tagged.join().ok().flatten(), untagged)
+    });
+    let (tagged, untagged) = (tagged?, untagged?);
     tracing::debug!(tagged, untagged, "composite colour probe");
     policy_from_reds(tagged, untagged)
 }
 
+/// Run `cmd` with `input` on its stdin and return its stdout if it exits
+/// successfully before `deadline` — killed, and `None`, if it does not. The pipes
+/// are served from side threads, so a child that stops reading or never exits
+/// cannot wedge the caller; on a timeout those threads are left to finish on
+/// their own (a wrapper script that spawned the real ffmpeg keeps the pipe open
+/// past the kill, and the caller must not wait for it).
+fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut stdout = child.stdout.take()?;
+    // The input is a few kilobytes and the child may close the pipe before reading
+    // it all, which is not the feeder's problem.
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(4)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let _ = feeder.join();
+    let out = reader.join().ok()?;
+    status.success().then_some(out)
+}
+
 /// The red of the middle pixel of the still graph's composite over a one-frame
 /// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
-fn probe_composite_red(tag_bt709: bool) -> Option<u8> {
-    use std::io::Write;
-    let bin = ffmpeg_bin();
+fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: Instant) -> Option<u8> {
     let (y, u, v) = POLICY_PROBE_YUV;
     // 1. A one-frame clip of exactly that picture (raw planes, so no generator gets
     // to round it), tagged the way a camera's file is, or not.
@@ -723,7 +845,7 @@ fn probe_composite_red(tag_bt709: bool) -> Option<u8> {
     // The tag goes on the *input* (a decoder option): put on the output of a
     // raw-video encode it would make FFmpeg 9 convert the picture into the new
     // matrix on the way, and the two clips would no longer hold the same planes.
-    let mut maker = command(&bin);
+    let mut maker = command(ffmpeg);
     maker.args([
         "-hide_banner",
         "-loglevel",
@@ -738,37 +860,52 @@ fn probe_composite_red(tag_bt709: bool) -> Option<u8> {
     if tag_bt709 {
         maker.args(["-colorspace", "bt709"]);
     }
-    let mut maker = maker
-        .args([
-            "-i",
-            "pipe:0",
-            "-frames:v",
-            "1",
-            "-c:v",
-            "ffv1",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "matroska",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut maker_in = maker.stdin.take()?;
-    let writer = std::thread::spawn(move || {
-        let _ = maker_in.write_all(&raw);
-    });
-    let made = maker.wait_with_output().ok()?;
-    let _ = writer.join();
-    if !made.status.success() || made.stdout.is_empty() {
+    maker.args([
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "ffv1",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "matroska",
+        "pipe:1",
+    ]);
+    let clip = run_piped_until(&mut maker, raw, deadline).filter(|c| !c.is_empty())?;
+
+    // 2. The tag must have survived into the clip, as the probe the app imports
+    // with reads it: a clip that lost it (a wrapper, a build that drops the
+    // option) would make the two measurements identical on *any* FFmpeg, and the
+    // probe would read "FFmpeg 6" off an FFmpeg 9.
+    let mut checker = command(ffprobe);
+    checker.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=color_space",
+        "-of",
+        "csv=p=0",
+        "-i",
+        "pipe:0",
+    ]);
+    let found = run_piped_until(&mut checker, clip.clone(), deadline)?;
+    let found = String::from_utf8_lossy(&found);
+    let found = found.trim();
+    let survived = if tag_bt709 {
+        found == "bt709"
+    } else {
+        !matches!(found, "bt709" | "bt2020nc" | "bt2020c")
+    };
+    if !survived {
+        tracing::debug!(found, tag_bt709, "the probe clip's colour tag is not what was written");
         return None;
     }
-    let clip = made.stdout;
 
-    // 2. The still graph of a one-clip timeline over that clip, built by the very
+    // 3. The still graph of a one-clip timeline over that clip, built by the very
     // builder the stills use, ending in raw RGB.
     let asset = Asset {
         id: uuid::Uuid::new_v4(),
@@ -815,25 +952,13 @@ fn probe_composite_red(tag_bt709: bool) -> Option<u8> {
         &StillOutput::RgbPipe,
     )
     .ok()?;
-    let mut child = command(&bin)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let feeder = std::thread::spawn(move || {
-        // The clip is a few kilobytes; ffmpeg may close the pipe before reading it
-        // all, which is not the feeder's problem.
-        let _ = stdin.write_all(&clip);
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = feeder.join();
-    if !out.status.success() || out.stdout.len() != 64 * 64 * 3 {
+    let mut render = command(ffmpeg);
+    render.args(&args);
+    let out = run_piped_until(&mut render, clip, deadline)?;
+    if out.len() != 64 * 64 * 3 {
         return None;
     }
-    Some(out.stdout[(32 * 64 + 32) * 3])
+    Some(out[(32 * 64 + 32) * 3])
 }
 
 /// The filter chain that turns decoded HDR frames into 8-bit SDR BT.709 —
@@ -10266,16 +10391,310 @@ mod tests {
     #[allow(clippy::print_stderr)]
     fn the_composite_policy_is_measured_from_the_graph_not_guessed() {
         // Whatever this ffmpeg is, the probe must read *something* off the real
-        // graph (a `None` would mean it silently fell back to the cautious answer).
-        let measured = measure_composite_color_policy();
+        // graph (a `None` would mean it fell back to `Unknown`).
+        let (ffmpeg, ffprobe) = (ffmpeg_bin(), ffprobe_bin());
+        let deadline = Instant::now() + POLICY_PROBE_TIMEOUT;
+        let started = Instant::now();
+        let measured = measure_composite_color_policy(&ffmpeg, &ffprobe, POLICY_PROBE_TIMEOUT);
         eprintln!(
-            "composite colour policy of {}: {measured:?} (reds tagged {:?} / untagged {:?})",
-            ffmpeg_bin(),
-            probe_composite_red(true),
-            probe_composite_red(false)
+            "composite colour policy of {ffmpeg}: {measured:?} in {:?} (reds tagged {:?} / untagged {:?})",
+            started.elapsed(),
+            probe_composite_red(&ffmpeg, &ffprobe, true, deadline),
+            probe_composite_red(&ffmpeg, &ffprobe, false, deadline)
         );
         assert!(measured.is_some(), "the probe could not read the still graph's matrix");
         assert_eq!(composite_color_policy(), measured.unwrap());
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[cfg(unix)]
+    fn a_probe_whose_tag_does_not_survive_measures_nothing() {
+        // Standing in for an `ffprobe` that reports no matrix for the tagged clip
+        // (`echo` prints its arguments, which is not `bt709`): the measurement is
+        // refused rather than read as "FFmpeg 6", which is what two identical
+        // clips would say on any build.
+        let ffmpeg = ffmpeg_bin();
+        assert!(measure_composite_color_policy(&ffmpeg, "echo", POLICY_PROBE_TIMEOUT).is_none());
+        assert!(measure_composite_color_policy(&ffmpeg, &ffprobe_bin(), POLICY_PROBE_TIMEOUT).is_some());
+    }
+
+    /// `crop` rounds its window to the chroma grid of the pixel format it is given,
+    /// and [`crate::model::pix_fmt_subsampling`] says which grid that is: measured
+    /// here by cropping a 33x35 window out of a picture in each format and reading
+    /// the size ffmpeg reports for what came out.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn the_subsampling_table_matches_ffmpegs_crop() {
+        let bin = ffmpeg_bin();
+        let supported = command(&bin)
+            .args(["-hide_banner", "-v", "error", "-pix_fmts"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let has = |fmt: &str| supported.lines().any(|l| l.split_whitespace().nth(1) == Some(fmt));
+        let mut checked = 0;
+        for fmt in [
+            "yuv420p",
+            "yuvj420p",
+            "yuv420p9le",
+            "yuv420p10le",
+            "yuv420p12le",
+            "yuv420p16le",
+            "nv12",
+            "nv21",
+            "p010le",
+            "p016le",
+            "yuv422p",
+            "yuvj422p",
+            "yuv422p10le",
+            "yuv422p16le",
+            "nv16",
+            "p210le",
+            "yuv440p",
+            "yuvj440p",
+            "yuv440p10le",
+            "yuv411p",
+            "yuv410p",
+            "yuv444p",
+            "yuvj444p",
+            "yuv444p9le",
+            "yuv444p16le",
+            "nv24",
+            "nv42",
+            "p410le",
+            "gray",
+            "gray10le",
+            "gray16le",
+            "gbrp",
+            "gbrp10le",
+            "gbrp16le",
+            "rgb24",
+            "bgr24",
+            "rgb0",
+            "bgr0",
+            "0rgb",
+            "0bgr",
+            "rgb48le",
+            "bgr48le",
+        ] {
+            if !has(fmt) {
+                continue;
+            }
+            let want = crate::model::pix_fmt_subsampling(fmt).unwrap_or_else(|| panic!("{fmt} is not in the table"));
+            let output = command(&bin)
+                .args(["-hide_banner", "-v", "info", "-f", "lavfi", "-i"])
+                .arg(format!("color=c=gray:s=128x128:r=1,format={fmt}"))
+                .args(["-vf", "crop=w=33:h=35:x=1:y=1,showinfo", "-frames:v", "1", "-f", "null", "-"])
+                .stdin(Stdio::null())
+                .output()
+                .expect("run ffmpeg");
+            let log = String::from_utf8_lossy(&output.stderr);
+            let size = log
+                .lines()
+                .filter(|l| l.contains("Parsed_showinfo"))
+                .find_map(|l| {
+                    let rest = l.split(" s:").nth(1)?;
+                    let dims = rest.split_whitespace().next()?;
+                    let (w, h) = dims.split_once('x')?;
+                    Some((w.parse::<i64>().ok()?, h.parse::<i64>().ok()?))
+                })
+                .unwrap_or_else(|| panic!("{fmt}: no showinfo size in {log}"));
+            assert_eq!(
+                size,
+                (want.round_w(33), want.round_h(35)),
+                "{fmt}: crop gave {size:?}, the table says {want:?}"
+            );
+            // ...and the origin is rounded to the same grid: a 32x32 window at (1, 1)
+            // is the window at the rounded origin, and where an axis is not rounded
+            // it is *not* the window one pixel back.
+            let md5_at = |x: i64, y: i64| -> String {
+                let output = command(&bin)
+                    .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i"])
+                    .arg(format!("testsrc2=s=128x128:r=1,format={fmt}"))
+                    .args([
+                        "-vf",
+                        &format!("crop=w=32:h=32:x={x}:y={y}"),
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "framemd5",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("run ffmpeg");
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+                    .and_then(|l| l.split(',').next_back())
+                    .map(|m| m.trim().to_string())
+                    .unwrap_or_else(|| panic!("{fmt}: no frame md5 for crop at ({x}, {y})"))
+            };
+            assert_eq!(
+                md5_at(1, 1),
+                md5_at(want.round_w(1), want.round_h(1)),
+                "{fmt}: the origin (1, 1) is not rounded to {want:?}"
+            );
+            if want.log2_w == 0 {
+                assert_ne!(md5_at(1, 1), md5_at(0, 1), "{fmt}: x was rounded, the table says it is not");
+            }
+            if want.log2_h == 0 {
+                assert_ne!(md5_at(1, 1), md5_at(1, 0), "{fmt}: y was rounded, the table says it is not");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "only {checked} formats were available to check");
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_measures_nothing() {
+        let t = std::time::Duration::from_secs(5);
+        assert!(measure_composite_color_policy("/nonexistent/ffmpeg", "/nonexistent/ffprobe", t).is_none());
+        // A binary that runs and fails.
+        #[cfg(unix)]
+        assert!(measure_composite_color_policy("false", "false", t).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_never_exits_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        let out = run_piped_until(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            b"input".to_vec(),
+            Instant::now() + std::time::Duration::from_millis(300),
+        );
+        assert!(out.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        // One that finishes in time hands back its output, with the input fed in.
+        let out = run_piped_until(
+            &mut Command::new("cat"),
+            b"input".to_vec(),
+            Instant::now() + std::time::Duration::from_secs(10),
+        );
+        assert_eq!(out.as_deref(), Some(&b"input"[..]));
+        // ...and one that fails hands back nothing.
+        let out = run_piped_until(
+            &mut Command::new("false"),
+            Vec::new(),
+            Instant::now() + std::time::Duration::from_secs(10),
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn a_measured_policy_is_kept_and_a_failed_probe_is_not() {
+        let state = Mutex::new(PolicyProbe::new());
+        let now = Instant::now();
+        let runs = std::cell::Cell::new(0);
+        let counter = &runs;
+        let measure = |answer: Option<CompositeColorPolicy>| {
+            move || {
+                counter.set(counter.get() + 1);
+                answer
+            }
+        };
+        // A probe that fails answers `Unknown` and is not remembered...
+        assert_eq!(cached_policy(&state, now, measure(None)), CompositeColorPolicy::Unknown);
+        assert_eq!(runs.get(), 1);
+        // ...nor run again before its backoff has passed (a broken ffmpeg is not
+        // respawned for every frame)...
+        assert_eq!(
+            cached_policy(&state, now, measure(Some(CompositeColorPolicy::FixedBt601))),
+            CompositeColorPolicy::Unknown
+        );
+        assert_eq!(runs.get(), 1, "the backoff holds the probe off");
+        // ...but it is retried once the backoff is over, and a policy it then
+        // measures is the answer for good.
+        state.lock().unwrap().retry_at = Some(Instant::now());
+        assert_eq!(
+            cached_policy(
+                &state,
+                Instant::now() + std::time::Duration::from_secs(1),
+                measure(Some(CompositeColorPolicy::BottomLayerTag))
+            ),
+            CompositeColorPolicy::BottomLayerTag
+        );
+        assert_eq!(runs.get(), 2);
+        assert_eq!(
+            cached_policy(&state, now, measure(Some(CompositeColorPolicy::FixedBt601))),
+            CompositeColorPolicy::BottomLayerTag
+        );
+        assert_eq!(runs.get(), 2, "a measured policy is never measured again");
+    }
+
+    #[test]
+    fn the_backoff_after_a_failed_probe_doubles_up_to_five_minutes() {
+        let secs = |n| policy_probe_backoff(n).as_secs();
+        assert_eq!((secs(1), secs(2), secs(3), secs(4)), (5, 10, 20, 40));
+        assert_eq!((secs(7), secs(8), secs(100)), (300, 300, 300));
+    }
+
+    #[test]
+    fn a_failed_probe_leaves_bt709_footage_to_ffmpeg() {
+        // The reviewer's repro: an ffmpeg wrapper that fails the probe. The answer
+        // used to be `BottomLayerTag`, which draws a BT.709 clip as BT.709 and is
+        // 30 dB / 31 levels wrong on every FFmpeg 6.
+        let state = Mutex::new(PolicyProbe::new());
+        let policy = cached_policy(&state, Instant::now(), || {
+            measure_composite_color_policy(
+                "/nonexistent/ffmpeg",
+                "/nonexistent/ffprobe",
+                std::time::Duration::from_secs(5),
+            )
+        });
+        assert_eq!(policy, CompositeColorPolicy::Unknown);
+        let clip_of = |color_space: Option<&str>| {
+            let asset = Asset {
+                id: uuid::Uuid::new_v4(),
+                path: "/media/a.mp4".to_string(),
+                name: "a".to_string(),
+                duration: 5.0,
+                streams: vec![StreamInfo {
+                    index: 0,
+                    kind: StreamKind::Video,
+                    codec: "h264".to_string(),
+                    width: Some(640),
+                    height: Some(360),
+                    fps: Some(30.0),
+                    sample_rate: None,
+                    channels: None,
+                    image: false,
+                    projection: None,
+                    rotation: 0,
+                    color_transfer: None,
+                    color_primaries: None,
+                    pix_fmt: Some("yuv420p".to_string()),
+                    color_space: color_space.map(str::to_string),
+                }],
+                imported_at: chrono::Utc::now(),
+                source_paths: Vec::new(),
+                voiceover: None,
+            };
+            let timeline = Timeline {
+                tracks: vec![crate::model::Track {
+                    clips: vec![Clip::new(asset.id, 0.0, 5.0, 0.0)],
+                    ..crate::model::Track::new(StreamKind::Video, "V1")
+                }],
+                overlays: Vec::new(),
+                markers: Vec::new(),
+                format: None,
+            };
+            crate::render_plan::RenderPlan::at(&timeline, &[asset], &ExportOptions::default(), 1.0, policy).unwrap()
+        };
+        let plan = clip_of(Some("bt709"));
+        assert!(!plan.gpu_supported(), "a BT.709 clip must go to FFmpeg");
+        assert!(plan.unsupported_reasons().iter().any(|r| r.contains("could not be measured")));
+        // What every FFmpeg draws the same way is still drawn.
+        let plan = clip_of(None);
+        assert!(plan.gpu_supported(), "{:?}", plan.unsupported_reasons());
+        assert_eq!(plan.canvas.matrix, crate::render_plan::YuvMatrix::Bt601);
     }
 
     #[test]

@@ -21,8 +21,11 @@
 //! * **The composite's matrix is the FFmpeg's, probed.** The conversion to RGB is
 //!   limited range with the matrix of [`kerf_core::YuvMatrix`], a field of the plan,
 //!   and which matrix FFmpeg uses depends on the FFmpeg. [`kerf_core::composite_color_policy`]
-//!   renders a tagged and an untagged clip through the real still graph once per
-//!   process and reads which behaviour it has ([`kerf_core::CompositeColorPolicy`]):
+//!   renders a tagged and an untagged clip through the real still graph (after
+//!   checking, with `ffprobe`, that the tag survived into the clip) and reads which
+//!   behaviour it has ([`kerf_core::CompositeColorPolicy`]) — once per process, in a
+//!   call that blocks for a few hundred milliseconds and so belongs on a blocking
+//!   thread:
 //!   - **`FixedBt601`** (FFmpeg 6.1: the black base carries no colourspace, so the
 //!     composite is read as BT.601 whatever the layers were tagged — BT.709, BT.601
 //!     and untagged files convert identically);
@@ -34,7 +37,13 @@
 //!     a mixed stack**, a layer whose matrix is unknown, and an RGB picture in a
 //!     stack that is not BT.601, because the arithmetic of the conversion into the
 //!     bottom layer's matrix was not reproduced (float and fixed-point models of it
-//!     were off by up to 26 levels).
+//!     were off by up to 26 levels);
+//!   - **`Unknown`** — the probe could not tell (ffmpeg would not run, timed out, or
+//!     the clip lost its tag), which is **not** remembered: it is retried after a
+//!     backoff, and until it succeeds nothing is guessed. The two policies differ on
+//!     exactly BT.709 and BT.2020 footage, so any answer for that would be wrong on
+//!     one FFmpeg; `Unknown` draws only the stacks both agree on (BT.601 throughout)
+//!     and refuses the rest.
 //!
 //!   Everything is judged by the plan, from the policy, before anything is decoded.
 //!   An asset that never recorded its pixel format has an unknown matrix and is
@@ -61,11 +70,12 @@
 //!   patterns and within five at 40:1 (x86 swscale's vertical scaler is not
 //!   bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0. A
 //!   shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
-//!   refused. FFmpeg scales a picture in the
-//!   format it has; the decode reduces it to 8-bit 4:2:0 first, which agrees for a
-//!   shrink and not for an **enlargement** of a picture that is not 4:2:0 (a 2x
-//!   enlargement of 4:4:4 is 27 levels off, of RGB 69), so the plan refuses that
-//!   from the pixel format.
+//!   refused. FFmpeg scales a picture in the format it has; the decode reduces it to
+//!   8-bit 4:2:0 first, which is the same picture only for 4:2:0 and gray: the chroma
+//!   of anything else is interpolated from different samples (a 2x enlargement of 4:4:4
+//!   is 27 levels off, of RGB 69, and a shrink as mild as 1.05x to 1.5x reads flat max
+//!   8 to 9 and 32 levels on edges), so the plan refuses **any resize** of such a
+//!   picture from its pixel format, and draws it at its own size.
 //! * **Opacity below 1** takes FFmpeg's RGB round trip ([`roundtrip`]): the layer
 //!   goes `yuva420p -> argb -> yuva420p`, because `colorchannelmixer` only takes
 //!   RGB. Out of YCbCr with the layer's own matrix (swscale's converter, exact), back
@@ -77,10 +87,23 @@
 //! * **Geometry.** FFmpeg's integer rounding (`crop`, `scale`, `pad`, `overlay`,
 //!   `rotate`) is reproduced in [`geometry`], so layers land on the same pixels —
 //!   including the chroma block an odd layer's last pixel shares with the pixel
-//!   just past it.
+//!   just past it. Which chroma grid a position is rounded to depends on where in
+//!   the graph it is: the first `crop` sees the picture as decoded and rounds to its
+//!   **native** grid (even for 4:2:0, nothing for 4:4:4, gray or RGB), and so does
+//!   the Cover crop when the transform's own `scale` follows it — the chain converts
+//!   to 4:2:0 in its *last* `scale` — while `pad`, and the Cover crop of a chain with
+//!   one `scale`, are on the 4:2:0 grid whatever the source was. The compositor's
+//!   planes are 4:2:0, so a position that lands between two of their chroma samples
+//!   on a 4:2:2 / 4:4:4 / RGB picture would misplace its chroma by a pixel: the plan
+//!   refuses it (gray, with no chroma, is drawn exactly).
+//! * **Range.** The decode converts a full-range picture to limited range up front.
+//!   FFmpeg 9 keeps it full range through the graph (tagged `pc`) and grades and
+//!   converts later, which agrees without colour correction and disagrees by 34 to
+//!   44 dB with it — on the picture itself, and on a graded layer anywhere in a stack
+//!   with a full-range one. The plan refuses both.
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
 //!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
-//!   an enlargement of a picture whose chroma is not 4:2:0, a translucent layer of
+//!   a resize of a picture whose chroma is not 4:2:0, a translucent layer of
 //!   odd size) and the decode and the compositor refuse what only they can see
 //!   ([`GpuError::Unsupported`]): a picture that decodes at another size than the
 //!   probe said (an EXIF orientation), a pixel format that is not on the allow-list

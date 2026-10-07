@@ -4,20 +4,24 @@
 //!
 //! The still graph hands a clip to `crop → scale → (pad | scale) → rotate →
 //! overlay`, and each of those rounds differently: `crop` rounds with `lrint` and
-//! then clears the low bit (4:2:0 chroma), `scale`'s aspect-preserving mode uses
-//! `av_rescale` (round half away), the second `scale` truncates, `pad` and
-//! `overlay` truncate and then round *down* to an even pixel, `rotate` rounds its
-//! box half-up. None of it is hard, but a layer that lands one pixel off from
-//! FFmpeg's is a layer whose every edge differs, and a picture-in-picture
-//! placed on `x = 16.5` is a different picture at 16 and at 17. So the
-//! compositor does not place things "where they should be" — it places them
+//! then rounds down to a whole chroma sample **of the picture's own format** (even
+//! for 4:2:0, even columns only for 4:2:2, nothing for 4:4:4, gray or RGB; see
+//! [`Subsampling`]). Every filter after it sees the picture in whatever format the
+//! chain still has, and the chain converts to 4:2:0 — the one format the overlay at
+//! the end accepts — in its **last** `scale`: so with only one `scale` (the
+//! identity transform, or a transform that does not resize) the Cover crop and `pad`
+//! after it are on the 4:2:0 grid whatever the source was, and with the transform's
+//! own `scale` after them the Cover crop is still on the native one. `scale`'s
+//! aspect-preserving mode uses `av_rescale` (round half away), the second `scale`
+//! truncates, `overlay` truncates and rounds down to even, `rotate` rounds its box
+//! half-up. None of it is hard, but a layer that lands one pixel off from//! compositor does not place things "where they should be" — it places them
 //! where FFmpeg does, and that arithmetic lives here, pure and testable.
 //!
 //! The output is a recipe for the GPU: up to two resample stages (the fit scale,
 //! the transform's own scale), an optional rotation, and where the result lands
 //! on the canvas.
 
-use crate::model::{Fit, Transform};
+use crate::model::{Fit, Subsampling, Transform};
 
 /// A pixel rectangle in some picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +120,10 @@ fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
     (a * b + c / 2) / c
 }
 
-/// Round down to a multiple of two — what 4:2:0 chroma makes `crop`, `pad` and
-/// `overlay` do to a position.
+/// Round down to a multiple of two — what 4:2:0 chroma makes `pad` and `overlay`
+/// do to a position: `pad` only runs when there is one `scale`, which has converted
+/// the picture to 4:2:0 whatever format it started in, and `overlay` works on the
+/// 4:2:0 canvas.
 fn even(v: i64) -> i64 {
     v & !1
 }
@@ -129,14 +135,14 @@ fn overlay_coord(d: f64) -> i32 {
     ((d.clamp(-1e9, 1e9) as i64) & !1) as i32
 }
 
-fn crop_window(iw: u32, ih: u32, tf: &Transform) -> Result<Rect, GeometryError> {
+fn crop_window(iw: u32, ih: u32, tf: &Transform, sub: Subsampling) -> Result<Rect, GeometryError> {
     if !tf.has_crop() {
         return Ok(Rect::whole(iw, ih));
     }
     let (iwf, ihf) = (f64::from(iw), f64::from(ih));
     let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
     let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
-    let (w, h) = (even(lrint(iwf * cw)), even(lrint(ihf * ch)));
+    let (w, h) = (sub.round_w(lrint(iwf * cw)), sub.round_h(lrint(ihf * ch)));
     if w <= 0 || h <= 0 || w > i64::from(iw) || h > i64::from(ih) {
         return Err(GeometryError(format!("the crop leaves {w}x{h} of {iw}x{ih}")));
     }
@@ -149,8 +155,8 @@ fn crop_window(iw: u32, ih: u32, tf: &Transform) -> Result<Rect, GeometryError> 
         y = i64::from(ih) - h;
     }
     Ok(Rect {
-        x: even(x) as u32,
-        y: even(y) as u32,
+        x: sub.round_w(x) as u32,
+        y: sub.round_h(y) as u32,
         w: w as u32,
         h: h as u32,
     })
@@ -168,9 +174,37 @@ fn rotated_box(iw: u32, ih: u32, angle: f64) -> (u32, u32) {
 }
 
 impl LayerGeometry {
+    /// [`LayerGeometry::resolve`] for a picture whose native chroma grid is not
+    /// known — a format that was never recorded, or one whose rounding was not
+    /// measured ([`crate::model::pix_fmt_subsampling`]). The geometry is returned
+    /// only if every grid a format could have gives the same one (no crop to round);
+    /// otherwise it is refused, because whichever grid was picked, one of the
+    /// formats it stands for would land a pixel off.
+    pub fn resolve_any_grid(src: (u32, u32), canvas: (u32, u32), fit: Fit, tf: &Transform) -> Result<Self, GeometryError> {
+        let first = Self::resolve(src, canvas, fit, tf, Subsampling::YUV420)?;
+        for sub in Subsampling::ALL {
+            if Self::resolve(src, canvas, fit, tf, sub)? != first {
+                return Err(GeometryError(
+                    "its crop rounds differently for 4:2:0 and for other pixel formats, and this one is not known well enough to say which"
+                        .into(),
+                ));
+            }
+        }
+        Ok(first)
+    }
+
     /// Resolve a `src`-sized picture onto a `canvas`-sized frame: exactly what
-    /// `still_clip_chain` + `still_overlay` build for the same inputs.
-    pub fn resolve(src: (u32, u32), canvas: (u32, u32), fit: Fit, tf: &Transform) -> Result<Self, GeometryError> {
+    /// `still_clip_chain` + `still_overlay` build for the same inputs. `sub` is the
+    /// chroma grid of the picture's **native** format, which the first `crop` rounds
+    /// to ([`Subsampling`]) and the Cover crop too when the transform scales the
+    /// picture again afterwards; `pad` and the rest are on the 4:2:0 grid.
+    pub fn resolve(
+        src: (u32, u32),
+        canvas: (u32, u32),
+        fit: Fit,
+        tf: &Transform,
+        sub: Subsampling,
+    ) -> Result<Self, GeometryError> {
         let (iw, ih) = src;
         let (ow, oh) = canvas;
         if iw == 0 || ih == 0 || ow == 0 || oh == 0 {
@@ -183,7 +217,7 @@ impl LayerGeometry {
         }
 
         // 1. crop, 2. the fit scale (`force_original_aspect_ratio`).
-        let win = crop_window(iw, ih, tf)?;
+        let win = crop_window(iw, ih, tf, sub)?;
         let (tmp_w, tmp_h) = (
             av_rescale(i64::from(oh), i64::from(win.w), i64::from(win.h)),
             av_rescale(i64::from(ow), i64::from(win.h), i64::from(win.w)),
@@ -196,14 +230,21 @@ impl LayerGeometry {
             return Err(GeometryError(format!("the fit scale leaves {fw}x{fh}")));
         }
         let (fw, fh) = (fw as u32, fh as u32);
-        // Cover then crops the overhang: `crop=ow:oh`, centred by `(iw-ow)/2`.
+        // Cover then crops the overhang: `crop=ow:oh`, centred by `(iw-ow)/2`. It
+        // sits between the first `scale` and whatever comes next, and the picture is
+        // converted to 4:2:0 by the **last** `scale` of the chain: with the
+        // transform's own scale after it (below) the crop still sees the native
+        // format and rounds to its grid; without one the first scale has already
+        // converted, and it is on the 4:2:0 grid whatever the source was.
+        let second_scale = !tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9;
+        let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
             Fit::Contain => Rect::whole(fw, fh),
             Fit::Cover => Rect {
-                x: even(lrint(f64::from(fw - ow) / 2.0)) as u32,
-                y: even(lrint(f64::from(fh - oh) / 2.0)) as u32,
-                w: ow,
-                h: oh,
+                x: cover_grid.round_w(lrint(f64::from(fw - ow) / 2.0)) as u32,
+                y: cover_grid.round_h(lrint(f64::from(fh - oh) / 2.0)) as u32,
+                w: cover_grid.round_w(i64::from(ow)) as u32,
+                h: cover_grid.round_h(i64::from(oh)) as u32,
             },
         };
         let mut stages = vec![ScaleStage {
@@ -223,9 +264,10 @@ impl LayerGeometry {
                 Fit::Cover => (0, 0),
             };
             // `pad` copies the picture in at a size rounded *down* to even (it
-            // hands 4:2:0 chroma whole blocks), so a scaled picture with an odd
-            // side loses its last row or column to the padding — measured: a
-            // 203-row fit in a 640-row frame is 202 rows in FFmpeg's still — and
+            // hands 4:2:0 chroma whole blocks — the picture is 4:2:0 by now, from
+            // any source), so a scaled picture with an odd side loses its last row
+            // or column to the padding — measured: a 203-row fit in a 640-row frame
+            // is 202 rows in FFmpeg's still, for 4:4:4 and RGB sources too — and
             // what it emits is the whole canvas, bars included.
             let (layer, picture_at, picture_shows, matte) = match fit {
                 Fit::Contain => {
@@ -334,9 +376,27 @@ mod tests {
         Transform::default()
     }
 
+    /// The geometry of a 4:2:0 picture, which is what most of these assert.
+    fn r420(src: (u32, u32), canvas: (u32, u32), fit: Fit, tf: &Transform) -> Result<LayerGeometry, GeometryError> {
+        LayerGeometry::resolve(src, canvas, fit, tf, Subsampling::YUV420)
+    }
+
+    const S422: Subsampling = Subsampling { log2_w: 1, log2_h: 0 };
+
+    /// An odd 623x347 window at an odd (11, 7) origin of a 640x360 picture.
+    fn odd_crop() -> Transform {
+        Transform {
+            crop_left: 11.0 / 640.0,
+            crop_top: 7.0 / 360.0,
+            crop_right: 6.0 / 640.0,
+            crop_bottom: 6.0 / 360.0,
+            ..t()
+        }
+    }
+
     #[test]
     fn identity_same_shape_is_a_copy_at_the_origin() {
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture, (640, 360));
         assert_eq!(g.origin, (0, 0));
         assert!(!g.matte, "a picture that fills the frame has no bars");
@@ -349,7 +409,7 @@ mod tests {
     fn contain_letterboxes_with_ffmpegs_rounding_and_even_padding() {
         // 16:9 into 9:16: scaled to 360x203 (202.5 rounds away from zero), then
         // padded at y = 218.5 -> 218 (truncate, already even).
-        let g = LayerGeometry::resolve((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
+        let g = r420((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture, (360, 203));
         // The layer is the whole canvas — `pad` emits black bars — with the
         // picture at y = 218 showing an even 202 of its rows.
@@ -357,7 +417,7 @@ mod tests {
         assert_eq!((g.layer, g.origin), ((360, 640), (0, 0)));
         assert_eq!((g.picture_at, g.picture_shows), ((0, 218), (360, 202)));
         // An odd gap rounds down to even: 1080-607 = 473 / 2 = 236.5 -> 236.
-        let g = LayerGeometry::resolve((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
+        let g = r420((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture.1, 1080);
         assert_eq!(g.picture_at.0 % 2, 0);
     }
@@ -366,7 +426,7 @@ mod tests {
     fn cover_scales_up_and_crops_the_centre() {
         // 16:9 into 9:16: scaled to cover (1138x640), then the middle 360 columns
         // are kept, at x = (1138 - 360) / 2 = 389 -> 388.
-        let g = LayerGeometry::resolve((640, 360), (360, 640), Fit::Cover, &t()).unwrap();
+        let g = r420((640, 360), (360, 640), Fit::Cover, &t()).unwrap();
         assert_eq!(g.stages[0].scaled, (1138, 640));
         assert_eq!(
             g.stages[0].keep,
@@ -388,7 +448,7 @@ mod tests {
             crop_top: 0.05,
             ..t()
         };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
         // w = 640 * 0.9 = 576, h = 360 * 0.95 = 342; x = 64, y = lrint(18) = 18.
         assert_eq!(
             g.stages[0].src,
@@ -411,7 +471,7 @@ mod tests {
             crop_right: 0.6,
             ..t()
         };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).is_err());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &tf).is_err());
     }
 
     #[test]
@@ -422,7 +482,7 @@ mod tests {
             pos_y: -0.1,
             ..t()
         };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
         assert_eq!(g.stages.len(), 2);
         assert_eq!(g.picture, (320, 180));
         // x = (640-320)/2 + 0.25*640 = 320 ; y = (360-180)/2 - 36 = 54.
@@ -433,7 +493,7 @@ mod tests {
             pos_x: 1.0 / 3.0,
             ..t()
         };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
         assert_eq!(g.origin.0, 372);
     }
 
@@ -455,21 +515,21 @@ mod tests {
     #[test]
     fn rotation_grows_the_box_and_recentres() {
         let tf = Transform { rotation: 90.0, ..t() };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
         let r = g.rotation.unwrap();
         assert_eq!(r.out, (360, 640));
         assert_eq!(g.layer, (360, 640));
         assert_eq!(g.origin, (140, -140));
         // 45 degrees of a square: side * sqrt(2) = 141.42, rounded half-up.
         let tf = Transform { rotation: 45.0, ..t() };
-        let g = LayerGeometry::resolve((100, 100), (100, 100), Fit::Contain, &tf).unwrap();
+        let g = r420((100, 100), (100, 100), Fit::Contain, &tf).unwrap();
         assert_eq!(g.rotation.unwrap().out, (141, 141));
     }
 
     #[test]
     fn opacity_is_the_alpha_ffmpegs_round_trip_leaves() {
         let tf = Transform { opacity: 0.5, ..t() };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tf).unwrap();
         // 0.5 * 255 = 127.5 -> lrint 128, then the conversion's 256/255: 129
         // (measured on FFmpeg 6.1 and 9.0, for all 256 alpha values).
         assert!((g.opacity - 129.0 / 255.0).abs() < 1e-6);
@@ -477,10 +537,10 @@ mod tests {
         assert!(g.rotation.is_none() && g.stages.len() == 1);
         // Opaque is untouched and not translucent; 0.999 is translucent (it takes
         // the RGB round trip) with an opaque alpha plane.
-        let opaque = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
+        let opaque = r420((640, 360), (640, 360), Fit::Contain, &t()).unwrap();
         assert!(!opaque.translucent && opaque.opacity == 1.0);
         let almost = Transform { opacity: 0.999, ..t() };
-        let g = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &almost).unwrap();
+        let g = r420((640, 360), (640, 360), Fit::Contain, &almost).unwrap();
         assert!(g.translucent && g.opacity == 1.0);
     }
 
@@ -492,16 +552,16 @@ mod tests {
             opacity: 0.5,
             ..t()
         };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &even).is_ok());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &even).is_ok());
         let odd = Transform {
             scale: 0.33,
             opacity: 0.5,
             ..t()
         };
-        let err = LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &odd).unwrap_err();
+        let err = r420((640, 360), (640, 360), Fit::Contain, &odd).unwrap_err();
         assert!(err.0.contains("odd size 211x118"), "{err}");
         let opaque = Transform { scale: 0.33, ..t() };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &opaque).is_ok());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &opaque).is_ok());
         // Rotation after the scale does not matter: the picture is what is checked.
         let turned = Transform {
             scale: 0.5,
@@ -509,7 +569,7 @@ mod tests {
             opacity: 0.5,
             ..t()
         };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &turned).is_ok());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &turned).is_ok());
     }
 
     #[test]
@@ -535,8 +595,131 @@ mod tests {
     #[test]
     fn nonsense_transforms_are_refused_not_drawn() {
         let tf = Transform { scale: f64::NAN, ..t() };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).is_err());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &tf).is_err());
         let tf = Transform { scale: -1.0, ..t() };
-        assert!(LayerGeometry::resolve((640, 360), (640, 360), Fit::Contain, &tf).is_err());
+        assert!(r420((640, 360), (640, 360), Fit::Contain, &tf).is_err());
+    }
+
+    #[test]
+    fn a_crop_rounds_to_the_native_chroma_grid_of_the_picture() {
+        let at = |sub| {
+            LayerGeometry::resolve((640, 360), (320, 180), Fit::Contain, &odd_crop(), sub)
+                .unwrap()
+                .stages[0]
+                .src
+        };
+        // 4:2:0: even window, even origin.
+        assert_eq!(
+            at(Subsampling::YUV420),
+            Rect {
+                x: 10,
+                y: 6,
+                w: 622,
+                h: 346
+            }
+        );
+        // 4:2:2: the columns are paired, the rows are not.
+        assert_eq!(
+            at(S422),
+            Rect {
+                x: 10,
+                y: 7,
+                w: 622,
+                h: 347
+            }
+        );
+        // 4:4:4, gray and RGB: exactly the window that was asked for.
+        assert_eq!(
+            at(Subsampling::NONE),
+            Rect {
+                x: 11,
+                y: 7,
+                w: 623,
+                h: 347
+            }
+        );
+    }
+
+    #[test]
+    fn the_cover_crop_and_the_letterbox_are_on_the_420_grid_whatever_the_source() {
+        // With a single `scale` in the chain it has converted the picture to 4:2:0
+        // before they run: only the first `crop` sees the native format. Cover 16:9
+        // into 178x324: scaled to 576x324, the overhang (576-178)/2 = 199 — odd,
+        // kept from 198 for every source.
+        for sub in Subsampling::ALL {
+            let g = LayerGeometry::resolve((640, 360), (178, 324), Fit::Cover, &t(), sub).unwrap();
+            assert_eq!(g.stages[0].keep.x, 198, "{sub:?}");
+            // 402x200 scales to 402x226 and (226-200)/2 = 13 rows go: 12 kept.
+            let g = LayerGeometry::resolve((640, 360), (402, 200), Fit::Cover, &t(), sub).unwrap();
+            assert_eq!(g.stages[0].keep.y, 12, "{sub:?}");
+            // A letterbox in a 640x366 frame: a 3-row gap above, placed at row 2...
+            let g = LayerGeometry::resolve((640, 360), (640, 366), Fit::Contain, &t(), sub).unwrap();
+            assert_eq!(g.picture_at.1, 2, "{sub:?}");
+            // ...and 360x203 shows 202 rows, 4:4:4 and RGB sources included.
+            let g = LayerGeometry::resolve((640, 360), (360, 640), Fit::Contain, &t(), sub).unwrap();
+            assert_eq!(g.picture_shows.1, 202, "{sub:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_scale_leaves_the_cover_crop_on_the_native_grid() {
+        // The transform's own `scale` converts to 4:2:0, so the Cover crop before
+        // it still sees the picture as decoded: 199 columns, not 198, on 4:4:4 and
+        // gray — and the letterbox gap and the identity case stay on 4:2:0's.
+        let scaled = Transform { scale: 1.2, ..t() };
+        let keep = |tf: &Transform, sub| {
+            LayerGeometry::resolve((640, 360), (178, 324), Fit::Cover, tf, sub)
+                .unwrap()
+                .stages[0]
+                .keep
+        };
+        assert_eq!(keep(&scaled, Subsampling::NONE).x, 199);
+        assert_eq!(keep(&scaled, S422).x, 198);
+        assert_eq!(keep(&scaled, Subsampling::YUV420).x, 198);
+        // A transform that moves the picture without resizing it has one scale only.
+        let moved = Transform { pos_x: 0.1, ..t() };
+        assert_eq!(keep(&moved, Subsampling::NONE).x, 198);
+        // The vertical overhang: 402x200 keeps 13 rows (not 12) on a native grid.
+        let y = |tf: &Transform, sub| {
+            LayerGeometry::resolve((640, 360), (402, 200), Fit::Cover, tf, sub)
+                .unwrap()
+                .stages[0]
+                .keep
+                .y
+        };
+        assert_eq!(
+            (
+                y(&scaled, Subsampling::NONE),
+                y(&scaled, S422),
+                y(&scaled, Subsampling::YUV420)
+            ),
+            (13, 13, 12)
+        );
+    }
+
+    #[test]
+    fn a_picture_of_unknown_grid_is_refused_only_where_the_grids_disagree() {
+        let any = |canvas, fit, tf: &Transform| LayerGeometry::resolve_any_grid((640, 360), canvas, fit, tf);
+        // Nothing odd to round: every grid agrees, and the geometry is the plain one.
+        let g = any((640, 360), Fit::Contain, &t()).unwrap();
+        assert_eq!(g, r420((640, 360), (640, 360), Fit::Contain, &t()).unwrap());
+        assert!(any((320, 180), Fit::Contain, &t()).is_ok());
+        // An odd crop is where the grids disagree. An odd gap or Cover overhang is
+        // not: those are on the 4:2:0 grid for every source.
+        let err = any((320, 180), Fit::Contain, &odd_crop()).unwrap_err();
+        assert!(err.0.contains("rounds differently"), "{err}");
+        for (canvas, fit) in [((640, 366), Fit::Contain), ((178, 324), Fit::Cover), ((402, 200), Fit::Cover)] {
+            assert!(any(canvas, fit, &t()).is_ok(), "{canvas:?}");
+        }
+        // A crop that lands on a multiple of four (every grid, 4:1:1 included, rounds
+        // it to itself) is the same on all of them.
+        let even_crop = Transform {
+            crop_left: 0.05,
+            crop_right: 0.05,
+            crop_top: 0.1,
+            crop_bottom: 0.1,
+            ..t()
+        };
+        assert!(any((320, 180), Fit::Contain, &even_crop).is_ok());
     }
 }

@@ -32,7 +32,12 @@ GPU has to match, and most of its quirks are deliberate.
   `RenderPlan::at` takes the policy as an argument. Stacks of one matrix are drawn
   with it; mixed matrices, unknown ones (`pix_fmt: None` = never recorded) and an
   RGB picture in a non-BT.601 stack are refused, because the conversion into the
-  bottom layer's matrix is not reproduced. The conversion happens in a shader, and
+  bottom layer's matrix is not reproduced. **A probe that cannot tell is `Unknown`,
+  never a guess** (it used to fall back to `BottomLayerTag` as "cautious", which draws
+  every BT.709 clip wrongly on FFmpeg 6): `Unknown` draws only BT.601-throughout
+  stacks, is not cached (retried after a backoff), and the probe is bounded and checks
+  its own clip's tag survived. `composite_color_policy()` blocks on its first call:
+  blocking threads only. The conversion happens in a shader, and
   compositing happens in the same space FFmpeg composites in (encoded gamma, as
   `overlay` on YUV does). The stream's own matrix (`PlanStream::matrix`) takes a
   translucent layer *out of* YUV in the RGB round trip, and the way back uses the
@@ -47,8 +52,15 @@ GPU has to match, and most of its quirks are deliberate.
   before widening a threshold.
 - **Refuse what you cannot match, loudly**: `gpu_supported_at(size)` for what the
   plan can know (including what depends on the render size: a translucent odd
-  layer, enlarging a picture that is not 8/10-bit 4:2:0 or gray, which FFmpeg
-  scales in its own format); `GpuError::Unsupported` from the decode / compositor
+  layer, any resize of a picture that is not 8/10-bit 4:2:0 or gray, which FFmpeg
+  scales in its own format (enlarging 15-69 levels off, a mild shrink flat max 8-9),
+  and a crop of a 4:2:2 / 4:4:4 / RGB picture that
+  lands between two 4:2:0 chroma samples — the first `crop` rounds to the picture's
+  *native* grid, the Cover crop only if a second `scale` follows it, and the chain
+  converts to 4:2:0 in its *last* `scale` — so check *where in the graph* a rounding
+  happens before threading a format through it; and colour correction on a
+  full-range `yuvj` picture, or in a stack that holds one under a negotiating policy,
+  because FFmpeg 9 grades before converting the range); `GpuError::Unsupported` from the decode / compositor
   for what only they can see (a picture that decodes at another size than probed,
   a pixel format off the allow-list of known-opaque ones). Alpha is judged by a
   positive allow-list (`pix_fmt_layout`), never a deny-list. Never draw it
