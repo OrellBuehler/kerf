@@ -992,6 +992,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/SettingsDialog.svelte',
 			'lib/components/editor/Timeline.svelte',
+			'lib/components/editor/TitlesControls.svelte',
 			'lib/components/editor/UpdateDialog.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',
 			'lib/components/editor/WorkspaceTabs.svelte',

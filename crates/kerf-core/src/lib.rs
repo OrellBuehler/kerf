@@ -6,6 +6,7 @@
 //! timeline (EDL), and the operations that mutate it.
 
 pub mod analysis;
+pub mod captions_import;
 mod clip_timing;
 pub mod error;
 pub mod fonts;
@@ -25,6 +26,11 @@ pub use analysis::{
     AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn,
     RhythmAnalyzer, SceneDetector, SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
+pub use captions_import::{
+    decode_caption_bytes, parse_ass, parse_captions, parse_srt, read_caption_file, CaptionFile, CaptionFormat,
+    CaptionImportRequest, ImportSummary, ImportedCue, ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
+    MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
+};
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
@@ -41,11 +47,11 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionStyle, Clip, ClipMove, Color, CropFrame, Delivery,
-    DiffEntry, DiffKind, EditSource, Framing, Keyframe, Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe,
-    ResolvedReframe, Revision, Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus,
-    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition,
-    TransitionKind, VideoEffect, Voiceover,
+    Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
+    ClipMove, Color, CropFrame, Delivery, DiffEntry, DiffKind, EditSource, Framing, Keyframe, Marker, Mask, MaskShape,
+    Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, StagedEdit, StreamInfo, StreamKind,
+    Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment,
+    Transform, Transition, TransitionKind, VideoEffect, Voiceover,
 };
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
