@@ -663,6 +663,8 @@ timeouts, apt retries, each command bounded by `sudo timeout -k` and the whole t
 three times) — a hung or trickling mirror connection otherwise sat until the job's
 timeout and read as a cancelled job. The `timeout` goes *inside* `sudo` with a KILL
 follow-up: apt-get outlives a SIGTERM mid-download, and sudo does not relay a KILL.
+A retry drops `azure.archive.ubuntu.com` from the runner's `apt-mirrors.txt` (the
+mirror that was stalling) and goes through the rest of the list.
 Rust lints are `[workspace.lints]` in the root `Cargo.toml` (no `dbg!`/`todo!`/
 `println!`, justified `unsafe`, a few style lints) — every crate opts in with
 `[lints] workspace = true`.
