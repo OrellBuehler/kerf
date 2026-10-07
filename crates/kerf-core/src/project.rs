@@ -774,6 +774,31 @@ impl Project {
         engine::waveform(Path::new(&asset.path), buckets, 8_000)
     }
 
+    /// `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
+    /// peak pairs per channel — what the timeline draws a clip's waveform from.
+    /// Served from a cached peak pyramid (one decode per file, ever), so any
+    /// window at any zoom is a slice read. `buckets` is capped at
+    /// [`crate::MAX_WAVEFORM_BUCKETS`]; see [`crate::WaveformRange`] for the shape.
+    /// An asset with no audio stream is an `InvalidArgument`.
+    pub fn waveform_range(&self, asset_id: Uuid, start: f64, end: f64, buckets: usize) -> Result<engine::WaveformRange> {
+        let asset = self.require_asset(asset_id)?;
+        Self::decode_waveform_range(&asset, start, end, buckets)
+    }
+
+    /// [`Project::waveform_range`] for an already-resolved [`Asset`], *without*
+    /// `&self` — so the caller can release the project lock before the first
+    /// call's whole-file decode (later calls are memoized and cheap). Ungated
+    /// like [`Project::decode_waveform`]: a waveform appearing is not worth
+    /// queueing behind an export.
+    pub fn decode_waveform_range(asset: &Asset, start: f64, end: f64, buckets: usize) -> Result<engine::WaveformRange> {
+        // A video-only asset has nothing to draw; say so rather than spawn an
+        // ffmpeg to fail on `-map 0:a:0`. (No stream info at all is tried anyway.)
+        if !asset.streams.is_empty() && !asset.streams.iter().any(|s| s.kind == StreamKind::Audio) {
+            return Err(Error::InvalidArgument(format!("asset {} has no audio stream", asset.id)));
+        }
+        engine::waveform_range_of(Path::new(&asset.path), start, end, buckets)
+    }
+
     /// Reduce an asset's first audio stream to `buckets` RMS magnitudes in
     /// `0.0..=1.0` — a perceptual energy-over-time curve. Companion to
     /// [`Self::waveform`] (which returns peaks); RMS better reflects loudness.
@@ -3527,6 +3552,67 @@ mod tests {
             .unwrap();
         assert_eq!(first.id, second.id, "the second import resolves to the first asset");
         assert_eq!(project.list_assets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_waveform_range_needs_an_asset_with_audio() {
+        let project = Project::open_in_memory().unwrap();
+        // Nothing here exists on disk: both refusals must come before any
+        // ffmpeg is spawned, and say what is wrong.
+        let silent = project
+            .insert_or_get_asset(&asset_with("/nowhere/silent.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let err = project.waveform_range(silent.id, 0.0, 1.0, 100).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+        assert!(err.to_string().contains("no audio stream"), "{err}");
+        let still = project
+            .insert_or_get_asset(&asset_with("/nowhere/still.png", vec![vid_stream(true)]))
+            .unwrap();
+        assert!(matches!(
+            project.waveform_range(still.id, 0.0, 1.0, 100),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            project.waveform_range(Uuid::new_v4(), 0.0, 1.0, 100),
+            Err(Error::AssetNotFound(_))
+        ));
+    }
+
+    /// `cargo test -p kerf-core --no-default-features -- --ignored waveform_range_reads`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn waveform_range_reads_an_imported_assets_peaks_without_the_project_lock() {
+        use crate::engine::test_support::StatusBounded;
+        let ffmpeg = std::env::var("KERF_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+        let dir = std::env::temp_dir().join(format!("kerf-wave-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        // Left: a 0.5 sine; right: silence. Two seconds.
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("aevalsrc='0.5*sin(2*PI*440*t)|0':s=48000:d=2:c=stereo")
+            .args(["-c:a", "pcm_f32le"])
+            .arg(&wav)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(made.success());
+
+        let project = Project::open_in_memory().unwrap();
+        let asset = project.import_asset(&wav).unwrap();
+        let range = project.waveform_range(asset.id, 0.0, 2.0, 40).unwrap();
+        assert_eq!(
+            (range.channels, range.buckets, range.min.len(), range.max.len()),
+            (2, 40, 2, 2)
+        );
+        assert!(range.max[0].iter().all(|v| (0.45..=0.51).contains(v)), "{:?}", range.max[0]);
+        assert!(range.min[1].iter().chain(&range.max[1]).all(|v| v.abs() < 1e-4));
+        assert!((range.duration - 2.0).abs() < 0.01);
+
+        // The lock-free static a surface calls after dropping the project lock
+        // reads the same answer (from the memo this time).
+        let again = Project::decode_waveform_range(&asset, 0.0, 2.0, 40).unwrap();
+        assert_eq!(again, range);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

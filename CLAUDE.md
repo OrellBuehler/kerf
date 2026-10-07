@@ -274,6 +274,39 @@ so the feature is **only** activated through these forwards — which is what ma
   a stripped-tag phone file does not abort the graph with "no path between
   colorspaces". Assets saved before these fields existed deserialize as SDR with
   the coded size; re-importing the file re-probes it.
+- `peaks.rs` (always compiled, CLI only) is what the timeline draws a clip's **waveform**
+  from, and it answers a different question than `waveform` (N peaks for a whole
+  file, 8 kHz, kept as it was): a clip shows a *window* at a zoom that never stops
+  changing, so a file is decoded **once** into a `WaveformPyramid` — min/max peak
+  pairs at 500 / 100 / 25 / 10 buckets per second, per channel (stereo when the
+  source has two or more channels, mono otherwise) — and any window is then a slice
+  read, `waveform_range(pyramid, start, end, buckets)` (pure + unit-tested; `start` /
+  `end` in **source** seconds). It picks the *coarsest* level that still has a source
+  bucket per requested one, partitions source buckets among the requested ones by
+  where each begins (a peak lands in one column, never smeared across two; when the
+  request is finer than the source it reads the bucket under each column's midpoint),
+  leaves the part of a window outside the media as 0/0 buckets so the caller's
+  time-to-column mapping stays linear, and caps `buckets` at 4096. The decode is
+  **48 kHz f32** on purpose: 96 samples is exactly one 2 ms bucket, every coarser
+  level is a whole multiple, and 48 kHz is what video audio already is, so no
+  resampler runs and the peaks are the real samples' — at 8 kHz the low-pass smears
+  transients and rings around a clipped plateau, so a flat-topped 1.0 would not read
+  as full scale. Peaks are stored as `i16` (±32767 = full scale, so a clipped sample
+  is recognizable; ~18 MB per hour of stereo) and the PCM is folded into buckets as
+  it streams off the pipe, so memory is the pyramid, never the file. Like every read
+  the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
+  niced, at most two decodes at once (a freshly opened project asks for every clip
+  at the same instant), concurrent requests for one file share one decode
+  (`shared_pyramid`), and the pipe is read on a side thread so a decode silent for
+  60 s is killed. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
+  by path + size + mtime + a format version, written to a temp file and renamed; a
+  file that is short, long, the wrong version, inconsistent with its own frame count
+  or has a bucket whose min exceeds its max is recomputed, never trusted — and the
+  size is checked before anything is allocated. Loaded pyramids sit in a
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
+  op (an asset with no audio stream is `InvalidArgument`); `get_waveform` /
+  `get_energy` are unchanged.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
@@ -554,7 +587,7 @@ no editing logic in the adapter.
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
   opens a `.kerf` file to populate it.
-  `analyze_asset`, `frame_at` and `waveform` delegate to the engine; editing ops are
+  `analyze_asset`, `frame_at`, `waveform` and `waveform_range` delegate to the engine; editing ops are
   unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects
   every asset's cached `Tempo`, builds the grid and aligns one track (or every
   unlocked video track) to it, defaulting the tolerance to half a beat so each cut

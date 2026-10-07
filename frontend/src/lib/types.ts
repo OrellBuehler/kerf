@@ -385,6 +385,24 @@ export interface AssetMetadata {
 	analysis: AssetAnalysis | null;
 }
 
+/**
+ * A window of an asset's audio as min/max peaks (`get_waveform_range`).
+ * Mirrors `kerf_core::WaveformRange`. `min` / `max` are `[channel][bucket]`,
+ * each `buckets` long and in -1..1; a bucket outside the media is 0 / 0.
+ */
+export interface WaveformRange {
+	/** Lanes: 1 (mono) or 2 (stereo). */
+	channels: number;
+	/** Buckets per channel actually returned — the request, capped at 4096. */
+	buckets: number;
+	/** Length of the decoded audio in seconds. */
+	duration: number;
+	/** Resolution of the pyramid level served (10, 25, 100 or 500). */
+	peaks_per_second: number;
+	min: number[][];
+	max: number[][];
+}
+
 export type EditSource = 'user' | 'agent' | 'system';
 
 export interface Revision {
