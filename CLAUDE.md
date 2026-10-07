@@ -71,8 +71,8 @@ so the feature is **only** activated through these forwards — which is what ma
   anything that reads a *whole file*: silence / scene / loudness detection, the
   PCM decode behind rhythm and in-process whisper, transcription, proxy, stitch,
   export. **Ungated** = anything that reads a *moment*: a scrubbed frame, the
-  composited still, a clip's audio, the preview stream, a waveform, a contact
-  sheet — the UI (and an agent *looking* at footage) must not wait out a render.
+  composited still, a clip's audio, the preview stream, a waveform, a filmstrip, a
+  contact sheet — the UI (and an agent *looking* at footage) must not wait out a render.
   The share becomes `-threads` / `-filter_threads` / `-filter_complex_threads`,
   written in at **spawn** time (`cpu::limit_args` / `limit_cmd`) rather than in
   the pure argument builders, so those keep describing exactly what ffmpeg is
@@ -308,6 +308,39 @@ so the feature is **only** activated through these forwards — which is what ma
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
   are unchanged.
+- `filmstrip.rs` (always compiled, CLI only) is the video twin of `peaks.rs`: what the
+  timeline draws a clip's **thumbnails** from. An asset is sampled once into a
+  `Filmstrip` — 96 px-high frames (width from the *displayed* aspect, so rotation is
+  autorotate's; a 360 asset is its raw equirect frame), `tile`d into one-row JPEG
+  sheets of at most 8192 px, balanced so none is mostly padding (`sheet_layout`) — and
+  a window is a few thumbnails picked with `Filmstrip::frame_at(t)` / `locate(k)`.
+  **Thumbnail `k` is the frame on screen at source time `k * interval`** (the last
+  frame at or before it; 0 is the first frame): that is `fps=…:start_time=0:round=up`
+  — `fps`'s default `round=near` picks the frame half an interval *later*, and
+  without `start_time=0` a picture that starts after the sound numbers its samples
+  from its first frame's slot. The interval is the finest rung of 0.5 / 1 / 2 / 5 /
+  10 / 15 / 30 / 60 … s that keeps the strip within 300 thumbnails (`pick_interval`;
+  ~3-6 KB a frame); a still is one thumbnail. It decodes the **proxy when
+  `ready_proxy` has one, else the original** (`Project::filmstrip_inputs` resolves it
+  under the lock; a failing proxy falls back to the original, hardware decode to
+  software), and the cache key is the **original's** identity (path + size + mtime +
+  geometry + interval + version), never the proxy's: the frames look the same and a
+  proxy keeps frame times, so a strip made before the proxy landed is the same entry
+  after. HDR is tone-mapped after the downscale from `source_hdr` of the file
+  actually decoded (a proxy converts nothing twice). **Two ffmpegs, one decode:** the
+  first streams *raw* thumbnails over a pipe — so the no-hang rule is per thumbnail
+  (silent for `max(60 s, 6 × interval)` and it is killed) and the count is exact
+  rather than inferred from tile padding — the second tiles and JPEG-encodes them
+  from memory. **Ungated** (no `cpu::lease`) although it reads the whole file: the
+  timeline draws from it, and gated it would sit behind the proxy encode and the
+  import's analysis while clips stay empty; so thread-capped, niced, two at once, and
+  concurrent asks for one asset share one decode. Cached at
+  `<cache>/kerf/filmstrips/<hash>/` (`sheet-000.jpg …` + `manifest.json`) via a
+  `.part` directory and a rename; a manifest that is not the canonical layout for its
+  frame count, or a sheet that is missing / resized / not a JPEG of the promised size,
+  is rebuilt, never trusted. `Filmstrip` serializes its geometry *without* the JPEG
+  bytes (`#[serde(skip)]`) — a surface adds its own transport. No video stream is
+  `InvalidArgument`; `Project::decode_filmstrip` is the lock-free half.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

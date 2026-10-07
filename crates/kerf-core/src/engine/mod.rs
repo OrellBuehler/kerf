@@ -31,6 +31,13 @@ pub use peaks::{
     MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
 };
 
+// Filmstrip thumbnails for timeline clips: one decode per asset into a few
+// tiled JPEG sheets, cached on disk. CLI-only, so it works in every build.
+mod filmstrip;
+#[cfg(test)]
+pub(crate) use filmstrip::cached_entry_dir as cached_filmstrip_dir;
+pub use filmstrip::{filmstrip_for, Filmstrip, FilmstripSheet, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES};
+
 /// Test-only: run the ffmpeg commands that synthesize media under a deadline, so
 /// a wedged binary fails the test with its command line instead of holding the
 /// suite until the CI job's own timeout cancels it.
