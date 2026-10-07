@@ -3563,6 +3563,24 @@ fn fmt_delivery(d: &Delivery) -> String {
 }
 
 impl Timeline {
+    /// How many clips stand somewhere else here than in `before`: a different
+    /// start on their track, or a different track. Matched by id, so a clip that
+    /// exists on only one side is not counted. This is how a caller learns whether
+    /// an edit *rippled* — ripple is the only thing that moves a clip a remove or a
+    /// retime did not touch — rather than assuming it did because ripple mode was
+    /// on: a locked track never moves, and a ripple that would leave a lane
+    /// overlapping is declined, both silently.
+    pub fn clips_moved_since(&self, before: &Timeline) -> usize {
+        let was = clip_index(before);
+        clip_index(self)
+            .into_iter()
+            .filter(|(id, (track, clip))| {
+                was.get(id)
+                    .is_some_and(|(t, c)| t.id != track.id || num_changed(c.timeline_start, clip.timeline_start))
+            })
+            .count()
+    }
+
     /// What changed between this timeline and `after`, phrased for a human
     /// reviewing a cut.
     ///
@@ -5403,5 +5421,37 @@ mod tests {
         t.tracks[0].locked = true;
         assert!(matches!(t.remove_clips(&[clips[1].id]), Err(Error::InvalidArgument(why)) if why.contains("locked")));
         assert!(t.tracks[0].locked && t.tracks[0].clips.len() == 1);
+    }
+
+    #[test]
+    fn clips_moved_since_says_whether_an_edit_rippled() {
+        let (t, [a, b, c]) = gapped();
+        assert_eq!(t.clips_moved_since(&t), 0);
+
+        // A bare remove leaves a gap; ripple closes it and b and c follow.
+        let (bare, out) = rippled(&t, |tl| tl.tracks[0].clips.retain(|x| x.id != a));
+        assert_eq!(bare.clips_moved_since(&t), 0);
+        assert_eq!(out.clips_moved_since(&t), 2);
+
+        // Removing the last clip has nothing after it to move: ripple on, nothing rippled.
+        let (_, out) = rippled(&t, |tl| tl.tracks[0].clips.retain(|x| x.id != c));
+        assert_eq!(out.clips_moved_since(&t), 0);
+
+        // A locked track never moves, so the same removal moves nothing there.
+        let mut locked = t.clone();
+        locked.tracks[0].locked = true;
+        let (_, out) = rippled(&locked, |tl| tl.tracks[0].clips.retain(|x| x.id != a));
+        assert_eq!(out.clips_moved_since(&locked), 0);
+
+        // A clip on another track counts, a clip that exists on one side only does not.
+        let mut two = t;
+        two.tracks.push(track(StreamKind::Video, "V2", vec![]));
+        let mut moved = two.clone();
+        let clip = moved.tracks[0].clips.remove(1);
+        assert_eq!(clip.id, b);
+        moved.tracks[1].clips.push(clip);
+        assert_eq!(moved.clips_moved_since(&two), 1);
+        moved.tracks[1].clips.push(rclip(0.0, 1.0));
+        assert_eq!(moved.clips_moved_since(&two), 1, "an added clip is not a moved one");
     }
 }

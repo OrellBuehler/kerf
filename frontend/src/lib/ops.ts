@@ -4,7 +4,7 @@
 
 import { editor } from './state.svelte';
 import { toast } from './notifications.svelte';
-import { removalNotice } from './removal';
+import { cutNotice, lockedNotice, removalNotice } from './removal';
 
 export function errorMessage(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
@@ -26,10 +26,28 @@ export async function deleteSelection(ripple: boolean): Promise<void> {
 	try {
 		const { removed, skipped } = await editor.removeSelected(ripple);
 		if (removed === 0) {
-			if (skipped > 0) toast.error(skipped === 1 ? 'That clip is on a locked track' : `Those ${skipped} clips are on locked tracks`);
+			if (skipped > 0) toast.error(lockedNotice(skipped));
 			return;
 		}
 		toast(removalNotice(removed, skipped, ripple), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	} catch (e) {
+		toast.error(errorMessage(e));
+	}
+}
+
+/** Cut (⌘/Ctrl+X): the selected clips go to the clipboard and off the timeline as
+ *  one edit. Only what the cut actually removes is copied — clips on a locked
+ *  track stay (and stay selected), and if that is everything, nothing happens to
+ *  the clipboard and the notice says why instead of claiming a cut. */
+export async function cutSelection(): Promise<void> {
+	try {
+		editor.copySelection(true);
+		const { removed, skipped } = await editor.removeSelected(false);
+		if (removed === 0) {
+			if (skipped > 0) toast.error(lockedNotice(skipped));
+			return;
+		}
+		toast(cutNotice(removed, skipped), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 	} catch (e) {
 		toast.error(errorMessage(e));
 	}

@@ -19,7 +19,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { deleteSelection } from '$lib/ops';
+	import { cutSelection, deleteSelection } from '$lib/ops';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -325,12 +325,7 @@
 				if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
 			} else if (k === 'x') {
 				e.preventDefault();
-				const n = editor.copySelection();
-				if (n)
-					void editor
-						.removeSelected(false)
-						.then(() => toast(n === 1 ? 'Clip cut' : `${n} clips cut`))
-						.catch(clipErr);
+				void cutSelection();
 			} else if (k === 'v') {
 				e.preventDefault();
 				void editor

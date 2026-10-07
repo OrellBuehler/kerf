@@ -369,11 +369,16 @@ class EditorState {
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
+			// The ripple flag is the project's, saved in its file: a project that was
+			// saved with ripple on has to open that way, and a new one has to reset
+			// the toggle, so it is read with everything else every load. (It never
+			// rejects — a failed read keeps what was showing.)
 			const [assets, timeline, history, currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
 				getHistory(),
-				projectPath()
+				projectPath(),
+				this.loadRippleMode()
 			]);
 			this.assets = assets;
 			this.#setTimeline(timeline);
@@ -646,11 +651,17 @@ class EditorState {
 	 */
 	clipboard = $state<Placement[]>([]);
 
-	copySelection(): number {
+	/** Copy the selection to the clipboard; resolves to how many clips. With
+	 *  `editableOnly`, clips on a locked track are left out — what a cut may take —
+	 *  and a selection with nothing left leaves the clipboard as it was. */
+	copySelection(editableOnly = false): number {
 		const want = new Set(this.selectedClipIds);
 		const out: Placement[] = [];
-		for (const t of this.timeline.tracks)
+		for (const t of this.timeline.tracks) {
+			if (editableOnly && t.locked) continue;
 			for (const c of t.clips) if (want.has(c.id)) out.push({ track_id: t.id, clip: $state.snapshot(c) as Clip });
+		}
+		if (editableOnly && out.length === 0) return 0;
 		this.clipboard = out.sort((a, b) => a.clip.timeline_start - b.clip.timeline_start);
 		return this.clipboard.length;
 	}
@@ -680,9 +691,14 @@ class EditorState {
 		return this.#apply(rippleDelete(clipId));
 	}
 
+	/** Drop a clip from the selection; the primary falls to what is left. */
 	#forget(clipId: string) {
-		if (this.selectedClipId === clipId) this.selectedClipId = null;
-		this.selectedClipIds = this.selectedClipIds.filter((id) => id !== clipId);
+		this.#setSelection(
+			normalize(
+				this.selectedClipIds.filter((id) => id !== clipId),
+				this.selectedClipId === clipId ? null : this.selectedClipId
+			)
+		);
 	}
 	cutRange(clipId: string, from: number, to: number) {
 		return this.#apply(cutClipRange(clipId, from, to));

@@ -111,7 +111,7 @@ struct VoiceoverParams {
     )]
     caption_style: Option<CaptionStyle>,
     #[schemars(
-        description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently and a locked track never moves."
+        description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -163,7 +163,7 @@ struct AddClipParams {
     #[schemars(description = "Timeline position (seconds); omit to append")]
     timeline_start: Option<f64>,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, a clip dropped onto footage that is already there pushes that footage and everything after it later by the clip's length; appending, or filling a gap it fits in, moves nothing either way. false places the clip exactly as asked. Tracks ripple independently and a locked track never moves."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, a clip dropped onto footage that is already there pushes that footage and everything after it later by the clip's length; appending, or filling a gap it fits in, moves nothing either way. false places the clip exactly as asked. Tracks ripple independently. A clip dropped INSIDE an existing clip would need that clip split, so ripple cannot make room: it leaves the two overlapping — place clips on the boundary between two, or split first, and check get_timeline_state. More generally ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -194,7 +194,7 @@ struct TrimParams {
     )]
     timeline_start: Option<f64>,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's length, keeping their gaps, and a left-edge trim keeps the clip's start (so timeline_start is not needed). false trims in place and leaves later clips where they are. Tracks ripple independently (trimming on V1 never moves A1) and a locked track never moves."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's length, keeping their gaps, and a left-edge trim keeps the clip's start (so timeline_start is not needed). false trims in place and leaves later clips where they are. Tracks ripple independently (trimming on V1 never moves A1). Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -220,7 +220,7 @@ struct RemoveClipParams {
     #[schemars(description = "UUID of the clip to remove")]
     clip_id: String,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true closes the gap the clip leaves: the later clips on its track shift left by its length, gaps kept (ripple_delete is the same thing as a tool of its own). false leaves the gap. Tracks ripple independently and a locked track never moves."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true closes the gap the clip leaves: the later clips on its track shift left by its length, gaps kept (ripple_delete is the same thing as a tool of its own). false leaves the gap. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -230,7 +230,7 @@ struct RemoveClipsParams {
     #[schemars(description = "UUIDs of the clips to remove, on any tracks; a clip named twice is removed once")]
     clip_ids: Vec<String>,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true is a multi-clip ripple delete: every track closes up behind what it lost, each by its own removed length, gaps kept. false leaves the gaps. Tracks ripple independently and a locked track never moves."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true is a multi-clip ripple delete: every track closes up behind what it lost, each by its own removed length, gaps kept. false leaves the gaps. Tracks ripple independently. The result's `rippled` / `clips_shifted` say whether anything actually moved."
     )]
     ripple: Option<bool>,
 }
@@ -466,7 +466,7 @@ struct SpeedParams {
     #[schemars(description = "Playback rate: 1.0 = normal, 2.0 = 2x faster, 0.5 = half speed, negative = reverse")]
     speed: f64,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false retimes the clip and leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently and a locked track never moves."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false retimes the clip and leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -1479,19 +1479,33 @@ impl KerfMcp {
         description = "Remove several clips in ONE edit (one revision, one undo step) — a multi-select delete. \
                        All or nothing: an unknown clip, or one on a locked track, refuses the whole call. Leaves \
                        gaps, unless the project is in ripple mode (get_ripple_mode) or `ripple` is true, which \
-                       closes every track up behind what it lost (a multi-clip ripple delete). Returns how many \
-                       clips were removed and whether the edit rippled."
+                       closes every track up behind what it lost (a multi-clip ripple delete). Returns \
+                       `removed` (how many clips), `ripple_active` (whether ripple applied to this call) and, \
+                       measured rather than assumed, `rippled` / `clips_shifted` (whether any later clip actually \
+                       moved, and how many — ripple on with nothing after the removed clips moves nothing)."
     )]
     fn remove_clips(&self, Parameters(p): Parameters<RemoveClipsParams>) -> Result<String, McpError> {
         let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
         self.edit(|project| {
+            // What the agent sees is the cut it is building: the proposal while it has
+            // one staged, the live timeline otherwise.
+            let before = project.working_timeline().map_err(core_err)?;
             let (removed, ripple) = project
                 .with_ripple(p.ripple, |project| {
                     let ripple = project.ripple_active()?;
                     project.remove_clips(&ids).map(|removed| (removed, ripple))
                 })
                 .map_err(core_err)?;
-            json(&serde_json::json!({ "removed": removed, "rippled": ripple }))
+            // Ripple on is a promise to try, not a result: a locked track never moves
+            // and a lane the shift would leave overlapping is declined, silently.
+            // So say what happened.
+            let shifted = project.working_timeline().map_err(core_err)?.clips_moved_since(&before);
+            json(&serde_json::json!({
+                "removed": removed,
+                "ripple_active": ripple,
+                "rippled": shifted > 0,
+                "clips_shifted": shifted,
+            }))
         })
     }
 
@@ -1500,7 +1514,8 @@ impl KerfMcp {
                        sits ahead of a clip — a trim, a speed change, a remove, an add onto footage that is there, \
                        a voiceover placed over footage — carries the later clips on the same track along, keeping \
                        their gaps. Each track ripples on its own (no sync lock: a V1 ripple leaves A1 where it \
-                       is), a locked track never moves, and titles and markers stay put. Off by default; it is the \
+                       is), a locked track never moves (and a lane the shift would leave overlapping is left as the \
+                       edit made it), and titles and markers stay put. Off by default; it is the \
                        user's toolbar setting and is saved with the project. Check it before trimming or \
                        removing, and pass `ripple` on those tools to override it for one call."
     )]

@@ -24,6 +24,7 @@
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
 	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
 	import { frameTicksIn, rulerStep, tickLabel, ticksIn } from '$lib/ruler';
+	import { MIN_CLIP, rippleTrimPreview, trimBounds } from '$lib/ripple-trim';
 	import {
 		clampZoom,
 		fitZoom,
@@ -235,8 +236,10 @@
 		clipId: string;
 		trackId: string;
 		edge: 'l' | 'r';
-		min: number; // dragged-edge bounds, timeline seconds
+		min: number; // dragged-edge bounds, timeline seconds: stopped by the neighbours...
 		max: number;
+		rMin: number; // ...and with ripple on, which pushes the neighbours along instead
+		rMax: number;
 		origStart: number;
 		origEnd: number;
 		pos: number; // current ghost position of the dragged edge
@@ -246,8 +249,21 @@
 	};
 	let trimDrag = $state<TrimDrag | null>(null);
 
-	/** Shortest a clip may get when edge-trimming, seconds. */
-	const MIN_CLIP = 0.05;
+	/** The bounds in force: ripple lifts the neighbour clamps (it pushes them along),
+	 *  and the mode is the project's, so it is asked again at every move and at the
+	 *  release rather than trusted from the press. */
+	const trimLimits = (d: TrimDrag) => (editor.rippleMode ? { min: d.rMin, max: d.rMax } : { min: d.min, max: d.max });
+
+	/** What the trim in progress leaves on its track under ripple: the clip and every
+	 *  clip it moves, where each lands (`ripple-trim.ts`, over the faithful port of
+	 *  the backend's `ripple_from`) — not the clip with its edge dragged, because a
+	 *  left-edge trim keeps the clip's start. Null without ripple or a moving drag. */
+	const trimPreview = $derived.by(() => {
+		const d = trimDrag;
+		if (!d?.moved || !editor.rippleMode) return null;
+		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
+		return track ? rippleTrimPreview(track, d.clipId, d.edge, d.pos) : null;
+	});
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool === 'razor') return; // razor falls through to split
@@ -260,37 +276,21 @@
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		// A still image loops, so its source window can grow without limit.
 		const still = asset?.streams.some((s) => s.image) ?? false;
-		const sp = c.speed ?? 1;
-		const mag = Math.max(Math.abs(sp), 0.01);
 		const start = c.timeline_start;
 		const end = start + clipDuration(c);
 		const clips = [...(editor.timeline.tracks.find((tr) => tr.id === t.id)?.clips ?? [])].sort(
 			(a, b) => a.timeline_start - b.timeline_start
 		);
-		const i = clips.findIndex((x) => x.id === c.id);
-		// Unused source on the side being extended: a forward clip's left edge
-		// draws on the handle below source_in, its right edge on the handle past
-		// source_out; a reversed clip plays backwards, so the sides swap.
-		const headHandle = sp < 0 ? Math.max(0, (asset?.duration ?? c.source_out) - c.source_out) : c.source_in;
-		const tailHandle = sp < 0 ? c.source_in : Math.max(0, (asset?.duration ?? c.source_out) - c.source_out);
-		let min: number;
-		let max: number;
-		if (edge === 'l') {
-			const prev = i > 0 ? clips[i - 1] : null;
-			const prevEnd = prev ? prev.timeline_start + clipDuration(prev) : 0;
-			min = Math.max(0, prevEnd, still ? 0 : start - headHandle / mag);
-			max = end - MIN_CLIP;
-		} else {
-			const nextStart = i >= 0 && i < clips.length - 1 ? clips[i + 1].timeline_start : Infinity;
-			min = start + MIN_CLIP;
-			max = Math.min(nextStart, still ? Infinity : end + tailHandle / mag);
-		}
+		const strict = trimBounds(c, edge, clips, asset?.duration, still, false);
+		const loose = trimBounds(c, edge, clips, asset?.duration, still, true);
 		trimDrag = {
 			clipId: c.id,
 			trackId: t.id,
 			edge,
-			min,
-			max,
+			min: strict.min,
+			max: strict.max,
+			rMin: loose.min,
+			rMax: loose.max,
 			origStart: start,
 			origEnd: end,
 			pos: edge === 'l' ? start : end,
@@ -308,7 +308,8 @@
 		// Where the pointer says the edge is (it keeps the offset it grabbed it at),
 		// rounded once: that is the ghost, and the commit.
 		const raw = laneTime(e.clientX, laneLeft) - trimDrag.grab;
-		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), trimDrag.min, trimDrag.max);
+		const { min, max } = trimLimits(trimDrag);
+		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), min, max);
 		const moved = trimDrag.moved || Math.abs(e.clientX - trimDrag.downX) >= DRAG_SLOP;
 		trimDrag = { ...trimDrag, pos, moved };
 	}
@@ -318,13 +319,22 @@
 		const d = trimDrag;
 		trimDrag = null;
 		if (!d.moved) return;
+		// The mode can flip mid-drag (the R key, an agent): the position is held to
+		// what is legal now, as the ghost was.
+		const limits = trimLimits(d);
+		const pos = clampEdge(d.pos, limits.min, limits.max);
 		// A drag that ended on the frame the edge was already on writes nothing.
-		if (Math.abs(d.pos - (d.edge === 'l' ? d.origStart : d.origEnd)) < 1e-9) return;
-		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
-		if (!clip) return;
-		// `d.pos` is the gesture's one rounded position (the ghost drew it too); every
+		if (Math.abs(pos - (d.edge === 'l' ? d.origStart : d.origEnd)) < 1e-9) return;
+		const track = editor.timeline.tracks.find((t) => t.id === d.trackId);
+		const clip = track?.clips.find((c) => c.id === d.clipId);
+		if (!track || !clip) return;
+		// Under ripple the neighbours are pushed along — unless the backend would
+		// decline to (it hands the edit back as made), which would leave this clip
+		// over its neighbour: the ghost was red, and letting go changes nothing.
+		if (editor.rippleMode && !rippleTrimPreview(track, d.clipId, d.edge, pos)?.ok) return;
+		// `pos` is the gesture's one rounded position (the ghost drew it too); every
 		// field the trim writes comes from it.
-		const e = trimEdit(clip, d.edge, d.pos);
+		const e = trimEdit(clip, d.edge, pos);
 		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start).catch(err);
 	}
 
@@ -490,11 +500,14 @@
 		scrubbing = false;
 		markDrag = null;
 		markerDrag = null;
-		// A marquee abandoned gives the selection back as it found it.
+		// A marquee abandoned gives the selection back as it found it — and the click
+		// that still follows when the button comes up is not a click on the lane
+		// (it would seek, and clear what was just restored).
 		if (marquee) {
 			const { base } = marquee;
 			marquee = null;
 			editor.selectClips(base.ids, base.primary);
+			swallowClick = true;
 		}
 		releaseCapture();
 	}
@@ -639,7 +652,10 @@
 	let marquee = $state<Marquee | null>(null);
 	let lanesEl = $state<HTMLElement | null>(null);
 	/** The click that ends a marquee is not a click on the lane it ends on: it
-	 *  would seek and clear the selection the drag just made. */
+	 *  would seek and clear the selection the drag just made (or just gave back).
+	 *  Held until that click arrives or the next press, which always comes first —
+	 *  not on a timer: an Escape mid-drag abandons the marquee long before the
+	 *  button comes up. */
 	let swallowClick = false;
 
 	/** Where each track's lane sits in lane space — measured, because the heights
@@ -711,7 +727,6 @@
 		if (!m) return;
 		if (m.moved) {
 			swallowClick = true;
-			setTimeout(() => (swallowClick = false), 0); // the click, if any, follows at once
 			const primary = editor.selectedClip;
 			if (primary) void editor.select(primary.asset_id);
 		} else if (m.from === 'canvas' && m.mode === 'replace') {
@@ -1754,7 +1769,7 @@
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
 						{@const primary = editor.selectedClipId === c.id}
-						{@const dragging = drag?.moved && drag.members.has(c.id)}
+						{@const dragging = (drag?.moved && drag.members.has(c.id)) || !!trimPreview?.shifted.has(c.id)}
 						{@const off = c.enabled === false || !renders(t)}
 						<button
 							class="kclip"
@@ -1858,7 +1873,20 @@
 								: 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'};pointer-events:none;z-index:25"
 						></div>
 					{/each}
-					{#if trimDrag?.moved && trimDrag.trackId === t.id}
+					{#if trimPreview && trimDrag?.trackId === t.id}
+						<!-- Ripple: where the trimmed clip and everything it moves would be — a
+						     left edge keeps the clip's start, so this is not the edge dragged. -->
+						{#each trimPreview.ghosts as g (g.id)}
+							<div
+								style="position:absolute;left:{g.start * pxPerSec}px;top:5px;height:calc(100% - 10px);width:{Math.max(
+									2,
+									g.dur * pxPerSec
+								)}px;border:1.5px dashed {trimPreview.ok ? 'var(--kerf-400)' : 'var(--red-500)'};border-radius:2px;background:{trimPreview.ok
+									? 'color-mix(in srgb,var(--drag-ghost) 16%,transparent)'
+									: 'var(--danger-surface)'};pointer-events:none;z-index:25"
+							></div>
+						{/each}
+					{:else if trimDrag?.moved && trimDrag.trackId === t.id}
 						{@const gl = trimDrag.edge === 'l' ? trimDrag.pos : trimDrag.origStart}
 						{@const gr = trimDrag.edge === 'l' ? trimDrag.origEnd : trimDrag.pos}
 						<div

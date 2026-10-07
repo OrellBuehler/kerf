@@ -779,11 +779,16 @@ MCP**: `get_ripple_mode` / `set_ripple_mode` read and write the project flag
 (the tool description warns that the latter flips the *user's* toolbar setting —
 a call that wants one different answer passes `ripple` instead), `move_clips`
 (`moves: [{clip_id, timeline_start, track_id?}]`, ids parsed by `clip_moves`) and
-`remove_clips` (`clip_ids`, answering `{removed, rippled}`) are the one-revision
-group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
+`remove_clips` (`clip_ids`, answering `{removed, ripple_active, rippled,
+clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the clips
+standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
+attempt, skipped on a locked track and declined for a lane the shift would leave
+overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
 `remove_clips`, `add_clip_to_timeline`, `split_at`, `generate_voiceover`'s
 placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
-around the core call (omitted follows the project; `false` is the escape hatch).
+around the core call (omitted follows the project; `false` is the escape hatch); their
+descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
+the overlap.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `reorder`, `duplicate_clips`) take
 none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
@@ -1309,7 +1314,15 @@ project flag — read in `load()` (so launch, New and Open) and again on the
 the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
 `aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
 ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
-All the rippling is the backend's. *Selection* is a set: `selection.ts` holds every way of
+All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
+no longer stopped by its neighbours (it pushes them — only the source's footage, the
+0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
+*outcome* (`rippleTrimPreview`: the trim applied to a scratch copy of the track, then
+`ripple.ts`'s `rippleFrom`), because a left-edge trim keeps the clip's start rather than
+holding the right edge — one ghost per clip it moves, the moved clips dimmed, red and
+inert if the backend would decline the ripple. The bounds are asked again at every move
+and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
+load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
 changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
 with several selected it shows an "N clips selected" note, since its sections act on that
 one): a click replaces, Ctrl/Cmd toggles, Shift extends along the primary's track (adds
@@ -1319,8 +1332,9 @@ touches — Shift adds, Ctrl/Cmd toggles — recomputed from the selection as th
 it so the rectangle can shrink (`marqueeSelect`; `marquee.ts` tests the rectangle, in lane
 space, against lane boxes measured from the DOM since the heights are CSS). Clips on a
 locked track are not swept up (locking guards edits, and the selection is what every edit
-acts on) but stay clickable. Escape mid-drag restores the selection; the click that ends a
-marquee is swallowed so it does not seek and deselect; Escape otherwise clears (the page's
+acts on) but stay clickable. Escape mid-drag restores the selection; the click that ends (or follows an abandoned)
+marquee is swallowed — held until it arrives or the next press, not on a timer — so it
+does not seek and deselect; Escape otherwise clears (the page's
 handler — the timeline's and the preview's abandon-a-gesture handlers run in the capture
 phase and stop the event, so abandoning a drag never also clears). `#setTimeline` prunes
 ids another edit removed. *Group move*: pressing a selected clip of several keeps them
@@ -1333,7 +1347,9 @@ clamped, locked or missing lane refused) and a property test replays random drag
 per clip, red with the reason beside the pointer when refused (letting go then does
 nothing), and a valid drop is ONE `editor.moveClips` — one revision, one undo. Delete is
 `removeClips(ids)` (one revision; ripple follows the project's mode) and Shift+Delete
-forces ripple; a clip on a locked track is left alone and stays selected. *Zoom*
+forces ripple; a clip on a locked track is left alone and stays selected, and Cut
+(⌘/Ctrl+X) copies only what it can remove and says so when that is nothing (`ops.ts`
+`deleteSelection` / `cutSelection`). *Zoom*
 (`zoom.ts`): 0.05–2000 px/s, `ui.zoom` still px/s but stepped by ratio (+/-, buttons ×1.25)
 and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
 holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has
