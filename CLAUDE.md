@@ -62,12 +62,29 @@ so the feature is **only** activated through these forwards — which is what ma
   `fps_mode_flag()` (`-vsync` before 5.1; 9.0 removed it). Not `-fps_mode cfr`:
   that regrids every frame and turns variable-frame-rate phone footage constant.
   The key gains `|lead` for these sources only (every ordinary file's key is
-  unchanged, so nothing else is rebuilt). `source_traits` is the one cached
-  ffprobe per file that answers both HDR and the lead. Known limit: a clip cut
-  from the very head of such a source (no `-ss`, `source_in` ≈ 0) holds the first
-  frame for `lead` in the *streamed* preview, where the export starts the video
-  at once (`setpts=PTS-STARTPTS` re-bases the first frame to the clip start);
-  scrubbed stills always seek, so they agree.
+  unchanged, so nothing else is rebuilt) and the file is named `<hash>.lead.mp4`:
+  that it is padded is a fact about the *file*, so it travels in the name
+  (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
+  path. `source_traits` is the one cached ffprobe per file that answers HDR, the
+  lead and the container. The clone is a frame the original has no counterpart
+  for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
+  from the very head of the source) would hold it for `lead` while the export
+  starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
+  input's name and `video_clip_chain` opens that chain with `trim=start_frame=1`.
+  Any seeked read skips the clone already. Ordinary assets get no such filter and
+  an unchanged argv. A padded proxy never takes a hardware encoder (its output
+  has no frame rate for the encoder to be told, and one refusal disables HW
+  encode process-wide). **MPEG-TS is not fixed and is left alone**
+  (`.ts`/`.mts`/`.m2ts`, `format_name` `mpegts`: lead reported 0, plain proxy,
+  unchanged key): the TS demuxer measures the container start over the streams it
+  reads, so the audio-less read rebases the video to zero and no pad can restore
+  the original's offset — a late-starting transport stream still previews its
+  seeks `lead` off. **Known export issue, not fixed here**: the export itself
+  rebases a head clip's first video frame to the clip start (`trim=start=0` then
+  `setpts=PTS-STARTPTS`), so for a late-start source a clip cut from the head has
+  its video `lead` early against its own audio (the preview now matches the
+  export, not the source's true sync); only clips that start past the lead are in
+  sync.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
   encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
   each compiled-in candidate is verified with a one-frame test encode, because
