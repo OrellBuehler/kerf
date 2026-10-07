@@ -2232,7 +2232,8 @@ export async function getSettings(): Promise<SettingsView> {
 			safe_areas: readBrowserSafeAreas(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
-			workspaces: readBrowserJson(WORKSPACES_KEY)
+			workspaces: readBrowserJson(WORKSPACES_KEY),
+			keybindings: readBrowserJson(KEYBINDINGS_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -2255,6 +2256,7 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
+			if ('keybindings' in patch) writeBrowserJson(KEYBINDINGS_KEY, patch.keybindings);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -2269,6 +2271,7 @@ const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
 const WORKSPACES_KEY = 'kerf.settings.workspaces';
+const KEYBINDINGS_KEY = 'kerf.settings.keybindings';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 

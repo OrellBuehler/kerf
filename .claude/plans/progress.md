@@ -21,7 +21,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | A6 Headless agent rendering | — | — | todo | |
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Open: edit modes, linked A/V + detach audio (verify `extract_audio` doubling), blurred background, SRT/ASS import, marker notes, keybindings, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Open: edit modes, linked A/V + detach audio (verify `extract_audio` doubling), blurred background, SRT/ASS import (in progress), marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -100,6 +100,10 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   event; no hot-path logging), missing `.kerf` launch paths are reported and
   never created, and stored Kerf Light themes that exactly match an old preset
   upgrade on load.
+
+- **2026-10-07 — keybindings are strict.** A chord means exactly its
+  modifiers (⇧J no longer shuttles, Ctrl chords don't fire on macOS) so
+  conflicts are unambiguous; one-press actions ignore auto-repeat.
 
 ## Needs a real machine
 

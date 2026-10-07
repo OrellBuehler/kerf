@@ -20,6 +20,7 @@
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
 	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
+	import { settings } from '$lib/settings.svelte';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
@@ -584,7 +585,7 @@
 				>
 					<strong style="color:var(--kerf-300);font-weight:600">{editor.selectedClips.length} clips selected</strong>
 					— the settings below edit {asset?.name ?? 'the highlighted clip'} only. Drag any selected clip to move
-					them all; Delete removes them all.
+					them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}.
 				</div>
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
