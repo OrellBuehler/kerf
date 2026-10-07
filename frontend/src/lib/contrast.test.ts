@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { contrastRatio, relativeLuminance } from './contrast';
+import { contrastRatio, mixSrgb, relativeLuminance } from './contrast';
 
 describe('relativeLuminance', () => {
 	test('black is 0 and white is 1', () => {
@@ -40,5 +40,20 @@ describe('contrastRatio', () => {
 		expect(contrastRatio('#777777', '#ffffff')).toBeLessThan(4.5);
 		// A mid-gray against black: (0.2159 + .05) / .05.
 		expect(contrastRatio('#808080', '#000000')).toBeCloseTo(5.32, 2);
+	});
+});
+
+describe('mixSrgb', () => {
+	test('is the colors themselves at the ends and halfway between in the middle', () => {
+		expect(mixSrgb('#336699', '#ffffff', 1)).toBe('#336699');
+		expect(mixSrgb('#336699', '#ffffff', 0)).toBe('#ffffff');
+		expect(mixSrgb('#000000', '#ffffff', 0.5)).toBe('#808080');
+		expect(mixSrgb('#000000', '#ffffff', 0.25)).toBe('#bfbfbf');
+	});
+
+	test('weights the first color by the fraction given', () => {
+		// 70% of #5d4180 over black: each channel scaled by .7.
+		expect(mixSrgb('#5d4180', '#000000', 0.7)).toBe('#412e5a');
+		expect(() => mixSrgb('red', '#000000', 0.5)).toThrow();
 	});
 });

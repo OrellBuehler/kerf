@@ -9,7 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
+	import { GENERATED_TITLE_FILL, MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
 	import type { TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
@@ -427,7 +427,7 @@
 	<div style="display:flex;gap:9px;align-items:center">
 		<div
 			style="width:40px;height:28px;border-radius:3px;flex:none;background:{o.generated
-				? 'color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))'
+				? GENERATED_TITLE_FILL
 				: 'var(--track-text)'};border:1px solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
 		>
 			<Icon n="captions" s={14} />

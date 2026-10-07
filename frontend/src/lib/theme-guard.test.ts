@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
-import { contrastRatio } from './contrast';
-import { PRESET_IDS, PRESETS, type ColorToken, type PresetId } from './theme';
+import { contrastRatio, mixSrgb } from './contrast';
+import { PRESET_IDS, PRESETS, type ColorToken } from './theme';
+import { GENERATED_TITLE_FILL } from './titles';
 
 // Two guards that keep "every color is themable" and "every theme is readable"
 // true as the UI grows.
@@ -137,14 +138,21 @@ describe('color literals', () => {
 //     on the clip bodies it is drawn over).
 //   SECONDARY (3:1)  What is not body text: text-muted on the hover / active
 //     states, accent and status hues used as text or icon colour on the
-//     panels, the amber chips that carry text-on-accent (the S / L flags), and
-//     the strokes and marks that carry meaning — clip edges and the playhead /
-//     selection amber against the lane, the waveform against its clip, the drag
-//     ghost.
+//     panels, the amber chips that carry text-on-accent (the S / L flags), the
+//     idle state of live toggles (text-disabled — see below), and the strokes and
+//     marks that carry meaning — clip edges and the playhead / selection amber
+//     against the lane, the waveform against its clip, the drag ghost.
+//   COMPOSITES  Fills the stylesheet builds with color-mix, resolved per preset
+//     and held to READING under the label that sits on them (the generated-caption
+//     block in the titles lane).
 //
 // Not checked, on purpose:
-//   - text-disabled: inactive controls are exempt from WCAG contrast (and it is
-//     only required to read as dimmer than text-muted, below).
+//   - text-disabled on a *disabled* control: inactive components are exempt from
+//     WCAG contrast. But the UI also draws the idle state of controls that are
+//     live — the DUCK / S / L toggles, the notification bell, 56 uses — in
+//     text-disabled, and an idle toggle is not disabled, so it is held to 3:1 on
+//     the resting surfaces (it is still required to read dimmer than text-muted,
+//     below).
 //   - Translucent hairlines (border-*, timeline grid, scrims): they are derived in
 //     the stylesheet by color-mix, so they are not a pair of opaque tokens; they
 //     separate rather than identify.
@@ -181,6 +189,7 @@ const PAIRS: Pair[] = [
 	...cross(['text-inverted'], ['text-primary'], READING, 'inverted label on a text-colored fill'),
 	// Secondary text, status hues and the marks that carry meaning.
 	...cross(['text-muted'], STATES, SECONDARY, 'muted text on a hover / active state'),
+	...cross(['text-disabled'], RESTING, SECONDARY, 'idle state of a live toggle (DUCK / S / L, the bell)'),
 	...cross(
 		['kerf-300', 'kerf-400', 'agent-300', 'agent-400', 'green-400', 'red-400', 'orange-400', 'green-500', 'orange-500', 'red-500'],
 		PANELS,
@@ -237,6 +246,30 @@ describe('contrast', () => {
 			...cross(['text-on-video'], CLIP_BODIES, 7, 'clip name on the clip body')
 		];
 		expect(failures(PRESETS['high-contrast'].colors, enhanced)).toEqual([]);
+	});
+
+	/** `color-mix(in srgb,var(--a) P%,var(--b))` resolved against a preset's colors. */
+	function resolveMix(expr: string, colors: Record<ColorToken, string>): string {
+		const m = /^color-mix\(in srgb,\s*var\(--([a-z0-9-]+)\)\s+([\d.]+)%,\s*var\(--([a-z0-9-]+)\)\)$/.exec(expr);
+		if (!m) throw new Error(`not a two-token srgb color-mix: ${expr}`);
+		return mixSrgb(colors[m[1] as ColorToken], colors[m[3] as ColorToken], Number(m[2]) / 100);
+	}
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: a generated caption's block keeps its label readable`, () => {
+			const c = PRESETS[id].colors;
+			const fill = resolveMix(GENERATED_TITLE_FILL, c);
+			const ratio = contrastRatio(c['text-on-video'], fill);
+			expect(ratio, `text-on-video ${c['text-on-video']} on the generated fill ${fill}`).toBeGreaterThanOrEqual(READING);
+		});
+	}
+
+	test('the composite check would have caught the mix it replaced', () => {
+		// Dimming the title color toward the panel — a pale one on Kerf Light — left
+		// the white label on it at 2.7:1.
+		const c = PRESETS['kerf-light'].colors;
+		const washed = resolveMix('color-mix(in srgb,var(--track-text) 55%,var(--surface-panel))', c);
+		expect(contrastRatio(c['text-on-video'], washed)).toBeLessThan(READING);
 	});
 
 	test('a failing pair is reported with its numbers', () => {

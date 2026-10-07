@@ -47,10 +47,11 @@ struct AppState {
     /// (`show_main_window`), a timer shows it anyway if that never happens, and
     /// whichever comes first wins (`reveal_once`).
     main_window_shown: Arc<AtomicBool>,
-    /// The `.kerf` this launch was started with, held until the webview is up
-    /// and takes it (`take_launch_project`). A pull rather than an event: an
-    /// event emitted from `setup` fires before the page has a listener.
-    launch_project: Mutex<Option<String>>,
+    /// What this launch (or a second one that arrived while the webview was still
+    /// booting) asked to open, held until the webview takes it
+    /// (`take_launch_project`). A pull rather than an event: an event emitted
+    /// before the page has a listener is lost.
+    launch: Mutex<LaunchSlot>,
 }
 
 #[derive(Serialize)]
@@ -2276,8 +2277,10 @@ fn project_arg(argv: &[String], cwd: &str) -> Option<String> {
     Some(full.display().to_string())
 }
 
-/// What a launch's arguments ask to open.
-#[derive(Debug, PartialEq, Eq)]
+/// What a launch's arguments ask to open. Serialized for the webview as
+/// `{"open": path}` / `{"missing": path}`; `Nothing` is never sent (it is `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum LaunchProject {
     /// No `.kerf` argument.
     Nothing,
@@ -2285,7 +2288,8 @@ enum LaunchProject {
     Open(String),
     /// A `.kerf` argument that names nothing on disk. Not opened: SQLite would
     /// happily create it, so a mistyped path would leave an empty project file
-    /// behind and open that as if it were the one meant.
+    /// behind and open that as if it were the one meant. The webview says so
+    /// instead.
     Missing(String),
 }
 
@@ -2307,19 +2311,60 @@ fn first_launch_project() -> LaunchProject {
     launch_project(&argv, &cwd, |p| p.is_file())
 }
 
-/// Hand a value over once: the first caller gets it, every later one `None`.
-fn take_once(slot: &Mutex<Option<String>>) -> Option<String> {
-    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+/// Where a launch's request waits for the webview. The webview *pulls* it once its
+/// listeners exist (`take`); until then a second launch's request is *held* here
+/// too — emitting it to a page that is not listening yet would lose it — and the
+/// newest request wins. Once the webview has asked, later requests are events.
+/// One lock covers both halves, so a request is delivered exactly one way.
+#[derive(Debug, Default)]
+struct LaunchSlot {
+    request: Option<LaunchProject>,
+    /// The webview has asked, so it is listening.
+    taken: bool,
 }
 
-/// The `.kerf` the app was launched with, once — the webview calls this after
-/// its listeners and the first project load are in place, then opens it the way
-/// it opens a second launch's (`open-project-file`), including the question about
-/// unsaved work. `None` when there was none, or it was already taken (a
-/// reloaded webview must not reopen the file over the user's edits).
+impl LaunchSlot {
+    fn new(first: LaunchProject) -> Self {
+        let mut slot = Self::default();
+        slot.hold(first);
+        slot
+    }
+
+    fn hold(&mut self, request: LaunchProject) {
+        if request != LaunchProject::Nothing {
+            self.request = Some(request);
+        }
+    }
+
+    /// A second launch's request. `None`: held for the webview to take. `Some`:
+    /// the webview is already listening, deliver it as an event.
+    fn offer(&mut self, request: LaunchProject) -> Option<LaunchProject> {
+        if request == LaunchProject::Nothing {
+            return None;
+        }
+        if self.taken {
+            return Some(request);
+        }
+        self.hold(request);
+        None
+    }
+
+    /// The webview asking: what is waiting, once. A later call (a reloaded
+    /// webview) gets nothing, so a project is never reopened over the user's edits.
+    fn take(&mut self) -> Option<LaunchProject> {
+        self.taken = true;
+        self.request.take()
+    }
+}
+
+/// What the app was launched with, once — the webview calls this after its
+/// listeners and the first project load are in place, then opens it the way it
+/// opens a second launch's (`open-project-file`), including the question about
+/// unsaved work, or says the file was not found. `None` when there was nothing,
+/// or it was already taken.
 #[tauri::command(async)]
-fn take_launch_project(state: State<'_, AppState>) -> Option<String> {
-    take_once(&state.launch_project)
+fn take_launch_project(state: State<'_, AppState>) -> Option<LaunchProject> {
+    state.launch.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// How long the main window may stay hidden waiting for the webview to say it is
@@ -2328,29 +2373,57 @@ fn take_launch_project(state: State<'_, AppState>) -> Option<String> {
 /// app with no window at all. A slow machine that goes over just sees the window
 /// a little before it is themed, which is what every start used to look like.
 const REVEAL_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(3);
+/// If the failsafe finds no window to show (or showing fails), how often it tries
+/// again, and how many times.
+const REVEAL_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+const REVEAL_RETRIES: u32 = 20;
 
-/// Run `show` unless the window has already been revealed; says whether it ran.
-/// The webview's request, the failsafe timer and a second launch all go through
+/// Run `show` unless the window has already been revealed; says whether it ran
+/// *and worked*. The webview's request and the failsafe timer both go through
 /// this, so the window is shown once and the late ones are no-ops — in
 /// particular a timer firing after the user has minimized the window must not
-/// pop it back up.
-fn reveal_once(shown: &AtomicBool, show: impl FnOnce()) -> bool {
+/// pop it back up. `show` says whether it actually showed something: when it did
+/// not (no window yet, the platform refused) the claim is given back, so the
+/// next caller tries again rather than finding a window that was never shown
+/// marked as shown.
+fn reveal_once(shown: &AtomicBool, show: impl FnOnce() -> bool) -> bool {
     if shown.swap(true, Ordering::AcqRel) {
         return false;
     }
-    show();
-    true
+    if show() {
+        return true;
+    }
+    shown.store(false, Ordering::Release);
+    false
 }
 
-fn show_main_window_now(app: &AppHandle) {
-    match app.get_webview_window("main") {
-        Some(window) => {
-            if let Err(e) = window.show() {
-                tracing::error!(error = %e, "could not show the main window");
-            }
-        }
-        None => tracing::error!("no main window to show"),
+/// A second launch brings the window forward every time, whatever was shown
+/// before; only a show that worked counts as the reveal, so one that found no
+/// window (it can arrive before the config windows exist) leaves the failsafe
+/// armed.
+fn bring_forward(shown: &AtomicBool, show: impl FnOnce() -> bool) -> bool {
+    let worked = show();
+    if worked {
+        shown.store(true, Ordering::Release);
     }
+    worked
+}
+
+/// Show and focus the main window; says whether there was one to show.
+fn show_main(app: &AppHandle, unminimize: bool) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("no main window to show (yet)");
+        return false;
+    };
+    if unminimize {
+        let _ = window.unminimize();
+    }
+    if let Err(e) = window.show() {
+        tracing::error!(error = %e, "could not show the main window");
+        return false;
+    }
+    let _ = window.set_focus();
+    true
 }
 
 /// The webview is themed and has painted: show the main window. The window is
@@ -2359,37 +2432,66 @@ fn show_main_window_now(app: &AppHandle) {
 /// permission and Rust keeps the one-shot flag.
 #[tauri::command(async)]
 fn show_main_window(app: AppHandle, state: State<'_, AppState>) {
-    reveal_once(&state.main_window_shown, || show_main_window_now(&app));
+    reveal_once(&state.main_window_shown, || show_main(&app, false));
 }
 
-/// Show the window after `after` if the webview has not asked by then.
+/// Show the window after `after` if the webview has not asked by then, and keep
+/// trying for a while if there is no window to show yet or showing fails.
 fn spawn_reveal_failsafe(app: AppHandle, shown: Arc<AtomicBool>, after: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(after);
-        if reveal_once(&shown, || show_main_window_now(&app)) {
-            tracing::warn!(secs = after.as_secs(), "the webview never showed the main window; showing it");
+        for _ in 0..REVEAL_RETRIES {
+            if shown.load(Ordering::Acquire) {
+                return;
+            }
+            if reveal_once(&shown, || show_main(&app, false)) {
+                tracing::warn!(secs = after.as_secs(), "the webview never showed the main window; showing it");
+                return;
+            }
+            std::thread::sleep(REVEAL_RETRY_EVERY);
         }
+        tracing::error!("gave up showing the main window");
     });
+}
+
+/// Emitted to the webview when a launch named a `.kerf` that is not there.
+const MISSING_PROJECT_EVENT: &str = "launch-project-missing";
+
+/// Tell the webview about a launch request over events (it is listening).
+fn deliver_launch(app: &AppHandle, request: LaunchProject) {
+    match request {
+        LaunchProject::Open(path) => {
+            let _ = app.emit(OPEN_PROJECT_EVENT, path);
+        }
+        LaunchProject::Missing(path) => {
+            let _ = app.emit(MISSING_PROJECT_EVENT, path);
+        }
+        LaunchProject::Nothing => {}
+    }
 }
 
 fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
     tracing::info!(?argv, "second launch; focusing the running window");
-    // Someone is waiting on a window: it is shown now, themed or not, and the
-    // failsafe stands down.
-    if let Some(state) = app.try_state::<AppState>() {
-        state.main_window_shown.store(true, Ordering::Release);
+    let state = app.try_state::<AppState>();
+    // Someone is waiting on a window: bring it forward now, themed or not. The
+    // failsafe stands down only if that really showed one — this can run before
+    // the config windows exist, and then the failsafe is still what shows it.
+    match &state {
+        Some(state) => bring_forward(&state.main_window_shown, || show_main(app, true)),
+        None => show_main(app, true),
+    };
+    let request = launch_project(&argv, &cwd, |p| p.is_file());
+    if let LaunchProject::Missing(path) = &request {
+        tracing::warn!(path, "second launch named a project file that does not exist");
     }
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    match launch_project(&argv, &cwd, |p| p.is_file()) {
-        LaunchProject::Open(path) => {
-            let _ = app.emit(OPEN_PROJECT_EVENT, path);
-        }
-        LaunchProject::Missing(path) => tracing::warn!(path, "second launch named a project file that does not exist"),
-        LaunchProject::Nothing => {}
+    // While the webview is still booting it is not listening, so the request is
+    // held for it to take (newest wins); once it is, the request is an event.
+    let undelivered = match &state {
+        Some(state) => state.launch.lock().unwrap_or_else(|e| e.into_inner()).offer(request),
+        None => Some(request),
+    };
+    if let Some(request) = undelivered {
+        deliver_launch(app, request);
     }
 }
 
@@ -2419,10 +2521,7 @@ pub fn run() {
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             voiceover_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
-            launch_project: Mutex::new(match &launch {
-                LaunchProject::Open(path) => Some(path.clone()),
-                _ => None,
-            }),
+            launch: Mutex::new(LaunchSlot::new(launch.clone())),
         })
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
@@ -2594,15 +2693,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_appender, file_layer, filmstrip_payload, launch_project, log_panic, panic_summary, project_arg, require_json_path,
-        require_local_output_path, reveal_once, take_once, truncate_log, LaunchProject, LogBudget, FRONTEND_LOG_PER_SEC,
-        REVEAL_FAILSAFE,
+        bring_forward, file_appender, file_layer, filmstrip_payload, launch_project, log_panic, panic_summary, project_arg,
+        require_json_path, require_local_output_path, reveal_once, truncate_log, LaunchProject, LaunchSlot, LogBudget,
+        FRONTEND_LOG_PER_SEC, REVEAL_FAILSAFE,
     };
     use base64::Engine as _;
     use kerf_core::{Filmstrip, FilmstripSheet};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
     use tracing_subscriber::prelude::*;
 
     /// A fresh directory under the system temp dir, removed when dropped.
@@ -2853,12 +2951,55 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_project_is_handed_over_once() {
-        let slot = Mutex::new(Some("/data/cut.kerf".to_string()));
-        assert_eq!(take_once(&slot).as_deref(), Some("/data/cut.kerf"));
+    fn the_launch_request_is_handed_over_once() {
+        let open = |p: &str| LaunchProject::Open(p.to_string());
+        let mut slot = LaunchSlot::new(open("/data/cut.kerf"));
+        assert_eq!(slot.take(), Some(open("/data/cut.kerf")));
         // A reloaded webview asking again must not reopen it over the user's edits.
-        assert_eq!(take_once(&slot), None);
-        assert_eq!(take_once(&Mutex::new(None)), None);
+        assert_eq!(slot.take(), None);
+        assert_eq!(LaunchSlot::new(LaunchProject::Nothing).take(), None);
+        // A missing file is a request too: the webview says so.
+        let mut slot = LaunchSlot::new(LaunchProject::Missing("/x.kerf".to_string()));
+        assert_eq!(slot.take(), Some(LaunchProject::Missing("/x.kerf".to_string())));
+    }
+
+    #[test]
+    fn a_second_launch_while_the_webview_boots_is_held_not_emitted() {
+        let open = |p: &str| LaunchProject::Open(p.to_string());
+        // The first launch carried nothing, and a second arrives before the page is
+        // listening: an event now would be lost, so the slot holds it.
+        let mut slot = LaunchSlot::new(LaunchProject::Nothing);
+        assert_eq!(slot.offer(open("/a.kerf")), None);
+        assert_eq!(slot.take(), Some(open("/a.kerf")));
+
+        // Newest wins over what the first launch asked for, and over an earlier second.
+        let mut slot = LaunchSlot::new(open("/first.kerf"));
+        assert_eq!(slot.offer(open("/second.kerf")), None);
+        assert_eq!(slot.offer(open("/third.kerf")), None);
+        assert_eq!(slot.take(), Some(open("/third.kerf")));
+
+        // Once the webview has asked it is listening, so a later one is an event.
+        assert_eq!(slot.offer(open("/late.kerf")), Some(open("/late.kerf")));
+        assert_eq!(slot.take(), None, "an event-delivered request is not also held");
+
+        // A second launch with no project argument asks for nothing, either way.
+        let mut slot = LaunchSlot::new(open("/first.kerf"));
+        assert_eq!(slot.offer(LaunchProject::Nothing), None);
+        assert_eq!(slot.take(), Some(open("/first.kerf")), "and does not clobber what is waiting");
+        assert_eq!(slot.offer(LaunchProject::Nothing), None);
+    }
+
+    #[test]
+    fn a_missing_file_reaches_the_webview_as_a_variant_it_can_name() {
+        let json = |p: LaunchProject| serde_json::to_value(p).unwrap();
+        assert_eq!(
+            json(LaunchProject::Open("/a.kerf".into())),
+            serde_json::json!({ "open": "/a.kerf" })
+        );
+        assert_eq!(
+            json(LaunchProject::Missing("/b.kerf".into())),
+            serde_json::json!({ "missing": "/b.kerf" })
+        );
     }
 
     #[test]
@@ -2866,18 +3007,52 @@ mod tests {
         let shown = AtomicBool::new(false);
         let mut calls = 0;
         // The webview asks, then the failsafe timer fires: only the first shows it.
-        assert!(reveal_once(&shown, || calls += 1));
-        assert!(!reveal_once(&shown, || calls += 1));
-        assert!(!reveal_once(&shown, || calls += 1));
+        assert!(reveal_once(&shown, || {
+            calls += 1;
+            true
+        }));
+        assert!(!reveal_once(&shown, || {
+            calls += 1;
+            true
+        }));
+        assert!(!reveal_once(&shown, || {
+            calls += 1;
+            true
+        }));
         assert_eq!(calls, 1);
         assert!(shown.load(Ordering::Acquire));
+    }
 
-        // The other order: the timer wins, the webview's late request is a no-op.
+    #[test]
+    fn a_reveal_that_showed_nothing_is_not_counted() {
+        // No window yet (or the platform refused): the claim is given back, so the
+        // next caller — the failsafe's retry — still gets to try.
         let shown = AtomicBool::new(false);
-        let mut calls = 0;
-        assert!(reveal_once(&shown, || calls += 1));
-        assert!(!reveal_once(&shown, || calls += 10));
-        assert_eq!(calls, 1);
+        assert!(!reveal_once(&shown, || false));
+        assert!(!shown.load(Ordering::Acquire));
+        assert!(reveal_once(&shown, || true));
+        assert!(shown.load(Ordering::Acquire));
+        assert!(!reveal_once(&shown, || panic!("already shown")));
+    }
+
+    #[test]
+    fn a_second_launch_before_the_window_exists_leaves_the_failsafe_armed() {
+        let shown = AtomicBool::new(false);
+        // The single-instance callback can run before the config windows exist.
+        assert!(!bring_forward(&shown, || false));
+        assert!(
+            !shown.load(Ordering::Acquire),
+            "nothing was shown, so the failsafe must still fire"
+        );
+        assert!(bring_forward(&shown, || true));
+        assert!(shown.load(Ordering::Acquire));
+        // It brings the window forward every time, whatever was shown before.
+        let mut forward = 0;
+        assert!(bring_forward(&shown, || {
+            forward += 1;
+            true
+        }));
+        assert_eq!(forward, 1);
     }
 
     #[test]
@@ -2940,22 +3115,52 @@ mod tests {
         assert!(logs.contains("lib.rs:"), "{logs}");
     }
 
-    /// A process that logs and then dies without unwinding leaves its last line
-    /// in the file. The "crash" is a real one — a child process (this test
-    /// binary, re-run on just this test) that calls `abort()` straight after
-    /// logging, which runs no destructors and joins no threads, exactly what a
-    /// segfault in a native library or `process::exit` gives a queue-backed
-    /// writer no chance to drain.
+    #[test]
+    fn a_line_is_on_disk_the_moment_logging_returns() {
+        // The property a crash relies on, checked without needing one: when a
+        // `tracing` call returns, its line is already in the file — nothing is
+        // queued for a worker to write later. Read straight back after each line,
+        // many times over: behind `tracing_appender::non_blocking` the worker has
+        // to be woken first, so the read misses it most of the time and a few
+        // dozen tries make that all but certain.
+        let scratch = Scratch::new("sync");
+        let subscriber = tracing_subscriber::registry().with(file_layer(file_appender(&scratch.0).unwrap()));
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..40 {
+                tracing::info!(i, "line");
+                let logs = scratch.logs();
+                assert!(
+                    logs.contains(&format!("i={i} ")) || logs.contains(&format!("i={i}\n")),
+                    "line {i} is not on disk yet:\n{logs}"
+                );
+            }
+        });
+    }
+
+    /// A process that logs and then dies without unwinding leaves its lines in
+    /// the file. The "crash" is a child process (this test binary, re-run on just
+    /// this test) that calls `process::exit(1)` straight after a burst of logging:
+    /// no destructors run, so anything held in a buffer is gone. That is what this
+    /// catches (a `BufWriter` around the appender, say). It does *not* reliably
+    /// catch a queue-backed writer — `exit` takes long enough for that worker to
+    /// drain — which is `a_line_is_on_disk_the_moment_logging_returns`'s job.
+    /// (`abort()` would model a crash more literally, but raises the OS's crash
+    /// reporter — apport, WER, ReportCrash — on a developer's machine.)
     #[test]
     fn the_last_lines_survive_a_hard_crash() {
         const CHILD_DIR: &str = "KERF_TEST_LOG_CRASH_DIR";
+        const BURST: u32 = 2000;
         if let Some(dir) = std::env::var_os(CHILD_DIR) {
             tracing_subscriber::registry()
                 .with(file_layer(file_appender(Path::new(&dir)).unwrap()))
                 .init();
             tracing::info!("starting");
+            // A burst, so a queue-backed writer is behind when the end comes.
+            for i in 0..BURST {
+                tracing::info!(i, "burst");
+            }
             tracing::error!("last words before the crash");
-            std::process::abort();
+            std::process::exit(1);
         }
 
         let scratch = Scratch::new("crash");
@@ -2969,14 +3174,23 @@ mod tests {
             .env(CHILD_DIR, &scratch.0)
             .output()
             .unwrap();
-        assert!(
-            !child.status.success(),
-            "the child should have crashed, not exited cleanly: {}{}",
+        assert_eq!(
+            child.status.code(),
+            Some(1),
+            "the child should have died at its exit(1), not finished the test: {}{}",
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
         let logs = scratch.logs();
         assert!(logs.contains("starting"), "{logs}");
-        assert!(logs.contains("last words before the crash"), "{logs}");
+        assert_eq!(
+            logs.lines().filter(|l| l.contains("burst")).count(),
+            BURST as usize,
+            "every line logged before the crash is in the file"
+        );
+        assert!(
+            logs.contains("last words before the crash"),
+            "the very last line is in the file"
+        );
     }
 }

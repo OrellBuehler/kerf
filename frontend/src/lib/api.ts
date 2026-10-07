@@ -23,6 +23,7 @@ import type {
 	Filmstrip,
 	ImportProgress,
 	Keyframe,
+	LaunchRequest,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -61,6 +62,7 @@ import { sampleFilmstrip } from './sample-filmstrip';
 import { sampleFrameUrl } from './sample-frame';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
+import { parseLaunchRequest } from './launch';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export function inTauri(): boolean {
@@ -391,12 +393,15 @@ export async function showMainWindow(): Promise<void> {
 	await invoke('show_main_window');
 }
 
-/** The `.kerf` this launch was started with (`kerf path/to/cut.kerf`), handed
- *  over once — `null` when there was none or it was already taken. A second
- *  launch's path arrives as the `open-project-file` event instead. */
-export async function takeLaunchProject(): Promise<string | null> {
+/** What this launch was started asking to open (`kerf path/to/cut.kerf`) — a
+ *  `.kerf` that exists, or one that was named and is not there — handed over once;
+ *  `null` when there was nothing or it was already taken. A second launch's request
+ *  arrives as an event instead (`open-project-file` / `launch-project-missing`),
+ *  unless it came while this page was still starting, in which case it is waiting
+ *  here too, newest first. */
+export async function takeLaunchProject(): Promise<LaunchRequest | null> {
 	if (!inTauri()) return null;
-	return (await invoke<string | null>('take_launch_project')) ?? null;
+	return parseLaunchRequest(await invoke<unknown>('take_launch_project'));
 }
 
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */
@@ -2433,6 +2438,10 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
  */
 export async function installUpdate(onProgress?: (p: UpdateProgress) => void): Promise<void> {
 	if (!pendingUpdate) throw new Error('no update pending — check for updates first');
+	// The installer can end this process outright (on Windows the plugin exits
+	// without a normal shutdown), so the logfile's last line would otherwise look
+	// like a crash. This one says it was the update.
+	logFrontend('info', 'installing an update; the app may exit without a normal shutdown', 'updater');
 	let downloaded = 0;
 	let total: number | null = null;
 	await pendingUpdate.downloadAndInstall((e) => {

@@ -22,6 +22,7 @@
 	import { cutSelection, deleteSelection } from '$lib/ops';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
+	import { missingProjectMessage } from '$lib/launch';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -129,6 +130,8 @@
 					await listen('proxy-ready', () => ui.refreshPreview()),
 					// A second launch with a `.kerf` argument: the running app opens it.
 					await listen<string>('open-project-file', (e) => void openProjectAt(e.payload)),
+					// …or one naming a file that is not there, which is never created.
+					await listen<string>('launch-project-missing', (e) => toast.error(missingProjectMessage(e.payload))),
 					// An agent can pick the speech model over MCP; the status is
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
@@ -153,13 +156,16 @@
 					)
 				);
 				// A `.kerf` on the command line of this very launch (a second launch's
-				// arrives as the event above). Asked for only now — with the listeners
-				// up and the first load done, so the open is neither raced by that load
-				// nor lost to a listener that did not exist yet — and it goes through
-				// the same path as the event, unsaved-work question included.
+				// arrives as the events above, unless it came while this page was still
+				// starting, when it is waiting here instead). Asked for only now — with
+				// the listeners up and the first load done, so the open is neither raced
+				// by that load nor lost to a listener that did not exist yet — and it
+				// goes through the same path as the event, unsaved-work question
+				// included. A path that is not there is reported, never created.
 				await firstLoad;
 				const launched = await takeLaunchProject().catch(() => null);
-				if (launched) await openProjectAt(launched);
+				if (launched && 'open' in launched) await openProjectAt(launched.open);
+				else if (launched) toast.error(missingProjectMessage(launched.missing));
 			});
 		}
 		return () => {

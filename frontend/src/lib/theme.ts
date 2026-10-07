@@ -203,7 +203,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'text-primary': '#14181e',
 			'text-secondary': '#3f4956',
 			'text-muted': '#5a6776',
-			'text-disabled': '#97a3b2',
+			'text-disabled': '#76828f',
 			'text-on-accent': '#1a1205',
 			'text-inverted': '#ffffff',
 			'text-on-video': '#ffffff',
@@ -306,6 +306,120 @@ export const PRESETS: Record<PresetId, Theme> = {
 	}
 };
 
+/** Kerf Light as earlier builds shipped it, oldest first. A theme is stored as
+ *  the colors it had when it was picked, so a user who chose Kerf Light keeps those
+ *  colors after the preset itself is revised — here, after the contrast pass that
+ *  darkened its clip bodies, amber and status hues. `upgradeStoredTheme` moves a
+ *  stored theme whose colors are *exactly* one of these to the current preset and
+ *  leaves everything else alone. Whenever Kerf Light's colors change again, the
+ *  outgoing set goes on the end of this list. */
+export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
+	// As shipped up to v0.22.0.
+	{
+		'surface-void': '#e2e6ea',
+		'surface-app': '#f2f4f6',
+		'surface-panel': '#ffffff',
+		'surface-raised': '#f6f8fa',
+		'surface-inset': '#e9edf1',
+		'surface-hover': '#e4e8ed',
+		'surface-active': '#d3d9e0',
+		input: '#ffffff',
+		scrim: '#000000',
+		'border-base': '#000000',
+		'scrollbar-thumb': '#c2c9d1',
+		'scrollbar-thumb-hover': '#a9b2bd',
+		'text-primary': '#14181e',
+		'text-secondary': '#3f4956',
+		'text-muted': '#5e6b7a',
+		'text-disabled': '#97a3b2',
+		'text-on-accent': '#1a1205',
+		'text-inverted': '#ffffff',
+		'text-on-video': '#ffffff',
+		'kerf-200': '#7a4f0e',
+		'kerf-300': '#9a6413',
+		'kerf-400': '#b8770f',
+		'kerf-500': '#d18f1e',
+		'kerf-600': '#e29d2e',
+		'kerf-700': '#eab14e',
+		'agent-200': '#0b4a54',
+		'agent-300': '#126f80',
+		'agent-400': '#1894a6',
+		'agent-500': '#1a9fb0',
+		'agent-600': '#22b4c4',
+		'agent-700': '#3fcdd4',
+		'agent-fg': '#ffffff',
+		'green-400': '#1f8f60',
+		'green-500': '#22a874',
+		'red-400': '#c8362a',
+		'red-500': '#e0402c',
+		'red-600': '#b32d1e',
+		'orange-400': '#c46b0c',
+		'orange-500': '#e07f14',
+		'track-bg': '#eceff2',
+		'track-video': '#b7d2e4',
+		'track-video-edge': '#3f7ea3',
+		'track-audio': '#b8dccb',
+		'track-audio-edge': '#2f7d5e',
+		'track-text': '#d8c8e6',
+		'track-text-edge': '#7b56a0',
+		waveform: '#1f8f60',
+		'drag-ghost': '#4a5fd6',
+		'frame-matte': '#000000'
+	},
+	// The first contrast pass, before `text-disabled` was raised for idle toggles.
+	{
+		'surface-void': '#e2e6ea',
+		'surface-app': '#f2f4f6',
+		'surface-panel': '#ffffff',
+		'surface-raised': '#f6f8fa',
+		'surface-inset': '#e9edf1',
+		'surface-hover': '#e4e8ed',
+		'surface-active': '#d3d9e0',
+		input: '#ffffff',
+		scrim: '#000000',
+		'border-base': '#000000',
+		'scrollbar-thumb': '#c2c9d1',
+		'scrollbar-thumb-hover': '#a9b2bd',
+		'text-primary': '#14181e',
+		'text-secondary': '#3f4956',
+		'text-muted': '#5a6776',
+		'text-disabled': '#97a3b2',
+		'text-on-accent': '#1a1205',
+		'text-inverted': '#ffffff',
+		'text-on-video': '#ffffff',
+		'kerf-200': '#7a4f0e',
+		'kerf-300': '#9a6413',
+		'kerf-400': '#a96d11',
+		'kerf-500': '#b8770f',
+		'kerf-600': '#e29d2e',
+		'kerf-700': '#eab14e',
+		'agent-200': '#0b4a54',
+		'agent-300': '#126f80',
+		'agent-400': '#1894a6',
+		'agent-500': '#1a9fb0',
+		'agent-600': '#22b4c4',
+		'agent-700': '#3fcdd4',
+		'agent-fg': '#04181c',
+		'green-400': '#1f8f60',
+		'green-500': '#1c9a68',
+		'red-400': '#c8362a',
+		'red-500': '#e4452f',
+		'red-600': '#b32d1e',
+		'orange-400': '#c46b0c',
+		'orange-500': '#c76f0a',
+		'track-bg': '#eceff2',
+		'track-video': '#3b6d8c',
+		'track-video-edge': '#3f7ea3',
+		'track-audio': '#2f6f56',
+		'track-audio-edge': '#2f7d5e',
+		'track-text': '#5d4180',
+		'track-text-edge': '#7b56a0',
+		waveform: '#a8ecca',
+		'drag-ghost': '#4a5fd6',
+		'frame-matte': '#000000'
+	}
+];
+
 export const PRESET_IDS = Object.keys(PRESETS) as PresetId[];
 
 const HEX = /^#[0-9a-f]{6}$/i;
@@ -367,6 +481,18 @@ export function parseTheme(raw: unknown): Theme | null {
 	const ts = gs['slider-thumb-style'];
 	if (ts === 'round' || ts === 'bar') shape['slider-thumb-style'] = ts;
 	return { name: r.name.trim(), version: 1, scheme: r.scheme, colors, shape };
+}
+
+/** A stored theme, brought up to date. One whose colors are exactly an earlier
+ *  Kerf Light (`SUPERSEDED_KERF_LIGHT`) was that preset picked and never edited, and
+ *  takes the current preset's colors — keeping the name and shape it was saved
+ *  with. Anything else, a theme the user edited or imported included, is returned
+ *  as it is. Run on what is read back from the settings, never on an import. */
+export function upgradeStoredTheme(theme: Theme): Theme {
+	if (theme.scheme !== 'light') return theme;
+	const colors = theme.colors;
+	const wasKerfLight = SUPERSEDED_KERF_LIGHT.some((old) => COLOR_TOKENS.every((t) => old[t] === colors[t].toLowerCase()));
+	return wasKerfLight ? { ...theme, colors: { ...PRESETS['kerf-light'].colors } } : theme;
 }
 
 /** The custom properties a shape sets. The thumb is a circle (or square at
