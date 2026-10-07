@@ -2169,6 +2169,21 @@ impl Clip {
         !self.keyframes.is_empty()
     }
 
+    /// True when the keyframes move the clip's *scale*, i.e. the picture the
+    /// export hands to `overlay` changes size from one frame to the next.
+    ///
+    /// That is a different thing from [`Clip::is_animated`]: a clip keyed only on
+    /// position, rotation or opacity keeps a constant picture size, which every
+    /// filter in its chain can be built around. A zoom that actually moves cannot
+    /// be: most filters read the frame size once, when the graph is configured, so
+    /// the export restructures the chain around it (`video_clip_chain` puts the
+    /// size-changing `scale` last). The test is on the keyed values, not on the
+    /// expression the engine writes.
+    pub fn zoom_animated(&self) -> bool {
+        let mut scales = self.keyframes.iter().map(|k| k.scale);
+        scales.next().is_some_and(|first| scales.any(|s| (s - first).abs() > 1e-9))
+    }
+
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
     /// the editing op, but render code must not assume it).
     pub fn sorted_keyframes(&self) -> Vec<Keyframe> {
@@ -5279,6 +5294,34 @@ mod tests {
             clips,
             ..Track::new(kind, name)
         }
+    }
+
+    #[test]
+    fn a_zoom_is_animated_only_when_the_keyed_scale_moves() {
+        let key = |time: f64, scale: f64, pos_x: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let mut clip = clip_at(0.0, 4.0);
+        // Nothing keyed, and one key (a held pose): the picture never changes size.
+        assert!(!clip.zoom_animated());
+        clip.keyframes = vec![key(0.0, 1.5, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Position moves, scale does not: animated, but not a zoom.
+        clip.keyframes = vec![key(0.0, 0.5, -0.2), key(2.0, 0.5, 0.2)];
+        assert!(clip.is_animated() && !clip.zoom_animated());
+        // Float noise is not a zoom (it cannot change the size by a pixel).
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1e-12, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Any key off the first one is, wherever it sits and whatever the order.
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(1.0, 0.5, 0.0), key(2.0, 0.75, 0.0)];
+        assert!(clip.zoom_animated());
+        clip.keyframes = vec![key(2.0, 0.75, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(clip.zoom_animated());
     }
 
     #[test]

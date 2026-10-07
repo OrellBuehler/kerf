@@ -13,12 +13,13 @@
 //!
 //! **What this does and does not say.** It checks the *grammar*: that the text the builders
 //! write, evaluated at the output frame's time, is the curve the plan samples. It does not say
-//! the graph reads each expression at that time. The zoom (`scale eval=frame`) is read at the
-//! *source* frame's time and is not always shown at all (`rendered.rs`,
-//! `a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it_still`),
-//! which is why a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`) however well
-//! the zoom expression agrees here. That the *pictures* agree is `rendered.rs`'s and the
-//! parity harness's to say.
+//! the graph reads each expression at that time, or that what follows a filter keeps up with
+//! it; that the *pictures* agree is `rendered.rs`'s and `keyed_zoom.rs`'s (every output frame of
+//! a keyed zoom against `transform_at`) and the parity harness's to say. (The zoom
+//! (`scale eval=frame`) used to be read at the *source* frame's time and not always shown at
+//! all, and a Motion plan still refuses a moving zoom, `Unsupported::KeyedZoom`: the export
+//! has since been fixed (`video_clip_chain` puts the zoom after `fps` and last), and lifting
+//! that refusal is for the compositor that would draw it.)
 
 use std::f64::consts::PI;
 
@@ -333,8 +334,8 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                     let chain = chain_of(flat);
                     let tf = layer.transform;
                     if let Some(z) = options(chain, "scale").filter(|o| opt(o, "eval") == Some("frame")) {
-                        // The expression's grammar at the output frame's time; the graph itself
-                        // reads it at the source frame's (see the module docs).
+                        // The expression's grammar at the output frame's time, which is the
+                        // time the graph reads it at (the zoom follows `fps`).
                         let zoom = eval(opt(&z, "w").unwrap(), &[("t", t), ("iw", 1.0)]);
                         assert!((zoom - tf.scale).abs() < 1e-9, "{at}: zoom {zoom} vs {}", tf.scale);
                     }

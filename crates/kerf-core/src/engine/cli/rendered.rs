@@ -426,47 +426,55 @@ fn a_frame_rate_parses_to_the_rational_the_graph_runs_on() {
     assert!(parted >= 3, "the two parses should part on the awkward rates ({parted})");
 }
 
-/// A keyframed zoom is `scale eval=frame`, which sits **before** the chain's `fps`, and
-/// FFmpeg is not faithful to it. It reads the *source* frame's time, so a 10 fps clip in a
-/// 30 fps export zooms in steps three frames long; and every filter after it has to accept
-/// a frame whose size changed mid-stream, which some do not: a converter inserted in front
-/// of `overlay` for a chain that does not end in an alpha format (scale-only keys) holds the
-/// **first** frame's size, and so does `geq` (keyed opacity) — measured as the width of a red
-/// clip over green. (A `rotate` after it is no better: its output jumps back to the full
-/// size and then to garbage, differently on 6.1 and 9.0.) The plan flags a moving zoom
-/// (`Animated::zooms`) instead of drawing it wrong. Both FFmpegs.
+/// A keyframed zoom is `scale eval=frame`, which reads the time of the frame it is given,
+/// and the clip's `fps` decides whose that is. Ahead of `fps` it is the *source* frame's, so
+/// a 10 fps clip in a 30 fps export zoomed in steps three frames long (first half, straight
+/// off the filter); behind it, it is the output frame's, and the picture grows on every
+/// frame. The export puts it **after** `fps`, and last in the clip's chain, because every
+/// filter behind a size that changes mid-stream has to accept it and some do not: the
+/// converter `overlay` gets for a chain that does not end in an alpha format (scale-only
+/// keys) held the **first** frame's size, and so did `geq` (keyed opacity) — the width of a
+/// red clip over green, second half, never left its first size. Both FFmpegs.
+/// (`keyed_zoom.rs` holds every other combination to `transform_at` frame by frame.)
 #[test]
 #[ignore = "needs the ffmpeg binary"]
-fn a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it_still() {
+fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_still() {
     use crate::model::Keyframe;
     let dir = scratch("zoom");
     let (red, green) = (solid(&dir, "red", "10", 4.0), solid(&dir, "green", "30", 4.0));
-    // The zoom itself, straight off the filter: frame sizes after `fps=30` of a 10 fps clip.
-    let run = command(&ffmpeg_bin())
-        .args(["-hide_banner", "-loglevel", "info", "-i"])
-        .arg(&red.path)
-        .args([
-            "-vf",
-            "scale=320:180,scale=w='iw*(1-0.4*t)':h='ih*(1-0.4*t)':eval=frame,setsar=1,fps=30,showinfo=checksum=0",
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let log = String::from_utf8_lossy(&run.stderr);
-    let sizes: Vec<&str> = log
-        .lines()
-        .filter(|l| l.contains(" n:"))
-        .filter_map(|l| l.split(" s:").nth(1)?.split_whitespace().next())
-        .collect();
-    assert!(sizes.len() >= 30, "{log}");
-    for (k, size) in sizes.iter().enumerate() {
-        assert_eq!(*size, sizes[k / 3 * 3], "frame {k}: {sizes:?}");
+    // The zoom itself, straight off the filter: the size of each frame of a 10 fps clip.
+    let sizes_of = |graph: &str| {
+        let run = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "info", "-i"])
+            .arg(&red.path)
+            .args(["-vf", graph, "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&run.stderr).into_owned();
+        let sizes: Vec<String> = log
+            .lines()
+            .filter(|l| l.contains(" n:"))
+            .filter_map(|l| Some(l.split(" s:").nth(1)?.split_whitespace().next()?.to_string()))
+            .collect();
+        assert!(sizes.len() >= 30, "{log}");
+        sizes
+    };
+    // Before `fps`: every group of three output frames has the size of one source frame.
+    let before = sizes_of("scale=320:180,scale=w='iw*(1-0.4*t)':h='ih*(1-0.4*t)':eval=frame,setsar=1,fps=30,showinfo=checksum=0");
+    for (k, size) in before.iter().enumerate() {
+        assert_eq!(*size, before[k / 3 * 3], "frame {k}: {before:?}");
     }
-    assert_ne!(sizes[0], sizes[3], "{sizes:?}");
-    // What the export shows of it: the width of the red picture, frame by frame.
+    assert_ne!(before[0], before[3], "{before:?}");
+    // After `fps`: a size of its own on every frame, one step per frame (4.3 px of width).
+    let after = sizes_of("scale=320:180,setsar=1,fps=30,scale=w='iw*(1-0.4*t)':h='ih*(1-0.4*t)':eval=frame,showinfo=checksum=0");
+    assert!(
+        after.windows(2).take(50).all(|p| p[0] != p[1]),
+        "every output frame has its own size: {after:?}"
+    );
+
+    // What the export shows of it: the width of the red picture on each of its frames
+    // follows the keys (1.0 at 0 s to 0.2 at 2 s of a 320 px wide fit).
     let widths = |opacity: f64, tag: &str| {
         let key = |time, scale, opacity| Keyframe {
             time,
@@ -494,12 +502,16 @@ fn a_keyframed_zoom_is_read_at_the_source_frame_and_filters_after_it_may_hold_it
             })
             .collect::<Vec<_>>()
     };
-    for (opacity, tag) in [(1.0, "zoom-pinned"), (0.99, "zoom-geq")] {
+    for (opacity, tag) in [(1.0, "zoom-scale-only"), (0.99, "zoom-geq")] {
         let w = widths(opacity, tag);
-        assert!(
-            w.iter().all(|w| *w == 320),
-            "{tag}: the picture never leaves its first size: {w:?}"
-        );
+        for (k, width) in w.iter().enumerate() {
+            let want = 320.0 * (1.0 - 0.4 * ffmpeg_frame_time(k as u64, 30, 1));
+            assert!(
+                (*width as f64 - want).abs() <= 2.0,
+                "{tag}: frame {k} is {width} px wide, the keys say {want:.1}: {w:?}"
+            );
+        }
+        assert!(w.windows(2).all(|p| p[1] < p[0]), "{tag}: it shrinks on every frame: {w:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

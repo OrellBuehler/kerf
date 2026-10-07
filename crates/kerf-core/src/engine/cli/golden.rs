@@ -28,7 +28,9 @@
 //! files of the builders you changed should move. To find the case behind a failing
 //! block, run the test on the base and on the change with `KERF_GOLDEN_CASES=<file>`
 //! (one digest line per case) and diff the two files; `KERF_GOLDEN_DUMP=<case>` then
-//! prints that case's argv (`KERF_GOLDEN_COVERAGE=1` prints the thinnest families).
+//! prints that case's argv (`KERF_GOLDEN_COVERAGE=1` prints the thinnest families, and
+//! `KERF_GOLDEN_FAMILIES=<file>` writes the families each case hit, one line per case,
+//! which is how to say *which kind* of case a moved digest belongs to).
 //! The files are identical under any `KERF_HWACCEL` and
 //! with `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4`.
 //!
@@ -71,9 +73,13 @@ reverse ,reverse,
 speed setpts=(PTS-STARTPTS)/
 scale-static scale=iw*
 scale-keyed eval=frame
+zoom-keyed-last format=yuva420p[v
+preview-zoom-keyed-last format=yuva420p[v
 crop crop=w=iw*
 rotate-static :fillcolor=none:ow=rotw(
 rotate-keyed rotate=a='(
+rotate-keyed-transparent :fillcolor=black@0:ow='hypot(
+preview-rotate-keyed-transparent :fillcolor=black@0:ow='hypot(
 opacity-static colorchannelmixer=aa=
 opacity-keyed a='(if(lt((T-
 mask-rect max(abs(
@@ -678,7 +684,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 11] = [
+const STRUCTURAL: [&str; 13] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -690,6 +696,8 @@ const STRUCTURAL: [&str; 11] = [
     "reframe-single-keyframe",
     "reframe-held",
     "time-negative",
+    "zoom-keyed",
+    "zoom-keyed-constant",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -767,6 +775,11 @@ fn families(c: &Case, text: &[String; 3], table: &[(&str, &str)], transitions: V
             "reframe-single-keyframe",
         ),
         (times.iter().any(|t| *t < 0.0), "time-negative"),
+        // A keyed clip whose scale moves is the one the export restructures; one
+        // whose scale holds still (position / rotation / opacity keys only) keeps
+        // the chain it always had, so both are covered.
+        (clips().any(Clip::zoom_animated), "zoom-keyed"),
+        (clips().any(|k| k.is_animated() && !k.zoom_animated()), "zoom-keyed-constant"),
         (
             tl.overlays.iter().any(|o| times.contains(&o.start) || times.contains(&o.end)),
             "time-at-overlay-edge",
@@ -845,9 +858,10 @@ fn the_argv_builders_still_produce_the_golden_digests() {
 
     let mut seen: BTreeMap<String, usize> = expected(&table).into_iter().map(|f| (f, 0)).collect();
     let mut digests: [Vec<u64>; 3] = Default::default();
-    let mut per_case = String::new();
+    let (mut per_case, mut per_case_families) = (String::new(), String::new());
     for (i, (h, hit)) in &results {
         per_case += &format!("{i} {:016x} {:016x} {:016x}\n", h[0], h[1], h[2]);
+        per_case_families += &format!("{i} {}\n", hit.join(","));
         h.iter().zip(&mut digests).for_each(|(h, d)| d.push(*h));
         for f in hit {
             *seen
@@ -857,6 +871,9 @@ fn the_argv_builders_still_produce_the_golden_digests() {
     }
     if let Some(path) = std::env::var_os("KERF_GOLDEN_CASES") {
         std::fs::write(path, per_case).unwrap();
+    }
+    if let Some(path) = std::env::var_os("KERF_GOLDEN_FAMILIES") {
+        std::fs::write(path, per_case_families).unwrap();
     }
 
     // The digests first, so a moved block is reported even when coverage fails too.
