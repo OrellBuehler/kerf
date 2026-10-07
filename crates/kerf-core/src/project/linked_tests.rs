@@ -1026,6 +1026,8 @@ struct Fuzzed {
     blocked: usize,
     /// Per edit: `(attempted, refused by a genuine block)`.
     by_edit: std::collections::BTreeMap<String, (usize, usize)>,
+    /// The same, keyed `edit/picture` or `edit/sound` by the kind of clip that was named.
+    by_named: std::collections::BTreeMap<String, (usize, usize)>,
     /// `(edit, reason)` of every refusal of an edit that has no business being refused on
     /// a J/L-cut: no lane is locked and no such block stands in its way.
     unexpected: Vec<(String, String)>,
@@ -1039,6 +1041,7 @@ fn fuzz_linked_edits(start: Cut0) -> Fuzzed {
         refused: 0,
         blocked: 0,
         by_edit: std::collections::BTreeMap::new(),
+        by_named: std::collections::BTreeMap::new(),
         unexpected: Vec::new(),
     };
     for seed in 1..=250u64 {
@@ -1104,7 +1107,23 @@ fn fuzz_linked_edits(start: Cut0) -> Fuzzed {
                     } else {
                         SplitSide::Right
                     };
-                    ("split-remove", project.split_remove(c.id, at, side).map(|_| ()))
+                    // Half the time as the UI's trim-to-the-playhead does it: a click selects a
+                    // clip's partners too, so *both* are named in one call.
+                    let partner = t
+                        .link_partners(c.id)
+                        .into_iter()
+                        .filter_map(|id| t.clip(id))
+                        .find(|p| p.timeline_start + 1e-3 < at && at < p.timeline_end() - 1e-3)
+                        .map(|p| p.id);
+                    match partner {
+                        Some(p) if rng.below(2) == 0 => (
+                            "split-remove both",
+                            project
+                                .split_remove_clips(&[ClipCut { clip_id: c.id, at }, ClipCut { clip_id: p, at }], side)
+                                .map(|_| ()),
+                        ),
+                        _ => ("split-remove", project.split_remove(c.id, at, side).map(|_| ())),
+                    }
                 }
                 _ => {
                     // The next clip on the same track, if the two touch.
@@ -1119,7 +1138,19 @@ fn fuzz_linked_edits(start: Cut0) -> Fuzzed {
                 }
             };
             let what = format!("{what} ({label})");
+            let named = format!(
+                "{label}/{}",
+                if t.tracks
+                    .iter()
+                    .any(|tr| tr.kind == StreamKind::Video && tr.clips.iter().any(|x| x.id == c.id))
+                {
+                    "picture"
+                } else {
+                    "sound"
+                }
+            );
             out.by_edit.entry(label.to_string()).or_default().0 += 1;
+            out.by_named.entry(named.clone()).or_default().0 += 1;
             match result {
                 Ok(()) => {
                     out.applied += 1;
@@ -1128,14 +1159,30 @@ fn fuzz_linked_edits(start: Cut0) -> Fuzzed {
                 Err(e) => {
                     out.refused += 1;
                     let why = e.to_string();
-                    let genuine = ["not linked to it", "cover another linked clip", "trimmed away by this edit"]
-                        .iter()
-                        .any(|m| why.contains(m));
+                    let genuine = [
+                        "not linked to it",
+                        "cover another linked clip",
+                        "trimmed away by this edit",
+                        "a picture is never trimmed",
+                        "under 0.05s",
+                    ]
+                    .iter()
+                    .any(|m| why.contains(m));
                     if genuine {
                         out.blocked += 1;
                         out.by_edit.entry(label.to_string()).or_default().1 += 1;
+                        out.by_named.entry(named).or_default().1 += 1;
                     } else if start == Cut0::JlCut
-                        && ["ripple delete", "speed", "remove", "right trim", "left trim", "cut range"].contains(&label)
+                        && [
+                            "ripple delete",
+                            "speed",
+                            "remove",
+                            "right trim",
+                            "left trim",
+                            "cut range",
+                            "split-remove both",
+                        ]
+                        .contains(&label)
                     {
                         out.unexpected.push((
                             format!("{what} [ripple {}]\n{lanes_before}", project.ripple_active().unwrap()),
@@ -1203,6 +1250,7 @@ fn a_jl_cut_edits_without_refusal_unless_something_genuinely_stands_in_the_way()
         "left trim",
         "cut range",
         "split-remove",
+        "split-remove both",
     ]
     .iter()
     .map(|edit| run.by_edit.get(*edit).copied().unwrap_or_default())
@@ -1213,17 +1261,34 @@ fn a_jl_cut_edits_without_refusal_unless_something_genuinely_stands_in_the_way()
         run.applied
     );
     // Ten random edits in a row on small clips chop a cut to bits, and a block is what
-    // is left when two scraps meet; it stays the exception.
+    // is left when two scraps meet. Naming a *picture* — what trimming to the playhead
+    // and dragging an edge do — the sound follows, and a sound is trimmed back to make
+    // room (and said so in the label), so it stays the exception.
+    let sum = |kind: &str| {
+        run.by_named
+            .iter()
+            .filter(|(k, _)| k.ends_with(kind))
+            .fold((0, 0), |(a, b), (_, (n, k))| (a + n, b + k))
+    };
+    let (named, blocked_by_picture) = sum("/picture");
     assert!(
-        blocked * 100 <= attempted * 8,
-        "{blocked} of {attempted} footage-moving edits were blocked: {:?}",
-        run.by_edit
+        blocked_by_picture * 100 <= named * 8,
+        "{blocked_by_picture} of {named} edits that named a picture were blocked: {:?}",
+        run.by_named
     );
-    // The edits that only *remove* material meet almost nothing.
-    for edit in ["ripple delete", "remove", "cut range"] {
-        let (n, k) = run.by_edit[edit];
-        assert!(k * 100 <= n * 4, "{edit}: {k} of {n} blocked");
-    }
+    // Naming a *sound* makes the sound's track the authority, so the pictures follow it —
+    // and a picture is never trimmed to make room, so one that would have to is refused
+    // (the old rule cut the previous shot silently). More of those, never a surprise.
+    let (named, blocked_by_sound) = sum("/sound");
+    assert!(
+        blocked_by_sound * 100 <= named * 30,
+        "{blocked_by_sound} of {named} edits that named a sound were blocked: {:?}",
+        run.by_named
+    );
+    assert!(
+        blocked == blocked_by_picture + blocked_by_sound,
+        "every block is counted once"
+    );
 }
 
 /// After a split or a cut at `lo`, every link group the edit touched (the named clip's group
@@ -1416,6 +1481,145 @@ fn a_jl_cut_ripple_delete_through_the_project_is_one_revision_and_both_lanes_sta
     // Naming the *sound* closes up by the sound's length instead: the named clip's track speaks.
     p.ripple_delete(y1.id).unwrap();
     assert_eq!((span(p, y2.id), span(p, x2.id)), ((0.0, 12.0), (2.0, 12.0)));
+}
+
+/// V1 `x1` 5..15 (footage 5..15) and `x2` 15..25 (footage 15..25) over A1 `y1` 0..13 (footage 0..13) and
+/// `y2` 13..25 (footage 13..25): every sound in step with its picture, leading it by 5 s and 2 s — a J-cut.
+/// Returns the project and `[x1, x2, y1, y2]`.
+fn jl_pairs() -> (Project, [Uuid; 4]) {
+    let (project, asset) = av_project();
+    let p = &project;
+    let a1 = timeline(p).tracks[A1].id;
+    let x1 = p.add_clip_to_timeline(asset.id, None, 5.0, 15.0, Some(5.0)).unwrap();
+    let x2 = p.add_clip_to_timeline(asset.id, None, 15.0, 25.0, Some(15.0)).unwrap();
+    let y1 = p.add_clip_to_timeline(asset.id, Some(a1), 0.0, 13.0, Some(0.0)).unwrap();
+    let y2 = p.add_clip_to_timeline(asset.id, Some(a1), 13.0, 25.0, Some(13.0)).unwrap();
+    p.link_clips(&[x1.id, y1.id]).unwrap();
+    p.link_clips(&[x2.id, y2.id]).unwrap();
+    (project, [x1.id, x2.id, y1.id, y2.id])
+}
+
+fn in_step(p: &Project, a: Uuid, b: Uuid) -> bool {
+    let (a, b) = (clip_of(p, a), clip_of(p, b));
+    let off = |c: &Clip| c.timeline_start - c.source_in / c.speed_mag();
+    (off(&a) - off(&b)).abs() < 1e-6
+}
+
+#[test]
+fn trimming_to_the_playhead_with_both_partners_named_ripples_a_jl_pair_in_step() {
+    // What the UI's trim-to-the-playhead does: a click selects a clip's partners, so the picture
+    // *and* its sound are named in one call. The edit cuts both at the same time (they agree), and
+    // it is only the per-track ripple — x1 loses 3 s, y1 8 s — that sets them apart, which the sync
+    // lock puts right instead of refusing it as "named members moved apart".
+    for side in [SplitSide::Left, SplitSide::Right] {
+        let (project, [x1, x2, y1, y2]) = jl_pairs();
+        let p = &project;
+        p.set_ripple_mode(true).unwrap();
+        let cuts = [ClipCut { clip_id: x1, at: 8.0 }, ClipCut { clip_id: y1, at: 8.0 }];
+        let kept = p.split_remove_clips(&cuts, side).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(
+            in_step(p, x1, y1) && in_step(p, x2, y2),
+            "{side:?}: both pairs stayed in step\n{}",
+            dump(p)
+        );
+        let label = p.history().unwrap().last().unwrap().label.clone();
+        let want = if side == SplitSide::Left {
+            "Split and remove left (2 clips)"
+        } else {
+            "Split and remove right (2 clips)"
+        };
+        assert!(label.starts_with(want), "{label}");
+    }
+    // Two partners named and moved to *different* places by a move are still parted by hand.
+    let (project, [x1, _, y1, _]) = jl_pairs();
+    let err = project
+        .move_clips(&[
+            ClipMove {
+                clip_id: x1,
+                timeline_start: 3.0,
+                track_id: None,
+            },
+            ClipMove {
+                clip_id: y1,
+                timeline_start: 0.0,
+                track_id: None,
+            },
+        ])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("out of step"), "{err}");
+}
+
+#[test]
+fn a_sound_trimmed_to_make_room_is_said_in_the_revision_label() {
+    let (project, [x1, x2, y1, y2]) = jl_pairs();
+    let p = &project;
+    p.set_ripple_mode(true).unwrap();
+    // Shorten x1 by 3 s: x2 and its sound y2 (which leads it) come up 3 s, onto y1's tail.
+    p.trim(x1, None, Some(12.0), None).unwrap();
+    assert_eq!(span(p, x2), (12.0, 22.0));
+    assert_eq!(span(p, y2), (10.0, 22.0));
+    assert_eq!(span(p, y1), (0.0, 10.0), "the earlier sound gave way");
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Trim clip (trimmed sound on A1)");
+    // An edit that trims nothing says nothing.
+    p.set_volume(x1, 0.5).unwrap();
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Set volume");
+    // …in a staged proposal as in the live cut.
+    let (mut project, [x1, _, _, _]) = jl_pairs();
+    project.set_actor(EditSource::Agent);
+    project.set_ripple_mode(true).unwrap();
+    project.begin_staging(None, None).unwrap();
+    project.trim(x1, None, Some(12.0), None).unwrap();
+    assert_eq!(
+        project.staged().unwrap().unwrap().edits,
+        vec!["Trim clip (trimmed sound on A1)".to_string()]
+    );
+}
+
+#[test]
+fn a_picture_is_never_trimmed_to_make_room_and_a_refusal_changes_nothing() {
+    let (project, [x1, _, y1, _]) = jl_pairs();
+    let p = &project;
+    // Naming the *sound* y1 and shortening it by 3 s with ripple on pulls y2 up, and y2's picture x2
+    // with it, onto x1: refused — the picture is not cut to make room.
+    p.set_ripple_mode(true).unwrap();
+    let (before, json) = (revisions(p), p.timeline_json().unwrap());
+    let err = p.trim(y1, None, Some(10.0), None).unwrap_err().to_string();
+    assert!(
+        err.contains("picture") && err.contains("never trimmed") && err.contains("V1"),
+        "{err}"
+    );
+    assert_eq!((revisions(p), p.timeline_json().unwrap()), (before, json));
+    // Named by the picture instead, the same shortening is fine: the sound gives way.
+    p.trim(x1, None, Some(12.0), None).unwrap();
+}
+
+#[test]
+fn a_detach_under_a_compressor_meets_the_same_fader_and_says_so_in_the_result() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let c = p.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    p.set_audio_effects(
+        c.id,
+        vec![AudioEffect::Compressor {
+            threshold_db: -18.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+        }],
+    )
+    .unwrap();
+    let (v1, a1) = (timeline(p).tracks[0].id, timeline(p).tracks[A1].id);
+    p.set_track_volume(v1, 0.5).unwrap();
+    p.set_track_volume(a1, 2.0).unwrap();
+    let d = p.detach_audio(c.id).unwrap();
+    assert!(d.created_track, "A1's fader would move the level the compressor hears");
+    assert_eq!(d.clip.volume, 1.0, "the clip's own volume is untouched");
+    let t = timeline(p);
+    let made = t.tracks.iter().find(|x| x.id == d.track_id).unwrap();
+    assert_eq!(made.volume, 0.5, "the new track rides at the picture track's fader");
 }
 
 #[test]

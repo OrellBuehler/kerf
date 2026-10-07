@@ -102,13 +102,12 @@ fn locked_partner(track: &Track) -> Error {
 /// a JSON round-trip or a chain of shifts is not a desynchronization.
 const STEP_EPS: f64 = 1e-6;
 
-/// The shortest a clip may be left after a follower ran into it. A sliver no one
-/// can hear or see is a clip that was covered, and covering a clip is refused.
-const MIN_LEFT: f64 = ADJACENT_EPS;
-
 /// A track fader at or below this is silent: nothing can be carried onto it by
 /// scaling a clip up.
 const MIN_FADER: f32 = 1e-3;
+
+/// Two faders closer than this are the same fader.
+const FADER_EPS: f32 = 1e-6;
 
 /// The link groups of one timeline, built in a single pass so an edit that asks
 /// about many clips (a multi-select delete, the conform) does not scan every track
@@ -142,24 +141,36 @@ impl LinkIndex {
 impl Track {
     /// Make a lane legal again after [`Timeline::conform_links`] shifted the clips
     /// in `movers` into it. A mover that starts before 0 loses its head (trimming
-    /// the head keeps a clip's sync, moving it would not). Where a mover overlaps a
-    /// clip, the mover wins — of two movers, the later — and the clip it ran into is
-    /// trimmed back, which is allowed only for a **linked** clip (`linked`); an
-    /// unlinked clip, or one that would be covered completely, refuses with the
-    /// reason. Overlaps between clips nothing moved are old news and ignored.
-    fn settle_followers(&mut self, movers: &HashSet<Uuid>, linked: &HashSet<Uuid>) -> Result<()> {
+    /// the head keeps a clip's sync, moving it would not) — if it is **sound**: a
+    /// picture is never trimmed to fit, and a clip left under [`MIN_EDIT_CLIP`] is
+    /// refused rather than stubbed. Where a mover overlaps a clip, the mover wins — of
+    /// two movers, the later — and the clip it ran into is trimmed back, which is
+    /// allowed only for a **linked** clip (`linked`) on an **audio** track, and only
+    /// while at least [`MIN_EDIT_CLIP`] of it is left; an unlinked clip, a picture or
+    /// a clip that would be left shorter refuses with the reason. Every sound trimmed
+    /// (its track's name) is pushed to `notes`, so the edit can say so. Overlaps
+    /// between clips nothing moved are old news and ignored.
+    fn settle_followers(&mut self, movers: &HashSet<Uuid>, linked: &HashSet<Uuid>, notes: &mut Vec<String>) -> Result<()> {
+        let picture = self.kind == StreamKind::Video;
         for clip in &mut self.clips {
             if movers.contains(&clip.id) && clip.timeline_start < -DIFF_EPS {
-                let by = -clip.timeline_start;
-                if clip.duration() - by < MIN_LEFT {
+                if picture {
                     return Err(Error::InvalidArgument(format!(
-                        "the linked clip on {} would end before the beginning of the timeline",
+                        "the linked clip on {} would start before the beginning of the timeline — a picture is never trimmed to fit",
+                        self.name
+                    )));
+                }
+                let by = -clip.timeline_start;
+                if clip.duration() - by < MIN_EDIT_CLIP {
+                    return Err(Error::InvalidArgument(format!(
+                        "the linked clip on {} would be left under {MIN_EDIT_CLIP}s by the beginning of the timeline",
                         self.name
                     )));
                 }
                 clip.move_head(by, false);
                 clip.timeline_start = 0.0;
                 clip.clamp_fades();
+                notes.push(self.name.clone());
             }
         }
         self.sort_by_start();
@@ -177,10 +188,16 @@ impl Track {
                     self.name, at
                 )));
             }
-            let overlap = self.clips[i].timeline_end() - self.clips[i + 1].timeline_start;
-            if self.clips[loser].duration() - overlap < MIN_LEFT {
+            if picture {
                 return Err(Error::InvalidArgument(format!(
-                    "the linked clip on {} would cover another linked clip at {} completely — move one of them first",
+                    "the clip linked to this one would cut into a picture on {} at {} — a picture is never trimmed to make room; move one of them first",
+                    self.name, at
+                )));
+            }
+            let overlap = self.clips[i].timeline_end() - self.clips[i + 1].timeline_start;
+            if self.clips[loser].duration() - overlap < MIN_EDIT_CLIP {
+                return Err(Error::InvalidArgument(format!(
+                    "the linked clip on {} would cover another linked clip at {} (under {MIN_EDIT_CLIP}s of it would be left) — move one of them first",
                     self.name, at
                 )));
             }
@@ -191,6 +208,7 @@ impl Track {
                 clip.move_tail(-overlap, false);
             }
             clip.clamp_fades();
+            notes.push(self.name.clone());
             self.sort_by_start();
         }
         Err(Error::InvalidArgument(format!(
@@ -442,14 +460,17 @@ impl Timeline {
     /// not looked at.
     pub fn first_sync_break(&self, before: &Timeline) -> Option<(String, String)> {
         let prior: HashMap<Uuid, &Clip> = before.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| (c.id, c)).collect();
-        let mut groups: HashMap<Uuid, Vec<(&Track, &Clip)>> = HashMap::new();
-        for track in &self.tracks {
+        let mut groups: HashMap<Uuid, Vec<(usize, &Clip)>> = HashMap::new();
+        for (ti, track) in self.tracks.iter().enumerate() {
             for clip in &track.clips {
                 if let Some(link) = clip.link_id {
-                    groups.entry(link).or_default().push((track, clip));
+                    groups.entry(link).or_default().push((ti, clip));
                 }
             }
         }
+        // Of every pair that broke, the one on the lowest tracks: the answer must not
+        // depend on the order a hash map happens to hold the groups in.
+        let mut first: Option<(usize, usize)> = None;
         for members in groups.values() {
             for (i, (ta, a)) in members.iter().enumerate() {
                 for (tb, b) in &members[i + 1..] {
@@ -463,12 +484,15 @@ impl Timeline {
                         continue;
                     }
                     if (a.speed - b.speed).abs() >= STEP_EPS || (content_offset(a) - content_offset(b)).abs() >= STEP_EPS {
-                        return Some((ta.name.clone(), tb.name.clone()));
+                        let pair = (*ta.min(tb), *ta.max(tb));
+                        if first.is_none_or(|f| pair < f) {
+                            first = Some(pair);
+                        }
                     }
                 }
             }
         }
-        None
+        first.map(|(a, b)| (self.tracks[a].name.clone(), self.tracks[b].name.clone()))
     }
 
     // ---- the sync lock ------------------------------------------------------
@@ -482,29 +506,51 @@ impl Timeline {
     /// did not move as far as the group's **authority** are shifted by the
     /// difference.
     ///
-    /// The authority is, in order, the member the edit named; the member on the
-    /// track of a clip the edit named (a ripple of V1 is V1's ripple, whatever the
-    /// partner track did of its own); the first member — in track order — that
+    /// The authority is, in order, the first member — in track order — the edit
+    /// named; the member on the track of a clip the edit named (a ripple of V1 is
+    /// V1's ripple, whatever the partner track did of its own); the first member that
     /// moved at all (a ripple that pushed one clip, whose partner nobody touched).
-    /// Two *named* members that moved apart were parted by hand and are left alone:
-    /// that is the guard's to refuse. A shift keeps a clip's length, so this carries
-    /// the same removed or inserted span to every linked track without ever cutting
-    /// a partner — only [`Timeline::cut_clip_range_linked`], which is an explicit
+    /// Two *named* members that were **moved apart by the edit itself** were parted by
+    /// hand and are left alone: that is the guard's to refuse. That is judged on the
+    /// timeline *as the edit left it* (`left`, which is the timeline before the
+    /// per-lane ripple; `None` judges `self`): a trim to the playhead that names a
+    /// picture and its sound cuts both at the same time and agrees, and only the
+    /// ripple — which closes each track by a different length for a J- or L-cut — sets
+    /// them apart afterwards, which is the lock's to put right: the other named members
+    /// are shifted to the first one. A shift keeps a clip's length, so this carries the
+    /// same removed or inserted span to every linked track without ever cutting a
+    /// partner — only [`Timeline::cut_clip_range_linked`], which is an explicit
     /// removal, cuts one.
     ///
     /// Only clips **in a group** follow; the other clips of a partner's lane are
     /// nobody's business. Where a follower lands on another clip it wins against a
-    /// *linked* one (that clip is trimmed back, keeping its own sync), and
-    /// stops before 0 by losing its head. It refuses — with the reason, leaving
-    /// `self` partly changed, so call it on a scratch copy — when a follower is on
-    /// a locked track, when an *unlinked* clip is in its way, or when a clip would be
-    /// covered completely.
+    /// *linked* one on an *audio* track (that clip is trimmed back, keeping its own
+    /// sync, and the track's name is pushed to `notes`), and a sound stops before 0 by
+    /// losing its head. It refuses — with the reason, leaving `self` partly changed,
+    /// so call it on a scratch copy — when a follower is on a locked track, when an
+    /// *unlinked* clip or a *picture* is in its way, when less than
+    /// [`MIN_EDIT_CLIP`] of a clip would be left, or a picture would start before 0.
     pub fn conform_links(&mut self, before: &Timeline, anchors: &HashSet<Uuid>, origin: &HashMap<Uuid, Uuid>) -> Result<()> {
+        self.conform_links_noted(before, anchors, origin, None, &mut Vec::new())
+    }
+
+    /// [`Timeline::conform_links`] with the timeline as the edit left it (`left`) and
+    /// the sounds it trimmed reported in `notes`.
+    pub fn conform_links_noted(
+        &mut self,
+        before: &Timeline,
+        anchors: &HashSet<Uuid>,
+        origin: &HashMap<Uuid, Uuid>,
+        left: Option<&Timeline>,
+        notes: &mut Vec<String>,
+    ) -> Result<()> {
         let index = self.link_index();
         if index.groups().next().is_none() {
             return Ok(());
         }
         let prior: HashMap<Uuid, &Clip> = before.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| (c.id, c)).collect();
+        let left_at: Option<HashMap<Uuid, &Clip>> =
+            left.map(|l| l.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| (c.id, c)).collect());
         let at: HashMap<Uuid, (usize, &Clip)> = self
             .tracks
             .iter()
@@ -535,32 +581,70 @@ impl Timeline {
                 continue;
             }
             let named: Vec<&(Uuid, usize, f64)> = moved.iter().filter(|(id, _, _)| anchors.contains(id)).collect();
-            let reference = if let Some((_, _, d)) = named.first() {
-                if named.iter().any(|(_, _, other)| (other - d).abs() > STEP_EPS) {
+            let (authority, reference) = if let Some((first, _, d)) = named.first() {
+                // How far each named member was moved by the edit itself, before any ripple.
+                let as_left = |id: &Uuid, now: f64| match (&left_at, prior.get(origin.get(id).unwrap_or(id))) {
+                    (Some(l), Some(was)) => l.get(id).map_or(now, |c| content_offset(c) - content_offset(was)),
+                    _ => now,
+                };
+                let first_left = as_left(first, *d);
+                if named
+                    .iter()
+                    .any(|(id, _, other)| (as_left(id, *other) - first_left).abs() > STEP_EPS)
+                {
                     continue;
                 }
-                *d
+                (Some(*first), *d)
             } else if let Some((_, _, d)) = moved.iter().find(|(_, ti, _)| anchor_tracks.contains(&self.tracks[*ti].id)) {
-                *d
+                (None, *d)
             } else if let Some((_, _, d)) = moved.iter().find(|(_, _, d)| d.abs() > STEP_EPS) {
-                *d
+                (None, *d)
             } else {
                 continue;
             };
             for (id, _, d) in &moved {
                 let shift = reference - d;
-                if !anchors.contains(id) && shift.abs() > STEP_EPS {
+                if Some(*id) != authority && shift.abs() > STEP_EPS {
                     shifts.push((*id, shift));
                 }
             }
         }
+        let linked = self.settle_linked(before, origin);
+        self.apply_shifts(&shifts, &linked, notes)
+    }
+
+    /// The clips that may be trimmed back to make room for a follower: those linked now,
+    /// and those that *were* linked before the edit (a piece an edit cut off from its
+    /// partner is a leftover of a linked clip, and `origin` says which clip a new piece
+    /// came from).
+    fn settle_linked(&self, before: &Timeline, origin: &HashMap<Uuid, Uuid>) -> HashSet<Uuid> {
+        let mut linked = self.linked_clip_ids();
+        let was = before.linked_clip_ids();
+        linked.extend(
+            self.tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .map(|c| c.id)
+                .filter(|id| was.contains(origin.get(id).unwrap_or(id))),
+        );
+        linked
+    }
+
+    /// Shift clips by `shifts` (a clip, by how much) and lay each lane they landed on out
+    /// again ([`Track::settle_followers`]); a lane that is locked refuses the lot.
+    fn apply_shifts(&mut self, shifts: &[(Uuid, f64)], linked: &HashSet<Uuid>, notes: &mut Vec<String>) -> Result<()> {
+        let shifts: Vec<(Uuid, f64)> = shifts.iter().copied().filter(|(_, by)| by.abs() > STEP_EPS).collect();
         if shifts.is_empty() {
             return Ok(());
         }
-
-        let linked = self.linked_clip_ids();
-        let mover: HashSet<Uuid> = shifts.iter().map(|(id, _)| *id).collect();
-        let mut lanes: Vec<usize> = shifts.iter().map(|(id, _)| at[id].0).collect();
+        let lane_of: HashMap<Uuid, usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, t)| t.clips.iter().map(move |c| (c.id, ti)))
+            .collect();
+        let movers: HashSet<Uuid> = shifts.iter().map(|(id, _)| *id).collect();
+        let mut lanes: Vec<usize> = shifts.iter().filter_map(|(id, _)| lane_of.get(id).copied()).collect();
         lanes.sort_unstable();
         lanes.dedup();
         let shift_of: HashMap<Uuid, f64> = shifts.into_iter().collect();
@@ -573,7 +657,7 @@ impl Timeline {
                     clip.timeline_start += by;
                 }
             }
-            self.tracks[ti].settle_followers(&mover, &linked)?;
+            self.tracks[ti].settle_followers(&movers, linked, notes)?;
         }
         Ok(())
     }
@@ -653,10 +737,12 @@ impl Timeline {
 
     /// The audio lane to put a detached clip spanning `span` on: the audio track at
     /// the picture track's own position (V1 → A1, V2 → A2) when it has room, else
-    /// the first audio track that does; never a locked one, one with its fader at
-    /// zero (the picture's level cannot be carried onto it), nor one in `avoid`.
-    /// `None` when no audio track will do.
-    fn audio_lane_for(&self, video_track: usize, span: (f64, f64), avoid: &HashSet<usize>) -> Option<usize> {
+    /// the first audio track that does; never a locked one nor one in `avoid`. With
+    /// `fader` — the clip's sound must meet the same fader it did, because something on
+    /// its chain reacts to level — only a lane at exactly that fader will do; without
+    /// it, any lane whose fader is not at zero (the picture's level is carried onto it
+    /// by scaling the clip). `None` when no audio track will do.
+    fn audio_lane_for(&self, video_track: usize, span: (f64, f64), avoid: &HashSet<usize>, fader: Option<f32>) -> Option<usize> {
         let ordinal = self.tracks[..video_track]
             .iter()
             .filter(|t| t.kind == StreamKind::Video)
@@ -671,7 +757,7 @@ impl Timeline {
             .find(|&i| {
                 let track = &self.tracks[i];
                 !track.locked
-                    && track.volume > MIN_FADER
+                    && fader.map_or(track.volume > MIN_FADER, |f| (track.volume - f).abs() <= FADER_EPS)
                     && !avoid.contains(&i)
                     && !track
                         .clips
@@ -690,11 +776,16 @@ impl Timeline {
     /// fader rides its clips' own sound, and the audio track the sound moves to has
     /// a fader of its own, so the new clip's gain is `volume × picture track's fader
     /// ÷ audio track's fader` — through that fader it comes out exactly as loud as
-    /// it was. (A lane whose fader is at zero cannot take it and is not chosen.)
-    /// What *cannot* be carried is the rest of the destination's strip: its **pan**,
-    /// its **duck** flag and its **mute / solo** now decide how the sound is mixed,
-    /// where the picture track's did before — a pan on V1 no longer leans the
-    /// dialogue, and a muted or ducked A1 changes it.
+    /// it was, **provided everything on the clip's chain is linear** (a lane whose
+    /// fader is at zero cannot take it and is not chosen). A **compressor or gate** is
+    /// not: folding the fader into the clip's volume would move the gain ahead of it,
+    /// and it would react to a different level. So when the chain has one and the
+    /// faders differ, the sound goes to a lane whose fader *equals* the picture
+    /// track's — an existing one with room, else a **new audio track at that fader** —
+    /// and the volume is left alone. What *cannot* be carried is the rest of the
+    /// destination's strip: its **pan**, its **duck** flag and its **mute / solo** now
+    /// decide how the sound is mixed, where the picture track's did before — a pan on
+    /// V1 no longer leans the dialogue, and a muted or ducked A1 changes it.
     ///
     /// The audio clip also carries what shapes the *sound* itself: audio effects,
     /// fades and the transition (a crossfade or dip fades the sound too). The picture
@@ -727,11 +818,18 @@ impl Timeline {
             .filter_map(|p| self.locate(*p).map(|(ti, _)| ti))
             .collect();
         let span = (clip.timeline_start, clip.timeline_end());
-        let (lane_ix, created_track) = match self.audio_lane_for(vi, span, &avoid) {
+        let picture_fader = self.tracks[vi].volume;
+        // Something that reacts to level must meet the same fader it did.
+        let fader = clip.audio.iter().any(AudioEffect::is_dynamic).then_some(picture_fader);
+        let (lane_ix, created_track) = match self.audio_lane_for(vi, span, &avoid, fader) {
             Some(lane_ix) => (lane_ix, false),
             None => {
                 let count = self.tracks.iter().filter(|t| t.kind == StreamKind::Audio).count();
-                self.tracks.push(Track::new(StreamKind::Audio, format!("A{}", count + 1)));
+                let mut track = Track::new(StreamKind::Audio, format!("A{}", count + 1));
+                if let Some(f) = fader {
+                    track.volume = f;
+                }
+                self.tracks.push(track);
                 (self.tracks.len() - 1, true)
             }
         };
@@ -739,7 +837,12 @@ impl Timeline {
         let mut audio = Clip::new(clip.asset_id, clip.source_in, clip.source_out, clip.timeline_start);
         audio.speed = clip.speed;
         // The picture track's fader rode this sound; the destination's rides it now.
-        audio.volume = clip.volume * self.tracks[vi].volume / self.tracks[lane_ix].volume;
+        let dest_fader = self.tracks[lane_ix].volume;
+        audio.volume = if (picture_fader - dest_fader).abs() <= FADER_EPS {
+            clip.volume
+        } else {
+            clip.volume * picture_fader / dest_fader
+        };
         audio.fade_in = clip.fade_in;
         audio.fade_out = clip.fade_out;
         audio.audio = clip.audio.clone();
@@ -940,10 +1043,23 @@ impl Timeline {
     /// about to settle. An edit that changed the clip's speed is not this function's
     /// (`set_speed_linked`).
     ///
-    /// A partner carried before 0 loses what hangs off the front. Errors, and the
-    /// caller discards the edit, when a partner is on a locked track or would be
-    /// trimmed away entirely. Returns the partners as they stand afterwards.
+    /// A **sound** carried before 0 loses what hangs off the front (and its track is
+    /// pushed to `notes`); a **picture** is never trimmed to fit and refuses, as does a
+    /// clip that would be left under [`MIN_EDIT_CLIP`]. Errors, and the caller discards
+    /// the edit, when a partner is on a locked track or would be trimmed away entirely.
+    /// Returns the partners as they stand afterwards.
     pub fn carry_extent_edit(&mut self, clip_id: Uuid, was: &Clip, footage: &SourceLimits) -> Result<Vec<Clip>> {
+        self.carry_extent_edit_noted(clip_id, was, footage, &mut Vec::new())
+    }
+
+    /// [`Timeline::carry_extent_edit`] reporting the sounds it trimmed in `notes`.
+    pub fn carry_extent_edit_noted(
+        &mut self,
+        clip_id: Uuid,
+        was: &Clip,
+        footage: &SourceLimits,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<Clip>> {
         let now = self.clip(clip_id).ok_or(Error::ClipNotFound(clip_id))?.clone();
         let looping = footage.get(&now.asset_id).is_some_and(|l| l.is_infinite());
         let Some(edit) = extent_edit(was, &now, looping) else {
@@ -952,6 +1068,7 @@ impl Timeline {
         let skip = HashSet::from([clip_id]);
         // Every partner is worked out before any is written, so a refusal changes nothing.
         let mut updates: Vec<(usize, usize, Clip)> = Vec::new();
+        let mut trimmed: Vec<String> = Vec::new();
         for partner_id in self.unlocked_partners(clip_id, &skip)? {
             let (pt, pc) = self.locate(partner_id).expect("a partner is on the timeline");
             let mut p = self.tracks[pt].clips[pc].clone();
@@ -988,21 +1105,30 @@ impl Timeline {
                 )));
             }
             if p.timeline_start < -DIFF_EPS {
-                // Carried before 0: what hangs off the front is cut away — losing the
-                // head keeps the clip in step, moving it would not.
-                let over = -p.timeline_start;
-                if p.duration() - over < MIN_LEFT {
+                // Carried before 0: what hangs off the front of a sound is cut away —
+                // losing the head keeps the clip in step, moving it would not. A picture
+                // is never trimmed to fit.
+                if self.tracks[pt].kind == StreamKind::Video {
                     return Err(Error::InvalidArgument(format!(
-                        "the linked clip on {} would end before the beginning of the timeline",
+                        "the linked clip on {} would start before the beginning of the timeline — a picture is never trimmed to fit",
+                        self.tracks[pt].name
+                    )));
+                }
+                let over = -p.timeline_start;
+                if p.duration() - over < MIN_EDIT_CLIP {
+                    return Err(Error::InvalidArgument(format!(
+                        "the linked clip on {} would be left under {MIN_EDIT_CLIP}s by the beginning of the timeline",
                         self.tracks[pt].name
                     )));
                 }
                 p.move_head(over, p_looping);
+                trimmed.push(self.tracks[pt].name.clone());
             }
             p.timeline_start = p.timeline_start.max(0.0);
             p.clamp_fades();
             updates.push((pt, pc, p));
         }
+        notes.extend(trimmed);
         let mut out = Vec::with_capacity(updates.len());
         for (pt, pc, p) in updates {
             self.tracks[pt].clips[pc] = p.clone();
@@ -1017,6 +1143,11 @@ impl Timeline {
     /// where **more than one** member changed is left alone — the edit named them
     /// explicitly — and so is a partner that changed itself.
     pub fn carry_links_since(&mut self, before: &Timeline, footage: &SourceLimits) -> Result<()> {
+        self.carry_links_since_noted(before, footage, &mut Vec::new())
+    }
+
+    /// [`Timeline::carry_links_since`] reporting the sounds it trimmed in `notes`.
+    pub fn carry_links_since_noted(&mut self, before: &Timeline, footage: &SourceLimits, notes: &mut Vec<String>) -> Result<()> {
         if !self.tracks.iter().any(|t| t.clips.iter().any(|c| c.link_id.is_some())) {
             return Ok(());
         }
@@ -1038,7 +1169,7 @@ impl Timeline {
             // Exactly one changed member means no partner changed on its own.
             let [driver] = ids.as_slice() else { continue };
             let was = before.clip(*driver).expect("a driver was on the timeline before").clone();
-            self.carry_extent_edit(*driver, &was, footage)?;
+            self.carry_extent_edit_noted(*driver, &was, footage, notes)?;
         }
         Ok(())
     }
@@ -1153,6 +1284,11 @@ impl Timeline {
     /// partner's track stays where it was. A partner on a locked track refuses the
     /// lot. Returns how many clips were deleted.
     pub fn ripple_delete_linked(&mut self, clip_id: Uuid) -> Result<usize> {
+        self.ripple_delete_linked_noted(clip_id, &mut Vec::new())
+    }
+
+    /// [`Timeline::ripple_delete_linked`] reporting the sounds the sync lock trimmed in `notes`.
+    pub fn ripple_delete_linked_noted(&mut self, clip_id: Uuid, notes: &mut Vec<String>) -> Result<usize> {
         self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let partners = self.unlocked_partners(clip_id, &HashSet::from([clip_id]))?;
         let mut scratch = self.clone();
@@ -1161,7 +1297,7 @@ impl Timeline {
         for track in &mut scratch.tracks {
             track.clips.retain(|c| !doomed.contains(&c.id));
         }
-        scratch.conform_links(self, &HashSet::from([clip_id]), &HashMap::new())?;
+        scratch.conform_links_noted(self, &HashSet::from([clip_id]), &HashMap::new(), None, notes)?;
         *self = scratch;
         Ok(1 + partners.len())
     }
@@ -1271,17 +1407,31 @@ impl Timeline {
     /// the same moment, not the same source span). The named clip's track closes up
     /// by the stretch; every other track gets its **linked** clips put back in step
     /// with what survived — a partner wholly after the stretch moves up by it, one
-    /// whose head was inside the stretch resumes at the cut, one that spanned it
+    /// whose head was inside the stretch **resumes at the cut**, one that spanned it
     /// is cut in two and its tail follows — and only those: an unlinked clip on a
     /// partner's track stays where it was ([`Timeline::conform_links`]). A partner the
     /// cut misses and that lies before it is untouched; one the cut overlaps on a
-    /// locked track refuses the lot.
+    /// locked track refuses the lot. The partners' surviving pieces after the stretch
+    /// are moved explicitly, so a piece whose group no longer has a second member
+    /// (the named clip left nothing after the cut) still lands where the footage it
+    /// shows now plays.
     ///
     /// The group then falls in two by side, as for a split: what is before the
     /// stretch keeps the link, what is after it (the tail pieces, and the partners
     /// that moved up to meet them) gets a new one. Returns the named clip's kept
     /// pieces.
     pub fn cut_clip_range_linked(&mut self, clip_id: Uuid, from: f64, to: f64) -> Result<Vec<Clip>> {
+        self.cut_clip_range_linked_noted(clip_id, from, to, &mut Vec::new())
+    }
+
+    /// [`Timeline::cut_clip_range_linked`] reporting the sounds trimmed to make room in `notes`.
+    pub fn cut_clip_range_linked_noted(
+        &mut self,
+        clip_id: Uuid,
+        from: f64,
+        to: f64,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<Clip>> {
         let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let clip = self.tracks[ti].clips[ci].clone();
         let group = clip.link_id;
@@ -1293,7 +1443,10 @@ impl Timeline {
         let (head, tail, _) = scratch.cut_range_pieces(clip_id, from, to, true)?;
         // The stretch of timeline the cut removed, and the pieces on either side of it.
         let span = clip.source_span_to_timeline(a, b);
+        let removed = span.end - span.start;
         let (mut lefts, mut rights) = (Vec::new(), Vec::new());
+        // What lies after the stretch comes up to it: `(piece, by how much)`.
+        let mut closing: Vec<(Uuid, f64)> = Vec::new();
         let mut origin: HashMap<Uuid, Uuid> = HashMap::new();
         match (&head, &tail) {
             (Some(h), Some(t)) => {
@@ -1314,6 +1467,7 @@ impl Timeline {
                     lefts.push(partner);
                 } else {
                     rights.push(partner);
+                    closing.push((partner, -removed));
                 }
                 continue;
             }
@@ -1334,9 +1488,16 @@ impl Timeline {
                 (None, Some(t)) => rights.push(t.id),
                 (None, None) => {}
             }
+            // What survives the stretch resumes at the cut — the footage after it, which
+            // played at `span.end`, now plays at `span.start`.
+            if let Some(t) = &pt {
+                closing.push((t.id, span.start - t.timeline_start));
+            }
         }
         scratch.relink_sides(group, &lefts, &rights);
-        scratch.conform_links(self, &HashSet::from([clip_id]), &origin)?;
+        let linked = scratch.settle_linked(self, &origin);
+        scratch.apply_shifts(&closing, &linked, notes)?;
+        scratch.conform_links_noted(self, &HashSet::from([clip_id]), &origin, None, notes)?;
         let kept = head
             .into_iter()
             .chain(tail)
@@ -3270,5 +3431,334 @@ mod tests {
         let err = t.detach_audio_many(&ids, &|a| a == asset).unwrap_err().to_string();
         assert!(err.contains("already detached") || err.contains("no audio"), "{err}");
         assert_eq!(serde_json::to_string(&t).unwrap(), serde_json::to_string(&before).unwrap());
+    }
+
+    // ---- the second review: authority of named members, leftovers, victims, faders ----
+
+    /// [`edited`], judging what the edit moved apart on `after` as the edit left it (the timeline
+    /// before the per-lane ripple), and reporting the sounds trimmed.
+    fn edited_noted(before: &Timeline, after: &Timeline, ripple: bool, anchors: &[Uuid]) -> Result<(Timeline, Vec<String>)> {
+        let mut out = if ripple { after.ripple_lanes(before) } else { after.clone() };
+        let mut notes = Vec::new();
+        out.conform_links_noted(
+            before,
+            &anchors.iter().copied().collect(),
+            &HashMap::new(),
+            Some(after),
+            &mut notes,
+        )?;
+        Ok((out, notes))
+    }
+
+    #[test]
+    fn named_partners_that_the_edit_cut_together_are_one_authority_whatever_the_ripple_did() {
+        // x1 5..15 / y1 0..13, then x2 15..25 / y2 13..25: trim to the playhead at 8 from
+        // the left names *both* x1 and y1 and cuts them at the same time — they agree.
+        let (t, [x1, x2, y1, y2], _) = jl_cut();
+        let before = t.clone();
+        let mut after = t;
+        for id in [x1, y1] {
+            let c = after.clip_mut(id).unwrap();
+            let head = 8.0 - c.timeline_start;
+            c.source_in += head;
+            c.timeline_start = 8.0;
+        }
+        let (out, notes) = edited_noted(&before, &after, true, &[x1, y1]).unwrap();
+        // The ripple puts each start back and pulls each track in by its own length (x1 lost 3 s,
+        // y1 8 s): the first named member (V1) is the authority and the sound follows.
+        assert_eq!(extent(&out, x1), (5.0, 12.0));
+        assert_eq!(
+            extent(&out, y1),
+            (5.0, 10.0),
+            "y1 is moved to x1's lane: it lost 5 s, x1 only 3"
+        );
+        assert_eq!(extent(&out, y2), (10.0, 22.0));
+        let (x, y) = (get(&out, x1), get(&out, y1));
+        assert!(
+            (content_offset(x) - content_offset(y)).abs() < 1e-9,
+            "the pair stayed in step"
+        );
+        assert!((start(&out, x2) - 12.0).abs() < 1e-9, "the picture track closed by 3");
+        assert!((content_offset(get(&out, x2)) - content_offset(get(&out, y2))).abs() < 1e-9);
+        assert!(out.first_sync_break(&before).is_none());
+        assert!(notes.is_empty() || notes == ["A1".to_string()]);
+        // Moved apart by the edit itself they are still left for the guard.
+        let mut apart = before.clone();
+        apart.clip_mut(x1).unwrap().timeline_start += 1.0;
+        apart.clip_mut(y1).unwrap().timeline_start += 2.0;
+        let (out, _) = edited_noted(&before, &apart, true, &[x1, y1]).unwrap();
+        assert!(out.first_sync_break(&before).is_some());
+    }
+
+    #[test]
+    fn the_guard_names_the_lowest_pair_of_tracks_whatever_order_it_scans_in() {
+        let asset = Uuid::new_v4();
+        let mut before = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 0.0, 5.0, 0.0)]),
+            lane(StreamKind::Video, "V2", vec![clip(asset, 0.0, 5.0, 10.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 0.0, 5.0, 0.0)]),
+            lane(StreamKind::Audio, "A2", vec![clip(asset, 0.0, 5.0, 10.0)]),
+        ]);
+        let ids = [
+            id_of(&before, 0, 0),
+            id_of(&before, 1, 0),
+            id_of(&before, 2, 0),
+            id_of(&before, 3, 0),
+        ];
+        linked(&mut before, &[ids[0], ids[2]]);
+        linked(&mut before, &[ids[1], ids[3]]);
+        let mut after = before.clone();
+        after.clip_mut(ids[2]).unwrap().timeline_start = 1.0; // V1/A1 apart
+        after.clip_mut(ids[3]).unwrap().timeline_start = 11.0; // V2/A2 apart
+                                                               // A fresh hash map holds the groups in a different order every time it is built.
+        for _ in 0..40 {
+            assert_eq!(after.first_sync_break(&before), Some(("V1".to_string(), "A1".to_string())));
+        }
+    }
+
+    #[test]
+    fn a_follower_never_trims_a_picture_and_reports_the_sound_it_does_trim() {
+        // The sound track is named: V1's second picture follows y2 onto the first one.
+        let (t, [x1, x2, y1, y2], _) = jl_cut();
+        let before = t.clone();
+        let mut after = t.clone();
+        after.clip_mut(y2).unwrap().timeline_start -= 4.0;
+        let err = edited_noted(&before, &after, false, &[y2]).unwrap_err().to_string();
+        assert!(
+            err.contains("picture") && err.contains("V1") && err.contains("never trimmed"),
+            "{err}"
+        );
+        // A sound in the way is trimmed back — and reported.
+        let mut after = t;
+        after.clip_mut(x2).unwrap().timeline_start -= 3.0;
+        let (out, notes) = edited_noted(&before, &after, false, &[x2]).unwrap();
+        assert_eq!(extent(&out, y2), (10.0, 22.0));
+        assert_eq!(extent(&out, y1), (0.0, 10.0));
+        assert_eq!(notes, ["A1".to_string()]);
+        let _ = x1;
+    }
+
+    #[test]
+    fn a_clip_that_would_be_left_under_the_floor_is_refused_not_stubbed() {
+        let (mut t, [_, x2, y1, _], _) = jl_cut();
+        // y1 is 13 s long (0..13); y2 would land 12.97 s in: 0.03 s of y1 would remain.
+        t.clip_mut(y1).unwrap().source_out = 100.0 + 13.0;
+        let before = t.clone();
+        let mut after = t;
+        after.clip_mut(x2).unwrap().timeline_start -= 2.03;
+        let err = edited_noted(&before, &after, false, &[x2]);
+        assert!(err.is_ok(), "x2 pulled 2.03 s leaves 10.97 s of y1: {err:?}");
+        let mut after = before.clone();
+        after.clip_mut(x2).unwrap().timeline_start -= 12.97;
+        let err = edited_noted(&before, &after, false, &[x2]).unwrap_err().to_string();
+        assert!(err.contains("under 0.05s") && err.contains("A1"), "{err}");
+    }
+
+    #[test]
+    fn a_sound_pulled_before_zero_is_trimmed_and_reported_and_a_picture_refuses() {
+        let (t, [x1, x2, y1, y2], _) = jl_cut();
+        let mut t = t;
+        t.remove_clips(&[x1, y1]).unwrap();
+        let before = t.clone();
+        let mut after = t.clone();
+        after.clip_mut(x2).unwrap().timeline_start = 0.0;
+        let (out, notes) = edited_noted(&before, &after, false, &[x2]).unwrap();
+        assert_eq!(start(&out, y2), 0.0);
+        assert_eq!(notes, ["A1".to_string()], "the lost lead is reported");
+        // A picture that would have to start before 0 refuses: x 0..10, its sound y 3..10 named and
+        // pulled up to 0 takes the picture with it.
+        let asset = Uuid::new_v4();
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 3.0, 10.0, 3.0)]),
+        ]);
+        let (x, y) = (id_of(&t, 0, 0), id_of(&t, 1, 0));
+        linked(&mut t, &[x, y]);
+        let before = t.clone();
+        let mut after = t;
+        after.clip_mut(y).unwrap().timeline_start = 0.0;
+        let err = edited_noted(&before, &after, false, &[y]).unwrap_err().to_string();
+        assert!(err.contains("V1") && err.contains("never trimmed"), "{err}");
+    }
+
+    #[test]
+    fn a_move_that_carries_a_sound_before_zero_reports_it_and_a_picture_refuses() {
+        // The picture at 5, its sound leading it by 3 (at 2): moving the picture to 0 would put the sound at -3.
+        let asset = Uuid::new_v4();
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 5.0, 15.0, 5.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 2.0, 15.0, 2.0)]),
+        ]);
+        let (x, y) = (id_of(&t, 0, 0), id_of(&t, 1, 0));
+        linked(&mut t, &[x, y]);
+        let was = get(&t, x).clone();
+        t.clip_mut(x).unwrap().timeline_start = 0.0;
+        let mut notes = Vec::new();
+        t.carry_extent_edit_noted(x, &was, &limits(&[asset]), &mut notes).unwrap();
+        assert_eq!(notes, ["A1".to_string()]);
+        assert_eq!(extent(&t, y), (0.0, 10.0));
+        assert_eq!(get(&t, y).source_in, 5.0);
+        // The other way round, the picture is the one that would start before 0: refused, nothing changes.
+        let mut u = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 2.0, 15.0, 2.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 5.0, 15.0, 5.0)]),
+        ]);
+        let (p, s) = (id_of(&u, 0, 0), id_of(&u, 1, 0));
+        linked(&mut u, &[p, s]);
+        let was_s = get(&u, s).clone();
+        u.clip_mut(s).unwrap().timeline_start = 0.0;
+        let picture = serde_json::to_value(&u.tracks[0]).unwrap();
+        let err = u.carry_extent_edit(s, &was_s, &limits(&[asset])).unwrap_err().to_string();
+        assert!(err.contains("V1") && err.contains("never trimmed"), "{err}");
+        assert_eq!(serde_json::to_value(&u.tracks[0]).unwrap(), picture);
+        // And a sound that would be left under the floor is refused outright.
+        let mut w = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 5.0, 15.0, 5.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 2.0, 5.04, 2.0)]),
+        ]);
+        let (px, sx) = (id_of(&w, 0, 0), id_of(&w, 1, 0));
+        linked(&mut w, &[px, sx]);
+        let was_w = get(&w, px).clone();
+        w.clip_mut(px).unwrap().timeline_start = 0.0;
+        let err = w.carry_extent_edit(px, &was_w, &limits(&[asset])).unwrap_err().to_string();
+        assert!(err.contains("under 0.05s"), "{err}");
+    }
+
+    #[test]
+    fn a_cut_that_leaves_a_partners_head_no_group_does_not_make_it_an_obstacle() {
+        // V1 X 5..15 / A1 S 0..13, X2 15..25 / S2 13..25 (footage offset -10): cutting all of X.
+        let asset = Uuid::new_v4();
+        let mut t = timeline(vec![
+            lane(
+                StreamKind::Video,
+                "V1",
+                vec![clip(asset, 5.0, 15.0, 5.0), clip(asset, 25.0, 35.0, 15.0)],
+            ),
+            lane(
+                StreamKind::Audio,
+                "A1",
+                vec![clip(asset, 0.0, 13.0, 0.0), clip(asset, 23.0, 35.0, 13.0)],
+            ),
+        ]);
+        let ids = [id_of(&t, 0, 0), id_of(&t, 0, 1), id_of(&t, 1, 0), id_of(&t, 1, 1)];
+        linked(&mut t, &[ids[0], ids[2]]);
+        linked(&mut t, &[ids[1], ids[3]]);
+        let before = t.clone();
+        let mut notes = Vec::new();
+        t.cut_clip_range_linked_noted(ids[0], 5.0, 15.0, &mut notes).unwrap();
+        // X is gone; S keeps its head (0..5), now trimmed by S2 coming up to 3 — a leftover of a
+        // linked clip, so it gives way, and the edit says so.
+        assert_eq!(extent(&t, ids[1]), (5.0, 15.0));
+        assert_eq!(extent(&t, ids[3]), (3.0, 15.0));
+        assert_eq!(extent(&t, ids[2]), (0.0, 3.0));
+        assert_eq!(notes, ["A1".to_string()]);
+        assert_eq!(get(&t, ids[2]).link_id, None, "and it is no longer linked to anything");
+        assert!(t.first_sync_break(&before).is_none());
+    }
+
+    #[test]
+    fn a_lone_leftover_of_a_partner_still_resumes_at_the_cut() {
+        // X 0..10 / S 9..15 (the sound starts inside what is cut): cut X's 8..10.
+        let asset = Uuid::new_v4();
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 9.0, 15.0, 9.0)]),
+        ]);
+        let (x, s) = (id_of(&t, 0, 0), id_of(&t, 1, 0));
+        linked(&mut t, &[x, s]);
+        t.cut_clip_range_linked(x, 8.0, 10.0).unwrap();
+        assert_eq!(extent(&t, x), (0.0, 8.0));
+        assert_eq!(
+            extent(&t, s),
+            (8.0, 13.0),
+            "what survives resumes at the cut, not where its head was"
+        );
+        assert_eq!(get(&t, s).source_in, 10.0);
+        // A partner wholly after the stretch comes up by it even when the named clip keeps nothing after.
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![clip(asset, 0.0, 10.0, 0.0)]),
+            lane(StreamKind::Audio, "A1", vec![clip(asset, 12.0, 20.0, 12.0)]),
+        ]);
+        let (x, s) = (id_of(&t, 0, 0), id_of(&t, 1, 0));
+        linked(&mut t, &[x, s]);
+        t.cut_clip_range_linked(x, 8.0, 10.0).unwrap();
+        assert_eq!(extent(&t, s), (10.0, 18.0));
+    }
+
+    fn compressed(volume: f32) -> Clip {
+        let mut c = clip(Uuid::new_v4(), 0.0, 10.0, 0.0);
+        c.volume = volume;
+        c.audio = vec![AudioEffect::Compressor {
+            threshold_db: -18.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+        }];
+        c
+    }
+
+    #[test]
+    fn a_compressor_or_gate_makes_detach_meet_the_same_fader_instead_of_folding_it() {
+        for dynamic in [
+            AudioEffect::Compressor {
+                threshold_db: -18.0,
+                ratio: 4.0,
+                attack_ms: 10.0,
+                release_ms: 100.0,
+                makeup_db: 0.0,
+            },
+            AudioEffect::Gate { threshold_db: -40.0 },
+        ] {
+            let mut c = compressed(0.8);
+            c.audio = vec![dynamic];
+            let id = c.id;
+            let mut t = timeline(vec![
+                lane(StreamKind::Video, "V1", vec![c]),
+                lane(StreamKind::Audio, "A1", vec![]),
+                lane(StreamKind::Audio, "A2", vec![]),
+            ]);
+            t.tracks[0].volume = 0.5;
+            t.tracks[1].volume = 2.0;
+            t.tracks[2].volume = 0.5;
+            // A1's fader differs; A2's equals the picture track's: the sound goes to A2, volume untouched.
+            let d = t.detach_audio(id, true).unwrap();
+            assert_eq!((d.track_id, d.created_track, d.clip.volume), (t.tracks[2].id, false, 0.8));
+            // With no lane at that fader a new one is made at it.
+            let mut c = compressed(0.8);
+            let id2 = c.id;
+            c.audio = t.tracks[0].clips[0].audio.clone();
+            let mut u = timeline(vec![
+                lane(StreamKind::Video, "V1", vec![c]),
+                lane(StreamKind::Audio, "A1", vec![]),
+            ]);
+            u.tracks[0].volume = 0.5;
+            u.tracks[1].volume = 2.0;
+            let d = u.detach_audio(id2, true).unwrap();
+            assert!(d.created_track);
+            let made = u.tracks.iter().find(|x| x.id == d.track_id).unwrap();
+            assert_eq!((made.name.as_str(), made.volume, d.clip.volume), ("A2", 0.5, 0.8));
+            assert_eq!(
+                u.tracks[1].clips.len(),
+                0,
+                "A1 stayed empty: its fader would have moved the level"
+            );
+        }
+        // Linear chains still fold, and equal faders need neither.
+        let mut c = clip(Uuid::new_v4(), 0.0, 10.0, 0.0);
+        c.audio = vec![AudioEffect::Highpass { hz: 80.0 }];
+        let id = c.id;
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", vec![c]),
+            lane(StreamKind::Audio, "A1", vec![]),
+        ]);
+        t.tracks[0].volume = 0.5;
+        t.tracks[1].volume = 2.0;
+        let d = t.detach_audio(id, true).unwrap();
+        assert!(!d.created_track);
+        assert!(
+            (d.clip.volume * 2.0 - 0.5).abs() < 1e-6,
+            "a high-pass is linear: the fader folds"
+        );
     }
 }

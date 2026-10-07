@@ -13,10 +13,12 @@
  *    on V1 and the next shot's sound on A1 moves too, a J/L-cut offset kept. `linkedTrimPreview`
  *    applies the trim to a scratch copy of the lanes that matter, then the same steps the
  *    backend takes (`carryExtentEdit`, the per-lane ripple, then `conformLinks` with the
- *    trimmed clip as its anchor), then the sync guard, and reads off every clip that changed —
- *    on any track — so the ghosts of the partners' ripple are drawn live, and a refusal (a
- *    locked partner, an unlinked clip in the way, a pair pulled out of step) is drawn red with
- *    its reason instead of found out on release.
+ *    trimmed clip as its anchor and the trim itself as the timeline it judges "moved apart"
+ *    on), then the sync guard, and reads off every clip that changed — on any track — so the
+ *    ghosts of the partners' ripple are drawn live, and a refusal (a locked partner, an
+ *    unlinked clip or a picture in the way, a pair pulled out of step) is drawn red with its
+ *    reason instead of found out on release. A sound the trim cuts back to make room is
+ *    drawn too, and named in `trimmed` (the backend puts it in the revision's label).
  */
 
 import { ADJACENT_EPS, type SourceLimits } from './edit-modes';
@@ -84,6 +86,8 @@ export interface LinkedTrimPreview {
 	/** Whether the backend would take it: no lane left overlapping, no partner refused,
 	 *  no pair pulled out of step. */
 	ok: boolean;
+	/** The tracks whose sound the trim would cut back to make room (each once). */
+	trimmed: string[];
 	/** Why not, in a sentence — `null` when `ok`, or when the only fault is a lane overlapping. */
 	reason: string | null;
 }
@@ -131,9 +135,10 @@ export function linkedTrimPreview(
 		home.clips.sort((a, b) => a.timeline_start - b.timeline_start);
 	}
 	let reason: string | null = null;
+	const notes: string[] = [];
 	if (opts.links) {
 		try {
-			carryExtentEdit(after, clipId, was, opts.footage);
+			carryExtentEdit(after, clipId, was, opts.footage, notes);
 		} catch (err) {
 			reason = gestureReason(reasonOf(err));
 		}
@@ -143,7 +148,8 @@ export function linkedTrimPreview(
 	if (reason === null && opts.ripple) result = rippleLanes(after, before);
 	if (reason === null && opts.links && hasLinks(before)) {
 		try {
-			conformLinks(result, before, new Set([clipId]));
+			// `left`: what the trim itself left, before the ripple (`Project::run_edit`).
+			conformLinks(result, before, new Set([clipId]), new Map(), opts.ripple ? after : undefined, notes);
 		} catch (err) {
 			reason = gestureReason(reasonOf(err));
 		}
@@ -178,5 +184,5 @@ export function linkedTrimPreview(
 			reach = Math.max(reach, endOf(c));
 		}
 	}
-	return { ghosts, shifted, ok: reason === null && !overlapping, reason };
+	return { ghosts, shifted, ok: reason === null && !overlapping, trimmed: reason === null ? [...new Set(notes)] : [], reason };
 }

@@ -994,7 +994,7 @@ mod tests {
                 ..keyed(2.0, 0.5, 0.0)
             },
         ];
-        let mut fading = zoom.clone();
+        let mut fading = zoom;
         fading.keyframes = vec![
             Keyframe {
                 opacity: 0.6,

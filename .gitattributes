@@ -1,1 +1,2 @@
 crates/kerf-core/src/engine/cli/golden/*.txt text eol=lf
+frontend/src/lib/fixtures/*.json text eol=lf

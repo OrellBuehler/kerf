@@ -190,7 +190,7 @@ fn random_op(rng: &mut Rng, t: &Timeline, which: usize) -> Value {
     let src = |f: f64| round3(c.source_in + f * (c.source_out - c.source_in));
     let speed = [0.5, 2.0, -1.0, 1.0][rng.below(4)];
     let side = if rng.below(2) == 0 { "left" } else { "right" };
-    match which % 11 {
+    match which % 12 {
         0 => json!({"kind": "split_at", "clip_id": c.id, "at": at}),
         1 => json!({"kind": "trim", "clip_id": c.id, "source_out": src(frac)}),
         2 => json!({"kind": "trim", "clip_id": c.id, "source_in": src(frac), "timeline_start": at}),
@@ -208,6 +208,21 @@ fn random_op(rng: &mut Rng, t: &Timeline, which: usize) -> Value {
             }
         }
         9 => json!({"kind": "move_clips", "moves": [{"clip_id": c.id, "timeline_start": round3(rng.unit() * 30.0)}]}),
+        10 => {
+            // What the UI's trim to the playhead does: a click selects the partners too, so both are named.
+            let partner = t
+                .link_partners(c.id)
+                .into_iter()
+                .filter_map(|id| t.clip(id))
+                .find(|p| p.timeline_start + 1e-3 < at && at < p.timeline_end() - 1e-3)
+                .map(|p| p.id);
+            match partner {
+                Some(p) => {
+                    json!({"kind": "split_remove_clips", "cuts": [{"clip_id": c.id, "at": at}, {"clip_id": p, "at": at}], "side": side})
+                }
+                None => json!({"kind": "split_remove", "clip_id": c.id, "at": at, "side": side}),
+            }
+        }
         _ => {
             let track = t
                 .tracks
@@ -443,6 +458,182 @@ fn special_cases() -> Vec<Case> {
         }
     }
 
+    // The second review: named partners, leftovers of a cut, victims, faders.
+    {
+        let build = || {
+            let mut ids = Ids::new();
+            let (x1, x2) = (ids.clip(AV, 5.0, 15.0, 5.0), ids.clip(AV, 15.0, 25.0, 15.0));
+            let (y1, y2) = (ids.clip(AV, 0.0, 13.0, 0.0), ids.clip(AV, 13.0, 25.0, 13.0));
+            let mut t = timeline(vec![
+                lane(StreamKind::Video, "V1", 0, vec![x1.clone(), x2.clone()]),
+                lane(StreamKind::Audio, "A1", 1, vec![y1.clone(), y2.clone()]),
+            ]);
+            link(&mut t, &mut ids, &[x1.id, y1.id]);
+            link(&mut t, &mut ids, &[x2.id, y2.id]);
+            (t, [x1.id, x2.id, y1.id, y2.id])
+        };
+        let (t, [x1, _, y1, _]) = build();
+        for side in ["left", "right"] {
+            let mut c = case(
+                &format!("trim to the playhead naming both partners of a J-cut ripples them in step ({side})"),
+                t.clone(),
+                json!({"kind": "split_remove_clips", "cuts": [{"clip_id": x1, "at": 8.0}, {"clip_id": y1, "at": 8.0}], "side": side}),
+            );
+            c.ripple = true;
+            out.push(c);
+        }
+        let mut c = case(
+            "a ripple trim named by the sound pulls its picture onto the one before: refused, never cut",
+            t.clone(),
+            json!({"kind": "trim", "clip_id": y1, "source_out": 10.0}),
+        );
+        c.ripple = true;
+        out.push(c);
+        // A cut of a whole clip: the partner keeps its head, which a later pair then comes up to.
+        let mut t2 = t;
+        t2.tracks[1].clips[1].source_in = 23.0;
+        t2.tracks[1].clips[1].source_out = 35.0;
+        t2.tracks[0].clips[1].source_in = 25.0;
+        t2.tracks[0].clips[1].source_out = 35.0;
+        out.push(case(
+            "cutting a whole clip leaves its partner's head to give way to the pair after it",
+            t2,
+            json!({"kind": "cut_clip_range", "clip_id": x1, "from": 5.0, "to": 15.0}),
+        ));
+    }
+    {
+        let mut ids = Ids::new();
+        let x = ids.clip(AV, 0.0, 10.0, 0.0);
+        let s = ids.clip(AV, 9.0, 15.0, 9.0);
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![x.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s.clone()]),
+        ]);
+        link(&mut t, &mut ids, &[x.id, s.id]);
+        {
+            // A1 holds an unlinked clip, then the sound of the picture on V1 (which starts later than
+            // the sound's picture would let it): deleting the unlinked clip pulls the sound up by 3 s,
+            // and the picture follows it — before 0, where a picture is never trimmed.
+            let mut ids = Ids::new();
+            let x = ids.clip(AV, 0.0, 10.0, 0.0);
+            let gap = ids.clip(MUS, 0.0, 3.0, 0.0);
+            let y = ids.clip(AV, 3.0, 10.0, 3.0);
+            let mut t = timeline(vec![
+                lane(StreamKind::Video, "V1", 0, vec![x.clone()]),
+                lane(StreamKind::Audio, "A1", 1, vec![gap.clone(), y.clone()]),
+            ]);
+            link(&mut t, &mut ids, &[x.id, y.id]);
+            out.push(case(
+                "a picture pulled before 0 by its sound is refused, never trimmed",
+                t,
+                json!({"kind": "ripple_delete", "clip_id": gap.id}),
+            ));
+        }
+        out.push(case(
+            "a lone leftover of a partner still resumes at the cut",
+            t,
+            json!({"kind": "cut_clip_range", "clip_id": x.id, "from": 8.0, "to": 10.0}),
+        ));
+        let mut ids = Ids::new();
+        let x = ids.clip(AV, 0.0, 10.0, 0.0);
+        let s = ids.clip(AV, 12.0, 20.0, 12.0);
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![x.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s.clone()]),
+        ]);
+        link(&mut t, &mut ids, &[x.id, s.id]);
+        out.push(case(
+            "a partner after the cut comes up by it even when the named clip keeps nothing after",
+            t,
+            json!({"kind": "cut_clip_range", "clip_id": x.id, "from": 8.0, "to": 10.0}),
+        ));
+    }
+    {
+        // A sound pulled before 0 is trimmed and the label says so; a floor under 0.05 s refuses.
+        let mut ids = Ids::new();
+        let (x1, x2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 10.0, 20.0, 10.0));
+        let (y1, y2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 8.0, 20.0, 8.0));
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![x1.clone(), x2.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![y1.clone(), y2.clone()]),
+        ]);
+        link(&mut t, &mut ids, &[x1.id, y1.id]);
+        link(&mut t, &mut ids, &[x2.id, y2.id]);
+        out.push(case(
+            "a J-cut's lead pulled before 0 is trimmed and the label says so",
+            t,
+            json!({"kind": "ripple_delete", "clip_id": x1.id}),
+        ));
+
+        let mut ids = Ids::new();
+        let (x1, x2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 10.0, 20.0, 10.0));
+        let (y1, y2) = (ids.clip(AV, 9.0, 12.0, 9.0), ids.clip(AV, 12.0, 20.0, 12.0));
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![x1.clone(), x2.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![y1.clone(), y2.clone()]),
+        ]);
+        link(&mut t, &mut ids, &[x1.id, y1.id]);
+        link(&mut t, &mut ids, &[x2.id, y2.id]);
+        let mut c = case(
+            "a clip that would be left under 0.05 s is refused, not stubbed",
+            t.clone(),
+            json!({"kind": "trim", "clip_id": x1.id, "source_out": 1.97}),
+        );
+        c.ripple = true;
+        out.push(c);
+        let mut c = case(
+            "a sound trimmed to make room is said in the label",
+            t,
+            json!({"kind": "trim", "clip_id": x1.id, "source_out": 9.0}),
+        );
+        c.ripple = true;
+        out.push(c);
+    }
+    {
+        // Faders and dynamics.
+        let build = |lanes: &[f32], effect: Option<AudioEffect>| {
+            let mut ids = Ids::new();
+            let mut c = ids.clip(AV, 5.0, 15.0, 2.0);
+            c.volume = 0.8;
+            if let Some(e) = effect {
+                c.audio = vec![e];
+            }
+            let mut tracks = vec![lane(StreamKind::Video, "V1", 0, vec![c.clone()])];
+            for (i, f) in lanes.iter().enumerate() {
+                tracks.push(lane(StreamKind::Audio, &format!("A{}", i + 1), 1 + i as u128, vec![]));
+                tracks.last_mut().expect("a lane").volume = *f;
+            }
+            let mut t = timeline(tracks);
+            t.tracks[0].volume = 0.5;
+            (t, c.id)
+        };
+        let compressor = AudioEffect::Compressor {
+            threshold_db: -18.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+        };
+        let (t, c) = build(&[2.0], Some(compressor));
+        out.push(case(
+            "a compressor on the clip: detach makes a lane at the picture track's fader",
+            t,
+            json!({"kind": "detach_audio", "clip_id": c}),
+        ));
+        let (t, c) = build(&[2.0, 0.5], Some(AudioEffect::Gate { threshold_db: -40.0 }));
+        out.push(case(
+            "a gate on the clip: detach takes the lane that is already at the picture track's fader",
+            t,
+            json!({"kind": "detach_audio", "clip_id": c}),
+        ));
+        let (t, c) = build(&[2.0], Some(AudioEffect::Highpass { hz: 80.0 }));
+        out.push(case(
+            "a linear chain still folds the fader",
+            t,
+            json!({"kind": "detach_audio", "clip_id": c}),
+        ));
+    }
+
     // A J/L-cut under the sync lock.
     {
         let build = || {
@@ -555,6 +746,23 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
                 SplitSide::Right
             };
             p.split_remove(uuid_of(&op["clip_id"]), f("at"), side).map(|_| Value::Null)
+        }
+        "split_remove_clips" => {
+            let side = if op["side"] == "left" {
+                SplitSide::Left
+            } else {
+                SplitSide::Right
+            };
+            let cuts: Vec<ClipCut> = op["cuts"]
+                .as_array()
+                .expect("cuts")
+                .iter()
+                .map(|c| ClipCut {
+                    clip_id: uuid_of(&c["clip_id"]),
+                    at: c["at"].as_f64().expect("a time"),
+                })
+                .collect();
+            p.split_remove_clips(&cuts, side).map(|_| Value::Null)
         }
         "move_clips" => {
             let moves: Vec<ClipMove> = op["moves"]
@@ -733,8 +941,11 @@ fn links_corpus_is_what_this_engine_does() {
         std::fs::write(CORPUS_PATH, &fresh).expect("writes the corpus");
         return;
     }
+    // A Windows checkout may hand the file back with CRLF line endings (`.gitattributes` asks for
+    // LF, but a stale clone predates it): the content is what is compared, not the newline.
     let on_disk = std::fs::read_to_string(CORPUS_PATH)
-        .expect("frontend/src/lib/fixtures/links-corpus.json — generate it with KERF_BLESS_CORPUS=1");
+        .expect("frontend/src/lib/fixtures/links-corpus.json — generate it with KERF_BLESS_CORPUS=1")
+        .replace("\r\n", "\n");
     assert!(
         on_disk == fresh,
         "the linked-clip corpus is stale: the engine now does something the checked-in answers do not say. \
@@ -765,6 +976,7 @@ fn the_corpus_covers_the_ops_and_both_outcomes() {
         "remove_clips",
         "set_speed",
         "split_remove",
+        "split_remove_clips",
         "move_clips",
         "reorder",
         "detach_audio",

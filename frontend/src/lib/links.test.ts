@@ -10,6 +10,7 @@ import {
 } from './edit-modes';
 import {
 	clipById,
+	contentOffset,
 	dissolveAllOrphans,
 	firstSyncBreak,
 	linkClips,
@@ -32,9 +33,10 @@ import {
 	withLinkedCuts,
 	withLinkedMoves
 } from './links';
+import { trimmedSuffix } from './link-ops';
 import { moveClips } from './multi-edit';
 import { conformLinks, rippleFrom, rippleLanes } from './ripple';
-import type { Clip, ClipMove, StreamKind, Timeline, Track } from './types';
+import type { AudioEffect, Clip, ClipMove, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
 // The bun mirror of the Rust tests in `crates/kerf-core/src/model/links.rs`, case for
@@ -844,9 +846,16 @@ function jlCut(): { t: Timeline; x1: string; x2: string; y1: string; y2: string;
 
 /** The edit `Project::run_edit` makes: per-lane ripple, then the sync lock with `anchors` named. */
 function edited(before: Timeline, after: Timeline, ripple: boolean, anchors: string[]): Timeline {
+	return editedNoted(before, after, ripple, anchors)[0];
+}
+
+/** `edited`, judging "moved apart" on what the edit itself left (`after`, before the per-lane ripple)
+ *  and reporting the sounds the lock trimmed — `Project::run_edit`'s own order. */
+function editedNoted(before: Timeline, after: Timeline, ripple: boolean, anchors: string[]): [Timeline, string[]] {
 	const out = ripple ? rippleLanes(after, before) : structuredClone(after);
-	conformLinks(out, before, new Set(anchors));
-	return out;
+	const notes: string[] = [];
+	conformLinks(out, before, new Set(anchors), new Map(), after, notes);
+	return [out, notes];
 }
 
 describe('the sync lock', () => {
@@ -1271,5 +1280,266 @@ describe('the sync guard', () => {
 		expect(firstSyncBreak(t, before)).toBeNull();
 		get(t, c).timeline_start = 3.5;
 		expect(firstSyncBreak(t, before)).not.toBeNull();
+	});
+});
+
+// ---- the second review: authority as the edit left it, leftovers, victims, the fader fold ----------
+
+describe('named partners and the ripple', () => {
+	test('named partners that the edit cut together are one authority whatever the ripple did', () => {
+		// x1 5..15 / y1 0..13, then x2 15..25 / y2 13..25: trim to the playhead at 8 from the left
+		// names *both* x1 and y1 and cuts them at the same time — they agree.
+		const { t, x1, x2, y1, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		for (const id of [x1, y1]) {
+			const c = get(after, id);
+			const head = 8 - c.timeline_start;
+			c.source_in += head;
+			c.timeline_start = 8;
+		}
+		const [out, notes] = editedNoted(before, after, true, [x1, y1]);
+		expect(extent(out, x1)).toEqual([5, 12]);
+		expect(extent(out, y1)).toEqual([5, 10]);
+		expect(extent(out, y2)).toEqual([10, 22]);
+		same(contentOffset(get(out, x1)), contentOffset(get(out, y1)));
+		same(start(out, x2), 12);
+		same(contentOffset(get(out, x2)), contentOffset(get(out, y2)));
+		expect(firstSyncBreak(out, before)).toBeNull();
+		expect(notes.length === 0 || (notes.length === 1 && notes[0] === 'A1')).toBe(true);
+		// Moved apart by the edit itself they are still left for the guard.
+		const apart = structuredClone(before);
+		get(apart, x1).timeline_start += 1;
+		get(apart, y1).timeline_start += 2;
+		const [parted] = editedNoted(before, apart, true, [x1, y1]);
+		expect(firstSyncBreak(parted, before)).not.toBeNull();
+	});
+
+	test('the guard names the lowest pair of tracks whatever order it scans in', () => {
+		const asset = uuid();
+		const before = timeline([
+			lane('video', 'V1', [clip(asset, 0, 5, 0)]),
+			lane('video', 'V2', [clip(asset, 0, 5, 10)]),
+			lane('audio', 'A1', [clip(asset, 0, 5, 0)]),
+			lane('audio', 'A2', [clip(asset, 0, 5, 10)])
+		]);
+		const ids = [0, 1, 2, 3].map((i) => idOf(before, i, 0));
+		linkClips(before, [ids[0], ids[2]]);
+		linkClips(before, [ids[1], ids[3]]);
+		const after = structuredClone(before);
+		get(after, ids[2]).timeline_start = 1;
+		get(after, ids[3]).timeline_start = 11;
+		expect(firstSyncBreak(after, before)).toEqual(['V1', 'A1']);
+		// And with the groups met in the other order.
+		const swapped = structuredClone(after);
+		swapped.tracks = [swapped.tracks[1], swapped.tracks[0], swapped.tracks[3], swapped.tracks[2]];
+		const priorSwapped = structuredClone(before);
+		priorSwapped.tracks = [priorSwapped.tracks[1], priorSwapped.tracks[0], priorSwapped.tracks[3], priorSwapped.tracks[2]];
+		expect(firstSyncBreak(swapped, priorSwapped)).toEqual(['V2', 'A2']);
+	});
+});
+
+describe('victims of the sync lock', () => {
+	test('a follower never trims a picture and reports the sound it does trim', () => {
+		// The sound track is named: V1's second picture follows y2 onto the first one.
+		const { t, x2, y1, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, y2).timeline_start -= 4;
+		let err = '';
+		try {
+			editedNoted(before, after, false, [y2]);
+		} catch (e) {
+			err = (e as Error).message;
+		}
+		expect(err).toContain('picture');
+		expect(err).toContain('V1');
+		expect(err).toContain('never trimmed');
+		// A sound in the way is trimmed back — and reported.
+		const again = structuredClone(t);
+		get(again, x2).timeline_start -= 3;
+		const [out, notes] = editedNoted(before, again, false, [x2]);
+		expect(extent(out, y2)).toEqual([10, 22]);
+		expect(extent(out, y1)).toEqual([0, 10]);
+		expect(notes).toEqual(['A1']);
+	});
+
+	test('a clip that would be left under the floor is refused, not stubbed', () => {
+		const { t, x2, y1 } = jlCut();
+		// y1 is 13 s long (0..13); y2 would land 12.97 s in: 0.03 s of y1 would remain.
+		get(t, y1).source_out = 100 + 13;
+		const before = structuredClone(t);
+		const ok = structuredClone(t);
+		get(ok, x2).timeline_start -= 2.03;
+		expect(() => editedNoted(before, ok, false, [x2])).not.toThrow();
+		const after = structuredClone(before);
+		get(after, x2).timeline_start -= 12.97;
+		let err = '';
+		try {
+			editedNoted(before, after, false, [x2]);
+		} catch (e) {
+			err = (e as Error).message;
+		}
+		expect(err).toContain('under 0.05s');
+		expect(err).toContain('A1');
+	});
+
+	test('a sound pulled before zero is trimmed and reported and a picture refuses', () => {
+		const { t, x1, x2, y1, y2 } = jlCut();
+		t.tracks.forEach((track) => (track.clips = track.clips.filter((c) => c.id !== x1 && c.id !== y1)));
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x2).timeline_start = 0;
+		const [out, notes] = editedNoted(before, after, false, [x2]);
+		expect(start(out, y2)).toBe(0);
+		expect(notes).toEqual(['A1']);
+		// A picture that would have to start before 0 refuses: x 0..10, its sound y 3..10 named and
+		// pulled up to 0 takes the picture with it.
+		const asset = uuid();
+		const u = timeline([lane('video', 'V1', [clip(asset, 0, 10, 0)]), lane('audio', 'A1', [clip(asset, 3, 10, 3)])]);
+		const [x, y] = [idOf(u, 0, 0), idOf(u, 1, 0)];
+		linkClips(u, [x, y]);
+		const priorU = structuredClone(u);
+		const afterU = structuredClone(u);
+		get(afterU, y).timeline_start = 0;
+		let err = '';
+		try {
+			editedNoted(priorU, afterU, false, [y]);
+		} catch (e) {
+			err = (e as Error).message;
+		}
+		expect(err).toContain('V1');
+		expect(err).toContain('never trimmed');
+	});
+
+	test('a move that carries a sound before zero reports it, and a picture refuses', () => {
+		// The picture at 5, its sound leading it by 3 (at 2): moving the picture to 0 would put the sound at -3.
+		const asset = uuid();
+		const t = timeline([lane('video', 'V1', [clip(asset, 5, 15, 5)]), lane('audio', 'A1', [clip(asset, 2, 15, 2)])]);
+		const [x, y] = [idOf(t, 0, 0), idOf(t, 1, 0)];
+		linkClips(t, [x, y]);
+		const was = structuredClone(get(t, x));
+		get(t, x).timeline_start = 0;
+		const notes: string[] = [];
+		carryExtentEdit(t, x, was, limits([asset]), notes);
+		expect(notes).toEqual(['A1']);
+		expect(extent(t, y)).toEqual([0, 10]);
+		expect(get(t, y).source_in).toBe(5);
+		// The other way round, the picture is the one that would start before 0: refused, nothing changes.
+		const u = timeline([lane('video', 'V1', [clip(asset, 2, 15, 2)]), lane('audio', 'A1', [clip(asset, 5, 15, 5)])]);
+		const [p, s] = [idOf(u, 0, 0), idOf(u, 1, 0)];
+		linkClips(u, [p, s]);
+		const wasS = structuredClone(get(u, s));
+		get(u, s).timeline_start = 0;
+		const json = JSON.stringify(u.tracks[0]);
+		expect(() => carryExtentEdit(u, s, wasS, limits([asset]))).toThrow(/V1.*never trimmed/);
+		expect(JSON.stringify(u.tracks[0])).toBe(json);
+		// And a sound that would be left under the floor is refused outright.
+		const w = timeline([lane('video', 'V1', [clip(asset, 5, 15, 5)]), lane('audio', 'A1', [clip(asset, 2, 5.04, 2)])]);
+		const [px, sx] = [idOf(w, 0, 0), idOf(w, 1, 0)];
+		linkClips(w, [px, sx]);
+		const wasW = structuredClone(get(w, px));
+		get(w, px).timeline_start = 0;
+		expect(() => carryExtentEdit(w, px, wasW, limits([asset]))).toThrow('under 0.05s');
+		expect(sx).toBeDefined();
+	});
+});
+
+describe('a cut and what it leaves of a partner', () => {
+	test('a cut that leaves a partners head, no group, does not make it an obstacle', () => {
+		// V1 X 5..15 / A1 S 0..13, X2 15..25 / S2 13..25 (footage offset -10): cutting all of X.
+		const asset = uuid();
+		const t = timeline([
+			lane('video', 'V1', [clip(asset, 5, 15, 5), clip(asset, 25, 35, 15)]),
+			lane('audio', 'A1', [clip(asset, 0, 13, 0), clip(asset, 23, 35, 13)])
+		]);
+		const ids = [idOf(t, 0, 0), idOf(t, 0, 1), idOf(t, 1, 0), idOf(t, 1, 1)];
+		linkClips(t, [ids[0], ids[2]]);
+		linkClips(t, [ids[1], ids[3]]);
+		const before = structuredClone(t);
+		const notes: string[] = [];
+		cutClipRangeLinked(t, ids[0], 5, 15, notes);
+		// X is gone; S keeps its head (0..5), now trimmed by S2 coming up to 3 — a leftover of a
+		// linked clip, so it gives way, and the edit says so.
+		expect(extent(t, ids[1])).toEqual([5, 15]);
+		expect(extent(t, ids[3])).toEqual([3, 15]);
+		expect(extent(t, ids[2])).toEqual([0, 3]);
+		expect(notes).toEqual(['A1']);
+		expect(get(t, ids[2]).link_id).toBeUndefined();
+		expect(firstSyncBreak(t, before)).toBeNull();
+	});
+
+	test('a lone leftover of a partner still resumes at the cut', () => {
+		// X 0..10 / S 9..15 (the sound starts inside what is cut): cut X's 8..10.
+		const asset = uuid();
+		const t = timeline([lane('video', 'V1', [clip(asset, 0, 10, 0)]), lane('audio', 'A1', [clip(asset, 9, 15, 9)])]);
+		const [x, s] = [idOf(t, 0, 0), idOf(t, 1, 0)];
+		linkClips(t, [x, s]);
+		cutClipRangeLinked(t, x, 8, 10);
+		expect(extent(t, x)).toEqual([0, 8]);
+		expect(extent(t, s)).toEqual([8, 13]);
+		expect(get(t, s).source_in).toBe(10);
+		// A partner wholly after the stretch comes up by it even when the named clip keeps nothing after.
+		const u = timeline([lane('video', 'V1', [clip(asset, 0, 10, 0)]), lane('audio', 'A1', [clip(asset, 12, 20, 12)])]);
+		const [x2, s2] = [idOf(u, 0, 0), idOf(u, 1, 0)];
+		linkClips(u, [x2, s2]);
+		cutClipRangeLinked(u, x2, 8, 10);
+		expect(extent(u, s2)).toEqual([10, 18]);
+	});
+});
+
+describe('detach under a compressor or gate', () => {
+	const compressor = (): AudioEffect => ({
+		type: 'compressor',
+		threshold_db: -18,
+		ratio: 4,
+		attack_ms: 10,
+		release_ms: 100,
+		makeup_db: 0
+	});
+
+	test('meets the same fader instead of folding it', () => {
+		for (const dynamic of [compressor(), { type: 'gate', threshold_db: -40 } as AudioEffect]) {
+			const asset = uuid();
+			const c = clip(asset, 0, 10, 0);
+			c.volume = 0.8;
+			c.audio = [dynamic];
+			const t = timeline([lane('video', 'V1', [c]), lane('audio', 'A1', []), lane('audio', 'A2', [])]);
+			t.tracks[0].volume = 0.5;
+			t.tracks[1].volume = 2;
+			t.tracks[2].volume = 0.5;
+			// A1's fader differs; A2's equals the picture track's: the sound goes to A2, volume untouched.
+			const d = detachAudio(t, c.id, true);
+			expect([d.track_id, d.created_track, d.clip.volume]).toEqual([t.tracks[2].id, false, 0.8]);
+			// With no lane at that fader a new one is made at it.
+			const c2 = clip(asset, 0, 10, 0);
+			c2.volume = 0.8;
+			c2.audio = [structuredClone(dynamic)];
+			const u = timeline([lane('video', 'V1', [c2]), lane('audio', 'A1', [])]);
+			u.tracks[0].volume = 0.5;
+			u.tracks[1].volume = 2;
+			const made = detachAudio(u, c2.id, true);
+			expect(made.created_track).toBe(true);
+			const track = u.tracks.find((x) => x.id === made.track_id)!;
+			expect([track.name, track.volume, made.clip.volume]).toEqual(['A2', 0.5, 0.8]);
+			expect(u.tracks[1].clips).toHaveLength(0);
+		}
+		// Linear chains still fold, and equal faders need neither.
+		const c = clip(uuid(), 0, 10, 0);
+		c.audio = [{ type: 'highpass', hz: 80 }];
+		const t = timeline([lane('video', 'V1', [c]), lane('audio', 'A1', [])]);
+		t.tracks[0].volume = 0.5;
+		t.tracks[1].volume = 2;
+		const d = detachAudio(t, c.id, true);
+		expect(d.created_track).toBe(false);
+		same(d.clip.volume * 2, 0.5);
+	});
+});
+
+describe('the label says what the lock trimmed', () => {
+	test('each track once, in the order it happened, and nothing when nothing was trimmed', () => {
+		expect(trimmedSuffix([])).toBe('');
+		expect(trimmedSuffix(['A1'])).toBe(' (trimmed sound on A1)');
+		expect(trimmedSuffix(['A2', 'A1', 'A2', 'A3'])).toBe(' (trimmed sound on A2, A1, A3)');
 	});
 });

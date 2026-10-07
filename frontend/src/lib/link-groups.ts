@@ -257,17 +257,19 @@ export function hasLinks(timeline: Timeline): boolean {
 export function firstSyncBreak(after: Timeline, before: Timeline): [string, string] | null {
 	const prior = new Map<string, Clip>();
 	for (const c of before.tracks.flatMap((t) => t.clips)) prior.set(c.id, c);
-	const groups = new Map<string, { track: Track; clip: Clip }[]>();
-	for (const track of after.tracks) {
+	const groups = new Map<string, { ti: number; clip: Clip }[]>();
+	after.tracks.forEach((track, ti) => {
 		for (const clip of track.clips) {
 			if (!clip.link_id) continue;
 			const members = groups.get(clip.link_id) ?? [];
-			members.push({ track, clip });
+			members.push({ ti, clip });
 			groups.set(clip.link_id, members);
 		}
-	}
+	});
 	const EPS = STEP_EPS;
 	const speed = (c: Clip) => c.speed ?? 1;
+	// Of every pair that broke, the one on the lowest tracks (`Timeline::first_sync_break`).
+	let first: [number, number] | null = null;
 	for (const members of groups.values()) {
 		for (let i = 0; i < members.length; i++) {
 			for (let j = i + 1; j < members.length; j++) {
@@ -283,12 +285,14 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 				if (
 					Math.abs(speed(a.clip) - speed(b.clip)) >= EPS ||
 					Math.abs(contentOffset(a.clip) - contentOffset(b.clip)) >= EPS
-				)
-					return [a.track.name, b.track.name];
+				) {
+					const pair: [number, number] = [Math.min(a.ti, b.ti), Math.max(a.ti, b.ti)];
+					if (!first || pair[0] < first[0] || (pair[0] === first[0] && pair[1] < first[1])) first = pair;
+				}
 			}
 		}
 	}
-	return null;
+	return first ? [after.tracks[first[0]].name, after.tracks[first[1]].name] : null;
 }
 
 /** The refusal for an edit `firstSyncBreak` found, in the backend's words. */

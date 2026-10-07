@@ -7708,7 +7708,7 @@ mod tests {
         tiny.transform.scale = 0.0004;
         let c = chain(&tiny);
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
-        let mut small = tiny.clone();
+        let mut small = tiny;
         small.transform.scale = 0.5;
         assert!(chain(&small).contains(",scale=iw*0.5:ih*0.5,"), "{}", chain(&small));
         // A keyed one, moving or not, clamps when any key is tiny.
@@ -7834,7 +7834,7 @@ mod tests {
         faded.transform.opacity = 0.5;
         let chain = video_clip_chain(&faded, &fmt, &alpha, true, "c0");
         assert!(chain.ends_with("colorchannelmixer=aa=0.5"), "{chain}");
-        let mut moving = clip.clone();
+        let mut moving = clip;
         moving.keyframes = vec![key(0.0, 0.3, 0.0, 0.0, 1.0), key(2.0, 1.6, 0.0, 0.0, 1.0)];
         let chain = video_clip_chain(&moving, &fmt, &alpha, true, "c0");
         assert!(

@@ -73,6 +73,8 @@ function replay(c: Case): Outcome {
 			return { ...ops.setSpeed(tl, e, op.clip_id, op.speed), report: null };
 		case 'split_remove':
 			return { ...ops.splitRemoveClips(tl, e, [{ clip_id: op.clip_id, at: op.at }], op.side), report: null };
+		case 'split_remove_clips':
+			return { ...ops.splitRemoveClips(tl, e, op.cuts, op.side), report: null };
 		case 'move_clips':
 			return { ...ops.moveClips(tl, e, op.moves), report: null };
 		case 'reorder':

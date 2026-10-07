@@ -180,6 +180,38 @@ describe('linkedTrimPreview', () => {
 		expect([at('b').start, at('pb').start]).toEqual([6, 4]);
 	});
 
+	test('a sound the trim cuts back to make room is drawn and named, a picture is never cut', () => {
+		// V1: c [0,8) then b [8,18); A1: pa under c (0..8), pb leads b by 2 s ([6,18)). Stretching c by 2
+		// pushes b to 10 and its sound to 8 — and c's own sound follows the edge to 10, onto pb's lead.
+		const t: Timeline = {
+			tracks: [
+				lane('video', 'V1', [clip('c', 'x', 40, 48, 0, 'L1'), clip('b', 'x', 20, 30, 8, 'L2')]),
+				lane('audio', 'A1', [clip('pa', 'x', 40, 48, 0, 'L1'), clip('pb', 'x', 18, 30, 6, 'L2')])
+			]
+		};
+		const p = linkedTrimPreview(t, 'c', 'r', 10, opts({ ripple: true }))!;
+		expect(p.ok).toBe(true);
+		expect(p.trimmed).toEqual(['A1']);
+		const at = (id: string) => p.ghosts.find((g) => g.id === id)!;
+		expect(p.ghosts.find((g) => g.id === 'pa')).toBeUndefined(); // stretched to 10, cut back to where it was
+		expect(at('pb').start).toBe(8);
+		// Nothing trimmed, nothing named.
+		expect(linkedTrimPreview(pairs(), 'a', 'r', 8, opts())!.trimmed).toEqual([]);
+		// The same cut, named by the *sound* of a J-cut: its picture would be pulled onto the one before.
+		const jl: Timeline = {
+			tracks: [
+				lane('video', 'V1', [clip('x1', 'x', 105, 115, 5, 'L1'), clip('x2', 'x', 215, 225, 15, 'L2')]),
+				lane('audio', 'A1', [clip('y1', 'x', 100, 113, 0, 'L1'), clip('y2', 'x', 213, 225, 13, 'L2')])
+			]
+		};
+		const refused = linkedTrimPreview(jl, 'y1', 'r', 10, opts({ ripple: true }))!;
+		expect(refused.ok).toBe(false);
+		expect(refused.trimmed).toEqual([]);
+		expect(refused.reason).toContain('never trimmed');
+		expect(refused.reason).toContain('picture');
+		expect(refused.reason).toContain('hold Alt');
+	});
+
 	test('a locked partner refuses, in the backend’s words', () => {
 		const t = pairs();
 		t.tracks[1].locked = true;

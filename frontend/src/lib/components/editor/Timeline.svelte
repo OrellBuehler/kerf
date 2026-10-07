@@ -2653,6 +2653,13 @@
 				>
 					{trimView.reason}
 				</div>
+			{:else if trimDrag?.moved && trimView?.ok && trimView.trimmed.length > 0}
+				<div
+					role="status"
+					style="position:absolute;left:{Math.max(4, Math.min(trimDrag.nx + 14, contentW - 300))}px;top:{trimDrag.ny + 18}px;z-index:35;pointer-events:none;max-width:290px;padding:3px 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--warning);background:var(--surface-raised);color:var(--text-primary);font-size:11px;line-height:1.35"
+				>
+					Cuts back the sound on {trimView.trimmed.join(', ')} to make room
+				</div>
 			{/if}
 
 			<!-- playhead -->

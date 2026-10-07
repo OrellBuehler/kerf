@@ -2402,7 +2402,10 @@ impl KerfMcp {
                        A1) when it has room, else the first that does, else a new one; it is LINKED to the picture \
                        (so they move, trim, split and delete together — see link_clips) and the picture's own sound \
                        is muted, so the sound is heard once, from the audio track. The LEVEL is kept: the picture \
-                       track's fader is folded into the new clip's volume (volume × picture fader ÷ audio fader). \
+                       track's fader is folded into the new clip's volume (volume × picture fader ÷ audio fader) — \
+                       except under a compressor or gate, which react to level: such a clip goes to an audio \
+                       track whose fader EQUALS the picture track's (an existing one with room, else a new \
+                       track at that fader) and its volume is left alone. \
                        What cannot be kept is the rest of the audio track's strip — its pan, duck and mute/solo \
                        decide the mix now, not the picture track's. Audio effects, fades and the transition's sound \
                        fade go with the audio clip. One revision. Errors if the clip is not on a video track, its \
@@ -2455,8 +2458,12 @@ impl KerfMcp {
                        that moves a linked clip moves its partners by the same amount — a sound that leads or trails \
                        its picture (a J- or L-cut) stays that far ahead or behind. Only linked clips follow: an \
                        unlinked clip on a partner's track stays where it was, and one in the way refuses the edit \
-                       (as does a locked partner, or a linked clip that would be covered) with a reason. Two linked \
-                       clips you name and move apart yourself are refused as \"out of step\" — unlink them first. \
+                       (as does a locked partner, a PICTURE a linked clip would run into or start before 0 — pictures are \
+                       never trimmed to fit — or a clip that would be left under 0.05 s) with a reason; a linked SOUND \
+                       in the way is trimmed back instead, and the revision label says so (\"… (trimmed sound on \
+                       A2)\"). Two linked clips you name and move apart yourself are refused as \"out of step\" — \
+                       unlink them first (naming both and cutting them at the same moment, as a trim to the \
+                       playhead does, is not moving them apart). \
                        At least two clips, on different tracks, none on a locked track. detach_audio links for you. One revision. Returns the group's `link_id`."
     )]
     fn link_clips(&self, Parameters(p): Parameters<LinkClipsParams>) -> Result<String, McpError> {
@@ -3346,8 +3353,9 @@ impl ServerHandler for KerfMcp {
              `link_id` in get_timeline_state shows them; pass `link: false` on any \
              of those tools to edit one clip alone, which can leave the pair out \
              of sync; a partner on a locked track refuses the edit, and so does \
-             an unlinked clip that a linked clip would run into — the error names the \
-             lane). A ripple, a delete or a cut moves linked clips together by the \
+             an unlinked clip, or a picture, that a linked clip would run into — the \
+             error names the lane; a linked sound in the way is trimmed back and \
+             the revision label says \"(trimmed sound on A2)\"). A ripple, a delete or a cut moves linked clips together by the \
              same amount, so a sound that leads or trails its picture stays that far \
              off; add_asset_audio puts an asset's whole audio on an audio track. Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \

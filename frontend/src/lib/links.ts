@@ -25,6 +25,7 @@ import {
 	clampFades,
 	footageOf,
 	handles,
+	MIN_EDIT_CLIP,
 	moveHead,
 	moveTail,
 	type SourceLimits
@@ -42,17 +43,21 @@ import {
 	STEP_EPS,
 	unlockedPartners
 } from './link-groups';
-import { conformLinks, DIFF_EPS, spansOverlap } from './ripple';
-import type { Clip, ClipCut, ClipMove, Timeline } from './types';
+import { applyShifts, conformLinks, DIFF_EPS, settleLinked, spansOverlap } from './ripple';
+import type { AudioEffect, Clip, ClipCut, ClipMove, Timeline, Track } from './types';
 import { clipDuration } from './types';
+
+/** Whether an effect reacts to *level* (a compressor, a gate): a gain put ahead of it changes
+ *  what it does (`AudioEffect::is_dynamic`). */
+const isDynamic = (e: AudioEffect) => e.type === 'compressor' || e.type === 'gate';
 
 const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);
 const reversed = (c: Clip) => (c.speed ?? 1) < 0;
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
 /** A track fader at or below this is silent: nothing can be carried onto it by scaling a clip up. */
 const MIN_FADER = 1e-3;
-/** The shortest a clip may be left (kerf-core's `MIN_LEFT`). */
-const MIN_LEFT = 1e-3;
+/** Two faders closer than this are the same fader (kerf-core's `FADER_EPS`). */
+const FADER_EPS = 1e-6;
 
 // ---- detach / reattach -----------------------------------------------------------
 
@@ -68,9 +73,17 @@ export interface Detached {
 
 /** The audio lane to put a detached clip spanning `span` on: the audio track at the
  *  picture track's own position (V1 → A1, V2 → A2) when it has room, else the first
- *  audio track that does; never a locked one, one with its fader at zero (the picture's
- *  level cannot be carried onto it), nor one in `avoid`. */
-function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, number], avoid: ReadonlySet<number>): number | undefined {
+ *  audio track that does; never a locked one nor one in `avoid`. With `fader` — the clip's
+ *  sound must meet the same fader it did, because something on its chain reacts to level —
+ *  only a lane at exactly that fader will do; without it, any lane whose fader is not at
+ *  zero (the picture's level is carried onto it by scaling the clip). */
+function audioLaneFor(
+	timeline: Timeline,
+	videoTrack: number,
+	span: [number, number],
+	avoid: ReadonlySet<number>,
+	fader?: number
+): number | undefined {
 	const ordinal = timeline.tracks.slice(0, videoTrack).filter((t) => t.kind === 'video').length;
 	const audio = timeline.tracks.map((_, i) => i).filter((i) => timeline.tracks[i].kind === 'audio');
 	const preferred = audio[ordinal];
@@ -79,7 +92,7 @@ function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, num
 		const track = timeline.tracks[i];
 		return (
 			!track.locked &&
-			(track.volume ?? 1) > MIN_FADER &&
+			(fader === undefined ? (track.volume ?? 1) > MIN_FADER : Math.abs((track.volume ?? 1) - fader) <= FADER_EPS) &&
 			!avoid.has(i) &&
 			!track.clips.some((c) => spansOverlap(span, [c.timeline_start, endOf(c)]))
 		);
@@ -92,8 +105,12 @@ function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, num
  * linked to the picture clip, and the picture clip's own sound is muted
  * (`source_audio: false`). The level is kept where it can be: a video track's fader rides
  * its clips' own sound and the audio track has one of its own, so the new clip's gain is
- * `volume × picture track's fader ÷ audio track's fader`. The destination's pan, duck and
- * mute/solo decide the rest of the mix afterwards. The audio clip also carries audio
+ * `volume × picture track's fader ÷ audio track's fader` — exact while everything on the
+ * clip's chain is linear. A **compressor or gate** reacts to level, and folding the fader
+ * into the volume would move the gain ahead of it, so a clip with one goes to a lane whose
+ * fader *equals* the picture track's (an existing one with room, else a new audio track at
+ * that fader) and its volume is left alone. The destination's pan, duck and mute/solo
+ * decide the rest of the mix afterwards. The audio clip also carries audio
  * effects, fades and the transition; the picture keeps its own, inert while muted.
  * `hasAudio` is whether the clip's asset carries an audio stream. Refuses a clip that is
  * not on a video track, whose sound is already detached, or whose track is locked.
@@ -112,14 +129,20 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 	const avoid = new Set<number>();
 	for (const p of linkPartners(timeline, clipId)) avoid.add(locateIndex(timeline, p)![0]);
 	const span: [number, number] = [clip.timeline_start, endOf(clip)];
-	let laneIx = audioLaneFor(timeline, vi, span, avoid);
+	const pictureFader = timeline.tracks[vi].volume ?? 1;
+	// Something that reacts to level must meet the same fader it did.
+	const fader = (clip.audio ?? []).some(isDynamic) ? pictureFader : undefined;
+	let laneIx = audioLaneFor(timeline, vi, span, avoid, fader);
 	let createdTrack = false;
 	if (laneIx === undefined) {
 		const count = timeline.tracks.filter((t) => t.kind === 'audio').length;
-		timeline.tracks.push({ id: newId(), kind: 'audio', name: `A${count + 1}`, clips: [] });
+		const track: Track = { id: newId(), kind: 'audio', name: `A${count + 1}`, clips: [] };
+		if (fader !== undefined) track.volume = fader;
+		timeline.tracks.push(track);
 		laneIx = timeline.tracks.length - 1;
 		createdTrack = true;
 	}
+	const destFader = timeline.tracks[laneIx].volume ?? 1;
 	const group = clip.link_id ?? newId();
 	const audio: Clip = {
 		id: newId(),
@@ -128,7 +151,7 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 		source_out: clip.source_out,
 		timeline_start: clip.timeline_start,
 		// The picture track's fader rode this sound; the destination's rides it now.
-		volume: (clip.volume * (timeline.tracks[vi].volume ?? 1)) / (timeline.tracks[laneIx].volume ?? 1),
+		volume: Math.abs(pictureFader - destFader) <= FADER_EPS ? clip.volume : (clip.volume * pictureFader) / destFader,
 		fade_in: clip.fade_in,
 		fade_out: clip.fade_out,
 		speed: clip.speed ?? 1,
@@ -320,11 +343,19 @@ export function extentEdit(was: Clip, now: Clip, looping: boolean): ExtentEdit |
  * **trim** moves a partner's edge by the same amount *when the partner shares that edge*
  * with the clip as it was (within `ADJACENT_EPS`), clamped to the footage the partner
  * has. It writes no overlap check — like a trim, it leaves what the ripple pass or the
- * user is about to settle. A partner carried before 0 loses what hangs off the front.
- * Throws when a partner is on a locked track or would be trimmed away entirely. Returns
- * the partners as they stand afterwards.
+ * user is about to settle. A **sound** carried before 0 loses what hangs off the front
+ * (its track's name is pushed to `notes`); a **picture** is never trimmed to fit and
+ * refuses, as does a clip that would be left under `MIN_EDIT_CLIP`. Throws when a partner
+ * is on a locked track or would be trimmed away entirely. Returns the partners as they
+ * stand afterwards.
  */
-export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, footage: SourceLimits): Clip[] {
+export function carryExtentEdit(
+	timeline: Timeline,
+	clipId: string,
+	was: Clip,
+	footage: SourceLimits,
+	notes: string[] = []
+): Clip[] {
 	const now = clipById(timeline, clipId);
 	if (!now) throw clipNotFound(clipId);
 	const looping = footage.get(now.asset_id) === Infinity;
@@ -333,6 +364,7 @@ export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, f
 	const out: Clip[] = [];
 	// Validate every partner before writing any, so a refusal changes nothing.
 	const updates: [number, number, Clip][] = [];
+	const trimmed: string[] = [];
 	for (const partnerId of unlockedPartners(timeline, clipId, new Set([clipId]))) {
 		const [pt, pc] = locateIndex(timeline, partnerId)!;
 		const p = structuredClone(timeline.tracks[pt].clips[pc]);
@@ -353,17 +385,25 @@ export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, f
 		if (clipDuration(p) <= DIFF_EPS)
 			throw invalid(`the linked clip on ${timeline.tracks[pt].name} would be trimmed away by this edit`);
 		if (p.timeline_start < -DIFF_EPS) {
-			// Carried before 0: what hangs off the front is cut away — losing the head keeps
-			// the clip in step, moving it would not.
+			// Carried before 0: what hangs off the front of a sound is cut away — losing the
+			// head keeps the clip in step, moving it would not. A picture is never trimmed to fit.
+			if (timeline.tracks[pt].kind === 'video')
+				throw invalid(
+					`the linked clip on ${timeline.tracks[pt].name} would start before the beginning of the timeline — a picture is never trimmed to fit`
+				);
 			const over = -p.timeline_start;
-			if (clipDuration(p) - over < MIN_LEFT)
-				throw invalid(`the linked clip on ${timeline.tracks[pt].name} would end before the beginning of the timeline`);
+			if (clipDuration(p) - over < MIN_EDIT_CLIP)
+				throw invalid(
+					`the linked clip on ${timeline.tracks[pt].name} would be left under ${MIN_EDIT_CLIP}s by the beginning of the timeline`
+				);
 			moveHead(p, over, pLooping);
+			trimmed.push(timeline.tracks[pt].name);
 		}
 		p.timeline_start = Math.max(p.timeline_start, 0);
 		clampFades(p);
 		updates.push([pt, pc, p]);
 	}
+	notes.push(...trimmed);
 	for (const [pt, pc, p] of updates) {
 		timeline.tracks[pt].clips[pc] = p;
 		out.push(structuredClone(p));
@@ -377,7 +417,7 @@ export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, f
  * change to its partners afterwards. A group where more than one member changed is left
  * alone — the edit named them explicitly.
  */
-export function carryLinksSince(timeline: Timeline, before: Timeline, footage: SourceLimits) {
+export function carryLinksSince(timeline: Timeline, before: Timeline, footage: SourceLimits, notes: string[] = []) {
 	if (!timeline.tracks.some((t) => t.clips.some((c) => c.link_id))) return;
 	const changed = (was: Clip, now: Clip) =>
 		Math.abs(was.timeline_start - now.timeline_start) > DIFF_EPS ||
@@ -392,7 +432,7 @@ export function carryLinksSince(timeline: Timeline, before: Timeline, footage: S
 	for (const ids of drivers.values()) {
 		if (ids.length !== 1) continue;
 		const was = structuredClone(clipById(before, ids[0])!);
-		carryExtentEdit(timeline, ids[0], was, footage);
+		carryExtentEdit(timeline, ids[0], was, footage, notes);
 	}
 }
 
@@ -487,14 +527,14 @@ export function rippleDeleteClip(timeline: Timeline, clipId: string) {
  *  authority), so a J- or L-cut pair still closes up by the amount of *picture* removed. An
  *  unlinked clip on a partner's track stays where it was. A partner on a locked track
  *  refuses the lot. Atomic. Returns how many were deleted. */
-export function rippleDeleteLinked(timeline: Timeline, clipId: string): number {
+export function rippleDeleteLinked(timeline: Timeline, clipId: string, notes: string[] = []): number {
 	if (!locateIndex(timeline, clipId)) throw clipNotFound(clipId);
 	const partners = unlockedPartners(timeline, clipId, new Set([clipId]));
 	const scratch: Timeline = structuredClone(timeline);
 	rippleDeleteClip(scratch, clipId);
 	const doomed = new Set(partners);
 	for (const track of scratch.tracks) track.clips = track.clips.filter((c) => !doomed.has(c.id));
-	conformLinks(scratch, timeline, new Set([clipId]));
+	conformLinks(scratch, timeline, new Set([clipId]), new Map(), undefined, notes);
 	timeline.tracks = scratch.tracks;
 	return 1 + partners.length;
 }
@@ -587,10 +627,13 @@ export function cutClipRange(timeline: Timeline, clipId: string, from: number, t
  * moves up by it, one whose head was inside the stretch resumes at the cut, one that spanned
  * it is cut in two and its tail follows — and only those: an unlinked clip on a partner's
  * track stays where it was (`conformLinks`). A partner the cut misses and that lies before
- * it is untouched; one the cut overlaps on a locked track refuses the lot. The group then
- * falls in two by side, as for a split. Atomic. Returns the named clip's kept pieces.
+ * it is untouched; one the cut overlaps on a locked track refuses the lot. The partners'
+ * surviving pieces after the stretch are moved explicitly (`closing`), so a piece whose group
+ * no longer has a second member (the named clip left nothing after the cut) still lands where
+ * the footage it shows now plays. The group then falls in two by side, as for a split. Atomic.
+ * Returns the named clip's kept pieces.
  */
-export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: number, to: number): Clip[] {
+export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: number, to: number, notes: string[] = []): Clip[] {
 	const clip = clipById(timeline, clipId);
 	if (!clip) throw clipNotFound(clipId);
 	const group = clip.link_id ?? undefined;
@@ -603,8 +646,11 @@ export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: num
 	const spanA = sourceToTimeline(clip, a);
 	const spanB = sourceToTimeline(clip, b);
 	const span: [number, number] = [Math.min(spanA, spanB), Math.max(spanA, spanB)];
+	const removed = span[1] - span[0];
 	const lefts: string[] = [];
 	const rights: string[] = [];
+	// What lies after the stretch comes up to it: `[piece, by how much]`.
+	const closing: [string, number][] = [];
 	const origin = new Map<string, string>();
 	const sides = (h: Clip | null, t: Clip | null, from: string) => {
 		if (h) lefts.push(h.id);
@@ -618,8 +664,12 @@ export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: num
 		const hi = Math.min(span[1], endOf(p));
 		if (hi - lo <= DIFF_EPS) {
 			// The cut misses it: before the stretch it stays with the left, after it with the right.
-			if (endOf(p) <= span[0] + DIFF_EPS) lefts.push(partner);
-			else rights.push(partner);
+			if (endOf(p) <= span[0] + DIFF_EPS) {
+				lefts.push(partner);
+			} else {
+				rights.push(partner);
+				closing.push([partner, -removed]);
+			}
 			continue;
 		}
 		const [pt] = locateIndex(timeline, partner)!;
@@ -628,9 +678,13 @@ export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: num
 		const [s0, s1] = [timelineToSource(p, lo), timelineToSource(p, hi)];
 		const pieces = cutRangePieces(scratch, partner, Math.min(s0, s1), Math.max(s0, s1), false);
 		sides(pieces.head, pieces.tail, partner);
+		// What survives the stretch resumes at the cut — the footage after it, which played
+		// at `span[1]`, now plays at `span[0]`.
+		if (pieces.tail) closing.push([pieces.tail.id, span[0] - pieces.tail.timeline_start]);
 	}
 	relinkSides(scratch, group, lefts, rights);
-	conformLinks(scratch, timeline, new Set([clipId]), origin);
+	applyShifts(scratch, closing, settleLinked(scratch, timeline, origin), notes);
+	conformLinks(scratch, timeline, new Set([clipId]), origin, undefined, notes);
 	timeline.tracks = scratch.tracks;
 	return [head, tail].filter((c): c is Clip => !!c).map((c) => structuredClone(clipById(timeline, c.id) ?? c));
 }

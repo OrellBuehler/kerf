@@ -2,7 +2,7 @@
 //! analysis metadata, and the non-destructive timeline (EDL). All timeline
 //! operations mutate the stored EDL; nothing is re-encoded until [`Project::export`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -166,6 +166,27 @@ pub struct Project {
     /// [`Project::with_links`]. Unset means yes: links are always in force unless a
     /// call says otherwise.
     links_override: Cell<Option<bool>>,
+    /// The sounds the sync lock trimmed in the edit being made — the names of their
+    /// tracks — so its revision can say so (`… (trimmed sound on A2)`). Filled while an
+    /// edit runs and drained when it lands; a `RefCell` for the same reason as the
+    /// overrides above.
+    edit_notes: RefCell<Vec<String>>,
+}
+
+/// What an edit's revision label says about the sounds it trimmed to make room: nothing
+/// when none was, else ` (trimmed sound on A2, A3)` — each track once, in order.
+fn trimmed_suffix(notes: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for n in notes {
+        if !seen.contains(&n.as_str()) {
+            seen.push(n);
+        }
+    }
+    if seen.is_empty() {
+        String::new()
+    } else {
+        format!(" (trimmed sound on {})", seen.join(", "))
+    }
 }
 
 impl Project {
@@ -178,6 +199,7 @@ impl Project {
             actor: EditSource::User,
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
+            edit_notes: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -192,6 +214,7 @@ impl Project {
             actor: EditSource::User,
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
+            edit_notes: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -205,6 +228,7 @@ impl Project {
             actor: EditSource::User,
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
+            edit_notes: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -1054,6 +1078,8 @@ impl Project {
     ) -> Result<R> {
         let links = self.links_active();
         let anchors: HashSet<Uuid> = anchors.iter().copied().collect();
+        let notes = &self.edit_notes;
+        notes.borrow_mut().clear();
         let f = move |timeline: &mut Timeline| -> Result<R> {
             // The sync lock and guard: with links in force and something linked, the
             // partners of what the edit moved follow it, and an edit that would
@@ -1063,11 +1089,17 @@ impl Project {
             let before = (ripple || sync).then(|| timeline.clone());
             let result = f(timeline)?;
             if let Some(before) = &before {
+                // What the edit itself left, before the per-lane ripple moves each track
+                // by its own length: which of the clips it named it *moved apart* is
+                // judged there.
+                let left = (ripple && sync).then(|| timeline.clone());
                 if ripple {
                     *timeline = timeline.ripple_lanes(before);
                 }
                 if sync {
-                    timeline.conform_links(before, &anchors, &HashMap::new())?;
+                    let mut trimmed = Vec::new();
+                    timeline.conform_links_noted(before, &anchors, &HashMap::new(), left.as_ref(), &mut trimmed)?;
+                    notes.borrow_mut().extend(trimmed);
                     if let Some((a, b)) = timeline.first_sync_break(before) {
                         return Err(Error::InvalidArgument(format!(
                             "that edit would leave the linked clips on {a} and {b} out of step with each other — unlink them first if they are meant to part"
@@ -1094,7 +1126,8 @@ impl Project {
         let result = f(&mut timeline)?;
         let json = serde_json::to_string(&timeline)?;
         self.save_timeline_str(&json)?;
-        self.record_revision(&label(&result), self.actor, &json)?;
+        let label = format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take()));
+        self.record_revision(&label, self.actor, &json)?;
         tx.commit()?;
         Ok(result)
     }
@@ -1183,7 +1216,7 @@ impl Project {
         let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
         let result = f(&mut timeline)?;
         let mut edits = row.edits;
-        edits.push(label(&result));
+        edits.push(format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take())));
         self.conn.execute(
             "UPDATE staged SET timeline = ?1, edits = ?2, updated_at = ?3 WHERE id = 1",
             params![
@@ -1563,7 +1596,9 @@ impl Project {
                 }
                 if links {
                     // The partners follow the edge that moved (see `carry_extent_edit`).
-                    timeline.carry_extent_edit(clip_id, &was, &footage)?;
+                    let mut trimmed = Vec::new();
+                    timeline.carry_extent_edit_noted(clip_id, &was, &footage, &mut trimmed)?;
+                    self.edit_notes.borrow_mut().extend(trimmed);
                 }
                 Ok(out)
             },
@@ -1598,7 +1633,10 @@ impl Project {
             |_| "Cut range".to_string(),
             |timeline| {
                 if links {
-                    timeline.cut_clip_range_linked(clip_id, from, to)
+                    let mut trimmed = Vec::new();
+                    let kept = timeline.cut_clip_range_linked_noted(clip_id, from, to, &mut trimmed);
+                    self.edit_notes.borrow_mut().extend(trimmed);
+                    kept
                 } else {
                     timeline.cut_clip_range(clip_id, from, to)
                 }
@@ -1995,7 +2033,10 @@ impl Project {
             |_| "Ripple delete".to_string(),
             |timeline| {
                 if links {
-                    timeline.ripple_delete_linked(clip_id).map(|_| ())
+                    let mut trimmed = Vec::new();
+                    let done = timeline.ripple_delete_linked_noted(clip_id, &mut trimmed);
+                    self.edit_notes.borrow_mut().extend(trimmed);
+                    done.map(|_| ())
                 } else {
                     timeline.ripple_delete_clip(clip_id)
                 }
@@ -2802,7 +2843,9 @@ impl Project {
                 aligned += track.align_cuts_to_beats(&beats, tolerance, &limits);
             }
             if let Some(before) = before {
-                timeline.carry_links_since(&before, &limits)?;
+                let mut trimmed = Vec::new();
+                timeline.carry_links_since_noted(&before, &limits, &mut trimmed)?;
+                self.edit_notes.borrow_mut().extend(trimmed);
             }
             Ok(aligned)
         })

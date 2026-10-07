@@ -1051,6 +1051,13 @@ pub enum AudioEffect {
 }
 
 impl AudioEffect {
+    /// Whether the effect reacts to *level* (a compressor, a gate): a gain put ahead of
+    /// it changes what it does, so the clip's level cannot be moved across it. Filters
+    /// and EQ are linear and commute with any gain.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, AudioEffect::Compressor { .. } | AudioEffect::Gate { .. })
+    }
+
     /// Short name, for listing a chain in a diff or a log line.
     pub fn name(&self) -> &'static str {
         match self {
@@ -3431,7 +3438,10 @@ impl Timeline {
         let out = self.ripple_lanes(before);
         if links {
             let mut conformed = out.clone();
-            if conformed.conform_links(before, anchors, &HashMap::new()).is_ok() {
+            if conformed
+                .conform_links_noted(before, anchors, &HashMap::new(), Some(self), &mut Vec::new())
+                .is_ok()
+            {
                 return conformed;
             }
         }

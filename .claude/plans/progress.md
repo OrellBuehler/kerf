@@ -22,7 +22,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -164,6 +164,31 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   no longer falls through to appending (that is `add_asset_audio`) and reports skipped
   clips, `detach_audio_clips` is the one-revision batch. The browser harness is replayed
   against a corpus kerf-core writes (`links-corpus.json`).
+- **2026-10-07 — linked A/V, second review.** (1) *Both partners named.* Trim to the
+  playhead names a picture and its sound; the per-lane ripple then pulled each track by its
+  own length and the lock read that as "moved apart" (refused 90/101, "unlink them first").
+  "Moved apart" is now judged on the timeline **as the edit left it** (before
+  `ripple_lanes`; `left` in `run_edit`); if the named members agree there the first in track
+  order is the authority and the other named ones are shifted too. `move_clips` with
+  partners at different deltas stays refused. (2) *Cut range:* a partner's leftover is a
+  linked clip when making room (`settle_linked`), and what a partner keeps after the cut is
+  moved to the cut explicitly (`closing`), so a lone leftover still resumes there. (3)
+  *Detach under a compressor or gate* no longer folds the fader (the gain would sit ahead of
+  a level-dependent effect): the clip goes to a lane at the picture track's fader, else a
+  new track at it (no skip path — a lane can always be made); the doc claim is narrowed to
+  linear chains. (4) The corpus fixture is `eol=lf` in `.gitattributes` and the freshness
+  test normalizes `\r\n`. (5) `first_sync_break` names the lowest track pair (TS too).
+  *Victims* — decided: a picture is **never** cut to make room or pushed before 0 (refused,
+  naming the lane, Alt offered); a linked **sound** may be trimmed back or lose its head and
+  the revision label says so (`… (trimmed sound on A2)`, live and staged); the floor is
+  `MIN_EDIT_CLIP` (0.05 s) — a victim that would fall under it is refused, not stubbed. A
+  J-cut lead lost at 0 is trimmed and reported rather than refused: the lead is a sound's,
+  the picture is untouched, and refusing would block deleting the first shot of any J-cut
+  edit. Cost, measured on the J/L fuzz: 13% of moving edits are blocked (was ~5%) — 2.8% of
+  those naming a picture, 23% of those naming a sound under ripple, which pulls the next
+  shot's picture onto the one before; before, that silently cut the previous shot. The UI
+  preview (`linkedTrimPreview`) runs the same rules, refusals included, and names a trimmed
+  sound. Corpus 80 → 93 cases.
 - **2026-10-07 — `extract_audio` doubled the sound, measured.** The export mixes every
   clip whose asset has audio, video tracks included, so appending the asset's audio
   with its picture still on V1 was +6.02 dB over the clip alone (real render, ffmpeg

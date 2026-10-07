@@ -925,7 +925,12 @@ no editing logic in the adapter.
   track's fader rides its clips' own sound and the audio track has one of its own, so the
   new clip's volume is `volume × picture fader ÷ audio fader` (a lane whose fader is at
   zero is never chosen, and the render check measures +0.00 dB through a V1 fader of 0.5
-  into an A1 fader of 2.0); the destination's **pan, duck flag and mute/solo** now decide
+  into an A1 fader of 2.0) — **exact only while the clip's chain is linear**: folding the
+  fader into the volume moves the gain *ahead of* a compressor or gate
+  (`AudioEffect::is_dynamic`), which then reacts to a different level. So a clip with one
+  goes to a lane whose fader **equals** the picture track's — an existing one with room,
+  else a **new audio track at that fader**, there is no skip path — and its volume is left
+  alone; filters and EQ commute with gain and still fold; the destination's **pan, duck flag and mute/solo** now decide
   the mix, and that difference is documented rather than hidden. The audio clip also carries audio
   effects, fades and the transition (the `audio_clip_chain` strings are pinned equal
   before / after at neutral faders); the picture keeps inert copies so **`reattach_audio`**
@@ -938,15 +943,22 @@ no editing logic in the adapter.
   lock, which the single-clip ops still do not): *move* by the same Δt on each partner's
   own track (a track change is the named clip's alone); *trim* (`carry_extent_edit`) moves
   the edge **a partner shares within 1 ms**, clamped to its footage, never overlap-checked
-  (what it pushes is the sync lock's); a partner carried before 0 loses its head, one a trim
-  would take entirely is refused; *split* cuts every partner the time is inside and then
+  (what it pushes is the sync lock's); a **sound** carried before 0 loses its head (the lead
+  is reported, below), a **picture** is never trimmed to fit and refuses, as does any clip
+  left under `MIN_EDIT_CLIP` (0.05 s — refused, not stubbed) and one a trim would take
+  entirely; *split* cuts every partner the time is inside and then
   re-forms the group **by side** (`relink_sides`): the left halves and any partner wholly
   before the cut keep the group, the right halves and any partner wholly after it get a new
   one — an unsplit partner lying after the cut used to stay linked to the *left* half and
   desync silently when the right half moved (17 of 1418 fuzz splits); *remove* / *ripple
   delete* take the partners; *cut a source range* takes the same stretch of **timeline**
   out of each overlapping partner (a partner whose head was inside the stretch resumes at
-  the cut, one spanning it is cut in two) and relinks by side; *speed* applies the same
+  the cut, one spanning it is cut in two) and relinks by side; what a partner keeps *after*
+  the stretch is moved to the cut **explicitly** (`closing`), not left to the lock, because
+  once the named clip keeps nothing after the cut the piece has no second group member to
+  follow (V1 `X[0..10]` / A1 `S[9..15]`, cut X 8..10: S's remainder starts at 8, not 9), and
+  a partner's leftover is a *linked* clip for the purpose of making room (`settle_linked`:
+  linked now ∪ linked before, through `origin`), not an unlinked obstacle; *speed* applies the same
   **ratio**; *split-and-remove* cuts partners the time is inside; *roll* rolls each
   partner pair sharing the cut, *slip* the same timeline moment of footage (scaled by the
   speed ratio, stills skipped), *slide* each partner with its own neighbours — all clamped
@@ -960,31 +972,50 @@ no editing logic in the adapter.
   edit each link group is put back in the relationship it had: every member's offset
   moved is measured against its own before (a clip an op *created*, the tail of a cut,
   is measured against the clip it was cut from, `origin`), the group's **authority** is
-  the member the edit **named** (`anchors`, from `edit_named*`), else the member on a
-  named clip's track, else the first member that moved, and the others are *shifted* by
-  the difference — a shift keeps a clip's length, so a ripple's removed or inserted
+  the member the edit **named** (`anchors`, from `edit_named*`; the first in track order
+  when it named several), else the member on a named clip's track, else the first member
+  that moved, and the others — *every* other member, other named ones included — are
+  *shifted* by the difference. Whether named members "moved apart" is judged on the
+  timeline **as the edit left it**, before the per-lane ripple (`left`, taken in `run_edit`
+  when ripple and a link both apply): a trim to the playhead names a picture *and* its
+  sound (clicking selects partners) and cuts both at the same moment, so they agree there
+  and only the ripple, which pulls each track by its own length, sets them apart — which
+  the lock puts right (this used to refuse the edit 90 times in 101, steering to "unlink
+  them first"). `move_clips` with partners at different deltas still moves them apart
+  itself and stays refused. A shift keeps a clip's length, so — a shift keeps a clip's length, so a ripple's removed or inserted
   span reaches every linked track without ever cutting a partner (only a cut range,
   an explicit removal, cuts one). **Only clips in a group follow**; an unlinked clip on
-  a partner's track stays where it was. A follower that lands on **linked** material
-  wins (the clip it ran into is trimmed back, `Track::settle_followers`) and stops at
-  0 by losing its head; it refuses — with a reason naming the lane — for a locked track,
-  an **unlinked** clip in its way, or a linked clip it would cover entirely. `ripple_delete`
+  a partner's track stays where it was. **A picture is never silently cut.** A follower
+  that lands on linked material wins against it only when the clip it ran into is a
+  **sound** (`Track::settle_followers`: trimmed back, at least `MIN_EDIT_CLIP` left) and a
+  sound stops at 0 by losing its head; **every sound so trimmed is reported** — the
+  track's name goes to `Project::edit_notes` (a side channel, since the closures return
+  their own types) and the revision label ends `(trimmed sound on A2)`, live and staged
+  alike. It refuses — with a reason naming the lane — for a locked track, an **unlinked**
+  clip in its way, a **picture** in its way or pushed before 0, or a clip it would leave
+  under 0.05 s. The refusal rate is the price: on the J/L fuzz 13% of the moving edits are
+  blocked (was ~5% when a picture could be cut) — 2.8% of those that name a picture, 23% of
+  those that name a sound, where ripple pulls the *next shot's picture* up onto the one
+  before; the message says so and offers Alt. A J-cut's lead lost at 0 is *trimmed and
+  reported* (the picture is untouched and the lead is a sound's), not refused. `ripple_delete`
   closes the named clip's track by *its* length and leaves partner tracks to the lock (a
   J-cut pair closes by the picture removed); `reorder` carries partners the same way. Two
   *named* members moved apart by hand are left for **the sync guard**
   (`first_sync_break`, last in `run_edit`): it refuses with `out of step … unlink them
   first if they are meant to part` — it no longer steers anyone to `link: false`, which
-  desyncs. Measured on a J/L-cut fuzz (250 seeds × 10 edits, ripple on and off): none
-  of ripple delete / remove / trim / speed / cut range / split-remove is refused for
-  an unstated reason, and the blocks that remain name themselves — an unlinked clip in the
-  way, a linked clip a follower would cover entirely, a partner a trim would take
-  entirely — at 1-4% of edits on the removing ops and ~5% overall (the old per-track
-  ripple refused these 10-65%). **`run_edit`** (`edit_timeline` / `edit_timeline_exact` /
+  desyncs — and names the **lowest pair of tracks** (it used to take whichever group a
+  `HashMap` met first, so the same refusal read differently run to run; the TS mirror picks
+  the same pair). Measured on a J/L-cut fuzz (250 seeds × 10 edits, ripple on and off): none
+  of ripple delete / remove / trim / speed / cut range / split-remove (one or both partners
+  named) is refused for an unstated reason, and the blocks that remain name themselves — an
+  unlinked clip or a picture in the way, a linked clip a follower would cover, a clip left
+  under 0.05 s, a partner a trim would take entirely (the old per-track ripple refused
+  these 10-65%). **`run_edit`** (`edit_timeline` / `edit_timeline_exact` /
   `edit_named*`): scratch snapshot only if ripple or links apply, then `f`, `ripple_lanes`,
   `conform_links`, the guard, and finally **`dissolve_all_orphans`** — a link left with
   one clip (its partner cut, deleted, or on a removed track) is cleared in the same edit.
   `edit_named*` take the named clip ids and a **label computed from the result** (a group
-  edit counts the partners it carried), so unlinked projects never reload the timeline
+  edit counts the partners it carried; `trimmed_suffix` appends the reported sounds), so unlinked projects never reload the timeline
   for a label; `working_has_links` answers "does this timeline link anything" with one
   `instr` over the stored JSON, which is what keeps `trim` from loading every asset on a
   project that links nothing. `LinkIndex` (one pass) replaces `link_partners` per clip in
@@ -1002,13 +1033,17 @@ no editing logic in the adapter.
   `unlinked` / `own sound off|on`. `Project::sample()` seeds its interview sound
   detached-then-*unlinked*.
   **The browser harness is held to all of it by a differential corpus**: `project/linked_corpus.rs`
-  writes ~80 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
-  rule above) with the answer `Project` gave — canonical timeline (no ids: clips an edit
+  writes 93 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
+  rule above — both partners named, a cut's leftover and its lone resumed piece, a picture
+  victim, the 0.05 s floor, a lead lost at 0) with the answer `Project` gave — canonical timeline (no ids: clips an edit
   creates have random ones), revision label, report or the exact refusal — to
   `frontend/src/lib/fixtures/links-corpus.json`; `links-corpus.test.ts` replays each through
   `link-ops.ts` (the pure mirror of `Project`'s ops and of `run_edit`, which `api.ts` now
   composes) and demands the same. A freshness test fails a stale file; regenerate with
   `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- links_corpus`.
+  The fixture is pinned `eol=lf` in `.gitattributes` (like the golden argv files) *and* the
+  freshness test compares with `\r\n` normalized, so a Windows checkout with `autocrlf`
+  cannot fail it for a line ending.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -2315,9 +2350,11 @@ ghosts; `moves` names only the clips dragged (the backend adds the rest; a prope
 linked drags against the mirror). An edge trim's bounds are the clip's narrowed by each sharing partner's
 neighbours (`linkedTrimBounds`; a partner's footage is no limit — it is trimmed less); its ghost
 (`linkedTrimPreview`) is `trim_clip` + `carry_extent_edit` + the per-lane ripple + `conformLinks` (the trimmed
-clip its anchor) + the sync guard on a scratch copy, so a clip ripple pushes shows the partner it drags
-along on its own lane (a J/L-cut offset kept), and a refusal — a locked partner, an unlinked clip in the way,
-a linked clip it would cover — is red with its reason (`api-links.test.ts` holds it equal to the harness commit).
+clip its anchor, the trim itself the timeline "moved apart" is judged on) + the sync guard on a scratch copy, so a
+clip ripple pushes shows the partner it drags along on its own lane (a J/L-cut offset kept), and a refusal — a
+locked partner, an unlinked clip or a picture in the way, a linked clip it would cover, a clip left under 0.05 s —
+is red with its reason; a sound it cuts back to make room is drawn too and named (`trimmed`, an amber hint — the
+revision's label says it afterwards) (`api-links.test.ts` holds it equal to the harness commit).
 Roll / slip / slide run `previewEdit(…, links)` over the `*Linked` edits and `*RangeLinked` clamps:
 partners are `partner`-role ghosts with a `trackId`, the readout says `· with A1`. `gestureReason` adds
 "or hold Alt to edit this clip on its own" to a refusal about linked clips. The clip menu and keymap share
