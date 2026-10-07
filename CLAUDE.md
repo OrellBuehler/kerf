@@ -203,7 +203,11 @@ so the feature is **only** activated through these forwards — which is what ma
   `ffmpeg_frame_time(k) = k * (den / num)`, an ulp off `k / fps`, which drops the first
   frame of a third of the frame-aligned clips at 24 fps and half at 29.97; and a `fade`
   counts frames (`S = round(st * fps)`, `N = round(d * fps)`, `i / N`), it does not
-  interpolate time. Exact rationals are for the frame pick alone. Each is pinned against
+  interpolate time. Exact rationals are for the frame pick alone: `Rational` is the delivery
+  rate as FFmpeg parses the text the graph prints (`av_d2q(x, 1001000)`, ported and checked
+  against `showinfo` on both builds: `29.97` runs on 2997/100, `29.97002997002997` on
+  30000/1001), with `frame_time(k)` for what the graph evaluates and `exact_time(k)` for the
+  pick. Each is pinned against
   rendered pixels by `#[ignore]`d tests in `engine/cli/rendered.rs` (both FFmpegs). Moving
   the extraction changed no argv byte: the golden oracle below is the proof, and the next
   change to these numbers has to go through it. Shared test fixtures (assets, streams,
@@ -214,7 +218,70 @@ so the feature is **only** activated through these forwards — which is what ma
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **Any such expression must be quoted in
+  `keyframe_expr` over clip-local time). **The keyframed zoom is the one stage that changes a
+  picture's size from frame to frame, and almost nothing after it can follow**:
+  `format` negotiation inserts a fixed-size converter (`overlay` takes `yuva420p`
+  only, so a chain ending `format=yuv420p` got one), and `geq` / `rotate` / `eq` /
+  `gblur` / `zscale` read the frame size once, when the graph is configured — a filter
+  after a `scale eval=frame` was pinned to the *first* frame's size for the whole clip, so
+  a scale-only zoom never showed, a keyed opacity ramp and a keyed rotation ran at the
+  first frame's geometry, and the zoom itself sat before `fps` and was read at the
+  *source* frame's time (a 10 fps clip in a 30 fps export zoomed in three-frame steps).
+  So when `Clip::zoom_animated()` (the keyed scale actually moves; position / rotation /
+  opacity-only keys keep their chain, bar the rotation's fill below) `video_clip_chain` puts the zoom **last**: crop,
+  fit, `setsar`, **`fps`**, tone-map, `eq`, effects, `format=yuva420p`, chroma key,
+  mask / opacity `geq`, `rotate`, fades — all at the constant fit size — then the
+  `scale ... eval=frame`, then `format=yuva420p`, then `overlay`, which reads every
+  picture's own `w`/`h` per frame (`(W-w)/2` centres it as it grows) and takes the
+  yuva format natively, so nothing sits between. The zoom is therefore evaluated at the
+  **output** frame's time, on both FFmpegs. Two costs of that order, both bounded: an
+  effect, mask or `rotate` now acts on the picture at fit size and the zoom magnifies the
+  result (a blur grows with the zoom, as in an NLE's effect-then-motion order; a hard mask
+  edge is as soft as the zoom is large), and those filters run on the fit-size picture even
+  when the zoom shrinks it (`geq` is ~150 ms a frame at 1080p, so a keyed-opacity clip zoomed
+  out pays what the fit-size clip would — `KERF_ZOOM_COST=1` times it, `keyed_zoom_cost`).
+  **The scrubbed still follows the same order** (`still_clip_chain(.., zoom_last)`, fed
+  `Clip::zoom_animated()`): it used to zoom first, so its blur was the same softness at every
+  zoom while the export's grew with it (a sigma-6 edge was 26 px wide in the still and 18 in
+  the file at a zoom of 0.5; the two now agree: 18 and 18 there, 56 and 56 at 1.6). Every other clip's still, and every other
+  clip's export, zooms first as ever, so **there is a step where the keys stop being equal**
+  (1.6 to 1.6000001): a blur or a hard mask edge is a zoom's factor softer on one side of it
+  than the other, because "unkeyed or held" and "moving" are two orders and an effect's size is
+  defined by where in the order it sits. It is inherent to leaving every held and unkeyed clip
+  byte-identical; moving the held keyed clips across too would only move the step to the first
+  keyframe. **`rotate=…:fillcolor=none` is not
+  transparent**: `none` means "do not fill", the corners keep whatever the buffer `rotate`
+  reuses held, and a rotation that *moves* leaves every earlier pose behind (the "erratic"
+  rotation; the opaque footprint of a rigidly turning rectangle grew 44k → 64k pixels on
+  6.1 and 9.0 alike), so the keyed rotation fills `black@0`; the static rotation, whose
+  footprint never changes, keeps `none` and its argv. The rendered tests
+  (`engine/cli/keyed_zoom.rs`, `#[ignore]`d, both FFmpegs) measure the picture and the
+  blue box inside it on **every output frame** against `Clip::transform_at` and every
+  eighth against the scrubbed still, for the zoom alone and with position, opacity,
+  rotation, crop, mask, effects, grade, fades, HLG, Cover, a still, speed, reverse, every
+  transition, a range export, every frame rate, a slow source, a shared input and the
+  playback stream (`KERF_ZOOM_KEEP` keeps what they rendered, `KERF_ZOOM_VERBOSE` prints
+  the frames worth a look); `rendered.rs`'s `a_keyframed_zoom_is_read_at_the_output_frame_…`
+  is the mechanism, straight off the filter. The plan (`render_plan`) mirrors the order by
+  refusing: a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`, until
+  `GpuCaps::keyed_zoom`), and a Still plan refuses one with a grade, rotation, fade of opacity,
+  mask or effect in front of it (`Unsupported::ZoomBehind`) — a pure zoom, whose two orders are
+  one chain, is still drawn; `Animated.zooms` is `Clip::zoom_animated()` itself, which holds every
+  key against the first one *in time*. Three more graph bugs of the same shape are fixed beside
+  it. **A tiny scale snapped to full size**: `scale` reads a width or height that evaluates to 0
+  as "unset" and keeps the input's, so 0.0004 of a frame drew at 100%; below `TINY_SCALE` (0.01,
+  on the static zoom, any key of a keyed one, and the still) the sizes are `max(1, ...)`
+  (`zoom_scale`), and above it no graph has changed. **HDR footage aborted on an odd size**:
+  `zscale` (the tone-map, which follows the geometry) refuses a size not divisible by its
+  subsampling, and 4:3 footage Contain-fitted into 9:16 is 405 rows high, so for an HDR clip the
+  Contain fit says `force_divisible_by=2` and a constant zoom is `max(2,2*trunc(x/2))` (a moving
+  zoom runs after the tone-map and needs neither; SDR is byte-identical). **Alpha sources were
+  flattened**: a chain with no alpha plane of its own ended in `format=<pix_fmt>`, which has none,
+  so a transparent PNG sticker or an FFV1 clip cut-out drew as a whole rectangle where the still
+  (no terminal format) kept the cut-out, and a moving zoom (terminal `yuva420p`) flipped it back;
+  `ClipFx.alpha` (`Asset::has_alpha`: the probed pixel format of the first video stream is an
+  alpha one; an unrecorded format is not) ends such a chain in `format=yuva420p`.
+  **Any such expression must be quoted in
   the filter value** — it contains commas, and an unquoted comma is where the
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
   x/y made every animated clip and every animated overlay abort the render with
@@ -713,8 +780,11 @@ no editing logic in the adapter.
   took 6 s, a full file ~17 min) — and `time_chunks` keeps its weights as it merges
   and stops a scan at the first short line instead of rebuilding and cloning every
   chunk per merge (the output is bit-identical; a test sweeps it against the old
-  implementation), so a cue of a thousand one-letter words in word punch is
-  milliseconds, not seconds. Tests time the pathological inputs at < 1 s unoptimized.
+  implementation). The merge is still **quadratic within a cue** (4x the words
+  costs ~16x), so the per-cue and per-import caps are what bound it: the worst
+  import they allow (100,000 one-letter words in 2,000-char cues) places in about
+  half a second unoptimized. Performance tests assert generous wall-clock limits
+  (seconds) sized to catch the algorithm or a lost cap, never a busy machine.
   Encodings: UTF-8 / BOM'd UTF-16 / Latin-1 read as Windows-1252.
   **Parsing is outside the project lock.** `parse_captions` (after `read_caption_file`)
   is a pure static step that yields a `CaptionFile`; `Project::import_captions(&file,
@@ -957,16 +1027,90 @@ no editing logic in the adapter.
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
   a render resizes away from the project frame.
-- `render_plan.rs` — **what one frame is made of**, shared by every renderer.
-  `RenderPlan::at(timeline, assets, opts, t, color)` is the canvas (the same
-  `export_format` the still uses, through `render_geometry`) plus the ordered video
-  layers visible at `t`: asset path, resolved source time (speed / reverse /
+- `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
+  shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
+  canvas (the same `export_format` the still uses, through `render_geometry`) plus the
+  ordered video layers visible at `t`: asset path, resolved source time (speed / reverse /
   clamped), the `Transform` sampled at clip-local time, `Color`, the stream's
-  displayed size / rotation / transfer / pixel format / matrix. It is built on
-  `active_video_clips`, the very function `build_still_args` takes its inputs from,
-  so the FFmpeg still and the GPU compositor cannot disagree about which clip is
-  where in its source (a `cli.rs` test pins the argv against the plan); `still_size`
-  is the preview-size rule both use.
+  displayed size / rotation / transfer / pixel format / matrix. It is a one-shot
+  `Planner` in `PlanMode::Still` and shares `clip_source_time` with `active_video_clips`,
+  the function `build_still_args` takes its inputs from, so the FFmpeg still and the GPU
+  compositor cannot disagree about which clip is where in its source (a `cli.rs` test
+  pins the argv against the plan, and `planner.rs` the whole plan against
+  `active_video_clips` over a busy cut); `still_size` is the preview-size rule both use.
+  **The plan is complete, and a `Planner` prepares a cut once.** `Planner::new` does the
+  per-cut work (`for_render`, `transition_fx`, geometry, the asset facts, each clip's
+  window / fades / motion keys, fonts) and a **per-track clip index** (sorted by start,
+  with a running maximum of window ends): `at(t)` / `at_frame(k)` binary-search to the
+  clips that have started and walk back only while an earlier window could still reach
+  the frame — `O(log n)` plus the clips on screen for a cut whose clips follow one
+  another, but `O(n)` for a track with one very long clip under many short ones (the
+  running maximum never lets the walk stop). `at(t)` is the output frame **on screen** at
+  `t` (`Rational::frame_containing`: the slot `[k/fps, (k+1)/fps)` holds it, a hair of
+  floating point included), not the nearest. A clip with no asset is an error only when a
+  frame asks for it; an `fps` FFmpeg would not parse is an error in either mode. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
+  (a chroma key's colour made safe), `reframe` (`PlanReframe { pose, interp }`: sampled
+  — the `sendcmd` schedule's held pose is for the pass that draws a reframe), `hdr`,
+  `projection`, `animated` (which keyed channels move) and `fx: LayerFx` — **transitions
+  are per-layer, as in the graph**: the clip's `FadeStep`s (evaluated by
+  `LayerFx::strength(tint, frame, fps)`, which counts frames like `fade` does), the slide /
+  push travel at this frame (`MotionKeys::at`) and whether the layer is on its `tail`; a
+  dissolve is two ordinary layers. The plan holds the live `PlanText`s (colour and box
+  made safe, the font file resolved once, bold known to be real or synthetic), and the
+  canvas the delivery's `fps` (a `Rational`: the `color=r=` canvas's parse, the overlay's
+  clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
+  are placed on; the same for every rate with small terms, different for `29.970029`),
+  `pix_fmt`, gif and composite colour policy.
+  **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
+  one sampled transform, fades and transitions left out of the picture, half-open spans,
+  text drawn statically). `Motion` is the export graph at output frame `k`: every
+  expression the graph evaluates (`enable`, keyframes, the overlay position, `drawtext`) is
+  read at `ffmpeg_frame_time(k)`, the slot boundary is `exact_time(k)`; an outgoing clip
+  plays on its tail; a keyframed clip is never padded and always scales again
+  (`LayerGeometry::resolve_with` and its `Placement`, which `resolve` defaults to
+  `Placement::STILL`; a slide's travel joins the position in every branch); text is on
+  `between(t,start,end)`. **A still plan is never drawn inside a transition**: it has no
+  layer for the outgoing clip playing on its tail — the export keeps drawing it until its
+  window closes, which is *after* the alpha ramp (the fade counts frames and rounds) and
+  around an incoming clip that does not cover it (6.9 dB, max 255 at 24 fps, 0.6 s dissolve,
+  frame 62) — so `RenderPlan.tails` records every clip whose tail window is open at the
+  frame (read at `t` and at `ffmpeg_frame_time(frame)`) and `reasons` refuses it
+  (`Unsupported::StillTail`), as it refuses a still inside a fade step or a travel,
+  **whatever the caps**: `fades`, `transitions`, `keyed_*` and `motion` are about Motion
+  plans (the FFmpeg still draws no fades), `mask` / `text` / `effects` / `reframe` / `hdr`
+  hold for both. `frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn`
+  (kerf-gpu parity: dissolve / slide / push / dip, covering and partial incoming clip,
+  frames before / inside / after, both FFmpegs) holds every listed frame to "refused, or
+  the still it draws like is the export's frame and the GPU matches it", so the second half
+  of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge —
+  `PlanTiming` carries the window, source window, speed and direction the source-frame
+  pick (next slice) works from, and `rendered.rs` pins that every drawn clip is planned
+  and the only extras are on the frame the window closes on. `engine/cli/sweep.rs` holds
+  the Motion plan against the **evaluated** graph (a ~50-line evaluator for
+  `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the
+  layer's `origin`, travel and all, a title's position and `between`, five frame rates)
+  — parsing `enable=` back out of the graph would only restate what the builder printed.
+  It checks the *grammar* at the output frame's time, not the graph's clock (that the zoom is
+  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern**: a Motion
+  plan decides the composite's matrix per frame from the layers on it
+  (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
+  over a cut whose bottom layer changes the matrix the export converts with may not be the
+  one a frame's own layers suggest — to be measured before the GPU encodes an export.
+  **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
+  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `mask`,
+  `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
+  size)` is a pure function of the plan's fields** returning `Unsupported` values whose
+  `Display` is the message the plan has always given — nothing is decided while planning,
+  so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
+  cases. A Motion plan is refused as a whole until `caps.motion`, and in Motion a moving
+  keyframed zoom (the export draws it at the output frame's time now, but no compositor has been
+  held to it yet) and
+  keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
+  gif are refused. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
+  `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
+  `reasons(&GpuCaps::A0, ..)`. A still is refused while a fade step is live, a layer
+  travels or a tail window is open — exactly, where A0 refused the whole
+  `[start - d/2, start + d)` of a transition and missed the tail after the ramp.
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,
@@ -1087,6 +1231,29 @@ no editing logic in the adapter.
   dice of its own — so all three files re-blessed but only 428 of the 4000 per-case digests
   moved (`KERF_GOLDEN_CASES` before / after) and the rest are byte-identical. Raising
   `LIBRARY` (a new generated asset) moves the draws of every case; a new twin moves none.
+  The **keyed-zoom fix** (zoom last in the chain, `rotate` filling `black@0` when keyed)
+  re-blessed `export.txt` and `preview.txt` and left `still.txt` alone: 2027 export and 1507
+  preview of 4000 cases moved, exactly the ones whose graph holds a moving zoom (1814 / 1298,
+  the `zoom-keyed-last` families) or a keyed rotation (1748 / 1249, `rotate-keyed-transparent`,
+  213 / 209 of them with no moving zoom: the fill fix is the one change not confined to a
+  zoom), and with the fix compiled out the argv equals the committed digests. `KERF_GOLDEN_FAMILIES=<file>`
+  writes the families each case hit, which is how a moved set is tied to a kind of case; a
+  keyed clip whose scale holds still is byte-identical unless it also rotates (of the 482
+  cases that carry only such clips, the 196 that moved are exactly the ones with a keyed
+  rotation). The second round (the still following the export's order, the tiny-scale clamp,
+  even sizes ahead of a tone-map, alpha sources kept) went in **one change at a time with
+  `KERF_GOLDEN_CASES` between**, each moved set tied to its family: the generator's own
+  inputs first (three no-dice retargets like the padded twins — `-alpha` twins of `still` /
+  `wide` / `interview`, `i % 11 == 5`; a 4:3 HLG twin, `i % 13 == 8`; a 0.0004 scale,
+  `i % 17 == 4` — moved 477 export / 171 still / 310 preview cases, all of them retargeted
+  ones), then the still's zoom (still only: 616, exactly `still-zoom-last`, a chain that ends
+  in the zoom), the clamp (138 / 66 / 116 = `tiny-scale`), the even sizes (export and
+  preview 1733 / 1442 = `hdr-even-fit` or `hdr-even-zoom`; the still has no tone-map after
+  the geometry) and the alpha chain (98 / 68 = `alpha-kept`: a clip chain whose last filter is
+  `format=yuva420p` and not a zoom). Against the digests committed before the round 1920
+  export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
+  `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
+  zoom and of an alpha source's terminal format is the same `format=yuva420p`).
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All
@@ -1217,7 +1384,8 @@ WebGL — so the CI target is a software adapter (Mesa **lavapipe** on Linux, WA
 Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is an
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
-`Compositor::new` and `composite` return `Result`, and a lost device is tracked — every
+`Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
+draws, `GpuCaps::A0` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -1343,7 +1511,8 @@ scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scal
 cover, graded bars), **opacity** (several sources and roles, a graded fade),
 **matrices** (BT.709 and BT.2020 single and layered, mixed tags, an RGB PNG under and over
 tagged clips, translucent layers over tagged ones in both orders), colour (all four knobs,
-contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes,
+contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
+and a position moving; a rotation and an opacity moving over a held zoom),
 10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources
 (shrunk, fitted and **enlarged** — every resize of a non-4:2:0, non-gray format is
 asserted refused, the mild shrinks included, and the same formats at their own size drawn), **busy sources** scaled by non-integer ratios, a clip past the end of its
@@ -1356,7 +1525,8 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer) — each of which FFmpeg still renders. 160
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
+each of which FFmpeg still renders. 160
 renders in the table on FFmpeg 6.1.1 (150 compared and 10 asserted refused on the pinned
 9.0.2 the Windows and macOS bundles ship) plus the plane-level scaler runs, all passing
 strictly. A failing case writes the reference, GPU and diff images to `target/parity/`

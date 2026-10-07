@@ -446,6 +446,17 @@ impl Asset {
         self.streams.iter().find_map(|s| s.hdr())
     }
 
+    /// Whether this asset's picture carries an alpha channel, by the probed pixel format of
+    /// its first video stream. `false` for a format that was never recorded (assets saved
+    /// before the field existed): nothing is assumed transparent that was never seen to be.
+    pub fn has_alpha(&self) -> bool {
+        self.streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(|s| s.pix_fmt.as_deref())
+            .is_some_and(pix_fmt_has_alpha)
+    }
+
     /// This asset as seen through its generated preview proxy: same metadata
     /// (so the composite geometry matches the export) but SDR, because the
     /// proxy was tone-mapped when it was encoded and must not be converted a
@@ -2185,6 +2196,24 @@ impl Clip {
     /// True when the clip carries transform keyframes (i.e. is animated).
     pub fn is_animated(&self) -> bool {
         !self.keyframes.is_empty()
+    }
+
+    /// True when the keyframes move the clip's *scale*, i.e. the picture the
+    /// export hands to `overlay` changes size from one frame to the next.
+    ///
+    /// That is a different thing from [`Clip::is_animated`]: a clip keyed only on
+    /// position, rotation or opacity keeps a constant picture size, which every
+    /// filter in its chain can be built around. A zoom that actually moves cannot
+    /// be: most filters read the frame size once, when the graph is configured, so
+    /// the export restructures the chain around it (`video_clip_chain` puts the
+    /// size-changing `scale` last). The test is on the keyed values, not on the
+    /// expression the engine writes.
+    pub fn zoom_animated(&self) -> bool {
+        // Against the first key *in time*, which is the one the engine's expression holds
+        // before the clip's first moment (the stored order is not guaranteed to be sorted).
+        let keys = self.sorted_keyframes();
+        keys.first()
+            .is_some_and(|first| keys.iter().any(|k| (k.scale - first.scale).abs() > 1e-9))
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -5363,6 +5392,43 @@ mod tests {
     }
 
     #[test]
+    fn a_zoom_is_animated_only_when_the_keyed_scale_moves() {
+        let key = |time: f64, scale: f64, pos_x: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        let mut clip = clip_at(0.0, 4.0);
+        // Nothing keyed, and one key (a held pose): the picture never changes size.
+        assert!(!clip.zoom_animated());
+        clip.keyframes = vec![key(0.0, 1.5, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Position moves, scale does not: animated, but not a zoom.
+        clip.keyframes = vec![key(0.0, 0.5, -0.2), key(2.0, 0.5, 0.2)];
+        assert!(clip.is_animated() && !clip.zoom_animated());
+        // Float noise is not a zoom (it cannot change the size by a pixel).
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1e-12, 0.0)];
+        assert!(!clip.zoom_animated());
+        // Any key off the first one is, wherever it sits and whatever the order.
+        clip.keyframes = vec![key(0.0, 0.5, 0.0), key(1.0, 0.5, 0.0), key(2.0, 0.75, 0.0)];
+        assert!(clip.zoom_animated());
+        clip.keyframes = vec![key(2.0, 0.75, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(clip.zoom_animated());
+        // Held against the first key in *time*: a stored order that puts a later key first
+        // gives the same answer, at the edge of the tolerance too.
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1.6e-9, 0.0)];
+        assert!(
+            clip.zoom_animated(),
+            "1.6e-9 from the first key in time, though 0.8e-9 from the stored first"
+        );
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(!clip.zoom_animated());
+    }
+
+    #[test]
     fn beat_grid_maps_source_beats_onto_the_timeline() {
         // A music clip cut from 2s into the source and placed at 10s: a beat at
         // source 3.0 is heard at 11.0, and beats outside the window never sound.
@@ -6805,17 +6871,24 @@ mod tests {
 
     #[test]
     fn a_thousand_word_cue_in_word_punch_places_quickly() {
-        // 400 cues of a thousand one-letter words, each over a few seconds: every
-        // word is a flicker and has to be merged. The old timer rebuilt (and
-        // cloned) every chunk per merge — about three seconds per hundred such
-        // cues, so about twelve here, against well under two now. The limit is
-        // wide because tests run in parallel on a busy machine: it has to catch
-        // the algorithm, never the load.
+        // The worst import the caps allow: `MAX_CAPTION_WORDS` one-letter words in
+        // cues as long as `MAX_CUE_CHARS` lets them be, each over a few seconds,
+        // so every word is a flicker that has to be merged. Merging within a cue
+        // is still quadratic in its word count (4x the words costs ~16x), which is
+        // why a cue and an import are capped: the worst case is bounded, not the
+        // algorithm. It runs in well under half a second unoptimized; the limit is
+        // ~20x that because the suite runs in parallel on a busy machine — it has
+        // to catch a lost cap or a much slower merge, never the load. (The old
+        // timer rebuilt and cloned every chunk per merge: about 3 s for this.)
+        use crate::captions_import::{MAX_CAPTION_WORDS, MAX_CUE_CHARS};
+        let words_per_cue = MAX_CUE_CHARS.div_ceil(2);
+        let cue_count = MAX_CAPTION_WORDS / words_per_cue;
         let asset = Uuid::new_v4();
-        let timeline = cut_of(asset, 4_000.0);
-        let thousand = vec!["a"; 1000].join(" ");
-        let cues: Vec<TranscriptSegment> = (0..400)
-            .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &thousand))
+        let timeline = cut_of(asset, cue_count as f64 * 10.0);
+        let text = vec!["a"; words_per_cue].join(" ");
+        assert!(text.chars().count() <= MAX_CUE_CHARS);
+        let cues: Vec<TranscriptSegment> = (0..cue_count)
+            .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &text))
             .collect();
         let started = std::time::Instant::now();
         let p = timeline.place_cues(
@@ -6825,11 +6898,11 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_secs(8), "placing took {took:?}");
-        accounted(&p, 400);
-        assert_eq!(p.placed, 400);
+        accounted(&p, cue_count);
+        assert_eq!(p.placed, cue_count);
         // Nothing was lost to the merging: every word is still there.
         let words: usize = p.overlays.iter().map(|o| o.text.split_whitespace().count()).sum();
-        assert_eq!(words, 400 * 1000);
+        assert_eq!(words, cue_count * words_per_cue);
     }
 
     #[test]

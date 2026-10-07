@@ -12,6 +12,8 @@ pub mod error;
 pub mod fonts;
 pub mod layer_geometry;
 pub mod model;
+pub mod plan_caps;
+pub mod planner;
 pub mod platform;
 pub mod project;
 pub mod render_plan;
@@ -31,6 +33,7 @@ pub use captions_import::{
     CaptionImportRequest, ImportSummary, ImportedCue, ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
     MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
 };
+pub use clip_timing::{FadeEdge, FadeStep, FadeTint, MotionKeys, Rational};
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
@@ -54,9 +57,14 @@ pub use model::{
     TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition,
     TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS, MIN_EDIT_CLIP,
 };
+pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+pub use planner::{PlanRequest, Planner};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, VOICEOVER_TRACK};
-pub use render_plan::{CompositeColorPolicy, PlanCanvas, PlanLayer, PlanStream, RenderPlan, YuvMatrix, MAX_SHRINK};
+pub use render_plan::{
+    Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanStream, PlanText, PlanTiming,
+    ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
+};

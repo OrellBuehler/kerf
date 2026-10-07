@@ -5,25 +5,35 @@
 //! (`engine::cli::build_still_args`, and the export / playback graphs) and the
 //! wgpu compositor in `kerf-gpu` — and they must agree on *which* clips are on
 //! screen, *where in the source* each one is, and *what pose* it holds. That
-//! agreement is this module: pure, unit-tested, and consumed by both, so
-//! neither re-derives it. `build_still_args` takes its active-clip list from
-//! [`active_video_clips`], the same function [`RenderPlan::at`] is built on.
+//! agreement is this module and [`crate::planner`]: pure, unit-tested, and consumed
+//! by both, so neither re-derives it. `build_still_args` takes its active-clip list
+//! from [`active_video_clips`], the same arithmetic [`Planner`] indexes.
 //!
-//! The plan is deliberately a *description*, not a renderer. It carries only
-//! what a compositor needs for the features the GPU path renders today (layers
-//! in track order, resolved source time, sampled [`Transform`], [`Color`], the
-//! delivery canvas and fit), and [`RenderPlan::gpu_supported`] says "no" — with
-//! the reasons — for anything it does not carry, so that frame goes through
-//! FFmpeg instead of being drawn wrong.
+//! The plan is a *description*, not a renderer, and it is complete: a layer carries
+//! its sampled transform and colour, its mask, effects, reframe camera, HDR flag and
+//! the per-frame state of its transitions ([`LayerFx`]), and the plan carries the
+//! live text. What a compositor does *not* draw is not decided here as stored text:
+//! [`RenderPlan::reasons`] is a pure function of these fields and a [`GpuCaps`], so
+//! that frame goes through FFmpeg instead of being drawn wrong.
+//!
+//! **Two modes.** [`PlanMode::Still`] is the contract the GPU path started with:
+//! what `build_still_args` draws at a time `t` (the transform sampled once, fades and
+//! transitions left out, text drawn statically). [`PlanMode::Motion`] is the export
+//! graph at output frame `k`: see [`Planner`].
 
 use uuid::Uuid;
 
-use crate::engine::{render_geometry, ExportOptions, Fit};
-use crate::error::{Error, Result};
-use crate::layer_geometry::LayerGeometry;
+use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational};
+use crate::engine::Fit;
+use crate::error::Result;
+use crate::layer_geometry::{LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, PixLayout, StreamInfo, StreamKind, Subsampling, Timeline, Transform,
+    pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection, ResolvedReframe, StreamInfo,
+    StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
+use crate::plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+use crate::planner::{PlanRequest, Planner};
+use crate::ExportOptions;
 
 /// A video clip visible at a timeline time, paired with where in its source the
 /// frame comes from.
@@ -35,8 +45,6 @@ pub(crate) struct ActiveClip<'a> {
     pub source_time: f64,
     /// Seconds from the clip's start — the time keyframes are sampled at.
     pub local_time: f64,
-    /// Index of the track in the timeline the clip sits on (bottom first).
-    pub track: usize,
 }
 
 impl ActiveClip<'_> {
@@ -45,6 +53,20 @@ impl ActiveClip<'_> {
     pub(crate) fn transform(&self) -> Transform {
         self.clip.transform_at(self.local_time)
     }
+}
+
+/// The source time a clip shows at timeline time `t`: honors speed and reverse and
+/// is clamped to the asset (`asset_duration`), because a seek past the end would
+/// decode nothing. It is not limited to the clip's own `source_in..source_out`: a
+/// clip playing on under a transition borrows the handle beyond it.
+pub(crate) fn clip_source_time(clip: &Clip, asset_duration: f64, t: f64) -> f64 {
+    let off = (t - clip.timeline_start) * clip.speed_mag();
+    let raw = if clip.is_reversed() {
+        clip.source_out - off
+    } else {
+        clip.source_in + off
+    };
+    raw.clamp(0.0, asset_duration.max(0.0))
 }
 
 /// The video clips whose timeline span contains `t`, in composite order: tracks
@@ -58,7 +80,7 @@ impl ActiveClip<'_> {
 pub(crate) fn active_video_clips<'a>(timeline: &'a Timeline, assets: &[Asset], t: f64) -> Vec<ActiveClip<'a>> {
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
     let mut active = Vec::new();
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
+    for track in &timeline.tracks {
         if track.kind != StreamKind::Video {
             continue;
         }
@@ -69,18 +91,11 @@ pub(crate) fn active_video_clips<'a>(timeline: &'a Timeline, assets: &[Asset], t
             if t < clip.timeline_start || t >= clip.timeline_end() {
                 continue;
             }
-            let off = (t - clip.timeline_start) * clip.speed_mag();
-            let raw = if clip.is_reversed() {
-                clip.source_out - off
-            } else {
-                clip.source_in + off
-            };
             let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
             active.push(ActiveClip {
                 clip,
-                source_time: raw.clamp(0.0, dur.max(0.0)),
+                source_time: clip_source_time(clip, dur, t),
                 local_time: (t - clip.timeline_start).max(0.0),
-                track: track_index,
             });
         }
     }
@@ -159,6 +174,20 @@ pub enum CompositeColorPolicy {
 /// frame goes through FFmpeg.
 pub const MAX_SHRINK: u32 = 40;
 
+/// Which graph a plan describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanMode {
+    /// What `build_still_args` draws at a time `t`: the transform sampled at that
+    /// instant, no fades or transitions in the picture, text drawn statically. The
+    /// contract the GPU path started with, and what every `RenderPlan::at` returns.
+    Still,
+    /// What the export graph draws at output frame `k` (`Planner::at_frame`): the
+    /// graph's own time for every expression it evaluates, outgoing clips playing on
+    /// their tails, fades and transitions timed from the clip, keyframed clips
+    /// placed by the overlay rather than padded, text on `between(t,start,end)`.
+    Motion,
+}
+
 /// The frame a plan renders into.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanCanvas {
@@ -180,6 +209,21 @@ pub struct PlanCanvas {
     /// saturated colour. Moving this to BT.709 is a decision for the day the GPU
     /// path *replaces* the FFmpeg preview.
     pub matrix: YuvMatrix,
+    /// The composite colour policy the matrix was decided under — kept so
+    /// [`RenderPlan::reasons`] can say why a stack is refused without re-planning.
+    pub policy: CompositeColorPolicy,
+    /// The output rate as the `color=r=` canvas parses the graph's text to: the clock the
+    /// overlay (and so every `t` the graph evaluates) runs on.
+    pub fps: Rational,
+    /// The rate as the `fps=` filter of each clip parses it — the grid its frames are placed
+    /// on, which the source-frame pick works from. The same as [`PlanCanvas::fps`] for every
+    /// rate with small terms (see [`Rational`]).
+    pub pick_fps: Rational,
+    /// The delivery's terminal pixel format. A [`PlanMode::Motion`] frame is only
+    /// drawn for 8-bit 4:2:0 (`yuv420p`); a preview still is always that.
+    pub pix_fmt: String,
+    /// The delivery is a gif (palettegen / paletteuse on the composite).
+    pub gif: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -256,7 +300,7 @@ impl PlanStream {
         self.layout() == Some(PixLayout::Rgb)
     }
 
-    fn of(s: &StreamInfo) -> Option<Self> {
+    pub(crate) fn of(s: &StreamInfo) -> Option<Self> {
         Some(Self {
             width: s.width.filter(|w| *w > 0)?,
             height: s.height.filter(|h| *h > 0)?,
@@ -271,6 +315,140 @@ impl PlanStream {
     }
 }
 
+/// Which of a keyframed clip's channels move. The export graph builds a keyframed
+/// clip differently from a static one whatever its pose at one instant ([`Placement`]),
+/// and what it needs a renderer to refuse depends on which channels the keys drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Animated {
+    /// Some key turns the picture (so the graph has a `rotate`, in a `hypot(iw,ih)` box).
+    pub rotates: bool,
+    /// Some key is below full opacity (so the graph has a `geq` alpha).
+    pub opacity: bool,
+    /// The keys' scales differ ([`Clip::zoom_animated`]): the zoom moves. The export (and
+    /// the playback stream) then runs the clip's `scale eval=frame` **last**, after `fps`
+    /// and after every effect, mask, `rotate` and fade, which act on the picture at its fit
+    /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
+    /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
+    /// rest" as it does a constant one, so a moving zoom in an export frame is refused until
+    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it.
+    pub zooms: bool,
+}
+
+/// What a clip's transitions and fades do to one layer at this frame, **per layer
+/// and as the graph has it**: there is no transition node. A dissolve is two
+/// ordinary layers (the outgoing clip playing on its [`tail`](Self::tail), the
+/// incoming one on an alpha ramp), a dip is a fade out and a fade in, a slide or push
+/// is a [`motion`](Self::motion) offset on one or both.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LayerFx {
+    /// Every fade of the clip's picture, timed on the timeline: its own fades, the
+    /// dips, a dissolve's ramp ([`FadeTint::Alpha`]). Steps, not a number — how much of
+    /// the picture is left is [`LayerFx::strength`], which counts frames the way
+    /// FFmpeg's `fade` does.
+    pub fades: Vec<FadeStep>,
+    /// The travel a slide or push gives the layer at this frame, in frame widths and
+    /// heights (exact: the overlay truncates it to the 4:2:0 pixel grid, see
+    /// [`MotionKeys::at`](crate::clip_timing::MotionKeys::at)). Added to the layer's
+    /// own position.
+    pub motion: (f64, f64),
+    /// The frame is past the clip's own end: it is playing on, from source it
+    /// borrowed from its handle, under the clip that replaces it.
+    pub tail: bool,
+}
+
+impl LayerFx {
+    /// What the steps of one tint leave of the picture at output frame `frame`:
+    /// `1` untouched, `0` gone (a fade-in rises, a fade-out falls). The product of
+    /// the tint's steps, as the chain applies them one after another.
+    pub fn strength(&self, tint: FadeTint, frame: i64, fps: Rational) -> f64 {
+        self.fades
+            .iter()
+            .filter(|s| s.tint == tint)
+            .map(|s| s.progress_at_frame(frame, fps.num, fps.den))
+            .product()
+    }
+
+    /// The first fade still changing the picture at `frame`: its edge, and whether
+    /// it is a dissolve's alpha ramp.
+    pub fn in_progress(&self, frame: i64, fps: Rational) -> Option<(FadeEdge, bool)> {
+        self.fades
+            .iter()
+            .find(|s| s.progress_at_frame(frame, fps.num, fps.den) < 1.0)
+            .map(|s| (s.edge, s.tint == FadeTint::Alpha))
+    }
+
+    /// A slide or push is moving the layer.
+    pub fn travels(&self) -> bool {
+        self.motion != (0.0, 0.0)
+    }
+}
+
+/// What the source-frame pick needs of a layer, which is not what its decoded
+/// `source_time` says: FFmpeg's `fps` filter picks the frame for output frame `k`
+/// by the rule `the last frame with pts < ws + s * ((k + 1/2) / fps - start)`
+/// (mirrored over the window for reverse), so the pick wants the window, the speed
+/// and the start — and the plan's `frame` and `canvas.fps`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanTiming {
+    /// The overlay's `enable` window on the timeline, tail included. A [`PlanMode::Motion`]
+    /// plan holds every layer whose window contains the frame time (end included, as
+    /// `between` has it): **candidates**. An equal-rate source has no frame at the
+    /// window's end and the export draws nothing there; which layers are really drawn
+    /// is the pick's to say.
+    pub window: (f64, f64),
+    /// The source window the chain trims (`clip_source_window`, tail included).
+    pub source_window: (f64, f64),
+    /// Speed magnitude.
+    pub speed: f64,
+    pub reversed: bool,
+}
+
+/// The interpolation `v360` resamples with: the export's, or the still's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReframeInterp {
+    /// The still and the preview (`line`, for speed).
+    Line,
+    /// The export (`cubic`, sharper edges on a wide reframe).
+    Cubic,
+}
+
+/// A layer's 360 reframe camera at this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanReframe {
+    /// The camera sampled on its curve at the frame's time. The export graph does not
+    /// hold that curve: `v360` keeps the pose its `sendcmd` schedule last set (a 0.05
+    /// degree gate, values rounded to four decimals, an unmoving channel at its static
+    /// value), which is what a pass that draws a reframe will have to replay.
+    pub pose: ResolvedReframe,
+    pub interp: ReframeInterp,
+}
+
+/// One text overlay live at this frame, ready to draw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanText {
+    pub id: Uuid,
+    pub text: String,
+    /// Font height as a fraction of the frame height.
+    pub size: f64,
+    /// The text's centre, in frame fractions, sampled at this frame.
+    pub pos: (f64, f64),
+    /// Opacity, 0..1 (`TextOverlay::sample`).
+    pub alpha: f64,
+    /// A valid colour (else the safe default), as FFmpeg names it.
+    pub color: String,
+    /// The box behind the text; `None` when there is none or its colour is invalid.
+    pub bg: Option<String>,
+    /// The font file `drawtext` would use, resolved on this machine. `None` is FFmpeg's
+    /// default font, which no other renderer can reproduce: never drawn.
+    pub font_file: Option<std::path::PathBuf>,
+    /// No bold face was found for a bold request, and `drawtext` thickens the glyphs
+    /// with a same-colour border instead.
+    pub synthetic_bold: bool,
+}
+
+/// A layer whose source has no picture of a known size: not drawable under any caps.
+pub type Pictureless = LayerRef;
+
 /// One video layer of a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanLayer {
@@ -283,23 +461,55 @@ pub struct PlanLayer {
     pub is_image: bool,
     /// The source time to decode (speed / reverse honored, clamped to the asset).
     pub source_time: f64,
-    /// Seconds from the clip's start; keyframes were sampled here.
+    /// Seconds from the clip's start; keyframes were sampled here. A [`PlanMode::Motion`]
+    /// plan samples at the graph's own frame time, which is not `frame / fps`.
     pub clip_time: f64,
     pub stream: PlanStream,
     /// The transform **sampled** at this instant.
     pub transform: Transform,
     pub color: Color,
+    /// The asset's name, for messages.
+    pub name: String,
+    /// The asset's spherical projection, if it is 360 footage.
+    pub projection: Option<Projection>,
+    /// The footage is HDR and is tone-mapped to SDR, **before** the geometry in a
+    /// still and **after** the fit `scale` (and `fps`) in the export graph.
+    pub hdr: Option<Hdr>,
+    /// The clip's effects in order; a chroma key's colour is already a safe one.
+    pub effects: Vec<VideoEffect>,
+    /// The clip's mask, normalized; fractions of the *layer* frame.
+    pub mask: Option<Mask>,
+    pub reframe: Option<PlanReframe>,
+    pub fx: LayerFx,
+    /// `Some` for a keyframed clip.
+    pub animated: Option<Animated>,
+    pub timing: PlanTiming,
 }
 
 /// The ordered video layers visible at one timeline time, on their canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
-    /// The (non-negative) timeline time the plan is for.
+    /// The (non-negative) timeline time the plan is for. For [`PlanMode::Motion`], the
+    /// exact start of the output frame's slot (`k * den / num`).
     pub time: f64,
+    pub mode: PlanMode,
+    /// The output frame: exact for [`PlanMode::Motion`], the frame nearest `time` for
+    /// a still (which is what fades are counted in).
+    pub frame: i64,
     pub canvas: PlanCanvas,
     /// Bottom layer first — the order they are composited in.
     pub layers: Vec<PlanLayer>,
-    unsupported: Vec<String>,
+    /// The text overlays live at this frame, in the order they are drawn (on top).
+    pub overlays: Vec<PlanText>,
+    /// Clips that are on screen but whose source has no picture to draw. `index` is the
+    /// number of drawn layers below it: the slot in `layers` it would have taken.
+    pub pictureless: Vec<Pictureless>,
+    /// **Still plans only**: the clips whose tail window is open at this frame. The export keeps
+    /// drawing a clip past its end under the one that replaces it (a dissolve, a slide, a
+    /// push), around an incoming clip that does not cover it; a still plan has no layer for
+    /// that, and is refused ([`Unsupported::StillTail`]) whatever the caps. A Motion plan holds
+    /// them as layers (`fx.tail`). `index` as for `pictureless`.
+    pub tails: Vec<LayerRef>,
 }
 
 /// The matrix the composite is converted with under `policy`, and the reasons a
@@ -314,9 +524,10 @@ pub struct RenderPlan {
 /// matrix the neighbours negotiated, and the result depends on the order).
 /// [`CompositeColorPolicy::Unknown`] draws only what those two agree on — a stack
 /// that is BT.601 throughout — and refuses a stack of any other matrix.
-fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsupported: &mut Vec<String>) -> YuvMatrix {
+pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy) -> (YuvMatrix, Vec<Unsupported>) {
+    let mut unsupported = Vec::new();
     if policy == CompositeColorPolicy::FixedBt601 {
-        return YuvMatrix::Bt601;
+        return (YuvMatrix::Bt601, unsupported);
     }
     let mut shared: Option<YuvMatrix> = None;
     let mut mixed = false;
@@ -327,9 +538,7 @@ fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsuppor
             continue;
         }
         match layer.stream.matrix() {
-            None => unsupported.push(format!(
-                "layer {n}: its colour matrix is unknown, and FFmpeg's composite takes its matrix from the layers' tags"
-            )),
+            None => unsupported.push(Unsupported::MatrixUnknown(n)),
             Some(m) => match shared {
                 None => shared = Some(m),
                 Some(first) if first != m => mixed = true,
@@ -338,31 +547,27 @@ fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolicy, unsuppor
         }
     }
     if mixed {
-        unsupported.push(
-            "layers tagged with different YCbCr matrices: FFmpeg converts them into the bottom layer's, which is not reproduced"
-                .to_string(),
-        );
+        unsupported.push(Unsupported::MixedMatrices);
     }
     let matrix = shared.unwrap_or(YuvMatrix::Bt601);
     if policy == CompositeColorPolicy::Unknown && matrix != YuvMatrix::Bt601 {
-        unsupported.push(format!(
-            "a {matrix:?} stack, and this FFmpeg's composite colour policy could not be measured (FFmpeg 6 and 9 convert BT.709 and BT.2020 footage differently)"
-        ));
+        unsupported.push(Unsupported::UnmeasuredPolicy(matrix));
     }
     if rgb && matrix != YuvMatrix::Bt601 {
-        unsupported.push(format!(
-            "an RGB picture in a {matrix:?} stack: FFmpeg converts it with the stack's matrix, which is not reproduced"
-        ));
+        unsupported.push(Unsupported::RgbInStack(matrix));
     }
-    matrix
+    (matrix, unsupported)
 }
 
 impl RenderPlan {
     /// The plan for timeline time `t`: what `timeline_frame` / `export_still`
-    /// would draw. Like them it renders the cut as [`Timeline::for_render`]
-    /// sees it, so a muted or solo-shadowed track is as absent here as there.
+    /// would draw ([`PlanMode::Still`]). Like them it renders the cut as
+    /// [`Timeline::for_render`] sees it, so a muted or solo-shadowed track is as
+    /// absent here as there.
     ///
-    /// Errors the way the still does: a clip whose asset is not in `assets`.
+    /// Errors the way the still does: a clip whose asset is not in `assets`. It
+    /// builds a [`Planner`] for the one call; a caller that plans many frames of the
+    /// same cut holds one.
     pub fn at(
         timeline: &Timeline,
         assets: &[Asset],
@@ -370,175 +575,30 @@ impl RenderPlan {
         t: f64,
         color: CompositeColorPolicy,
     ) -> Result<RenderPlan> {
-        let rendered = timeline.for_render();
-        let geom = render_geometry(&rendered, assets, opts);
-        let t = t.max(0.0);
-        let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
-
-        let mut unsupported: Vec<String> = Vec::new();
-        let mut layers = Vec::new();
-        for (n, ac) in active_video_clips(&rendered, assets, t).iter().enumerate() {
-            let clip = ac.clip;
-            let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-            let label = format!("layer {n} ({})", asset.name);
-            let Some(stream) = asset
-                .streams
-                .iter()
-                .find(|s| s.kind == StreamKind::Video)
-                .and_then(PlanStream::of)
-            else {
-                unsupported.push(format!("{label}: the source has no video picture of a known size"));
-                continue;
-            };
-            if asset.hdr().is_some() {
-                unsupported.push(format!("{label}: HDR footage needs tone mapping"));
-            }
-            // Alpha is composited by FFmpeg (a ProRes 4444 title, a VP9 or FFV1
-            // clip with transparency, a GIF); the compositor draws opaque 4:2:0
-            // and would flatten it onto black without a word. The probed pixel
-            // format must be on the allow-list of known-opaque ones — a name a
-            // deny-list never thought of (`ayuv`, `vuya`, the `rgb32` aliases) is
-            // refused too. `None` (never recorded) is the decoder's to find out.
-            if let Some(fmt) = stream.pix_fmt.as_deref() {
-                if crate::model::pix_fmt_has_alpha(fmt) {
-                    unsupported.push(format!("{label}: the picture has an alpha channel ({fmt})"));
-                } else if pix_fmt_layout(fmt).is_none() {
-                    unsupported.push(format!(
-                        "{label}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)"
-                    ));
-                }
-            }
-            // Below full opacity FFmpeg takes the layer through RGB and back (see
-            // `kerf-gpu`'s `roundtrip`), out of YCbCr with the picture's own matrix,
-            // which has to be known for the arithmetic to be reproduced.
-            let opacity = ac.transform().opacity;
-            if opacity < 1.0 && stream.matrix().is_none() {
-                unsupported.push(format!(
-                    "{label}: opacity below 1 on a picture whose colour matrix is {}",
-                    match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
-                        (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
-                        (Some(_), Some(tag)) => format!("`{tag}`, which the compositor has no coefficients for"),
-                        (Some(_), None) => "unknown".to_string(),
-                    }
-                ));
-            }
-            // Colour correction (`eq`) runs on the picture as it is in the graph. FFmpeg 9
-            // hands it a full-range picture's raw values and converts the range later;
-            // the compositor converts to limited range first, as the decode does. The
-            // results differ (34 to 42 dB on a graded `yuvj420p` clip, in every knob),
-            // so a full-range picture is not graded on the GPU — and a picture whose
-            // format was never recorded is not known not to be full-range.
-            if !clip.color.is_identity() && stream.maybe_full_range() {
-                unsupported.push(format!(
-                    "{label}: colour correction on {}",
-                    match stream.pix_fmt.as_deref() {
-                        Some(f) => format!("a full-range picture ({f}), which FFmpeg grades before converting its range"),
-                        None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
-                    }
-                ));
-            }
-            if !clip.effects.is_empty() {
-                unsupported.push(format!("{label}: video effects"));
-            }
-            if clip.mask.is_some() {
-                unsupported.push(format!("{label}: mask"));
-            }
-            if clip.reframe.is_some() || asset.projection().is_some() {
-                unsupported.push(format!("{label}: 360 reframe"));
-            }
-            // The still ignores fades and transitions (it shows the frame each
-            // visible clip contributes); the export and the streamed playback do
-            // not. A frame inside one is a frame the GPU cannot yet draw like
-            // either, so it is FFmpeg's.
-            if clip.fade_in > 0.0 && ac.local_time < clip.fade_in {
-                unsupported.push(format!("{label}: inside its fade-in"));
-            }
-            if clip.fade_out > 0.0 && t >= clip.timeline_end() - clip.fade_out {
-                unsupported.push(format!("{label}: inside its fade-out"));
-            }
-            layers.push(PlanLayer {
-                clip_id: clip.id,
-                asset_id: clip.asset_id,
-                track: ac.track,
-                path: asset.path.clone(),
-                is_image: asset.is_image(),
-                source_time: ac.source_time,
-                clip_time: ac.local_time,
-                stream,
-                transform: ac.transform(),
-                color: clip.color,
-            });
-        }
-
-        // A transition changes what the neighbours of the cut look like for its
-        // whole length, including the clip that is *not* the one starting.
-        for track in rendered.tracks.iter().filter(|tr| tr.kind == StreamKind::Video) {
-            for clip in &track.clips {
-                let Some(tr) = clip.transition_in else { continue };
-                let d = tr.duration.max(0.0);
-                if d > 0.0 && t >= clip.timeline_start - d / 2.0 && t < clip.timeline_start + d {
-                    unsupported.push(format!("transition ({}) in progress", tr.kind.as_str()));
-                }
-            }
-        }
-        if rendered.overlays.iter().any(|o| t >= o.start && t < o.end) {
-            unsupported.push("a text overlay is live".to_string());
-        }
-        // The compositor implements swscale's default (bicubic) only.
-        if let Some(s) = geom.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
-            unsupported.push(format!("scaler '{s}'"));
-        }
-
-        let matrix = composite_matrix(&layers, color, &mut unsupported);
-        // FFmpeg 9 negotiates the *range* along the overlay chain as it does the matrix:
-        // the bottom layer's decides, and a graded layer above a full-range picture is
-        // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
-        // the composite's colour is negotiated, or not known, grading in a stack that
-        // holds a full-range picture is FFmpeg's.
-        if color != CompositeColorPolicy::FixedBt601 && layers.iter().any(|l| l.stream.maybe_full_range()) {
-            for (n, layer) in layers.iter().enumerate() {
-                if !layer.color.is_identity() && !layer.stream.maybe_full_range() {
-                    unsupported.push(format!(
-                        "layer {n}: colour correction in a stack with a full-range picture, whose range FFmpeg negotiates across the layers"
-                    ));
-                }
-            }
-        }
-
-        Ok(RenderPlan {
-            time: t,
-            canvas: PlanCanvas {
-                width: geom.width,
-                height: geom.height,
-                fit: geom.fit,
-                scaler: geom.scaler,
-                matrix,
+        Planner::new(
+            timeline,
+            assets,
+            opts,
+            PlanRequest {
+                mode: PlanMode::Still,
+                color,
             },
-            layers,
-            unsupported,
-        })
+        )?
+        .at(t)
     }
 
-    /// Whether the compositor draws this frame exactly, **judged without the render
-    /// size**. `false` means "render it through FFmpeg"; [`RenderPlan::unsupported_reasons`]
-    /// says why. A `true` is necessary, not sufficient: what depends on the size the
-    /// frame is rendered at (a resize of a picture whose chroma is not 4:2:0, a
-    /// translucent layer of odd size, a crop that leaves nothing) is
-    /// [`RenderPlan::gpu_supported_at`]'s.
-    pub fn gpu_supported(&self) -> bool {
-        self.unsupported.is_empty()
-    }
-
-    /// Why the frame cannot be drawn at `size` ([`RenderPlan::size`]): the size-free
-    /// reasons of [`RenderPlan::unsupported_reasons`] plus those the geometry at this
-    /// size adds. Pure; ask it before decoding anything.
-    pub fn unsupported_reasons_at(&self, size: (u32, u32)) -> Vec<String> {
-        let mut reasons = self.unsupported.clone();
+    /// Why a compositor with `caps` cannot draw this frame at `size`
+    /// ([`RenderPlan::size`]) exactly — empty when it can. A **pure function of the
+    /// plan's fields**: nothing was decided while planning, so the same plan answers
+    /// for every [`GpuCaps`], and a refusal is a value ([`Unsupported`]) whose
+    /// `Display` is the message. Ask it before decoding anything.
+    pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
+        let mut reasons = self.size_free_reasons(caps);
         for (n, layer) in self.layers.iter().enumerate() {
             let geom = match self.layer_geometry(layer, size) {
                 Ok(g) => g,
                 Err(e) => {
-                    reasons.push(format!("layer {n}: {e}"));
+                    reasons.push(Unsupported::Geometry(n, e.to_string()));
                     continue;
                 }
             };
@@ -557,25 +617,172 @@ impl RenderPlan {
                 .iter()
                 .find(|s| s.src.w > MAX_SHRINK * s.scaled.0 || s.src.h > MAX_SHRINK * s.scaled.1)
             {
-                reasons.push(format!(
-                    "layer {n}: shrinks a {}x{} picture to {}x{}, steeper than the {MAX_SHRINK}:1 the scaler comparison covers",
-                    stage.src.w, stage.src.h, stage.scaled.0, stage.scaled.1
-                ));
+                reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
             }
             let resizing = geom.stages.iter().find(|s| s.scaled != (s.src.w, s.src.h));
             if let Some(stage) = resizing.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
             {
-                reasons.push(format!(
-                    "layer {n}: scales a {}x{} picture to {}x{}, and its format ({}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales in its own format",
-                    stage.src.w,
-                    stage.src.h,
-                    stage.scaled.0,
-                    stage.scaled.1,
-                    layer.stream.pix_fmt.as_deref().unwrap_or("not recorded")
+                reasons.push(Unsupported::FormatResize(
+                    n,
+                    (stage.src.w, stage.src.h),
+                    stage.scaled,
+                    layer.stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string()),
                 ));
             }
         }
         reasons
+    }
+
+    /// The reasons that do not depend on the render size: what the plan holds,
+    /// judged against `caps`. [`RenderPlan::reasons`] adds the geometry's.
+    pub fn size_free_reasons(&self, caps: &GpuCaps) -> Vec<Unsupported> {
+        let mut out: Vec<Unsupported> = Vec::new();
+        let (frame, fps) = (self.frame, self.canvas.fps);
+        if self.mode == PlanMode::Motion {
+            if !caps.motion {
+                out.push(Unsupported::Motion);
+            }
+            if self.canvas.pix_fmt != "yuv420p" {
+                out.push(Unsupported::Delivery(self.canvas.pix_fmt.clone()));
+            }
+            if self.canvas.gif {
+                out.push(Unsupported::Gif);
+            }
+        }
+        out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));
+        out.extend(self.tails.iter().cloned().map(Unsupported::StillTail));
+        for (n, layer) in self.layers.iter().enumerate() {
+            let at = || LayerRef {
+                index: n,
+                name: layer.name.clone(),
+            };
+            let stream = &layer.stream;
+            if layer.hdr.is_some() && !caps.hdr {
+                out.push(Unsupported::Hdr(at()));
+            }
+            // Alpha is composited by FFmpeg (a ProRes 4444 title, a VP9 or FFV1
+            // clip with transparency, a GIF); the compositor draws opaque 4:2:0
+            // and would flatten it onto black without a word. The probed pixel
+            // format must be on the allow-list of known-opaque ones — a name a
+            // deny-list never thought of (`ayuv`, `vuya`, the `rgb32` aliases) is
+            // refused too. `None` (never recorded) is the decoder's to find out.
+            if let Some(fmt) = stream.pix_fmt.as_deref() {
+                if crate::model::pix_fmt_has_alpha(fmt) {
+                    out.push(Unsupported::AlphaPicture(at(), fmt.to_string()));
+                } else if pix_fmt_layout(fmt).is_none() {
+                    out.push(Unsupported::NotKnownOpaque(at(), fmt.to_string()));
+                }
+            }
+            // Below full opacity FFmpeg takes the layer through RGB and back (see
+            // `kerf-gpu`'s `roundtrip`), out of YCbCr with the picture's own matrix,
+            // which has to be known for the arithmetic to be reproduced. A keyframed
+            // clip's opacity is a `geq` alpha instead, refused below.
+            let keyed = self.mode == PlanMode::Motion && layer.animated.is_some();
+            if layer.transform.opacity < 1.0 && stream.matrix().is_none() && !keyed {
+                let detail = match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
+                    (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
+                    (Some(_), Some(tag)) => format!("`{tag}`, which the compositor has no coefficients for"),
+                    (Some(_), None) => "unknown".to_string(),
+                };
+                out.push(Unsupported::TranslucentMatrix(at(), detail));
+            }
+            // Colour correction (`eq`) runs on the picture as it is in the graph.
+            // FFmpeg 9 hands it a full-range picture's raw values and converts the
+            // range later; the compositor converts to limited range first, as the
+            // decode does. The results differ (34 to 42 dB on a graded `yuvj420p`
+            // clip, in every knob), so a full-range picture is not graded on the GPU
+            // — and a picture whose format was never recorded is not known not to be
+            // full-range.
+            if !layer.color.is_identity() && stream.maybe_full_range() {
+                let detail = match stream.pix_fmt.as_deref() {
+                    Some(f) => format!("a full-range picture ({f}), which FFmpeg grades before converting its range"),
+                    None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
+                };
+                out.push(Unsupported::GradedFullRange(at(), detail));
+            }
+            if layer.effects.iter().any(|e| !caps.effects.contains(EffectKinds::of(e))) {
+                out.push(Unsupported::Effects(at()));
+            }
+            if layer.mask.is_some() && !caps.mask {
+                out.push(Unsupported::Mask(at()));
+            }
+            if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
+                out.push(Unsupported::Reframe(at()));
+            }
+            // The still ignores fades and transitions (it shows the frame each visible clip
+            // contributes), the export and the streamed playback do not. A **still plan** has
+            // no tail layers and the FFmpeg still no fades, so it is never drawn inside one,
+            // whatever the caps say: those abilities are for [`PlanMode::Motion`] plans, and a
+            // frame inside a fade or a transition is FFmpeg's.
+            let motion = self.mode == PlanMode::Motion;
+            if let Some((edge, dissolve)) = layer.fx.in_progress(frame, fps).filter(|_| !(motion && caps.fades)) {
+                out.push(Unsupported::Fade(at(), edge, dissolve));
+            }
+            if layer.fx.travels() && !(motion && caps.transitions) {
+                out.push(Unsupported::Travel(at()));
+            }
+            if layer.fx.tail && !caps.transitions {
+                out.push(Unsupported::Tail(at()));
+            }
+            if keyed && layer.animated.is_some_and(|a| a.opacity) && !caps.keyed_opacity {
+                out.push(Unsupported::KeyedOpacity(at()));
+            }
+            if layer.animated.is_some_and(|a| a.zooms) && !caps.keyed_zoom {
+                if keyed {
+                    out.push(Unsupported::KeyedZoom(at()));
+                } else if !layer.color.is_identity()
+                    || layer.transform.rotation != 0.0
+                    || layer.transform.opacity < 1.0
+                    || layer.mask.is_some()
+                    || !layer.effects.is_empty()
+                {
+                    // A still's moving zoom is only the one stage when nothing follows it.
+                    out.push(Unsupported::ZoomBehind(at()));
+                }
+            }
+        }
+        if !self.overlays.is_empty() {
+            if !caps.text {
+                out.push(Unsupported::Text);
+            } else if self.overlays.iter().any(|o| o.font_file.is_none()) {
+                out.push(Unsupported::TextWithoutFont);
+            }
+        }
+        // The compositor implements swscale's default (bicubic) only.
+        if let Some(s) = self.canvas.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
+            out.push(Unsupported::Scaler(s.to_string()));
+        }
+        let policy = self.canvas.policy;
+        out.extend(composite_matrix(&self.layers, policy).1);
+        // FFmpeg 9 negotiates the *range* along the overlay chain as it does the matrix:
+        // the bottom layer's decides, and a graded layer above a full-range picture is
+        // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
+        // the composite's colour is negotiated, or not known, grading in a stack that
+        // holds a full-range picture is FFmpeg's.
+        if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range()) {
+            for (n, layer) in self.layers.iter().enumerate() {
+                if !layer.color.is_identity() && !layer.stream.maybe_full_range() {
+                    out.push(Unsupported::GradedInFullRangeStack(n));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the A0 compositor draws this frame exactly, **judged without the render
+    /// size**. `false` means "render it through FFmpeg"; [`RenderPlan::unsupported_reasons`]
+    /// says why. A `true` is necessary, not sufficient: what depends on the size the
+    /// frame is rendered at (a resize of a picture whose chroma is not 4:2:0, a
+    /// translucent layer of odd size, a crop that leaves nothing) is
+    /// [`RenderPlan::gpu_supported_at`]'s. A compositor with other abilities asks
+    /// [`RenderPlan::reasons`] with its own [`GpuCaps`].
+    pub fn gpu_supported(&self) -> bool {
+        self.size_free_reasons(&GpuCaps::A0).is_empty()
+    }
+
+    /// Why the A0 compositor cannot draw the frame at `size`, as messages.
+    pub fn unsupported_reasons_at(&self, size: (u32, u32)) -> Vec<String> {
+        self.reasons(&GpuCaps::A0, size).iter().map(ToString::to_string).collect()
     }
 
     /// Where a layer's picture lands when the frame is rendered at `size`, worked out
@@ -599,13 +806,14 @@ impl RenderPlan {
     ) -> std::result::Result<LayerGeometry, crate::layer_geometry::GeometryError> {
         let src = (layer.stream.width, layer.stream.height);
         let (fit, tf) = (self.canvas.fit, &layer.transform);
+        let place = self.placement(layer);
         let Some(native) = layer.stream.subsampling() else {
-            return LayerGeometry::resolve_any_grid(src, size, fit, tf);
+            return LayerGeometry::resolve_any_grid_with(src, size, fit, tf, place);
         };
-        let geom = LayerGeometry::resolve(src, size, fit, tf, native)?;
+        let geom = LayerGeometry::resolve_with(src, size, fit, tf, native, place)?;
         if native != Subsampling::YUV420
             && layer.stream.layout() != Some(PixLayout::Gray)
-            && geom != LayerGeometry::resolve(src, size, fit, tf, Subsampling::YUV420)?
+            && geom != LayerGeometry::resolve_with(src, size, fit, tf, Subsampling::YUV420, place)?
         {
             return Err(crate::layer_geometry::GeometryError(format!(
                 "its crop window or Cover offset starts or ends between two 4:2:0 chroma samples of a picture whose chroma is finer ({}), which the compositor's 4:2:0 planes cannot place",
@@ -615,14 +823,31 @@ impl RenderPlan {
         Ok(geom)
     }
 
-    /// Whether the compositor draws this frame exactly when rendered at `size`.
+    /// Whether the A0 compositor draws this frame exactly when rendered at `size`.
     pub fn gpu_supported_at(&self, size: (u32, u32)) -> bool {
-        self.unsupported_reasons_at(size).is_empty()
+        self.reasons(&GpuCaps::A0, size).is_empty()
     }
 
-    /// Why the frame cannot be drawn on the GPU yet — empty when it can.
-    pub fn unsupported_reasons(&self) -> &[String] {
-        &self.unsupported
+    /// Why the frame cannot be drawn by the A0 compositor — empty when it can (the
+    /// size-free reasons, as messages).
+    pub fn unsupported_reasons(&self) -> Vec<String> {
+        self.size_free_reasons(&GpuCaps::A0).iter().map(ToString::to_string).collect()
+    }
+
+    /// How the graph places this layer beyond its sampled transform ([`Placement`]):
+    /// the keyframed clip of an export frame, and whatever a transition moves it by.
+    /// A still's layer is placed by its sampled transform alone.
+    pub fn placement(&self, layer: &PlanLayer) -> Placement {
+        Placement {
+            keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).map(|a| a.rotates),
+            offset: layer.fx.motion,
+        }
+    }
+
+    /// What the `tint` fades of `layer` leave of its picture at this plan's frame
+    /// ([`LayerFx::strength`]): `1` untouched, `0` gone.
+    pub fn strength(&self, layer: &PlanLayer, tint: FadeTint) -> f64 {
+        layer.fx.strength(tint, self.frame, self.canvas.fps)
     }
 
     /// The size a render of this plan at `max_width` comes out — what the FFmpeg
@@ -635,6 +860,7 @@ impl RenderPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::model::{Delivery, Keyframe, Mask, MaskShape, Reframe, Track, Transition, TransitionKind, VideoEffect};
     use chrono::Utc;
 
@@ -855,7 +1081,7 @@ mod tests {
         let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
         edit(&mut tl, &mut a);
         let p = plan(&tl, std::slice::from_ref(&a), 5.0);
-        (p.gpu_supported(), p.unsupported_reasons().to_vec())
+        (p.gpu_supported(), p.unsupported_reasons())
     }
 
     #[test]
@@ -1108,7 +1334,7 @@ mod tests {
             let a = asset("a", 20.0, vec![v]);
             let tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
             let p = RenderPlan::at(&tl, &[a], &ExportOptions::default(), 1.0, U).unwrap();
-            (p.gpu_supported(), p.unsupported_reasons().to_vec())
+            (p.gpu_supported(), p.unsupported_reasons())
         };
         assert!(!ok && why.iter().any(|r| r.contains("matrix is unknown")), "{why:?}");
     }
@@ -1265,7 +1491,7 @@ mod tests {
             }
             let tl = timeline(vec![vec![Clip::new(ab.id, 0.0, 10.0, 0.0)], vec![ct]]);
             let p = RenderPlan::at(&tl, &[ab, at], &ExportOptions::default(), 1.0, policy).unwrap();
-            p.unsupported_reasons().to_vec()
+            p.unsupported_reasons()
         };
         let refused = |why: &[String]| why.iter().any(|r| r.contains("stack with a full-range picture"));
         use CompositeColorPolicy::{BottomLayerTag, FixedBt601, Unknown};

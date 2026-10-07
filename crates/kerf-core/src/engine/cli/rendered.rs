@@ -11,14 +11,21 @@
 //!   30 / 60 fps (the frame *pick* of A1a-3 has to reproduce this);
 //! * how far into a fade, dissolve or dip each frame is (`FadeStep::progress_at_frame`).
 //!
+//! The Motion plan is held to the same pictures: a drawn clip is always in the plan of its
+//! frame, the plan holds a clip the export does not draw only on the frame its window
+//! closes (a candidate — which of those are drawn is the pick's to say, next slice), and a
+//! layer's fade state is what the pixels show.
+//!
 //! `cargo test -p kerf-core --no-default-features -- --ignored rendered`
 
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::clip_timing::{clips_with_fx, ffmpeg_frame_time, ClipTiming, FadeStep, FadeTint};
+use crate::clip_timing::{clips_with_fx, ffmpeg_frame_time, ClipTiming, FadeTint};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::model::{Asset, Transition, TransitionKind};
+use crate::model::{Asset, Clip, Transition, TransitionKind};
+use crate::planner::{PlanRequest, Planner};
+use crate::render_plan::PlanMode;
 
 const W: u32 = 32;
 const H: u32 = 18;
@@ -61,8 +68,20 @@ fn solid(dir: &Path, color: &str, fps: &str, secs: f64) -> Asset {
 /// The export graph of `timeline` rendered at `fps`, one `W`x`H` rgb24 frame per
 /// output frame (no frame-rate conversion on the way out).
 fn export_frames(timeline: &Timeline, assets: &[Asset], fps: f64, dir: &Path, tag: &str) -> Vec<Vec<u8>> {
+    export_frames_sized(timeline, assets, fps, (W, H), dir, tag)
+}
+
+/// [`export_frames`] at another frame size.
+fn export_frames_sized(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fps: f64,
+    (w, h): (u32, u32),
+    dir: &Path,
+    tag: &str,
+) -> Vec<Vec<u8>> {
     let opts = ExportOptions {
-        resolution: Some((W, H)),
+        resolution: Some((w, h)),
         fps: Some(fps),
         ..ExportOptions::default()
     };
@@ -95,7 +114,7 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], fps: f64, dir: &Path, ta
     );
     std::fs::read(&out)
         .unwrap()
-        .chunks((W * H * 3) as usize)
+        .chunks((w * h * 3) as usize)
         .map(<[u8]>::to_vec)
         .collect()
 }
@@ -109,14 +128,28 @@ fn is_red(p: [f64; 3]) -> bool {
     p[0] > 128.0 && p[1] < 100.0 && p[2] < 100.0
 }
 
-/// What `FadeStep`s of one tint leave of the picture at output frame `k`.
-fn strength(timing: &ClipTiming, tint: FadeTint, k: u64, (num, den): (u32, u32)) -> f64 {
-    timing
-        .fades()
+/// The Motion plan of `timeline` as the export at `fps` is built.
+fn motion_planner(timeline: &Timeline, assets: &[Asset], fps: f64) -> Planner {
+    let opts = ExportOptions {
+        resolution: Some((W, H)),
+        fps: Some(fps),
+        ..ExportOptions::default()
+    };
+    let request = PlanRequest {
+        mode: PlanMode::Motion,
+        color: CompositeColorPolicy::FixedBt601,
+    };
+    Planner::new(timeline, assets, &opts, request).expect("plan")
+}
+
+/// What the plan says the `tint` fades of `clip` leave of its picture at output frame
+/// `k`; a clip the plan does not hold at that frame is not on screen at all.
+fn planned_strength(planner: &Planner, clip: &Clip, tint: FadeTint, k: u64) -> f64 {
+    let plan = planner.at_frame(k).expect("plan");
+    plan.layers
         .iter()
-        .filter(|s: &&FadeStep| s.tint == tint)
-        .map(|s| s.progress_at_frame(k as i64, num, den))
-        .product()
+        .find(|l| l.clip_id == clip.id)
+        .map_or(0.0, |l| plan.strength(l, tint))
 }
 
 /// A clip is drawn on exactly the output frames whose FFmpeg time is inside its
@@ -135,6 +168,7 @@ fn strength(timing: &ClipTiming, tint: FadeTint, k: u64, (num, den): (u32, u32))
 fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     let dir = scratch("boundary");
     let mut lost_first_frames = Vec::new();
+    let mut edge_candidates = 0;
     for (name, num, den) in RATES {
         let fps: f64 = name.parse().unwrap();
         let mut lost = 0;
@@ -154,6 +188,7 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
             ]);
             let assets = [red, green];
             let frames = export_frames(&timeline, &assets, fps, &dir, &format!("boundary-{name}-{src_in}"));
+            let planner = motion_planner(&timeline, &assets, fps);
             for (ti, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
                 let timing = ClipTiming::new(clip, &fx);
                 let (start, end) = timing.window();
@@ -173,6 +208,14 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
                         !drawn || timing.enabled(t),
                         "{name} fps: frame {k} drawn outside the enable window"
                     );
+                    // The plan holds every clip the export draws, and no other but the one
+                    // whose window closes on this frame.
+                    let planned = planner.at_frame(k).unwrap().layers.iter().any(|l| l.clip_id == clip.id);
+                    assert!(
+                        planned == drawn || (planned && t >= end - 1e-9),
+                        "{name} fps, source from {src_in}: clip {ci} at output frame {k}: drawn {drawn}, planned {planned}"
+                    );
+                    edge_candidates += usize::from(planned && !drawn);
                     lost += usize::from(k == sf && !drawn);
                 }
             }
@@ -184,6 +227,9 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     let lost = |name: &str| lost_first_frames.iter().find(|r| r.0 == name).unwrap().1;
     assert!(lost("24") > 0 && lost("29.97") > 0, "{lost_first_frames:?}");
     assert_eq!(lost("25"), 0, "{lost_first_frames:?}");
+    // ... and the plan really does hold a clip on the frame its window closes on, which
+    // an equal-rate source is not drawn on.
+    assert!(edge_candidates > 100, "{edge_candidates}");
 
     // A source slower than the export is held by the `fps` filter, so a clip can be
     // drawn on the frame at its own end — which an equal-rate one never is.
@@ -201,6 +247,7 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     ]);
     let assets = [red, green];
     let frames = export_frames(&timeline, &assets, fps, &dir, "boundary-slower");
+    let planner = motion_planner(&timeline, &assets, fps);
     let mut at_end = 0;
     for (_, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
         let timing = ClipTiming::new(clip, &fx);
@@ -213,6 +260,13 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
                 sf + n
             );
             at_end += usize::from(k == sf + n && drawn);
+            // Here the export draws the clip on the frame its window closes on, so the plan
+            // has to hold it there: the closing edge is a candidate, never a refusal.
+            let planned = planner.at_frame(k).unwrap().layers.iter().any(|l| l.clip_id == clip.id);
+            assert!(
+                !drawn || planned,
+                "24 -> 30: clip {ci} drawn at output frame {k} but not planned"
+            );
         }
     }
     assert!(
@@ -238,9 +292,8 @@ fn a_fade_follows_ffmpegs_frame_counting_at_every_rate() {
     const TOLERANCE: f64 = 8.0 / 255.0;
     let dir = scratch("fade");
     let mut worst = 0.0f64;
-    for (name, num, den) in RATES {
+    for (name, _, _) in RATES {
         let fps: f64 = name.parse().unwrap();
-        let rate = (num, den);
         let red = solid(&dir, "red", name, 12.0);
         let blue = solid(&dir, "blue", name, 12.0);
         // A start on the frame grid, `secs` in.
@@ -254,12 +307,13 @@ fn a_fade_follows_ffmpegs_frame_counting_at_every_rate() {
         let timeline = timeline_of(vec![video_track(vec![clip])]);
         let assets = [red.clone()];
         let frames = export_frames(&timeline, &assets, fps, &dir, &format!("own-{name}"));
+        let planner = motion_planner(&timeline, &assets, fps);
         for (_, _, clip, fx) in clips_with_fx(&timeline, &assets) {
             let timing = ClipTiming::new(clip, &fx);
             for k in sf..sf + n {
                 let (measured, expected) = (
                     rgb(&frames[k as usize])[0] / 255.0,
-                    strength(&timing, FadeTint::Black, k, rate),
+                    planned_strength(&planner, clip, FadeTint::Black, k),
                 );
                 worst = worst.max((measured - expected).abs());
                 assert!(
@@ -284,17 +338,21 @@ fn a_fade_follows_ffmpegs_frame_counting_at_every_rate() {
             let frames = export_frames(&timeline, &assets, fps, &dir, &format!("{label}-{name}"));
             let rows: Vec<_> = clips_with_fx(&timeline, &assets).collect();
             let (timing_a, timing_b) = (ClipTiming::new(rows[0].2, &rows[0].3), ClipTiming::new(rows[1].2, &rows[1].3));
+            let planner = motion_planner(&timeline, &assets, fps);
             for k in cut.saturating_sub(at(1.5))..cut + at(1.5) {
                 let p = rgb(&frames[k as usize]);
                 let (measured, expected) = if label == "dissolve" {
                     // The blue share of the mix: A is red underneath, B's alpha is the ramp.
-                    (p[2] / (p[0] + p[2]).max(1.0), strength(&timing_b, FadeTint::Alpha, k, rate))
+                    (
+                        p[2] / (p[0] + p[2]).max(1.0),
+                        planned_strength(&planner, rows[1].2, FadeTint::Alpha, k),
+                    )
                 } else if k >= cut {
                     // The incoming blue rises from black ...
-                    (p[2] / 255.0, strength(&timing_b, FadeTint::Black, k, rate))
+                    (p[2] / 255.0, planned_strength(&planner, rows[1].2, FadeTint::Black, k))
                 } else {
                     // ... after the outgoing red has gone.
-                    (p[0] / 255.0, strength(&timing_a, FadeTint::Black, k, rate))
+                    (p[0] / 255.0, planned_strength(&planner, rows[0].2, FadeTint::Black, k))
                 };
                 worst = worst.max((measured - expected).abs());
                 assert!(
@@ -307,5 +365,153 @@ fn a_fade_follows_ffmpegs_frame_counting_at_every_rate() {
         }
     }
     eprintln!("worst fade error against the frame count: {:.1}/255", worst * 255.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The frame rate the export grid runs on is the rational FFmpeg makes of the text the
+/// graph carries — by two parses with different limits. The `color=r=` canvas (and so the
+/// overlay's clock) is `Rational::from_fps`, each clip's `fps=` filter
+/// `Rational::from_fps_filter`; both are ports of `av_d2q` and here meet the real one
+/// (`showinfo` states the rate its input is configured with), on standard rates, on awkward
+/// ones, and on the ones where the two parts part.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_frame_rate_parses_to_the_rational_the_graph_runs_on() {
+    use crate::clip_timing::Rational;
+    let configured = |source: &str, vf: &str| {
+        let run = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "info", "-f", "lavfi", "-i"])
+            .arg(source)
+            .args(["-vf", vf, "-frames:v", "1", "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&run.stderr).into_owned();
+        let rate = log
+            .split("frame_rate: ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|r| r.split_once('/'))
+            .and_then(|(n, d)| Rational::new(n.parse().ok()?, d.parse().ok()?));
+        (rate, log)
+    };
+    let mut parted = 0;
+    for fps in [
+        24.0,
+        25.0,
+        29.97,
+        30000.0 / 1001.0,
+        23.976,
+        24000.0 / 1001.0,
+        59.94,
+        60000.0 / 1001.0,
+        119.88,
+        47.952,
+        12.5,
+        0.5,
+        0.1,
+        144.0,
+        1000.0 / 3.0,
+        29.970029,
+        1.23456789012345,
+        59.99999,
+        1234.56789,
+    ] {
+        let (canvas, log) = configured(&format!("color=c=black:s=16x16:r={fps}:d=1"), "showinfo=checksum=0");
+        assert_eq!(Rational::from_fps(fps), canvas, "color=r={fps}: {log}");
+        let (filter, log) = configured("color=c=black:s=16x16:r=30:d=1", &format!("fps={fps},showinfo=checksum=0"));
+        assert_eq!(Rational::from_fps_filter(fps), filter, "fps={fps}: {log}");
+        parted += usize::from(canvas != filter);
+    }
+    assert!(parted >= 3, "the two parses should part on the awkward rates ({parted})");
+}
+
+/// A keyframed zoom is `scale eval=frame`, which reads the time of the frame it is given,
+/// and the clip's `fps` decides whose that is. Ahead of `fps` it is the *source* frame's, so
+/// a 10 fps clip in a 30 fps export zoomed in steps three frames long (first half, straight
+/// off the filter); behind it, it is the output frame's, and the picture grows on every
+/// frame. The export puts it **after** `fps`, and last in the clip's chain, because every
+/// filter behind a size that changes mid-stream has to accept it and some do not: the
+/// converter `overlay` gets for a chain that does not end in an alpha format (scale-only
+/// keys) held the **first** frame's size, and so did `geq` (keyed opacity) — the width of a
+/// red clip over green, second half, never left its first size. Both FFmpegs.
+/// (`keyed_zoom.rs` holds every other combination to `transform_at` frame by frame.)
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_still() {
+    use crate::model::Keyframe;
+    let dir = scratch("zoom");
+    let (red, green) = (solid(&dir, "red", "10", 4.0), solid(&dir, "green", "30", 4.0));
+    // The zoom itself, straight off the filter: the size of each frame of a 10 fps clip.
+    let sizes_of = |graph: &str| {
+        let run = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "info", "-i"])
+            .arg(&red.path)
+            .args(["-vf", graph, "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&run.stderr).into_owned();
+        let sizes: Vec<String> = log
+            .lines()
+            .filter(|l| l.contains(" n:"))
+            .filter_map(|l| Some(l.split(" s:").nth(1)?.split_whitespace().next()?.to_string()))
+            .collect();
+        assert!(sizes.len() >= 30, "{log}");
+        sizes
+    };
+    // Before `fps`: every group of three output frames has the size of one source frame.
+    let before = sizes_of("scale=320:180,scale=w='iw*(1-0.4*t)':h='ih*(1-0.4*t)':eval=frame,setsar=1,fps=30,showinfo=checksum=0");
+    for (k, size) in before.iter().enumerate() {
+        assert_eq!(*size, before[k / 3 * 3], "frame {k}: {before:?}");
+    }
+    assert_ne!(before[0], before[3], "{before:?}");
+    // After `fps`: a size of its own on every frame, one step per frame (4.3 px of width).
+    let after = sizes_of("scale=320:180,setsar=1,fps=30,scale=w='iw*(1-0.4*t)':h='ih*(1-0.4*t)':eval=frame,showinfo=checksum=0");
+    assert!(
+        after.windows(2).take(50).all(|p| p[0] != p[1]),
+        "every output frame has its own size: {after:?}"
+    );
+
+    // What the export shows of it: the width of the red picture on each of its frames
+    // follows the keys (1.0 at 0 s to 0.2 at 2 s of a 320 px wide fit).
+    let widths = |opacity: f64, tag: &str| {
+        let key = |time, scale, opacity| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity,
+        };
+        let mut clip = make_clip(red.id, 0.0, 3.0, 0.0);
+        clip.keyframes = vec![key(0.0, 1.0, 1.0), key(2.0, 0.2, opacity)];
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(green.id, 0.0, 3.0, 0.0)]),
+            video_track(vec![clip]),
+        ]);
+        let frames = export_frames_sized(&timeline, &[red.clone(), green.clone()], 30.0, (320, 180), &dir, tag);
+        frames
+            .iter()
+            .take(60)
+            .map(|f| {
+                f[90 * 320 * 3..91 * 320 * 3]
+                    .chunks(3)
+                    .filter(|p| p[0] > 128 && p[1] < 100)
+                    .count()
+            })
+            .collect::<Vec<_>>()
+    };
+    for (opacity, tag) in [(1.0, "zoom-scale-only"), (0.99, "zoom-geq")] {
+        let w = widths(opacity, tag);
+        for (k, width) in w.iter().enumerate() {
+            let want = 320.0 * (1.0 - 0.4 * ffmpeg_frame_time(k as u64, 30, 1));
+            assert!(
+                (*width as f64 - want).abs() <= 2.0,
+                "{tag}: frame {k} is {width} px wide, the keys say {want:.1}: {w:?}"
+            );
+        }
+        assert!(w.windows(2).all(|p| p[1] < p[0]), "{tag}: it shrinks on every frame: {w:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
