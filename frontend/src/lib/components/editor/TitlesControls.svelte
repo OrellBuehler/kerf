@@ -14,10 +14,13 @@
 		CAPTION_HINT,
 		IMPORT_BASES,
 		NO_SOURCE_HINT,
+		OFFSET_HINT,
 		baseHint,
 		clearHint,
 		generatedCount,
 		importableAssets,
+		keepLinesHint,
+		keepLinesOn,
 		recaptionHint,
 		resolveChoice
 	} from '$lib/caption-import-ui';
@@ -26,8 +29,11 @@
 
 	const uid = $props.id();
 
+	// The list below is what is *shown* (a staged proposal while one is being
+	// reviewed); every button here acts on the live cut, and so does the count of
+	// captions an import or a recaption would replace.
 	const overlays = $derived(editor.overlays);
-	const captionCount = $derived(generatedCount(overlays));
+	const captionCount = $derived(generatedCount(editor.liveTimeline.overlays));
 	const hasCaptions = $derived(captionCount > 0);
 
 	// ---- importing captions from a subtitle file ----------------------------
@@ -44,6 +50,10 @@
 	);
 	const choiceAsset = $derived(offered.find((a) => a.id === choice.assetId));
 	const lookLabel = $derived(CAPTION_LOOKS.find((c) => c.id === ui.captionStyle)?.label ?? ui.captionStyle);
+	/** The delivery frame an import is laid out for: it decides whether keeping the
+	 *  file's lines is on until the box is touched. */
+	const frame = $derived(editor.liveTimeline.format);
+	const keepLines = $derived(keepLinesOn(ui.captionImportKeepLines, ui.captionStyle, frame));
 
 	// The Inspector scrolls: keep the options (and the Choose file button under them)
 	// in view when they open, and when picking a clip makes them taller.
@@ -181,6 +191,34 @@
 			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
 				{offered.length === 0 ? NO_SOURCE_HINT : baseHint(choice, choiceAsset?.label)}
 			</div>
+			<label style="display:flex;align-items:flex-start;gap:8px;cursor:{ui.captionStyle === 'lines' ? 'pointer' : 'default'}">
+				<input
+					type="checkbox"
+					checked={keepLines}
+					disabled={ui.captionStyle !== 'lines'}
+					onchange={(e) => (ui.captionImportKeepLines = e.currentTarget.checked)}
+					style="accent-color:var(--kerf-500);width:15px;height:15px;margin-top:1px;flex:none"
+				/>
+				<span style="display:flex;flex-direction:column;gap:2px">
+					<span style="font-size:12px;color:var(--text-primary)">Keep the file's lines</span>
+					<span style="font-size:12px;color:var(--text-muted);line-height:1.4"
+						>{keepLinesHint(ui.captionStyle, keepLines, frame)}</span
+					>
+				</span>
+			</label>
+			<label style="display:flex;align-items:center;gap:8px">
+				<span style="{fieldLabel};flex:none">Shift times</span>
+				<input
+					type="number"
+					step="0.1"
+					bind:value={ui.captionImportOffset}
+					placeholder="0"
+					aria-label="Shift every time in the file by this many seconds"
+					style="{selectCss};width:84px;min-width:0"
+				/>
+				<span style={fieldLabel}>seconds</span>
+			</label>
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">{OFFSET_HINT}</div>
 			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
 				Look: <span style="color:var(--text-secondary)">{lookLabel}</span>, from Caption style above. Fonts, colors and
 				positions in the file are ignored. {captionCount > 0

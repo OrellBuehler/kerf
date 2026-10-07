@@ -171,7 +171,7 @@ class EditorState {
 	error = $state<string | null>(null);
 
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
-	#liveTimeline: Timeline | null = null;
+	#liveTimeline = $state.raw<Timeline | null>(null);
 	/** The cut an edit lands on: the live one even while a proposal is on screen
 	 *  (every edit drops the preview first). `timeline` is what is *shown*. */
 	get liveTimeline(): Timeline {

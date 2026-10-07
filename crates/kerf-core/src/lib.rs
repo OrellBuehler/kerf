@@ -26,8 +26,9 @@ pub use analysis::{
     RhythmAnalyzer, SceneDetector, SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
 pub use captions_import::{
-    decode_caption_bytes, parse_ass, parse_captions, parse_srt, read_caption_file, CaptionFormat, ImportSummary, ImportedCue,
-    ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
+    decode_caption_bytes, parse_ass, parse_captions, parse_srt, read_caption_file, CaptionFile, CaptionFormat,
+    CaptionImportRequest, ImportSummary, ImportedCue, ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
+    MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
 };
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,

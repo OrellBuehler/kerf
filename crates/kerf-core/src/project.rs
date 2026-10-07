@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::captions_import::{parse_captions, CaptionFormat, ImportSummary};
+use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, MAX_CAPTION_OFFSET, MAX_IMPORTED_CAPTIONS};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
@@ -3366,18 +3366,26 @@ impl Project {
         Ok(created)
     }
 
-    /// Caption the cut from a subtitle file's text: parse SubRip or ASS / SSA
-    /// (`format` `None` guesses from the text), lay the cues onto the cut and
+    /// Caption the cut from a parsed subtitle file: lay its cues onto the cut and
     /// write them as caption overlays — as **one** `Import captions` revision.
     ///
-    /// `base` says which clock the file's times are on. The default,
+    /// Taking the [`CaptionFile`] rather than text is the lock-free split again:
+    /// [`parse_captions`](crate::captions_import::parse_captions) (and
+    /// [`read_caption_file`](crate::captions_import::read_caption_file) before it)
+    /// are pure and run with the project lock released, because reading a file —
+    /// a few MB at the worst — must not stall an edit; this method only places
+    /// what was read.
+    ///
+    /// `req.base` says which clock the file's times are on. The default,
     /// [`CaptionTimeBase::Timeline`], is a subtitle file made for the finished
     /// cut; [`CaptionTimeBase::Source`] is a file that times one asset's own
     /// footage (a transcript, subtitles for the uncut source) and is projected
     /// through that asset's clips exactly as a transcript is, so it follows trims,
-    /// reorders and speed changes. [`Timeline::place_cues`] does the placement
-    /// with the same chunking, flicker floors, one-lane rule and frame fit as
-    /// [`Project::generate_captions`], in the style `opts` names.
+    /// reorders and speed changes. `req.offset` is added to every cue first
+    /// (seconds, either sign: a broadcast file that starts at `01:00:00` wants
+    /// `-3600`). [`Timeline::place_cues`] does the placement with the same
+    /// chunking, flicker floors, one-lane rule and frame fit as
+    /// [`Project::generate_captions`], in the style `req.options` names.
     ///
     /// **The imported set is the caption set.** Its overlays are `generated`, so
     /// `Recaption` / `Clear captions` / the delivery re-fit treat them like any
@@ -3387,45 +3395,42 @@ impl Project {
     /// Captions are one lane of text at one position; keeping two sets would put
     /// two on screen at once. Typed titles are never touched.
     ///
-    /// The text is the caller's to read (see
-    /// [`read_caption_file`](crate::captions_import::read_caption_file), which
-    /// does it with the project lock released). Honors the staging session like
-    /// any edit: an agent's import lands in its proposal. Errors — and writes
-    /// nothing, so the existing captions survive — when the text holds no cues
-    /// or none of them reaches the cut.
-    pub fn import_captions(
-        &self,
-        text: &str,
-        format: Option<CaptionFormat>,
-        base: CaptionTimeBase,
-        opts: CaptionOptions,
-    ) -> Result<ImportSummary> {
-        let (format, parsed) = parse_captions(text, format)?;
-        if parsed.cues.is_empty() {
+    /// Honors the staging session like any edit: an agent's import lands in its
+    /// proposal. Errors — and writes nothing, so the existing captions survive —
+    /// when the file holds no cues, none of them can be shown, the offset is not
+    /// a sensible number, or the result would be more than
+    /// [`MAX_IMPORTED_CAPTIONS`] captions.
+    pub fn import_captions(&self, file: &CaptionFile, req: CaptionImportRequest) -> Result<ImportSummary> {
+        if file.cues.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "no captions found in the {} text ({} entries could not be read)",
-                format.as_str().to_uppercase(),
-                parsed.skipped
+                file.format.as_str().to_uppercase(),
+                file.skipped
             )));
         }
-        if let CaptionTimeBase::Source(asset) = base {
+        if !req.offset.is_finite() || req.offset.abs() > MAX_CAPTION_OFFSET {
+            return Err(Error::InvalidArgument(format!(
+                "offset must be a number of seconds within ±{MAX_CAPTION_OFFSET}"
+            )));
+        }
+        if let CaptionTimeBase::Source(asset) = req.base {
             self.require_asset(asset)?;
         }
-        let cues: Vec<TranscriptSegment> = parsed
+        let cues: Vec<TranscriptSegment> = file
             .cues
             .iter()
             .map(|c| TranscriptSegment {
-                start: c.start,
-                end: c.end,
+                start: c.start + req.offset,
+                end: c.end + req.offset,
                 text: c.text.clone(),
             })
             .collect();
-        let (first, last) = (parsed.cues[0].start, parsed.cues.iter().map(|c| c.end).fold(0.0, f64::max));
+        let (first, last) = (cues[0].start, cues.iter().map(|c| c.end).fold(f64::MIN, f64::max));
         // The placement is computed from the very timeline the edit then writes
         // to — the proposal for an agent that is staging — so there is no gap
         // between looking at the cut and changing it.
         let (placement, captions, replaced) = self.edit_timeline("Import captions", |timeline| {
-            if let CaptionTimeBase::Source(asset) = base {
+            if let CaptionTimeBase::Source(asset) = req.base {
                 if !timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| c.asset_id == asset) {
                     return Err(Error::InvalidArgument(format!(
                         "asset {asset} is not used by any clip in the cut; put it on the timeline first, \
@@ -3433,24 +3438,38 @@ impl Project {
                     )));
                 }
             }
-            let mut placement = timeline.place_cues(&cues, base, opts);
+            let mut placement = timeline.place_cues(&cues, req.base, req.options);
             if placement.overlays.is_empty() {
-                return Err(Error::InvalidArgument(match base {
-                    CaptionTimeBase::Timeline => format!(
-                        "none of the {} cues fall inside the cut: they run {} to {} and the cut is {} long",
+                let run = format!("they run {} to {}", fmt_time(first), fmt_time(last));
+                return Err(Error::InvalidArgument(if placement.dropped_outside == cues.len() {
+                    match req.base {
+                        CaptionTimeBase::Timeline => format!(
+                            "none of the {} cues fall inside the cut: {run} and the cut is {} long",
+                            cues.len(),
+                            fmt_time(timeline.for_render().duration()),
+                        ),
+                        CaptionTimeBase::Source(_) => format!(
+                            "none of the {} cues land on footage this asset shows in the cut: {run} of the \
+                             source (a muted track or a disabled clip does not count)",
+                            cues.len(),
+                        ),
+                    }
+                } else {
+                    format!(
+                        "none of the {} cues could be shown: {} outside the cut, {} too short to read, {} hidden by another",
                         cues.len(),
-                        fmt_time(first),
-                        fmt_time(last),
-                        fmt_time(timeline.for_render().duration()),
-                    ),
-                    CaptionTimeBase::Source(_) => format!(
-                        "none of the {} cues land on footage this asset shows in the cut: they run {} to {} of the \
-                         source (a muted track or a disabled clip does not count)",
-                        cues.len(),
-                        fmt_time(first),
-                        fmt_time(last),
-                    ),
+                        placement.dropped_outside,
+                        placement.dropped_short,
+                        placement.dropped_overlap,
+                    )
                 }));
+            }
+            if placement.overlays.len() > MAX_IMPORTED_CAPTIONS {
+                return Err(Error::InvalidArgument(format!(
+                    "this import would write {} captions; Kerf writes at most {MAX_IMPORTED_CAPTIONS} at a time \
+                     (the `word_punch` look makes one caption per word — `lines` makes far fewer)",
+                    placement.overlays.len()
+                )));
             }
             let before = timeline.overlays.len();
             timeline.overlays.retain(|o| !o.generated);
@@ -3460,12 +3479,13 @@ impl Project {
             Ok((placement, captions, replaced))
         })?;
         Ok(ImportSummary {
-            format,
+            format: file.format,
             cues: cues.len(),
             placed: placement.placed,
             captions,
-            skipped_lines: parsed.skipped,
+            skipped_lines: file.skipped,
             dropped_outside: placement.dropped_outside,
+            dropped_short: placement.dropped_short,
             dropped_overlap: placement.dropped_overlap,
             replaced,
         })
@@ -3796,7 +3816,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::captions_import::{CaptionFormat, ImportSummary};
+    use crate::captions_import::{parse_captions, CaptionFormat, CaptionImportRequest, ImportSummary, MAX_IMPORTED_CAPTIONS};
     use crate::model::{ClipMove, DiffKind, Fit};
 
     #[test]
@@ -5655,15 +5675,42 @@ mod tests {
             .collect()
     }
 
+    /// What the surfaces do, in the order they do it: parse with no project in
+    /// hand, then place under the project.
+    fn import_with(
+        project: &Project,
+        text: &str,
+        format: Option<CaptionFormat>,
+        req: CaptionImportRequest,
+    ) -> Result<ImportSummary> {
+        let file = parse_captions(text, format)?;
+        project.import_captions(&file, req)
+    }
+
+    fn import_text(project: &Project, text: &str, base: CaptionTimeBase, options: CaptionOptions) -> Result<ImportSummary> {
+        import_with(
+            project,
+            text,
+            None,
+            CaptionImportRequest {
+                base,
+                options,
+                offset: 0.0,
+            },
+        )
+    }
+
+    fn import_srt(project: &Project) -> Result<ImportSummary> {
+        import_text(project, SRT, CaptionTimeBase::Timeline, CaptionOptions::default())
+    }
+
     #[test]
     fn importing_a_subtitle_file_is_one_revision_of_generated_captions() {
         let (project, _) = project_with_one_clip(0.0, 20.0, 0.0);
         let title = project.add_overlay("Chapter one".to_string(), 0.0, 1.5).unwrap();
         let revisions = project.history().unwrap().len();
 
-        let summary = project
-            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
-            .unwrap();
+        let summary = import_srt(&project).unwrap();
         assert_eq!(
             summary,
             ImportSummary {
@@ -5673,6 +5720,7 @@ mod tests {
                 captions: 2,
                 skipped_lines: 0,
                 dropped_outside: 0,
+                dropped_short: 0,
                 dropped_overlap: 0,
                 replaced: 0,
             }
@@ -5693,14 +5741,13 @@ mod tests {
         );
 
         // Importing again replaces the set rather than stacking a second one…
-        let again = project
-            .import_captions(
-                SRT,
-                None,
-                CaptionTimeBase::Timeline,
-                CaptionOptions::styled(CaptionStyle::WordPunch),
-            )
-            .unwrap();
+        let again = import_text(
+            &project,
+            SRT,
+            CaptionTimeBase::Timeline,
+            CaptionOptions::styled(CaptionStyle::WordPunch),
+        )
+        .unwrap();
         assert_eq!(again.replaced, 2);
         assert_eq!(captions_on(&project).len(), again.captions);
         assert!(captions_on(&project).iter().all(|o| o.bold), "in the style asked for");
@@ -5716,9 +5763,7 @@ mod tests {
         // The documented interaction: captions are one lane, so whichever set was
         // written last is the set.
         let (project, _) = project_with_one_clip(5.5, 7.0, 2.0);
-        project
-            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
-            .unwrap();
+        import_srt(&project).unwrap();
         assert!(captions_on(&project).iter().any(|o| o.text == "Hello there"));
         let generated = project.generate_captions(CaptionOptions::default()).unwrap();
         let now = captions_on(&project);
@@ -5736,9 +5781,7 @@ mod tests {
                    Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Trimmed away\n\
                    Dialogue: 0,0:00:30.00,0:00:32.00,Default,,0,0,0,,Past the footage\n\
                    Dialogue: 0,broken\n";
-        let summary = project
-            .import_captions(ass, None, CaptionTimeBase::Source(asset), CaptionOptions::default())
-            .unwrap();
+        let summary = import_text(&project, ass, CaptionTimeBase::Source(asset), CaptionOptions::default()).unwrap();
         assert_eq!(summary.format, CaptionFormat::Ass);
         assert_eq!(
             (summary.cues, summary.placed, summary.dropped_outside, summary.skipped_lines),
@@ -5755,44 +5798,135 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_moves_every_cue_before_it_is_placed() {
+        // A broadcast file whose clock starts at one hour.
+        let (project, _) = project_with_one_clip(0.0, 20.0, 0.0);
+        let broadcast = "1\n01:00:01,000 --> 01:00:03,000\nHello there\n\n2\n01:00:04,000 --> 01:00:06,000\nGeneral Kenobi\n";
+        let req = |offset| CaptionImportRequest {
+            offset,
+            ..CaptionImportRequest::default()
+        };
+        let err = import_with(&project, broadcast, None, req(0.0)).unwrap_err();
+        assert!(err.to_string().contains("fall inside the cut"), "{err}");
+        let summary = import_with(&project, broadcast, None, req(-3600.0)).unwrap();
+        assert_eq!((summary.placed, summary.dropped_outside), (2, 0));
+        let captions = captions_on(&project);
+        assert_eq!(
+            captions.iter().map(|o| (o.start, o.end)).collect::<Vec<_>>(),
+            [(1.0, 3.0), (4.0, 6.0)]
+        );
+        // A positive offset shifts the other way, and part of a cue pushed below
+        // zero is clipped, the rest dropped.
+        let early = "1\n00:00:00,000 --> 00:00:04,000\nStarts at zero\n\n2\n00:00:01,000 --> 00:00:02,000\nBefore it\n";
+        let summary = import_with(&project, early, None, req(-2.0)).unwrap();
+        assert_eq!((summary.placed, summary.dropped_outside), (1, 1), "{summary:?}");
+        assert_eq!(captions_on(&project)[0].start, 0.0);
+        // Not a number of seconds, or an absurd one: refused, not applied.
+        for bad in [f64::NAN, f64::INFINITY, 1e9, -1e9] {
+            let err = import_with(&project, SRT, None, req(bad)).unwrap_err();
+            assert!(err.to_string().contains("offset"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_cue_too_short_to_read_is_counted_on_its_own() {
+        let (project, _) = project_with_one_clip(0.0, 10.0, 0.0);
+        let text = "1\n00:00:01,000 --> 00:00:03,000\nReadable\n\n2\n00:00:04,000 --> 00:00:04,050\nA blink\n\n3\n00:09:00,000 --> 00:09:03,000\nWay past the end\n";
+        let summary = import_text(&project, text, CaptionTimeBase::Timeline, CaptionOptions::default()).unwrap();
+        assert_eq!(
+            (
+                summary.cues,
+                summary.placed,
+                summary.dropped_outside,
+                summary.dropped_short,
+                summary.dropped_overlap
+            ),
+            (3, 1, 1, 1, 0)
+        );
+        assert_eq!(
+            summary.cues,
+            summary.placed + summary.dropped_outside + summary.dropped_short + summary.dropped_overlap
+        );
+        // When *nothing* could be shown the error says why, not "outside the cut".
+        let err = import_srt_text(&project, "1\n00:00:04,000 --> 00:00:04,050\nA blink\n").unwrap_err();
+        assert!(err.to_string().contains("too short to read"), "{err}");
+    }
+
+    fn import_srt_text(project: &Project, text: &str) -> Result<ImportSummary> {
+        import_text(project, text, CaptionTimeBase::Timeline, CaptionOptions::default())
+    }
+
+    #[test]
+    fn an_import_that_would_write_too_many_captions_is_refused_whole() {
+        // 9,000 five-word cues in word punch: 45,000 one-word captions. The cut is
+        // empty, so the cues are not clipped to anything — which is exactly when
+        // an unbounded import used to write all of them.
+        let project = Project::open_in_memory().unwrap();
+        let text: String = (0..9_000)
+            .map(|i| {
+                let (a, b) = (i as f64 * 1.5, i as f64 * 1.5 + 1.0);
+                let ts = |t: f64| {
+                    format!(
+                        "{:02}:{:02}:{:02},000",
+                        (t / 3600.0) as u32,
+                        (t as u32 / 60) % 60,
+                        t as u32 % 60
+                    )
+                };
+                format!("{i}\n{} --> {}\nalpha bravo charlie delta echo\n\n", ts(a), ts(b))
+            })
+            .collect();
+        let revisions = project.history().unwrap().len();
+        let err = import_text(
+            &project,
+            &text,
+            CaptionTimeBase::Timeline,
+            CaptionOptions::styled(CaptionStyle::WordPunch),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most 20000 at a time"), "{err}");
+        assert!(project.timeline().unwrap().overlays.is_empty());
+        assert_eq!(project.history().unwrap().len(), revisions);
+        // The same file in the lines look is a few captions per cue and lands.
+        let summary = import_text(&project, &text, CaptionTimeBase::Timeline, CaptionOptions::default()).unwrap();
+        assert!(
+            summary.captions <= MAX_IMPORTED_CAPTIONS && summary.placed > 8_000,
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn cues_on_an_empty_timeline_are_bounded_by_the_day_not_by_the_file() {
+        let project = Project::open_in_memory().unwrap();
+        let text = "1\n00:00:01,000 --> 00:00:03,000\nToday\n\n2\n30:00:00,000 --> 30:00:03,000\nA day and a bit on\n";
+        let summary = import_text(&project, text, CaptionTimeBase::Timeline, CaptionOptions::default()).unwrap();
+        assert_eq!((summary.placed, summary.dropped_outside), (1, 1), "{summary:?}");
+    }
+
+    #[test]
     fn an_import_that_cannot_land_writes_nothing_and_keeps_the_captions_it_would_replace() {
         let (project, asset) = project_with_one_clip(0.0, 10.0, 0.0);
-        project
-            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
-            .unwrap();
+        import_srt(&project).unwrap();
         let before = project.timeline().unwrap();
         let revisions = project.history().unwrap().len();
         let refused = |result: Result<ImportSummary>, needle: &str| {
             let err = result.unwrap_err();
             assert!(err.to_string().contains(needle), "{err}");
         };
+        let at_timeline = |text: &str| import_text(&project, text, CaptionTimeBase::Timeline, CaptionOptions::default());
+        let at_source =
+            |text: &str, asset| import_text(&project, text, CaptionTimeBase::Source(asset), CaptionOptions::default());
 
         // Nothing to read.
-        refused(
-            project.import_captions(
-                "not a subtitle file",
-                None,
-                CaptionTimeBase::Timeline,
-                CaptionOptions::default(),
-            ),
-            "no captions found",
-        );
+        refused(at_timeline("not a subtitle file"), "no captions found");
         // Every cue after the cut ends.
         refused(
-            project.import_captions(
-                "1\n00:05:00,000 --> 00:05:02,000\nToo late\n",
-                None,
-                CaptionTimeBase::Timeline,
-                CaptionOptions::default(),
-            ),
+            at_timeline("1\n00:05:00,000 --> 00:05:02,000\nToo late\n"),
             "fall inside the cut",
         );
         // An asset that is not in the project, and one that is but not in the cut.
         let missing = Uuid::new_v4();
-        assert!(matches!(
-            project.import_captions(SRT, None, CaptionTimeBase::Source(missing), CaptionOptions::default()),
-            Err(Error::AssetNotFound(id)) if id == missing
-        ));
+        assert!(matches!(at_source(SRT, missing), Err(Error::AssetNotFound(id)) if id == missing));
         let unused = project
             .list_assets()
             .unwrap()
@@ -5800,28 +5934,15 @@ mod tests {
             .map(|a| a.id)
             .find(|id| *id != asset)
             .expect("a second sample asset");
-        refused(
-            project.import_captions(SRT, None, CaptionTimeBase::Source(unused), CaptionOptions::default()),
-            "not used by any clip",
-        );
+        refused(at_source(SRT, unused), "not used by any clip");
         // Source time the clips do not show.
         refused(
-            project.import_captions(
-                "1\n00:09:00,000 --> 00:09:02,000\nElsewhere\n",
-                None,
-                CaptionTimeBase::Source(asset),
-                CaptionOptions::default(),
-            ),
+            at_source("1\n00:09:00,000 --> 00:09:02,000\nElsewhere\n", asset),
             "land on footage",
         );
         // An ASS file with an unusable Format line.
         refused(
-            project.import_captions(
-                "[Events]\nFormat: Layer, Text\nDialogue: 0,hi",
-                None,
-                CaptionTimeBase::Timeline,
-                CaptionOptions::default(),
-            ),
+            at_timeline("[Events]\nFormat: Layer, Text\nDialogue: 0,hi"),
             "Start, End and Text",
         );
 
@@ -5835,14 +5956,7 @@ mod tests {
     #[test]
     fn a_named_format_overrides_the_guess() {
         let (project, _) = project_with_one_clip(0.0, 10.0, 0.0);
-        let err = project
-            .import_captions(
-                SRT,
-                Some(CaptionFormat::Ass),
-                CaptionTimeBase::Timeline,
-                CaptionOptions::default(),
-            )
-            .unwrap_err();
+        let err = import_with(&project, SRT, Some(CaptionFormat::Ass), CaptionImportRequest::default()).unwrap_err();
         assert!(err.to_string().contains("no captions found in the ASS"), "{err}");
     }
 
@@ -5853,9 +5967,7 @@ mod tests {
         let revisions = project.history().unwrap().len();
         project.begin_staging(None, None).unwrap();
 
-        let summary = project
-            .import_captions(SRT, None, CaptionTimeBase::Timeline, CaptionOptions::default())
-            .unwrap();
+        let summary = import_srt(&project).unwrap();
         assert_eq!(summary.captions, 2);
 
         // The cut the user is looking at has not moved; the agent's own view has.

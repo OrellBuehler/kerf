@@ -3,7 +3,7 @@ import type { CaptionImportResult } from './types';
 
 // The desktop half of importing captions: which file dialog is opened, and what
 // `import_captions` / `import_captions_text` are handed. The Rust commands take
-// `path` / `text`, `format`, `base`, `asset_id` and `options` (Tauri turns the
+// `path` / `text`, `format`, `base`, `asset_id`, `options` and `offset` (Tauri turns the
 // camelCase keys into those), and `null` for what was not chosen — so a rename on
 // either side shows up here rather than as a refused import in the app.
 
@@ -36,7 +36,17 @@ const g = globalThis as unknown as { window?: unknown };
 
 const result = {
 	timeline: { tracks: [], overlays: [] },
-	summary: { format: 'srt', cues: 1, placed: 1, captions: 1, skipped_lines: 0, dropped_outside: 0, dropped_overlap: 0, replaced: 0 }
+	summary: {
+		format: 'srt',
+		cues: 1,
+		placed: 1,
+		captions: 1,
+		skipped_lines: 0,
+		dropped_outside: 0,
+		dropped_short: 0,
+		dropped_overlap: 0,
+		replaced: 0
+	}
 } as CaptionImportResult;
 
 beforeEach(() => {
@@ -77,17 +87,26 @@ describe('import_captions', () => {
 	test('is handed the path and, unset, nulls', async () => {
 		expect(await importCaptions('/subs/movie.srt')).toEqual(result);
 		expect(calls).toEqual([
-			{ cmd: 'import_captions', args: { path: '/subs/movie.srt', base: null, assetId: null, options: null } }
+			{
+				cmd: 'import_captions',
+				args: { path: '/subs/movie.srt', base: null, assetId: null, options: null, offset: null }
+			}
 		]);
 	});
 
 	test('carries the timing and the look', async () => {
-		await importCaptions('/subs/movie.srt', { base: 'source', assetId: 'asset-1', options: { style: 'word_punch' } });
+		await importCaptions('/subs/movie.srt', {
+			base: 'source',
+			assetId: 'asset-1',
+			options: { style: 'word_punch' },
+			offset: -3600
+		});
 		expect(calls[0].args).toEqual({
 			path: '/subs/movie.srt',
 			base: 'source',
 			assetId: 'asset-1',
-			options: { style: 'word_punch' }
+			options: { style: 'word_punch' },
+			offset: -3600
 		});
 	});
 });
@@ -107,7 +126,8 @@ describe('import_captions_text', () => {
 					format: 'srt',
 					base: 'timeline',
 					assetId: null,
-					options: { style: 'lines' }
+					options: { style: 'lines' },
+					offset: null
 				}
 			}
 		]);

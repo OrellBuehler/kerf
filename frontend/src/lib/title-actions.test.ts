@@ -52,7 +52,7 @@ afterAll(() => {
 
 const { editor } = await import('./state.svelte');
 const { ui } = await import('./editor-ui.svelte');
-const { importCaptionFile } = await import('./title-actions');
+const { importCaptionFile, makeCaptions } = await import('./title-actions');
 const { revertTo } = real;
 
 const text = (srt: string, name = 'subs.srt'): CaptionFilePick => ({ kind: 'text', text: srt, name, format: 'srt' });
@@ -65,6 +65,8 @@ beforeEach(async () => {
 	await editor.load();
 	editor.clearSelection();
 	ui.captionStyle = 'lines';
+	ui.captionImportKeepLines = null;
+	ui.captionImportOffset = null;
 	answer = true;
 	confirm = asking;
 	byPath = real.importCaptions;
@@ -164,6 +166,54 @@ describe('importCaptionFile', () => {
 		expect(captions().map((o) => o.text)).toEqual(['Hello', 'there', 'General', 'Kenobi']);
 	});
 
+	// A cue of eight words: the generator would split it into two lines of four.
+	const LONG = '1\n00:00:01,000 --> 00:00:09,000\none two three four five six seven eight\n';
+
+	test("keeps the file's lines on an unframed cut until told otherwise", async () => {
+		pick = async () => text(LONG);
+		await importCaptionFile();
+		expect(captions().map((o) => o.text)).toEqual(['one two three four five six seven eight']);
+		// Unticked, the generator's short lines come back.
+		ui.captionImportKeepLines = false;
+		await importCaptionFile();
+		expect(captions().map((o) => o.text)).toEqual(['one two three four', 'five six seven eight']);
+	});
+
+	test('a tall frame starts with the file re-split, and ticking the box keeps its lines', async () => {
+		await editor.setDeliveryFormat({ width: 1080, height: 1920, fit: 'cover' });
+		pick = async () => text(LONG);
+		await importCaptionFile();
+		expect(captions().map((o) => o.text)).toEqual(['one two three four', 'five six seven eight']);
+		ui.captionImportKeepLines = true;
+		await importCaptionFile();
+		expect(captions().map((o) => o.text)).toEqual(['one two three four five six seven eight']);
+	});
+
+	test('word punch never keeps lines, whatever the box says', async () => {
+		ui.captionStyle = 'word_punch';
+		ui.captionImportKeepLines = true;
+		pick = async () => text(LONG);
+		await importCaptionFile();
+		expect(captions().map((o) => o.text)).toEqual(['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight']);
+	});
+
+	test('the offset shifts the file onto the cut', async () => {
+		// A broadcast file whose clock starts at one hour.
+		pick = async () => text('1\n01:00:01,000 --> 01:00:03,000\nHello there\n');
+		expect(await importCaptionFile()).toBe(false);
+		expect(shown[0].kind).toBe('error');
+		shown.length = 0;
+		ui.captionImportOffset = -3600;
+		expect(await importCaptionFile()).toBe(true);
+		expect(captions().map((o) => [o.text, o.start, o.end])).toEqual([['Hello there', 1, 3]]);
+	});
+
+	test('a cue too short to read is its own line in the notice', async () => {
+		pick = async () => text(`${CLEAN}\n3\n00:00:07,000 --> 00:00:07,050\nA blink\n`);
+		expect(await importCaptionFile()).toBe(true);
+		expect(shown).toEqual([{ kind: 'warning', text: 'Imported 2 captions from 2 of 3 cues (1 too short)' }]);
+	});
+
 	test('leaves the selection where it was', async () => {
 		editor.selectClips(['c1']);
 		await importCaptionFile();
@@ -207,5 +257,46 @@ describe('importCaptionFile', () => {
 		release(true);
 		expect(await first).toBe(true);
 		expect(shown.map((s) => s.kind)).toEqual(['success']);
+	});
+});
+
+describe('captioning from transcripts', () => {
+	const generated = () => editor.overlays.filter((o) => o.generated).map((o) => o.text);
+
+	test('asks first when a set is already there — an imported one included — and names the count', async () => {
+		await importCaptionFile();
+		expect(asked).toEqual([]);
+		await makeCaptions();
+		expect(asked).toEqual([
+			{ message: 'Replace the 2 captions already on the cut? Titles you added by hand are kept.', title: 'Caption the cut' }
+		]);
+		// Agreed: the imported set is gone, replaced by the transcript's.
+		expect(generated()).not.toContain('Hello there');
+	});
+
+	test('declining leaves the set alone', async () => {
+		await importCaptionFile();
+		answer = false;
+		await makeCaptions();
+		expect(asked).toHaveLength(1);
+		expect(generated()).toEqual(['Hello there', 'General Kenobi']);
+	});
+
+	test('does not ask when there is nothing to replace, or only a title typed by hand', async () => {
+		await editor.addTitle('Mine', 0, 3);
+		await makeCaptions();
+		expect(asked).toEqual([]);
+		expect(generated().length).toBeGreaterThan(0);
+	});
+
+	test('counts the live cut, not a proposal on screen', async () => {
+		await importCaptionFile();
+		asked.length = 0;
+		// The Titles list would show the proposal's captions; the question is about
+		// the cut that is about to be written over.
+		const live = editor.liveTimeline;
+		expect(live.overlays?.filter((o) => o.generated)).toHaveLength(2);
+		await makeCaptions();
+		expect(asked[0].message).toContain('Replace the 2 captions');
 	});
 });

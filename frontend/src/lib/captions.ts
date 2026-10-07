@@ -135,38 +135,54 @@ export function chunkWords(text: string, opts: CaptionOpts): string[] {
 
 /** Spread a span across lines by character share, merging away any line too
  *  short to read. Character share is the approximation available: neither
- *  speech backend reports word timings. */
+ *  speech backend reports word timings.
+ *
+ *  The merge is repeated — join the first too-short line to its shorter
+ *  neighbour, re-time, look again — and what that costs is the *scan*: weights
+ *  and their total are kept as they change (a merge adds exactly the joining
+ *  space) and a scan stops at the first short line, so a pass allocates nothing.
+ *  Mirrors `time_chunks`, which the same sweep pins bit-for-bit. */
 export function timeChunks(
 	chunks: string[],
 	start: number,
 	end: number,
 	min = MIN_CAPTION
 ): { start: number; end: number; text: string }[] {
-	let lines = [...chunks];
+	const lines = [...chunks];
 	const duration = Math.max(end - start, 0);
-	for (;;) {
-		const weights = lines.map((c) => Math.max(c.length, 1));
-		const total = weights.reduce((a, b) => a + b, 0);
-		const timed: { start: number; end: number; text: string }[] = [];
+	const weights = lines.map((c) => Math.max(c.length, 1));
+	let total = weights.reduce((a, b) => a + b, 0);
+	const endOf = (at: number, i: number) =>
+		i + 1 === lines.length ? end : at + duration * (total > 0 ? weights[i] / total : 1);
+	// A whole segment shorter than `min` is one line, not a merge loop.
+	while (lines.length >= 2) {
 		let at = start;
-		lines.forEach((text, i) => {
-			const share = total > 0 ? weights[i] / total : 1;
-			const to = i + 1 === lines.length ? end : at + duration * share;
-			timed.push({ start: at, end: to, text });
+		let short = -1;
+		for (let i = 0; i < lines.length; i++) {
+			const to = endOf(at, i);
+			if (to - at < min) {
+				short = i;
+				break;
+			}
 			at = to;
-		});
-		if (lines.length < 2) return timed;
-		const short = timed.findIndex((t) => t.end - t.start < min);
-		if (short < 0) return timed;
+		}
+		if (short < 0) break;
 		const mergeBack =
 			short > 0 && (short + 1 === lines.length || lines[short - 1].length <= lines[short + 1].length);
 		const into = mergeBack ? short - 1 : short;
-		lines = [
-			...lines.slice(0, into),
-			`${lines[into]} ${lines[into + 1]}`,
-			...lines.slice(into + 2)
-		];
+		const moved = weights[into + 1];
+		lines.splice(into, 2, `${lines[into]} ${lines[into + 1]}`);
+		weights.splice(into, 2, weights[into] + moved + 1);
+		total += 1;
 	}
+	const timed: { start: number; end: number; text: string }[] = [];
+	let at = start;
+	lines.forEach((text, i) => {
+		const to = endOf(at, i);
+		timed.push({ start: at, end: to, text });
+		at = to;
+	});
+	return timed;
 }
 
 /** One caption line on its way to the screen: when, what, and which input it was
@@ -236,20 +252,28 @@ export function projectThroughClips(
 	return lines;
 }
 
+/** How lines that start at the same moment are ordered: alphabetically (all a
+ *  transcript has, and what it has always done) or in the order the input gave
+ *  them (an imported file's cues, in the order its author wrote them). */
+export type SimultaneousLines = 'text' | 'origin';
+
 /** Settle chunked lines into the caption lane: ordered, de-duplicated, never two
  *  on screen at once, each sized to fit the frame. Each overlay comes back with
  *  the `origin` of the line it was made from. Mirrors `settle_caption_lines`. */
 export function settleCaptionLines(
 	lines: CaptionLine[],
 	opts: CaptionOpts,
-	aspect: number
+	aspect: number,
+	simultaneous: SimultaneousLines = 'text'
 ): { overlay: Omit<TextOverlay, 'id'>; origin: number }[] {
 	const sorted = [...lines].sort((x, y) => x.start - y.start || compareText(x.text, y.text));
 	// The same words can reach two clips (`extract_audio` leaves picture and
 	// detached audio both on the asset); drawing one twice is drawing it bolder.
-	const deduped = sorted.filter(
+	let deduped = sorted.filter(
 		(l, i) => i === 0 || l.text !== sorted[i - 1].text || Math.abs(l.start - sorted[i - 1].start) >= 1e-3
 	);
+	// Stable (`Array.prototype.sort` is), so everything else keeps its order.
+	if (simultaneous === 'origin') deduped = [...deduped].sort((x, y) => x.start - y.start || x.origin - y.origin);
 	// Captions are one lane of text at one screen position, so two at once is two
 	// unreadable ones. First line in wins the slot; the next starts where it ends,
 	// or is dropped if nothing readable is left of it.
@@ -305,47 +329,71 @@ export function captionsForTimeline(
 export type CaptionBase = { kind: 'timeline' } | { kind: 'source'; assetId: string };
 
 /** Imported cues laid onto the cut: the overlays and an account of every cue.
- *  `placed + droppedOutside + droppedOverlap` is the number of cues offered. */
+ *  `placed + droppedOutside + droppedShort + droppedOverlap` is the number of
+ *  cues offered. */
 export interface CaptionPlacement {
 	overlays: Omit<TextOverlay, 'id'>[];
 	placed: number;
+	/** Never met the cut: past its end or before its start, footage no clip
+	 *  shows, or not a usable cue. */
 	droppedOutside: number;
+	/** Met the cut, but for a moment too short to read. */
+	droppedShort: number;
+	/** Lost their slot to another cue: captions are one lane. */
 	droppedOverlap: number;
 }
+
+/** How far into an *empty* timeline imported cues may reach (seconds): a cut has
+ *  an end that cues are clipped to; with nothing on the timeline yet the day is
+ *  the bound. Mirrors `EMPTY_CUT_WINDOW`. */
+export const EMPTY_CUT_WINDOW = 24 * 3600;
 
 /** Lay the cues of an imported subtitle file onto the cut — `captionsForTimeline`
  *  for text that did not come from a transcript, sharing everything after the
  *  time mapping. Mirrors `Timeline::place_cues`: a `source` base *is* transcript
  *  captioning, a `timeline` base takes the times as they stand, clipped to the
- *  length the cut renders at (with nothing on the timeline there is no end to run
- *  past), and a muted track does not silence them. */
+ *  length the cut renders at (`EMPTY_CUT_WINDOW` when there is nothing on the
+ *  timeline), and a muted track does not silence them. Simultaneous cues keep the
+ *  file's order. */
 export function placeCues(
 	timeline: Timeline,
 	cues: TranscriptSegment[],
 	base: CaptionBase,
 	opts: CaptionOpts = CAPTION_DEFAULTS
 ): CaptionPlacement {
+	let cutEnd = 0;
+	for (const clip of renderedClips(timeline)) cutEnd = Math.max(cutEnd, clip.timeline_start + clipDuration(clip));
+	const windowEnd = cutEnd > 0 ? cutEnd : EMPTY_CUT_WINDOW;
+	const usable = (cue: TranscriptSegment) =>
+		cue.text.trim() !== '' && Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start;
 	let lines: CaptionLine[];
 	if (base.kind === 'source') {
 		lines = projectThroughClips(timeline, (id) => (id === base.assetId ? cues : undefined), opts);
 	} else {
-		let cutEnd = 0;
-		for (const clip of renderedClips(timeline)) cutEnd = Math.max(cutEnd, clip.timeline_start + clipDuration(clip));
-		const window = { start: 0, end: cutEnd > 0 ? cutEnd : Infinity };
 		lines = [];
 		cues.forEach((cue, origin) => {
-			const text = cue.text.trim();
-			if (!text || !Number.isFinite(cue.start) || !Number.isFinite(cue.end) || cue.end <= cue.start) return;
-			pushCaptionLines(lines, text, cue, window, origin, opts);
+			if (!usable(cue)) return;
+			pushCaptionLines(lines, cue.text.trim(), cue, { start: 0, end: windowEnd }, origin, opts);
 		});
 	}
 	const reached = new Set(lines.map((l) => l.origin));
-	const settled = settleCaptionLines(lines, opts, captionAspect(timeline));
+	// A cue that produced nothing either never met the cut, or met it for too
+	// short a moment to read: different complaints, different counts.
+	const sourceClips =
+		base.kind === 'source' ? renderedClips(timeline).filter((c) => c.asset_id === base.assetId) : [];
+	const meetsTheCut = (cue: TranscriptSegment) =>
+		usable(cue) &&
+		(base.kind === 'timeline'
+			? cue.end > 0 && cue.start < windowEnd
+			: sourceClips.some((c) => coversSource(c, cue.start, cue.end)));
+	const droppedShort = cues.filter((cue, origin) => !reached.has(origin) && meetsTheCut(cue)).length;
+	const settled = settleCaptionLines(lines, opts, captionAspect(timeline), 'origin');
 	const kept = new Set(settled.map((l) => l.origin));
 	return {
 		overlays: settled.map((l) => l.overlay),
 		placed: kept.size,
-		droppedOutside: cues.length - reached.size,
+		droppedOutside: cues.length - reached.size - droppedShort,
+		droppedShort,
 		droppedOverlap: reached.size - kept.size
 	};
 }

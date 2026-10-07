@@ -1649,7 +1649,8 @@ export async function importCaptions(path: string, req: CaptionImportRequest = {
 		path,
 		base: req.base ?? null,
 		assetId: req.assetId ?? null,
-		options: req.options ?? null
+		options: req.options ?? null,
+		offset: req.offset ?? null
 	});
 }
 
@@ -1665,7 +1666,7 @@ export async function importCaptionsText(
 		const { overlays, kept, summary } = importCaptionsInto(
 			devTimeline,
 			text,
-			{ format: req.format, base, options: req.options },
+			{ format: req.format, base, options: req.options, offset: req.offset },
 			{ assetKnown: (id) => assetById(id) !== undefined }
 		);
 		devTimeline.overlays = [...kept, ...overlays.map((o) => ({ ...o, id: uid() }))];
@@ -1677,7 +1678,8 @@ export async function importCaptionsText(
 		format: req.format ?? null,
 		base: req.base ?? null,
 		assetId: req.assetId ?? null,
-		options: req.options ?? null
+		options: req.options ?? null,
+		offset: req.offset ?? null
 	});
 }
 

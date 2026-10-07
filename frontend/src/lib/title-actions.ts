@@ -9,11 +9,13 @@ import { toast } from './notifications.svelte';
 import { confirmAction, pickCaptionFile, type CaptionFilePick } from './api';
 import { describeImport } from './caption-import';
 import {
+	CAPTION_CONFIRM_TITLE,
 	IMPORT_CONFIRM_TITLE,
 	TIMELINE_CHOICE,
 	generatedCount,
 	importRequest,
 	importTone,
+	keepLinesOn,
 	replaceConfirm,
 	type ImportChoice
 } from './caption-import-ui';
@@ -66,12 +68,26 @@ export function pickTitle(o: TextOverlay) {
  *  means a later trim moves the words out from under them. Re-running replaces
  *  the generated set, so the button stays the same after the first press and
  *  only its label admits what it is doing. */
-export function makeCaptions(): Promise<void> | undefined {
+export async function makeCaptions(): Promise<void> {
 	if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
 		toast.error('Put a clip on the timeline first');
 		return;
 	}
-	return attempt(() => editor.generateCaptions({ style: ui.captionStyle }));
+	return attempt(async () => {
+		if (!(await confirmReplaceCaptions(CAPTION_CONFIRM_TITLE))) return;
+		await editor.generateCaptions({ style: ui.captionStyle });
+	});
+}
+
+/** Ask before captions are written over ones already on the cut — a set that was
+ *  generated from transcripts or imported from a subtitle file, which the engine
+ *  treats as one (captions are one lane of text) and replaces whole. Counted on
+ *  the live cut, the one the edit lands on, even while a proposal is on screen.
+ *  `true` when there is nothing to replace or the user agreed; `fileName` names
+ *  what is coming in, for an import. */
+export async function confirmReplaceCaptions(title: string, fileName?: string): Promise<boolean> {
+	const existing = generatedCount(editor.liveTimeline.overlays);
+	return existing === 0 || (await confirmAction(replaceConfirm(existing, fileName), title));
 }
 
 export function dropCaptions(): Promise<void> {
@@ -105,13 +121,11 @@ export async function importCaptionFile(choice: ImportChoice = TIMELINE_CHOICE):
 	if (!picked || importing) return false;
 	importing = true;
 	try {
-		// Counted on the live cut: that is what the import replaces, even while a
-		// proposal is on screen and `editor.overlays` shows its captions instead.
-		const existing = generatedCount(editor.liveTimeline.overlays);
-		if (existing > 0 && !(await confirmAction(replaceConfirm(existing, picked.name), IMPORT_CONFIRM_TITLE))) {
-			return false;
-		}
-		const req = importRequest(choice, ui.captionStyle);
+		if (!(await confirmReplaceCaptions(IMPORT_CONFIRM_TITLE, picked.name))) return false;
+		const req = importRequest(choice, ui.captionStyle, {
+			keepLines: keepLinesOn(ui.captionImportKeepLines, ui.captionStyle, editor.liveTimeline.format),
+			offset: ui.captionImportOffset
+		});
 		const summary =
 			picked.kind === 'path'
 				? await editor.importCaptions(picked.path, req)

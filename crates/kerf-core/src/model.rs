@@ -1590,6 +1590,12 @@ const CHAR_ADVANCE: f64 = 0.6;
 /// How much of the frame width a caption may take.
 const CAPTION_WIDTH: f64 = 0.9;
 
+/// How far into an *empty* timeline imported caption cues may reach (seconds).
+/// A cut has an end that cues are clipped to; with nothing on the timeline yet
+/// there is none, and a file's times are then bounded by the day instead of by
+/// whatever a hand-edited file says.
+pub const EMPTY_CUT_WINDOW: f64 = 24.0 * 3600.0;
+
 /// The frame captions assume when the project has not picked one. A timeline
 /// cannot see its assets, so it cannot derive the footage default `export_format`
 /// would use — and 16:9 is wide enough that the fit below never binds, which is
@@ -1654,37 +1660,60 @@ fn chunk_words(text: &str, layout: CaptionLayout) -> Vec<String> {
 /// approximation available here: neither speech backend reports word timings
 /// (`TranscriptSegment` has only a start and an end), so within a segment the
 /// speaker is assumed to be at a steady pace.
+///
+/// The merge is repeated — join the first too-short line to its shorter
+/// neighbour, re-time everything, look again — because joining changes every
+/// line's share. What that costs is the *scan*, not the bookkeeping: weights and
+/// their total are kept as they change (a merge adds exactly the joining space)
+/// and a scan stops at the first line that is too short, so a pass allocates
+/// nothing and the text is only copied for the lines actually merged. With a
+/// cue of a thousand one-word lines that is the difference between a millisecond
+/// and a second — imported files make such cues possible.
 fn time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange, String)> {
     let mut chunks = chunks;
     let duration = (span.end - span.start).max(0.0);
-    loop {
-        let weights: Vec<f64> = chunks.iter().map(|c| c.chars().count().max(1) as f64).collect();
-        let total: f64 = weights.iter().sum();
-        let mut timed: Vec<(TimeRange, String)> = Vec::with_capacity(chunks.len());
-        let mut at = span.start;
-        for (i, text) in chunks.iter().enumerate() {
+    let mut weights: Vec<f64> = chunks.iter().map(|c| c.chars().count().max(1) as f64).collect();
+    let mut total: f64 = weights.iter().sum();
+    // The end of chunk `i` of `n`, given where the previous one ended.
+    let end_of = |weights: &[f64], total: f64, at: f64, i: usize| {
+        if i + 1 == weights.len() {
+            span.end
+        } else {
             let share = if total > 0.0 { weights[i] / total } else { 1.0 };
-            let end = if i + 1 == chunks.len() {
-                span.end
-            } else {
-                at + duration * share
-            };
-            timed.push((TimeRange { start: at, end }, text.clone()));
+            at + duration * share
+        }
+    };
+    // A whole segment shorter than `min` is one line, not a merge loop.
+    while chunks.len() >= 2 {
+        let mut at = span.start;
+        let mut short = None;
+        for i in 0..chunks.len() {
+            let end = end_of(&weights, total, at, i);
+            if end - at < min {
+                short = Some(i);
+                break;
+            }
             at = end;
         }
-        // A whole segment shorter than `min` is one line, not a merge loop.
-        if chunks.len() < 2 {
-            return timed;
-        }
-        let short = timed.iter().position(|(r, _)| r.end - r.start < min);
-        let Some(i) = short else { return timed };
+        let Some(i) = short else { break };
         // Merge into the shorter neighbour so the joined line stays as close to
         // the requested width as the timing allows.
         let merge_back = i > 0 && (i + 1 == chunks.len() || chunks[i - 1].chars().count() <= chunks[i + 1].chars().count());
         let into = if merge_back { i - 1 } else { i };
         let moved = chunks.remove(into + 1);
         chunks[into] = format!("{}{}{}", chunks[into], ' ', moved);
+        let moved_weight = weights.remove(into + 1);
+        weights[into] += moved_weight + 1.0;
+        total += 1.0;
     }
+    let mut timed: Vec<(TimeRange, String)> = Vec::with_capacity(chunks.len());
+    let mut at = span.start;
+    for (i, text) in chunks.into_iter().enumerate() {
+        let end = end_of(&weights, total, at, i);
+        timed.push((TimeRange { start: at, end }, text));
+        at = end;
+    }
+    timed
 }
 
 /// One caption line on its way to the screen: when, what, and which input it
@@ -1753,15 +1782,37 @@ fn project_through_clips<'a>(
     lines
 }
 
+/// How lines that start at the same moment are ordered — which of them gets the
+/// slot and which waits behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimultaneousLines {
+    /// Alphabetically. All a transcript has: its segments are in no meaningful
+    /// order against each other, and this is what it has always done.
+    ByText,
+    /// In the order the input gave them. An imported file's cues are in the
+    /// order its author wrote them, so two cues at one timecode keep that order
+    /// instead of whichever sorts first.
+    ByOrigin,
+}
+
 /// Settle chunked lines into the caption lane: ordered, de-duplicated, never two
 /// on screen at once, each sized to fit the frame. Returns each overlay with the
 /// `origin` of the line it came from.
-fn settle_caption_lines(mut lines: Vec<CaptionLine>, layout: CaptionLayout, aspect: f64) -> Vec<(TextOverlay, usize)> {
+fn settle_caption_lines(
+    mut lines: Vec<CaptionLine>,
+    layout: CaptionLayout,
+    aspect: f64,
+    simultaneous: SimultaneousLines,
+) -> Vec<(TextOverlay, usize)> {
     lines.sort_by(|a, b| a.range.start.total_cmp(&b.range.start).then_with(|| a.text.cmp(&b.text)));
     // The same words can reach two clips — `extract_audio` leaves the picture
     // and its detached audio both referencing the asset — and drawing one
     // caption twice is drawing it bolder, not twice.
     lines.dedup_by(|a, b| a.text == b.text && (a.range.start - b.range.start).abs() < 1e-3);
+    if simultaneous == SimultaneousLines::ByOrigin {
+        // Stable, so everything else keeps the order it was just given.
+        lines.sort_by(|a, b| a.range.start.total_cmp(&b.range.start).then_with(|| a.origin.cmp(&b.origin)));
+    }
     // Captions are one lane of text at one screen position, so two at once is
     // two unreadable ones. The same footage reaching the cut twice — a
     // callback shot, or a full source parked under the edit — otherwise
@@ -1837,15 +1888,19 @@ impl CaptionTimeBase {
 }
 
 /// Imported cues laid onto the cut: the overlays, and an account of every cue.
-/// `placed + dropped_outside + dropped_overlap` is the number of cues offered.
+/// `placed + dropped_outside + dropped_short + dropped_overlap` is the number of
+/// cues offered.
 #[derive(Debug, Clone, Default)]
 pub struct CaptionPlacement {
     pub overlays: Vec<TextOverlay>,
     /// Cues that put at least one caption on screen.
     pub placed: usize,
-    /// Cues that reached nothing: past the end of the cut, or timing footage no
-    /// (rendered) clip shows, or too little of either to read.
+    /// Cues that never met the cut: past its end or before its start, timing
+    /// footage no (rendered) clip shows, or not a usable cue at all.
     pub dropped_outside: usize,
+    /// Cues that did meet the cut, but for a moment too short to read — their own
+    /// length, or the sliver of them left inside its edge (or a clip's).
+    pub dropped_short: usize,
     /// Cues that did reach the cut but lost their slot — the same words at the
     /// same moment as an earlier cue, or wholly under one that was already on
     /// screen. Captions are one lane of text.
@@ -1875,7 +1930,7 @@ impl Timeline {
         let layout = opts.resolve();
         let rendered = self.for_render();
         let lines = project_through_clips(&rendered, |asset| transcripts.get(&asset).map(Vec::as_slice), layout);
-        settle_caption_lines(lines, layout, self.caption_aspect())
+        settle_caption_lines(lines, layout, self.caption_aspect(), SimultaneousLines::ByText)
             .into_iter()
             .map(|(overlay, _)| overlay)
             .collect()
@@ -1899,36 +1954,63 @@ impl Timeline {
     ///   whole film outruns a short cut), and — unlike source time — a muted
     ///   track does not silence them: the file captions the finished cut, not
     ///   one clip's sound. With nothing on the timeline yet there is no end to
-    ///   run past, so nothing is dropped.
+    ///   run past, so the window is [`EMPTY_CUT_WINDOW`] instead.
+    ///
+    /// Simultaneous cues keep the order the input gave them (transcripts, which
+    /// have none, sort alphabetically). Every cue is accounted for in exactly one
+    /// bucket of the result.
     pub fn place_cues(&self, cues: &[TranscriptSegment], base: CaptionTimeBase, opts: CaptionOptions) -> CaptionPlacement {
         let layout = opts.resolve();
         let rendered = self.for_render();
+        let cut_end = rendered.duration();
+        let window_end = if cut_end > 0.0 { cut_end } else { EMPTY_CUT_WINDOW };
+        let usable = |cue: &TranscriptSegment| {
+            !cue.text.trim().is_empty() && cue.start.is_finite() && cue.end.is_finite() && cue.end > cue.start
+        };
         let lines = match base {
             CaptionTimeBase::Source(asset) => project_through_clips(&rendered, |id| (id == asset).then_some(cues), layout),
             CaptionTimeBase::Timeline => {
-                let cut_end = rendered.duration();
-                let window = (0.0, if cut_end > 0.0 { cut_end } else { f64::INFINITY });
                 let mut lines = Vec::new();
-                for (origin, cue) in cues.iter().enumerate() {
-                    let text = cue.text.trim();
-                    if text.is_empty() || !cue.start.is_finite() || !cue.end.is_finite() || cue.end <= cue.start {
-                        continue;
-                    }
+                for (origin, cue) in cues.iter().enumerate().filter(|(_, cue)| usable(cue)) {
                     let span = TimeRange {
                         start: cue.start,
                         end: cue.end,
                     };
-                    push_caption_lines(&mut lines, text, span, window, origin, layout);
+                    push_caption_lines(&mut lines, cue.text.trim(), span, (0.0, window_end), origin, layout);
                 }
                 lines
             }
         };
         let reached: HashSet<usize> = lines.iter().map(|l| l.origin).collect();
-        let settled = settle_caption_lines(lines, layout, self.caption_aspect());
+        // A cue that produced nothing either never met the cut, or met it for too
+        // short a moment to read — different complaints, so different counts.
+        let source_clips: Vec<&Clip> = match base {
+            CaptionTimeBase::Source(asset) => rendered
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .filter(|c| c.asset_id == asset)
+                .collect(),
+            CaptionTimeBase::Timeline => Vec::new(),
+        };
+        let meets_the_cut = |cue: &TranscriptSegment| {
+            usable(cue)
+                && match base {
+                    CaptionTimeBase::Timeline => cue.end > 0.0 && cue.start < window_end,
+                    CaptionTimeBase::Source(_) => source_clips.iter().any(|c| c.covers_source(cue.start, cue.end)),
+                }
+        };
+        let dropped_short = cues
+            .iter()
+            .enumerate()
+            .filter(|(origin, cue)| !reached.contains(origin) && meets_the_cut(cue))
+            .count();
+        let settled = settle_caption_lines(lines, layout, self.caption_aspect(), SimultaneousLines::ByOrigin);
         let kept: HashSet<usize> = settled.iter().map(|(_, origin)| *origin).collect();
         CaptionPlacement {
             placed: kept.len(),
-            dropped_outside: cues.len() - reached.len(),
+            dropped_outside: cues.len() - reached.len() - dropped_short,
+            dropped_short,
             dropped_overlap: reached.len() - kept.len(),
             overlays: settled.into_iter().map(|(overlay, _)| overlay).collect(),
         }
@@ -5446,7 +5528,11 @@ mod tests {
     /// Every cue offered is in exactly one bucket — the invariant the summary's
     /// numbers are built on.
     fn accounted(p: &CaptionPlacement, offered: usize) {
-        assert_eq!(p.placed + p.dropped_outside + p.dropped_overlap, offered, "{p:?}");
+        assert_eq!(
+            p.placed + p.dropped_outside + p.dropped_short + p.dropped_overlap,
+            offered,
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -5560,7 +5646,9 @@ mod tests {
             CaptionOptions::default(),
         );
         assert!(sliver.overlays.is_empty());
-        assert_eq!(sliver.dropped_outside, 1);
+        // It met the cut, for too short a moment to read: not "outside" it.
+        assert_eq!((sliver.dropped_outside, sliver.dropped_short), (0, 1));
+        accounted(&sliver, 1);
     }
 
     #[test]
@@ -5730,6 +5818,170 @@ mod tests {
             accounted(&p, 5);
             assert_eq!((p.placed, p.dropped_outside), (1, 4), "{base:?}");
         }
+    }
+
+    #[test]
+    fn a_cue_that_meets_the_cut_too_briefly_is_short_not_outside() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 10.0, 20.0, 0.0));
+        let cues = [
+            seg(11.0, 13.0, "readable"),
+            // Wholly on the footage, but a blink long.
+            seg(14.0, 14.05, "a blink"),
+            // Starts before the kept footage and leaves a sliver of it.
+            seg(9.0, 10.05, "just inside"),
+            // Not on the kept footage at all.
+            seg(30.0, 32.0, "elsewhere"),
+        ];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default());
+        accounted(&p, 4);
+        assert_eq!(
+            (p.placed, p.dropped_short, p.dropped_outside, p.dropped_overlap),
+            (1, 2, 1, 0),
+            "{p:?}"
+        );
+        // On the timeline clock the same split: before 0 and after the end are
+        // outside; a blink or a sliver at an edge is short.
+        let cut = cut_of(asset, 10.0);
+        let cues = [
+            seg(1.0, 3.0, "readable"),
+            seg(4.0, 4.05, "a blink"),
+            seg(-5.0, 0.05, "starts early"),
+            seg(-5.0, -1.0, "before the start"),
+            seg(9.96, 14.0, "at the end"),
+            seg(10.0, 12.0, "after the end"),
+        ];
+        let p = cut.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        accounted(&p, 6);
+        assert_eq!((p.placed, p.dropped_short, p.dropped_outside), (1, 3, 2), "{p:?}");
+    }
+
+    #[test]
+    fn simultaneous_imported_cues_keep_the_order_of_the_file() {
+        let asset = Uuid::new_v4();
+        let timeline = cut_of(asset, 10.0);
+        // Two cues at one timecode: the one written first holds the slot.
+        let cues = [seg(1.0, 4.0, "zebra"), seg(1.0, 4.0, "apple")];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        assert_eq!(rounded(&p.overlays), [("zebra".into(), 1.0, 4.0)]);
+        accounted(&p, 2);
+        assert_eq!(p.dropped_overlap, 1);
+        // …through a clip as well…
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Source(asset), CaptionOptions::default());
+        assert_eq!(rounded(&p.overlays), [("zebra".into(), 1.0, 4.0)]);
+        // …and an identical pair is still collapsed even with another between.
+        let cues = [seg(1.0, 3.0, "same"), seg(1.0, 3.0, "other"), seg(1.0, 3.0, "same")];
+        let p = timeline.place_cues(&cues, CaptionTimeBase::Timeline, CaptionOptions::default());
+        accounted(&p, 3);
+        assert_eq!(p.placed, 1, "{p:?}");
+        // A transcript has no order of its own and still sorts alphabetically —
+        // the behavior every existing cut was captioned with.
+        let mut map = HashMap::new();
+        map.insert(asset, cues[..1].to_vec());
+        map.insert(asset, vec![seg(1.0, 4.0, "zebra"), seg(1.0, 4.0, "apple")]);
+        let from_transcript = timeline.captions(&map, CaptionOptions::default());
+        assert_eq!(rounded(&from_transcript), [("apple".into(), 1.0, 4.0)]);
+    }
+
+    /// The line timer exactly as it was before it was made cheaper: everything
+    /// recomputed — and every chunk cloned — on every pass.
+    fn reference_time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange, String)> {
+        let mut chunks = chunks;
+        let duration = (span.end - span.start).max(0.0);
+        loop {
+            let weights: Vec<f64> = chunks.iter().map(|c| c.chars().count().max(1) as f64).collect();
+            let total: f64 = weights.iter().sum();
+            let mut timed: Vec<(TimeRange, String)> = Vec::with_capacity(chunks.len());
+            let mut at = span.start;
+            for (i, text) in chunks.iter().enumerate() {
+                let share = if total > 0.0 { weights[i] / total } else { 1.0 };
+                let end = if i + 1 == chunks.len() {
+                    span.end
+                } else {
+                    at + duration * share
+                };
+                timed.push((TimeRange { start: at, end }, text.clone()));
+                at = end;
+            }
+            if chunks.len() < 2 {
+                return timed;
+            }
+            let short = timed.iter().position(|(r, _)| r.end - r.start < min);
+            let Some(i) = short else { return timed };
+            let merge_back = i > 0 && (i + 1 == chunks.len() || chunks[i - 1].chars().count() <= chunks[i + 1].chars().count());
+            let into = if merge_back { i - 1 } else { i };
+            let moved = chunks.remove(into + 1);
+            chunks[into] = format!("{}{}{}", chunks[into], ' ', moved);
+        }
+    }
+
+    #[test]
+    fn the_cheaper_line_timer_gives_exactly_the_old_answers() {
+        // A deterministic pseudo-random sweep: chunk counts from none to dozens,
+        // chunk widths from one letter to a long word, spans from nothing to
+        // minutes and starting anywhere, every floor in use. Bit-for-bit equal,
+        // since it decides where every transcript caption starts.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for case in 0..6_000 {
+            let count = next(60) as usize;
+            let chunks: Vec<String> = (0..count)
+                .map(|_| {
+                    let width = if next(5) == 0 { 30 } else { 8 };
+                    "x".repeat(1 + next(width) as usize)
+                })
+                .collect();
+            let start = (next(100_000) as f64) / 100.0 - 50.0;
+            let len = match next(4) {
+                0 => 0.0,
+                1 => (next(100) as f64) / 1000.0,
+                2 => (next(3000) as f64) / 100.0,
+                _ => (next(100_000) as f64) / 10.0,
+            };
+            let span = TimeRange { start, end: start + len };
+            let min = [MIN_CAPTION, MIN_WORD_CAPTION, 0.0, 5.0][next(4) as usize];
+            let old = reference_time_chunks(chunks.clone(), span, min);
+            let new = time_chunks(chunks, span, min);
+            assert_eq!(old.len(), new.len(), "case {case}");
+            for (a, b) in old.iter().zip(&new) {
+                assert_eq!(
+                    (a.0.start.to_bits(), a.0.end.to_bits(), &a.1),
+                    (b.0.start.to_bits(), b.0.end.to_bits(), &b.1),
+                    "case {case}: {span:?} min {min}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_thousand_word_cue_in_word_punch_places_quickly() {
+        // 100 cues of a thousand one-letter words, each over a few seconds: every
+        // word is a flicker and has to be merged. The old timer rebuilt (and
+        // cloned) every chunk per merge — about three seconds for exactly this.
+        let asset = Uuid::new_v4();
+        let timeline = cut_of(asset, 1_000.0);
+        let thousand = vec!["a"; 1000].join(" ");
+        let cues: Vec<TranscriptSegment> = (0..100)
+            .map(|i| seg(i as f64 * 10.0, i as f64 * 10.0 + 6.0, &thousand))
+            .collect();
+        let started = std::time::Instant::now();
+        let p = timeline.place_cues(
+            &cues,
+            CaptionTimeBase::Timeline,
+            CaptionOptions::styled(CaptionStyle::WordPunch),
+        );
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "placing took {took:?}");
+        accounted(&p, 100);
+        assert_eq!(p.placed, 100);
+        // Nothing was lost to the merging: every word is still there.
+        let words: usize = p.overlays.iter().map(|o| o.text.split_whitespace().count()).sum();
+        assert_eq!(words, 100 * 1000);
     }
 
     #[test]

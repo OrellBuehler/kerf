@@ -1,10 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	CAPTION_EXTENSIONS,
+	CAPTION_CONFIRM_TITLE,
 	CAPTION_HINT,
 	IMPORT_BASES,
+	KEEP_LINES,
 	MENU_ASSET_LIMIT,
 	NO_SOURCE_HINT,
+	OFFSET_HINT,
 	TIMELINE_CHOICE,
 	baseHint,
 	baseName,
@@ -14,6 +17,10 @@ import {
 	importRequest,
 	importTone,
 	importableAssets,
+	keepLinesDefault,
+	keepLinesHint,
+	keepLinesOn,
+	normalizeOffset,
 	pickImportAsset,
 	recaptionHint,
 	replaceConfirm,
@@ -167,6 +174,76 @@ describe('the choice and the request', () => {
 		});
 	});
 
+	test('the offset and "keep the file\'s lines" ride along, and only when they do something', () => {
+		const keep = { max_words: KEEP_LINES.max_words, max_chars: KEEP_LINES.max_chars };
+		expect(importRequest(TIMELINE_CHOICE, 'lines', { keepLines: true })).toEqual({
+			base: 'timeline',
+			options: { style: 'lines', ...keep }
+		});
+		// Word punch has no lines to keep: sending the override would defeat the look.
+		expect(importRequest(TIMELINE_CHOICE, 'word_punch', { keepLines: true })).toEqual({
+			base: 'timeline',
+			options: { style: 'word_punch' }
+		});
+		expect(importRequest(TIMELINE_CHOICE, 'lines', { offset: -3600 })).toEqual({
+			base: 'timeline',
+			options: { style: 'lines' },
+			offset: -3600
+		});
+		expect(importRequest({ base: 'source', assetId: 'a' }, 'lines', { keepLines: true, offset: 2.5 })).toEqual({
+			base: 'source',
+			assetId: 'a',
+			options: { style: 'lines', ...keep },
+			offset: 2.5
+		});
+		// No shift is no field, however it was spelled.
+		for (const none of [0, -0, null, undefined, NaN, Infinity]) {
+			expect(importRequest(TIMELINE_CHOICE, 'lines', { offset: none })).toEqual({
+				base: 'timeline',
+				options: { style: 'lines' }
+			});
+		}
+		// A whole cue is one chunk: more words and characters than a cue can hold.
+		expect(KEEP_LINES.max_chars).toBeGreaterThanOrEqual(2000);
+		expect(KEEP_LINES.max_words).toBeGreaterThanOrEqual(1000);
+	});
+
+	test('the offset is held to what the engine takes', () => {
+		expect(normalizeOffset(12.5)).toBe(12.5);
+		expect(normalizeOffset(-3600)).toBe(-3600);
+		expect(normalizeOffset(1e9)).toBe(360_000);
+		expect(normalizeOffset(-1e9)).toBe(-360_000);
+		expect(normalizeOffset(null)).toBe(0);
+		expect(normalizeOffset(NaN)).toBe(0);
+		expect(OFFSET_HINT).toContain('-3600');
+	});
+
+	test('keeping the file\'s lines follows the frame until it is touched, and never in word punch', () => {
+		const wide = { width: 1920, height: 1080 };
+		const tall = { width: 1080, height: 1920 };
+		const square = { width: 1080, height: 1080 };
+		// Landscape and unframed: the file's lines were made for this shape.
+		expect(keepLinesDefault(wide)).toBe(true);
+		expect(keepLinesDefault(null)).toBe(true);
+		expect(keepLinesDefault(undefined)).toBe(true);
+		// Square and tall: one long line would be drawn too small to read.
+		expect(keepLinesDefault(tall)).toBe(false);
+		expect(keepLinesDefault(square)).toBe(false);
+		expect(keepLinesOn(null, 'lines', wide)).toBe(true);
+		expect(keepLinesOn(null, 'lines', tall)).toBe(false);
+		// Touching the box settles it, whatever the frame.
+		expect(keepLinesOn(false, 'lines', wide)).toBe(false);
+		expect(keepLinesOn(true, 'lines', tall)).toBe(true);
+		// Word punch is never "lines".
+		expect(keepLinesOn(true, 'word_punch', wide)).toBe(false);
+		expect(keepLinesOn(null, 'word_punch', null)).toBe(false);
+		expect(keepLinesHint('word_punch', false, wide)).toContain('one word at a time');
+		expect(keepLinesHint('lines', true, wide)).toContain('stays one caption');
+		expect(keepLinesHint('lines', false, tall)).toContain('tall frame');
+		expect(keepLinesHint('lines', false, wide)).toContain('split into short lines');
+		expect(CAPTION_CONFIRM_TITLE).toBe('Caption the cut');
+	});
+
 	test('the two timings are named for what they mean', () => {
 		expect(IMPORT_BASES.map((b) => b.id)).toEqual(['timeline', 'source']);
 		expect(IMPORT_BASES.map((b) => b.label)).toEqual(['Timed to the cut', 'Timed to a source clip']);
@@ -237,6 +314,7 @@ describe('words around the import', () => {
 		captions: 12,
 		skipped_lines: 0,
 		dropped_outside: 0,
+		dropped_short: 0,
 		dropped_overlap: 0,
 		replaced: 0
 	};
@@ -247,6 +325,7 @@ describe('words around the import', () => {
 		expect(importTone({ ...summary, replaced: 9 })).toBe('success');
 		expect(importTone({ ...summary, placed: 9, dropped_outside: 1 })).toBe('warning');
 		expect(importTone({ ...summary, placed: 9, dropped_overlap: 1 })).toBe('warning');
+		expect(importTone({ ...summary, placed: 9, dropped_short: 1 })).toBe('warning');
 		expect(importTone({ ...summary, skipped_lines: 2 })).toBe('warning');
 	});
 

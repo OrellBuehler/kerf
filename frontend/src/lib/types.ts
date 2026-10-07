@@ -284,9 +284,9 @@ export type CaptionFormat = 'srt' | 'ass';
 export type CaptionTimeBase = 'timeline' | 'source';
 
 /** What an import did. Every usable cue lands in exactly one of `placed`,
- *  `dropped_outside` or `dropped_overlap`, so
- *  `cues === placed + dropped_outside + dropped_overlap`; `captions` can exceed
- *  `placed` because a long cue is split into several lines. */
+ *  `dropped_outside`, `dropped_short` or `dropped_overlap`, so
+ *  `cues === placed + dropped_outside + dropped_short + dropped_overlap`;
+ *  `captions` can exceed `placed` because a long cue is split into several lines. */
 export interface CaptionImportSummary {
 	format: CaptionFormat;
 	/** Usable cues read from the file. */
@@ -297,8 +297,11 @@ export interface CaptionImportSummary {
 	captions: number;
 	/** Entries of the file that could not be used. */
 	skipped_lines: number;
-	/** Cues past the end of the cut, or timing footage no clip shows. */
+	/** Cues past the end of the cut (or before its start), or timing footage no
+	 *  clip shows. */
 	dropped_outside: number;
+	/** Cues that do reach the cut but only for a moment too short to read. */
+	dropped_short: number;
 	/** Cues that lost their slot: captions are one lane, never two at once. */
 	dropped_overlap: number;
 	/** Earlier generated / imported captions this import replaced. */
@@ -318,6 +321,10 @@ export interface CaptionImportRequest {
 	assetId?: string;
 	/** The caption look, as `generate_captions` takes it. */
 	options?: CaptionOptions;
+	/** Seconds added to every cue before it is placed; negative moves them
+	 *  earlier. For a file whose clock does not start where the picture does — a
+	 *  broadcast SRT that begins at 01:00:00 wants `-3600`. */
+	offset?: number;
 }
 
 export interface Clip {

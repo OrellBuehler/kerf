@@ -25,12 +25,14 @@
 //! [`Timeline::place_cues`]: crate::model::Timeline::place_cues
 //! [`Project::import_captions`]: crate::project::Project::import_captions
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::model::{CaptionOptions, CaptionTimeBase};
 
 /// The largest subtitle file Kerf will read. A feature film's SRT is ~100 KB;
 /// the path comes from a picker (or an agent) that could aim at anything.
@@ -45,6 +47,29 @@ pub const MAX_CAPTION_CUES: usize = 10_000;
 /// a longer one is a broken file, and chunking one into thousands of one-word
 /// lines is where the merge pass in the line timer would crawl.
 pub const MAX_CUE_CHARS: usize = 2_000;
+
+/// The longest one *line* of a file may be (characters) before it is even
+/// cleaned. A cue's text is capped at [`MAX_CUE_CHARS`] after markup is removed,
+/// but a megabyte of `<` or `{` is a megabyte to scan to find that out — so a
+/// line this long is refused outright. A karaoke line with an override per
+/// syllable is a couple of KB; nothing real comes near this.
+pub const MAX_LINE_CHARS: usize = 16_384;
+
+/// The most words one import may carry across all its cues. Chunking a cue into
+/// lines merges the ones too short to read, which costs more the more chunks one
+/// cue has; this is what keeps the worst case (hundreds of cues of a thousand
+/// one-letter words, in word-punch) a fraction of a second rather than minutes.
+/// A ten-hour talk is ~90,000 words.
+pub const MAX_CAPTION_WORDS: usize = 100_000;
+
+/// The most caption overlays one import may write. The timeline is a single JSON
+/// blob rewritten for every edit and every history snapshot; 20,000 captions is
+/// ~4 MB of it, a three-hour film in word-punch. Past that, an import is refused
+/// rather than slowing every edit that follows.
+pub const MAX_IMPORTED_CAPTIONS: usize = 20_000;
+
+/// The widest a time offset may be (seconds, either way): 100 hours.
+pub const MAX_CAPTION_OFFSET: f64 = 360_000.0;
 
 /// A subtitle format Kerf can read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -101,7 +126,9 @@ impl CaptionFormat {
     pub fn detect(text: &str) -> Self {
         let mut arrow = false;
         let mut dialogue = false;
-        for line in text.trim_start_matches('\u{feff}').lines() {
+        // Split on either line end, not `lines()`: a CR-only file (an old Mac
+        // tool) is one line to `lines()` and its `[Script Info]` would be missed.
+        for line in text.trim_start_matches('\u{feff}').split(['\r', '\n']) {
             let line = line.trim();
             if line.eq_ignore_ascii_case("[script info]") || line.eq_ignore_ascii_case("[events]") {
                 return Self::Ass;
@@ -182,15 +209,31 @@ const MARKUP_TAGS: &[&str] = &[
     "a", "b", "br", "c", "div", "em", "font", "i", "lang", "p", "rp", "rt", "ruby", "s", "span", "strike", "strong", "u", "v",
 ];
 
+/// How far ahead of a `<` its closing `>` may be and still make it a tag.
+const MAX_TAG_BYTES: usize = 256;
+
 /// Remove `<i>` / `</font>`-style markup from one line; `<br>` becomes a line
 /// break. Angle brackets that are not a known tag are kept.
-fn strip_markup(line: &str) -> String {
+///
+/// Linear in the line: a tag's `>` is looked for only within [`MAX_TAG_BYTES`]
+/// and only up to the next `<` (which starts the next candidate), so no byte is
+/// scanned more than once or twice however many unmatched `<` there are. An
+/// unbounded `find('>')` per `<` made a file of `<<<<…` quadratic.
+fn strip_markup(line: &str) -> Cow<'_, str> {
+    if !line.contains('<') {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let tag = after.find('>').filter(|&close| close <= 256).map(|close| &after[..close]);
+        let window = &after.as_bytes()[..after.len().min(MAX_TAG_BYTES + 1)];
+        let close = window
+            .iter()
+            .position(|&b| b == b'>' || b == b'<')
+            .filter(|&i| window[i] == b'>');
+        let tag = close.map(|i| &after[..i]);
         let name = tag.map(|t| {
             t.trim_start_matches('/')
                 .split(|c: char| !c.is_ascii_alphanumeric())
@@ -199,7 +242,7 @@ fn strip_markup(line: &str) -> String {
                 .to_ascii_lowercase()
         });
         match (tag, name) {
-            (Some(inner), Some(name)) if !inner.contains('<') && MARKUP_TAGS.contains(&name.as_str()) => {
+            (Some(inner), Some(name)) if MARKUP_TAGS.contains(&name.as_str()) => {
                 if name == "br" {
                     out.push('\n');
                 }
@@ -212,44 +255,106 @@ fn strip_markup(line: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
 /// Remove `{…}` blocks. With `only_overrides`, only the ones that start `{\` —
 /// SubRip's own `{laughs}` is text, an ASS `{comment}` is not. An unterminated
 /// `{` is literal text.
-fn strip_braces(line: &str, only_overrides: bool) -> String {
+///
+/// Linear in the line: a `{` that cannot start a block is literal without a scan,
+/// and one that *can* either finds its `}` (and the scan is consumed) or finds
+/// none — and then no `}` remains anywhere ahead, so every later `{` is literal
+/// too and the rest is copied as it stands.
+fn strip_braces(line: &str, only_overrides: bool) -> Cow<'_, str> {
+    if !line.contains('{') {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
+        if only_overrides && !after.starts_with('\\') {
+            out.push('{');
+            rest = after;
+            continue;
+        }
         match after.find('}') {
-            Some(close) if !only_overrides || after.starts_with('\\') => rest = &after[close + 1..],
-            _ => {
+            Some(close) => rest = &after[close + 1..],
+            None => {
                 out.push('{');
-                rest = after;
+                out.push_str(after);
+                return Cow::Owned(out);
             }
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
-/// Tidy one text line: collapse runs of whitespace (including the no-break
-/// spaces tools like to leave) to single spaces.
+/// Tidy one text line: control characters other than whitespace removed, runs
+/// of whitespace (including the no-break spaces tools like to leave) collapsed to
+/// single spaces.
+///
+/// A control character has no business in a caption and is dangerous in one: the
+/// text ends up in an `ffmpeg` argument, where a NUL byte makes every spawn fail
+/// ("nul byte found in provided data") — for the preview and the export alike —
+/// until the caption is found and deleted. Tab, CR and the like are whitespace
+/// and are kept as the separators they are.
 fn tidy(line: &str) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(line.len());
+    let mut gap = false;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            gap = !out.is_empty();
+        } else if !c.is_control() {
+            if gap {
+                out.push(' ');
+                gap = false;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A cue's lines cleaned and joined, or empty when nothing is left to show.
 fn join_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
-    lines
-        .flat_map(str::lines)
-        .map(tidy)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_cleaned(lines.map(Cow::Borrowed))
+}
+
+/// [`join_lines`] over lines a cleanup pass already produced (which may hold more
+/// line breaks, from `<br>`).
+fn join_cleaned<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for piece in line.lines() {
+            let piece = tidy(piece);
+            if piece.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&piece);
+        }
+    }
+    out
+}
+
+/// One SubRip text line with its markup and `{\an8}`-style overrides removed.
+fn clean_srt_line(line: &str) -> Cow<'_, str> {
+    match strip_markup(line) {
+        Cow::Borrowed(plain) => strip_braces(plain, true),
+        Cow::Owned(marked) => Cow::Owned(strip_braces(&marked, true).into_owned()),
+    }
+}
+
+/// Whether a raw line is over [`MAX_LINE_CHARS`]. Bytes are checked first: a line
+/// with no more bytes than that cannot have more characters.
+fn too_long(raw: &str) -> bool {
+    raw.len() > MAX_LINE_CHARS && raw.chars().count() > MAX_LINE_CHARS
 }
 
 // ---- SubRip -----------------------------------------------------------------
@@ -276,10 +381,14 @@ fn parse_srt_timing(line: &str) -> Option<(f64, f64)> {
 struct Block<'a> {
     time: Option<(f64, f64)>,
     body: Vec<&'a str>,
+    /// A line of it was over [`MAX_LINE_CHARS`]; the cue is refused whole rather
+    /// than shown with a hole in it.
+    oversized: bool,
 }
 
 /// Read SubRip text. Never fails: what is unusable is counted in
-/// [`ParsedCaptions::skipped`].
+/// [`ParsedCaptions::skipped`]. Stops reading once it holds more than
+/// [`MAX_CAPTION_CUES`] cues (the caller refuses such a file).
 ///
 /// A cue starts at a line with `-->` and runs to the next blank line *or* the
 /// next timing line, whichever comes first — a file with no blank lines between
@@ -290,16 +399,11 @@ pub fn parse_srt(text: &str) -> ParsedCaptions {
     let mut out = ParsedCaptions::default();
 
     fn finish(block: Block<'_>, out: &mut ParsedCaptions) {
-        let Some((start, end)) = block.time else {
+        let Some((start, end)) = block.time.filter(|_| !block.oversized) else {
             out.skipped += 1;
             return;
         };
-        let cleaned = block
-            .body
-            .iter()
-            .map(|l| strip_braces(&strip_markup(l), true))
-            .collect::<Vec<_>>();
-        let text = join_lines(cleaned.iter().map(String::as_str));
+        let text = join_cleaned(block.body.iter().map(|l| clean_srt_line(l)));
         if text.is_empty() || end <= start || text.chars().count() > MAX_CUE_CHARS {
             out.skipped += 1;
             return;
@@ -309,6 +413,19 @@ pub fn parse_srt(text: &str) -> ParsedCaptions {
 
     let mut current: Option<Block<'_>> = None;
     for raw in text.split('\n') {
+        // More cues than an import may carry is an error however many more there
+        // are, so there is no point reading the rest of a file that is mostly cues.
+        if out.cues.len() > MAX_CAPTION_CUES {
+            break;
+        }
+        // Refused before it is cleaned or even trimmed: see `MAX_LINE_CHARS`.
+        if too_long(raw) {
+            match current.as_mut() {
+                Some(block) => block.oversized = true,
+                None => out.skipped += 1,
+            }
+            continue;
+        }
         let line = raw.trim();
         if line.contains("-->") {
             let time = parse_srt_timing(line);
@@ -322,7 +439,11 @@ pub fn parse_srt(text: &str) -> ParsedCaptions {
                     }
                     finish(previous, &mut out);
                 }
-                current = Some(Block { time, body: Vec::new() });
+                current = Some(Block {
+                    time,
+                    body: Vec::new(),
+                    oversized: false,
+                });
                 continue;
             }
         }
@@ -453,6 +574,18 @@ pub fn parse_ass(text: &str) -> Result<ParsedCaptions> {
     let mut section: Option<String> = None;
     let mut columns = EventColumns::DEFAULT;
     for raw in text.split('\n') {
+        if out.cues.len() > MAX_CAPTION_CUES {
+            break; // see `parse_srt`
+        }
+        // Refused before it is cleaned: see `MAX_LINE_CHARS`. Only a dialogue
+        // line is a cue that was lost; a giant comment or style line is not.
+        if too_long(raw) {
+            let head = raw.trim_start().as_bytes();
+            if head.len() >= 9 && head[..9].eq_ignore_ascii_case(b"dialogue:") {
+                out.skipped += 1;
+            }
+            continue;
+        }
         let line = raw.trim();
         if line.is_empty() || line.starts_with(';') || line.starts_with('!') {
             continue;
@@ -495,14 +628,29 @@ pub fn parse_ass(text: &str) -> Result<ParsedCaptions> {
 
 // ---- entry points -----------------------------------------------------------
 
+/// A subtitle file read and ready to import: the format it was read as, its
+/// usable cues in the file's own time, and how many entries were not usable.
+/// Parsing is pure and does not touch a project — callers do it *before* taking
+/// the project lock, so a large file never stalls an edit — and
+/// [`Project::import_captions`](crate::project::Project::import_captions) then
+/// only places what is here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptionFile {
+    pub format: CaptionFormat,
+    pub cues: Vec<ImportedCue>,
+    /// See [`ParsedCaptions::skipped`].
+    pub skipped: usize,
+}
+
 /// Read subtitle text in `format`, or in whichever format it looks like when
-/// `format` is `None`. Returns the format used.
+/// `format` is `None`.
 ///
 /// Errors on text over [`MAX_CAPTION_FILE_BYTES`] (the guard for callers that
-/// hand over text rather than a file), on more than [`MAX_CAPTION_CUES`] cues,
-/// and on an ASS file whose `Format:` line is unusable; an unreadable *entry* is
-/// never an error.
-pub fn parse_captions(text: &str, format: Option<CaptionFormat>) -> Result<(CaptionFormat, ParsedCaptions)> {
+/// hand over text rather than a file), on more than [`MAX_CAPTION_CUES`] cues or
+/// [`MAX_CAPTION_WORDS`] words, and on an ASS file whose `Format:` line is
+/// unusable; an unreadable *entry* is never an error. A file with no cue at all
+/// is not an error here either — that is the import's to refuse.
+pub fn parse_captions(text: &str, format: Option<CaptionFormat>) -> Result<CaptionFile> {
     if text.len() as u64 > MAX_CAPTION_FILE_BYTES {
         return Err(too_large());
     }
@@ -513,11 +661,34 @@ pub fn parse_captions(text: &str, format: Option<CaptionFormat>) -> Result<(Capt
     };
     if parsed.cues.len() > MAX_CAPTION_CUES {
         return Err(Error::InvalidArgument(format!(
-            "this file has {} cues; Kerf imports at most {MAX_CAPTION_CUES} at a time",
-            parsed.cues.len()
+            "this file has more than {MAX_CAPTION_CUES} cues; Kerf imports at most {MAX_CAPTION_CUES} at a time"
         )));
     }
-    Ok((format, parsed))
+    let words: usize = parsed.cues.iter().map(|c| c.text.split_whitespace().count()).sum();
+    if words > MAX_CAPTION_WORDS {
+        return Err(Error::InvalidArgument(format!(
+            "this file has {words} words; Kerf imports at most {MAX_CAPTION_WORDS} at a time"
+        )));
+    }
+    Ok(CaptionFile {
+        format,
+        cues: parsed.cues,
+        skipped: parsed.skipped,
+    })
+}
+
+/// How a [`CaptionFile`] is laid onto the cut.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptionImportRequest {
+    /// Which clock the cue times are on (default: the finished cut's).
+    pub base: CaptionTimeBase,
+    /// The caption look, as `generate_captions` takes it.
+    pub options: CaptionOptions,
+    /// Seconds added to every cue before it is placed; negative moves them
+    /// earlier. For a file whose clock does not start where the picture does — a
+    /// broadcast SRT that begins at `01:00:00` wants `-3600`. At most
+    /// [`MAX_CAPTION_OFFSET`] either way.
+    pub offset: f64,
 }
 
 /// Windows-1252 for the bytes 0x80..=0x9F, where it differs from Latin-1 (which
@@ -619,8 +790,9 @@ pub fn read_caption_file(path: &Path) -> Result<String> {
 
 /// What an import did, in the numbers a caller reports.
 ///
-/// Every usable cue ends up in exactly one of `placed`, `dropped_outside` or
-/// `dropped_overlap`, so `cues == placed + dropped_outside + dropped_overlap`;
+/// Every usable cue ends up in exactly one of `placed`, `dropped_outside`,
+/// `dropped_short` or `dropped_overlap`, so
+/// `cues == placed + dropped_outside + dropped_short + dropped_overlap`;
 /// `captions` can exceed `placed` because a long cue is split into several lines.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ImportSummary {
@@ -634,8 +806,12 @@ pub struct ImportSummary {
     pub captions: usize,
     /// Entries of the file that could not be used (see [`ParsedCaptions::skipped`]).
     pub skipped_lines: usize,
-    /// Cues past the end of the cut, or timing footage no clip shows.
+    /// Cues past the end of the cut (or before its start), or timing footage no
+    /// clip shows.
     pub dropped_outside: usize,
+    /// Cues that do reach the cut but only for a moment too short to read — their
+    /// own length, or the sliver of them left inside its edge.
+    pub dropped_short: usize,
     /// Cues that lost their slot: captions are one lane, never two at once.
     pub dropped_overlap: usize,
     /// Earlier generated / imported captions this import replaced.
@@ -952,18 +1128,161 @@ mod tests {
 
     #[test]
     fn parse_captions_follows_a_named_format_over_a_guess_and_caps_the_cue_count() {
-        let (format, parsed) = parse_captions(ASS, None).unwrap();
-        assert_eq!((format, parsed.cues.len()), (CaptionFormat::Ass, 2));
+        let file = parse_captions(ASS, None).unwrap();
+        assert_eq!((file.format, file.cues.len()), (CaptionFormat::Ass, 2));
         // Told it is SRT, an ASS file has no timing lines: nothing, not a panic.
-        let (format, parsed) = parse_captions(ASS, Some(CaptionFormat::Srt)).unwrap();
-        assert_eq!(format, CaptionFormat::Srt);
-        assert!(parsed.cues.is_empty());
+        let file = parse_captions(ASS, Some(CaptionFormat::Srt)).unwrap();
+        assert_eq!(file.format, CaptionFormat::Srt);
+        assert!(file.cues.is_empty());
 
         let many: String = (0..=MAX_CAPTION_CUES)
             .map(|i| format!("{i}\n00:00:00,000 --> 00:00:01,000\nx\n\n"))
             .collect();
         let err = parse_captions(&many, None).unwrap_err();
         assert!(err.to_string().contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn the_words_in_one_import_are_capped() {
+        // 101 cues of a thousand one-letter words: each is legal, together they are
+        // the quadratic-merge worst case the cap exists for.
+        let thousand = vec!["a"; 1000].join(" ");
+        let text: String = (0..101)
+            .map(|i| format!("{i}\n00:00:{:02},000 --> 00:00:{:02},500\n{thousand}\n\n", i % 60, i % 60))
+            .collect();
+        let err = parse_captions(&text, None).unwrap_err().to_string();
+        assert!(err.contains("101000 words") && err.contains("at most 100000"), "{err}");
+        assert!(parse_captions(&text[..text.len() / 2], None).is_ok(), "half of it is fine");
+    }
+
+    #[test]
+    fn a_cr_only_file_is_still_told_apart() {
+        // An old Mac tool: one "line" to `str::lines`, so its `[Script Info]` used
+        // to go unseen and the file was read as SRT — and found empty.
+        let ass = "[Script Info]\rTitle: x\r\r[Events]\rFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\rDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,Hi\r";
+        assert_eq!(CaptionFormat::detect(ass), CaptionFormat::Ass);
+        let file = parse_captions(ass, None).unwrap();
+        assert_eq!((file.format, file.cues.len()), (CaptionFormat::Ass, 1));
+        let srt = "1\r00:00:01,000 --> 00:00:02,000\rHi\r";
+        assert_eq!(parse_captions(srt, None).unwrap().format, CaptionFormat::Srt);
+        let headerless = "Dialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,Hi\r";
+        assert_eq!(CaptionFormat::detect(headerless), CaptionFormat::Ass);
+    }
+
+    #[test]
+    fn control_characters_never_reach_a_caption() {
+        // A NUL makes every ffmpeg spawn fail ("nul byte found in provided data");
+        // ESC and the rest are noise. Whitespace controls stay as separators.
+        let srt = "1\n00:00:01,000 --> 00:00:03,000\nHel\0lo \u{1b}[31mred\u{7}\tworld\u{85}end\u{7f}\n";
+        assert_eq!(parse_srt(srt).cues[0].text, "Hello [31mred world end");
+        let ass = "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,a\0b{\\i1}\u{1}c\\Nd\u{1f}e\n";
+        assert_eq!(parse_ass(ass).unwrap().cues[0].text, "abc\nde");
+        // A cue that is nothing *but* control characters is empty and skipped.
+        let blank = parse_srt("1\n00:00:01,000 --> 00:00:03,000\n\0\u{1b}\n");
+        assert_eq!((blank.cues.len(), blank.skipped), (0, 1));
+        // Accents, emoji and CJK pass through untouched.
+        assert_eq!(
+            parse_srt("1\n00:00:01,000 --> 00:00:03,000\nCafé ☕ 日本語 🎬\n").cues[0].text,
+            "Café ☕ 日本語 🎬"
+        );
+    }
+
+    /// Run `f`, and fail if it took a second or more. The inputs below were
+    /// quadratic before their scans were bounded — 400 KB of `<` took 6 s and a
+    /// full 5 MiB file about seventeen minutes — so even in an unoptimized build a
+    /// linear parse is a small fraction of this limit.
+    fn within_a_second<T>(what: &str, f: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = f();
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "{what} took {took:?}");
+        out
+    }
+
+    /// `lines` copies of `line` as the text of one SRT cue.
+    fn srt_cue_of(line: &str, lines: usize) -> String {
+        let body = vec![line; lines].join("\n");
+        format!("1\n00:00:01,000 --> 00:00:03,000\n{body}\n")
+    }
+
+    #[test]
+    fn pathological_markup_parses_in_linear_time() {
+        // Each is ~1 MB in lines just under the per-line cap, which is what gets
+        // past the "refuse a long line" check and has to be *cleaned*.
+        let width = MAX_LINE_CHARS - 1;
+        let cases: Vec<(&str, String)> = vec![
+            ("unmatched `<`", "<".repeat(width)),
+            ("`<` with a letter", "<a".repeat(width / 2)),
+            (
+                "`<` each 300 bytes apart",
+                format!("<{}", "a".repeat(299)).repeat(width / 300),
+            ),
+            ("unterminated override blocks", "{\\".repeat(width / 2)),
+            ("braces that are not overrides", "{".repeat(width)),
+            ("a far `}` after many `{\\`", format!("{}}}", "{\\".repeat(width / 2 - 1))),
+            ("closing tags", "</i".repeat(width / 3)),
+        ];
+        for (what, line) in &cases {
+            let srt = srt_cue_of(line, 64);
+            within_a_second(what, || assert!(parse_srt(&srt).cues.is_empty()));
+            let ass = format!(
+                "[Events]\n{}",
+                format!("Dialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,{line}\n").repeat(64)
+            );
+            within_a_second(what, || assert!(parse_ass(&ass).unwrap().cues.is_empty()));
+        }
+        // Real text between the brackets still comes out, with the work bounded.
+        let mixed = srt_cue_of("<<<< hello >>>> <i>world</i>", 1);
+        assert_eq!(parse_srt(&mixed).cues[0].text, "<<<< hello >>>> world");
+    }
+
+    #[test]
+    fn a_line_over_the_cap_is_refused_before_it_is_cleaned() {
+        // The whole file on one line: 5 MiB of `<`, `{`, spaces.
+        for fill in ["<", "{", "{\\", " "] {
+            let one_line = fill.repeat(MAX_CAPTION_FILE_BYTES as usize / fill.len());
+            within_a_second("a 5 MiB line", || {
+                let srt = parse_srt(&one_line);
+                assert!(srt.cues.is_empty());
+                let ass = parse_ass(&format!("Dialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,{one_line}")).unwrap();
+                assert!(ass.cues.is_empty());
+                assert_eq!(ass.skipped, 1, "the lost dialogue line is counted");
+            });
+        }
+        // One long line inside a cue costs that cue, not the file.
+        let long = "x".repeat(MAX_LINE_CHARS + 1);
+        let p = parse_srt(&format!(
+            "1\n00:00:01,000 --> 00:00:02,000\nfine\n{long}\n\n2\n00:00:03,000 --> 00:00:04,000\nStill read\n"
+        ));
+        assert_eq!(texts(&p), ["Still read"]);
+        assert_eq!(p.skipped, 1);
+        // A giant comment or style line in an ASS file is not a lost cue.
+        let ass = parse_ass(&format!(
+            "[Events]\nComment: 0,{long}\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,ok\n"
+        ))
+        .unwrap();
+        assert_eq!((ass.cues.len(), ass.skipped), (1, 0));
+        // At the cap exactly it is read.
+        let exact = "y".repeat(MAX_CUE_CHARS);
+        assert_eq!(parse_srt(&srt_cue_of(&exact, 1)).cues.len(), 1);
+    }
+
+    #[test]
+    fn a_full_size_file_of_ordinary_cues_parses_quickly() {
+        // ~2.5 MiB of real-looking SRT (half the largest file, in the most cues an
+        // import takes): the linear passes — newline normalisation, split, per-cue
+        // cleanup, sort — stay well clear of a second even unoptimized.
+        let lines = "<i>The quick brown fox</i> jumps over\n{\\an8}the lazy dog and keeps on running\n".repeat(5);
+        let cue = format!("1234\n00:01:02,345 --> 00:01:04,000\n{lines}\n");
+        let count = (MAX_CAPTION_FILE_BYTES as usize / 2 / cue.len()).min(MAX_CAPTION_CUES);
+        assert!(count > 4_000, "{count}");
+        let text = cue.repeat(count);
+        let file = within_a_second("2.5 MiB of cues", || parse_srt(&text));
+        assert_eq!(file.cues.len(), count);
+        // More cues than that stop being read: a file of 20,000 is refused fast.
+        let flood = "1\n00:00:01,000 --> 00:00:02,000\nx\n\n".repeat(20_000);
+        let err = within_a_second("a flood of cues", || parse_captions(&flood, None).unwrap_err());
+        assert!(err.to_string().contains("more than 10000 cues"), "{err}");
     }
 
     // ---- bytes ----

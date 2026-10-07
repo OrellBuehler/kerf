@@ -29,6 +29,16 @@ export const MAX_CAPTION_FILE_BYTES = 5 * 1024 * 1024;
 export const MAX_CAPTION_CUES = 10_000;
 /** The longest one cue's text may be (characters). */
 export const MAX_CUE_CHARS = 2_000;
+/** The longest one *line* of a file may be (characters) before it is even
+ *  cleaned: a megabyte of `<` is a megabyte to scan to find out it is not a cue. */
+export const MAX_LINE_CHARS = 16_384;
+/** The most words one import may carry across all its cues (the line timer's
+ *  merge costs more the more chunks one cue has). */
+export const MAX_CAPTION_WORDS = 100_000;
+/** The most caption overlays one import may write. */
+export const MAX_IMPORTED_CAPTIONS = 20_000;
+/** The widest a time offset may be, seconds either way (100 hours). */
+export const MAX_CAPTION_OFFSET = 360_000;
 
 /** One cue of a subtitle file, in the file's own time (seconds). */
 export interface ImportedCue {
@@ -76,9 +86,15 @@ const MARKUP_TAGS = new Set([
 	'a', 'b', 'br', 'c', 'div', 'em', 'font', 'i', 'lang', 'p', 'rp', 'rt', 'ruby', 's', 'span', 'strike', 'strong', 'u', 'v'
 ]);
 
+/** How far ahead of a `<` its closing `>` may be and still make it a tag. */
+const MAX_TAG_CHARS = 256;
+
 /** Remove `<i>` / `</font>`-style markup; `<br>` becomes a line break. Angle
- *  brackets that are not a known tag (`<laughs>`, `<3`, `a < b`) are kept. */
+ *  brackets that are not a known tag (`<laughs>`, `<3`, `a < b`) are kept.
+ *  Linear: a tag's `>` is looked for only within `MAX_TAG_CHARS` and only up to
+ *  the next `<`, so `<<<<…` is not quadratic. */
 function stripMarkup(line: string): string {
+	if (!line.includes('<')) return line;
 	let out = '';
 	let rest = line;
 	for (;;) {
@@ -86,11 +102,18 @@ function stripMarkup(line: string): string {
 		if (open < 0) break;
 		out += rest.slice(0, open);
 		const after = rest.slice(open + 1);
-		const close = after.indexOf('>');
-		const inner = close >= 0 && close <= 256 ? after.slice(0, close) : null;
+		let close = -1;
+		for (let i = 0; i < Math.min(after.length, MAX_TAG_CHARS + 1); i++) {
+			const ch = after[i];
+			if (ch === '>' || ch === '<') {
+				if (ch === '>') close = i;
+				break;
+			}
+		}
+		const inner = close >= 0 ? after.slice(0, close) : null;
 		const name =
 			inner === null ? '' : (inner.replace(/^\/+/, '').split(/[^A-Za-z0-9]/)[0] ?? '').toLowerCase();
-		if (inner !== null && !inner.includes('<') && MARKUP_TAGS.has(name)) {
+		if (inner !== null && MARKUP_TAGS.has(name)) {
 			if (name === 'br') out += '\n';
 			rest = after.slice(close + 1);
 		} else {
@@ -102,8 +125,11 @@ function stripMarkup(line: string): string {
 }
 
 /** Remove `{…}` blocks — with `onlyOverrides`, only those that start `{\`. An
- *  unterminated `{` is literal text. */
+ *  unterminated `{` is literal text. Linear: a `{` that cannot start a block is
+ *  literal without a scan, and one that can either finds its `}` or finds none —
+ *  and then no `}` remains ahead, so the rest is copied as it stands. */
 function stripBraces(line: string, onlyOverrides: boolean): string {
+	if (!line.includes('{')) return line;
 	let out = '';
 	let rest = line;
 	for (;;) {
@@ -111,18 +137,30 @@ function stripBraces(line: string, onlyOverrides: boolean): string {
 		if (open < 0) break;
 		out += rest.slice(0, open);
 		const after = rest.slice(open + 1);
-		const close = after.indexOf('}');
-		if (close >= 0 && (!onlyOverrides || after.startsWith('\\'))) {
-			rest = after.slice(close + 1);
-		} else {
+		if (onlyOverrides && !after.startsWith('\\')) {
 			out += '{';
 			rest = after;
+			continue;
 		}
+		const close = after.indexOf('}');
+		if (close < 0) return `${out}{${after}`;
+		rest = after.slice(close + 1);
 	}
 	return out + rest;
 }
 
-const tidy = (line: string) => line.split(/\s+/).filter(Boolean).join(' ');
+/** Control characters other than whitespace are removed and runs of whitespace
+ *  collapse to single spaces. A control character has no business in a caption
+ *  and is dangerous in one: the text ends up in an `ffmpeg` argument, where a NUL
+ *  byte makes every spawn fail. Whitespace controls (tab, CR, NEL…) are kept as
+ *  the separators they are — `\u0085` is spelled out because `\s` omits it. */
+const tidy = (line: string) =>
+	line
+		.replace(/[\u0009-\u000d\u0085]/g, ' ')
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+		.split(/\s+/)
+		.filter(Boolean)
+		.join(' ');
 
 /** A cue's lines cleaned and joined with `\n`; empty when nothing is left. */
 function joinLines(lines: string[]): string {
@@ -132,6 +170,10 @@ function joinLines(lines: string[]): string {
 		.filter((l) => l.length > 0)
 		.join('\n');
 }
+
+/** Whether a raw line is over `MAX_LINE_CHARS` code points (UTF-16 units are
+ *  checked first: a line with no more of those cannot have more code points). */
+const tooLong = (raw: string) => raw.length > MAX_LINE_CHARS && chars(raw) > MAX_LINE_CHARS;
 
 const normalizeNewlines = (text: string) =>
 	text.replace(/^﻿+/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -154,9 +196,11 @@ function parseSrtTiming(line: string): [number, number] | null {
  *  line, handing back the index line that then ends the previous cue. */
 export function parseSrt(input: string): ParsedCaptions {
 	const out: ParsedCaptions = { cues: [], skipped: 0 };
-	type Block = { time: [number, number] | null; body: string[] };
+	// `oversized`: a line of it was over `MAX_LINE_CHARS`, so the cue is refused
+	// whole rather than shown with a hole in it.
+	type Block = { time: [number, number] | null; body: string[]; oversized: boolean };
 	const finish = (block: Block) => {
-		if (!block.time) {
+		if (!block.time || block.oversized) {
 			out.skipped += 1;
 			return;
 		}
@@ -171,6 +215,15 @@ export function parseSrt(input: string): ParsedCaptions {
 
 	let current: Block | null = null;
 	for (const raw of normalizeNewlines(input).split('\n')) {
+		// More cues than an import may carry is an error however many more there
+		// are, so there is no point reading the rest of a file that is mostly cues.
+		if (out.cues.length > MAX_CAPTION_CUES) break;
+		// Refused before it is cleaned or even trimmed.
+		if (tooLong(raw)) {
+			if (current) current.oversized = true;
+			else out.skipped += 1;
+			continue;
+		}
 		const line = raw.trim();
 		if (line.includes('-->')) {
 			const time = parseSrtTiming(line);
@@ -181,7 +234,7 @@ export function parseSrt(input: string): ParsedCaptions {
 					if (current.body.length && isIndex(current.body[current.body.length - 1])) current.body.pop();
 					finish(current);
 				}
-				current = { time, body: [] };
+				current = { time, body: [], oversized: false };
 				continue;
 			}
 		}
@@ -266,6 +319,13 @@ export function parseAss(input: string): ParsedCaptions {
 	let section: string | null = null;
 	let columns = DEFAULT_COLUMNS;
 	for (const raw of normalizeNewlines(input).split('\n')) {
+		if (out.cues.length > MAX_CAPTION_CUES) break;
+		// Refused before it is cleaned. Only a dialogue line is a cue that was
+		// lost; a giant comment or style line is not.
+		if (tooLong(raw)) {
+			if (raw.trimStart().slice(0, 9).toLowerCase() === 'dialogue:') out.skipped += 1;
+			continue;
+		}
 		const line = raw.trim();
 		if (!line || line.startsWith(';') || line.startsWith('!')) continue;
 		if (line.startsWith('[') && line.endsWith(']')) {
@@ -336,8 +396,9 @@ export const fileTooLarge = () =>
 	new Error(`subtitle file is larger than ${MAX_CAPTION_FILE_BYTES >> 20} MiB — not a subtitle file`);
 
 /** Read subtitle text in `format`, or in whichever format it looks like. Throws on
- *  text over the size cap, more than `MAX_CAPTION_CUES` cues, or an unusable ASS
- *  `Format:` line; an unreadable entry is never an error. */
+ *  text over the size cap, more than `MAX_CAPTION_CUES` cues or `MAX_CAPTION_WORDS`
+ *  words, or an unusable ASS `Format:` line; an unreadable entry is never an
+ *  error, and a file with no cue at all is the import's to refuse. */
 export function parseCaptions(
 	text: string,
 	format?: CaptionFormat | null
@@ -347,8 +408,12 @@ export function parseCaptions(
 	const parsed = used === 'srt' ? parseSrt(text) : parseAss(text);
 	if (parsed.cues.length > MAX_CAPTION_CUES) {
 		throw new Error(
-			`this file has ${parsed.cues.length} cues; Kerf imports at most ${MAX_CAPTION_CUES} at a time`
+			`this file has more than ${MAX_CAPTION_CUES} cues; Kerf imports at most ${MAX_CAPTION_CUES} at a time`
 		);
+	}
+	const words = parsed.cues.reduce((n, c) => n + c.text.split(/\s+/).filter(Boolean).length, 0);
+	if (words > MAX_CAPTION_WORDS) {
+		throw new Error(`this file has ${words} words; Kerf imports at most ${MAX_CAPTION_WORDS} at a time`);
 	}
 	return { format: used, parsed };
 }
@@ -383,12 +448,14 @@ export interface ImportEnv {
 
 /** `Project::import_captions` over a plain timeline: parse, place, and return the
  *  overlays the cut should hold afterwards (typed titles kept, the previous
- *  generated / imported set replaced) with the summary. Throws, changing
- *  nothing, when the text holds no cues or none of them reaches the cut. */
+ *  generated / imported set replaced) with the summary. `offset` seconds are added
+ *  to every cue before it is placed. Throws, changing nothing, when the text holds
+ *  no cues, none of them can be shown, the offset is not a sensible number, or the
+ *  result would be more than `MAX_IMPORTED_CAPTIONS` captions. */
 export function importCaptionsInto(
 	timeline: Timeline,
 	text: string,
-	req: { format?: CaptionFormat | null; base?: CaptionBase; options?: CaptionOptions },
+	req: { format?: CaptionFormat | null; base?: CaptionBase; options?: CaptionOptions; offset?: number },
 	env: ImportEnv
 ): { overlays: Omit<TextOverlay, 'id'>[]; kept: TextOverlay[]; summary: CaptionImportSummary } {
 	const { format, parsed } = parseCaptions(text, req.format);
@@ -396,6 +463,10 @@ export function importCaptionsInto(
 		throw new Error(
 			`no captions found in the ${format.toUpperCase()} text (${parsed.skipped} entries could not be read)`
 		);
+	}
+	const offset = req.offset ?? 0;
+	if (!Number.isFinite(offset) || Math.abs(offset) > MAX_CAPTION_OFFSET) {
+		throw new Error(`offset must be a number of seconds within ±${MAX_CAPTION_OFFSET}`);
 	}
 	const base = req.base ?? { kind: 'timeline' };
 	if (base.kind === 'source' && !env.assetKnown(base.assetId)) {
@@ -407,20 +478,32 @@ export function importCaptionsInto(
 				'or import with base "timeline" if the file already times the finished cut'
 		);
 	}
-	const cues: TranscriptSegment[] = parsed.cues;
+	const cues: TranscriptSegment[] = parsed.cues.map((c) => ({ ...c, start: c.start + offset, end: c.end + offset }));
 	const placement = placeCues(timeline, cues, base, resolveCaptions(req.options));
 	if (placement.overlays.length === 0) {
-		const first = parsed.cues[0].start;
-		const last = parsed.cues.reduce((m, c) => Math.max(m, c.end), 0);
-		if (base.kind === 'timeline') {
-			let cut = 0;
-			for (const c of renderedClips(timeline)) cut = Math.max(cut, c.timeline_start + clipDuration(c));
+		const first = cues[0].start;
+		const last = cues.reduce((m, c) => Math.max(m, c.end), -Infinity);
+		const run = `they run ${formatTime(first)} to ${formatTime(last)}`;
+		if (placement.droppedOutside === cues.length) {
+			if (base.kind === 'timeline') {
+				let cut = 0;
+				for (const c of renderedClips(timeline)) cut = Math.max(cut, c.timeline_start + clipDuration(c));
+				throw new Error(
+					`none of the ${cues.length} cues fall inside the cut: ${run} and the cut is ${formatTime(cut)} long`
+				);
+			}
 			throw new Error(
-				`none of the ${cues.length} cues fall inside the cut: they run ${formatTime(first)} to ${formatTime(last)} and the cut is ${formatTime(cut)} long`
+				`none of the ${cues.length} cues land on footage this asset shows in the cut: ${run} of the source (a muted track or a disabled clip does not count)`
 			);
 		}
 		throw new Error(
-			`none of the ${cues.length} cues land on footage this asset shows in the cut: they run ${formatTime(first)} to ${formatTime(last)} of the source (a muted track or a disabled clip does not count)`
+			`none of the ${cues.length} cues could be shown: ${placement.droppedOutside} outside the cut, ${placement.droppedShort} too short to read, ${placement.droppedOverlap} hidden by another`
+		);
+	}
+	if (placement.overlays.length > MAX_IMPORTED_CAPTIONS) {
+		throw new Error(
+			`this import would write ${placement.overlays.length} captions; Kerf writes at most ${MAX_IMPORTED_CAPTIONS} at a time ` +
+				'(the `word_punch` look makes one caption per word — `lines` makes far fewer)'
 		);
 	}
 	const existing = timeline.overlays ?? [];
@@ -435,6 +518,7 @@ export function importCaptionsInto(
 			captions: placement.overlays.length,
 			skipped_lines: parsed.skipped,
 			dropped_outside: placement.droppedOutside,
+			dropped_short: placement.droppedShort,
 			dropped_overlap: placement.droppedOverlap,
 			replaced: existing.length - kept.length
 		}
@@ -448,6 +532,7 @@ export function describeImport(s: CaptionImportSummary): string {
 	const parts = [`Imported ${lines} from ${s.placed} of ${s.cues} cues`];
 	const aside: string[] = [];
 	if (s.dropped_outside) aside.push(`${s.dropped_outside} outside the cut`);
+	if (s.dropped_short) aside.push(`${s.dropped_short} too short`);
 	if (s.dropped_overlap) aside.push(`${s.dropped_overlap} overlapping`);
 	if (s.skipped_lines) aside.push(`${s.skipped_lines} unreadable`);
 	if (aside.length) parts.push(`(${aside.join(', ')})`);

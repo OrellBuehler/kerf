@@ -5362,11 +5362,26 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
 /// passed as one argv argument: backslashes, then apostrophes (the filtergraph's
 /// own value parser un-escapes a backslash-doubled pair down to one backslash
 /// even inside single quotes, so a literal backslash needs doubling to survive
-/// it). Newlines collapse to spaces — drawtext here is single-line. Shared by
-/// the `text=` and `fontfile=` escapers below, which differ only in whether `%`
-/// also needs escaping.
+/// it). Newlines collapse to spaces — drawtext here is single-line. Control
+/// characters other than tab and carriage return are dropped: a NUL cannot be
+/// passed in an argv at all ("nul byte found in provided data" — every preview
+/// and export would fail to spawn until the title was found and deleted) and the
+/// rest (ESC, the C1 block) draw as nothing useful. Everything else — which is to
+/// say every real title — comes out exactly as before. Shared by the `text=` and
+/// `fontfile=` escapers below, which differ only in whether `%` also needs
+/// escaping.
 fn escape_drawtext(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', " ").replace('\'', "'\\''")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push(' '),
+            '\'' => out.push_str("'\\''"),
+            c if c.is_control() && !matches!(c, '\t' | '\r') => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// [`escape_drawtext`] for `text=`. `drawtext` expands `%{...}` at
@@ -7538,6 +7553,27 @@ mod tests {
     fn drawtext_escapes_apostrophes() {
         // close-quote, escaped quote, reopen — the ffmpeg-safe single-quote escape.
         assert_eq!(escape_drawtext("a'b"), "a'\\''b");
+    }
+
+    #[test]
+    fn drawtext_drops_control_characters_and_changes_nothing_else() {
+        // A NUL makes `Command::spawn` fail for the whole filtergraph; ESC and the
+        // C1 block are noise. All of them go.
+        assert_eq!(escape_drawtext_text("a\0b\u{1b}[0mc\u{7f}d\u{85}e"), "ab[0mcde");
+        assert_eq!(escape_drawtext_path("/fonts/\0x.ttf"), "/fonts/x.ttf");
+        // Real text is byte-identical to what it always was: quotes, backslashes,
+        // percent, newline-to-space, tab, CR, accents, emoji, CJK.
+        for plain in [
+            "Hello, world",
+            "50% OFF — it's \"live\"",
+            "C:\\path\\to",
+            "tab\there",
+            "crlf\r\nline",
+            "Café ☕ 日本語 🎬",
+        ] {
+            let expected = plain.replace('\\', "\\\\").replace('\n', " ").replace('\'', "'\\''");
+            assert_eq!(escape_drawtext(plain), expected, "{plain:?}");
+        }
     }
 
     #[test]

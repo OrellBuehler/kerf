@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipMove, Delivery, EditSource, ExportOptions,
-    Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, StreamKind, TextKeyframe, Transition,
-    TransitionKind, VideoEffect,
+    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipMove, Delivery,
+    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, StreamKind,
+    TextKeyframe, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -165,6 +165,10 @@ struct ImportCaptionsParams {
     pos_y: Option<f64>,
     #[schemars(description = "Font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     size: Option<f64>,
+    #[schemars(
+        description = "Seconds added to every cue before it is placed; negative moves them earlier. For a file whose clock does not start where the picture does — a broadcast .srt that begins at 01:00:00 wants -3600. Default 0."
+    )]
+    offset: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1845,25 +1849,36 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Returns a summary: cues read, placed, skipped_lines, dropped_outside (past the cut's end, or footage that was cut out), dropped_overlap, captions written and replaced."
+        description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
     )]
-    fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
+    async fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
         let asset = p.asset_id.as_deref().map(parse_id).transpose()?;
         let base = CaptionTimeBase::resolve(p.base.as_deref(), asset).map_err(core_err)?;
         let format = CaptionFormat::from_arg(p.format.as_deref()).map_err(core_err)?;
-        // Read (and size-check) the file before taking the project lock.
-        let text = caption_source(p.path.as_deref(), p.text)?;
-        let opts = CaptionOptions {
-            style: p.style.unwrap_or_default(),
-            max_words: p.max_words,
-            max_chars: p.max_chars,
-            pos_y: p.pos_y,
-            size: p.size,
+        let req = CaptionImportRequest {
+            base,
+            options: CaptionOptions {
+                style: p.style.unwrap_or_default(),
+                max_words: p.max_words,
+                max_chars: p.max_chars,
+                pos_y: p.pos_y,
+                size: p.size,
+            },
+            offset: p.offset.unwrap_or(0.0),
         };
-        self.edit(|project| {
-            let summary = project.import_captions(&text, format, base, opts).map_err(core_err)?;
-            json(&summary)
+        let project = self.project.clone();
+        let (path, text) = (p.path, p.text);
+        let summary = blocking(move || {
+            // Read, decode and parse with the project lock released — a few MB of
+            // text is milliseconds, but never milliseconds the user's edits wait
+            // on — and take it only to place the result.
+            let text = caption_source(path.as_deref(), text)?;
+            let file = kerf_core::parse_captions(&text, format).map_err(core_err)?;
+            lock_agent(&project).import_captions(&file, req).map_err(core_err)
         })
+        .await?;
+        self.changed();
+        json(&summary)
     }
 
     #[tool(

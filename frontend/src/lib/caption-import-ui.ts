@@ -6,13 +6,16 @@
  *  `importCaptionFile` in `title-actions.ts`.
  */
 
+import { MAX_CAPTION_OFFSET, MAX_CUE_CHARS } from './caption-import';
 import { renderedClips } from './captions';
 import type {
 	Asset,
 	CaptionImportRequest,
 	CaptionImportSummary,
+	CaptionOptions,
 	CaptionStyle,
 	CaptionTimeBase,
+	Delivery,
 	TextOverlay,
 	Timeline
 } from './types';
@@ -120,12 +123,65 @@ export function resolveChoice(
 	return assetId ? { base: 'source', assetId } : TIMELINE_CHOICE;
 }
 
+/** `max_words` / `max_chars` that keep a whole cue as one caption. A cue is capped
+ *  at `MAX_CUE_CHARS` characters and so at fewer words than this, which is why
+ *  these can never split one. */
+export const KEEP_LINES: Required<Pick<CaptionOptions, 'max_words' | 'max_chars'>> = {
+	max_words: MAX_CUE_CHARS,
+	max_chars: MAX_CUE_CHARS
+};
+
+/** Whether "Keep the file's lines" is on when the user has not touched it.
+ *
+ *  A subtitle file is already timed and broken into lines by whoever made it, so
+ *  re-chunking it into the generator's short lines mostly throws that away — on
+ *  by default. But a kept cue is one caption, and the engine shrinks a caption to
+ *  fit the frame's *width*: a two-line cue is ~80 characters on one line, which is
+ *  a legible 60% size at 16:9 and a 19-pixel smear at 9:16 (or 1:1). So it is on
+ *  for landscape and unframed projects and off for square and tall ones, where the
+ *  generator's short lines are the readable choice. Touching the checkbox settles
+ *  it either way. */
+export function keepLinesDefault(format: Pick<Delivery, 'width' | 'height'> | null | undefined): boolean {
+	return !format || !format.height || format.width / format.height > 1;
+}
+
+/** Whether the import sends `KEEP_LINES`: `choice` (`null` = untouched, follow
+ *  the frame) — but never in Word punch, which shows one word at a time and has
+ *  no lines to keep (sending the override would defeat the look). */
+export function keepLinesOn(
+	choice: boolean | null,
+	style: CaptionStyle,
+	format: Pick<Delivery, 'width' | 'height'> | null | undefined
+): boolean {
+	return style === 'lines' && (choice ?? keepLinesDefault(format));
+}
+
+/** A typed time offset as the number of seconds to send: a number field is `null`
+ *  when emptied and may hold anything, so a non-number is no shift and the rest is
+ *  held within what the engine accepts. */
+export function normalizeOffset(value: number | null | undefined): number {
+	if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+	return Math.min(Math.max(value, -MAX_CAPTION_OFFSET), MAX_CAPTION_OFFSET);
+}
+
+/** What the options row adds to the timing and the look. */
+export interface ImportExtras {
+	/** Keep each cue as one caption (ignored in Word punch). */
+	keepLines?: boolean;
+	/** Seconds added to every cue. */
+	offset?: number | null;
+}
+
 /** The request `import_captions` takes: the timing, in the caption look the
- *  controls are set to. */
-export function importRequest(choice: ImportChoice, style: CaptionStyle): CaptionImportRequest {
-	return choice.base === 'source' && choice.assetId
-		? { base: 'source', assetId: choice.assetId, options: { style } }
-		: { base: 'timeline', options: { style } };
+ *  controls are set to, shifted by the offset when there is one. */
+export function importRequest(choice: ImportChoice, style: CaptionStyle, extras: ImportExtras = {}): CaptionImportRequest {
+	const options: CaptionOptions = { style, ...(extras.keepLines && style === 'lines' ? KEEP_LINES : {}) };
+	const offset = normalizeOffset(extras.offset);
+	const timing: CaptionImportRequest =
+		choice.base === 'source' && choice.assetId
+			? { base: 'source', assetId: choice.assetId, options }
+			: { base: 'timeline', options };
+	return offset === 0 ? timing : { ...timing, offset };
 }
 
 /** The two timings, as the options row names them. */
@@ -186,7 +242,12 @@ export function generatedCount(overlays: readonly TextOverlay[] | undefined): nu
 	return (overlays ?? []).filter((o) => o.generated).length;
 }
 
-/** The question asked before an import replaces captions that are already there. */
+/** Dialog title of the confirmation before captioning the cut from transcripts
+ *  replaces an existing set. */
+export const CAPTION_CONFIRM_TITLE = 'Caption the cut';
+
+/** The question asked before captions are written over ones already there — an
+ *  import (`fileName` names what is coming in) or a recaption from transcripts. */
 export function replaceConfirm(existing: number, fileName?: string): string {
 	const what = existing === 1 ? 'the caption' : `the ${existing} captions`;
 	const from = fileName ? ` with those in ${fileName}` : '';
@@ -194,10 +255,10 @@ export function replaceConfirm(existing: number, fileName?: string): string {
 }
 
 /** Whether the toast after an import is good news or has something to read: any
- *  cue that did not make it onto the cut (outside it, overlapping, unreadable)
- *  makes it a warning. */
+ *  cue that did not make it onto the cut (outside it, too short, overlapping,
+ *  unreadable) makes it a warning. */
 export function importTone(s: CaptionImportSummary): 'success' | 'warning' {
-	return s.dropped_outside + s.dropped_overlap + s.skipped_lines > 0 ? 'warning' : 'success';
+	return s.dropped_outside + s.dropped_short + s.dropped_overlap + s.skipped_lines > 0 ? 'warning' : 'success';
 }
 
 /** Tooltip of the first-time caption button. */
@@ -218,3 +279,19 @@ export function clearHint(count: number): string {
 	const what = count === 1 ? 'the generated or imported caption' : `the ${count} generated or imported captions`;
 	return `Remove ${what}. Titles you added by hand stay.`;
 }
+
+// ---- the options row's two extra fields ---------------------------------------
+
+/** What "Keep the file's lines" does, said under the checkbox. */
+export function keepLinesHint(style: CaptionStyle, on: boolean, format: Pick<Delivery, 'width' | 'height'> | null | undefined): string {
+	if (style !== 'lines') return 'Word punch shows one word at a time, so there are no lines to keep.';
+	if (on) return 'Each cue stays one caption, as it is timed in the file. A long one is drawn smaller to fit the frame.';
+	const tall = !keepLinesDefault(format);
+	return tall
+		? 'Cues are split into short lines for this tall frame; a long line kept whole would be drawn too small to read.'
+		: 'Cues are split into short lines in the caption look above, retimed by their length.';
+}
+
+/** What the offset field means, said under it. */
+export const OFFSET_HINT =
+	'Seconds added to every time in the file; negative moves it earlier. A broadcast file that starts at 01:00:00 wants -3600.';

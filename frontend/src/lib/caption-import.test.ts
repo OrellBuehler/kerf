@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
 	MAX_CAPTION_CUES,
 	MAX_CAPTION_FILE_BYTES,
+	MAX_CAPTION_WORDS,
 	MAX_CUE_CHARS,
+	MAX_IMPORTED_CAPTIONS,
+	MAX_LINE_CHARS,
 	describeImport,
 	detectFormat,
 	importCaptionsInto,
@@ -202,6 +205,88 @@ describe('ASS / SSA', () => {
 	});
 });
 
+describe('hostile input', () => {
+	/** Fail if `f` takes a second or more. These inputs were quadratic before their
+	 *  scans were bounded (a megabyte of `<` took tens of seconds). */
+	const withinASecond = <T>(what: string, f: () => T): T => {
+		const started = performance.now();
+		const out = f();
+		const took = performance.now() - started;
+		expect(`${what}: ${took < 1000 ? 'quick' : `${Math.round(took)} ms`}`).toBe(`${what}: quick`);
+		return out;
+	};
+	const srtCueOf = (line: string, lines: number) => `1\n00:00:01,000 --> 00:00:03,000\n${Array(lines).fill(line).join('\n')}\n`;
+
+	test('pathological markup parses in linear time', () => {
+		const width = MAX_LINE_CHARS - 1;
+		const cases: [string, string][] = [
+			['unmatched <', '<'.repeat(width)],
+			['< with a letter', '<a'.repeat(width / 2)],
+			['< each 300 chars apart', `<${'a'.repeat(299)}`.repeat(Math.floor(width / 300))],
+			['unterminated override blocks', '{\\'.repeat(width / 2)],
+			['braces that are not overrides', '{'.repeat(width)],
+			['a far } after many {\\', `${'{\\'.repeat(width / 2 - 1)}}`],
+			['closing tags', '</i'.repeat(Math.floor(width / 3))]
+		];
+		for (const [what, line] of cases) {
+			withinASecond(what, () => expect(parseSrt(srtCueOf(line, 64)).cues).toEqual([]));
+			const ass = `[Events]\n${`Dialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,${line}\n`.repeat(64)}`;
+			withinASecond(what, () => expect(parseAss(ass).cues).toEqual([]));
+		}
+		// Real text between the brackets still comes out.
+		expect(parseSrt(srtCueOf('<<<< hello >>>> <i>world</i>', 1)).cues[0].text).toBe('<<<< hello >>>> world');
+	});
+
+	test('a line over the cap is refused before it is cleaned', () => {
+		for (const fill of ['<', '{', '{\\', ' ']) {
+			const oneLine = fill.repeat(Math.floor(MAX_CAPTION_FILE_BYTES / fill.length));
+			withinASecond('a 5 MiB line', () => {
+				expect(parseSrt(oneLine).cues).toEqual([]);
+				const ass = parseAss(`Dialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,${oneLine}`);
+				expect([ass.cues.length, ass.skipped]).toEqual([0, 1]);
+			});
+		}
+		const long = 'x'.repeat(MAX_LINE_CHARS + 1);
+		const p = parseSrt(`1\n00:00:01,000 --> 00:00:02,000\nfine\n${long}\n\n2\n00:00:03,000 --> 00:00:04,000\nStill read\n`);
+		expect(texts(p)).toEqual(['Still read']);
+		expect(p.skipped).toBe(1);
+		const ass = parseAss(`[Events]\nComment: 0,${long}\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,ok\n`);
+		expect([ass.cues.length, ass.skipped]).toEqual([1, 0]);
+		expect(parseSrt(srtCueOf('y'.repeat(MAX_CUE_CHARS), 1)).cues).toHaveLength(1);
+	});
+
+	test('more cues than an import takes stop being read', () => {
+		const flood = '1\n00:00:01,000 --> 00:00:02,000\nx\n\n'.repeat(20_000);
+		expect(() => withinASecond('a flood of cues', () => parseCaptions(flood))).toThrow('more than 10000 cues');
+	});
+
+	test('the words in one import are capped', () => {
+		const thousand = Array(1000).fill('a').join(' ');
+		const cues = (n: number) =>
+			Array.from({ length: n }, (_, i) => `${i}\n00:00:${String(i % 60).padStart(2, '0')},000 --> 00:00:${String(i % 60).padStart(2, '0')},500\n${thousand}\n\n`).join('');
+		expect(() => parseCaptions(cues(101))).toThrow(`101000 words; Kerf imports at most ${MAX_CAPTION_WORDS}`);
+		expect(() => parseCaptions(cues(50))).not.toThrow();
+	});
+
+	test('control characters never reach a caption', () => {
+		const srt = '1\n00:00:01,000 --> 00:00:03,000\nHel\0lo \u001b[31mred\u0007\tworld\u0085end\u007f\n';
+		expect(parseSrt(srt).cues[0].text).toBe('Hello [31mred world end');
+		const ass = '[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,a\0b{\\i1}\u0001c\\Nd\u001fe\n';
+		expect(parseAss(ass).cues[0].text).toBe('abc\nde');
+		const blank = parseSrt('1\n00:00:01,000 --> 00:00:03,000\n\0\u001b\n');
+		expect([blank.cues.length, blank.skipped]).toEqual([0, 1]);
+		expect(parseSrt('1\n00:00:01,000 --> 00:00:03,000\nCafé ☕ 日本語 🎬\n').cues[0].text).toBe('Café ☕ 日本語 🎬');
+	});
+
+	test('a CR-only file is still told apart', () => {
+		const ass =
+			'[Script Info]\rTitle: x\r\r[Events]\rFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\rDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,Hi\r';
+		expect(detectFormat(ass)).toBe('ass');
+		expect(parseCaptions(ass).parsed.cues).toHaveLength(1);
+		expect(parseCaptions('1\r00:00:01,000 --> 00:00:02,000\rHi\r').format).toBe('srt');
+	});
+});
+
 describe('entry points', () => {
 	test('the format is guessed from the text', () => {
 		expect(detectFormat(ASS)).toBe('ass');
@@ -256,8 +341,10 @@ const seg = (start: number, end: number, text: string): TranscriptSegment => ({ 
 const rounded = (o: { text: string; start: number; end: number }[]) =>
 	o.map((x) => [x.text, Math.round(x.start * 100) / 100, Math.round(x.end * 100) / 100]);
 const lines = resolveCaptions();
-const accounted = (p: { placed: number; droppedOutside: number; droppedOverlap: number }, n: number) =>
-	expect(p.placed + p.droppedOutside + p.droppedOverlap).toBe(n);
+const accounted = (
+	p: { placed: number; droppedOutside: number; droppedShort: number; droppedOverlap: number },
+	n: number
+) => expect(p.placed + p.droppedOutside + p.droppedShort + p.droppedOverlap).toBe(n);
 
 describe('placeCues', () => {
 	test('cues in timeline time land where the file says, as generated captions', () => {
@@ -296,7 +383,9 @@ describe('placeCues', () => {
 		expect(p.overlays[p.overlays.length - 1].end).toBeCloseTo(10, 9);
 		const sliver = placeCues(timelineOf([clip()]), [seg(9.95, 12, 'barely')], { kind: 'timeline' }, lines);
 		expect(sliver.overlays).toEqual([]);
-		expect(sliver.droppedOutside).toBe(1);
+		// It met the cut, for too short a moment to read: not "outside" it.
+		expect([sliver.droppedOutside, sliver.droppedShort]).toEqual([0, 1]);
+		accounted(sliver, 1);
 	});
 
 	test('an empty timeline has no end to run past', () => {
@@ -396,6 +485,7 @@ describe('importCaptionsInto', () => {
 			captions: 2,
 			skipped_lines: 0,
 			dropped_outside: 0,
+			dropped_short: 0,
 			dropped_overlap: 0,
 			replaced: 1
 		});
@@ -428,6 +518,105 @@ describe('importCaptionsInto', () => {
 	});
 });
 
+describe('placeCues, the details', () => {
+	test('a cue that meets the cut too briefly is short, not outside', () => {
+		const timeline = timelineOf([clip({ source_in: 10, source_out: 20 })]);
+		const onSource = placeCues(
+			timeline,
+			[seg(11, 13, 'readable'), seg(14, 14.05, 'a blink'), seg(9, 10.05, 'just inside'), seg(30, 32, 'elsewhere')],
+			{ kind: 'source', assetId: 'a1' },
+			lines
+		);
+		accounted(onSource, 4);
+		expect([onSource.placed, onSource.droppedShort, onSource.droppedOutside, onSource.droppedOverlap]).toEqual([1, 2, 1, 0]);
+		const cut = timelineOf([clip()]);
+		const onCut = placeCues(
+			cut,
+			[
+				seg(1, 3, 'readable'),
+				seg(4, 4.05, 'a blink'),
+				seg(-5, 0.05, 'starts early'),
+				seg(-5, -1, 'before the start'),
+				seg(9.96, 14, 'at the end'),
+				seg(10, 12, 'after the end')
+			],
+			{ kind: 'timeline' },
+			lines
+		);
+		accounted(onCut, 6);
+		expect([onCut.placed, onCut.droppedShort, onCut.droppedOutside]).toEqual([1, 3, 2]);
+	});
+
+	test('simultaneous cues keep the order of the file; a transcript still sorts alphabetically', () => {
+		const timeline = timelineOf([clip()]);
+		const cues = [seg(1, 4, 'zebra'), seg(1, 4, 'apple')];
+		const p = placeCues(timeline, cues, { kind: 'timeline' }, lines);
+		expect(rounded(p.overlays)).toEqual([['zebra', 1, 4]]);
+		accounted(p, 2);
+		expect(p.droppedOverlap).toBe(1);
+		expect(rounded(placeCues(timeline, cues, { kind: 'source', assetId: 'a1' }, lines).overlays)).toEqual([['zebra', 1, 4]]);
+		// An identical pair still collapses with another between them.
+		const same = placeCues(timeline, [seg(1, 3, 'same'), seg(1, 3, 'other'), seg(1, 3, 'same')], { kind: 'timeline' }, lines);
+		accounted(same, 3);
+		expect(same.placed).toBe(1);
+		expect(rounded(captionsForTimeline(timeline, { a1: [seg(1, 4, 'zebra'), seg(1, 4, 'apple')] }, lines))).toEqual([['apple', 1, 4]]);
+	});
+
+	test('a thousand-word cue in word punch places quickly and loses nothing', () => {
+		const thousand = Array(1000).fill('a').join(' ');
+		const cues = Array.from({ length: 100 }, (_, i) => seg(i * 10, i * 10 + 6, thousand));
+		const started = performance.now();
+		const p = placeCues(timelineOf([clip({ source_out: 1000 })]), cues, { kind: 'timeline' }, resolveCaptions({ style: 'word_punch' }));
+		expect(performance.now() - started).toBeLessThan(1000);
+		accounted(p, 100);
+		expect(p.placed).toBe(100);
+		expect(p.overlays.reduce((n, o) => n + o.text.split(' ').length, 0)).toBe(100 * 1000);
+	});
+});
+
+describe('importCaptionsInto, the details', () => {
+	const place = (text: string, extra: object = {}, tl = timelineOf([clip({ source_out: 20 })])) =>
+		importCaptionsInto(tl, text, extra, env);
+
+	test('an offset moves every cue before it is placed, and is refused when it is not a number of seconds', () => {
+		const broadcast = '1\n01:00:01,000 --> 01:00:03,000\nHello there\n\n2\n01:00:04,000 --> 01:00:06,000\nGeneral Kenobi\n';
+		expect(() => place(broadcast)).toThrow('fall inside the cut');
+		const out = place(broadcast, { offset: -3600 });
+		expect(rounded(out.overlays)).toEqual([
+			['Hello there', 1, 3],
+			['General Kenobi', 4, 6]
+		]);
+		const early = '1\n00:00:00,000 --> 00:00:04,000\nStarts at zero\n\n2\n00:00:01,000 --> 00:00:02,000\nBefore it\n';
+		const clipped = place(early, { offset: -2 });
+		expect([clipped.summary.placed, clipped.summary.dropped_outside]).toEqual([1, 1]);
+		expect(clipped.overlays[0].start).toBe(0);
+		for (const bad of [NaN, Infinity, 1e9, -1e9]) expect(() => place(SRT, { offset: bad })).toThrow('offset');
+	});
+
+	test('when nothing could be shown the error says why', () => {
+		expect(() => place('1\n00:00:04,000 --> 00:00:04,050\nA blink\n')).toThrow('too short to read');
+		const out = place('1\n00:00:01,000 --> 00:00:03,000\nReadable\n\n2\n00:00:04,000 --> 00:00:04,050\nA blink\n\n3\n00:09:00,000 --> 00:09:03,000\nWay past the end\n');
+		const s = out.summary;
+		expect([s.cues, s.placed, s.dropped_outside, s.dropped_short, s.dropped_overlap]).toEqual([3, 1, 1, 1, 0]);
+	});
+
+	test('an import that would write too many captions is refused whole', () => {
+		const ts = (t: number) =>
+			`${String(Math.floor(t / 3600)).padStart(2, '0')}:${String(Math.floor(t / 60) % 60).padStart(2, '0')}:${String(Math.floor(t) % 60).padStart(2, '0')},000`;
+		const text = Array.from({ length: 9000 }, (_, i) => `${i}\n${ts(i * 1.5)} --> ${ts(i * 1.5 + 1)}\nalpha bravo charlie delta echo\n\n`).join('');
+		const empty = timelineOf([]);
+		expect(() => place(text, { options: { style: 'word_punch' } }, empty)).toThrow(`at most ${MAX_IMPORTED_CAPTIONS} at a time`);
+		const lines = place(text, {}, empty);
+		expect(lines.summary.captions).toBeLessThanOrEqual(MAX_IMPORTED_CAPTIONS);
+		expect(lines.summary.placed).toBeGreaterThan(8000);
+	});
+
+	test('cues on an empty timeline are bounded by the day, not by the file', () => {
+		const out = place('1\n00:00:01,000 --> 00:00:03,000\nToday\n\n2\n30:00:00,000 --> 30:00:03,000\nA day and a bit on\n', {}, timelineOf([]));
+		expect([out.summary.placed, out.summary.dropped_outside]).toEqual([1, 1]);
+	});
+});
+
 describe('describeImport', () => {
 	const base: CaptionImportSummary = {
 		format: 'srt',
@@ -436,9 +625,13 @@ describe('describeImport', () => {
 		captions: 14,
 		skipped_lines: 0,
 		dropped_outside: 0,
+		dropped_short: 0,
 		dropped_overlap: 0,
 		replaced: 0
 	};
+	test('says what was too short', () => {
+		expect(describeImport({ ...base, placed: 8, dropped_short: 2 })).toBe('Imported 14 captions from 8 of 10 cues (2 too short)');
+	});
 	test('names only what happened', () => {
 		expect(describeImport(base)).toBe('Imported 14 captions from 10 of 10 cues');
 		expect(describeImport({ ...base, captions: 1, placed: 1, cues: 1 })).toBe('Imported 1 caption from 1 of 1 cues');

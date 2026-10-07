@@ -75,6 +75,11 @@ class EditorUi {
 	 *  the cut — an asset it no longer shows, or no clip to time to, falls back. */
 	captionImportBase = $state<CaptionTimeBase>('timeline');
 	captionImportAsset = $state<string | null>(null);
+	/** "Keep the file's lines": `null` until the box is touched, so it follows the
+	 *  delivery frame (`keepLinesDefault`); true / false once the user has chosen. */
+	captionImportKeepLines = $state<boolean | null>(null);
+	/** Seconds the imported cues are shifted by, as typed (`null` = empty). */
+	captionImportOffset = $state<number | null>(null);
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
