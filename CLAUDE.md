@@ -187,6 +187,27 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
+  on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
+  HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the
+  `for_render()`ed timeline and the graph's own asset list; `clips_with_fx` pairs each
+  clip with its entry), `clip_source_window` / `clip_seek`, `is_head_padded_proxy` and
+  `ClipTiming`, whose `window` / `fades` / `motion_keys` the builders *format* into
+  `enable=`, `fade=` and the `overlay` x/y expressions, and whose `enabled(t)` /
+  `motion_at(t)` / `FadeStep::progress_at_frame` a frame renderer *evaluates* — one
+  decision, two readers. `fades` is video-only (`audio_clip_chain` composes the same
+  `ClipFx` its own way and shares only the duration, window and seek). **The number is
+  not what FFmpeg does with it**: `enabled` is the overlay's `enable` predicate (closed
+  at `end`), necessary and not sufficient — an equal-rate source is drawn on
+  `start <= t < end` and nothing at `end`; graph expressions are evaluated at
+  `ffmpeg_frame_time(k) = k * (den / num)`, an ulp off `k / fps`, which drops the first
+  frame of a third of the frame-aligned clips at 24 fps and half at 29.97; and a `fade`
+  counts frames (`S = round(st * fps)`, `N = round(d * fps)`, `i / N`), it does not
+  interpolate time. Exact rationals are for the frame pick alone. Each is pinned against
+  rendered pixels by `#[ignore]`d tests in `engine/cli/rendered.rs` (both FFmpegs). Moving
+  the extraction changed no argv byte: the golden oracle below is the proof, and the next
+  change to these numbers has to go through it. Shared test fixtures (assets, streams,
+  clips, tracks) live in `engine/test_support.rs`.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
@@ -255,8 +276,13 @@ so the feature is **only** activated through these forwards — which is what ma
   exception: a still has no source timeline, so its input is `-loop 1 -framerate
   fps -t <window>` instead of `-ss`'d, and its in-graph `trim` stays absolute (seek
   forced to 0); `frame_*`/`timeline_frame` likewise decode the single frame without
-  seeking. `render_with_progress` streams ffmpeg's `-progress` to report
-  `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
+  seeking. The **composited still's `-ss` is spelled to the microsecond**
+  (`kerf_core::seek_arg`, `{:.6}`, which `kerf-gpu`'s `decode_args` calls too): `-ss` is
+  exact on a fine time base, and with a
+  frame at 1.0006 s `-ss 1.0006` returns it where the old `{:.3}` spelling, `1.001`,
+  skipped to the next frame (`a_still_picks_the_frame_at_a_fine_time_base_second`,
+  `#[ignore]`d, both FFmpegs). `render_with_progress` streams ffmpeg's `-progress` to
+  report `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
   `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
@@ -940,7 +966,14 @@ no editing logic in the adapter.
   it, or the argv text changed; digest and coverage failures are reported together.
   `KERF_GOLDEN_CASES=<file>` writes a digest per case (diff base vs change to find the case
   in a failing block), `KERF_GOLDEN_DUMP=<n>` prints one case's argv,
-  `KERF_GOLDEN_COVERAGE=1` the thinnest families.
+  `KERF_GOLDEN_COVERAGE=1` the thinnest families. Two intended changes since it landed:
+  the still's `-ss` going from `{:.3}` to `{:.6}` re-blessed `still.txt` alone (only `-ss`
+  values differ in any still argv), and the pool gained head-padded proxy twins of four
+  assets (`.../kerf/proxies/<hex>.lead.mp4`, so `ClipFx.head_pad` and its
+  `trim=start_frame=1` are covered), reached only by `retarget` — every seventh case, no
+  dice of its own — so all three files re-blessed but only 428 of the 4000 per-case digests
+  moved (`KERF_GOLDEN_CASES` before / after) and the rest are byte-identical. Raising
+  `LIBRARY` (a new generated asset) moves the draws of every case; a new twin moves none.
 - `project.rs` — `Project` wraps a `rusqlite::Connection`. **Persistence shape:**
   `assets` and `analysis` are real tables (streams/analysis stored as JSON columns);
   the **entire timeline is a single JSON blob** in a one-row `timeline` table. All

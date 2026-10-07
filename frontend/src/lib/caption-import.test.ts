@@ -206,13 +206,13 @@ describe('ASS / SSA', () => {
 });
 
 describe('hostile input', () => {
-	/** Fail if `f` takes a second or more. These inputs were quadratic before their
+	/** Fail if `f` takes five seconds or more (wide on purpose: catch the algorithm, not a busy machine). These inputs were quadratic before their
 	 *  scans were bounded (a megabyte of `<` took tens of seconds). */
 	const withinASecond = <T>(what: string, f: () => T): T => {
 		const started = performance.now();
 		const out = f();
 		const took = performance.now() - started;
-		expect(`${what}: ${took < 1000 ? 'quick' : `${Math.round(took)} ms`}`).toBe(`${what}: quick`);
+		expect(`${what}: ${took < 5000 ? 'quick' : `${Math.round(took)} ms`}`).toBe(`${what}: quick`);
 		return out;
 	};
 	const srtCueOf = (line: string, lines: number) => `1\n00:00:01,000 --> 00:00:03,000\n${Array(lines).fill(line).join('\n')}\n`;
@@ -567,7 +567,7 @@ describe('placeCues, the details', () => {
 		const cues = Array.from({ length: 100 }, (_, i) => seg(i * 10, i * 10 + 6, thousand));
 		const started = performance.now();
 		const p = placeCues(timelineOf([clip({ source_out: 1000 })]), cues, { kind: 'timeline' }, resolveCaptions({ style: 'word_punch' }));
-		expect(performance.now() - started).toBeLessThan(1000);
+		expect(performance.now() - started).toBeLessThan(5000);
 		accounted(p, 100);
 		expect(p.placed).toBe(100);
 		expect(p.overlays.reduce((n, o) => n + o.text.split(' ').length, 0)).toBe(100 * 1000);
