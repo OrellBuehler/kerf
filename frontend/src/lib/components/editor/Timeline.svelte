@@ -11,8 +11,8 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
-	import { gainLabel, panLabel } from '$lib/mixer';
-	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, trimEdit } from '$lib/frames';
+	import { gainLabel, MAX_GAIN, panLabel } from '$lib/mixer';
+	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
 	import { readPalette } from '$lib/waveform-draw';
 	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
@@ -184,9 +184,15 @@
 		dur: number;
 		start: number; // current ghost start (seconds)
 		trackId: string; // current ghost destination track
+		downX: number; // where the pointer went down, px: "moved" is judged on this
 		moved: boolean;
 	};
 	let drag = $state<Drag | null>(null);
+
+	/** Pointer travel (px) before a press on a clip or an edge is a drag. Judged on
+	 *  the pointer itself, never on the quantized position: at high zoom one pixel
+	 *  is under a frame, so a 1 px jitter of a click can round to the next frame. */
+	const DRAG_SLOP = 3;
 
 	// ---- edge-dragging trim ---------------------------------------------------
 
@@ -199,6 +205,8 @@
 		origStart: number;
 		origEnd: number;
 		pos: number; // current ghost position of the dragged edge
+		downX: number; // where the pointer went down, px
+		grab: number; // pointer's offset from the edge it grabbed (seconds): the edge follows the pointer, not jumps to it
 		moved: boolean;
 	};
 	let trimDrag = $state<TrimDrag | null>(null);
@@ -212,6 +220,8 @@
 		e.stopPropagation();
 		editor.selectClip(c.id);
 		void editor.select(c.asset_id);
+		const laneLeft =
+			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
 		// A still image loops, so its source window can grow without limit.
 		const still = asset?.streams.some((s) => s.image) ?? false;
@@ -249,6 +259,8 @@
 			origStart: start,
 			origEnd: end,
 			pos: edge === 'l' ? start : end,
+			downX: e.clientX,
+			grab: laneTime(e.clientX, laneLeft) - (edge === 'l' ? start : end),
 			moved: false
 		};
 		capturePointer(e);
@@ -258,9 +270,11 @@
 		if (!trimDrag) return;
 		const lane = document.querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
-		const pos = clampEdge(snapPoint(laneTime(e.clientX, laneLeft), trimDrag.trackId, trimDrag.clipId), trimDrag.min, trimDrag.max);
-		const orig = trimDrag.edge === 'l' ? trimDrag.origStart : trimDrag.origEnd;
-		const moved = trimDrag.moved || Math.abs(pos - orig) >= 2 / pxPerSec;
+		// Where the pointer says the edge is (it keeps the offset it grabbed it at),
+		// rounded once: that is the ghost, and the commit.
+		const raw = laneTime(e.clientX, laneLeft) - trimDrag.grab;
+		const pos = clampEdge(snapPoint(raw, trimDrag.trackId, trimDrag.clipId), trimDrag.min, trimDrag.max);
+		const moved = trimDrag.moved || Math.abs(e.clientX - trimDrag.downX) >= DRAG_SLOP;
 		trimDrag = { ...trimDrag, pos, moved };
 	}
 
@@ -269,6 +283,8 @@
 		const d = trimDrag;
 		trimDrag = null;
 		if (!d.moved) return;
+		// A drag that ended on the frame the edge was already on writes nothing.
+		if (Math.abs(d.pos - (d.edge === 'l' ? d.origStart : d.origEnd)) < 1e-9) return;
 		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
 		if (!clip) return;
 		// `d.pos` is the gesture's one rounded position (the ghost drew it too); every
@@ -351,6 +367,7 @@
 			dur: clipDuration(c),
 			start: c.timeline_start,
 			trackId: t.id,
+			downX: e.clientX,
 			moved: false
 		};
 		capturePointer(e);
@@ -373,7 +390,8 @@
 			magnets.push(0, ui.time);
 			for (const b of beatTimes) magnets.push(b, b - dur); // land either edge on a beat
 			// align heads, butt after, butt before
-			for (let i = 0; i < edges.length; i += 2) magnets.push(edges[i], edges[i + 1], edges[i] - dur);
+			// `startBefore`, not `edge - dur`: the latter can end an ULP past the edge it butts.
+			for (let i = 0; i < edges.length; i += 2) magnets.push(edges[i], edges[i + 1], startBefore(edges[i], dur));
 		}
 		return quantizeSpanStart(start, dur, { fps, magnets, threshold: 8 / pxPerSec, welds: edges });
 	}
@@ -478,7 +496,7 @@
 		}
 		const start = snapStart(laneTime(e.clientX, laneLeft) - drag.grabSec, trackId, drag.clipId, drag.dur);
 		const movedEnough =
-			drag.moved || trackId !== drag.origTrackId || Math.abs(start - drag.origStart) >= 3 / pxPerSec;
+			drag.moved || trackId !== drag.origTrackId || Math.abs(e.clientX - drag.downX) >= DRAG_SLOP;
 		drag = { ...drag, start: movedEnough ? start : drag.start, trackId, moved: movedEnough };
 	}
 
@@ -1226,7 +1244,7 @@
 							<input
 								type="range"
 								min="0"
-								max={Math.max(2, t.volume ?? 1)}
+								max={Math.max(MAX_GAIN, t.volume ?? 1)}
 								step="0.01"
 								value={t.volume ?? 1}
 								disabled={editor.busy}

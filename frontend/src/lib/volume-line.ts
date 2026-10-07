@@ -2,21 +2,25 @@
  * and what gain a drag of the line means.
  *
  * The line is on a dB scale — a level is judged in dB, and a linear scale spends
- * almost all its height above -6 dB — from `LINE_DB_MIN` at the bottom to
- * `LINE_DB_MAX` at the top. The bottom edge is silence (`-Infinity`), not -36 dB:
- * dragging all the way down mutes the clip, as a fader does.
+ * almost all its height above -6 dB — from `LINE_DB_MIN` at the bottom to the top
+ * of the shared range, `MAX_GAIN` (+6 dB: the Inspector's slider and the track
+ * fader stop at the same place). The bottom edge is silence (`-Infinity`), not
+ * -36 dB: dragging all the way down mutes the clip, as a fader does.
  *
  * A drag is *relative* to where the line was grabbed, so pressing a few pixels off
  * the line does not make it jump, and it has a detent at exactly 0 dB. Unity is
  * not just a nice number: the export omits a clip's volume from the graph at 1.0,
- * so landing on it exactly is what leaves an untouched clip's render untouched. */
+ * so landing on it exactly is what leaves an untouched clip's render untouched.
+ * It is relative to the clip's *real* value too, not the clamped place the line is
+ * drawn at: a clip an agent set to 6x draws at the top, and a small drag moves it
+ * from 6x rather than collapsing it to the top of the scale. */
 
-import { dbToGain, gainToDb } from './mixer';
+import { dbToGain, gainToDb, MAX_GAIN } from './mixer';
 
 /** dB at the bottom of the line's travel — below it a clip is silent. */
 export const LINE_DB_MIN = -36;
-/** dB at the top. */
-export const LINE_DB_MAX = 12;
+/** dB at the top: `MAX_GAIN`. */
+export const LINE_DB_MAX = gainToDb(MAX_GAIN);
 /** Within this many dB of unity a drag lands on exactly 1.0. */
 export const UNITY_DETENT_DB = 0.5;
 /** The bottom of the travel (a fraction of it) that means silence. */
@@ -39,15 +43,25 @@ export function fractionToGain(f: number): number {
 	return dbToGain(LINE_DB_MIN + x * (LINE_DB_MAX - LINE_DB_MIN));
 }
 
-/** The gain a drag means: the line was grabbed at `startGain` and the pointer has
- *  since moved `dy` pixels down the screen over a travel of `rangePx`. Rounded to
- *  `DB_STEP`, snapped to exactly 1.0 near 0 dB. */
+/** Below this a drag that is heading down means silence. */
+export const SILENT_DB = LINE_DB_MIN + SILENT_FRACTION * (LINE_DB_MAX - LINE_DB_MIN);
+
+/**
+ * The gain a drag means: the line was grabbed at `startGain` and the pointer has
+ * since moved `dy` pixels down the screen over a travel of `rangePx`. Worked in dB
+ * from the clip's real level (a silent clip is grabbed at the bottom), capped at
+ * the top of the scale or at the clip's own level when that is higher, rounded to
+ * `DB_STEP`, snapped to exactly 1.0 near 0 dB and to exactly `MAX_GAIN` at the top.
+ */
 export function dragGain(startGain: number, dy: number, rangePx: number): number {
 	if (!(rangePx > 0)) return startGain;
-	const gain = fractionToGain(gainToFraction(startGain) - dy / rangePx);
-	if (gain === 0) return 0;
-	const db = gainToDb(gain);
+	const grabDb = startGain > 0 ? gainToDb(startGain) : LINE_DB_MIN;
+	const db = Math.min(Math.max(LINE_DB_MAX, grabDb), grabDb - (dy * (LINE_DB_MAX - LINE_DB_MIN)) / rangePx);
+	// Down into the bottom of the travel is a mute; so is staying there from silence.
+	if (db <= SILENT_DB && (dy > 0 || startGain <= 0)) return 0;
+	if (grabDb > LINE_DB_MAX && db >= grabDb) return startGain; // already past the top: up changes nothing
 	if (Math.abs(db) < UNITY_DETENT_DB) return 1;
+	if (grabDb <= LINE_DB_MAX && db >= LINE_DB_MAX - DB_STEP / 2) return MAX_GAIN;
 	return dbToGain(Math.round(db / DB_STEP) * DB_STEP);
 }
 

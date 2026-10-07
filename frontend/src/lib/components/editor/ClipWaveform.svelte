@@ -87,7 +87,12 @@
 		const wanted = tiles;
 		const asset = clip.asset_id;
 		const owner = clip.id;
-		if (wanted.length === 0 || wanted.every((t) => waveforms.get(asset, t))) return;
+		if (wanted.length === 0) {
+			// Off screen: no interest in any tile, so nothing queued for it ever runs.
+			waveforms.release(owner);
+			return;
+		}
+		if (wanted.every((t) => waveforms.get(asset, t))) return;
 		const timer = setTimeout(() => waveforms.want(owner, asset, wanted, () => arrivals++), WANT_DEBOUNCE);
 		return () => clearTimeout(timer);
 	});
@@ -105,7 +110,22 @@
 		const el = canvas;
 		const r = rect;
 		const h = height;
-		if (!el || !r || h <= 0) return;
+		if (!el) return;
+		if (!r) {
+			// Scrolled out of range: a canvas keeps its full backing store (width x
+			// height x 4 bytes, a few MB) for as long as it is alive, and a long pan
+			// leaves one behind per clip. Hand it back.
+			if (el.width > 1 || el.height > 1) {
+				el.width = 1;
+				el.height = 1;
+			}
+			if (untrack(() => drawn)) {
+				drawn = null;
+				status = 'loading';
+			}
+			return;
+		}
+		if (h <= 0) return;
 		const asset = clip.asset_id;
 
 		const have = new Map<number, TileData>();
@@ -118,7 +138,9 @@
 			if (why !== undefined) {
 				status = 'failed';
 				failure = why;
-				const timer = setTimeout(() => retries++, waveforms.retryAfterMs + 50);
+				// Try again when the cache stops holding the file off — which backs off the
+				// longer it keeps failing, so a broken file is not asked for forever.
+				const timer = setTimeout(() => retries++, (waveforms.retryIn(asset) ?? 0) + 50);
 				return () => clearTimeout(timer);
 			}
 			// Still on its way: keep whatever bitmap there is.
@@ -141,9 +163,12 @@
 		});
 		const ctx = el.getContext('2d');
 		if (!ctx) return;
-		el.width = columns;
-		el.height = Math.max(1, Math.round(h * scale));
-		drawWaveform(ctx, cols, { width: el.width, height: el.height, gain, dpr: scale, palette });
+		// Assigning a canvas's size reallocates its backing store even when it is the
+		// same size — a volume drag redraws on every pointer move, so only on change.
+		const pixelH = Math.max(1, Math.round(h * scale));
+		if (el.width !== columns) el.width = columns;
+		if (el.height !== pixelH) el.height = pixelH;
+		drawWaveform(ctx, cols, { width: columns, height: pixelH, gain, dpr: scale, palette });
 		drawn = { t0: r.x0 / pxPerSec, t1: (r.x0 + columns / scale) / pxPerSec };
 		status = 'ready';
 	});

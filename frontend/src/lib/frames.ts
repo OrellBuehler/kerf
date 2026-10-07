@@ -80,6 +80,30 @@ export function quantizeTime(time: number, o: QuantizeOptions): number {
 	return nearestWithin(frame, o.welds ?? [], WELD_EPS) ?? frame;
 }
 
+const ulp = new Float64Array(1);
+const ulpBits = new BigInt64Array(ulp.buffer);
+
+/** The double just below `x` (for `x > 0`). */
+export function nextDown(x: number): number {
+	ulp[0] = x;
+	ulpBits[0] -= 1n;
+	return ulp[0];
+}
+
+/**
+ * The latest start for a span of `dur` seconds that still ends at or before `tail`,
+ * by the backend's own arithmetic: `move_clip` refuses an overlap whenever
+ * `neighbour.timeline_start < start + duration`, a strict compare of exactly that
+ * sum. `tail - dur` is one rounding away from the answer, and one ULP too high
+ * about as often as not — then the clip that was butted against its neighbour is
+ * rejected as overlapping it by 1e-16 s. Step down until the sum fits.
+ */
+export function startBefore(tail: number, dur: number): number {
+	let s = tail - dur;
+	for (let i = 0; i < 8 && s > 0 && s + dur > tail; i++) s = nextDown(s);
+	return s;
+}
+
 /** The start of a span of `dur` seconds being moved: a magnet for either edge
  *  (`magnets` are *start* targets, so a caller that wants the tail on a beat adds
  *  `beat - dur` itself), else the nearest frame for the start, welded at either
@@ -92,7 +116,7 @@ export function quantizeSpanStart(start: number, dur: number, o: QuantizeOptions
 	const head = nearestWithin(frame, welds, WELD_EPS);
 	if (head !== null) return Math.max(0, head);
 	const tail = nearestWithin(frame + dur, welds, WELD_EPS);
-	return Math.max(0, tail !== null ? tail - dur : frame);
+	return Math.max(0, tail !== null ? startBefore(tail, dur) : frame);
 }
 
 /** Clamp a quantized edge into the range the clip may be trimmed to. The bounds

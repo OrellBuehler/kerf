@@ -4,12 +4,14 @@ import {
 	frameIndex,
 	frameTime,
 	nearestWithin,
+	nextDown,
 	onFrame,
 	quantizeFade,
 	quantizeSpanStart,
 	quantizeTime,
 	snapToFrame,
 	splitPoint,
+	startBefore,
 	trimEdit,
 	WELD_EPS
 } from './frames';
@@ -126,8 +128,9 @@ describe('quantizeSpanStart (move)', () => {
 	test('butts a neighbour exactly even with snapping off, at either end', () => {
 		const next = frameTime(90, fps) + 4.4e-16; // the neighbour's start, a hair past frame 90
 		const head = quantizeSpanStart(frameTime(30, fps), frameTime(60, fps), { fps, welds: [next] });
-		// head at frame 30, 60 frames long: its tail is the neighbour's start
-		expect(head + frameTime(60, fps)).toBe(next);
+		// head at frame 30, 60 frames long: its tail is the neighbour's start, and never past it
+		expect(head + frameTime(60, fps)).toBeLessThanOrEqual(next);
+		expect(next - (head + frameTime(60, fps))).toBeLessThan(1e-12);
 		const prevEnd = frameTime(30, fps) + 4.4e-16;
 		expect(quantizeSpanStart(frameTime(30, fps), 1, { fps, welds: [prevEnd] })).toBe(prevEnd);
 	});
@@ -160,6 +163,55 @@ describe('quantizeSpanStart (move)', () => {
 		let wandered = 0;
 		for (const stop of [3.3, 9.9, 0.1, 40.4, 12.2, target]) wandered = quantizeSpanStart(stop, 2, { fps });
 		expect(wandered).toBe(direct);
+	});
+});
+
+describe('startBefore (a tail that butts a neighbour without passing it)', () => {
+	/** The backend's own end of a clip: `timeline_start + duration`. */
+	const endOf = (start: number, dur: number) => start + dur;
+
+	test('nextDown is exactly one ULP', () => {
+		for (const x of [1e-9, 0.1, 1, 2.4333333333333336, 600, 3600.5]) {
+			const d = nextDown(x);
+			expect(d).toBeLessThan(x);
+			expect((d + x) / 2 === d || (d + x) / 2 === x).toBe(true); // nothing between them
+		}
+	});
+
+	test('the naive tail - dur is sometimes past the tail; startBefore never is', () => {
+		const rand = rng(31337);
+		let naiveOver = 0;
+		for (let i = 0; i < 20_000; i++) {
+			const fps = RATES[Math.floor(rand() * RATES.length)];
+			const tail = frameTime(1 + Math.floor(rand() * 60_000), fps) + (rand() < 0.5 ? 0 : (rand() - 0.5) * 1e-9);
+			const dur = (1 + Math.floor(rand() * 6000)) / fps / (rand() < 0.5 ? 1 : 1.5);
+			if (tail - dur <= 0) continue;
+			if (endOf(tail - dur, dur) > tail) naiveOver++;
+			const s = startBefore(tail, dur);
+			expect(endOf(s, dur)).toBeLessThanOrEqual(tail);
+			// ...and is the *latest* such start: one ULP up would pass the tail again, unless it is already exact
+			if (s !== tail - dur) expect(endOf(Math.min(s * (1 + 2.3e-16), tail - dur), dur)).toBeLessThanOrEqual(tail + 1e-12);
+			expect(Math.abs(endOf(s, dur) - tail)).toBeLessThan(1e-12);
+		}
+		// the premise: without the step-down this really did overlap
+		expect(naiveOver).toBeGreaterThan(100);
+	});
+
+	test('a tail weld in quantizeSpanStart never passes the neighbour, the fuzz case that overlapped', () => {
+		const rand = rng(8);
+		for (let i = 0; i < 5000; i++) {
+			const fps = RATES[Math.floor(rand() * RATES.length)];
+			const dur = (30 + Math.floor(rand() * 900)) / fps / (rand() < 0.5 ? 1 : 1.25);
+			const next = frameTime(200 + Math.floor(rand() * 5000), fps) + 4.4e-16 * Math.floor(rand() * 3);
+			// the pointer puts the head on the frame that makes its tail land on `next`
+			const start = quantizeSpanStart(next - dur + (rand() - 0.5) / fps / 3, dur, { fps, welds: [next] });
+			if (Math.abs(start + dur - next) < 1e-6) expect(start + dur).toBeLessThanOrEqual(next);
+		}
+	});
+
+	test('a start that is already exact is kept', () => {
+		expect(startBefore(10, 2.5)).toBe(7.5);
+		expect(startBefore(3, 3)).toBe(0);
 	});
 });
 

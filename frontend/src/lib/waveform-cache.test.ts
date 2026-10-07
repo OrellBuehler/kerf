@@ -214,6 +214,116 @@ describe('WaveformCache', () => {
 		expect(m.calls).toHaveLength(3);
 	});
 
+	test('want after the tiles are already cached notifies, since nothing else will', async () => {
+		const m = manual();
+		const cache = new WaveformCache(m.fetcher);
+		// clip one asks first; its tiles land while clip two is still waiting out its debounce
+		cache.want('one', 'a', tiles(0, 1), () => {});
+		m.calls[0].ok(range());
+		m.calls[1].ok(range());
+		await tick();
+		let told = 0;
+		cache.want('two', 'a', tiles(0, 1), () => told++);
+		expect(m.calls).toHaveLength(2); // nothing fetched...
+		expect(told).toBe(0); // ...and not on the caller's stack
+		await tick();
+		expect(told).toBe(1); // ...but it is told, so it redraws from the cache
+	});
+
+	test('an owner that let go before the microtask is not told', async () => {
+		const m = manual();
+		const cache = new WaveformCache(m.fetcher);
+		cache.want('one', 'a', tiles(0), () => {});
+		m.calls[0].ok(range());
+		await tick();
+		let told = 0;
+		cache.want('two', 'a', tiles(0), () => told++);
+		cache.release('two');
+		await tick();
+		expect(told).toBe(0);
+		// ...and one that asked for something else since is told by its newer request only
+		cache.want('three', 'a', tiles(0), () => told++);
+		cache.want('three', 'a', tiles(5), () => told++);
+		await tick();
+		expect(told).toBe(0);
+	});
+
+	test('a want with nothing to wait for says nothing', async () => {
+		const m = manual();
+		const cache = new WaveformCache(m.fetcher);
+		let told = 0;
+		cache.want('one', 'a', [], () => told++);
+		await tick();
+		expect(told).toBe(0);
+	});
+
+	test('a want for an asset that is being held off is told, so the view can say so', async () => {
+		const m = manual();
+		const cache = new WaveformCache(m.fetcher);
+		cache.want('one', 'a', tiles(0), () => {});
+		m.calls[0].no(new Error('no audio'));
+		await tick();
+		let told = 0;
+		cache.want('two', 'a', tiles(3), () => told++);
+		await tick();
+		expect(told).toBe(1);
+		expect(cache.failure('a')).toBe('no audio');
+		expect(m.calls).toHaveLength(1);
+	});
+
+	test('a file that keeps failing is tried less and less often, up to a cap', async () => {
+		const m = manual();
+		let now = 0;
+		const cache = new WaveformCache(m.fetcher, { now: () => now, retryAfterMs: 30_000, maxRetryMs: 4 * 60_000 });
+		const attempt = async () => {
+			cache.want('one', 'a', tiles(0), () => {});
+			m.calls[m.calls.length - 1].no(new Error('still broken'));
+			await tick();
+		};
+		await attempt();
+		const waits: number[] = [];
+		for (let i = 0; i < 6; i++) {
+			waits.push(cache.retryIn('a')!);
+			now += cache.retryIn('a')! + 1; // wait it out, then try again
+			expect(cache.failure('a')).toBeUndefined();
+			await attempt();
+		}
+		// 30 s, 60 s, 120 s, 240 s, and then it stops growing
+		expect(waits).toEqual([30_000, 60_000, 120_000, 240_000, 240_000, 240_000]);
+		// while held off nothing is requested, however often it is asked
+		const calls = m.calls.length;
+		for (let i = 0; i < 50; i++) cache.want('one', 'a', tiles(i), () => {});
+		expect(m.calls).toHaveLength(calls);
+		expect(cache.retryIn('other')).toBeUndefined();
+	});
+
+	test('requests that fail together are one failure, and a tile arriving starts the count over', async () => {
+		const m = manual();
+		let now = 0;
+		const cache = new WaveformCache(m.fetcher, { now: () => now, retryAfterMs: 30_000, concurrency: 3 });
+		cache.want('one', 'a', tiles(0, 1, 2), () => {});
+		for (const c of m.calls) c.no(new Error('boom'));
+		await tick();
+		expect(cache.retryIn('a')).toBe(30_000); // not 120 s for three failures in one burst
+
+		now = 30_001;
+		cache.want('one', 'a', tiles(0), () => {});
+		m.calls[m.calls.length - 1].no(new Error('boom'));
+		await tick();
+		expect(cache.retryIn('a')).toBe(60_000);
+
+		now += 60_001;
+		cache.want('one', 'a', tiles(0), () => {});
+		m.calls[m.calls.length - 1].ok(range());
+		await tick();
+		expect(cache.retryIn('a')).toBeUndefined();
+		// the next failure starts from the base again
+		cache.want('one', 'a', tiles(7), () => {});
+		m.calls[m.calls.length - 1].no(new Error('later'));
+		await tick();
+		expect(cache.retryIn('a')).toBe(30_000);
+	});
+
 	test('clear forgets everything', async () => {
 		const m = manual();
 		const cache = new WaveformCache(m.fetcher);

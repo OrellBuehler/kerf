@@ -1235,7 +1235,12 @@ every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead
 / clip edges) still wins, unrounded; frames are *not* a magnet and apply with snapping
 off too. A landing within 1 µs of a neighbour's edge *is* that edge (`welds`):
 `move_clip`'s overlap test is a strict float compare, and an edge computed as
-`start + length / speed` can sit an ULP past its frame. A razor cut keeps half a frame
+`start + length / speed` can sit an ULP past its frame — so a tail butted against a
+neighbour is placed by `startBefore` (the latest start whose `start + duration` does not
+pass it, in the backend's own arithmetic; `tail - dur` is an ULP too high about as often
+as not). Whether a press became a drag is judged on pointer travel (3 px), never on the
+quantized position (one pixel is under a frame at high zoom), and an edge keeps the
+offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
 title drag.
@@ -1250,9 +1255,15 @@ read through the mapping, mirrored, never flipped), the bucket width is the wide
 `waveform-cache.ts` (injectable fetcher; the app's instance is `waveforms.ts`) caches by
 asset + window + bucket count, joins in-flight requests, runs three at a time newest
 interest first and drops queued tiles nobody wants any more, remembers a failed asset
-for 30 s (one notification, no re-request per scroll), and is LRU-bounded. The draw
-waits until every tile it needs is cached and until then leaves the old bitmap where it
-was, placed by clip-local *time* so a zoom or scroll shows it stretched, not blank.
+(one notification, no re-request per scroll; held off 30 s, doubling per failure in a row
+up to 10 min, cleared by a tile arriving), and is LRU-bounded. `want` tells its owner
+(microtask) when everything it asked for was already cached or the asset is held off,
+because nothing else would — a clip that looked a moment before another clip's request
+landed the same tiles would otherwise stay unpainted. The draw waits until every tile it
+needs is cached and until then leaves the old bitmap where it was, placed by clip-local
+*time* so a zoom or scroll shows it stretched, not blank; a clip scrolled out of range
+releases its tiles and shrinks its canvas to 1x1 (a canvas keeps its whole backing store
+otherwise), and a redraw only assigns the canvas size when it changed.
 `waveform-draw.ts` fills one polygon per lane (not a line per sample), scaled by
 `effectiveGain` — clip volume through the track fader, as the export multiplies them —
 and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
@@ -1262,8 +1273,11 @@ a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger
 presets can drive it) and folds to one below that; the default 64 px track is stereo.
 `get_waveform` is no longer used by the timeline (the MCP tool keeps it).
 **`ClipOverlays.svelte`** is everything on a clip beside its body: a **volume line**
-(dB scale −36…+12, the bottom edge is silence; a relative drag with a detent at exactly
-0 dB, since the export omits unity from the graph; double-click resets), **fade handles**
+(dB scale −36 dB…`MAX_GAIN` (+6 dB, `mixer.ts`) — one ceiling shared with the Inspector's
+slider and the track fader, a clip set above it by an agent keeps its value and is drawn at
+the top; the bottom edge is silence; a drag is relative to the clip's *real* level, so a
+small drag moves a 6x clip from 6x instead of collapsing it, with a detent at exactly 0 dB,
+since the export omits unity from the graph; double-click resets), **fade handles**
 at the top corners (picture and sound both fade, so every clip has them; the volume line
 is only for clips whose asset has audio; clamped to the clip and to each other,
 double-click clears), the fade ramps, **keyframe diamonds** (clip-local seconds; click

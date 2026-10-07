@@ -9,8 +9,8 @@
  *    wants any more (the view scrolled on) is dropped from the queue before it
  *    ever costs an IPC round trip;
  *  - an asset whose request failed is remembered, so a broken file is not asked
- *    for again on every scroll — it is tried again only after a cooldown, and
- *    reported once;
+ *    for again on every scroll — it is tried again only after a cooldown that
+ *    doubles with every failure in a row (capped), and reported once;
  *  - memory is bounded (least recently used goes first).
  *
  * The fetcher is injected so this has no idea what a Tauri command is. */
@@ -25,8 +25,11 @@ export interface CacheOptions {
 	maxTiles?: number;
 	/** Requests in flight at once. */
 	concurrency?: number;
-	/** How long a failed asset is left alone, ms. */
+	/** How long a failed asset is left alone the first time, ms. Each further
+	 *  failure in a row doubles it, up to `maxRetryMs`. */
 	retryAfterMs?: number;
+	/** The longest a failing asset is left alone, ms. */
+	maxRetryMs?: number;
 	/** The clock, for tests. */
 	now?: () => number;
 	/** Called once per asset the first time a request for it fails. */
@@ -54,6 +57,7 @@ export class WaveformCache {
 	readonly #maxTiles: number;
 	readonly #concurrency: number;
 	readonly #retryAfter: number;
+	readonly #maxRetry: number;
 	readonly #now: () => number;
 	readonly #onFail?: (assetId: string, message: string) => void;
 
@@ -61,7 +65,8 @@ export class WaveformCache {
 	readonly #tiles = new Map<string, TileData>();
 	readonly #inflight = new Set<string>();
 	readonly #queue = new Map<string, Job>();
-	readonly #failed = new Map<string, { at: number; message: string }>();
+	/** `count` is failures in a row: it sets the cooldown, and a tile arriving clears it. */
+	readonly #failed = new Map<string, { at: number; message: string; count: number }>();
 	readonly #reported = new Set<string>();
 	readonly #owners = new Map<string, Owner>();
 	#seq = 0;
@@ -72,13 +77,23 @@ export class WaveformCache {
 		this.#maxTiles = o.maxTiles ?? 512;
 		this.#concurrency = Math.max(1, o.concurrency ?? 3);
 		this.#retryAfter = o.retryAfterMs ?? 30_000;
+		this.#maxRetry = Math.max(this.#retryAfter, o.maxRetryMs ?? 10 * 60_000);
 		this.#now = o.now ?? Date.now;
 		this.#onFail = o.onFail;
 	}
 
-	/** How long a failed asset is left alone, ms — when a view may usefully ask again. */
-	get retryAfterMs(): number {
-		return this.#retryAfter;
+	/** How long a failing asset is left alone after its `count`th failure in a row. */
+	#cooldown(count: number): number {
+		return Math.min(this.#retryAfter * 2 ** Math.max(0, count - 1), this.#maxRetry);
+	}
+
+	/** Milliseconds until a failed asset may be asked for again, or `undefined`
+	 *  when it is not being held off — what a view waits before trying again. */
+	retryIn(assetId: string): number | undefined {
+		const f = this.#failed.get(assetId);
+		if (!f) return undefined;
+		const left = f.at + this.#cooldown(f.count) - this.#now();
+		return left > 0 ? left : undefined;
 	}
 
 	/** Tiles held. */
@@ -110,9 +125,7 @@ export class WaveformCache {
 	/** Why an asset's waveform is unavailable, while its failure is still being
 	 *  remembered; `undefined` once it may be tried again (or never failed). */
 	failure(assetId: string): string | undefined {
-		const f = this.#failed.get(assetId);
-		if (!f) return undefined;
-		return this.#now() - f.at < this.#retryAfter ? f.message : undefined;
+		return this.retryIn(assetId) === undefined ? undefined : this.#failed.get(assetId)?.message;
 	}
 
 	/**
@@ -124,7 +137,6 @@ export class WaveformCache {
 		const previous = this.#owners.get(owner);
 		const keys = new Map<string, string>();
 		const failed = this.failure(assetId) !== undefined;
-		if (!failed) this.#failed.delete(assetId); // cooldown over: a clean slate
 		const call = ++this.#seq;
 		for (const [order, spec] of specs.entries()) {
 			const key = tileKey(assetId, spec);
@@ -135,8 +147,17 @@ export class WaveformCache {
 			if (queued) Object.assign(queued, { call, order });
 			else this.#queue.set(key, { key, assetId, spec, call, order });
 		}
-		this.#owners.set(owner, { notify, keys });
+		const entry: Owner = { notify, keys };
+		this.#owners.set(owner, entry);
 		if (previous) this.#prune(previous.keys.keys());
+		// Nothing is coming to tell this owner: everything it wants is already cached
+		// (it may have looked a moment before another clip's request landed them) or
+		// belongs to an asset being held off. Say so, once, off the caller's stack.
+		if ((keys.size === 0 && specs.length > 0) || failed) {
+			queueMicrotask(() => {
+				if (this.#owners.get(owner) === entry) notify();
+			});
+		}
 		this.#pump();
 	}
 
@@ -197,6 +218,7 @@ export class WaveformCache {
 		void request.then(
 			(range) => {
 				this.#release(job);
+				this.#failed.delete(job.assetId); // it works: the next failure starts over
 				this.#put(job.key, tileData(range));
 				this.#tell(job.key);
 				this.#pump();
@@ -236,7 +258,15 @@ export class WaveformCache {
 	}
 
 	#fail(assetId: string, message: string): void {
-		this.#failed.set(assetId, { at: this.#now(), message });
+		// Failures of one burst (requests in flight together) are one failure; one
+		// after the cooldown has run out is the next in a row.
+		const prev = this.#failed.get(assetId);
+		const burst = prev !== undefined && this.retryIn(assetId) !== undefined;
+		this.#failed.set(assetId, {
+			at: burst ? prev.at : this.#now(),
+			message,
+			count: burst ? prev.count : (prev?.count ?? 0) + 1
+		});
 		// Whatever else was queued for the same file would fail the same way.
 		for (const [key, job] of this.#queue) if (job.assetId === assetId) this.#queue.delete(key);
 		const told = new Set<Owner>();
