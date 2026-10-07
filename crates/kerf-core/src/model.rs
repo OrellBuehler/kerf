@@ -3318,7 +3318,7 @@ impl Timeline {
 }
 
 mod links;
-pub use links::Detached;
+pub use links::{Detached, DetachedMany, SkippedDetach};
 
 // ---- ripple ----------------------------------------------------------------
 
@@ -3368,7 +3368,7 @@ impl Timeline {
     /// * **Tracks are independent — except for linked clips.** A ripple on `V1`
     ///   does not move the rest of `A1`, but a clip it moved takes its *linked
     ///   partners* along by the same amount (the sync lock, see
-    ///   `Timeline::follow_links`); a **locked** track never moves (an edit to it
+    ///   `Timeline::conform_links`); a **locked** track never moves (an edit to it
     ///   is left as made). **Overlays and markers do not move** either; they are
     ///   timeline-level, not track-level, and rippling titles can come later.
     ///
@@ -3385,11 +3385,33 @@ impl Timeline {
     }
 
     /// [`Timeline::ripple_from`] with the sync lock for linked material made
-    /// explicit: with `links` on, a clip the ripple moved drags its linked partners
-    /// on other tracks along by the same amount (see `Timeline::follow_links`) —
-    /// the picture's sound stays with it even when the sound's own track had
-    /// nothing to ripple. With `links` off, tracks are independent.
+    /// explicit: with `links` on, the clips the ripple moved take their linked
+    /// partners on other tracks along ([`Timeline::conform_links`], best effort — a
+    /// conform that would be refused leaves the plain per-track ripple, and the
+    /// edit's own sync guard says why) so the picture's sound stays with it even
+    /// when the sound's own track had nothing to ripple. With `links` off, tracks
+    /// are independent.
     pub fn ripple_from_with(&self, before: &Timeline, links: bool) -> Timeline {
+        self.ripple_from_anchored(before, links, &HashSet::new())
+    }
+
+    /// [`Timeline::ripple_from_with`] told which clips the edit **named**
+    /// (`anchors`), so the sync lock knows whose track speaks for a linked group
+    /// when the partners' tracks were rippled by different amounts.
+    pub fn ripple_from_anchored(&self, before: &Timeline, links: bool, anchors: &HashSet<Uuid>) -> Timeline {
+        let out = self.ripple_lanes(before);
+        if links {
+            let mut conformed = out.clone();
+            if conformed.conform_links(before, anchors, &HashMap::new()).is_ok() {
+                return conformed;
+            }
+        }
+        out
+    }
+
+    /// The per-track half of [`Timeline::ripple_from`]: every unlocked track
+    /// rippled on its own, nothing carried between them.
+    pub fn ripple_lanes(&self, before: &Timeline) -> Timeline {
         let in_before: HashSet<Uuid> = before.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
         let in_after: HashSet<Uuid> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
         let mut out = self.clone();
@@ -3403,9 +3425,6 @@ impl Timeline {
             if let Some(rippled) = ripple_track(track, prior, &in_before, &in_after) {
                 *track = rippled;
             }
-        }
-        if links {
-            out.follow_links(self, before);
         }
         out
     }

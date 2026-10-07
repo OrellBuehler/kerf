@@ -24,7 +24,6 @@
 import { formatTime } from './diff';
 import { invalid, locateIndex, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
-import { DIFF_EPS } from './ripple';
 import type {
 	Clip,
 	ClipCut,
@@ -58,6 +57,11 @@ export interface DeltaRange {
 	whyMin: string;
 	whyMax: string;
 }
+
+/** kerf-core's `DIFF_EPS`: timing closer than this is float noise from a JSON round-trip.
+ *  Defined here (and re-exported by `ripple.ts`, where it always lived) so the sync lock in
+ *  `ripple.ts` can use this module's clip helpers without an import cycle. */
+export const DIFF_EPS = 1e-6;
 
 const changed = (a: number, b: number) => Math.abs(a - b) > DIFF_EPS;
 const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);

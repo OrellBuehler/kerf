@@ -218,7 +218,7 @@ struct SplitParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: each partner that has the split time inside it is split at the same moment, and the new halves are linked to each other. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: each partner that has the split time inside it is split at the same moment; the clips on each side of the cut form a link group of their own (a partner that lies wholly after the cut goes with the right half). false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -267,7 +267,7 @@ struct RippleDeleteParams {
     #[schemars(description = "UUID of the clip to remove")]
     clip_id: String,
     #[schemars(
-        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: each partner is removed too and every track closes the gap behind its own clip. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: each partner is removed too, the named clip's track closes the gap by that clip's length, and the linked clips after it follow by the same amount on their own tracks (unlinked clips on a partner's track stay put). false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -326,6 +326,14 @@ struct MoveClipsParams {
 struct LinkClipsParams {
     #[schemars(
         description = "UUIDs of the clips to link — at least two, each on a DIFFERENT track (a picture and its sound), none on a locked track"
+    )]
+    clip_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DetachClipsParams {
+    #[schemars(
+        description = "UUIDs of the picture clips whose own sound to detach (on video tracks); one that cannot be is skipped and reported"
     )]
     clip_ids: Vec<String>,
 }
@@ -397,7 +405,7 @@ struct CutClipRangeParams {
     #[schemars(description = "Source-time end of the span to remove (seconds)")]
     to: f64,
     #[schemars(
-        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: the stretch of TIMELINE the cut removes is taken out of every partner it overlaps too, each closing the gap on its own track. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: the stretch of TIMELINE the cut removes is taken out of every partner it overlaps too — a partner whose start was inside the stretch resumes at the cut, one spanning it is cut in two — and the linked clips after it follow by the same amount. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -659,7 +667,7 @@ struct SpeedParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: partners are retimed by the same ratio. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: partners are retimed by the same ratio and re-placed about the clip you named (a sound that leads its picture still leads it, scaled); the linked clips after follow it. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -1397,9 +1405,10 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Move a clip to a new index within its track (re-flows the track gaplessly). Not link-aware: \
-                       it re-lays this one track, so it is REFUSED (\"out of step\") when it would part a linked \
-                       picture and sound — move_clip is the link-aware way to reposition."
+        description = "Move a clip to a new index within its track (re-flows the track gaplessly). The re-flow \
+                       re-lays this one track and the clips linked to what it moved follow (a picture's sound goes where \
+                       its picture went), unless an unlinked clip on their track is in the way, which refuses it; \
+                       link=false is not offered here — use move_clip to reposition one clip."
     )]
     fn reorder(&self, Parameters(p): Parameters<ReorderParams>) -> Result<String, McpError> {
         let track_id = parse_id(&p.track_id)?;
@@ -1549,8 +1558,9 @@ impl KerfMcp {
                        loses what belonged to the removed half: removing the left drops fade_in and the transition into \
                        it, removing the right drops fade_out. In ripple mode (get_ripple_mode, or pass `ripple`) the \
                        later clips on the track close the gap; otherwise the gap stays. Linked partners that span \
-                       `at` are trimmed to it as well (link=false: this clip only). Returns the clip that remains, \
-                       then the partners'. \
+                       `at` are trimmed to it as well (link=false: this clip only) — but only the named clip comes \
+                       back: read the partners from get_timeline_state, or use split_remove_clips, which returns \
+                       every clip it cut. Returns the clip that remains. \
                        Errors if `at` is not inside the clip or would leave under 0.05s, or the track is locked."
     )]
     fn split_remove(&self, Parameters(p): Parameters<SplitRemoveParams>) -> Result<String, McpError> {
@@ -1869,9 +1879,10 @@ impl KerfMcp {
                        sits ahead of a clip — a trim, a speed change, a remove, an add onto footage that is there, \
                        a voiceover placed over footage — carries the later clips on the same track along, keeping \
                        their gaps. Tracks ripple on their own, except that a clip the ripple moved takes its \
-                       LINKED partners along by the same amount (a picture's detached sound keeps with it; \
-                       other clips on that audio track stay put), a locked track never moves (and a lane the shift would leave overlapping is left as the \
-                       edit made it), and titles and markers stay put. Off by default; it is the \
+                       LINKED partners along by the same amount (a picture's detached sound keeps with it, a \
+                       J/L-cut offset included; other clips on that audio track stay put), a locked track never \
+                       moves (and a lane the shift would leave overlapping is left as the edit made it), and titles \
+                       and markers stay put. Off by default; it is the \
                        user's toolbar setting and is saved with the project. Check it before trimming or \
                        removing, and pass `ripple` on those tools to override it for one call."
     )]
@@ -2353,11 +2364,14 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Make an asset's sound its own clip on an audio track. If the asset is already cut onto a \
-                       video track, each of those clips has its sound DETACHED (see detach_audio: an audio clip with \
-                       the same span and position, linked to the picture, whose own sound is muted) so nothing is \
-                       heard twice; otherwise the asset's whole audio is appended to the first audio track. Returns \
-                       the (first) audio clip made. For one clip, use detach_audio."
+        description = "Give an asset's sound its own clip on an audio track, for every clip of the asset on a video \
+                       track that still plays it: each is DETACHED (see detach_audio: an audio clip with the same span \
+                       and position, linked to the picture, whose own sound is muted) so nothing is heard twice — in \
+                       one revision. A clip that cannot be detached (its track is locked) is skipped and listed in \
+                       `skipped` with the reason. Errors when there is nothing to extract (no clip of the asset on a \
+                       video track, or its sound already detached) and does NOT append the asset's audio as a \
+                       fallback: for the asset's whole audio as a clip of its own, use add_asset_audio. Returns \
+                       `detached` (each: the audio `clip`, its `track_id`, `created_track`) and `skipped`."
     )]
     fn extract_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -2368,15 +2382,33 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Add an asset's WHOLE audio, from its start, as a new clip at the end of the first audio track \
+                       (created when there is none). It touches no picture clip, so footage that is also on a video \
+                       track playing its own sound is heard twice where the two overlap — to give a clip already cut its \
+                       sound as an audio clip use extract_audio / detach_audio, which mute the picture. For music and \
+                       other audio-only assets this is how they reach the timeline. One revision. Returns the clip."
+    )]
+    fn add_asset_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        self.edit(|project| {
+            let out = project.add_asset_audio(id).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
         description = "DETACH a picture clip's own sound onto an audio track: a new audio clip with the SAME source \
                        span, speed and timeline position goes on the audio track at the picture's own position (V1 → \
                        A1) when it has room, else the first that does, else a new one; it is LINKED to the picture \
                        (so they move, trim, split and delete together — see link_clips) and the picture's own sound \
-                       is muted, so the sound is heard once, from the audio track, where its fader, pan, ducking and \
-                       mute apply. Volume, audio effects, fades and the transition's sound fade go with the audio \
-                       clip. One revision. Errors if the clip is not on a video track, its asset has no audio, its \
-                       sound is already detached, or a track involved is locked. Returns `clip` (the audio clip), \
-                       `track_id` and `created_track`. reattach_audio undoes it."
+                       is muted, so the sound is heard once, from the audio track. The LEVEL is kept: the picture \
+                       track's fader is folded into the new clip's volume (volume × picture fader ÷ audio fader). \
+                       What cannot be kept is the rest of the audio track's strip — its pan, duck and mute/solo \
+                       decide the mix now, not the picture track's. Audio effects, fades and the transition's sound \
+                       fade go with the audio clip. One revision. Errors if the clip is not on a video track, its \
+                       asset has no audio, its sound is already detached, or a track involved is locked. Returns \
+                       `clip` (the audio clip), `track_id` and `created_track`. reattach_audio undoes it; \
+                       detach_audio_clips does several in one revision."
     )]
     fn detach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2387,9 +2419,25 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "DETACH the own sound of SEVERAL picture clips in ONE revision (one undo step) — detach_audio for \
+                       each. A clip that cannot be (not a video clip, no audio, already detached, a locked track) is \
+                       skipped and listed in `skipped` with the reason; errors only when none could be. Returns \
+                       `detached` (each: the audio `clip`, `track_id`, `created_track`) and `skipped`."
+    )]
+    fn detach_audio_clips(&self, Parameters(p): Parameters<DetachClipsParams>) -> Result<String, McpError> {
+        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        self.edit(|project| {
+            let out = project.detach_audio_clips(&ids).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
         description = "REATTACH detached sound: delete the linked audio clip(s) carrying a picture's sound and let the \
                        picture play its own again, as it was before detach_audio (edits made to the audio clip are \
-                       not carried back). Name either clip of the pair. One revision. Returns the picture clip."
+                       not carried back). Name either clip of the pair. A picture whose audio clip is already gone \
+                       is just unmuted — unless another audio clip is already playing the same footage in step with \
+                       it (unmuting would double the sound), which is refused. One revision. Returns the picture clip."
     )]
     fn reattach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2403,12 +2451,13 @@ impl KerfMcp {
         description = "LINK clips into one group — a picture and the sound that goes with it, or any clips that must \
                        stay together. From then on move_clip(s) / trim / split_at / remove(_clips) / ripple_delete / \
                        cut_clip_range / set_speed / roll_edit / slip_clip / slide_clip / split_remove(_clips) carry the \
-                       edit to the others (pass link=false on those to edit one alone) and a ripple moves a linked clip \
-                       with its partners. Any edit that would leave a linked pair OUT OF STEP anyway (a ripple whose \
-                       partner is blocked by another clip, a left trim of a pair that was never cut to the same \
-                       edges) is refused with an \"out of step\" error instead of desynchronizing the sound — retry \
-                       with link=false or ripple=false. At least two clips, on different tracks, none on a locked \
-                       track. detach_audio links for you. One revision. Returns the group's `link_id`."
+                       edit to the others (pass link=false on those to edit one alone) and any ripple, cut or delete \
+                       that moves a linked clip moves its partners by the same amount — a sound that leads or trails \
+                       its picture (a J- or L-cut) stays that far ahead or behind. Only linked clips follow: an \
+                       unlinked clip on a partner's track stays where it was, and one in the way refuses the edit \
+                       (as does a locked partner, or a linked clip that would be covered) with a reason. Two linked \
+                       clips you name and move apart yourself are refused as \"out of step\" — unlink them first. \
+                       At least two clips, on different tracks, none on a locked track. detach_audio links for you. One revision. Returns the group's `link_id`."
     )]
     fn link_clips(&self, Parameters(p): Parameters<LinkClipsParams>) -> Result<String, McpError> {
         let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
@@ -3083,6 +3132,7 @@ impl KerfMcp {
     fn timeline_summary(&self) -> Result<String, McpError> {
         let project = self.lock();
         let timeline = project.working_timeline().map_err(core_err)?;
+        let linked = timeline.linked_clip_ids();
         let tracks: Vec<TrackSummary> = timeline
             .tracks
             .iter()
@@ -3093,7 +3143,7 @@ impl KerfMcp {
                 clip_count: t.clips.len(),
                 duration_secs: t.end(),
                 gaps: track_gaps(t),
-                linked_clips: t.clips.iter().filter(|c| !timeline.link_partners(c.id).is_empty()).count(),
+                linked_clips: t.clips.iter().filter(|c| linked.contains(&c.id)).count(),
                 detached_sound_clips: t.clips.iter().filter(|c| !c.source_audio).count(),
             })
             .collect();
@@ -3289,14 +3339,17 @@ impl ServerHandler for KerfMcp {
              which flips the user's own setting. A picture and its sound can be \
              LINKED: detach_audio splits a clip's own sound onto an audio track \
              (muting the picture's, so it is not heard twice — extract_audio does the \
-             same for every clip of an asset) and links the two, and from then on \
+             same for every use of an asset, detach_audio_clips for several clips \
+             in one revision) and links the two, and from then on \
              move / trim / split / remove / speed / roll-slip-slide / ripple carry \
              a linked partner along (link_clips / unlink_clips edit the groups; \
              `link_id` in get_timeline_state shows them; pass `link: false` on any \
              of those tools to edit one clip alone, which can leave the pair out \
-             of sync; a partner on a locked track refuses the edit, and so does any \
-             edit that would part a pair — an `out of step` error — which `link: false` \
-             or `ripple: false` gets past). Layer footage with add_track / \
+             of sync; a partner on a locked track refuses the edit, and so does \
+             an unlinked clip that a linked clip would run into — the error names the \
+             lane). A ripple, a delete or a cut moves linked clips together by the \
+             same amount, so a sound that leads or trails its picture stays that far \
+             off; add_asset_audio puts an asset's whole audio on an audio track. Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
@@ -4008,7 +4061,9 @@ mod tests {
             "snap_to_beats",
             "duplicate_clips",
             "extract_audio",
+            "add_asset_audio",
             "detach_audio",
+            "detach_audio_clips",
             "reattach_audio",
             "link_clips",
             "unlink_clips",
@@ -4020,6 +4075,8 @@ mod tests {
             );
         }
         assert_eq!(schema("detach_audio").1, ["clip_id"]);
+        assert_eq!(schema("detach_audio_clips").1, ["clip_ids"]);
+        assert_eq!(schema("add_asset_audio").1, ["asset_id"]);
         assert_eq!(schema("reattach_audio").1, ["clip_id"]);
         assert_eq!(schema("link_clips").1, ["clip_ids"]);
         assert_eq!(schema("unlink_clips").1, ["clip_ids"]);

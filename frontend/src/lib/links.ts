@@ -8,13 +8,13 @@
 //   edit                       the partners…
 //   move (withLinkedMoves)     move by the same Δt, on their own tracks
 //   trim (carryExtentEdit)     follow the edge that changed when they share it, clamped to their footage
-//   split (splitClipLinked)    are split at the same time (if it is inside them); the new halves link up
+//   split (splitClipLinked)    are split at the same time (if it is inside them); the pieces on each side link up
 //   remove / ripple delete     are removed too
-//   cut a source span          lose the same stretch of *timeline*, and close up
-//   speed                      are retimed by the same ratio
+//   cut a source span          lose the same stretch of *timeline*; what survives of a partner is put back in step
+//   speed                      are retimed by the same ratio, and re-placed about the named clip
 //   split and remove           are cut at the same time, if it is inside them
 //   roll / slip / slide        (edit-modes.ts) get the same edit, the group clamping to its tightest
-//   ripple                     (ripple.ts) follow a partner the ripple moved
+//   ripple, delete, cut        (ripple.ts, `conformLinks`) the clips they moved take their linked partners along
 //
 // A locked partner refuses the whole edit; property edits (volume, fades, effects) are
 // not carried. Every function validates before it mutates, so a thrown error leaves
@@ -32,21 +32,27 @@ import {
 import {
 	clipById,
 	clipNotFound,
+	contentOffset,
 	invalid,
 	linkPartners,
 	locateIndex,
 	lockedPartner,
 	newId,
-	relinkNewHalves,
+	relinkSides,
+	STEP_EPS,
 	unlockedPartners
 } from './link-groups';
-import { DIFF_EPS, spansOverlap } from './ripple';
+import { conformLinks, DIFF_EPS, spansOverlap } from './ripple';
 import type { Clip, ClipCut, ClipMove, Timeline } from './types';
 import { clipDuration } from './types';
 
 const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);
 const reversed = (c: Clip) => (c.speed ?? 1) < 0;
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
+/** A track fader at or below this is silent: nothing can be carried onto it by scaling a clip up. */
+const MIN_FADER = 1e-3;
+/** The shortest a clip may be left (kerf-core's `MIN_LEFT`). */
+const MIN_LEFT = 1e-3;
 
 // ---- detach / reattach -----------------------------------------------------------
 
@@ -62,7 +68,8 @@ export interface Detached {
 
 /** The audio lane to put a detached clip spanning `span` on: the audio track at the
  *  picture track's own position (V1 → A1, V2 → A2) when it has room, else the first
- *  audio track that does; never a locked one, nor one in `avoid`. */
+ *  audio track that does; never a locked one, one with its fader at zero (the picture's
+ *  level cannot be carried onto it), nor one in `avoid`. */
 function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, number], avoid: ReadonlySet<number>): number | undefined {
 	const ordinal = timeline.tracks.slice(0, videoTrack).filter((t) => t.kind === 'video').length;
 	const audio = timeline.tracks.map((_, i) => i).filter((i) => timeline.tracks[i].kind === 'audio');
@@ -70,7 +77,12 @@ function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, num
 	const order = [...(preferred === undefined ? [] : [preferred]), ...audio.filter((i) => i !== preferred)];
 	return order.find((i) => {
 		const track = timeline.tracks[i];
-		return !track.locked && !avoid.has(i) && !track.clips.some((c) => spansOverlap(span, [c.timeline_start, endOf(c)]));
+		return (
+			!track.locked &&
+			(track.volume ?? 1) > MIN_FADER &&
+			!avoid.has(i) &&
+			!track.clips.some((c) => spansOverlap(span, [c.timeline_start, endOf(c)]))
+		);
 	});
 }
 
@@ -78,8 +90,11 @@ function audioLaneFor(timeline: Timeline, videoTrack: number, span: [number, num
  * **Detach** a picture clip's own sound: a new audio clip with the same source span,
  * speed and timeline position goes on an audio track (a new one when none has room), is
  * linked to the picture clip, and the picture clip's own sound is muted
- * (`source_audio: false`). The audio clip carries what shapes the *sound*: volume,
- * audio effects, fades and the transition; the picture keeps its own, inert while muted.
+ * (`source_audio: false`). The level is kept where it can be: a video track's fader rides
+ * its clips' own sound and the audio track has one of its own, so the new clip's gain is
+ * `volume × picture track's fader ÷ audio track's fader`. The destination's pan, duck and
+ * mute/solo decide the rest of the mix afterwards. The audio clip also carries audio
+ * effects, fades and the transition; the picture keeps its own, inert while muted.
  * `hasAudio` is whether the clip's asset carries an audio stream. Refuses a clip that is
  * not on a video track, whose sound is already detached, or whose track is locked.
  */
@@ -112,7 +127,8 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 		source_in: clip.source_in,
 		source_out: clip.source_out,
 		timeline_start: clip.timeline_start,
-		volume: clip.volume,
+		// The picture track's fader rode this sound; the destination's rides it now.
+		volume: (clip.volume * (timeline.tracks[vi].volume ?? 1)) / (timeline.tracks[laneIx].volume ?? 1),
 		fade_in: clip.fade_in,
 		fade_out: clip.fade_out,
 		speed: clip.speed ?? 1,
@@ -129,11 +145,65 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 	return { clip: structuredClone(audio), track_id: lane.id, created_track: createdTrack };
 }
 
+/** A clip a batch detach left alone, and why. */
+export interface SkippedDetach {
+	clip_id: string;
+	reason: string;
+}
+
+/** What `detachAudioMany` did (`DetachedMany`). */
+export interface DetachedMany {
+	detached: Detached[];
+	skipped: SkippedDetach[];
+}
+
+/**
+ * **Detach** several picture clips (`Timeline::detach_audio_many`). A clip that cannot be
+ * detached (not on a video track, no audio, already detached, a locked track) is skipped
+ * and reported rather than failing the rest; throws — with the first reason — only when
+ * nothing at all could be detached, so a caller never records an empty edit.
+ */
+export function detachAudioMany(timeline: Timeline, ids: readonly string[], hasAudio: (assetId: string) => boolean): DetachedMany {
+	const out: DetachedMany = { detached: [], skipped: [] };
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const clip = clipById(timeline, id);
+		try {
+			if (!clip) throw clipNotFound(id);
+			out.detached.push(detachAudio(timeline, id, hasAudio(clip.asset_id)));
+		} catch (e) {
+			out.skipped.push({ clip_id: id, reason: e instanceof Error ? e.message : String(e) });
+		}
+	}
+	if (out.detached.length === 0) throw invalid(out.skipped[0]?.reason ?? 'no clips to detach');
+	return out;
+}
+
+/** Whether `picture` would be heard **twice** if it played its own sound: some *other* clip
+ *  on an audio track carries the same footage in step with it, over time the two share
+ *  (`Timeline::sound_already_playing`). `without` are clips about to be deleted. */
+export function soundAlreadyPlaying(timeline: Timeline, picture: Clip, without: ReadonlySet<string>): boolean {
+	return timeline.tracks
+		.filter((t) => t.kind === 'audio')
+		.flatMap((t) => t.clips)
+		.some(
+			(c) =>
+				!without.has(c.id) &&
+				c.asset_id === picture.asset_id &&
+				Math.abs((c.speed ?? 1) - (picture.speed ?? 1)) < STEP_EPS &&
+				Math.abs(contentOffset(c) - contentOffset(picture)) < STEP_EPS &&
+				spansOverlap([c.timeline_start, endOf(c)], [picture.timeline_start, endOf(picture)])
+		);
+}
+
 /**
  * **Reattach** detached sound: the audio clip(s) linked to the picture clip that carry
  * the same asset are deleted and the picture clip plays its own sound again. Name either
  * the picture clip or its audio clip. A picture whose audio clip is already gone is just
- * unmuted. Returns the picture clip.
+ * unmuted — unless another audio clip is already playing the same footage in step with it
+ * (unmuting would double the sound), which is refused. Returns the picture clip.
  */
 export function reattachAudio(timeline: Timeline, clipId: string): Clip {
 	const at = locateIndex(timeline, clipId);
@@ -163,6 +233,10 @@ export function reattachAudio(timeline: Timeline, clipId: string): Clip {
 		if (timeline.tracks[pt].locked) throw lockedPartner(timeline.tracks[pt]);
 	}
 	const gone = new Set(doomed);
+	if (soundAlreadyPlaying(timeline, picture, gone))
+		throw invalid(
+			"this clip's sound is already playing from another audio clip — remove that clip first, or the sound would be heard twice"
+		);
 	for (const track of timeline.tracks) track.clips = track.clips.filter((c) => !gone.has(c.id));
 	const group = picture.link_id;
 	delete picture.source_audio;
@@ -246,8 +320,9 @@ export function extentEdit(was: Clip, now: Clip, looping: boolean): ExtentEdit |
  * **trim** moves a partner's edge by the same amount *when the partner shares that edge*
  * with the clip as it was (within `ADJACENT_EPS`), clamped to the footage the partner
  * has. It writes no overlap check — like a trim, it leaves what the ripple pass or the
- * user is about to settle. Throws when a partner is on a locked track, would be trimmed
- * away, or would start before 0. Returns the partners as they stand afterwards.
+ * user is about to settle. A partner carried before 0 loses what hangs off the front.
+ * Throws when a partner is on a locked track or would be trimmed away entirely. Returns
+ * the partners as they stand afterwards.
  */
 export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, footage: SourceLimits): Clip[] {
 	const now = clipById(timeline, clipId);
@@ -276,9 +351,15 @@ export function carryExtentEdit(timeline: Timeline, clipId: string, was: Clip, f
 			moveTail(p, by, pLooping);
 		}
 		if (clipDuration(p) <= DIFF_EPS)
-			throw invalid(`the linked clip on ${timeline.tracks[pt].name} would be trimmed away — edit with links off`);
-		if (p.timeline_start < -DIFF_EPS)
-			throw invalid(`the linked clip on ${timeline.tracks[pt].name} would start before the beginning of the timeline`);
+			throw invalid(`the linked clip on ${timeline.tracks[pt].name} would be trimmed away by this edit`);
+		if (p.timeline_start < -DIFF_EPS) {
+			// Carried before 0: what hangs off the front is cut away — losing the head keeps
+			// the clip in step, moving it would not.
+			const over = -p.timeline_start;
+			if (clipDuration(p) - over < MIN_LEFT)
+				throw invalid(`the linked clip on ${timeline.tracks[pt].name} would end before the beginning of the timeline`);
+			moveHead(p, over, pLooping);
+		}
 		p.timeline_start = Math.max(p.timeline_start, 0);
 		clampFades(p);
 		updates.push([pt, pc, p]);
@@ -311,9 +392,7 @@ export function carryLinksSince(timeline: Timeline, before: Timeline, footage: S
 	for (const ids of drivers.values()) {
 		if (ids.length !== 1) continue;
 		const was = structuredClone(clipById(before, ids[0])!);
-		const scratch: Timeline = structuredClone(timeline);
-		carryExtentEdit(scratch, ids[0], was, footage);
-		timeline.tracks = scratch.tracks;
+		carryExtentEdit(timeline, ids[0], was, footage);
 	}
 }
 
@@ -349,24 +428,40 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
 
 /**
  * **Split** `clipId` at `at` *and* every linked partner that has `at` inside it (a partner
- * that does not reach that moment is left whole); the new right halves are linked to each
- * other, the left halves keep the group. A partner on a locked track that would be split
- * refuses the whole edit. Returns the named clip's `[left, right]`.
+ * that does not reach that moment is left whole). The group then falls in two, by **side**:
+ * the left halves, and any partner that lies wholly before `at`, keep the group; the right
+ * halves, and any partner that lies wholly at or after `at`, form a new one. A side of one
+ * clip is no group. A partner on a locked track that would be split refuses the whole edit.
+ * Returns the named clip's `[left, right]`.
  */
 export function splitClipLinked(timeline: Timeline, clipId: string, at: number): [Clip, Clip] {
-	const partners = linkPartners(timeline, clipId).filter((id) => {
+	const found = locateIndex(timeline, clipId);
+	if (!found) throw clipNotFound(clipId);
+	const group = timeline.tracks[found[0]].clips[found[1]].link_id ?? undefined;
+	const cut: string[] = [];
+	const beforeAt: string[] = [];
+	const afterAt: string[] = [];
+	for (const id of linkPartners(timeline, clipId)) {
 		const c = clipById(timeline, id)!;
-		return c.timeline_start + DIFF_EPS < at && at < endOf(c) - DIFF_EPS;
-	});
-	for (const id of partners) {
+		if (c.timeline_start + DIFF_EPS < at && at < endOf(c) - DIFF_EPS) cut.push(id);
+		else if (c.timeline_start + DIFF_EPS >= at) afterAt.push(id);
+		else beforeAt.push(id);
+	}
+	for (const id of cut) {
 		const [ti] = locateIndex(timeline, id)!;
 		if (timeline.tracks[ti].locked) throw lockedPartner(timeline.tracks[ti]);
 	}
 	const [left, right] = splitClip(timeline, clipId, at);
-	const halves = [right.id];
-	for (const id of partners) halves.push(splitClip(timeline, id, at)[1].id);
-	relinkNewHalves(timeline, halves);
-	return [left, structuredClone(clipById(timeline, right.id)!)];
+	const lefts = [clipId];
+	const rights = [right.id];
+	for (const id of cut) {
+		lefts.push(id);
+		rights.push(splitClip(timeline, id, at)[1].id);
+	}
+	lefts.push(...beforeAt);
+	rights.push(...afterAt);
+	relinkSides(timeline, group, lefts, rights);
+	return [structuredClone(clipById(timeline, left.id)!), structuredClone(clipById(timeline, right.id)!)];
 }
 
 // ---- remove ----------------------------------------------------------------------
@@ -385,23 +480,41 @@ export function rippleDeleteClip(timeline: Timeline, clipId: string) {
 	for (const c of track.clips) if (c.timeline_start >= from) c.timeline_start = Math.max(c.timeline_start - dur, 0);
 }
 
-/** `rippleDeleteClip` on the clip and each of its linked partners, every track closing up
- *  behind its own. A partner on a locked track refuses the lot. Returns how many were deleted. */
+/** `rippleDeleteClip` on the clip, and its linked partners removed with it
+ *  (`Timeline::ripple_delete_linked`). The named clip's track closes the gap by **its**
+ *  length; the partners' tracks do not close one of their own — the clips that were pushed
+ *  left take their linked partners with them (`conformLinks`, the named clip's track the
+ *  authority), so a J- or L-cut pair still closes up by the amount of *picture* removed. An
+ *  unlinked clip on a partner's track stays where it was. A partner on a locked track
+ *  refuses the lot. Atomic. Returns how many were deleted. */
 export function rippleDeleteLinked(timeline: Timeline, clipId: string): number {
 	if (!locateIndex(timeline, clipId)) throw clipNotFound(clipId);
 	const partners = unlockedPartners(timeline, clipId, new Set([clipId]));
-	rippleDeleteClip(timeline, clipId);
-	for (const p of partners) rippleDeleteClip(timeline, p);
+	const scratch: Timeline = structuredClone(timeline);
+	rippleDeleteClip(scratch, clipId);
+	const doomed = new Set(partners);
+	for (const track of scratch.tracks) track.clips = track.clips.filter((c) => !doomed.has(c.id));
+	conformLinks(scratch, timeline, new Set([clipId]));
+	timeline.tracks = scratch.tracks;
 	return 1 + partners.length;
 }
 
 // ---- cut a source range ----------------------------------------------------------
 
-/** Cut a **source-time** range out of a clip: split around the intersection of
- *  `[from, to]` with its source window, the middle piece removed, and later clips on the
- *  track ripple left to close the gap. Returns the kept pieces in play order. A tail
- *  piece is a new clip with no link. */
-export function cutClipRange(timeline: Timeline, clipId: string, from: number, to: number): Clip[] {
+/** The cut itself (`Timeline::cut_range_pieces`): split `clipId` around the intersection of
+ *  `[from, to]` with its source window and drop the middle. Returns the `[head, tail]` pieces
+ *  that survive (in play order — a reversed clip plays the upper span first). A piece that is
+ *  the sole survivor keeps the original id and both fades; otherwise the fades facing the
+ *  removed middle are dropped and the tail is a new clip with no link. With `closeGap`, later
+ *  clips on the track ripple left over the removed span; without, the lane is left for the
+ *  caller to settle. */
+function cutRangePieces(
+	timeline: Timeline,
+	clipId: string,
+	from: number,
+	to: number,
+	closeGap: boolean
+): { head: Clip | null; tail: Clip | null } {
 	const found = locateIndex(timeline, clipId);
 	if (!found) throw clipNotFound(clipId);
 	const [ti, ci] = found;
@@ -423,7 +536,8 @@ export function cutClipRange(timeline: Timeline, clipId: string, from: number, t
 			];
 	const headOk = head[1] - head[0] > 1e-9;
 	const tailOk = tail[1] - tail[0] > 1e-9;
-	const pieces: Clip[] = [];
+	let headPiece: Clip | null = null;
+	let tailPiece: Clip | null = null;
 	let cursor = clip.timeline_start;
 	if (headOk) {
 		const p = structuredClone(clip);
@@ -431,7 +545,7 @@ export function cutClipRange(timeline: Timeline, clipId: string, from: number, t
 		p.timeline_start = cursor;
 		if (tailOk) p.fade_out = 0;
 		cursor = endOf(p);
-		pieces.push(p);
+		headPiece = p;
 	}
 	if (tailOk) {
 		const p = structuredClone(clip);
@@ -443,51 +557,82 @@ export function cutClipRange(timeline: Timeline, clipId: string, from: number, t
 			p.transition_in = null;
 			delete p.link_id;
 		}
-		pieces.push(p);
+		tailPiece = p;
 	}
 	track.clips.splice(ci, 1);
-	for (const c of track.clips)
-		if (c.timeline_start > clip.timeline_start + 1e-9) c.timeline_start = Math.max(c.timeline_start - removed, 0);
-	track.clips.push(...pieces.map((p) => structuredClone(p)));
+	if (closeGap) {
+		for (const c of track.clips)
+			if (c.timeline_start > clip.timeline_start + 1e-9) c.timeline_start = Math.max(c.timeline_start - removed, 0);
+	}
+	for (const p of [headPiece, tailPiece]) if (p) track.clips.push(structuredClone(p));
 	track.clips.sort((x, y) => x.timeline_start - y.timeline_start);
-	return pieces;
+	return { head: headPiece, tail: tailPiece };
+}
+
+/** Cut a **source-time** range out of a clip: split around the intersection of
+ *  `[from, to]` with its source window, the middle piece removed, and later clips on the
+ *  track ripple left to close the gap. Returns the kept pieces in play order. A tail
+ *  piece is a new clip with no link. */
+export function cutClipRange(timeline: Timeline, clipId: string, from: number, to: number): Clip[] {
+	const { head, tail } = cutRangePieces(timeline, clipId, from, to, true);
+	return [head, tail].filter((p): p is Clip => !!p);
 }
 
 /**
- * `cutClipRange` on the clip *and* its linked partners: the stretch of **timeline** the
- * cut removes is taken out of every partner it overlaps too (a partner of another asset,
- * or at another offset, loses the same moment, not the same source span), each closing
- * the gap on its own track. A partner the cut misses is untouched; one on a locked track
- * refuses the lot. The tail pieces the cut makes are linked to each other. Returns the
- * named clip's kept pieces.
+ * `cutClipRange` on the clip *and* its linked partners (`Timeline::cut_clip_range_linked`):
+ * the stretch of **timeline** the cut removes is taken out of every partner it overlaps too
+ * (a partner of another asset, or at another offset, loses the same moment, not the same
+ * source span). The named clip's track closes up by the stretch; every other track gets its
+ * **linked** clips put back in step with what survived — a partner wholly after the stretch
+ * moves up by it, one whose head was inside the stretch resumes at the cut, one that spanned
+ * it is cut in two and its tail follows — and only those: an unlinked clip on a partner's
+ * track stays where it was (`conformLinks`). A partner the cut misses and that lies before
+ * it is untouched; one the cut overlaps on a locked track refuses the lot. The group then
+ * falls in two by side, as for a split. Atomic. Returns the named clip's kept pieces.
  */
 export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: number, to: number): Clip[] {
 	const clip = clipById(timeline, clipId);
 	if (!clip) throw clipNotFound(clipId);
+	const group = clip.link_id ?? undefined;
 	const a = Math.max(from, clip.source_in);
 	const b = Math.min(to, clip.source_out);
-	const partners = unlockedPartners(timeline, clipId, new Set([clipId]));
-	if (partners.length === 0 || b - a <= 1e-9) return cutClipRange(timeline, clipId, from, to);
+	const partners = linkPartners(timeline, clipId);
+	const scratch: Timeline = structuredClone(timeline);
+	const { head, tail } = cutRangePieces(scratch, clipId, from, to, true);
+	// The stretch of timeline the cut removed, and the pieces on either side of it.
 	const spanA = sourceToTimeline(clip, a);
 	const spanB = sourceToTimeline(clip, b);
 	const span: [number, number] = [Math.min(spanA, spanB), Math.max(spanA, spanB)];
-	const cuts: [string, number, number][] = [];
+	const lefts: string[] = [];
+	const rights: string[] = [];
+	const origin = new Map<string, string>();
+	const sides = (h: Clip | null, t: Clip | null, from: string) => {
+		if (h) lefts.push(h.id);
+		if (t) rights.push(t.id);
+		if (h && t) origin.set(t.id, from);
+	};
+	sides(head, tail, clipId);
 	for (const partner of partners) {
 		const p = clipById(timeline, partner)!;
 		const lo = Math.max(span[0], p.timeline_start);
 		const hi = Math.min(span[1], endOf(p));
-		if (hi - lo <= DIFF_EPS) continue;
+		if (hi - lo <= DIFF_EPS) {
+			// The cut misses it: before the stretch it stays with the left, after it with the right.
+			if (endOf(p) <= span[0] + DIFF_EPS) lefts.push(partner);
+			else rights.push(partner);
+			continue;
+		}
+		const [pt] = locateIndex(timeline, partner)!;
+		if (timeline.tracks[pt].locked) throw lockedPartner(timeline.tracks[pt]);
+		// The partner's own cut, in *its* source time.
 		const [s0, s1] = [timelineToSource(p, lo), timelineToSource(p, hi)];
-		cuts.push([partner, Math.min(s0, s1), Math.max(s0, s1)]);
+		const pieces = cutRangePieces(scratch, partner, Math.min(s0, s1), Math.max(s0, s1), false);
+		sides(pieces.head, pieces.tail, partner);
 	}
-	const before = new Set(timeline.tracks.flatMap((t) => t.clips.map((c) => c.id)));
-	const scratch: Timeline = structuredClone(timeline);
-	const kept = cutClipRange(scratch, clipId, from, to);
-	for (const [partner, lo, hi] of cuts) cutClipRange(scratch, partner, lo, hi);
-	const fresh = scratch.tracks.flatMap((t) => t.clips).filter((c) => !before.has(c.id)).map((c) => c.id);
-	relinkNewHalves(scratch, fresh);
+	relinkSides(scratch, group, lefts, rights);
+	conformLinks(scratch, timeline, new Set([clipId]), origin);
 	timeline.tracks = scratch.tracks;
-	return kept.map((c) => structuredClone(clipById(timeline, c.id) ?? c));
+	return [head, tail].filter((c): c is Clip => !!c).map((c) => structuredClone(clipById(timeline, c.id) ?? c));
 }
 
 /** Where a source timestamp of `clip` lands on the timeline (kerf-core's `Clip::source_to_timeline`). */
@@ -523,7 +668,7 @@ export function setSpeedLinked(timeline: Timeline, clipId: string, speed: number
 		const p = clipById(timeline, partner)!;
 		const next = (p.speed ?? 1) * ratio;
 		if (!Number.isFinite(next) || next === 0)
-			throw invalid('a linked clip would end up with no speed — set the speed with links off');
+			throw invalid('a linked clip would end up with no speed');
 		updates.push([p, next]);
 	}
 	timeline.tracks[ti].clips[ci].speed = speed;

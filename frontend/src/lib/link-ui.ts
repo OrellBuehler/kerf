@@ -13,6 +13,7 @@
 // reason this could have said first.
 
 import { linkPartners, locateIndex, planLink, planUnlink, withLinkPartners } from './link-groups';
+import { soundAlreadyPlaying } from './links';
 import { clickSelect, marqueeSelect, normalize, type MarqueeMode, type PickMode, type Selection } from './selection';
 import type { Clip, StreamKind, Timeline } from './types';
 
@@ -25,11 +26,11 @@ const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 export const reasonOf = (e: unknown): string =>
 	capital((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
 
-/** A backend refusal worded for a *gesture*: where it says to edit with links off, the user
- *  holds Alt (`unlock it, or edit with links off` → `unlock it, or hold Alt to edit this clip on
- *  its own`). The refusals are the backend's own words, shared with the agent that has no Alt. */
+/** A backend refusal worded for a *gesture*: where the refusal is about linked clips, the
+ *  user holds Alt to edit this clip on its own (`link: false` for a caller with no Alt).
+ *  The refusals are the backend's own words, shared with the agent that has no Alt. */
 export const gestureReason = (message: string): string =>
-	message.replace(/edit with links off( to move one of them on its own)?/g, 'hold Alt to edit this clip on its own');
+	/linked/.test(message) ? `${message} (or hold Alt to edit this clip on its own)` : message;
 
 // ---- selection --------------------------------------------------------------------
 
@@ -252,13 +253,21 @@ export function linkPlans(timeline: Timeline, hasAudio: (assetId: string) => boo
 			reattachReason = `Track ${timeline.tracks[pt].name} is locked`;
 			break;
 		}
-		const asset = timeline.tracks[pt].clips[pc].asset_id;
-		const sound = linkPartners(timeline, id).find((p) => {
+		const picture = timeline.tracks[pt].clips[pc];
+		const asset = picture.asset_id;
+		const sounds = linkPartners(timeline, id).filter((p) => {
 			const [t, c] = locateIndex(timeline, p)!;
-			return timeline.tracks[t].kind === 'audio' && timeline.tracks[t].clips[c].asset_id === asset && timeline.tracks[t].locked;
+			return timeline.tracks[t].kind === 'audio' && timeline.tracks[t].clips[c].asset_id === asset;
 		});
-		if (sound) {
-			reattachReason = `Track ${timeline.tracks[locateIndex(timeline, sound)![0]].name} is locked`;
+		const locked = sounds.find((p) => timeline.tracks[locateIndex(timeline, p)![0]].locked);
+		if (locked) {
+			reattachReason = `Track ${timeline.tracks[locateIndex(timeline, locked)![0]].name} is locked`;
+			break;
+		}
+		// Unmuting the picture while another audio clip already plays the same footage in step
+		// with it would be heard twice (`Timeline::reattach_audio` refuses it).
+		if (soundAlreadyPlaying(timeline, picture, new Set(sounds))) {
+			reattachReason = 'Its sound is already playing from another audio clip — remove that clip first';
 			break;
 		}
 	}

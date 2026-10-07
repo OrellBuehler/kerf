@@ -6208,9 +6208,11 @@ mod golden;
 #[cfg(test)]
 mod rendered;
 
-/// The sound of detached / linked clips: that `extract_audio` used to double, and
-/// that detaching changes what is heard by exactly nothing (graph level, and
-/// measured on a render under `#[ignore]`).
+/// The sound of detached / linked clips: that `extract_audio` used to double, that a
+/// detached clip's *own* chain is the chain it had, and that its **level** survives
+/// the move between a picture track's fader and an audio track's (graph level, and
+/// measured on a render under `#[ignore]`). Pan, duck and mute are the destination
+/// track's afterwards — see `Timeline::detach_audio`.
 #[cfg(test)]
 mod linked_audio;
 

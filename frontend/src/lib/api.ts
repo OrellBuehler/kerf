@@ -6,6 +6,7 @@
 // explorable without the desktop shell.
 
 import type {
+	AudioDetached,
 	Asset,
 	AssetAnalysis,
 	AssetMetadata,
@@ -67,35 +68,11 @@ import {
 	slideClipLinked as slideClipLinkedLocal,
 	slipClip as slipClipLocal,
 	slipClipLinked as slipClipLinkedLocal,
-	splitRemoveClips as splitRemoveClipsLocal,
 	type SourceLimits
 } from './edit-modes';
-import {
-	firstSyncBreak,
-	hasLinks,
-	linkClips as linkClipsLocal,
-	linkPartners,
-	syncBreakError,
-	unlinkClips as unlinkClipsLocal,
-	withLinkPartners
-} from './link-groups';
-import {
-	carryExtentEdit,
-	carryLinksSince,
-	cutClipRange as cutClipRangeLocal,
-	cutClipRangeLinked,
-	detachAudio as detachAudioLocal,
-	reattachAudio as reattachAudioLocal,
-	rippleDeleteClip,
-	rippleDeleteLinked,
-	setSpeedLinked,
-	splitClip as splitClipLocal,
-	splitClipLinked,
-	withLinkedCuts,
-	withLinkedMoves
-} from './links';
-import { moveClips as moveClipsLocal, removeClips as removeClipsLocal } from './multi-edit';
-import { rippleFrom } from './ripple';
+import { linkPartners, withLinkPartners } from './link-groups';
+import * as ops from './link-ops';
+import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
@@ -106,6 +83,8 @@ import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
+
+export type { AudioDetached };
 
 export function inTauri(): boolean {
 	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -338,38 +317,30 @@ function trackForAsset(tl: Timeline, assetId: string): Track {
 let devRippleMode = false;
 
 /** Run one harness edit with ripple applied after it when it is on: the project's
- *  flag, or `ripple` for this call (`Project::with_ripple`). A throwing edit has
- *  changed nothing, so the timeline is only replaced once it returns. */
+ *  flag, or `ripple` for this call (`Project::with_ripple`). `run` mutates `devTimeline`;
+ *  it is `Project::run_edit` in miniature (`runEdit` in `link-ops.ts`): the sync lock and
+ *  guard when links are in force, and a throwing edit has changed nothing. */
 function devEdit<R>(ripple: boolean | undefined, run: () => R, link?: boolean): R {
-	const rippling = ripple ?? devRippleMode;
-	// The sync guard (`Timeline::first_sync_break`): an edit that would part an in-step
-	// picture and sound is refused. A project that links nothing skips it.
-	const guard = devLinks(link) && hasLinks(devTimeline);
-	if (!rippling && !guard) return run();
-	const before = snapshot();
-	let result: R;
-	try {
-		result = run();
-	} catch (e) {
-		devTimeline = before;
-		throw e;
-	}
-	if (rippling) devTimeline = rippleFrom(devTimeline, before, devLinks(link));
-	const broke = guard ? firstSyncBreak(devTimeline, before) : null;
-	if (broke) {
-		devTimeline = before;
-		throw syncBreakError(broke);
-	}
-	return result;
+	const home = devTimeline;
+	const done = runEdit(home, { ripple: ripple ?? devRippleMode, links: devLinks(link) }, (scratch) => {
+		devTimeline = scratch;
+		try {
+			return run();
+		} finally {
+			devTimeline = home;
+		}
+	});
+	devTimeline = done.timeline;
+	return done.result;
 }
 
 // ---- linked clips (browser dev fallback) ------------------------------------
 // Links are a property of the clips (`link_id`), so there is no project switch — only
-// the per-call escape hatch, `link: false` (`Project::with_links`). The link-aware
-// edits run through `devApply`, which does what the backend's edit closure does: work
-// on a scratch copy, so a refusal part-way (a locked partner, a partner that would
-// start before 0) leaves the timeline exactly as it was, then store the result — after
-// `rippleFrom` (and its sync lock, unless links are off) when ripple applies.
+// the per-call escape hatch, `link: false` (`Project::with_links`). The link-aware ops are
+// the faithful mirror in `link-ops.ts`, which does what the backend's edit closure does:
+// work on a scratch copy, so a refusal part-way (a locked partner, a lane the sync lock
+// cannot lay out) leaves the timeline exactly as it was, then settle ripple, the sync lock
+// and the guard.
 
 /** `Project::links_active`: links are in force unless a call says `link: false`. */
 const devLinks = (link: boolean | undefined): boolean => link !== false;
@@ -380,18 +351,23 @@ function devLimits(): SourceLimits {
 	return sourceLimits(sampleAssets);
 }
 
-/** Run one link-aware harness edit atomically. `ripple` forces ripple on or off for the
- *  call (`undefined` follows the project's flag); `link` is the per-call escape hatch. */
-function devApply<R>(ripple: boolean | undefined, link: boolean | undefined, edit: (timeline: Timeline) => R): R {
-	const before = snapshot();
-	const guard = devLinks(link) && hasLinks(before);
-	const scratch = structuredClone(devTimeline);
-	const result = edit(scratch);
-	const next = (ripple ?? devRippleMode) ? rippleFrom(scratch, before, devLinks(link)) : scratch;
-	const broke = guard ? firstSyncBreak(next, before) : null;
-	if (broke) throw syncBreakError(broke);
-	devTimeline = next;
-	return result;
+/** What a harness call is made under (`link-ops.ts`'s `EditEnv`). `ripple` forces ripple on or
+ *  off for the call (`undefined` follows the project's flag); `link` is the per-call escape hatch. */
+function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.EditEnv {
+	return {
+		ripple: ripple ?? devRippleMode,
+		links: devLinks(link),
+		footage: devLimits(),
+		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio')
+	};
+}
+
+/** Run one link-op against the harness timeline: store what it leaves, record its label. */
+function devRun<R>(op: (timeline: Timeline) => ops.Edited<R>): R {
+	const done = op(devTimeline);
+	devTimeline = done.timeline;
+	recordDev(done.label);
+	return done.result;
 }
 
 // ---- read ------------------------------------------------------------------
@@ -939,8 +915,7 @@ export async function addClip(
  *  are split at the same moment unless `link` is `false`; the new halves link up. */
 export async function splitClip(clipId: string, at: number, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(undefined, link, (tl) => (devLinks(link) ? splitClipLinked(tl, clipId, at) : splitClipLocal(tl, clipId, at)));
-		recordDev('Split clip');
+		devRun((tl) => ops.splitAt(tl, devEnv(undefined, link), clipId, at));
 		return snapshot();
 	}
 	return invoke<Timeline>('split_clip', { clipId, at, link });
@@ -958,22 +933,7 @@ export async function trimClip(
 		// left-edge trim keeps the clip's start, so the timeline handed back
 		// carries the clip as it ended up — as the backend's does. Linked partners
 		// follow the edge that moved (`carryExtentEdit`).
-		devApply(undefined, link, (tl) => {
-			const found = locate(tl, clipId);
-			if (!found) return;
-			const clip = found[0].clips[found[1]];
-			const was = structuredClone(clip);
-			if ((sourceOut ?? clip.source_out) <= (sourceIn ?? clip.source_in))
-				throw new Error('invalid argument: source_out must be greater than source_in');
-			if (sourceIn != null) clip.source_in = sourceIn;
-			if (sourceOut != null) clip.source_out = sourceOut;
-			if (timelineStart != null) {
-				clip.timeline_start = Math.max(0, timelineStart);
-				found[0].clips.sort((a, b) => a.timeline_start - b.timeline_start);
-			}
-			if (devLinks(link)) carryExtentEdit(tl, clipId, was, devLimits());
-		});
-		recordDev('Trim clip');
+		devRun((tl) => ops.trim(tl, devEnv(undefined, link), clipId, sourceIn, sourceOut, timelineStart));
 		return snapshot();
 	}
 	return invoke<Timeline>('trim_clip', { clipId, sourceIn, sourceOut, timelineStart, link });
@@ -981,39 +941,11 @@ export async function trimClip(
 
 export async function reorderClip(trackId: string, clipId: string, newIndex: number): Promise<Timeline> {
 	if (!inTauri()) {
-		// Never rippled (it re-lays the lane itself) but not link-aware either, so the sync
-		// guard refuses a reorder that would part a linked pair.
-		devEdit(false, () => {
-			const track = devTimeline.tracks.find((t) => t.id === trackId);
-			if (track) {
-				const cur = track.clips.findIndex((c) => c.id === clipId);
-				if (cur >= 0) {
-					const [clip] = track.clips.splice(cur, 1);
-					track.clips.splice(Math.min(newIndex, track.clips.length), 0, clip);
-					reflow(track);
-				}
-			}
-		});
-		recordDev('Reorder clip');
+		// Never rippled (it re-lays the lane itself); the clips linked to what it moved follow.
+		devRun((tl) => ops.reorder(tl, devEnv(false, undefined), trackId, clipId, newIndex));
 		return snapshot();
 	}
 	return invoke<Timeline>('reorder_clip', { trackId, clipId, newIndex });
-}
-
-/** The link ids of pasted copies (`insert_clips` in kerf-core): a copy is a new clip, so
- *  it cannot share a group with its original — but copies of a linked *group* are linked to
- *  each other under a fresh id, and a copy whose partner was not pasted with it is unlinked.
- *  Returns what to call on each `(original, copy)` pair. */
-function copyLinks(originals: Clip[]): (original: Clip, copy: Clip) => void {
-	const members = new Map<string, number>();
-	for (const c of originals) if (c.link_id) members.set(c.link_id, (members.get(c.link_id) ?? 0) + 1);
-	const fresh = new Map<string, string>();
-	for (const [link, n] of members) if (n >= 2) fresh.set(link, uid());
-	return (original, copy) => {
-		const next = original.link_id ? fresh.get(original.link_id) : undefined;
-		if (next) copy.link_id = next;
-		else delete copy.link_id;
-	};
 }
 
 /** One clipboard entry: the clip's data plus the track it should land on. */
@@ -1024,19 +956,9 @@ export interface Placement {
 
 export async function insertClips(placements: Placement[], at: number): Promise<Timeline> {
 	if (!inTauri()) {
-		const base = Math.min(...placements.map((p) => p.clip.timeline_start));
-		const fresh = copyLinks(placements.map((p) => p.clip));
-		for (const p of placements) {
-			const track = devTimeline.tracks.find((t) => t.id === p.track_id);
-			if (!track) throw new Error(`no track ${p.track_id}`);
-			const copy: Clip = JSON.parse(JSON.stringify(p.clip));
-			copy.id = crypto.randomUUID();
-			copy.timeline_start = at + (p.clip.timeline_start - base);
-			fresh(p.clip, copy);
-			track.clips.push(copy);
-			track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
-		}
-		recordDev('Insert clips');
+		// All or nothing; copies of a linked group link up, a picture pasted without its sound
+		// gets its own back (`Project::insert_clips`, in `link-ops.ts`).
+		devRun((tl) => ops.insertClips(tl, devEnv(false, undefined), placements, at));
 		return snapshot();
 	}
 	return invoke<Timeline>('insert_clips', { placements, at });
@@ -1044,23 +966,7 @@ export async function insertClips(placements: Placement[], at: number): Promise<
 
 export async function duplicateClips(clipIds: string[], at: number): Promise<Timeline> {
 	if (!inTauri()) {
-		const sources = clipIds.map((id) => {
-			const found = locate(devTimeline, id);
-			if (!found) throw new Error(`no clip ${id}`);
-			return { track: found[0], clip: found[0].clips[found[1]] };
-		});
-		const base = Math.min(...sources.map((s) => s.clip.timeline_start));
-		const fresh = copyLinks(sources.map((s) => s.clip));
-		for (const s of sources) {
-			// Deep-copy so the copy's transform / effects / keyframes are its own.
-			const copy: Clip = JSON.parse(JSON.stringify(s.clip));
-			copy.id = crypto.randomUUID();
-			copy.timeline_start = at + (s.clip.timeline_start - base);
-			fresh(s.clip, copy);
-			s.track.clips.push(copy);
-			s.track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
-		}
-		recordDev('Duplicate clips');
+		devRun((tl) => ops.duplicateClips(tl, devEnv(false, undefined), clipIds, at));
 		return snapshot();
 	}
 	return invoke<Timeline>('duplicate_clips', { clipIds, at });
@@ -1068,19 +974,8 @@ export async function duplicateClips(clipIds: string[], at: number): Promise<Tim
 
 export async function removeClip(clipId: string, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		const partners = devLinks(link) ? linkPartners(devTimeline, clipId) : [];
-		if (partners.length > 0) {
-			// A clip with partners is a group removal (`Project::remove`): one revision, all or nothing.
-			const ids = [clipId, ...partners];
-			devApply(undefined, link, (tl) => removeClipsLocal(tl, ids));
-			recordDev(`Remove ${ids.length} clips`);
-			return snapshot();
-		}
-		devEdit(undefined, () => {
-			const found = locate(devTimeline, clipId);
-			if (found) found[0].clips.splice(found[1], 1);
-		});
-		recordDev('Remove clip');
+		// A clip with partners is a group removal (`Project::remove`): one revision, all or nothing.
+		devRun((tl) => ops.remove(tl, devEnv(undefined, link), clipId));
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clip', { clipId, link });
@@ -1092,11 +987,7 @@ export async function removeClip(clipId: string, link?: boolean): Promise<Timeli
  *  the named clips go too, unless `link` is `false`. */
 export async function removeClips(clipIds: string[], ripple?: boolean, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		const rippled = ripple ?? devRippleMode;
-		const ids = devLinks(link) ? withLinkPartners(devTimeline, clipIds) : clipIds;
-		const n = new Set(ids).size;
-		devApply(ripple, link, (tl) => removeClipsLocal(tl, ids));
-		recordDev(n === 1 ? (rippled ? 'Ripple delete' : 'Remove clip') : `${rippled ? 'Ripple delete' : 'Remove'} ${n} clips`);
+		devRun((tl) => ops.removeClips(tl, devEnv(ripple, link), clipIds));
 		return snapshot();
 	}
 	return invoke<Timeline>('remove_clips', { clipIds, ripple, link });
@@ -1141,9 +1032,7 @@ export async function moveClip(clipId: string, timelineStart: number, trackId?: 
  *  same Δt, on their own tracks) unless `link` is `false`. */
 export async function moveClips(moves: ClipMove[], link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		const all = devLinks(link) ? withLinkedMoves(devTimeline, moves) : moves;
-		devApply(false, link, (tl) => moveClipsLocal(tl, all));
-		recordDev(all.length === 1 ? 'Move clip' : `Move ${all.length} clips`);
+		devRun((tl) => ops.moveClips(tl, devEnv(false, link), moves));
 		return snapshot();
 	}
 	return invoke<Timeline>('move_clips', { moves, link });
@@ -1153,8 +1042,7 @@ export async function moveClips(moves: ClipMove[], link?: boolean): Promise<Time
  *  are removed too, each closing the gap on its own track, unless `link` is `false`. */
 export async function rippleDelete(clipId: string, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, link, (tl) => (devLinks(link) ? rippleDeleteLinked(tl, clipId) : rippleDeleteClip(tl, clipId)));
-		recordDev('Ripple delete');
+		devRun((tl) => ops.rippleDelete(tl, devEnv(false, link), clipId));
 		return snapshot();
 	}
 	return invoke<Timeline>('ripple_delete', { clipId, link });
@@ -1165,10 +1053,7 @@ export async function rippleDelete(clipId: string, link?: boolean): Promise<Time
  * `link` is `false`. */
 export async function cutClipRange(clipId: string, from: number, to: number, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, link, (tl) =>
-			devLinks(link) ? cutClipRangeLinked(tl, clipId, from, to) : cutClipRangeLocal(tl, clipId, from, to)
-		);
-		recordDev('Cut range');
+		devRun((tl) => ops.cutRange(tl, devEnv(false, link), clipId, from, to));
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip_range', { clipId, from, to, link });
@@ -1238,10 +1123,7 @@ export async function splitRemove(clipId: string, at: number, side: SplitSide, l
  *  and nothing changed), one clip per track; ripple mode closes each track's own gap. */
 export async function splitRemoveClips(cuts: ClipCut[], side: SplitSide, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		const all = devLinks(link) ? withLinkedCuts(devTimeline, cuts) : cuts;
-		devApply(undefined, link, (tl) => splitRemoveClipsLocal(tl, all, side));
-		const what = side === 'left' ? 'Split and remove left' : 'Split and remove right';
-		recordDev(all.length > 1 ? `${what} (${all.length} clips)` : what);
+		devRun((tl) => ops.splitRemoveClips(tl, devEnv(undefined, link), cuts, side));
 		return snapshot();
 	}
 	return invoke<Timeline>('split_remove_clips', { cuts, side, link });
@@ -1404,17 +1286,9 @@ export async function setFade(clipId: string, fadeIn?: number, fadeOut?: number)
 /** Set a clip's playback speed (1.0 = normal, negative = reverse). */
 export async function setSpeed(clipId: string, speed: number, link?: boolean): Promise<Timeline> {
 	if (!inTauri()) {
-		// Linked clips are retimed by the same ratio (`setSpeedLinked`), so a picture and its
-		// sound keep step; `link: false` retimes the named clip alone.
-		devApply(undefined, link, (tl) => {
-			if (devLinks(link)) {
-				setSpeedLinked(tl, clipId, speed);
-				return;
-			}
-			const found = locate(tl, clipId);
-			if (found) found[0].clips[found[1]].speed = speed;
-		});
-		recordDev('Set speed');
+		// Linked clips are retimed by the same ratio (`setSpeedLinked`) and re-placed about the
+		// named clip, so a picture and its sound keep step; `link: false` retimes the named clip alone.
+		devRun((tl) => ops.setSpeed(tl, devEnv(undefined, link), clipId, speed));
 		return snapshot();
 	}
 	return invoke<Timeline>('set_speed', { clipId, speed, link });
@@ -1930,13 +1804,14 @@ export async function snapToBeats(trackId?: string, tolerance?: number): Promise
 		if (beats.length < 2) throw new Error('no beat grid — put rhythmic audio on an audio track and analyze it first');
 		const tol = tolerance ?? defaultBeatTolerance(beats);
 		const limitFor = (id: string) => assetById(id)?.duration ?? Infinity;
-		const targets = devTimeline.tracks.filter((t) => (trackId ? t.id === trackId : t.kind === 'video'));
-		const before = snapshot();
-		for (const t of targets) alignCutsToBeats(t.clips, beats, tol, limitFor);
 		// The snap reflows a lane without knowing about links; each retimed clip then carries
-		// its change to its partners (`carryLinksSince`).
-		carryLinksSince(devTimeline, before, devLimits());
-		recordDev('Cut to the beat');
+		// its change to its partners (`carryLinksSince`, inside `ops.carrySince`).
+		devRun((tl) =>
+			ops.carrySince(tl, devEnv(false, undefined), (t) => {
+				const targets = t.tracks.filter((x) => (trackId ? x.id === trackId : x.kind === 'video'));
+				for (const track of targets) alignCutsToBeats(track.clips, beats, tol, limitFor);
+			})
+		);
 		return snapshot();
 	}
 	return invoke<Timeline>('snap_to_beats', { trackId, tolerance });
@@ -1980,64 +1855,64 @@ export async function smartCrop(clipId?: string): Promise<Timeline> {
 	return invoke<Timeline>('smart_crop', { clipId });
 }
 
-/** Make an asset's sound its own clip on an audio track. When the asset is already cut
- *  onto a video track, each of those clips has its sound **detached** (the picture muted,
- *  an audio clip with the same span linked to it) so nothing is heard twice; otherwise the
- *  asset's whole audio is appended to the first audio track — exactly what it used to do
- *  for an asset that was only in the bin. */
-export async function extractAudio(assetId: string): Promise<Timeline> {
+/** Give an asset's sound its own clip on an audio track, for every use of the asset on a
+ *  video track that still plays it: each is **detached** (the picture muted, an audio clip with
+ *  the same span linked to it) so nothing is heard twice — one revision. A clip on a locked
+ *  track is skipped and reported; with nothing to detach it rejects (`addAssetAudio` is the
+ *  explicit way to append the asset's whole audio). */
+export async function extractAudio(assetId: string): Promise<AudioDetached> {
+	if (!inTauri()) {
+		const done = devRun((tl) => ops.extractAudio(tl, devEnv(false, undefined), assetId));
+		return { timeline: snapshot(), detached: done.detached.length, skipped: done.skipped };
+	}
+	return invoke<AudioDetached>('extract_audio', { assetId });
+}
+
+/** Append an asset's whole audio to the first audio track as a clip of its own. It never
+ *  touches a picture clip, so an asset that also plays its own sound from a video track is
+ *  heard twice where they overlap — `extractAudio` is for that. */
+export async function addAssetAudio(assetId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const asset = assetById(assetId);
-		if (!asset) return snapshot();
-		devApply(false, undefined, (tl) => {
-			const sounding = tl.tracks
-				.filter((t) => t.kind === 'video')
-				.flatMap((t) => t.clips)
-				.filter((c) => c.asset_id === assetId && c.source_audio !== false)
-				.map((c) => c.id);
-			if (sounding.length > 0) {
-				for (const id of sounding) detachAudioLocal(tl, id, true);
-				return;
-			}
-			let track = tl.tracks.find((t) => t.kind === 'audio');
-			if (!track) {
-				track = { id: uid(), kind: 'audio', name: 'A1', clips: [] };
-				tl.tracks.push(track);
-			}
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: 0, source_out: asset.duration, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Extract audio');
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		if (!asset.streams.some((s) => s.kind === 'audio')) throw new Error('invalid argument: asset has no audio stream');
+		devRun((tl) => ops.addAssetAudio(tl, devEnv(false, undefined), asset));
 		return snapshot();
 	}
-	return invoke<Timeline>('extract_audio', { assetId });
+	return invoke<Timeline>('add_asset_audio', { assetId });
 }
 
 // ---- linked A/V ---------------------------------------------------------------
 
 /** **Detach audio**: split a picture clip's own sound onto an audio track — a new audio
- *  clip with the same span and position, linked to the picture, whose own sound is muted.
+ *  clip with the same span and position, linked to the picture, whose own sound is muted;
+ *  the picture track's fader is folded into the new clip so the level is unchanged.
  *  One revision. Rejects a clip that is not on a video track, whose asset has no audio,
  *  whose sound is already detached, or whose track is locked. */
 export async function detachAudio(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, undefined, (tl) => {
-			const found = locate(tl, clipId);
-			if (!found) throw new Error(`clip not found: ${clipId}`);
-			const hasAudio = !!assetById(found[0].clips[found[1]].asset_id)?.streams.some((s) => s.kind === 'audio');
-			return detachAudioLocal(tl, clipId, hasAudio);
-		});
-		recordDev('Detach audio');
+		devRun((tl) => ops.detach(tl, devEnv(false, undefined), clipId));
 		return snapshot();
 	}
 	return invoke<Timeline>('detach_audio', { clipId });
 }
 
+/** **Detach audio** from several picture clips as **one** revision. A clip that cannot be
+ *  detached is skipped and reported; rejects only when none could be. */
+export async function detachAudioClips(clipIds: string[]): Promise<AudioDetached> {
+	if (!inTauri()) {
+		const done = devRun((tl) => ops.detachClips(tl, devEnv(false, undefined), clipIds));
+		return { timeline: snapshot(), detached: done.detached.length, skipped: done.skipped };
+	}
+	return invoke<AudioDetached>('detach_audio_clips', { clipIds });
+}
+
 /** **Reattach audio**: delete the linked audio clip(s) carrying a picture's sound and let
- *  the picture play its own again. Name either clip of the pair. One revision. */
+ *  the picture play its own again. Name either clip of the pair. Rejects when the picture's
+ *  sound is already playing from another audio clip (it would double). One revision. */
 export async function reattachAudio(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, undefined, (tl) => reattachAudioLocal(tl, clipId));
-		recordDev('Reattach audio');
+		devRun((tl) => ops.reattach(tl, devEnv(false, undefined), clipId));
 		return snapshot();
 	}
 	return invoke<Timeline>('reattach_audio', { clipId });
@@ -2047,8 +1922,7 @@ export async function reattachAudio(clipId: string): Promise<Timeline> {
  *  others. One revision. */
 export async function linkClips(clipIds: string[]): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, undefined, (tl) => linkClipsLocal(tl, clipIds));
-		recordDev(`Link ${clipIds.length} clips`);
+		devRun((tl) => ops.link(tl, devEnv(false, undefined), clipIds));
 		return snapshot();
 	}
 	return invoke<Timeline>('link_clips', { clipIds });
@@ -2057,8 +1931,7 @@ export async function linkClips(clipIds: string[]): Promise<Timeline> {
 /** Unlink clips; a group left with a single clip dissolves. One revision. */
 export async function unlinkClips(clipIds: string[]): Promise<Timeline> {
 	if (!inTauri()) {
-		devApply(false, undefined, (tl) => unlinkClipsLocal(tl, clipIds));
-		recordDev('Unlink clips');
+		devRun((tl) => ops.unlink(tl, devEnv(false, undefined), clipIds));
 		return snapshot();
 	}
 	return invoke<Timeline>('unlink_clips', { clipIds });

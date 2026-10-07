@@ -1,6 +1,6 @@
 // Central editor state (Svelte 5 runes).
 
-import type { Placement } from './api';
+import type { AudioDetached, Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
@@ -20,7 +20,9 @@ import {
 	cancelExport,
 	onExportProgress,
 	exportVariants,
+	addAssetAudio,
 	detachAudio,
+	detachAudioClips,
 	extractAudio,
 	getAssetMetadata,
 	getHistory,
@@ -983,8 +985,21 @@ class EditorState {
 	smartCrop(clipId?: string) {
 		return this.#apply(smartCrop(clipId));
 	}
-	extractAudio(assetId: string) {
-		return this.#apply(extractAudio(assetId));
+	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
+	 *  to what was detached and what was skipped (a locked track). */
+	async extractAudio(assetId: string): Promise<AudioDetached> {
+		let report!: AudioDetached;
+		await this.#apply(
+			extractAudio(assetId).then((r) => {
+				report = r;
+				return r.timeline;
+			})
+		);
+		return report;
+	}
+	/** Append an asset's whole audio to the first audio track as a clip of its own. */
+	addAssetAudio(assetId: string) {
+		return this.#apply(addAssetAudio(assetId));
 	}
 
 	// ---- linked A/V -------------------------------------------------------------
@@ -993,6 +1008,18 @@ class EditorState {
 	 *  picture (one `Detach audio` revision). */
 	detachAudio(clipId: string) {
 		return this.#apply(detachAudio(clipId));
+	}
+	/** Detach several pictures' own sound as **one** `Detach audio (N clips)` revision; a clip that
+	 *  cannot be is skipped and reported. */
+	async detachAudioClips(clipIds: string[]): Promise<AudioDetached> {
+		let report!: AudioDetached;
+		await this.#apply(
+			detachAudioClips(clipIds).then((r) => {
+				report = r;
+				return r.timeline;
+			})
+		);
+		return report;
 	}
 	/** The way back: delete the linked audio clip and let the picture play its own sound
 	 *  again. Name either clip of the pair. */

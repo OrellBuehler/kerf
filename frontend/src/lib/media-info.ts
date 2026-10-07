@@ -123,9 +123,10 @@ export function specLine(info: MediaInfo): string {
 
 /** What the bin's audio action will do to an asset, said before it is pressed. */
 export interface AudioExtraction {
-	/** `detach`: each picture clip still playing its own sound hands it to an audio track
-	 *  (the picture is muted, the two linked). `append`: the asset's whole audio is added to
-	 *  an audio track, because no picture clip of it is playing its own sound. */
+	/** `detach` (`extract_audio`): each picture clip still playing its own sound hands it to an
+	 *  audio track (the picture is muted, the two linked). `append` (`add_asset_audio`): the
+	 *  asset's whole audio is added to an audio track, because no picture clip of it is playing
+	 *  its own sound — a separate operation, which the backend never falls back to silently. */
 	mode: 'detach' | 'append';
 	/** The clips detached (`detach`), else 0. */
 	clips: number;
@@ -136,13 +137,14 @@ export interface AudioExtraction {
 }
 
 /**
- * The bin's "Extract audio" as the backend does it (`Project::extract_audio`), so the
- * label says what will happen. When the asset is cut onto a video track with its own
- * sound still on, each such clip is **detached** — one revision, the picture muted,
- * an audio clip linked to it — so nothing is heard twice. Otherwise its whole audio is
- * appended to the first audio track (a new `A1` when the cut has none). Appending while
- * the asset's sound is already on an audio track puts a second copy there, which the
- * label says. `null` for an asset with no audio stream.
+ * The bin's audio action as the backend does it, so the label says what will happen. When
+ * the asset is cut onto a video track with its own sound still on, each such clip is
+ * **detached** (`Project::extract_audio`) — one revision, the picture muted, an audio clip
+ * linked to it — so nothing is heard twice. Otherwise its whole audio is appended to the
+ * first audio track (`Project::add_asset_audio`; a new `A1` when the cut has none) — a
+ * separate backend operation the bin chooses by this mode. Appending while the asset's
+ * sound is already on an audio track puts a second copy there, which the label says.
+ * `null` for an asset with no audio stream.
  */
 export function audioExtraction(a: Pick<Asset, 'id' | 'streams'>, timeline: Pick<Timeline, 'tracks'>): AudioExtraction | null {
 	if (!audioStream(a)) return null;

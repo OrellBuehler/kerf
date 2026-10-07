@@ -757,7 +757,7 @@ describe('previewEdit — linked', () => {
 		t.tracks[1].locked = true;
 		const p = previewEdit(t, edit, 1, footage(60), true);
 		expect(p.ok).toBe(false);
-		expect(p.why).toBe('a linked clip is on locked track A1 — unlock it, or hold Alt to edit this clip on its own');
+		expect(p.why).toBe('a linked clip is on locked track A1 — unlock it first (or hold Alt to edit this clip on its own)');
 		// Alt: the picture alone rolls.
 		expect(previewEdit(t, edit, 1, footage(60), false).ok).toBe(true);
 	});

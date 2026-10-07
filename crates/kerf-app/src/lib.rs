@@ -928,8 +928,24 @@ fn detach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeli
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// **Detach audio** from several picture clips in **one** revision. A clip that
+/// cannot be detached is skipped and reported; an error only when none could be.
+#[tauri::command(async)]
+fn detach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<AudioDetached> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    let done = project.detach_audio_clips(&ids).map_err(|e| e.to_string())?;
+    Ok(AudioDetached {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        detached: done.detached.len(),
+        skipped: done.skipped,
+    })
+}
+
 /// **Reattach audio**: delete the linked audio clip(s) carrying a picture's sound and
-/// let the picture play its own again. Name either clip of the pair. One revision.
+/// let the picture play its own again. Name either clip of the pair; refused when the
+/// picture's sound is already playing from another audio clip (it would double). One
+/// revision.
 #[tauri::command(async)]
 fn reattach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
@@ -1452,15 +1468,41 @@ fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance
     project.timeline().map_err(|e| e.to_string())
 }
 
-/// Make an asset's sound its own clip on an audio track. When the asset is already
-/// cut onto a video track, each of those clips has its sound **detached** (the
-/// picture muted, an audio clip with the same span linked to it) so nothing sounds
-/// twice; otherwise the asset's whole audio is appended to the first audio track.
+/// What detaching sound from several clips did: the refreshed timeline, how many
+/// clips were detached, and the ones left alone with the reason (a locked track,
+/// an asset without audio, a sound already detached).
+#[derive(serde::Serialize)]
+struct AudioDetached {
+    timeline: Timeline,
+    detached: usize,
+    skipped: Vec<kerf_core::SkippedDetach>,
+}
+
+/// Give an asset's sound its own clip on an audio track, for every use of the asset
+/// on a video track that still plays it: each has its sound **detached** (the picture
+/// muted, an audio clip with the same span linked to it) so nothing sounds twice — one
+/// revision. A clip on a locked track is skipped and reported; with nothing to detach
+/// it is an error (`add_asset_audio` is the explicit way to append the whole audio).
 #[tauri::command(async)]
-fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
+fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<AudioDetached> {
     let id = id(&asset_id)?;
     let project = state.project();
-    project.extract_audio(id).map_err(|e| e.to_string())?;
+    let done = project.extract_audio(id).map_err(|e| e.to_string())?;
+    Ok(AudioDetached {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        detached: done.detached.len(),
+        skipped: done.skipped,
+    })
+}
+
+/// Append an asset's whole audio to the first audio track as a clip of its own. It
+/// never touches a picture clip, so an asset that also plays its own sound from a
+/// video track is heard twice where they overlap — `extract_audio` is for that.
+#[tauri::command(async)]
+fn add_asset_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
+    let id = id(&asset_id)?;
+    let project = state.project();
+    project.add_asset_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2874,7 +2916,9 @@ pub fn run() {
             snap_to_beats,
             smart_crop,
             extract_audio,
+            add_asset_audio,
             detach_audio,
+            detach_audio_clips,
             reattach_audio,
             link_clips,
             unlink_clips,

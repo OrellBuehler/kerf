@@ -13,6 +13,9 @@
 
 import type { Clip, Timeline, Track } from './types';
 
+/** kerf-core's `STEP_EPS`: offsets closer than this are the same offset. */
+export const STEP_EPS = 1e-6;
+
 export const invalid = (why: string) => new Error(`invalid argument: ${why}`);
 export const clipNotFound = (id: string) => new Error(`clip not found: ${id}`);
 
@@ -64,7 +67,7 @@ export function withLinkPartners(timeline: Timeline, ids: string[]): string[] {
 
 /** The error for a partner the edit cannot touch. */
 export function lockedPartner(track: Track): Error {
-	return invalid(`a linked clip is on locked track ${track.name} — unlock it, or edit with links off`);
+	return invalid(`a linked clip is on locked track ${track.name} — unlock it first`);
 }
 
 /** The partners of `clipId` that are not in `skip`, each on an unlocked track — or the
@@ -92,15 +95,51 @@ export function dissolveOrphans(timeline: Timeline, groups: ReadonlySet<string>)
 	}
 }
 
-/** Give `ids` — clips an edit just created from one clip and its partners — one fresh
- *  link group when there are two or more of them, else none. */
-export function relinkNewHalves(timeline: Timeline, ids: string[]) {
-	const group = ids.length >= 2 ? newId() : undefined;
-	for (const id of ids) {
-		const clip = clipById(timeline, id);
-		if (!clip) continue;
-		if (group) clip.link_id = group;
-		else delete clip.link_id;
+/** `dissolveOrphans` for every group on the timeline (`Timeline::dissolve_all_orphans`) —
+ *  what an edit that removed clips (a cut, a delete, a removed track) leaves behind: a
+ *  picture whose sound is gone is not linked to anything. Reports whether it cleared one. */
+export function dissolveAllOrphans(timeline: Timeline): boolean {
+	const members = new Map<string, number>();
+	for (const clip of timeline.tracks.flatMap((t) => t.clips)) {
+		if (clip.link_id) members.set(clip.link_id, (members.get(clip.link_id) ?? 0) + 1);
+	}
+	let cleared = false;
+	for (const clip of timeline.tracks.flatMap((t) => t.clips)) {
+		if (clip.link_id && members.get(clip.link_id) === 1) {
+			delete clip.link_id;
+			cleared = true;
+		}
+	}
+	return cleared;
+}
+
+/** Every clip that is linked to at least one other (`Timeline::linked_clip_ids`). */
+export function linkedClipIds(timeline: Timeline): Set<string> {
+	const groups = new Map<string, string[]>();
+	for (const clip of timeline.tracks.flatMap((t) => t.clips)) {
+		if (clip.link_id) groups.set(clip.link_id, [...(groups.get(clip.link_id) ?? []), clip.id]);
+	}
+	const out = new Set<string>();
+	for (const members of groups.values()) if (members.length >= 2) for (const id of members) out.add(id);
+	return out;
+}
+
+/** Re-form a group after an edit cut it in two (`Timeline::relink_sides`): the clips of
+ *  `left` (before the cut) keep `group`, the clips of `right` (after it) get a fresh id, and
+ *  a side with fewer than two clips is no group at all. */
+export function relinkSides(timeline: Timeline, group: string | undefined, left: readonly string[], right: readonly string[]) {
+	const leftId = left.length >= 2 ? group : undefined;
+	const rightId = right.length >= 2 ? newId() : undefined;
+	for (const [ids, link] of [
+		[left, leftId],
+		[right, rightId]
+	] as const) {
+		for (const id of ids) {
+			const clip = clipById(timeline, id);
+			if (!clip) continue;
+			if (link) clip.link_id = link;
+			else delete clip.link_id;
+		}
 	}
 }
 
@@ -196,7 +235,7 @@ export function unlinkClips(timeline: Timeline, ids: string[]): number {
  *  of one asset exactly when they show the same moment of footage at the same moment of
  *  the timeline. A reversed clip plays its window backwards, so it is measured from the
  *  out side (`content_offset` in kerf-core). */
-function contentOffset(clip: Clip): number {
+export function contentOffset(clip: Clip): number {
 	const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
 	return (clip.speed ?? 1) < 0 ? clip.timeline_start + clip.source_out / mag : clip.timeline_start - clip.source_in / mag;
 }
@@ -227,7 +266,7 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 			groups.set(clip.link_id, members);
 		}
 	}
-	const EPS = 1e-6;
+	const EPS = STEP_EPS;
 	const speed = (c: Clip) => c.speed ?? 1;
 	for (const members of groups.values()) {
 		for (let i = 0; i < members.length; i++) {
@@ -255,6 +294,6 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 /** The refusal for an edit `firstSyncBreak` found, in the backend's words. */
 export function syncBreakError([a, b]: [string, string]): Error {
 	return invalid(
-		`that edit would put the linked clips on ${a} and ${b} out of step — edit with links off to move one of them on its own`
+		`that edit would leave the linked clips on ${a} and ${b} out of step with each other — unlink them first if they are meant to part`
 	);
 }

@@ -8,12 +8,22 @@ import {
 	slipRangeLinked,
 	type SourceLimits
 } from './edit-modes';
-import { clipById, firstSyncBreak, linkClips, linkPartners, unlinkClips, withLinkPartners } from './link-groups';
+import {
+	clipById,
+	dissolveAllOrphans,
+	firstSyncBreak,
+	linkClips,
+	linkedClipIds,
+	linkPartners,
+	unlinkClips,
+	withLinkPartners
+} from './link-groups';
 import {
 	carryExtentEdit,
 	carryLinksSince,
 	cutClipRangeLinked,
 	detachAudio,
+	detachAudioMany,
 	reattachAudio,
 	rippleDeleteLinked,
 	setSpeedLinked,
@@ -23,13 +33,13 @@ import {
 	withLinkedMoves
 } from './links';
 import { moveClips } from './multi-edit';
-import { rippleFrom } from './ripple';
+import { conformLinks, rippleFrom, rippleLanes } from './ripple';
 import type { Clip, ClipMove, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
 // The bun mirror of the Rust tests in `crates/kerf-core/src/model/links.rs`, case for
 // case: the harness's linked edits (`links.ts`, `link-groups.ts`, the linked modes in
-// `edit-modes.ts`, `followLinks` in `ripple.ts`) are ports of the backend's, and these
+// `edit-modes.ts`, `conformLinks` in `ripple.ts`) are ports of the backend's, and these
 // are the cases that keep them honest. Where a Rust test has a name, this one repeats it.
 
 const X = 100;
@@ -278,7 +288,18 @@ describe('trim', () => {
 		const wasU = structuredClone(get(u.t, u.c));
 		get(u.t, u.a).timeline_start = 1;
 		get(u.t, u.c).timeline_start = 0;
-		expect(() => carryExtentEdit(u.t, u.c, wasU, limits([u.asset]))).toThrow('beginning');
+		// Carried before zero, the partner loses what hangs off the front (and keeps its sync:
+		// its head is trimmed, it is not slid) — unless nothing would be left.
+		carryExtentEdit(u.t, u.c, wasU, limits([u.asset]));
+		const p = get(u.t, u.a);
+		expect([p.timeline_start, p.timeline_start + clipDuration(p), p.source_in]).toEqual([0, 8, 2]);
+		const w = pair();
+		get(w.t, w.a).source_out = 1;
+		get(w.t, w.a).timeline_start = 1;
+		get(w.t, w.c).timeline_start = 5;
+		const wasW = structuredClone(get(w.t, w.c));
+		get(w.t, w.c).timeline_start = 0;
+		expect(() => carryExtentEdit(w.t, w.c, wasW, limits([w.asset]))).toThrow('beginning of the timeline');
 	});
 
 	test('a trim that would remove the partner or touch a locked one is refused', () => {
@@ -402,6 +423,7 @@ describe('remove', () => {
 		const { t, c, a, asset } = pair();
 		for (const track of [0, 1]) t.tracks[track].clips.push(clip(asset, 10, 16, 10));
 		const [c2, a2] = [idOf(t, 0, 1), idOf(t, 1, 1)];
+		linkClips(t, [c2, a2]);
 		expect(rippleDeleteLinked(t, c)).toBe(2);
 		expect(clipById(t, c)).toBeUndefined();
 		expect(clipById(t, a)).toBeUndefined();
@@ -418,6 +440,7 @@ describe('cut a source range', () => {
 		const { t, c, a, asset } = pair();
 		for (const track of [0, 1]) t.tracks[track].clips.push(clip(asset, 20, 25, 10));
 		const [c2, a2] = [idOf(t, 0, 1), idOf(t, 1, 1)];
+		linkClips(t, [c2, a2]);
 		const kept = cutClipRangeLinked(t, c, 3, 5);
 		expect(kept).toHaveLength(2);
 		expect([extent(t, c), extent(t, a)]).toEqual([
@@ -760,7 +783,7 @@ describe('ripple: the sync lock', () => {
 		expect([start(out, ids[1]), start(out, ids[3])]).toEqual([4, 4]);
 	});
 
-	test('a group whose moved members disagree is left alone', () => {
+	test('a group whose members were rippled by different amounts follows the first that moved', () => {
 		const asset = uuid();
 		const before = timeline([
 			lane('video', 'V1', [clip(asset, 0, 5, 0), clip(asset, 20, 30, 5)]),
@@ -773,11 +796,12 @@ describe('ripple: the sync lock', () => {
 		after.tracks[0].clips[0].source_out = 4;
 		after.tracks[1].clips[0].source_out = 4;
 		const out = rippleFrom(after, before);
-		expect([start(out, c2), start(out, a2)]).toEqual([4, 4]);
-		expect(start(out, b2)).toBe(5);
+		// No clip was named, so the first member that moved speaks for the group (V1, by 1 s)
+		// and the others keep the relationship they had to it.
+		expect([start(out, c2), start(out, a2), start(out, b2)]).toEqual([4, 5, 4]);
 	});
 
-	test('the start a left trim gives back is not a ripple the partner follows', () => {
+	test('a left trim that ripples pulls a partner that never shared the head along', () => {
 		const asset = uuid();
 		const before = timeline([
 			lane('video', 'V1', [clip(asset, 0, 10, 0), clip(asset, 20, 26, 10)]),
@@ -792,7 +816,240 @@ describe('ripple: the sync lock', () => {
 		const out = rippleFrom(after, before);
 		expect(extent(out, c1)).toEqual([0, 7]);
 		expect(start(out, idOf(out, 0, 1))).toBe(7);
-		expect(extent(out, a1)).toEqual([5, 10]);
+		// The picture's content slid 3 s earlier (its start was put back while its in-point
+		// moved on), so the sound that goes with it slides too — whole, not cut.
+		expect(extent(out, a1)).toEqual([2, 7]);
+		expect(firstSyncBreak(out, before)).toBeNull();
+	});
+});
+
+// ---- the sync lock: range-based, for J- and L-cuts ---------------------------------
+
+/** V1 holds x1 (5..15, footage 105..115) and x2 (15..25, footage 215..225); A1 their sound,
+ *  which leads the first picture by 5 s (y1 0..13, trimmed to end where y2 begins) and the
+ *  second by 2 s (y2 13..25). Each sound is in step with its picture while covering a
+ *  different stretch. */
+function jlCut(): { t: Timeline; x1: string; x2: string; y1: string; y2: string; asset: string } {
+	const asset = uuid();
+	const t = timeline([
+		lane('video', 'V1', [clip(asset, 105, 115, 5), clip(asset, 215, 225, 15)]),
+		lane('audio', 'A1', [clip(asset, 100, 115, 0), clip(asset, 213, 225, 13)])
+	]);
+	t.tracks[1].clips[0].source_out = 113;
+	const [x1, x2, y1, y2] = [idOf(t, 0, 0), idOf(t, 0, 1), idOf(t, 1, 0), idOf(t, 1, 1)];
+	linkClips(t, [x1, y1]);
+	linkClips(t, [x2, y2]);
+	return { t, x1, x2, y1, y2, asset };
+}
+
+/** The edit `Project::run_edit` makes: per-lane ripple, then the sync lock with `anchors` named. */
+function edited(before: Timeline, after: Timeline, ripple: boolean, anchors: string[]): Timeline {
+	const out = ripple ? rippleLanes(after, before) : structuredClone(after);
+	conformLinks(out, before, new Set(anchors));
+	return out;
+}
+
+describe('the sync lock', () => {
+	test('a ripple delete of a J/L-cut closes by the picture removed and keeps every later pair in step', () => {
+		const { t, x1, x2, y1, y2 } = jlCut();
+		const before = structuredClone(t);
+		expect(rippleDeleteLinked(t, x1)).toBe(2);
+		expect(clipById(t, x1)).toBeUndefined();
+		expect(clipById(t, y1)).toBeUndefined();
+		expect(extent(t, x2)).toEqual([5, 15]);
+		expect(extent(t, y2)).toEqual([3, 15]);
+		expect(firstSyncBreak(t, before)).toBeNull();
+	});
+
+	test('a ripple delete leaves an unlinked clip on the partners track where it was', () => {
+		const { t, x1, x2, y2, asset } = jlCut();
+		t.tracks[1].clips.push(clip(asset, 0, 4, 40));
+		const bed = idOf(t, 1, 2);
+		rippleDeleteLinked(t, x1);
+		expect(extent(t, bed)).toEqual([40, 44]);
+		expect([start(t, x2), start(t, y2)]).toEqual([5, 3]);
+	});
+
+	test('a follower that would run into an unlinked clip refuses and names the lane', () => {
+		const { t, x1, asset } = jlCut();
+		t.tracks[1].clips.push(clip(asset, 0, 2, 2));
+		const json = JSON.stringify(t);
+		let err = '';
+		try {
+			rippleDeleteLinked(t, x1);
+		} catch (e) {
+			err = (e as Error).message;
+		}
+		expect(err).toContain('A1');
+		expect(err).toContain('not linked');
+		expect(err).not.toContain('links off');
+		expect(JSON.stringify(t)).toBe(json);
+	});
+
+	test('a follower that lands on linked material trims it back, and one it would cover refuses', () => {
+		const { t, x1, x2, y1, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x1).source_out = 112;
+		carryExtentEdit(after, x1, get(before, x1), limits([uuid()]));
+		const out = edited(before, after, true, [x1]);
+		expect(extent(out, x2)).toEqual([12, 22]);
+		expect(extent(out, y2)).toEqual([10, 22]);
+		expect(extent(out, y1)).toEqual([0, 10]);
+		expect(firstSyncBreak(out, before)).toBeNull();
+
+		t.tracks[1].clips[0].source_out = 101;
+		t.tracks[1].clips[1].timeline_start = 1.5;
+		t.tracks[1].clips[1].source_in = 201.5;
+		const b2 = structuredClone(t);
+		const a2 = structuredClone(t);
+		get(a2, x2).timeline_start = 0;
+		expect(() => edited(b2, a2, false, [x2])).toThrow(/cover.*A1|A1.*cover/);
+	});
+
+	test('a follower pulled before zero loses its head and keeps its sync', () => {
+		const { t, x1, x2, y1, y2 } = jlCut();
+		t.tracks.forEach((track) => (track.clips = track.clips.filter((c) => c.id !== x1 && c.id !== y1)));
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x2).timeline_start = 0;
+		const out = edited(before, after, false, [x2]);
+		const y = get(out, y2);
+		expect([y.timeline_start, y.timeline_start + clipDuration(y)]).toEqual([0, 10]);
+		expect(y.source_in).toBe(215);
+		expect(firstSyncBreak(out, before)).toBeNull();
+	});
+
+	test('the clip an edit names speaks for the group, and its track for the rest', () => {
+		const { t, x1, x2, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x2).timeline_start += 6;
+		get(after, y2).timeline_start += 4;
+		const at = (anchors: string[]) => {
+			const out = edited(before, after, false, anchors);
+			return [start(out, x2), start(out, y2)];
+		};
+		expect(at([x2])).toEqual([21, 19]);
+		expect(at([y2])).toEqual([19, 17]);
+		expect(at([x1])).toEqual([21, 19]);
+		expect(at([])).toEqual([21, 19]);
+	});
+
+	test('two partners both named and moved apart are left for the guard', () => {
+		const { t, x2, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x2).timeline_start += 6;
+		get(after, y2).timeline_start += 4;
+		const out = edited(before, after, false, [x2, y2]);
+		expect([start(out, x2), start(out, y2)]).toEqual([21, 17]);
+		expect(firstSyncBreak(out, before)).not.toBeNull();
+	});
+
+	test('a follower on a locked track refuses', () => {
+		const { t, x1 } = jlCut();
+		lock(t, 1);
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		get(after, x1).timeline_start += 1;
+		expect(() => edited(before, after, false, [x1])).toThrow(/locked.*A1|A1.*locked/);
+	});
+
+	test('a speed change re-places the partners about the named clip', () => {
+		const { t, x1, x2, y1, y2 } = jlCut();
+		const before = structuredClone(t);
+		const after = structuredClone(t);
+		setSpeedLinked(after, x1, 2);
+		expect(get(after, y1).speed).toBe(2);
+		const out = edited(before, after, true, [x1]);
+		expect(extent(out, x1)).toEqual([5, 10]);
+		expect(extent(out, y1)).toEqual([2.5, 8]);
+		expect(extent(out, x2)).toEqual([10, 20]);
+		expect(extent(out, y2)).toEqual([8, 20]);
+		expect(firstSyncBreak(out, before)).toBeNull();
+	});
+
+	test('a cut range whose stretch swallows a partners head resumes it at the cut', () => {
+		const asset = uuid();
+		const t = timeline([lane('video', 'V1', [clip(asset, 0, 20, 0)]), lane('audio', 'A1', [clip(asset, 8, 20, 8)])]);
+		const [x, y] = [idOf(t, 0, 0), idOf(t, 1, 0)];
+		linkClips(t, [x, y]);
+		const before = structuredClone(t);
+		const kept = cutClipRangeLinked(t, x, 5, 12);
+		expect(kept).toHaveLength(2);
+		expect(extent(t, x)).toEqual([0, 5]);
+		expect(extent(t, kept[1].id)).toEqual([5, 13]);
+		expect(idOf(t, 1, 0)).toBe(y);
+		expect(extent(t, y)).toEqual([5, 13]);
+		expect(get(t, y).source_in).toBe(12);
+		expect(linkPartners(t, kept[1].id)).toEqual([y]);
+		expect(linkPartners(t, x)).toEqual([]);
+		expect(firstSyncBreak(t, before)).toBeNull();
+	});
+
+	test('a cut range cuts a partner that spans the stretch in two and the tail follows', () => {
+		const { t, x1, x2, y2 } = jlCut();
+		const kept = cutClipRangeLinked(t, x1, 108, 111);
+		expect(kept).toHaveLength(2);
+		expect(extent(t, x1)).toEqual([5, 8]);
+		expect(extent(t, kept[1].id)).toEqual([8, 12]);
+		const sound = t.tracks[1].clips.map((c) => [c.timeline_start, c.timeline_start + clipDuration(c)]);
+		expect(sound[0]).toEqual([0, 8]);
+		expect(sound[1]).toEqual([8, 10]);
+		expect([extent(t, x2), extent(t, y2)]).toEqual([
+			[12, 22],
+			[10, 22]
+		]);
+	});
+
+	test('a split hands an unsplit partner to the side it lies on', () => {
+		const asset = uuid();
+		const t = timeline([lane('video', 'V1', [clip(asset, 0, 10, 0)]), lane('audio', 'A1', [clip(asset, 5, 10, 5)])]);
+		const [c, a] = [idOf(t, 0, 0), idOf(t, 1, 0)];
+		linkClips(t, [c, a]);
+		const [left, right] = splitClipLinked(t, c, 3);
+		expect(linkPartners(t, left.id)).toEqual([]);
+		expect(get(t, left.id).link_id).toBeUndefined();
+		expect(linkPartners(t, right.id)).toEqual([a]);
+		expect(withLinkedMoves(t, [mv(t, left.id, 1)])).toHaveLength(1);
+		expect(withLinkedMoves(t, [mv(t, right.id, 4)])).toHaveLength(2);
+
+		const u = timeline([lane('video', 'V1', [clip(asset, 0, 10, 0)]), lane('audio', 'A1', [clip(asset, 0, 4, 0)])]);
+		const [c2, a2] = [idOf(u, 0, 0), idOf(u, 1, 0)];
+		linkClips(u, [c2, a2]);
+		const [l2, r2] = splitClipLinked(u, c2, 6);
+		expect(linkPartners(u, l2.id)).toEqual([a2]);
+		expect(get(u, r2.id).link_id).toBeUndefined();
+	});
+
+	test('orphaned links are dissolved in one pass', () => {
+		const { t, c, a, asset } = pair();
+		const lone = clip(asset, 0, 1, 50);
+		lone.link_id = uuid();
+		t.tracks[0].clips.push(lone);
+		expect(dissolveAllOrphans(t)).toBe(true);
+		expect(get(t, lone.id).link_id).toBeUndefined();
+		expect(linkPartners(t, c)).toEqual([a]);
+		expect(dissolveAllOrphans(t)).toBe(false);
+		expect(linkedClipIds(t)).toEqual(new Set([c, a]));
+	});
+
+	test('detaching several clips skips what cannot be and fails only when all are', () => {
+		const asset = uuid();
+		const silent = uuid();
+		const t = timeline([
+			lane('video', 'V1', [clip(asset, 0, 5, 0), clip(silent, 0, 5, 5), clip(asset, 5, 9, 10)]),
+			lane('audio', 'A1', [])
+		]);
+		const ids = t.tracks[0].clips.map((c) => c.id);
+		const done = detachAudioMany(t, ids, (a) => a === asset);
+		expect([done.detached.length, done.skipped.length]).toEqual([2, 1]);
+		expect(done.skipped[0].clip_id).toBe(ids[1]);
+		expect(done.skipped[0].reason).toContain('no audio');
+		const json = JSON.stringify(t);
+		expect(() => detachAudioMany(t, ids, (a) => a === asset)).toThrow(/already detached|no audio/);
+		expect(JSON.stringify(t)).toBe(json);
 	});
 });
 

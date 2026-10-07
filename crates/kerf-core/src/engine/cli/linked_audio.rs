@@ -9,6 +9,16 @@
 //! recipe comes out twice the level (+6 dB), the fixed one at the level of the clip
 //! alone, and once detached the audio track's own fader rules the sound.
 //!
+//! **What detaching keeps, and what it cannot.** The *chain* of the sound — speed,
+//! volume, effects, fades, the dip's sound fade — is carried unchanged. The
+//! **level** is carried too, through the faders: a video track's fader rides its
+//! clips' own sound, and the audio track the sound moves to has one of its own, so
+//! the new clip's gain is folded (`volume × picture fader ÷ audio fader`) and the
+//! sound comes out as loud as it was (`detaching_keeps_the_level_through_the_faders`
+//! at graph level, measured under `#[ignore]`). What cannot follow is the rest of
+//! the destination's strip: its pan, its duck flag, its mute and solo decide the mix
+//! afterwards, where the picture track's did before.
+//!
 //! `cargo test -p kerf-core --no-default-features -- --ignored linked_audio`
 
 use std::path::{Path, PathBuf};
@@ -91,7 +101,9 @@ fn extract_audio_of_a_cut_asset_detaches_rather_than_doubles() {
     timeline.tracks[0].clips.push(Clip::for_asset(&asset, 0.0, 10.0, 0.0));
     project.save_timeline(&timeline).unwrap();
 
-    let audio = project.extract_audio(asset.id).unwrap();
+    let done = project.extract_audio(asset.id).unwrap();
+    assert!(done.skipped.is_empty());
+    let audio = &done.detached[0].clip;
     let timeline = project.timeline().unwrap();
     let picture = &timeline.tracks[0].clips[0];
     assert!(!picture.source_audio, "the picture no longer plays its own sound");
@@ -104,15 +116,21 @@ fn extract_audio_of_a_cut_asset_detaches_rather_than_doubles() {
 }
 
 #[test]
-fn an_asset_not_in_the_cut_is_still_just_appended() {
+fn extracting_an_asset_that_is_not_in_the_cut_says_so_and_adding_its_audio_is_its_own_operation() {
     let asset = av(10.0);
     let project = Project::open_in_memory().unwrap();
     project.insert_asset(&asset).unwrap();
-    let audio = project.extract_audio(asset.id).unwrap();
+    // Nothing of it plays its own sound: extract has nothing to detach and no longer
+    // falls through to appending the whole asset (which a second call used to do).
+    let err = project.extract_audio(asset.id).unwrap_err().to_string();
+    assert!(err.contains("add_asset_audio"), "{err}");
+    assert!(project.timeline().unwrap().tracks.iter().all(|t| t.clips.is_empty()));
+    let audio = project.add_asset_audio(asset.id).unwrap();
     let timeline = project.timeline().unwrap();
     let a1 = timeline.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap();
     assert_eq!(a1.clips.len(), 1);
     assert_eq!(a1.clips[0].id, audio.id);
+    assert_eq!((audio.source_in, audio.source_out), (0.0, 10.0));
     assert!(audio.link_id.is_none(), "nothing to link it to");
     assert!(timeline.tracks.iter().all(|t| t.clips.iter().all(|c| c.source_audio)));
 }
@@ -191,6 +209,69 @@ fn links_never_reach_the_graph() {
     assert!(!json.contains("link_id") && !json.contains("source_audio"), "{json}");
     let json = serde_json::to_string(&linked).unwrap();
     assert!(json.contains("link_id") && !json.contains("source_audio"), "{json}");
+}
+
+/// The product of every `volume=` in the audio chains of a graph (one clip's
+/// worth of gain: its own volume, then its track's fader).
+fn total_gain(graph: &str) -> f64 {
+    let chains = audio_chains(graph);
+    assert_eq!(chains.len(), 1, "one sounding clip: {graph}");
+    chains[0]
+        .split(',')
+        .filter_map(|f| f.strip_prefix("volume="))
+        .map(|v| v.trim_matches('\'').parse::<f64>().expect("a gain"))
+        .product()
+}
+
+#[test]
+fn detaching_keeps_the_level_through_the_faders() {
+    // A video track's fader rides its clips' own sound; the audio track the sound
+    // moves to has one of its own. The new clip's gain folds the first into the
+    // second, so what comes out is as loud as it was — for any pair of faders.
+    let asset = av(10.0);
+    let assets = vec![asset.clone()];
+    for (picture_fader, audio_fader) in [(1.0f32, 1.0f32), (0.5, 1.0), (0.5, 2.0), (1.5, 0.25), (0.0, 1.0), (1.0, 0.5)] {
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.volume = 0.8;
+        let mut timeline = timeline_of(vec![video_track(vec![clip.clone()]), audio_track(vec![])]);
+        timeline.tracks[0].volume = picture_fader;
+        timeline.tracks[1].volume = audio_fader;
+        let was = if picture_fader == 0.0 {
+            0.0
+        } else {
+            total_gain(&graph_of(&timeline, &assets))
+        };
+        let done = timeline.detach_audio(clip.id, true).unwrap();
+        let now = if picture_fader == 0.0 {
+            f64::from(done.clip.volume * audio_fader)
+        } else {
+            total_gain(&graph_of(&timeline, &assets))
+        };
+        assert!(
+            (was - now).abs() < 1e-4,
+            "faders {picture_fader}/{audio_fader}: gain {was} became {now}"
+        );
+        assert!(
+            (f64::from(done.clip.volume * audio_fader) - f64::from(0.8 * picture_fader)).abs() < 1e-4,
+            "the clip's own volume carries the ratio: {}",
+            done.clip.volume
+        );
+    }
+}
+
+#[test]
+fn a_lane_whose_fader_is_at_zero_cannot_take_a_detached_sound() {
+    let asset = av(10.0);
+    let clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+    let mut timeline = timeline_of(vec![video_track(vec![clip.clone()]), audio_track(vec![])]);
+    timeline.tracks[1].volume = 0.0;
+    let done = timeline.detach_audio(clip.id, true).unwrap();
+    assert!(
+        done.created_track,
+        "A1 is silent: the sound cannot be carried onto it, so a new track is made"
+    );
+    assert_eq!(timeline.tracks[1].clips.len(), 0);
+    assert_eq!(done.clip.volume, 1.0, "the new lane's fader is neutral");
 }
 
 #[test]
@@ -297,6 +378,8 @@ fn the_old_extract_audio_doubled_the_level_and_detaching_does_not() {
     timeline.tracks[0].clips.push(Clip::for_asset(&asset, 0.0, dur, 0.0));
     project.save_timeline(&timeline).unwrap();
     project.extract_audio(asset.id).unwrap();
+    // A second call finds nothing still sounding: an error, not a second clip.
+    assert!(project.extract_audio(asset.id).is_err());
     let timeline = project.timeline().unwrap();
     let fixed = level(&export_audio(&timeline, &assets, &dir, "fixed"));
     let gain_db = 20.0 * (fixed / base).log10();
@@ -317,6 +400,32 @@ fn the_old_extract_audio_doubled_the_level_and_detaching_does_not() {
     assert!(
         (gain_db + 6.02).abs() < 0.3,
         "the fader rides the detached sound: {gain_db:.2} dB"
+    );
+
+    // The picture track's fader rode its own sound; detaching folds it into the
+    // clip, so a V1 fader at 0.5 still means -6 dB — measured through the render, with
+    // A1's own fader at 2.0 (which the fold has to divide back out).
+    let project = Project::open_in_memory().unwrap();
+    project.insert_asset(&asset).unwrap();
+    let mut timeline = project.timeline().unwrap();
+    timeline.tracks[0].clips.push(Clip::for_asset(&asset, 0.0, dur, 0.0));
+    project.save_timeline(&timeline).unwrap();
+    let ids: Vec<Uuid> = project.timeline().unwrap().tracks.iter().map(|t| t.id).collect();
+    project.set_track_volume(ids[0], 0.5).unwrap();
+    let before = level(&export_audio(&project.timeline().unwrap(), &assets, &dir, "v1-fader"));
+    project.set_track_volume(ids[1], 2.0).unwrap();
+    project.extract_audio(asset.id).unwrap();
+    let after = level(&export_audio(
+        &project.timeline().unwrap(),
+        &assets,
+        &dir,
+        "v1-fader-detached",
+    ));
+    let moved_db = 20.0 * (after / before).log10();
+    eprintln!("V1 fader 0.5 -> detached under A1 fader 2.0: {moved_db:+.2} dB (before {before:.4}, after {after:.4})");
+    assert!(
+        moved_db.abs() < 0.3,
+        "detaching keeps the level the picture track's fader made: {moved_db:.2} dB"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

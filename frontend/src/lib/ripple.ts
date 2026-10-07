@@ -23,19 +23,25 @@
 // nothing; a split shifts nothing; moves never ripple; a clip the edit itself
 // moved is not a follower (so an op that already closed the gap is not shifted
 // twice); tracks are independent — except for *linked* clips: a clip the ripple moved
-// takes its linked partners along by the same amount (the sync lock, `followLinks`);
+// takes its linked partners along by the same amount (the sync lock, `conformLinks`);
 // a locked track never moves; overlays and markers do not move. And it never
 // produces an overlap: a track whose ripple would leave a touched clip overlapping
 // another, or before 0, is returned exactly as the edit made it.
 
+import { clampFades, DIFF_EPS, moveHead, moveTail } from './edit-modes';
+import { contentOffset, invalid, linkedClipIds, lockedPartner, STEP_EPS } from './link-groups';
+import { formatTime } from './diff';
 import type { Clip, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
 /** kerf-core's `DIFF_EPS`: timing closer than this is float noise from a JSON round-trip. */
-export const DIFF_EPS = 1e-6;
+export { DIFF_EPS };
 
 const numChanged = (a: number, b: number): boolean => Math.abs(a - b) > DIFF_EPS;
 const clipEnd = (c: Clip): number => c.timeline_start + clipDuration(c);
+
+/** The shortest a clip may be left after a follower ran into it (kerf-core's `MIN_LEFT`). */
+const MIN_LEFT = 1e-3;
 
 /** Rust's `f64::total_cmp` for the finite numbers a timeline holds: it orders -0 before +0. */
 function totalCmp(a: number, b: number): number {
@@ -54,9 +60,27 @@ export function spansOverlap(a: [number, number], b: [number, number]): boolean 
 /**
  * The cut after a **ripple edit**: `after` is what an edit left behind and
  * `before` is what it started from. Pure — neither argument is modified — and
- * the identity (a copy) when nothing about any track's timing changed.
+ * the identity (a copy) when nothing about any track's timing changed. With `links`
+ * on, the clips the ripple moved take their linked partners along (`conformLinks`,
+ * best effort — a conform that would be refused leaves the plain per-track ripple, and
+ * the edit's own sync guard says why); `anchors` are the clips the edit named, so the
+ * lock knows whose track speaks for a group (`Timeline::ripple_from_anchored`).
  */
-export function rippleFrom(after: Timeline, before: Timeline, links = true): Timeline {
+export function rippleFrom(after: Timeline, before: Timeline, links = true, anchors: Iterable<string> = []): Timeline {
+	const out = rippleLanes(after, before);
+	if (!links) return out;
+	const conformed = structuredClone(out);
+	try {
+		conformLinks(conformed, before, new Set(anchors));
+		return conformed;
+	} catch {
+		return out;
+	}
+}
+
+/** The per-track half of `rippleFrom` (`Timeline::ripple_lanes`): every unlocked track
+ *  rippled on its own, nothing carried between them. */
+export function rippleLanes(after: Timeline, before: Timeline): Timeline {
 	const inBefore = new Set(before.tracks.flatMap((t) => t.clips.map((c) => c.id)));
 	const inAfter = new Set(after.tracks.flatMap((t) => t.clips.map((c) => c.id)));
 	const out: Timeline = structuredClone(after);
@@ -66,87 +90,140 @@ export function rippleFrom(after: Timeline, before: Timeline, links = true): Tim
 		if (track.locked || prior.locked) return track;
 		return rippleTrack(track, prior, inBefore, inAfter) ?? track;
 	});
-	if (links) followLinks(out, after, before);
 	return out;
 }
 
 /**
- * The **sync lock** (`Timeline::follow_links` in kerf-core): after the per-track ripple
- * (`out` is its result, `edited` what the edit left before it, `before` where it
- * started), every clip the ripple moved takes its linked partners along by the same
- * amount — the picture's sound stays with it even when the sound's track had no edit of
- * its own to ripple from. Only **clips** follow, never the lane. Only a clip *the
- * ripple* moved counts (one that started where it started and was pushed, not one the
- * edit itself moved — a left trim's start, which the ripple puts back). A partner
- * follows only if nothing moved it yet and its track is not locked; a group whose moved
- * members disagree on the amount is left alone; a lane the followers would leave
- * overlapping, or before 0, keeps its clips where they were. Mutates `out`.
+ * The **sync lock** (`Timeline::conform_links` in kerf-core). `timeline` is what an edit
+ * (and, in ripple mode, the per-lane ripple) left, `before` where it started, `anchors` the
+ * clips the edit named and `origin` maps a clip the edit *created* (the tail of a cut) to the
+ * clip it was made from. Every link group is put back in the relationship it had: each
+ * member's content offset is compared with its own before, and the members that did not move
+ * as far as the group's **authority** are shifted by the difference. The authority is, in
+ * order, the member the edit named; the member on the track of a clip the edit named; the
+ * first member — in track order — that moved at all. Two *named* members that moved apart were
+ * parted by hand and are left for the guard. Only clips **in a group** follow; where a
+ * follower lands on another clip it wins against a *linked* one (trimmed back) and stops
+ * before 0 by losing its head; it throws — with `timeline` partly changed, so call it on a
+ * scratch copy — for a follower on a locked track, an *unlinked* clip in its way, or a clip
+ * that would be covered completely. Mutates `timeline`.
  */
-function followLinks(out: Timeline, edited: Timeline, before: Timeline) {
-	if (!out.tracks.some((t) => t.clips.some((c) => c.link_id))) return;
-	const startIn = (t: Timeline, id: string): number | undefined => {
-		for (const track of t.tracks) {
-			const c = track.clips.find((x) => x.id === id);
-			if (c) return c.timeline_start;
-		}
-		return undefined;
-	};
-	const groups = new Map<string, [number, number][]>();
-	out.tracks.forEach((track, ti) =>
-		track.clips.forEach((clip, ci) => {
-			if (!clip.link_id) return;
-			const members = groups.get(clip.link_id) ?? [];
-			members.push([ti, ci]);
-			groups.set(clip.link_id, members);
-		})
-	);
-	// `"lane:index"` -> shift, for every follower.
-	const shifts = new Map<string, number>();
+export function conformLinks(
+	timeline: Timeline,
+	before: Timeline,
+	anchors: ReadonlySet<string>,
+	origin: ReadonlyMap<string, string> = new Map()
+) {
+	const groups = new Map<string, string[]>(); // link -> members in track order
+	for (const clip of timeline.tracks.flatMap((t) => t.clips)) {
+		if (clip.link_id) groups.set(clip.link_id, [...(groups.get(clip.link_id) ?? []), clip.id]);
+	}
+	if (![...groups.values()].some((m) => m.length >= 2)) return;
+	const prior = new Map<string, Clip>();
+	for (const c of before.tracks.flatMap((t) => t.clips)) prior.set(c.id, c);
+	const now = new Map<string, { ti: number; clip: Clip }>();
+	timeline.tracks.forEach((t, ti) => t.clips.forEach((clip) => now.set(clip.id, { ti, clip })));
+	// The tracks the edit named a clip on: where it speaks for the group.
+	const anchorTracks = new Set<string>();
+	for (const id of anchors) {
+		const was = before.tracks.find((t) => t.clips.some((c) => c.id === id));
+		const here = now.get(id);
+		if (was) anchorTracks.add(was.id);
+		else if (here) anchorTracks.add(timeline.tracks[here.ti].id);
+	}
+
+	const shifts: [string, number][] = [];
 	for (const members of groups.values()) {
-		const moved: { at: [number, number]; by: number }[] = [];
-		for (const [ti, ci] of members) {
-			const clip = out.tracks[ti].clips[ci];
-			const was = startIn(edited, clip.id);
-			const prior = startIn(before, clip.id);
-			if (was === undefined || prior === undefined) continue;
-			if (Math.abs(prior - was) > DIFF_EPS) continue;
-			const by = clip.timeline_start - was;
-			if (Math.abs(by) > DIFF_EPS) moved.push({ at: [ti, ci], by });
+		if (members.length < 2) continue;
+		// `[clip, its track, how far its offset moved]` for every member that has a before.
+		const moved: [string, number, number][] = [];
+		for (const id of members) {
+			const here = now.get(id);
+			const was = prior.get(origin.get(id) ?? id);
+			if (!here || !was) continue;
+			moved.push([id, here.ti, contentOffset(here.clip) - contentOffset(was)]);
 		}
-		if (moved.length === 0) continue;
-		const by = moved[0].by;
-		if (moved.some((m) => Math.abs(m.by - by) > DIFF_EPS)) continue;
-		for (const [ti, ci] of members) {
-			const clip = out.tracks[ti].clips[ci];
-			if (out.tracks[ti].locked || moved.some((m) => m.at[0] === ti && m.at[1] === ci)) continue;
-			const b = startIn(before, clip.id);
-			const e = startIn(edited, clip.id);
-			const untouched =
-				b !== undefined &&
-				e !== undefined &&
-				Math.abs(b - e) <= DIFF_EPS &&
-				Math.abs(e - clip.timeline_start) <= DIFF_EPS;
-			const sameLane = moved.some((m) => m.at[0] === ti);
-			if (untouched && !sameLane) shifts.set(`${ti}:${ci}`, by);
+		if (moved.length < 2) continue;
+		const named = moved.filter(([id]) => anchors.has(id));
+		let reference: number;
+		if (named.length > 0) {
+			const d = named[0][2];
+			if (named.some(([, , other]) => Math.abs(other - d) > STEP_EPS)) continue;
+			reference = d;
+		} else {
+			const onAnchorTrack = moved.find(([, ti]) => anchorTracks.has(timeline.tracks[ti].id));
+			const first = moved.find(([, , d]) => Math.abs(d) > STEP_EPS);
+			if (onAnchorTrack) reference = onAnchorTrack[2];
+			else if (first) reference = first[2];
+			else continue;
 		}
-	}
-	const lanes = new Map<number, number[]>();
-	for (const key of shifts.keys()) {
-		const [ti, ci] = key.split(':').map(Number);
-		lanes.set(ti, [...(lanes.get(ti) ?? []), ci]);
-	}
-	for (const [ti, followers] of lanes) {
-		const clips: Clip[] = out.tracks[ti].clips.map((c) => ({ ...c }));
-		const pristine = clips.map(() => true);
-		for (const ci of followers) {
-			clips[ci].timeline_start += shifts.get(`${ti}:${ci}`)!;
-			pristine[ci] = false;
-		}
-		if (laneIsLegal(clips, pristine)) {
-			clips.sort((a, b) => totalCmp(a.timeline_start, b.timeline_start));
-			out.tracks[ti] = { ...out.tracks[ti], clips };
+		for (const [id, , d] of moved) {
+			const shift = reference - d;
+			if (!anchors.has(id) && Math.abs(shift) > STEP_EPS) shifts.push([id, shift]);
 		}
 	}
+	if (shifts.length === 0) return;
+
+	const linked = linkedClipIds(timeline);
+	const movers = new Set(shifts.map(([id]) => id));
+	const shiftOf = new Map(shifts);
+	const lanes = [...new Set(shifts.map(([id]) => now.get(id)!.ti))].sort((a, b) => a - b);
+	for (const ti of lanes) {
+		const track = timeline.tracks[ti];
+		if (track.locked) throw lockedPartner(track);
+		for (const clip of track.clips) {
+			const by = shiftOf.get(clip.id);
+			if (by !== undefined) clip.timeline_start += by;
+		}
+		settleFollowers(track, movers, linked);
+	}
+}
+
+/** Make a lane legal again after `conformLinks` shifted the clips in `movers` into it
+ *  (`Track::settle_followers`): a mover before 0 loses its head; where a mover overlaps a
+ *  clip the mover wins — of two movers, the later — and the clip it ran into is trimmed back,
+ *  which only a **linked** clip allows; an unlinked clip, or one that would be covered
+ *  completely, throws with the reason. Overlaps between clips nothing moved are ignored. */
+function settleFollowers(track: Track, movers: ReadonlySet<string>, linked: ReadonlySet<string>) {
+	for (const clip of track.clips) {
+		if (movers.has(clip.id) && clip.timeline_start < -DIFF_EPS) {
+			const by = -clip.timeline_start;
+			if (clipDuration(clip) - by < MIN_LEFT)
+				throw invalid(`the linked clip on ${track.name} would end before the beginning of the timeline`);
+			moveHead(clip, by, false);
+			clip.timeline_start = 0;
+			clampFades(clip);
+		}
+	}
+	track.clips.sort((a, b) => totalCmp(a.timeline_start, b.timeline_start));
+	for (let round = 0; round <= track.clips.length * 2; round++) {
+		const cs = track.clips;
+		let i = -1;
+		for (let k = 0; k + 1 < cs.length; k++) {
+			if (cs[k + 1].timeline_start < clipEnd(cs[k]) - DIFF_EPS && (movers.has(cs[k].id) || movers.has(cs[k + 1].id))) {
+				i = k;
+				break;
+			}
+		}
+		if (i < 0) return;
+		const laterLoses = movers.has(cs[i].id) && !movers.has(cs[i + 1].id);
+		const loser = laterLoses ? i + 1 : i;
+		const at = formatTime(cs[loser].timeline_start);
+		if (!linked.has(cs[loser].id))
+			throw invalid(
+				`the clip linked to this one would run into another clip on ${track.name} at ${at} that is not linked to it — move that clip first`
+			);
+		const overlap = clipEnd(cs[i]) - cs[i + 1].timeline_start;
+		if (clipDuration(cs[loser]) - overlap < MIN_LEFT)
+			throw invalid(
+				`the linked clip on ${track.name} would cover another linked clip at ${at} completely — move one of them first`
+			);
+		if (laterLoses) moveHead(cs[loser], overlap, false);
+		else moveTail(cs[loser], -overlap, false);
+		clampFades(cs[loser]);
+		track.clips.sort((a, b) => totalCmp(a.timeline_start, b.timeline_start));
+	}
+	throw invalid(`the linked clips on ${track.name} cannot be laid out without overlapping`);
 }
 
 /** The rippled version of one track, or `null` when there is nothing to do or the ripple would leave the lane illegal. */

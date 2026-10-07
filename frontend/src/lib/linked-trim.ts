@@ -8,14 +8,15 @@
  *    so it is the *drag* that has to keep the partner off its own neighbours
  *    (`linkedTrimBounds`: the named clip's bounds intersected with each sharing partner's,
  *    footage aside).
- *  - *The outcome.* With ripple on, the backend runs `ripple_from` over the whole cut, and
- *    its sync lock (`follow_links`) makes a clip the ripple pushed drag its partners along:
- *    trim a title on V1 and the next shot's sound on A1 moves too. `linkedTrimPreview`
- *    applies the trim to a scratch copy of the lanes that matter, then the same two steps
- *    the backend takes (`carryExtentEdit`, then `rippleFrom` with its sync lock), then the
- *    sync guard, and reads off every clip that changed — on any track — so the ghosts of the
- *    partners' ripple are drawn live, and a refusal (a locked partner, a pair pulled out of
- *    step) is drawn red with its reason instead of found out on release.
+ *  - *The outcome.* With ripple on, the backend ripples every lane, and its sync lock
+ *    (`conform_links`) makes the clips a ripple pushed drag their partners along: trim a title
+ *    on V1 and the next shot's sound on A1 moves too, a J/L-cut offset kept. `linkedTrimPreview`
+ *    applies the trim to a scratch copy of the lanes that matter, then the same steps the
+ *    backend takes (`carryExtentEdit`, the per-lane ripple, then `conformLinks` with the
+ *    trimmed clip as its anchor), then the sync guard, and reads off every clip that changed —
+ *    on any track — so the ghosts of the partners' ripple are drawn live, and a refusal (a
+ *    locked partner, an unlinked clip in the way, a pair pulled out of step) is drawn red with
+ *    its reason instead of found out on release.
  */
 
 import { ADJACENT_EPS, type SourceLimits } from './edit-modes';
@@ -23,7 +24,7 @@ import { trimEdit } from './frames';
 import { firstSyncBreak, hasLinks, linkPartners, locateIndex, syncBreakError } from './link-groups';
 import { gestureReason, reasonOf } from './link-ui';
 import { carryExtentEdit } from './links';
-import { DIFF_EPS, rippleFrom } from './ripple';
+import { conformLinks, DIFF_EPS, rippleLanes } from './ripple';
 import { trimBounds, type TrimBounds } from './ripple-trim';
 import { plainCopy } from './trim-tools';
 import type { Clip, Timeline, Track } from './types';
@@ -137,9 +138,16 @@ export function linkedTrimPreview(
 			reason = gestureReason(reasonOf(err));
 		}
 	}
-	const result = opts.ripple && reason === null ? rippleFrom(after, before, opts.links) : after;
+	// The rest of `Project::run_edit`: the per-lane ripple, then the sync lock and guard.
+	let result = after;
+	if (reason === null && opts.ripple) result = rippleLanes(after, before);
 	if (reason === null && opts.links && hasLinks(before)) {
-		const broke = firstSyncBreak(result, before);
+		try {
+			conformLinks(result, before, new Set([clipId]));
+		} catch (err) {
+			reason = gestureReason(reasonOf(err));
+		}
+		const broke = reason === null ? firstSyncBreak(result, before) : null;
 		if (broke) reason = gestureReason(reasonOf(syncBreakError(broke)));
 	}
 

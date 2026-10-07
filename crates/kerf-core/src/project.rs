@@ -3,7 +3,7 @@
 //! operations mutate the stored EDL; nothing is re-encoded until [`Project::export`].
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -13,7 +13,6 @@ use uuid::Uuid;
 use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, MAX_CAPTION_OFFSET, MAX_IMPORTED_CAPTIONS};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
-use crate::model::Detached;
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
@@ -21,6 +20,7 @@ use crate::model::{
     SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
     Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
 };
+use crate::model::{Detached, DetachedMany};
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
 /// source window, and the shape it was shot in.
@@ -998,13 +998,16 @@ impl Project {
     /// [`Timeline::ripple_from`] before it is stored. With it off nothing is
     /// cloned and the edit is exactly what `f` made.
     ///
-    /// **Linked clips** are guarded here too, for every op: with links in force
-    /// and something linked, an edit that would leave an in-step picture and
-    /// sound apart is refused (`Timeline::first_sync_break`), whether the op
-    /// knew about links or not — the net under the ones that carry them.
+    /// **Linked clips** are kept in step here too, for every op: with links in
+    /// force and something linked, the clips an edit (and the ripple) moved take their
+    /// linked partners along ([`Timeline::conform_links`]), and an edit that would
+    /// still leave an in-step picture and sound apart is refused
+    /// ([`Timeline::first_sync_break`]) — whether the op knew about links or not.
+    /// Afterwards a link left with one clip (its partner was cut, deleted, or on a
+    /// track that was removed) is dissolved.
     fn edit_timeline<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
         let ripple = self.ripple_active()?;
-        self.run_edit(label, ripple, f)
+        self.run_edit(|_| label.to_string(), ripple, &[], f)
     }
 
     /// [`Self::edit_timeline`] for an op that decides its own layout and so is
@@ -1015,30 +1018,65 @@ impl Project {
     /// reflows, and a move changes where clips *are*, not how much footage sits
     /// ahead of them.
     fn edit_timeline_exact<R>(&self, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
-        self.run_edit(label, false, f)
+        self.run_edit(|_| label.to_string(), false, &[], f)
     }
 
-    fn run_edit<R>(&self, label: &str, ripple: bool, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+    /// [`Self::edit_timeline`] for an op that **names clips** (`anchors`), whose track
+    /// speaks for a link group when the sync lock has to choose, and whose label may
+    /// depend on what the edit did (`label` is given its result — a group move counts
+    /// the partners it carried, which only the edit knows).
+    fn edit_named<R>(
+        &self,
+        anchors: &[Uuid],
+        label: impl FnOnce(&R) -> String,
+        f: impl FnOnce(&mut Timeline) -> Result<R>,
+    ) -> Result<R> {
+        let ripple = self.ripple_active()?;
+        self.run_edit(label, ripple, anchors, f)
+    }
+
+    /// [`Self::edit_named`] for an op that is never rippled.
+    fn edit_named_exact<R>(
+        &self,
+        anchors: &[Uuid],
+        label: impl FnOnce(&R) -> String,
+        f: impl FnOnce(&mut Timeline) -> Result<R>,
+    ) -> Result<R> {
+        self.run_edit(label, false, anchors, f)
+    }
+
+    fn run_edit<R>(
+        &self,
+        label: impl FnOnce(&R) -> String,
+        ripple: bool,
+        anchors: &[Uuid],
+        f: impl FnOnce(&mut Timeline) -> Result<R>,
+    ) -> Result<R> {
         let links = self.links_active();
+        let anchors: HashSet<Uuid> = anchors.iter().copied().collect();
         let f = move |timeline: &mut Timeline| -> Result<R> {
-            // The sync guard: with links in force and something linked, an edit that
-            // would leave an in-step picture and sound apart is refused (see
-            // `Timeline::first_sync_break`). A project that links nothing skips it.
-            let guard = links && timeline.has_links();
-            if !ripple && !guard {
-                return f(timeline);
-            }
-            let before = timeline.clone();
+            // The sync lock and guard: with links in force and something linked, the
+            // partners of what the edit moved follow it, and an edit that would
+            // leave an in-step picture and sound apart is refused. A project that
+            // links nothing skips all of it, and the snapshot with it.
+            let sync = links && timeline.has_links();
+            let before = (ripple || sync).then(|| timeline.clone());
             let result = f(timeline)?;
-            if ripple {
-                *timeline = timeline.ripple_from_with(&before, links);
-            }
-            if guard {
-                if let Some((a, b)) = timeline.first_sync_break(&before) {
-                    return Err(Error::InvalidArgument(format!(
-                        "that edit would put the linked clips on {a} and {b} out of step — edit with links off to move one of them on its own"
-                    )));
+            if let Some(before) = &before {
+                if ripple {
+                    *timeline = timeline.ripple_lanes(before);
                 }
+                if sync {
+                    timeline.conform_links(before, &anchors, &HashMap::new())?;
+                    if let Some((a, b)) = timeline.first_sync_break(before) {
+                        return Err(Error::InvalidArgument(format!(
+                            "that edit would leave the linked clips on {a} and {b} out of step with each other — unlink them first if they are meant to part"
+                        )));
+                    }
+                }
+            }
+            if timeline.has_links() {
+                timeline.dissolve_all_orphans();
             }
             Ok(result)
         };
@@ -1056,9 +1094,30 @@ impl Project {
         let result = f(&mut timeline)?;
         let json = serde_json::to_string(&timeline)?;
         self.save_timeline_str(&json)?;
-        self.record_revision(label, self.actor, &json)?;
+        self.record_revision(&label(&result), self.actor, &json)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Whether the timeline an edit made now would land on has any linked clip —
+    /// answered from the stored JSON (`link_id` is only ever written for a linked
+    /// clip) without parsing it, so an op that wants to know *before* it runs, on
+    /// a project that links nothing, pays one `instr` rather than a timeline load.
+    fn working_has_links(&self) -> Result<bool> {
+        const KEY: &str = "\"link_id\"";
+        if self.actor == EditSource::Agent {
+            if let Some(row) = self.staged_row()? {
+                return Ok(row.timeline.contains(KEY));
+            }
+        }
+        let found: i64 = self
+            .conn
+            .query_row("SELECT instr(data, ?1) FROM timeline WHERE id = 1", params![KEY], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or(0);
+        Ok(found > 0)
     }
 
     // ---- staged edits -----------------------------------------------------
@@ -1115,11 +1174,16 @@ impl Project {
 
     /// Apply an edit to the pending proposal rather than the live timeline,
     /// appending its label to the running list of what has been staged.
-    fn edit_staged<R>(&self, row: StagedRow, label: &str, f: impl FnOnce(&mut Timeline) -> Result<R>) -> Result<R> {
+    fn edit_staged<R>(
+        &self,
+        row: StagedRow,
+        label: impl FnOnce(&R) -> String,
+        f: impl FnOnce(&mut Timeline) -> Result<R>,
+    ) -> Result<R> {
         let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
         let result = f(&mut timeline)?;
         let mut edits = row.edits;
-        edits.push(label.to_string());
+        edits.push(label(&result));
         self.conn.execute(
             "UPDATE staged SET timeline = ?1, edits = ?2, updated_at = ?3 WHERE id = 1",
             params![
@@ -1468,36 +1532,42 @@ impl Project {
         source_out: Option<f64>,
         timeline_start: Option<f64>,
     ) -> Result<Clip> {
-        let links = self.links_active();
+        // The partners follow the trimmed edge only if there are any: a project that
+        // links nothing never loads its assets for this.
+        let links = self.links_active() && self.working_has_links()?;
         let footage = if links { self.source_limits()? } else { SourceLimits::new() };
-        let clip = self.edit_timeline("Trim clip", |timeline| {
-            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            let was = timeline.tracks[ti].clips[ci].clone();
-            let clip = &mut timeline.tracks[ti].clips[ci];
-            if let Some(value) = source_in {
-                clip.source_in = value;
-            }
-            if let Some(value) = source_out {
-                clip.source_out = value;
-            }
-            if clip.source_out <= clip.source_in {
-                return Err(Error::InvalidArgument(
-                    "source_out must be greater than source_in".to_string(),
-                ));
-            }
-            if let Some(start) = timeline_start {
-                clip.timeline_start = start.max(0.0);
-            }
-            let out = clip.clone();
-            if timeline_start.is_some() {
-                timeline.tracks[ti].sort_by_start();
-            }
-            if links {
-                // The partners follow the edge that moved (see `carry_extent_edit`).
-                timeline.carry_extent_edit(clip_id, &was, &footage)?;
-            }
-            Ok(out)
-        })?;
+        let clip = self.edit_named(
+            &[clip_id],
+            |_| "Trim clip".to_string(),
+            |timeline| {
+                let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+                let was = timeline.tracks[ti].clips[ci].clone();
+                let clip = &mut timeline.tracks[ti].clips[ci];
+                if let Some(value) = source_in {
+                    clip.source_in = value;
+                }
+                if let Some(value) = source_out {
+                    clip.source_out = value;
+                }
+                if clip.source_out <= clip.source_in {
+                    return Err(Error::InvalidArgument(
+                        "source_out must be greater than source_in".to_string(),
+                    ));
+                }
+                if let Some(start) = timeline_start {
+                    clip.timeline_start = start.max(0.0);
+                }
+                let out = clip.clone();
+                if timeline_start.is_some() {
+                    timeline.tracks[ti].sort_by_start();
+                }
+                if links {
+                    // The partners follow the edge that moved (see `carry_extent_edit`).
+                    timeline.carry_extent_edit(clip_id, &was, &footage)?;
+                }
+                Ok(out)
+            },
+        )?;
         // The ripple can move the trimmed clip itself (a left-edge trim keeps its
         // start), so hand back what is on the timeline rather than what the trim
         // alone produced.
@@ -1523,30 +1593,38 @@ impl Project {
     /// alone.
     pub fn cut_clip_range(&self, clip_id: Uuid, from: f64, to: f64) -> Result<Vec<Clip>> {
         let links = self.links_active();
-        self.edit_timeline_exact("Cut range", |timeline| {
-            if links {
-                timeline.cut_clip_range_linked(clip_id, from, to)
-            } else {
-                timeline.cut_clip_range(clip_id, from, to)
-            }
-        })
+        self.edit_named_exact(
+            &[clip_id],
+            |_| "Cut range".to_string(),
+            |timeline| {
+                if links {
+                    timeline.cut_clip_range_linked(clip_id, from, to)
+                } else {
+                    timeline.cut_clip_range(clip_id, from, to)
+                }
+            },
+        )
     }
 
     /// Move a clip to a new index within its track and re-flow the track gaplessly.
     pub fn reorder(&self, track_id: Uuid, clip_id: Uuid, new_index: usize) -> Result<()> {
-        self.edit_timeline_exact("Reorder clip", |timeline| {
-            let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
-            let current = track
-                .clips
-                .iter()
-                .position(|c| c.id == clip_id)
-                .ok_or(Error::ClipNotFound(clip_id))?;
-            let clip = track.clips.remove(current);
-            let index = new_index.min(track.clips.len());
-            track.clips.insert(index, clip);
-            track.reflow();
-            Ok(())
-        })
+        self.edit_named_exact(
+            &[clip_id],
+            |_| "Reorder clip".to_string(),
+            |timeline| {
+                let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+                let current = track
+                    .clips
+                    .iter()
+                    .position(|c| c.id == clip_id)
+                    .ok_or(Error::ClipNotFound(clip_id))?;
+                let clip = track.clips.remove(current);
+                let index = new_index.min(track.clips.len());
+                track.clips.insert(index, clip);
+                track.reflow();
+                Ok(())
+            },
+        )
     }
 
     /// Move a clip to a new timeline position, optionally onto another track of
@@ -1564,7 +1642,7 @@ impl Project {
     /// `with_links(Some(false))` moves the named clip alone, by the rules below.
     pub fn move_clip(&self, clip_id: Uuid, timeline_start: f64, track_id: Option<Uuid>) -> Result<Clip> {
         let start = timeline_start.max(0.0);
-        if self.links_active() && !self.working_timeline()?.link_partners(clip_id).is_empty() {
+        if self.links_active() && self.working_has_links()? && !self.working_timeline()?.link_partners(clip_id).is_empty() {
             let moved = self.move_clips(&[ClipMove {
                 clip_id,
                 timeline_start: start,
@@ -1633,18 +1711,15 @@ impl Project {
     /// the move. `with_links(Some(false))` moves exactly what is named.
     pub fn move_clips(&self, moves: &[ClipMove]) -> Result<Vec<Clip>> {
         let links = self.links_active();
-        let total = if links {
-            self.working_timeline()?
-                .with_linked_moves(moves)
-                .map_or(moves.len(), |all| all.len())
-        } else {
-            moves.len()
-        };
-        let label = match total {
+        // The label counts the partners carried along, which only the edit knows.
+        let label = |moved: &Vec<Clip>| match moved.len() {
             1 => "Move clip".to_string(),
             n => format!("Move {n} clips"),
         };
-        self.edit_timeline_exact(&label, |timeline| {
+        // Named clips are authoritative: two partners both named and moved apart were
+        // parted by hand, which the guard refuses rather than the sync lock undoing.
+        let anchors: Vec<Uuid> = moves.iter().map(|m| m.clip_id).collect();
+        self.edit_named_exact(&anchors, label, |timeline| {
             if links {
                 let all = timeline.with_linked_moves(moves)?;
                 timeline.move_clips(&all)
@@ -1767,18 +1842,13 @@ impl Project {
             SplitSide::Right => "Split and remove right",
         };
         let links = self.links_active();
-        let total = if links {
-            self.working_timeline()?
-                .with_linked_cuts(cuts)
-                .map_or(cuts.len(), |all| all.len())
-        } else {
-            cuts.len()
-        };
-        let label = match total {
+        let anchors: Vec<Uuid> = cuts.iter().map(|c| c.clip_id).collect();
+        // The label counts the partners cut with the named clips: what the edit cut.
+        let label = |kept: &Vec<Clip>| match kept.len() {
             0 | 1 => what.to_string(),
             n => format!("{what} ({n} clips)"),
         };
-        let kept = self.edit_timeline(&label, |timeline| {
+        let kept = self.edit_named(&anchors, label, |timeline| {
             if links {
                 let all = timeline.with_linked_cuts(cuts)?;
                 timeline.split_remove_clips(&all, side)
@@ -1851,6 +1921,24 @@ impl Project {
                 staged.push((ti, copy));
             }
 
+            // A picture whose sound was detached is silent *because* that sound plays
+            // from its partner. Pasted without the partner it would be a silent clip
+            // for good, so it gets its own sound back; kept with a partner that does
+            // carry the same footage's audio it stays muted (heard once, from there).
+            let carriers: HashSet<(Uuid, Uuid)> = staged
+                .iter()
+                .filter(|(ti, c)| timeline.tracks[*ti].kind == StreamKind::Audio && c.link_id.is_some())
+                .map(|(_, c)| (c.link_id.expect("filtered"), c.asset_id))
+                .collect();
+            for (ti, clip) in &mut staged {
+                if timeline.tracks[*ti].kind == StreamKind::Video
+                    && !clip.source_audio
+                    && !clip.link_id.is_some_and(|link| carriers.contains(&(link, clip.asset_id)))
+                {
+                    clip.source_audio = true;
+                }
+            }
+
             for (i, (ti, clip)) in staged.iter().enumerate() {
                 let (start, end) = (clip.timeline_start, clip.timeline_end());
                 let hits_existing = timeline.tracks[*ti]
@@ -1902,13 +1990,17 @@ impl Project {
     /// `with_links(Some(false))` deletes the named clip alone.
     pub fn ripple_delete(&self, clip_id: Uuid) -> Result<()> {
         let links = self.links_active();
-        self.edit_timeline_exact("Ripple delete", |timeline| {
-            if links {
-                timeline.ripple_delete_linked(clip_id).map(|_| ())
-            } else {
-                timeline.ripple_delete_clip(clip_id)
-            }
-        })
+        self.edit_named_exact(
+            &[clip_id],
+            |_| "Ripple delete".to_string(),
+            |timeline| {
+                if links {
+                    timeline.ripple_delete_linked(clip_id).map(|_| ())
+                } else {
+                    timeline.ripple_delete_clip(clip_id)
+                }
+            },
+        )
     }
 
     /// Append a new empty track of `kind`, keeping kinds grouped (video tracks
@@ -2053,14 +2145,18 @@ impl Project {
     /// nothing, refusing a locked track — the clip's own included, as every group
     /// edit does); `with_links(Some(false))` removes the named clip alone.
     pub fn remove(&self, clip_id: Uuid) -> Result<()> {
-        if self.links_active() && !self.working_timeline()?.link_partners(clip_id).is_empty() {
+        if self.links_active() && self.working_has_links()? && !self.working_timeline()?.link_partners(clip_id).is_empty() {
             return self.remove_clips(&[clip_id]).map(|_| ());
         }
-        self.edit_timeline("Remove clip", |timeline| {
-            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips.remove(ci);
-            Ok(())
-        })
+        self.edit_named(
+            &[clip_id],
+            |_| "Remove clip".to_string(),
+            |timeline| {
+                let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+                timeline.tracks[ti].clips.remove(ci);
+                Ok(())
+            },
+        )
     }
 
     /// Remove several clips in **one** edit — one revision — for a multi-select
@@ -2076,19 +2172,15 @@ impl Project {
     pub fn remove_clips(&self, clip_ids: &[Uuid]) -> Result<usize> {
         let ripple = self.ripple_active()?;
         let links = self.links_active();
-        let all = if links {
-            self.working_timeline()?.with_link_partners(clip_ids)
-        } else {
-            clip_ids.to_vec()
-        };
-        let n = all.iter().collect::<std::collections::HashSet<_>>().len();
-        let label = match (n, ripple) {
+        // The label counts the partners removed with the named clips, which only the
+        // edit knows (it returns how many it removed).
+        let label = |n: &usize| match (*n, ripple) {
             (1, false) => "Remove clip".to_string(),
             (1, true) => "Ripple delete".to_string(),
             (n, false) => format!("Remove {n} clips"),
             (n, true) => format!("Ripple delete {n} clips"),
         };
-        self.edit_timeline(&label, |timeline| {
+        self.edit_named(clip_ids, label, |timeline| {
             if links {
                 timeline.remove_clips_linked(clip_ids)
             } else {
@@ -2142,14 +2234,18 @@ impl Project {
             return Err(Error::InvalidArgument("speed must be a non-zero, finite number".to_string()));
         }
         let links = self.links_active();
-        self.edit_timeline("Set speed", |timeline| {
-            if links {
-                return timeline.set_speed_linked(clip_id, speed);
-            }
-            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips[ci].speed = speed;
-            Ok(timeline.tracks[ti].clips[ci].clone())
-        })
+        self.edit_named(
+            &[clip_id],
+            |_| "Set speed".to_string(),
+            |timeline| {
+                if links {
+                    return timeline.set_speed_linked(clip_id, speed);
+                }
+                let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+                timeline.tracks[ti].clips[ci].speed = speed;
+                Ok(timeline.tracks[ti].clips[ci].clone())
+            },
+        )
     }
 
     /// Update a clip's geometric transform. Each `None` leaves that field
@@ -2712,42 +2808,60 @@ impl Project {
         })
     }
 
-    /// Make an asset's sound its own clip on an audio track.
+    /// **Extract audio**: give an asset's sound its own clip on an audio track, for
+    /// every use of the asset on the timeline that still plays it.
     ///
     /// **Verified bug, fixed here:** this used to append the asset's whole audio to
     /// the first audio track *and leave the picture's own sound on*, so an asset
     /// already cut onto V1 was heard twice — the export mixes the audio of every
     /// clip whose asset carries an audio stream, video tracks included (see
     /// `doubled_audio_is_what_extract_audio_used_to_make` in the engine tests).
-    /// Now, when the asset has clips on a video track still playing their own sound,
-    /// each is **detached** ([`Project::detach_audio`]: an audio clip with the same
-    /// span and position, linked, the picture muted) — one `Extract audio` revision —
-    /// and the first of the new audio clips is returned. When no such clip is on the
-    /// timeline (the asset is only in the bin, or only its audio is in the cut) it is
-    /// what it always was: the asset's full audio appended to the first audio track,
-    /// created if there is none.
-    pub fn extract_audio(&self, asset_id: Uuid) -> Result<Clip> {
+    /// Now each clip of the asset on a video track still playing its own sound is
+    /// **detached** ([`Project::detach_audio`]: an audio clip with the same span and
+    /// position, linked, the picture muted) in one `Extract audio` revision. A clip
+    /// that cannot be (its track is locked) is **skipped and reported**, not a reason
+    /// to fail the rest; nothing to extract — the asset is only in the bin, or its
+    /// sound is already detached — is an error saying so, not a quiet fall-through.
+    /// To put an asset's whole audio on an audio track, as itself, that is
+    /// [`Project::add_asset_audio`].
+    pub fn extract_audio(&self, asset_id: Uuid) -> Result<DetachedMany> {
         let asset = self.require_asset(asset_id)?;
         if !asset.has_audio() {
             return Err(Error::InvalidArgument("asset has no audio stream".to_string()));
         }
-        self.edit_timeline("Extract audio", |timeline| {
-            let sounding: Vec<Uuid> = timeline
+        let label = |_: &DetachedMany| "Extract audio".to_string();
+        self.edit_named_exact(&[], label, |timeline| {
+            let on_video: Vec<&Clip> = timeline
                 .tracks
                 .iter()
                 .filter(|t| t.kind == StreamKind::Video)
                 .flat_map(|t| t.clips.iter())
-                .filter(|c| c.asset_id == asset_id && c.source_audio)
-                .map(|c| c.id)
+                .filter(|c| c.asset_id == asset_id)
                 .collect();
-            if !sounding.is_empty() {
-                let mut first = None;
-                for id in sounding {
-                    let detached = timeline.detach_audio(id, true)?;
-                    first.get_or_insert(detached.clip);
-                }
-                return Ok(first.expect("at least one clip was detached"));
+            let sounding: Vec<Uuid> = on_video.iter().filter(|c| c.source_audio).map(|c| c.id).collect();
+            if sounding.is_empty() {
+                return Err(Error::InvalidArgument(if on_video.is_empty() {
+                    "no clip of this asset is on a video track, so there is no sound of its own to extract — add_asset_audio puts its audio on an audio track".to_string()
+                } else {
+                    "this asset's sound is already on an audio track".to_string()
+                }));
             }
+            timeline.detach_audio_many(&sounding, &|_| true)
+        })
+    }
+
+    /// **Add the asset's audio** as a clip of its own: the asset's whole audio, from
+    /// the start, appended to the end of the first audio track (created when there is
+    /// none). It never touches a picture clip, so an asset that is *also* on a video
+    /// track playing its own sound is heard twice where the two overlap — for the
+    /// sound of a clip already cut, that is [`Project::extract_audio`] /
+    /// [`Project::detach_audio`], which mute the picture. One `Add audio` revision.
+    pub fn add_asset_audio(&self, asset_id: Uuid) -> Result<Clip> {
+        let asset = self.require_asset(asset_id)?;
+        if !asset.has_audio() {
+            return Err(Error::InvalidArgument("asset has no audio stream".to_string()));
+        }
+        self.edit_timeline_exact("Add audio", |timeline| {
             let tid = match timeline.first_track_of(StreamKind::Audio) {
                 Some(tid) => tid,
                 None => {
@@ -2769,8 +2883,10 @@ impl Project {
     /// on the audio track at the picture's own position (V1 → A1) when it has room,
     /// else the first audio track that does, else a new one; it is **linked** to the
     /// picture clip (so they move, trim, split and delete together), and the picture
-    /// clip's own sound is muted — the sound is heard once, from the audio track,
-    /// where its fader, pan, ducking and mute apply. The audio clip carries volume,
+    /// clip's own sound is muted — the sound is heard once, from the audio track.
+    /// The picture track's fader is folded into the new clip's gain, so the **level**
+    /// is what it was; the destination track's pan, duck and mute/solo now decide the
+    /// rest of the mix (see [`Timeline::detach_audio`]). The audio clip carries volume,
     /// audio effects, fades and the transition; the picture keeps its own, inert
     /// while muted. One `Detach audio` revision. Refuses a clip that is not on a video
     /// track, whose asset has no audio, whose sound is already detached, or whose
@@ -2779,15 +2895,42 @@ impl Project {
         let timeline = self.working_timeline()?;
         let clip = timeline.clip(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let has_audio = self.require_asset(clip.asset_id)?.has_audio();
-        self.edit_timeline("Detach audio", |timeline| timeline.detach_audio(clip_id, has_audio))
+        self.edit_timeline_exact("Detach audio", |timeline| timeline.detach_audio(clip_id, has_audio))
+    }
+
+    /// [`Project::detach_audio`] on several clips as **one** `Detach audio (N clips)`
+    /// revision — a multi-select detach that undoes in a step. A clip that cannot be
+    /// detached (not a video clip, an asset without audio, already detached, a
+    /// locked track) is **skipped and reported**; the call fails only when nothing
+    /// could be detached, so it never records an empty edit.
+    pub fn detach_audio_clips(&self, clip_ids: &[Uuid]) -> Result<DetachedMany> {
+        let timeline = self.working_timeline()?;
+        let mut has_audio: HashMap<Uuid, bool> = HashMap::new();
+        for id in clip_ids {
+            if let Some(clip) = timeline.clip(*id) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = has_audio.entry(clip.asset_id) {
+                    slot.insert(self.require_asset(clip.asset_id)?.has_audio());
+                }
+            }
+        }
+        let label = |done: &DetachedMany| match done.detached.len() {
+            1 => "Detach audio".to_string(),
+            n => format!("Detach audio ({n} clips)"),
+        };
+        self.edit_named_exact(&[], label, |timeline| {
+            timeline.detach_audio_many(clip_ids, &|asset| has_audio.get(&asset).copied().unwrap_or(false))
+        })
     }
 
     /// **Reattach audio**: the inverse of [`Project::detach_audio`] — delete the
     /// linked audio clip(s) carrying the picture's asset and let the picture play its
-    /// own sound again. Name either clip of the pair. One `Reattach audio` revision;
-    /// returns the picture clip.
+    /// own sound again. Name either clip of the pair. Refused when the picture has
+    /// no audio partner to delete *and* another clip is already playing its sound
+    /// (unmuting would double it). One `Reattach audio` revision; returns the picture
+    /// clip. It is never rippled: deleting the sound is not a change in how much
+    /// footage sits ahead of anything.
     pub fn reattach_audio(&self, clip_id: Uuid) -> Result<Clip> {
-        self.edit_timeline("Reattach audio", |timeline| timeline.reattach_audio(clip_id))
+        self.edit_timeline_exact("Reattach audio", |timeline| timeline.reattach_audio(clip_id))
     }
 
     /// **Link** clips into one group (one `Link N clips` revision): from then on an
@@ -4158,6 +4301,10 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod linked_tests;
 
+/// The Rust half of the differential corpus the browser harness is replayed against.
+#[cfg(test)]
+mod linked_corpus;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4466,7 +4613,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        project.extract_audio(music.id).unwrap();
+        project.add_asset_audio(music.id).unwrap();
         project.cut_clip(video.id, 0.0, 1.1).unwrap();
         project.cut_clip(video.id, 2.0, 3.4).unwrap();
 
@@ -6802,7 +6949,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            project.extract_audio(music.id).unwrap();
+            project.add_asset_audio(music.id).unwrap();
             project.cut_clip(video.id, 0.0, 1.1).unwrap();
             project.cut_clip(video.id, 2.0, 2.9).unwrap();
             project.cut_clip(video.id, 4.0, 5.0).unwrap();

@@ -103,7 +103,7 @@ export function selectionLinkPlans(): LinkPlans {
 	return linkPlans(editor.timeline, (id) => audible.has(id), editor.selectedClipIds);
 }
 
-/** Undo `n` revisions — a detach or reattach across several clips is one revision each. */
+/** Undo `n` revisions — a reattach across several clips is one revision each. */
 async function undoTimes(n: number): Promise<void> {
 	for (let i = 0; i < n; i++) await editor.undo().catch(() => {});
 }
@@ -125,18 +125,25 @@ async function eachClip(ids: readonly string[], one: (id: string) => Promise<unk
 
 /** **Detach audio** (⇧D, the clip menu): each selected picture clip still playing its own
  *  sound hands it to a linked clip on an audio track and goes quiet, so it is heard once.
- *  One revision per clip; the toast's Undo takes them all back. */
+ *  One revision for the lot (`detach_audio_clips`); the toast's Undo takes it back. A clip the
+ *  backend skips (a locked track) is named in the toast rather than failing the rest. */
 export async function detachSelection(): Promise<void> {
 	const plan = selectionLinkPlans().detach;
 	if (plan.reason !== null) {
 		toast.info(plan.reason);
 		return;
 	}
-	const done = await eachClip(plan.ids, (id) => editor.detachAudio(id));
-	if (done === 0) return;
+	let report;
+	try {
+		report = await editor.detachAudioClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
 	// The sound that was just made is part of the pictures' link group: select it with them.
-	editor.selectClips(withLinkPartners(editor.timeline, [...plan.ids.slice(0, done)]), editor.selectedClipId);
-	toast(detachedNotice(done), { action: { label: 'Undo', onClick: () => void undoTimes(done) } });
+	editor.selectClips(withLinkPartners(editor.timeline, [...plan.ids]), editor.selectedClipId);
+	const note = report.skipped.length > 0 ? `${detachedNotice(report.detached)} — ${report.skipped.length} skipped (${report.skipped[0].reason})` : detachedNotice(report.detached);
+	toast(note, { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }
 
 /** **Reattach audio** (⇧⌘D, the clip menu): the linked audio clip goes and the picture

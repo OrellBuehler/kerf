@@ -21,7 +21,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | A6 Headless agent rendering | — | — | todo | |
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done (core + surfaces, UI still to come): linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, sync-lock ripple, `extract_audio` doubling verified +6.02 dB and fixed). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -144,6 +144,25 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   never the lane). `reorder`, property edits and captions are deliberately not
   link-aware. Imports / `cut_clip` / `add_clip` still do not auto-link an A/V asset's
   sound (follow-up option).
+- **2026-10-07 — range-based sync lock (review of the first linked-A/V cut).** The
+  per-track ripple plus "partners follow a pushed clip" only handled mirrored pairs; a
+  J- or L-cut pair (sound leading or trailing its picture) was refused 10-65% of the
+  time for ripple delete / speed / ripple remove / ripple trims / cut range, with an
+  error steering to `link: false`, which desyncs. Replaced by `Timeline::conform_links`:
+  in step = equal content offsets; after every edit each group is re-aligned to its
+  *authority* (the named clip, else its track, else the first member that moved) by
+  shifting the others, linked followers win against linked material (trimmed back) and
+  refuse only for a locked track, an unlinked clip in the way, or a linked clip they
+  would cover entirely. Unlinked clips on a partner's track never move for it (a
+  behaviour change: ripple delete used to close the partner's whole lane). The guard
+  stays as the net and no longer advises `link: false`. Split / cut re-link **by side**
+  (an unsplit partner after the cut belongs to the right half), orphaned groups dissolve
+  in the same edit, a muted picture pasted without its sound is unmuted, `reattach` is
+  never rippled and refuses to double the sound, `detach` folds the picture track's fader
+  into the new clip (pan / duck / mute are the destination's, documented), `extract_audio`
+  no longer falls through to appending (that is `add_asset_audio`) and reports skipped
+  clips, `detach_audio_clips` is the one-revision batch. The browser harness is replayed
+  against a corpus kerf-core writes (`links-corpus.json`).
 - **2026-10-07 — `extract_audio` doubled the sound, measured.** The export mixes every
   clip whose asset has audio, video tracks included, so appending the asset's audio
   with its picture still on V1 was +6.02 dB over the clip alone (real render, ffmpeg

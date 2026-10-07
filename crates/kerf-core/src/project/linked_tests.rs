@@ -5,7 +5,7 @@
 use super::*;
 use crate::model::EditSource;
 
-fn stream(kind: StreamKind) -> StreamInfo {
+pub(super) fn stream(kind: StreamKind) -> StreamInfo {
     StreamInfo {
         index: 0,
         kind,
@@ -25,7 +25,7 @@ fn stream(kind: StreamKind) -> StreamInfo {
     }
 }
 
-fn asset(path: &str, duration: f64, streams: Vec<StreamInfo>) -> Asset {
+pub(super) fn asset(path: &str, duration: f64, streams: Vec<StreamInfo>) -> Asset {
     Asset {
         id: Uuid::new_v4(),
         path: path.into(),
@@ -148,20 +148,181 @@ fn extract_audio_detaches_every_clip_of_the_asset_in_one_revision() {
     let c1 = project.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
     let c2 = project.add_clip_to_timeline(asset.id, None, 20.0, 26.0, Some(10.0)).unwrap();
     let before = revisions(&project);
-    let first = project.extract_audio(asset.id).unwrap();
+    let done = project.extract_audio(asset.id).unwrap();
     assert_eq!(revisions(&project), before + 1, "one revision for the lot");
+    assert_eq!(project.history().unwrap().last().unwrap().label, "Extract audio");
     let t = timeline(&project);
     assert_eq!(t.tracks[A1].clips.len(), 2);
-    assert_eq!(first.timeline_start, 0.0);
+    assert_eq!((done.detached.len(), done.skipped.len()), (2, 0));
+    assert_eq!(done.detached[0].clip.timeline_start, 0.0);
     for c in [c1.id, c2.id] {
         let picture = clip_of(&project, c);
         assert!(!picture.source_audio);
         assert_eq!(t.link_partners(c).len(), 1);
     }
-    // A second extract finds nothing still sounding: it appends the whole asset,
-    // exactly as the old operation did.
-    let again = project.extract_audio(asset.id).unwrap();
-    assert_eq!((again.source_in, again.source_out), (0.0, 60.0));
+    // A second extract finds nothing still sounding. It says so — it does not fall
+    // through to appending the whole asset, which is `add_asset_audio`'s job.
+    let before = revisions(&project);
+    let err = project.extract_audio(asset.id).unwrap_err().to_string();
+    assert!(err.contains("already on an audio track"), "{err}");
+    assert_eq!(revisions(&project), before);
+    assert_eq!(timeline(&project).tracks[A1].clips.len(), 2);
+}
+
+#[test]
+fn extract_audio_skips_a_clip_on_a_locked_track_and_reports_it() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let c1 = p.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    p.add_track(StreamKind::Video, None).unwrap();
+    let v2 = timeline(p).tracks[1].id;
+    let c2 = p.add_clip_to_timeline(asset.id, Some(v2), 0.0, 6.0, Some(0.0)).unwrap();
+    p.set_track_locked(v2, true).unwrap();
+    let done = p.extract_audio(asset.id).unwrap();
+    assert_eq!(done.detached.len(), 1);
+    assert_eq!(done.skipped.len(), 1);
+    assert_eq!(done.skipped[0].clip_id, c2.id);
+    assert!(done.skipped[0].reason.contains("locked"), "{}", done.skipped[0].reason);
+    assert!(!clip_of(p, c1.id).source_audio);
+    assert!(clip_of(p, c2.id).source_audio, "the locked track's clip is untouched");
+    // Nothing detachable at all is an error and records nothing.
+    let before = revisions(p);
+    assert!(p.extract_audio(asset.id).unwrap_err().to_string().contains("locked"));
+    assert_eq!(revisions(p), before);
+}
+
+#[test]
+fn adding_an_assets_audio_is_its_own_operation() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let before = revisions(p);
+    let a = p.add_asset_audio(asset.id).unwrap();
+    let b = p.add_asset_audio(asset.id).unwrap();
+    assert_eq!(revisions(p), before + 2);
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Add audio");
+    assert_eq!((a.source_in, a.source_out, a.timeline_start), (0.0, 60.0, 0.0));
+    assert_eq!(b.timeline_start, 60.0, "appended after the first, not on top of it");
+    let silent = asset_without_sound(p);
+    assert!(p.add_asset_audio(silent.id).is_err());
+}
+
+fn asset_without_sound(p: &Project) -> Asset {
+    let silent = asset("/silent.mp4", 20.0, vec![stream(StreamKind::Video)]);
+    p.insert_asset(&silent).unwrap();
+    silent
+}
+
+#[test]
+fn detaching_several_clips_is_one_revision_and_skips_what_cannot_be() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let silent = asset_without_sound(p);
+    let c1 = p.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    let c2 = p.add_clip_to_timeline(asset.id, None, 20.0, 26.0, Some(10.0)).unwrap();
+    let mute = p.add_clip_to_timeline(silent.id, None, 0.0, 4.0, Some(16.0)).unwrap();
+    let before = revisions(p);
+    let done = p.detach_audio_clips(&[c1.id, c2.id, mute.id, c1.id]).unwrap();
+    assert_eq!(revisions(p), before + 1, "one revision however many");
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Detach audio (2 clips)");
+    assert_eq!(done.detached.len(), 2, "a clip named twice is detached once");
+    assert_eq!(done.skipped.len(), 1);
+    assert_eq!(done.skipped[0].clip_id, mute.id);
+    assert_eq!(timeline(p).tracks[A1].clips.len(), 2);
+    p.undo().unwrap();
+    assert!(timeline(p).tracks[A1].clips.is_empty(), "and one undo takes them all back");
+    assert!(clip_of(p, c1.id).source_audio && clip_of(p, c2.id).source_audio);
+
+    // Nothing detachable: an error with the reason, and no revision.
+    let before = revisions(p);
+    assert!(p.detach_audio_clips(&[mute.id]).is_err());
+    assert_eq!(revisions(p), before);
+    // One clip is the plain label.
+    p.detach_audio_clips(&[c1.id]).unwrap();
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Detach audio");
+}
+
+#[test]
+fn detaching_folds_the_picture_tracks_fader_into_the_new_clip() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let c = p.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    p.set_volume(c.id, 0.8).unwrap();
+    let (v1, a1) = (timeline(p).tracks[0].id, timeline(p).tracks[A1].id);
+    p.set_track_volume(v1, 0.5).unwrap();
+    p.set_track_volume(a1, 2.0).unwrap();
+    let d = p.detach_audio(c.id).unwrap();
+    // Through A1's fader (2.0) the clip comes out at 0.8 * 0.5, as it did through V1's.
+    assert!((d.clip.volume * 2.0 - 0.8 * 0.5).abs() < 1e-6, "{}", d.clip.volume);
+    // Reattaching puts the picture back with its own volume, and the fader never moved.
+    let back = p.reattach_audio(d.clip.id).unwrap();
+    assert_eq!(back.volume, 0.8);
+    assert_eq!(timeline(p).tracks[0].volume, 0.5);
+}
+
+#[test]
+fn reattaching_a_picture_whose_sound_still_plays_elsewhere_is_refused() {
+    let cut = detached_cut();
+    let p = &cut.project;
+    // Unlink the pair: the picture stays muted and its sound stays on A1, as an
+    // ordinary audio clip. Unmuting the picture now would play the footage twice.
+    p.unlink_clips(&[cut.c[0]]).unwrap();
+    let (before, json) = (revisions(p), p.timeline_json().unwrap());
+    let err = p.reattach_audio(cut.c[0]).unwrap_err().to_string();
+    assert!(err.contains("heard twice"), "{err}");
+    assert_eq!((revisions(p), p.timeline_json().unwrap()), (before, json));
+    // Take that clip away and the picture can have its sound back: nothing doubles.
+    p.remove(cut.a[0]).unwrap();
+    let back = p.reattach_audio(cut.c[0]).unwrap();
+    assert!(back.source_audio);
+
+    // A clip of the same footage that is *not* in step with it is not a double.
+    let p2 = detached_cut();
+    let q = &p2.project;
+    q.unlink_clips(&[p2.c[1]]).unwrap();
+    q.with_links(Some(false), |q| q.slip_clip(p2.a[1], 2.0)).unwrap();
+    assert!(q.reattach_audio(p2.c[1]).is_ok());
+}
+
+#[test]
+fn detach_and_reattach_are_never_rippled() {
+    // With ripple on, deleting the sound clip is not "footage removed ahead of" the later
+    // pair, and a detach adds a clip onto empty lane: neither may move anything else.
+    let cut = detached_cut();
+    let p = &cut.project;
+    p.set_ripple_mode(true).unwrap();
+    let before = (span(p, cut.c[1]), span(p, cut.a[1]));
+    p.reattach_audio(cut.c[0]).unwrap();
+    assert_eq!(
+        (span(p, cut.c[1]), span(p, cut.a[1])),
+        before,
+        "the second pair stayed where it was"
+    );
+    assert!(clip_of(p, cut.c[0]).source_audio);
+    p.detach_audio(cut.c[0]).unwrap();
+    assert_eq!((span(p, cut.c[1]), span(p, cut.a[1])), before);
+    // And a link edit is not a ripple either.
+    let sound = timeline(p).link_partners(cut.c[0])[0];
+    p.unlink_clips(&[sound]).unwrap();
+    assert_eq!((span(p, cut.c[1]), span(p, cut.a[1])), before);
+}
+
+#[test]
+fn pasting_a_picture_without_its_sound_gives_the_copy_its_own_sound() {
+    let cut = detached_cut();
+    let p = &cut.project;
+    let lone = p.duplicate_clips(&[cut.c[1]], 50.0).unwrap();
+    let copy = clip_of(p, lone[0].id);
+    assert!(copy.source_audio, "the copy was silent for good: its partner was not pasted");
+    assert_eq!(copy.link_id, None);
+    // With its sound pasted alongside it stays a muted picture in a pair of its own.
+    let both = p.duplicate_clips(&[cut.c[1], cut.a[1]], 70.0).unwrap();
+    let pic = clip_of(p, both[0].id);
+    assert!(!pic.source_audio && pic.link_id.is_some());
+    // A pair pasted in two steps: the picture alone sounds again, the sound alone is a plain clip.
+    let snd_only = p.duplicate_clips(&[cut.a[1]], 90.0).unwrap();
+    assert_eq!(clip_of(p, snd_only[0].id).link_id, None);
+    // The original is untouched.
+    assert!(!clip_of(p, cut.c[1]).source_audio);
 }
 
 #[test]
@@ -591,7 +752,7 @@ fn the_beat_snap_carries_each_retimed_clip_to_its_partner() {
             ..Default::default()
         })
         .unwrap();
-    project.extract_audio(music.id).unwrap();
+    project.add_asset_audio(music.id).unwrap();
     let v1 = project.cut_clip(video.id, 0.0, 1.1).unwrap();
     let v2 = project.cut_clip(video.id, 2.0, 3.4).unwrap();
     let s1 = project.detach_audio(v1.id).unwrap().clip;
@@ -608,9 +769,16 @@ fn the_beat_snap_carries_each_retimed_clip_to_its_partner() {
 fn a_clip_whose_partner_is_gone_edits_as_if_it_were_unlinked() {
     let cut = detached_cut();
     let p = &cut.project;
-    // Take the first sound away with links off: its picture keeps a link to nothing.
+    // Take the first sound away with links off: the edit that removes the last
+    // partner dissolves the link, so the picture is not left linked to nothing.
     p.with_links(Some(false), |p| p.remove(cut.a[0])).unwrap();
     let c = cut.c[0];
+    assert!(clip_of(p, c).link_id.is_none(), "a group of one is not a link");
+    // A file from before that rule can still hold one; every op treats it as unlinked.
+    let mut stale = timeline(p);
+    let (ti, ci) = stale.locate(c).unwrap();
+    stale.tracks[ti].clips[ci].link_id = Some(Uuid::new_v4());
+    p.save_timeline(&stale).unwrap();
     assert!(clip_of(p, c).link_id.is_some());
     assert!(timeline(p).link_partners(c).is_empty(), "a group of one is not a link");
 
@@ -652,21 +820,21 @@ fn a_linked_edit_is_the_same_edit_whichever_clip_is_named() {
 
 /// A tiny deterministic generator (xorshift64*): the same seed always takes the same
 /// path, so a failure names a seed that replays.
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    fn unit(&mut self) -> f64 {
+    pub(super) fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
@@ -698,6 +866,43 @@ fn mirrored_project(rng: &mut Rng, titles: bool) -> (Project, Asset) {
         timeline.tracks[0].clips.push(picture);
         timeline.tracks[A1].clips.push(sound);
         at += len + if rng.below(3) == 0 { rng.unit() * 2.0 } else { 0.0 };
+    }
+    project.save_timeline(&timeline).unwrap();
+    (project, asset)
+}
+
+/// V1 and A1 as a **J/L-cut** edit: the same shots, but the sound of each leads or trails
+/// its picture (`-1..1.5` s at each cut, so the lanes never overlap and the clips stay in
+/// step — equal offsets — while covering different stretches). Every cut is a place where
+/// picture and sound change hands at different moments, which is what a mirrored pair never
+/// exercises.
+fn jl_project(rng: &mut Rng) -> (Project, Asset) {
+    let (project, asset) = av_project();
+    let mut timeline = timeline(&project);
+    let n = 3 + rng.below(3);
+    // The cuts of the picture, then where the sound changes hands at each.
+    let mut at = 2.0 + rng.unit();
+    let mut cuts = vec![at];
+    for _ in 0..n {
+        at += 2.0 + rng.unit() * 5.0;
+        cuts.push(at);
+    }
+    let mut shifts: Vec<f64> = (0..=n).map(|_| -1.0 + rng.unit() * 2.5).collect();
+    // Every sound lasts at least a second, whatever the cuts around it do.
+    for i in 0..n {
+        shifts[i + 1] = shifts[i + 1].max(1.0 + cuts[i] + shifts[i] - cuts[i + 1]);
+    }
+    for i in 0..n {
+        let source_in = 5.0 + rng.unit() * 30.0;
+        let len = cuts[i + 1] - cuts[i];
+        let mut picture = Clip::new(asset.id, source_in, source_in + len, cuts[i]);
+        let (lead, trail) = (shifts[i], shifts[i + 1]);
+        let mut sound = Clip::new(asset.id, source_in + lead, source_in + len + trail, cuts[i] + lead);
+        let group = Uuid::new_v4();
+        picture.link_id = Some(group);
+        sound.link_id = Some(group);
+        timeline.tracks[0].clips.push(picture);
+        timeline.tracks[A1].clips.push(sound);
     }
     project.save_timeline(&timeline).unwrap();
     (project, asset)
@@ -738,10 +943,14 @@ fn dump(p: &Project) -> String {
 /// what they show: a picture and its sound are still one piece of material.
 fn assert_in_step(p: &Project, what: &str, strict: bool, before: &str) {
     let t = timeline(p);
-    let mut groups: std::collections::HashMap<Uuid, Vec<(usize, Clip)>> = std::collections::HashMap::new();
+    let mut groups: HashMap<Uuid, Vec<(usize, Clip)>> = HashMap::new();
     for (ti, track) in t.tracks.iter().enumerate() {
         for clip in &track.clips {
-            assert!(clip.duration() > 0.0, "{what}: a clip with no length");
+            assert!(
+                clip.duration() > 0.0,
+                "{what}: a clip with no length\nbefore:\n{before}\nafter:\n{}",
+                dump(p)
+            );
             if let Some(link) = clip.link_id {
                 groups.entry(link).or_default().push((ti, clip.clone()));
             }
@@ -787,16 +996,66 @@ fn assert_in_step(p: &Project, what: &str, strict: bool, before: &str) {
     }
 }
 
-/// `(applied, refused)` over 250 seeds of ten random link-aware edits each.
-fn fuzz_linked_edits(titles: bool) -> (usize, usize) {
-    let mut applied = 0;
-    let mut refused = 0;
+/// Whether any lane has two clips on the same stretch of time.
+fn lanes_overlap(t: &Timeline) -> bool {
+    t.tracks.iter().any(|tr| {
+        let mut order: Vec<&Clip> = tr.clips.iter().collect();
+        order.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+        order.windows(2).any(|w| w[1].timeline_start < w[0].timeline_end() - 1e-6)
+    })
+}
+
+/// The shape of the cut a fuzz run starts from.
+#[derive(Clone, Copy, PartialEq)]
+enum Cut0 {
+    /// V1 and A1 copies of each other.
+    Mirrored,
+    /// Mirrored, plus unlinked silent clips on V1 only: the lanes are not copies.
+    Titles,
+    /// The sound leads or trails its picture at every cut.
+    JlCut,
+}
+
+/// What a fuzz run did: how many edits applied, how many were refused, and the edits that
+/// were refused although nothing genuinely stood in their way.
+struct Fuzzed {
+    applied: usize,
+    refused: usize,
+    /// Refusals that name a genuine block: an unlinked clip in the way, a linked clip
+    /// that would be covered completely, a partner a trim would take entirely.
+    blocked: usize,
+    /// Per edit: `(attempted, refused by a genuine block)`.
+    by_edit: std::collections::BTreeMap<String, (usize, usize)>,
+    /// `(edit, reason)` of every refusal of an edit that has no business being refused on
+    /// a J/L-cut: no lane is locked and no such block stands in its way.
+    unexpected: Vec<(String, String)>,
+}
+
+/// 250 seeds of ten random link-aware edits each.
+fn fuzz_linked_edits(start: Cut0) -> Fuzzed {
+    let titles = start == Cut0::Titles;
+    let mut out = Fuzzed {
+        applied: 0,
+        refused: 0,
+        blocked: 0,
+        by_edit: std::collections::BTreeMap::new(),
+        unexpected: Vec::new(),
+    };
     for seed in 1..=250u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let (project, _) = mirrored_project(&mut rng, titles);
+        let (project, _) = if start == Cut0::JlCut {
+            jl_project(&mut rng)
+        } else {
+            mirrored_project(&mut rng, titles)
+        };
         project.set_ripple_mode(rng.below(2) == 0).unwrap();
         for step in 0..10 {
             let t = timeline(&project);
+            // An edit that makes a lane overlap itself (a slower clip with ripple off)
+            // ends the sequence: the lanes are no longer legal ground to judge sync on.
+            if lanes_overlap(&t) {
+                break;
+            }
             let all: Vec<Clip> = t.tracks.iter().flat_map(|tr| tr.clips.clone()).collect();
             if all.is_empty() {
                 break;
@@ -860,13 +1119,29 @@ fn fuzz_linked_edits(titles: bool) -> (usize, usize) {
                 }
             };
             let what = format!("{what} ({label})");
+            out.by_edit.entry(label.to_string()).or_default().0 += 1;
             match result {
                 Ok(()) => {
-                    applied += 1;
-                    assert_in_step(&project, &what, !titles, &lanes_before);
+                    out.applied += 1;
+                    assert_in_step(&project, &what, start == Cut0::Mirrored, &lanes_before);
                 }
-                Err(_) => {
-                    refused += 1;
+                Err(e) => {
+                    out.refused += 1;
+                    let why = e.to_string();
+                    let genuine = ["not linked to it", "cover another linked clip", "trimmed away by this edit"]
+                        .iter()
+                        .any(|m| why.contains(m));
+                    if genuine {
+                        out.blocked += 1;
+                        out.by_edit.entry(label.to_string()).or_default().1 += 1;
+                    } else if start == Cut0::JlCut
+                        && ["ripple delete", "speed", "remove", "right trim", "left trim", "cut range"].contains(&label)
+                    {
+                        out.unexpected.push((
+                            format!("{what} [ripple {}]\n{lanes_before}", project.ripple_active().unwrap()),
+                            why,
+                        ));
+                    }
                     assert_eq!(
                         project.timeline_json().unwrap(),
                         json,
@@ -877,25 +1152,270 @@ fn fuzz_linked_edits(titles: bool) -> (usize, usize) {
             }
         }
     }
-    (applied, refused)
+    out
 }
 
 #[test]
 fn random_linked_edits_keep_a_mirrored_picture_and_sound_in_step_and_refusals_leave_no_trace() {
-    let (applied, refused) = fuzz_linked_edits(false);
+    let run = fuzz_linked_edits(Cut0::Mirrored);
     assert!(
-        applied > 500 && refused > 100,
-        "the run exercised both paths: {applied} applied, {refused} refused"
+        run.applied > 500 && run.refused > 100,
+        "the run exercised both paths: {} applied, {} refused",
+        run.applied,
+        run.refused
     );
 }
 
 #[test]
 fn random_linked_edits_keep_every_pair_in_sync_when_the_lanes_are_not_copies() {
-    let (applied, refused) = fuzz_linked_edits(true);
+    let run = fuzz_linked_edits(Cut0::Titles);
     assert!(
-        applied > 500 && refused > 100,
-        "the run exercised both paths: {applied} applied, {refused} refused"
+        run.applied > 500 && run.refused > 100,
+        "the run exercised both paths: {} applied, {} refused",
+        run.applied,
+        run.refused
     );
+}
+
+#[test]
+fn a_jl_cut_edits_without_refusal_unless_something_genuinely_stands_in_the_way() {
+    // The sound leads or trails its picture at every cut — the shape the old per-track
+    // ripple could not carry (refused 10-65% of the time for these edits). Now every
+    // refusal of the edits that move footage must be a block that names itself: an
+    // *unlinked* clip in the way, or *linked* material that the follower would cover
+    // entirely / a trim would take away entirely.
+    let run = fuzz_linked_edits(Cut0::JlCut);
+    assert!(
+        run.unexpected.is_empty(),
+        "refused for no stated reason:\n{}",
+        run.unexpected
+            .iter()
+            .take(3)
+            .map(|(what, why)| format!("{what}\n=> {why}"))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    );
+    let (attempted, blocked) = [
+        "ripple delete",
+        "speed",
+        "remove",
+        "right trim",
+        "left trim",
+        "cut range",
+        "split-remove",
+    ]
+    .iter()
+    .map(|edit| run.by_edit.get(*edit).copied().unwrap_or_default())
+    .fold((0, 0), |(a, b), (n, k)| (a + n, b + k));
+    assert!(
+        run.applied > 1500 && attempted > 1000,
+        "the run exercised the edits: {} applied, {attempted} of the moving ones",
+        run.applied
+    );
+    // Ten random edits in a row on small clips chop a cut to bits, and a block is what
+    // is left when two scraps meet; it stays the exception.
+    assert!(
+        blocked * 100 <= attempted * 8,
+        "{blocked} of {attempted} footage-moving edits were blocked: {:?}",
+        run.by_edit
+    );
+    // The edits that only *remove* material meet almost nothing.
+    for edit in ["ripple delete", "remove", "cut range"] {
+        let (n, k) = run.by_edit[edit];
+        assert!(k * 100 <= n * 4, "{edit}: {k} of {n} blocked");
+    }
+}
+
+/// After a split or a cut at `lo`, every link group the edit touched (the named clip's group
+/// and any group of a clip the edit made) has **all** its members on one side of it — a
+/// member left over on the other side would be dragged along by an edit to a clip it no longer
+/// has anything to do with.
+fn assert_one_side(p: &Project, lo: f64, old_group: Option<Uuid>, before_ids: &HashSet<Uuid>, what: &str) {
+    const EPS: f64 = 1e-6;
+    let t = timeline(p);
+    let mut groups: HashMap<Uuid, Vec<Clip>> = HashMap::new();
+    for clip in t.tracks.iter().flat_map(|tr| tr.clips.iter()) {
+        if let Some(link) = clip.link_id {
+            groups.entry(link).or_default().push(clip.clone());
+        }
+    }
+    for (link, members) in groups {
+        let touched = Some(link) == old_group || members.iter().any(|m| !before_ids.contains(&m.id));
+        if !touched {
+            continue;
+        }
+        let sides: Vec<Option<bool>> = members
+            .iter()
+            .map(|m| {
+                if m.timeline_end() <= lo + EPS {
+                    Some(false)
+                } else if m.timeline_start >= lo - EPS {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            sides.iter().all(|s| s.is_some()) && sides.windows(2).all(|w| w[0] == w[1]),
+            "{what}: group {link} has members on both sides of {lo:.3}: {:?}\n{}",
+            members
+                .iter()
+                .map(|m| (m.timeline_start, m.timeline_end()))
+                .collect::<Vec<_>>(),
+            dump(p)
+        );
+    }
+}
+
+#[test]
+fn a_split_or_a_cut_leaves_every_group_it_touched_on_one_side_of_the_cut() {
+    let mut checked = 0;
+    for seed in 1..=300u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let (project, _) = if seed % 2 == 0 {
+            jl_project(&mut rng)
+        } else {
+            mirrored_project(&mut rng, false)
+        };
+        project.set_ripple_mode(rng.below(2) == 0).unwrap();
+        for step in 0..8 {
+            let t = timeline(&project);
+            if lanes_overlap(&t) {
+                break;
+            }
+            let all: Vec<Clip> = t.tracks.iter().flat_map(|tr| tr.clips.clone()).collect();
+            if all.is_empty() {
+                break;
+            }
+            let c = all[rng.below(all.len())].clone();
+            let before_ids: HashSet<Uuid> = all.iter().map(|x| x.id).collect();
+            let frac = 0.1 + rng.unit() * 0.8;
+            let what = format!("seed {seed} step {step}");
+            let json = project.timeline_json().unwrap();
+            let before = dump(&project);
+            if rng.below(2) == 0 {
+                let at = c.timeline_start + frac * c.duration();
+                if project.split_at(c.id, at).is_ok() {
+                    assert_in_step(&project, &format!("{what} (split)"), false, &before);
+                    assert_one_side(&project, at, c.link_id, &before_ids, &format!("{what} (split)"));
+                    checked += 1;
+                }
+            } else {
+                let (from, to) = (
+                    c.source_in + frac * 0.4 * (c.source_out - c.source_in),
+                    c.source_in + frac * (c.source_out - c.source_in),
+                );
+                let lo = c.source_span_to_timeline(from.max(c.source_in), to.min(c.source_out)).start;
+                if project.cut_clip_range(c.id, from, to).is_ok() {
+                    assert_in_step(&project, &format!("{what} (cut)"), false, &before);
+                    assert_one_side(&project, lo, c.link_id, &before_ids, &format!("{what} (cut)"));
+                    checked += 1;
+                } else {
+                    assert_eq!(
+                        project.timeline_json().unwrap(),
+                        json,
+                        "{what}: a refusal changed the timeline"
+                    );
+                }
+            }
+        }
+    }
+    assert!(checked > 700, "{checked} splits and cuts were checked");
+}
+
+#[test]
+fn an_edit_that_leaves_a_link_with_one_clip_dissolves_it() {
+    // Removing a track takes its clips; the pictures they were linked to are not left
+    // linked to nothing.
+    let cut = detached_cut();
+    let p = &cut.project;
+    let a1 = timeline(p).tracks[A1].id;
+    p.remove_track(a1).unwrap();
+    for c in cut.c {
+        assert!(clip_of(p, c).link_id.is_none(), "the sound is gone, so the link is");
+    }
+    // A cut that takes the last partner of a clip does the same (here: the partner is
+    // removed with links off, so only the edit path can tidy up after it).
+    let cut = detached_cut();
+    let p = &cut.project;
+    p.with_links(Some(false), |p| p.remove(cut.a[1])).unwrap();
+    assert!(clip_of(&cut.project, cut.c[1]).link_id.is_none());
+    assert!(
+        clip_of(&cut.project, cut.c[0]).link_id.is_some(),
+        "the other pair is untouched"
+    );
+    // A cut range that leaves a half with nothing to be linked to: the head of a
+    // picture whose sound begins inside the stretch.
+    let (project, asset) = av_project();
+    let p = &project;
+    let pic = p.add_clip_to_timeline(asset.id, None, 0.0, 20.0, Some(0.0)).unwrap();
+    let a1 = timeline(p).tracks[A1].id;
+    let snd = p.add_clip_to_timeline(asset.id, Some(a1), 8.0, 20.0, Some(8.0)).unwrap();
+    p.link_clips(&[pic.id, snd.id]).unwrap();
+    let kept = p.cut_clip_range(pic.id, 5.0, 12.0).unwrap();
+    assert_eq!(clip_of(p, pic.id).link_id, None, "the head has no sound left to go with");
+    assert_eq!(timeline(p).link_partners(kept[1].id), vec![snd.id], "the tails are the pair");
+}
+
+#[test]
+fn a_dissolve_also_happens_in_a_staged_proposal() {
+    let mut cut = detached_cut();
+    cut.project.set_actor(EditSource::Agent);
+    let p = &cut.project;
+    p.begin_staging(None, None).unwrap();
+    let a1 = timeline(p).tracks[A1].id;
+    p.remove_track(a1).unwrap();
+    let staged = p.staged_timeline().unwrap().unwrap();
+    assert!(staged.clip(cut.c[0]).unwrap().link_id.is_none());
+    assert!(clip_of(p, cut.c[0]).link_id.is_some(), "the live cut did not move");
+}
+
+#[test]
+fn a_project_with_no_links_is_known_to_have_none_without_reading_the_timeline() {
+    let (project, asset) = av_project();
+    let p = &project;
+    let c = p.add_clip_to_timeline(asset.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    assert!(!p.working_has_links().unwrap());
+    p.detach_audio(c.id).unwrap();
+    assert!(p.working_has_links().unwrap());
+    p.unlink_clips(&[c.id]).unwrap();
+    assert!(!p.working_has_links().unwrap(), "and a link that was cleared is not written");
+    // A staged proposal is judged by its own timeline, not the live one.
+    let mut project = project;
+    project.set_actor(EditSource::Agent);
+    let p = &project;
+    p.begin_staging(None, None).unwrap();
+    assert!(!p.working_has_links().unwrap());
+    p.link_clips(&[c.id, timeline(p).tracks[A1].clips[0].id]).unwrap();
+    assert!(p.working_has_links().unwrap());
+}
+
+#[test]
+fn a_jl_cut_ripple_delete_through_the_project_is_one_revision_and_both_lanes_stay_in_step() {
+    let (project, asset) = av_project();
+    let p = &project;
+    // Picture 5..15 with sound that leads it by 5 s (0..15), then a second shot whose
+    // sound leads it by 2 s: footage and offsets as in `jl_cut`.
+    let a1 = timeline(p).tracks[A1].id;
+    let x1 = p.add_clip_to_timeline(asset.id, None, 5.0, 15.0, Some(5.0)).unwrap();
+    let x2 = p.add_clip_to_timeline(asset.id, None, 25.0, 35.0, Some(15.0)).unwrap();
+    let y1 = p.add_clip_to_timeline(asset.id, Some(a1), 0.0, 13.0, Some(0.0)).unwrap();
+    let y2 = p.add_clip_to_timeline(asset.id, Some(a1), 23.0, 35.0, Some(13.0)).unwrap();
+    p.link_clips(&[x1.id, y1.id]).unwrap();
+    p.link_clips(&[x2.id, y2.id]).unwrap();
+    let before = revisions(p);
+    p.ripple_delete(x1.id).unwrap();
+    assert_eq!(revisions(p), before + 1);
+    assert_eq!((span(p, x2.id), span(p, y2.id)), ((5.0, 15.0), (3.0, 15.0)));
+    assert!(timeline(p).clip(y1.id).is_none());
+    assert_eq!(clip_of(p, x2.id).link_id, clip_of(p, y2.id).link_id);
+    p.undo().unwrap();
+    assert_eq!(span(p, y2.id), (13.0, 25.0));
+
+    // Naming the *sound* closes up by the sound's length instead: the named clip's track speaks.
+    p.ripple_delete(y1.id).unwrap();
+    assert_eq!((span(p, y2.id), span(p, x2.id)), ((0.0, 12.0), (2.0, 12.0)));
 }
 
 #[test]
@@ -922,34 +1442,60 @@ fn a_ripple_that_cannot_carry_the_sound_is_refused_rather_than_leaving_it_behind
     let (before, json) = (revisions(p), p.timeline_json().unwrap());
     let err = p.trim(t.id, None, Some(3.0), None).unwrap_err().to_string();
     assert!(
-        err.contains("out of step") && err.contains("V1") && err.contains("A1"),
-        "{err}"
+        err.contains("A1") && err.contains("not linked") && !err.contains("links off"),
+        "it says what is in the way, not to switch links off: {err}"
     );
     assert_eq!(
         (revisions(p), p.timeline_json().unwrap()),
         (before, json),
         "nothing was recorded or moved"
     );
-    // Each way out the message names works: ripple off for the call, or links off.
+    // Ripple off for the call, or links off, still go through.
     p.with_ripple(Some(false), |p| p.trim(t.id, None, Some(3.0), None)).unwrap();
     p.undo().unwrap();
     p.with_links(Some(false), |p| p.trim(t.id, None, Some(3.0), None)).unwrap();
 }
 
 #[test]
-fn an_edit_that_is_not_link_aware_is_refused_when_it_would_part_a_pair() {
+fn reordering_a_lane_carries_the_partners_and_naming_both_apart_is_refused() {
     let cut = detached_cut();
     let p = &cut.project;
     let v1 = timeline(p).tracks[0].id;
-    let (before, json) = (revisions(p), p.timeline_json().unwrap());
-    // `reorder` re-lays one lane and knows nothing of partners: swapping the two shots
-    // would leave each sound behind its own picture's old place.
-    let err = p.reorder(v1, cut.c[1], 0).unwrap_err().to_string();
-    assert!(err.contains("out of step"), "{err}");
-    assert_eq!((revisions(p), p.timeline_json().unwrap()), (before, json));
+    // `reorder` re-lays one lane and knows nothing of partners; the sync lock puts
+    // each sound where its picture went, so the swap happens on both lanes.
+    p.reorder(v1, cut.c[1], 0).unwrap();
+    assert_eq!((span(p, cut.c[1]), span(p, cut.c[0])), ((0.0, 6.0), (6.0, 16.0)));
+    assert_eq!((span(p, cut.a[1]), span(p, cut.a[0])), ((0.0, 6.0), (6.0, 16.0)));
+    // Links off: the picture's lane only, the sound stayed.
+    p.undo().unwrap();
     p.with_links(Some(false), |p| p.reorder(v1, cut.c[1], 0)).unwrap();
     assert_eq!(span(p, cut.c[1]).0, 0.0);
     assert_eq!(span(p, cut.a[1]).0, 10.0, "links off: the sound stayed");
+    p.undo().unwrap();
+
+    // What the sync lock cannot choose between is refused: both clips of a pair named
+    // in one move, to different places, were parted on purpose — by hand, not by a ripple.
+    let (before, json) = (revisions(p), p.timeline_json().unwrap());
+    let err = p
+        .move_clips(&[
+            ClipMove {
+                clip_id: cut.c[1],
+                timeline_start: 20.0,
+                track_id: None,
+            },
+            ClipMove {
+                clip_id: cut.a[1],
+                timeline_start: 24.0,
+                track_id: None,
+            },
+        ])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("out of step") && err.contains("unlink") && !err.contains("links off"),
+        "{err}"
+    );
+    assert_eq!((revisions(p), p.timeline_json().unwrap()), (before, json));
 }
 
 #[test]

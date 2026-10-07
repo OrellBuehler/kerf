@@ -873,3 +873,13 @@ export const clipDuration = (clip: Clip): number => {
 	const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
 	return span / speed;
 };
+
+/** What detaching sound from several clips did (`AudioDetached` in `crates/kerf-app/src/lib.rs`, the
+ *  answer of `extract_audio` and `detach_audio_clips`): the refreshed timeline, how many clips were
+ *  detached, and the ones left alone with the reason (a locked track, an asset without audio, a sound
+ *  already detached). */
+export interface AudioDetached {
+	timeline: Timeline;
+	detached: number;
+	skipped: { clip_id: string; reason: string }[];
+}

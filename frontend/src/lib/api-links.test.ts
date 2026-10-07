@@ -1,14 +1,17 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+	addAssetAudio,
 	addClip,
 	cutClipRange,
 	detachAudio,
+	detachAudioClips,
 	extractAudio,
 	getHistory,
 	getTimeline,
 	linkClips,
 	listAssets,
 	moveClip,
+	moveClips,
 	reattachAudio,
 	removeClip,
 	removeClips,
@@ -117,12 +120,38 @@ describe('linked A/V (browser harness)', () => {
 	});
 
 	test('reattaching deletes the sound and unmutes the picture, naming either clip', async () => {
+		// The interview's whole audio is on A1 as a clip of its own, in step with c1: unmuting c1
+		// would play it twice, so with it there reattach is refused and records nothing.
 		let t = await detachAudio('c1');
 		const soundId = soundOf(t, 'c1').id;
+		const before = await headSeq();
+		await expect(reattachAudio(soundId)).rejects.toThrow('heard twice');
+		expect(await headSeq()).toBe(before);
+		await removeClip(c3);
 		t = await reattachAudio(soundId);
 		expect(clip(t, soundId)).toBeUndefined();
 		expect(clip(t, 'c1')!.source_audio).toBeUndefined();
 		expect(await lastLabel()).toBe('Reattach audio');
+	});
+
+	test('detaching several clips is one revision and skips what cannot be', async () => {
+		const before = await headSeq();
+		const done = await detachAudioClips(['c1', 'c2']);
+		expect(done.detached).toBe(1);
+		expect(done.skipped.map((s) => s.clip_id)).toEqual(['c2']);
+		expect(await headSeq()).toBe(before + 1);
+		expect(await lastLabel()).toBe('Detach audio');
+		expect(clip(done.timeline, 'c1')!.source_audio).toBe(false);
+		await expect(detachAudioClips(['c2'])).rejects.toThrow('no audio stream');
+	});
+
+	test('adding an asset’s audio is its own operation, and extracting never falls back to it', async () => {
+		const t = await addAssetAudio(INTERVIEW);
+		expect(await lastLabel()).toBe('Add audio');
+		const added = t.tracks.find((tr) => tr.kind === 'audio')!.clips.at(-1)!;
+		expect([added.source_in, added.source_out]).toEqual([0, 120]);
+		await detachAudio('c1');
+		await expect(extractAudio(INTERVIEW)).rejects.toThrow('already on an audio track');
 	});
 
 	test('a move carries the partner, as one revision, and link false moves one alone', async () => {
@@ -220,7 +249,9 @@ describe('linked A/V (browser harness)', () => {
 	});
 
 	test('extracting audio detaches the clips of an asset that is cut, rather than doubling it', async () => {
-		const t = await extractAudio(INTERVIEW);
+		const done = await extractAudio(INTERVIEW);
+		expect([done.detached, done.skipped]).toEqual([1, []]);
+		const t = await getTimeline();
 		expect(clip(t, 'c1')!.source_audio).toBe(false);
 		expect(linkPartners(t, 'c1')).toHaveLength(1);
 		expect(await lastLabel()).toBe('Extract audio');
@@ -230,13 +261,29 @@ describe('linked A/V (browser harness)', () => {
 describe('the sync guard (browser harness)', () => {
 	beforeEach(soundingCut);
 
-	test('a reorder that would part a linked pair is refused, and nothing is recorded', async () => {
-		await detachAudio('c1');
+	test('two linked clips both named and moved apart are refused, and nothing is recorded', async () => {
+		const t = await detachAudio('c1');
+		const soundId = soundOf(t, 'c1').id;
 		const before = await headSeq();
 		const json = JSON.stringify(await getTimeline());
-		await expect(reorderClip('v1', 'c2', 0)).rejects.toThrow('out of step');
+		await expect(
+			moveClips([
+				{ clip_id: 'c1', timeline_start: 30 },
+				{ clip_id: soundId, timeline_start: 34 }
+			])
+		).rejects.toThrow('out of step');
 		expect(await headSeq()).toBe(before);
 		expect(JSON.stringify(await getTimeline())).toBe(json);
+	});
+
+	test('a reorder carries the linked sound with its picture', async () => {
+		const t0 = await detachAudio('c1');
+		const soundId = soundOf(t0, 'c1').id;
+		const t = await reorderClip('v1', 'c2', 0);
+		expect(t.tracks[0].clips.map((c) => c.id)).toEqual(['c2', 'c1']);
+		// c1 was pushed back by c2's length; its sound went with it (c2 has none of its own).
+		const picture = clip(t, 'c1')!;
+		expect(clip(t, soundId)!.timeline_start).toBeCloseTo(picture.timeline_start, 9);
 	});
 
 	test('an unlinked project reorders exactly as it always did', async () => {

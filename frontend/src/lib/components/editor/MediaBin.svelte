@@ -154,26 +154,38 @@
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)
 		});
-		// The label says what will happen (`audioExtraction` mirrors `Project::extract_audio`): the
-		// asset's own sound is detached from every clip on the timeline still playing it — so it is
-		// heard once — and only an asset with none such is appended to an audio track.
+		// The label says what will happen (`audioExtraction` mirrors the backend's two operations): the
+		// asset's own sound is detached (`extract_audio`) from every clip on the timeline still playing
+		// it — so it is heard once — and only an asset with none such has its whole audio appended to an
+		// audio track (`add_asset_audio`, a separate operation the backend never falls back to).
 		const extraction = info.kind === 'video' ? audioExtraction(asset, editor.timeline) : null;
 		if (extraction)
 			items.push({
 				label: extraction.label,
 				icon: 'audio-waveform',
-				action: () =>
+				action: () => {
+					if (extraction.mode === 'append') {
+						void editor
+							.addAssetAudio(asset.id)
+							.then(() =>
+								toast.success(`Added the audio of ${asset.name}`, {
+									action: { label: 'Undo', onClick: () => void editor.undo() }
+								})
+							)
+							.catch(err);
+						return;
+					}
 					void editor
 						.extractAudio(asset.id)
-						.then(() =>
+						.then((done) =>
 							toast.success(
-								extraction.mode === 'detach'
-									? `Detached audio from ${extraction.clips} ${extraction.clips === 1 ? 'clip' : 'clips'}`
-									: `Added the audio of ${asset.name}`,
+								`Detached audio from ${done.detached} ${done.detached === 1 ? 'clip' : 'clips'}` +
+									(done.skipped.length > 0 ? ` — ${done.skipped.length} skipped (${done.skipped[0].reason})` : ''),
 								{ action: { label: 'Undo', onClick: () => void editor.undo() } }
 							)
 						)
-						.catch(err)
+						.catch(err);
+				}
 			});
 		items.push({
 			label: 'Remove silences',

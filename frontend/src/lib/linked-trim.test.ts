@@ -147,19 +147,37 @@ describe('linkedTrimPreview', () => {
 		expect(alone.ghosts.map((g) => g.id)).toEqual(['c', 'b']);
 	});
 
-	test('a ripple the sound’s lane would not allow breaks the pair out of step, and says so', () => {
+	test('a ripple the sound’s lane would not allow refuses, and names what is in the way', () => {
 		const t: Timeline = {
 			tracks: [
 				lane('video', 'V1', [clip('c', 'x', 40, 48, 0), clip('b', 'x', 20, 30, 8, 'L2')]),
-				// y sits where pb would have to go: the sync lock cannot move pb, so b alone would move.
+				// y sits where pb would have to go: the sync lock cannot move pb past a clip that is
+				// not linked to it, so the whole edit is refused with that reason.
 				lane('audio', 'A1', [clip('y', 'x', 60, 63, 5), clip('pb', 'x', 20, 30, 8, 'L2')])
 			]
 		};
 		const p = linkedTrimPreview(t, 'c', 'r', 6, opts({ ripple: true }))!;
 		expect(p.ok).toBe(false);
-		expect(p.reason).toBe('That edit would put the linked clips on V1 and A1 out of step — hold Alt to edit this clip on its own');
+		expect(p.reason).toContain('another clip on A1');
+		expect(p.reason).toContain('not linked to it');
+		expect(p.reason).toContain('hold Alt');
 		// With links off, nothing is out of step: they were never carried.
 		expect(linkedTrimPreview(t, 'c', 'r', 6, opts({ ripple: true, links: false }))!.ok).toBe(true);
+	});
+
+	test('a J/L-cut pair is carried, not refused: the sound that leads its picture still leads it', () => {
+		// V1: c [0,8) then b [8,18); A1: pa under c (0..8), pb leads b by 2 s ([6,18)).
+		const t: Timeline = {
+			tracks: [
+				lane('video', 'V1', [clip('c', 'x', 40, 48, 0, 'L1'), clip('b', 'x', 20, 30, 8, 'L2')]),
+				lane('audio', 'A1', [clip('pa', 'x', 40, 46, 0, 'L1'), clip('pb', 'x', 18, 30, 6, 'L2')])
+			]
+		};
+		const p = linkedTrimPreview(t, 'c', 'r', 6, opts({ ripple: true }))!;
+		expect(p.ok).toBe(true);
+		expect(p.reason).toBeNull();
+		const at = (id: string) => p.ghosts.find((g) => g.id === id)!;
+		expect([at('b').start, at('pb').start]).toEqual([6, 4]);
 	});
 
 	test('a locked partner refuses, in the backend’s words', () => {
@@ -167,7 +185,7 @@ describe('linkedTrimPreview', () => {
 		t.tracks[1].locked = true;
 		const p = linkedTrimPreview(t, 'a', 'r', 8, opts())!;
 		expect(p.ok).toBe(false);
-		expect(p.reason).toBe('A linked clip is on locked track A1 — unlock it, or hold Alt to edit this clip on its own');
+		expect(p.reason).toBe('A linked clip is on locked track A1 — unlock it first (or hold Alt to edit this clip on its own)');
 	});
 
 	test('a partner the trim would trim away refuses, and says so', () => {
@@ -175,7 +193,7 @@ describe('linkedTrimPreview', () => {
 		t.tracks[1].clips[0] = clip('pa', 'x', 0, 3, 0, 'L1'); // shares a's start, but is only 3 s long
 		const p = linkedTrimPreview(t, 'a', 'l', 5, opts())!;
 		expect(p.ok).toBe(false);
-		expect(p.reason).toBe('The linked clip on A1 would be trimmed away — hold Alt to edit this clip on its own');
+		expect(p.reason).toBe('The linked clip on A1 would be trimmed away by this edit (or hold Alt to edit this clip on its own)');
 	});
 
 	test('a lane left overlapping is not ok, but has no reason of its own', () => {

@@ -217,8 +217,20 @@ describe('linkPlans — detach', () => {
 });
 
 describe('linkPlans — reattach', () => {
+	test('is refused, with the reason, while another audio clip already plays the same footage in step', () => {
+		const t = cut(); // a1 plays what w1 shows, in step with it
+		detach(t, 'w1', true);
+		const p = linkPlans(t, hasAudio, ['w1']).reattach;
+		expect(p.show).toBe(true);
+		expect(p.reason).toContain('already playing from another audio clip');
+	});
+
 	function detached() {
 		const t = cut();
+		// `a1` is the same footage as `w1` and in step with it, so reattaching `w1` would double
+		// it (the backend refuses that): put it somewhere else in the footage for these cases.
+		t.tracks[2].clips[0].source_in = 30;
+		t.tracks[2].clips[0].source_out = 40;
 		detach(t, 'w1', true);
 		return t;
 	}
@@ -311,12 +323,14 @@ describe('linkPlans — link and unlink', () => {
 });
 
 describe('gestureReason', () => {
-	test('where the backend says to edit with links off, a gesture says to hold Alt', () => {
-		expect(gestureReason('a linked clip is on locked track A1 — unlock it, or edit with links off')).toBe(
-			'a linked clip is on locked track A1 — unlock it, or hold Alt to edit this clip on its own'
+	test('a refusal about linked clips gets the Alt way out; one that is not about them does not', () => {
+		expect(gestureReason('a linked clip is on locked track A1 — unlock it first')).toBe(
+			'a linked clip is on locked track A1 — unlock it first (or hold Alt to edit this clip on its own)'
 		);
-		expect(gestureReason('that edit would put the linked clips on V1 and A1 out of step — edit with links off to move one of them on its own')).toBe(
-			'that edit would put the linked clips on V1 and A1 out of step — hold Alt to edit this clip on its own'
+		expect(
+			gestureReason('that edit would leave the linked clips on V1 and A1 out of step with each other — unlink them first if they are meant to part')
+		).toBe(
+			'that edit would leave the linked clips on V1 and A1 out of step with each other — unlink them first if they are meant to part (or hold Alt to edit this clip on its own)'
 		);
 		expect(gestureReason('track V1 is locked')).toBe('track V1 is locked');
 	});
