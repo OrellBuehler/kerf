@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, untrack } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { toast, notifications } from '$lib/notifications.svelte';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
 	import Toolbar from '$lib/components/editor/Toolbar.svelte';
@@ -20,7 +20,8 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { cutSelection, deleteSelection } from '$lib/ops';
-	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested } from '$lib/api';
+	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
+	import { afterPaint, revealWindow } from '$lib/reveal';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -36,8 +37,19 @@
 		untrack(() => ui.resync());
 	});
 
+	// The desktop window is created hidden, so the unthemed first frame is never
+	// seen. Once the settings are in — which is when the theme is applied and the
+	// dock is built — wait for the frame that draws them and show the window. (If
+	// this never runs, the backend shows it itself after a few seconds.)
+	let revealed = false;
+	$effect(() => {
+		if (!settings.loaded || revealed) return;
+		revealed = true;
+		void revealWindow({ settle: tick, paint: afterPaint, show: showMainWindow });
+	});
+
 	onMount(() => {
-		void editor.load();
+		const firstLoad = editor.load();
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
@@ -140,6 +152,14 @@
 						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
 					)
 				);
+				// A `.kerf` on the command line of this very launch (a second launch's
+				// arrives as the event above). Asked for only now — with the listeners
+				// up and the first load done, so the open is neither raced by that load
+				// nor lost to a listener that did not exist yet — and it goes through
+				// the same path as the event, unsaved-work question included.
+				await firstLoad;
+				const launched = await takeLaunchProject().catch(() => null);
+				if (launched) await openProjectAt(launched);
 			});
 		}
 		return () => {
@@ -172,7 +192,7 @@
 		}
 	}
 
-	/** Open a project file — `path` when a second launch handed one over, else the picker. */
+	/** Open a project file — `path` when a launch handed one over, else the picker. */
 	async function openProjectAt(path?: string) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');

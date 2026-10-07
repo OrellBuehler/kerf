@@ -64,7 +64,7 @@
 		bind:this={el}
 		role="dialog"
 		aria-label="Notifications"
-		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg,0 24px 60px rgba(0,0,0,.5));overflow:hidden;font-family:var(--font-sans)"
+		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden;font-family:var(--font-sans)"
 	>
 		<div
 			style="flex:none;display:flex;align-items:center;gap:8px;padding:9px 10px 9px 12px;border-bottom:var(--line-width) solid var(--border-default)"

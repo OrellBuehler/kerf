@@ -1194,7 +1194,7 @@ the user has not got.
 
 ### kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch_project`, and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted from `setup` fires before the page has a listener. It returns the path once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. A `.kerf` argument naming nothing on disk is logged and ignored in both launches: `Project::open` would *create* it. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up; a second launch claims the flag and shows at once). It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
@@ -1284,7 +1284,7 @@ ffmpeg error when a stream someone is still watching dies, so the preview can sa
 why it went black. **Logging** (`init_logging`): stdout plus a daily-rolling `kerf.<date>.log` (14 kept) in
 `<app data dir>/logs` — `log_dir_path` is the one place that is decided, shared by
 `init_logging`, `log_dir` and `reveal_logs`; if it is not writable the app logs to stdout
-only. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
+only. **The file layer is synchronous**: the `RollingFileAppender` is the layer's writer directly (`file_layer`), one `write` per event, not behind `tracing_appender::non_blocking`. That queue's worker thread is what a hard crash takes the last lines with — an aborting panic, `process::exit`, or a segfault in FFmpeg / ONNX Runtime never reaches a `WorkerGuard`'s `Drop`, a flush in the panic hook would not cover them, and dropping the guard there would silence logging for the rest of a session after a panic on a thread that does not end the process. Logging is a few dozen lines a session, none in a hot loop, so a syscall each is free. A Rust test re-runs the test binary as a child that logs and `abort()`s (the queue loses the last line in most runs); `log_panic` / `panic_summary` are what the hook writes, tested against a real appender with no flush; `RunEvent::Exit` logs `kerf exiting`, so a log that ends without it ended in a crash. The startup line carries version, OS/arch, the ffmpeg/ffprobe in use and both
 directories (never env dumps or args). Failures reach the file from three places:
 Tauri commands return plain `String` errors that Tauri offers no hook to observe, so the
 single `invoke` wrapper in `api.ts` forwards every rejection (command name + message,
@@ -1427,9 +1427,29 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
   pseudo-elements) from those variables, with `--slider-accent` as the one
   per-slider choice; changing a shape value makes the theme `Custom`, and
-  High contrast ships thicker lines. `app.html` still paints dark before hydration. That file is also the
-  `tailwind.css` in `components.json`. Run `bunx shadcn-svelte add <name>` to
-  add primitives.
+  High contrast ships thicker lines. `app.html` paints Kerf Dark before hydration
+  (and the desktop window stays hidden until the theme is applied — see kerf-app).
+  **Two bun guards keep this true** (`theme-guard.test.ts`): a scan fails on any
+  color literal (`#hex`, `rgb()`, `hsl()`, …) in `src/` outside `theme.ts`,
+  `kerf-tokens.css`, `app.html` (pinned to Kerf Dark's `surface-app`, as is the
+  window's `backgroundColor`) and the two browser-harness image generators
+  (`sample-frame.ts`, `sample-filmstrip.ts`, whose colors are picture, not
+  interface); and every preset must meet WCAG contrast (`contrast.ts`) for the
+  pairs the UI draws — 4.5:1 for reading text and the labels on solid fills
+  (`text-primary` / `-secondary` on every surface, `text-muted` on the resting
+  ones, `text-on-accent`, `agent-fg`, `text-on-video` on the clip bodies), 3:1 for
+  muted text on hover / active, accent and status hues as text on the panels and
+  the strokes that carry meaning (clip edges, the playhead / selection amber, the
+  waveform, the drag ghost). `text-disabled` and the translucent hairlines are
+  exempt; High contrast is also held to 7:1 on its reading text. The pair list
+  and its reasoning live at the top of that test; a failing preset gets its
+  *values* fixed, not the list. Writing it found real defects — Kerf Light's clip
+  bodies were pale under white labels (1.5:1), the logo mark was a hard-coded
+  near-white that vanished on Light, and five dialogs carried a dead `rgba`
+  shadow fallback — so Light's clip fills, waveform, amber, three status hues,
+  muted text and `agent-fg` were adjusted (Dark and High contrast passed as
+  they were). `layout.css` is also the `tailwind.css` in `components.json`. Run
+  `bunx shadcn-svelte add <name>` to add primitives.
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
