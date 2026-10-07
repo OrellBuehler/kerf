@@ -20,7 +20,7 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import { cutSelection, deleteSelection } from '$lib/ops';
-	import type { ActionId } from '$lib/keymap';
+	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
@@ -28,7 +28,7 @@
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
-	const modalOpen = $derived(ui.exportDialog || settings.open || updater.dialogOpen);
+	const modalOpen = $derived(ui.exportDialog || settings.open || updater.dialogOpen || ui.voiceoverDialog !== null);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
 
@@ -358,8 +358,9 @@
 		'edit.rippleDelete': () => deleteKey(true),
 		'edit.clearSelection': () => {
 			// Whatever else Escape is for gets it first: a menu or the notification
-			// panel closing, a dialog, a drag being abandoned (those stop the event).
-			if (!contextMenu.visible && !notifications.open && !ui.voiceoverDialog) editor.clearSelection();
+			// panel closing, a drag being abandoned (those stop the event; a dialog
+			// never gets here, the page is inert behind it).
+			if (!contextMenu.visible && !notifications.open) editor.clearSelection();
 			// And it is never swallowed: it is how the browser backs out of things too.
 			return false;
 		},
@@ -370,11 +371,9 @@
 		'tool.razor': () => {
 			ui.tool = 'razor';
 		},
-		// Ripple mode is a project setting, so the key must not auto-repeat it back
-		// and forth while held.
-		'tool.rippleMode': (e) => {
-			if (!e.repeat) void editor.setRippleMode(!editor.rippleMode).catch(clipErr);
-		},
+		// A project setting: the registry marks it `repeat: false`, so a held key
+		// does not flip it back and forth.
+		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(clipErr),
 
 		'playback.toggle': () => ui.togglePlay(),
 		'playback.shuttleBack': () => ui.shuttle(-1),
@@ -427,7 +426,14 @@
 		// this one — does nothing, and in particular never falls through to a
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
-		if (id && run[id](e) !== false) e.preventDefault();
+		if (!id) return;
+		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
+		// is consumed, so the browser does not scroll or click on it either.
+		if (e.repeat && !allowsRepeat(id)) {
+			e.preventDefault();
+			return;
+		}
+		if (run[id](e) !== false) e.preventDefault();
 	}
 </script>
 

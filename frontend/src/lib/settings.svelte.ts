@@ -25,15 +25,17 @@ import {
 } from './workspaces';
 import {
 	applyRebind,
+	applyReset,
 	detectPlatform,
+	differsFromDefault,
 	displayChord,
 	emptyOverrides,
 	hasOverrides,
 	matchAction,
 	parseKeyOverrides,
 	rebindConflicts,
-	resetAction,
 	resetAll,
+	resetPlan,
 	resolveBindings,
 	sameChord,
 	serializeOverrides,
@@ -44,6 +46,7 @@ import {
 	type KeyEventLike,
 	type KeyOverrides,
 	type Rebind,
+	type ResetPlan,
 	type Resolution
 } from './keymap';
 import type { AppSettings, SettingsView } from './types';
@@ -286,9 +289,11 @@ class SettingsStore {
 		return hasOverrides(this.keyOverrides);
 	}
 
-	/** Whether an action has been changed from its defaults. */
-	isCustomKey(id: string): boolean {
-		return id in this.keyOverrides.bindings;
+	/** Whether an action has anything other than its defaults in force. Not the
+	 *  same as having an override: another action's customisation can have taken
+	 *  one of its default chords, and Reset has to stay on offer for that. */
+	differsFromDefault(id: string): boolean {
+		return differsFromDefault(this.bindings, id, this.platform);
 	}
 
 	/** Give an action a chord — in place of `rebind.replacing`, or beside its
@@ -304,8 +309,16 @@ class SettingsStore {
 		this.changeKeys(setActionChords(this.keyOverrides, id, mine, this.platform));
 	}
 
-	resetKey(id: string) {
-		this.changeKeys(resetAction(this.keyOverrides, id));
+	/** What putting an action back would run into: another action that has since
+	 *  been given one of its default chords. */
+	resetPlan(id: string): ResetPlan {
+		return resetPlan(this.bindings, id, this.platform);
+	}
+
+	/** Put an action back to its defaults. With a collision (`resetPlan`) and no
+	 *  resolution nothing changes. */
+	resetKey(id: string, resolution: Resolution | null = null) {
+		this.changeKeys(applyReset(this.keyOverrides, this.bindings, id, resolution, this.platform));
 	}
 
 	resetAllKeys() {

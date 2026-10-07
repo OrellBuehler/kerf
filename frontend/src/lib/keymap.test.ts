@@ -5,10 +5,13 @@ import {
 	ACTIONS,
 	GROUPS,
 	KEYMAP_VERSION,
+	allowsRepeat,
 	applyRebind,
+	applyReset,
 	chordFromEvent,
 	conflictsFor,
 	detectPlatform,
+	differsFromDefault,
 	displayChord,
 	emptyOverrides,
 	filterActions,
@@ -20,6 +23,7 @@ import {
 	rebindConflicts,
 	resetAction,
 	resetAll,
+	resetPlan,
 	resolveBindings,
 	sameChord,
 	serializeOverrides,
@@ -159,6 +163,46 @@ describe('the chord a keypress is', () => {
 		// A macOS Option combination types a symbol; the key under it is Z.
 		expect(chordFromEvent(ev('Ω', { alt: true }, 'KeyZ'))).toEqual(chord('Alt+Z'));
 		expect(chordFromEvent(ev('Dead', {}, 'Backquote'))).toEqual(chord('`'));
+	});
+
+	test('a space is Space however the platform types it', () => {
+		// macOS types a no-break space for ⌥Space; written down as `Alt+ ` it could
+		// not be read back, and the binding vanished on the next launch.
+		for (const key of [' ', '\u00a0', '\u2003']) {
+			const c = chordFromEvent({ ...ev(key, { alt: true }), code: 'Space' });
+			expect(c).toEqual(chord('Alt+Space'));
+			expect(formatChord(c!, 'mac')).toBe('Alt+Space');
+			expect(parseChord(formatChord(c!, 'mac'), 'mac')).toEqual(c);
+		}
+		expect(chordFromEvent(ev('\u00a0', { shift: true }))).toEqual(chord('Shift+Space'));
+	});
+
+	test('a key that would not survive being written down is not a chord', () => {
+		// `ß` upper-cases to `SS`, the Turkish dotless ı to an `I` that reads back as `i`.
+		expect(chordFromEvent(ev('ß'))).toBeNull();
+		expect(chordFromEvent(ev('ı', {}, 'KeyI'))).toBeNull();
+		expect(chordFromEvent(ev('İ', { shift: true }, 'KeyI'))).toBeNull();
+		// Whatever does come back is a chord that reads back as itself.
+		const keys = ['ß', 'ı', 'ö', 'é', 'ñ', 'я', 'Ω', '€', '\u00a0', ' ', 'z', 'Z', '+', ',', '\\', 'F5', 'ArrowUp', 'Tab', 'Enter'];
+		for (const key of keys) {
+			for (const code of [undefined, 'KeyA', 'Digit1', 'Minus', 'Space']) {
+				for (const alt of [false, true]) {
+					const c = chordFromEvent({ ...ev(key, { alt, ctrl: true }), code });
+					if (c) expect(parseChord(formatChord(c, 'other'), 'other')).toEqual(c);
+				}
+			}
+		}
+	});
+
+	test('a letter of the alphabet a keyboard has is that letter, not the US key under it', () => {
+		// ß sits over the US `-`; it must not become the zoom-out key.
+		expect(chordFromEvent(ev('ß', {}, 'Minus'))).toBeNull();
+		expect(matchAction(ev('ß', {}, 'Minus'), resolveBindings(emptyOverrides(), 'other'))).toBeNull();
+		expect(chordFromEvent(ev('ö', {}, 'Semicolon'))).toEqual(chord('ö'));
+		expect(chordFromEvent(ev('Ö', { shift: true }, 'Semicolon'))).toEqual(chord('Shift+ö'));
+		// …but with Option held a Mac types a symbol or a Latin letter over the real key.
+		expect(chordFromEvent(ev('ß', { alt: true }, 'KeyS'))).toEqual(chord('Alt+S'));
+		expect(chordFromEvent(ev('ø', { alt: true }, 'KeyO'))).toEqual(chord('Alt+O'));
 	});
 
 	test('what cannot be a shortcut', () => {
@@ -731,6 +775,129 @@ describe('editing bindings', () => {
 		const o = emptyOverrides();
 		const r = applyRebind(o, resolve(o), { id: 'a', chord: chord('W'), replacing: null }, null, platform, actions);
 		expect(r).toBe(o);
+	});
+});
+
+// ---- putting an action back ------------------------------------------------------------
+
+describe('resetting an action', () => {
+	const A = act('a', ['Q', 'Shift+Q']);
+	const B = act('b', ['W']);
+	const C = act('c', ['E']);
+	const actions = [A, B, C];
+	const platform: Platform = 'other';
+	const resolve = (o: KeyOverrides) => resolveBindings(o, platform, actions);
+	const keysOf = (o: KeyOverrides, id: string) => resolve(o)[id].map((c) => formatChord(c, platform));
+	const o = (bindings: Record<string, string[]>): KeyOverrides => ({ version: 1, bindings });
+	const reset = (ov: KeyOverrides, id: string, how: 'swap' | 'unbind' | null = null) =>
+		applyReset(ov, resolve(ov), id, how, platform, actions);
+
+	test('an action differs from its defaults when its chords do — not only when it has an override', () => {
+		const b = (ov: KeyOverrides, id: string) => differsFromDefault(resolve(ov), id, platform, actions);
+		expect(b(o({}), 'a')).toBe(false);
+		expect(b(o({ a: ['X'] }), 'a')).toBe(true);
+		expect(b(o({ a: [] }), 'a')).toBe(true);
+		expect(b(o({ a: ['Shift+Q', 'Q'] }), 'a')).toBe(true); // the same chords, reordered
+		// B was given A's first default: A has no override, and still differs.
+		const taken = o({ b: ['Q'] });
+		expect(taken.bindings.a).toBeUndefined();
+		expect(b(taken, 'a')).toBe(true);
+		expect(b(taken, 'c')).toBe(false);
+		expect(differsFromDefault(resolve(o({})), 'nope', platform, actions)).toBe(false);
+	});
+
+	test('with nothing in the way, reset brings the defaults back', () => {
+		const ov = o({ a: ['X'], b: [] });
+		expect(resetPlan(resolve(ov), 'a', platform, actions)).toEqual({ conflicts: [], chord: null, gives: chord('X') });
+		const r = reset(ov, 'a');
+		expect(keysOf(r, 'a')).toEqual(['Q', 'Shift+Q']);
+		expect(r.bindings).toEqual({ b: [] });
+		expect(differsFromDefault(resolve(r), 'a', platform, actions)).toBe(false);
+	});
+
+	test('a default that another action has been given is a collision, and nothing happens until it is settled', () => {
+		const ov = o({ a: ['X'], b: ['Q'] }); // B took A's Q while A was elsewhere
+		const plan = resetPlan(resolve(ov), 'a', platform, actions);
+		expect(plan.conflicts.map((x) => x.id)).toEqual(['b']);
+		expect(plan.chord).toEqual(chord('Q'));
+		expect(plan.gives).toEqual(chord('X'));
+		expect(reset(ov, 'a')).toBe(ov);
+	});
+
+	test('…unbind takes the chord from the other action', () => {
+		const ov = o({ a: ['X'], b: ['Q'] });
+		const r = reset(ov, 'a', 'unbind');
+		expect(keysOf(r, 'a')).toEqual(['Q', 'Shift+Q']);
+		expect(keysOf(r, 'b')).toEqual([]);
+		expect(findCollisions(resolve(r), actions)).toEqual([]);
+	});
+
+	test('…swap gives the other action what this one is giving up', () => {
+		const ov = o({ a: ['X'], b: ['Q'] });
+		const r = reset(ov, 'a', 'swap');
+		expect(keysOf(r, 'a')).toEqual(['Q', 'Shift+Q']);
+		expect(keysOf(r, 'b')).toEqual(['X']);
+		expect(findCollisions(resolve(r), actions)).toEqual([]);
+	});
+
+	test('a swap with nothing to hand over is an unbind', () => {
+		// A is only missing its Q (B has it); there is nothing of A's to give B.
+		const ov = o({ b: ['Q'] });
+		expect(resetPlan(resolve(ov), 'a', platform, actions).gives).toBeNull();
+		const r = reset(ov, 'a', 'swap');
+		expect(keysOf(r, 'a')).toEqual(['Q', 'Shift+Q']);
+		expect(keysOf(r, 'b')).toEqual([]);
+	});
+
+	test('swapping two actions back to their defaults leaves nothing customised', () => {
+		const ov = o({ b: ['E'], c: ['W'] }); // B and C traded keys
+		const r = reset(ov, 'b', 'swap');
+		expect(r.bindings).toEqual({});
+	});
+
+	test('an action left unbound on purpose is brought back too', () => {
+		const ov = o({ b: [] });
+		expect(keysOf(reset(ov, 'b'), 'b')).toEqual(['W']);
+		expect(reset(ov, 'b').bindings).toEqual({});
+	});
+
+	test('an unknown action is left alone', () => {
+		const ov = o({ a: ['X'] });
+		expect(reset(ov, 'nope')).toBe(ov);
+		expect(resetPlan(resolve(ov), 'nope', platform, actions).conflicts).toEqual([]);
+	});
+});
+
+describe('keys that act once per press', () => {
+	test('the actions that must not auto-repeat are exactly these', () => {
+		const once = ACTIONS.filter((a) => !allowsRepeat(a.id)).map((a) => a.id);
+		// Adding or removing one is a decision about what a held key does.
+		expect(once).toEqual([
+			'file.new',
+			'file.open',
+			'file.save',
+			'file.import',
+			'file.export',
+			'app.settings',
+			'edit.copy',
+			'edit.cut',
+			'edit.paste',
+			'edit.duplicate',
+			'edit.delete',
+			'edit.rippleDelete',
+			'tool.rippleMode',
+			'playback.toggle',
+			'playback.shuttleBack',
+			'playback.shuttleForward',
+			'marker.add'
+		]);
+	});
+
+	test('stepping, zooming and undoing keep repeating, and so does an action nobody has heard of', () => {
+		for (const id of ['playback.stepBack', 'playback.stepForward', 'playback.jumpBack', 'playback.jumpForward', 'view.zoomIn', 'view.zoomOut', 'edit.undo', 'edit.redo', 'marker.next']) {
+			expect(allowsRepeat(id)).toBe(true);
+		}
+		expect(allowsRepeat('nope')).toBe(true);
 	});
 });
 

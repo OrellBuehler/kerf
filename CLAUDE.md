@@ -1952,8 +1952,9 @@ engine. Below the queue, the **History** section renders
 
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close), and `+page.svelte` makes the app behind them `inert` and returns early from
-its global key handler while any is open — Space / Delete / J-K-L / ⌘Z would
+close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
+which focuses itself) `inert` and returns early from its global key handler while
+any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
 textarea / select / contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
@@ -1994,7 +1995,9 @@ did not take the key). Nothing else spells a key: menus and tooltips read
 sources so a hand-written `(⌘Z)` or `shortcut: 'Del'` fails. Chords match what the
 key *types* (`KeyboardEvent.key`, so AZERTY / Dvorak get their Z; a non-ASCII
 character falls back to the physical key's US letter; Shift is dropped from
-punctuation, since `+` is Shift+= on one layout and bare on another). `Mod` in the
+punctuation, since `+` is Shift+= on one layout and bare on another; a key that
+would not read back from its stored spelling — `ß`, macOS's no-break space for ⌥Space
+(which is `Space`) — is never recorded as something that silently vanishes). `Mod` in the
 stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* its
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
@@ -2008,10 +2011,15 @@ and unreadable chords and forgets anything equal to the defaults (a stored `[]` 
 a deliberate unbind). `resolveBindings` keeps what fires unambiguous: a customised
 chord beats another action's *default* (a later build's new default never steals a
 key already in use), and any other collision goes to the earlier registry entry.
+An action marked `repeat: false` (paste, duplicate, marker, ripple toggle, play /
+pause, the file commands, …) acts once per press — the page swallows a held key's
+auto-repeat — while stepping, zooming and undo keep repeating.
 **Settings › Keyboard** (`KeyboardSettings.svelte`) is search, click-to-record
 (Esc cancels, Backspace removes, Tab leaves), a conflict prompt naming the other
-action with Swap / Unbind / Cancel (`applyRebind` never guesses), per-row and
-Reset all, and a read-only list of the keys that are *not* rebindable (Esc
+action with Swap / Unbind / Cancel (`applyRebind` never guesses; Cancel has the
+focus, so a held Enter cannot answer it), per-row Reset — on offer whenever the
+chords in force differ from the defaults, and asking the same question when another
+action has since taken one (`applyReset`) — and Reset all, and a read-only list of the keys that are *not* rebindable (Esc
 abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
 control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.

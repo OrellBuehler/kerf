@@ -153,16 +153,21 @@ function charFromCode(code: string | undefined): string | null {
 const isAlnum = (ch: string) => /^[a-z0-9]$/.test(ch);
 const isFunctionKey = (k: string) => /^F([1-9]|1[0-9]|2[0-4])$/.test(k);
 
+const isLatinLetter = (ch: string) => /^\p{Script=Latin}$/u.test(ch);
+
 /** The chord a keypress is, or null for one that cannot be a shortcut: a modifier
  *  on its own, a dead key with nothing under it, a media key, an AltGr character
- *  (typing, not a shortcut). */
+ *  (typing, not a shortcut) — or anything that would not survive being written
+ *  down and read back (`ß`, which upper-cases to `SS`; a stored chord that cannot
+ *  be read is a shortcut that silently vanishes on the next launch). */
 export function chordFromEvent(e: KeyEventLike): Chord | null {
 	if (e.getModifierState?.('AltGraph')) return null;
 	let key = e.key;
 	if (MODIFIER_KEYS.has(key)) return null;
 	let shift = e.shiftKey;
 
-	if (key === ' ') {
+	if (/^\s$/u.test(key)) {
+		// A space — or the no-break space macOS types for ⌥Space.
 		key = 'Space';
 	} else if (key === 'Dead' || key === 'Unidentified') {
 		const c = charFromCode(e.code);
@@ -173,6 +178,10 @@ export function chordFromEvent(e: KeyEventLike): Chord | null {
 			key = key.toLowerCase();
 			// The character already carries the Shift: `+`, `?`, `<`.
 			if (!isAlnum(key)) shift = false;
+		} else if (!e.altKey && isLatinLetter(key)) {
+			// `ö` on a German keyboard is its own key, not the US `;` it happens to
+			// sit over (which would also make `ß` the zoom-out key).
+			key = key.toLowerCase();
 		} else {
 			// A Cyrillic letter, a macOS Option character: take the key's US-layout
 			// letter instead. Without a code there is nothing better than the character.
@@ -183,7 +192,10 @@ export function chordFromEvent(e: KeyEventLike): Chord | null {
 	} else {
 		return null;
 	}
-	return { key, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift };
+	const chord: Chord = { key, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift };
+	// Whether the key is writable does not depend on the platform.
+	const back = parseChord(formatChord(chord, 'other'), 'other');
+	return back && sameChord(back, chord) ? chord : null;
 }
 
 export function sameChord(a: Chord, b: Chord): boolean {
@@ -290,6 +302,10 @@ export interface ActionDef {
 	defaults: readonly string[];
 	/** A line for the settings list when the label alone leaves a question. */
 	hint?: string;
+	/** `false`: one press is one action, and the auto-repeat of a held key is
+	 *  swallowed — a held ⌘V would paste a dozen copies. Left out, the action
+	 *  repeats (stepping a frame, zooming, undoing). */
+	repeat?: boolean;
 }
 
 /** Bump when a default changes in a way a stored customisation has to be carried
@@ -299,28 +315,30 @@ export interface ActionDef {
 export const KEYMAP_VERSION = 1;
 
 const ACTION_LIST = [
-	{ id: 'file.new', label: 'New project', group: 'project', context: 'global', defaults: ['Mod+N'] },
-	{ id: 'file.open', label: 'Open project…', group: 'project', context: 'global', defaults: ['Mod+O'] },
+	{ id: 'file.new', repeat: false, label: 'New project', group: 'project', context: 'global', defaults: ['Mod+N'] },
+	{ id: 'file.open', repeat: false, label: 'Open project…', group: 'project', context: 'global', defaults: ['Mod+O'] },
 	{
 		id: 'file.save',
+		repeat: false,
 		label: 'Save project as…',
 		group: 'project',
 		context: 'global',
 		defaults: ['Mod+S', 'Mod+Shift+S']
 	},
-	{ id: 'file.import', label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
-	{ id: 'file.export', label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
-	{ id: 'app.settings', label: 'Settings', group: 'project', context: 'global', defaults: ['Mod+,'] },
+	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
+	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
+	{ id: 'app.settings', repeat: false, label: 'Settings', group: 'project', context: 'global', defaults: ['Mod+,'] },
 
 	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', defaults: ['Mod+Z'] },
 	{ id: 'edit.redo', label: 'Redo', group: 'edit', context: 'global', defaults: ['Mod+Shift+Z', 'Mod+Y'] },
 	{ id: 'edit.selectAll', label: 'Select all clips', group: 'edit', context: 'global', defaults: ['Mod+A'] },
-	{ id: 'edit.copy', label: 'Copy', group: 'edit', context: 'global', defaults: ['Mod+C'] },
-	{ id: 'edit.cut', label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
-	{ id: 'edit.paste', label: 'Paste at playhead', group: 'edit', context: 'global', defaults: ['Mod+V'] },
-	{ id: 'edit.duplicate', label: 'Duplicate', group: 'edit', context: 'global', defaults: ['Mod+D'] },
+	{ id: 'edit.copy', repeat: false, label: 'Copy', group: 'edit', context: 'global', defaults: ['Mod+C'] },
+	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
+	{ id: 'edit.paste', repeat: false, label: 'Paste at playhead', group: 'edit', context: 'global', defaults: ['Mod+V'] },
+	{ id: 'edit.duplicate', repeat: false, label: 'Duplicate', group: 'edit', context: 'global', defaults: ['Mod+D'] },
 	{
 		id: 'edit.delete',
+		repeat: false,
 		label: 'Delete selection',
 		group: 'edit',
 		context: 'global',
@@ -329,6 +347,7 @@ const ACTION_LIST = [
 	},
 	{
 		id: 'edit.rippleDelete',
+		repeat: false,
 		label: 'Ripple delete selection',
 		group: 'edit',
 		context: 'global',
@@ -348,6 +367,7 @@ const ACTION_LIST = [
 	{ id: 'tool.razor', label: 'Razor tool', group: 'tools', context: 'global', defaults: ['C'] },
 	{
 		id: 'tool.rippleMode',
+		repeat: false,
 		label: 'Toggle ripple mode',
 		group: 'tools',
 		context: 'global',
@@ -355,10 +375,10 @@ const ACTION_LIST = [
 		hint: 'A project setting: while on, deleting and trimming close the gap behind.'
 	},
 
-	{ id: 'playback.toggle', label: 'Play / pause', group: 'playback', context: 'global', defaults: ['Space'] },
-	{ id: 'playback.shuttleBack', label: 'Shuttle backward', group: 'playback', context: 'global', defaults: ['J'], hint: 'Tap again to double the speed, up to 8×.' },
+	{ id: 'playback.toggle', repeat: false, label: 'Play / pause', group: 'playback', context: 'global', defaults: ['Space'] },
+	{ id: 'playback.shuttleBack', repeat: false, label: 'Shuttle backward', group: 'playback', context: 'global', defaults: ['J'], hint: 'Tap again to double the speed, up to 8×.' },
 	{ id: 'playback.pause', label: 'Pause', group: 'playback', context: 'global', defaults: ['K'] },
-	{ id: 'playback.shuttleForward', label: 'Shuttle forward', group: 'playback', context: 'global', defaults: ['L'], hint: 'Tap again to double the speed, up to 8×.' },
+	{ id: 'playback.shuttleForward', repeat: false, label: 'Shuttle forward', group: 'playback', context: 'global', defaults: ['L'], hint: 'Tap again to double the speed, up to 8×.' },
 	{ id: 'playback.stepBack', label: 'Back one frame', group: 'playback', context: 'global', defaults: ['ArrowLeft'] },
 	{ id: 'playback.stepForward', label: 'Forward one frame', group: 'playback', context: 'global', defaults: ['ArrowRight'] },
 	{ id: 'playback.jumpBack', label: 'Back one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowLeft'] },
@@ -366,7 +386,7 @@ const ACTION_LIST = [
 	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', defaults: ['Home'] },
 	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', defaults: ['End'] },
 
-	{ id: 'marker.add', label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
+	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
 	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', defaults: ['.'] },
 	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', defaults: ['I'] },
@@ -387,6 +407,11 @@ export const ACTIONS: readonly ActionDef[] = ACTION_LIST;
 
 export function actionDef(id: string, actions: readonly ActionDef[] = ACTIONS): ActionDef | undefined {
 	return actions.find((a) => a.id === id);
+}
+
+/** Whether holding the key should keep firing the action (see `ActionDef.repeat`). */
+export function allowsRepeat(id: string, actions: readonly ActionDef[] = ACTIONS): boolean {
+	return actionDef(id, actions)?.repeat !== false;
 }
 
 /** Keys that mean the same thing everywhere and are not rebindable — shown
@@ -651,6 +676,75 @@ export function applyRebind(
 			resolution === 'swap' && replacing
 				? theirs.map((c) => (sameChord(c, chord) ? replacing : c))
 				: theirs.filter((c) => !sameChord(c, chord));
+		next = setActionChords(next, other.id, moved, platform, actions);
+	}
+	return next;
+}
+
+// ---- putting an action back ---------------------------------------------------
+
+/** Whether an action has anything other than its defaults, in force — which is
+ *  not the same as having an override: another action's customisation can have
+ *  taken one of its default chords, and Reset has to stay on offer for that. */
+export function differsFromDefault(bindings: Bindings, id: string, platform: Platform, actions: readonly ActionDef[] = ACTIONS): boolean {
+	const a = actionDef(id, actions);
+	if (!a) return false;
+	const want = defaultChords(a, platform);
+	const have = bindings[id] ?? [];
+	return want.length !== have.length || want.some((c, i) => !sameChord(c, have[i]));
+}
+
+/** What putting an action back would run into. */
+export interface ResetPlan {
+	/** The other actions holding one of its default chords. */
+	conflicts: ActionDef[];
+	/** The first default chord that is held elsewhere, for the prompt to name. */
+	chord: Chord | null;
+	/** A chord it has now that is not a default, which a swap hands over. */
+	gives: Chord | null;
+}
+
+export function resetPlan(bindings: Bindings, id: string, platform: Platform, actions: readonly ActionDef[] = ACTIONS): ResetPlan {
+	const own = actionDef(id, actions);
+	if (!own) return { conflicts: [], chord: null, gives: null };
+	const want = defaultChords(own, platform);
+	const isDefault = (c: Chord) => want.some((w) => sameChord(w, c));
+	const conflicts = actions.filter(
+		(b) => b.id !== id && contextsOverlap(b.context, own.context) && bindings[b.id]?.some(isDefault)
+	);
+	const chord = want.find((w) => conflicts.some((b) => bindings[b.id]?.some((c) => sameChord(c, w)))) ?? null;
+	return { conflicts, chord, gives: (bindings[id] ?? []).find((c) => !isDefault(c)) ?? null };
+}
+
+/** Put an action back to its defaults. If another action has since been given
+ *  one of them, `resolution` says what happens to it — the same choice as a
+ *  rebind, because it is one — and without a resolution nothing changes. */
+export function applyReset(
+	o: KeyOverrides,
+	bindings: Bindings,
+	id: string,
+	resolution: Resolution | null,
+	platform: Platform,
+	actions: readonly ActionDef[] = ACTIONS
+): KeyOverrides {
+	const own = actionDef(id, actions);
+	if (!own) return o;
+	const plan = resetPlan(bindings, id, platform, actions);
+	if (plan.conflicts.length > 0 && !resolution) return o;
+	const want = defaultChords(own, platform);
+	const isDefault = (c: Chord) => want.some((w) => sameChord(w, c));
+	// What it gives up, in order, for a swap to hand out.
+	const pool = (bindings[id] ?? []).filter((c) => !isDefault(c));
+	let next = resetAction(o, id);
+	for (const other of plan.conflicts) {
+		const moved: Chord[] = [];
+		for (const c of bindings[other.id] ?? []) {
+			if (!isDefault(c)) moved.push(c);
+			else if (resolution === 'swap') {
+				const give = pool.shift();
+				if (give) moved.push(give);
+			}
+		}
 		next = setActionChords(next, other.id, moved, platform, actions);
 	}
 	return next;

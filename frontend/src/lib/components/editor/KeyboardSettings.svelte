@@ -28,8 +28,16 @@
 	let query = $state('');
 	/** The key being recorded: which action, and the chord it replaces (null: one is being added). */
 	let recording = $state<{ id: string; replacing: Chord | null } | null>(null);
-	/** A recorded chord that another action already has, waiting for a decision. */
-	let pending = $state<{ rebind: Rebind; conflicts: ActionDef[] } | null>(null);
+	/** A chord that another action already has, waiting for a decision: a recorded
+	 *  one (`rebind`), or a default that Reset would bring back (`rebind` null).
+	 *  `gives` is what a swap hands the other action — what this one gives up. */
+	let pending = $state<{
+		id: string;
+		chord: Chord;
+		rebind: Rebind | null;
+		conflicts: ActionDef[];
+		gives: Chord | null;
+	} | null>(null);
 	let confirmingReset = $state(false);
 	/** What a screen reader is told after a change; the list itself is the visual. */
 	let announcement = $state('');
@@ -81,7 +89,7 @@
 			return stopRecording();
 		}
 		recording = null;
-		pending = { rebind, conflicts };
+		pending = { id, chord, rebind, conflicts, gives: replacing };
 		announcement = `${show(chord)} is already used by ${conflicts.map((c) => c.label).join(' and ')}.`;
 	}
 
@@ -110,19 +118,28 @@
 
 	function settle(how: 'swap' | 'unbind' | null) {
 		if (!pending) return;
-		const { rebind, conflicts } = pending;
+		const { id, chord, rebind, conflicts } = pending;
 		pending = null;
 		if (how) {
-			settings.rebind(rebind, how);
-			announcement =
-				how === 'swap'
-					? `Swapped: ${nameOf(rebind.id)} is now ${show(rebind.chord)}.`
-					: `${nameOf(rebind.id)} is now ${show(rebind.chord)}; ${conflicts.map((c) => c.label).join(' and ')} unbound.`;
+			if (rebind) settings.rebind(rebind, how);
+			else settings.resetKey(id, how);
+			const others = conflicts.map((c) => c.label).join(' and ');
+			const now = rebind ? `${nameOf(id)} is now ${show(chord)}` : `${nameOf(id)} is back to its default`;
+			announcement = how === 'swap' ? `Swapped: ${now}.` : `${now}; ${others} unbound.`;
 		}
-		void focusRow(rebind.id);
+		void focusRow(id);
 	}
 
+	/** Put an action back to its defaults — unless another action has been given
+	 *  one of them since, which is a collision like any other and is asked about. */
 	function reset(id: string) {
+		const plan = settings.resetPlan(id);
+		if (plan.conflicts.length > 0 && plan.chord) {
+			recording = null;
+			pending = { id, chord: plan.chord, rebind: null, conflicts: plan.conflicts, gives: plan.gives };
+			announcement = `${show(plan.chord)} is ${nameOf(id)}'s default, but ${plan.conflicts.map((c) => c.label).join(' and ')} uses it.`;
+			return;
+		}
 		settings.resetKey(id);
 		announcement = `${nameOf(id)} is back to its default.`;
 		void focusRow(id);
@@ -142,11 +159,22 @@
 	}
 
 	function onSearchKey(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		// An Escape that cancels an IME composition is the IME's, not ours — and
+		// not the dialog's either.
+		if (e.isComposing) return e.stopPropagation();
 		// A first Escape empties the search; the dialog's own Escape is the second.
-		if (e.key === 'Escape' && query) {
+		if (query) {
 			query = '';
 			e.stopPropagation();
 		}
+	}
+
+	/** Escape on the reset question is "keep", not "close Settings". */
+	function onResetKey(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		e.stopPropagation();
+		keepShortcuts();
 	}
 
 	function onPendingKey(e: KeyboardEvent) {
@@ -206,10 +234,15 @@
 			>
 		</div>
 		{#if confirmingReset}
+			<!-- Escape here answers the question (Keep); the keydown is a shortcut for the
+			     Keep button, which is the real control. -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 			<div
 				role="alertdialog"
 				aria-label="Reset all shortcuts"
+				tabindex="-1"
 				use:takeFocus
+				onkeydown={onResetKey}
 				style="display:flex;align-items:center;gap:8px;min-height:30px"
 			>
 				<span style="flex:1;font-size:12px;color:var(--text-secondary)"
@@ -237,7 +270,7 @@
 			<ul style="list-style:none;margin:4px 0 0;padding:0">
 				{#each g.actions as a (a.id)}
 					{@const chords = settings.bindings[a.id] ?? []}
-					{@const custom = settings.isCustomKey(a.id)}
+					{@const custom = settings.differsFromDefault(a.id)}
 					{@const adding = recording?.id === a.id && recording.replacing === null}
 					<li style="border-bottom:var(--line-width) solid var(--border-subtle)">
 						<div style="display:flex;align-items:center;gap:8px;min-height:34px;padding:4px 0">
@@ -246,9 +279,9 @@
 									{a.label}
 									{#if custom}
 										<span
-											title="Changed from the default"
+											title="Not the default"
 											role="img"
-											aria-label="Changed from the default"
+											aria-label="Not the default"
 											style="width:6px;height:6px;border-radius:50%;background:var(--kerf-400);flex:none"
 										></span>
 									{/if}
@@ -318,7 +351,7 @@
 							</div>
 						</div>
 
-						{#if pending?.rebind.id === a.id}
+						{#if pending?.id === a.id}
 							{@const p = pending}
 							{@const names = p.conflicts.map((c) => c.label)}
 							<!-- Escape here answers the question (Cancel); the keydown is a shortcut for the
@@ -337,23 +370,24 @@
 										><Icon n="alert-triangle" s={13} color="var(--warning)" /></span
 									>
 									<span
-										><strong style="font-family:var(--font-mono);font-weight:600">{show(p.rebind.chord)}</strong> is already
-										used by <strong style="font-weight:600">{names.join(' and ')}</strong>.</span
+										><strong style="font-family:var(--font-mono);font-weight:600">{show(p.chord)}</strong>
+										{#if p.rebind}is already used by{:else}is {a.label}'s default, but{/if}
+										<strong style="font-weight:600">{names.join(' and ')}</strong>{p.rebind ? '' : ' uses it'}.</span
 									>
 								</div>
 								<div style="display:flex;flex-wrap:wrap;gap:6px;padding-left:21px">
-									{#if p.rebind.replacing && p.conflicts.length === 1}
+									{#if p.gives && p.conflicts.length === 1}
 										<Btn
 											variant="secondary"
 											size="sm"
-											title="{names[0]} takes {show(p.rebind.replacing)}, which {a.label} is giving up"
+											title="{names[0]} takes {show(p.gives)}, which {a.label} is giving up"
 											onclick={() => settle('swap')}>Swap</Btn
 										>
 									{/if}
 									<Btn variant="secondary" size="sm" onclick={() => settle('unbind')}
 										>Unbind {names.length === 1 ? names[0] : 'them'}</Btn
 									>
-									<Btn variant="ghost" size="sm" onclick={() => settle(null)}>Cancel</Btn>
+									<Btn variant="ghost" size="sm" data-autofocus onclick={() => settle(null)}>Cancel</Btn>
 								</div>
 							</div>
 						{/if}
