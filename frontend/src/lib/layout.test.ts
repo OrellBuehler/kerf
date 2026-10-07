@@ -408,6 +408,13 @@ describe('sameArrangement', () => {
 		expect(sameArrangement(small, PRESET_LAYOUTS.edit)).toBe(true);
 	});
 
+	test('a deliberate nudge — a dozen pixels on a wide window — is a different arrangement', () => {
+		const nudged = clone(PRESET_LAYOUTS.edit);
+		nudged.grid.root.data[0].data[0].size += 12;
+		nudged.grid.root.data[0].data[1].size -= 12;
+		expect(sameArrangement(nudged, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+
 	test('a sash moved by more than the tolerance is a different arrangement', () => {
 		const moved = clone(PRESET_LAYOUTS.edit);
 		moved.grid.root.data[0].data[0].size += 60; // 60 of 1440 px

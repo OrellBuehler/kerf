@@ -35,15 +35,39 @@ describe('ThumbCache', () => {
 		expect(cache.peek('a')).toBe('data:a');
 	});
 
-	test('"no frame" is remembered, whether the decode returned none or failed', async () => {
+	test('"no frame" from a decoder that answered is remembered — the harness has none to give', async () => {
 		const cache = new ThumbCache();
 		let calls = 0;
 		expect(await cache.load('browser', async () => (calls++, null))).toBeNull();
-		expect(await cache.load('broken', async () => (calls++, Promise.reject(new Error('no decoder'))))).toBeNull();
 		expect(await cache.load('browser', async () => (calls++, 'x'))).toBeNull();
-		expect(await cache.load('broken', async () => (calls++, 'x'))).toBeNull();
+		expect(calls).toBe(1);
+		expect(cache.peek('browser')).toBeNull();
+	});
+
+	test('a failed decode is not remembered: the next ask tries again, and a success then sticks', async () => {
+		const cache = new ThumbCache();
+		let calls = 0;
+		expect(await cache.load('a', () => (calls++, Promise.reject(new Error('ffmpeg busy'))))).toBeNull();
+		expect(cache.peek('a')).toBeUndefined();
+		expect(await cache.load('a', async () => (calls++, 'data:a'))).toBe('data:a');
+		expect(cache.peek('a')).toBe('data:a');
+		expect(await cache.load('a', async () => (calls++, 'data:other'))).toBe('data:a');
 		expect(calls).toBe(2);
-		expect(cache.peek('broken')).toBeNull();
+	});
+
+	test('everyone waiting on a decode that fails gets null, and nothing is left in flight', async () => {
+		const cache = new ThumbCache();
+		const d = deferred<string | null>();
+		let calls = 0;
+		const first = cache.load('a', () => (calls++, d.promise));
+		const second = cache.load('a', () => (calls++, d.promise));
+		d.reject(new Error('gone'));
+		expect(await first).toBeNull();
+		expect(await second).toBeNull();
+		expect(calls).toBe(1);
+		// Not stuck: a fresh ask decodes.
+		expect(await cache.load('a', async () => (calls++, 'data:a'))).toBe('data:a');
+		expect(calls).toBe(2);
 	});
 
 	test('an audio asset is marked without a decode', () => {

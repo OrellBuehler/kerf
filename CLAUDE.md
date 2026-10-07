@@ -1043,9 +1043,14 @@ as customised and brought a just-reset one straight back. So after a restore the
 singleton waits two frames for the layout to settle, takes that as the reference,
 and `shouldPersistLayout` (pure, bun-tested) writes only a layout that
 `sameArrangement` finds different from it — same groups, panels and order, same
-*shares* of each branch within 1.5 % (pixel sizes move with the window; the active
-group and tab are ignored) — and, with no entry yet, from the preset. What was
-written becomes the new reference; Reset clears the entry and leaves none. After
+*shares* of each branch within 0.4 % (a dozen-pixel nudge of a sash counts; pixel
+sizes, the active group and the active tab do not) — and, with no entry yet, from
+the preset. What was written becomes the new reference; Reset clears the entry
+and leaves none. A window resize can move shares too (where a group's minimum
+binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
+the layout events the resize causes, and retakes the reference once the window has
+held still for 150 ms — otherwise the next unrelated event, a click on a tab,
+would write a layout nobody arranged. After
 every `fromJSON` it forces `api.layout()` at the host's real size: a layout
 is built at the size it was saved at and the dock learns its real one a frame
 later, and a constraint changed in that gap makes dockview re-split the whole
@@ -1058,7 +1063,8 @@ group with an icon **rail** (36 px icons in a 40 px column, tooltips and
 choose; a pointer click does not leave focus on the rail): Media (`MediaBin`, whose
 decoded thumbnails live in `thumbnails.ts` rather than the component — the library
 remounts it on every tab switch, unfold and workspace switch, and each remount
-used to decode every asset again), Titles (`TitlesControls`), Effects (color looks +
+used to decode every asset again; it keeps answers, including "no frame", but not
+a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
 video effects), Transitions (the grouped picker), Audio (audio effects + the
 voiceover entry point), Transcript (`TranscriptPanel`). Effects, Transitions and
 Audio act on the selected clip and say why they are off when none is; they own no

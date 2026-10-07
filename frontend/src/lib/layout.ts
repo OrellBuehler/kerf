@@ -333,9 +333,11 @@ export function sanitizeLayout(raw: unknown): SerializedDockview | null {
 // ---- comparing arrangements ------------------------------------------------
 
 /** How far a group's share of its branch may drift (as a fraction of the branch)
- *  before two layouts count as arranged differently: a window resize rescales
- *  every size by a pixel or two of rounding, which is not a rearrangement. */
-export const ARRANGEMENT_TOLERANCE = 0.015;
+ *  before two layouts count as arranged differently: pixel rounding, a few
+ *  hundredths of a percent. Small enough that a deliberate nudge of a sash — a
+ *  dozen pixels on a wide window — is a rearrangement; a window resize is not
+ *  held against this (the workspace takes a fresh reference when one settles). */
+export const ARRANGEMENT_TOLERANCE = 0.004;
 
 /** The share each child takes of its branch; equal shares when sizes are absent. */
 function shares(nodes: Node[]): number[] {

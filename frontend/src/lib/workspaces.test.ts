@@ -298,6 +298,13 @@ describe('shouldPersistLayout', () => {
 		expect(shouldPersistLayout(clicked, settled, preset, false)).toBe(false);
 	});
 
+	test('a 12 px nudge of a sash is a change, and is written', () => {
+		const nudged = scaled('edit', 1);
+		nudged.grid.root.data[0].data[0].size += 12;
+		nudged.grid.root.data[0].data[1].size -= 12;
+		expect(shouldPersistLayout(nudged, scaled('edit', 1), preset, false)).toBe(true);
+	});
+
 	test('a sash dragged is a change, and is written', () => {
 		expect(shouldPersistLayout(dragged(), scaled('edit'), preset, false)).toBe(true);
 		expect(shouldPersistLayout(dragged(), scaled('edit'), preset, true)).toBe(true);

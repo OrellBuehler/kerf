@@ -22,6 +22,11 @@ const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'l
 /** How long after the last layout change the arrangement is written. */
 const SAVE_DELAY_MS = 500;
 
+/** How long the window must hold still before a resize counts as over. Dockview
+ *  re-lays the grid out a frame after each size it is given, so this is a few
+ *  frames of margin. */
+const RESIZE_SETTLE_MS = 150;
+
 class WorkspaceState {
 	/** The panels currently shown, in dockview's order. */
 	open = $state<PanelId[]>([]);
@@ -44,6 +49,8 @@ class WorkspaceState {
 	 *  workspace merely visited as customised. */
 	#reference: SerializedDockview | null = null;
 	#settle = 0;
+	#resizing = false;
+	#resizeTimer: ReturnType<typeof setTimeout> | null = null;
 	#subs: Array<{ dispose(): void }> = [];
 
 	/** Take over a freshly created dock (built in `host`): build the active
@@ -63,8 +70,51 @@ class WorkspaceState {
 				if (this.#restoring || !this.#reference) return;
 				if (this.#timer) clearTimeout(this.#timer);
 				this.#timer = setTimeout(() => this.#save(), SAVE_DELAY_MS);
-			})
+			}),
+			this.#watchResize(host)
 		);
+	}
+
+	/** A window resize changes more than pixels: where a group's minimum binds,
+	 *  the branch's shares move too, so the layout afterwards is not the layout
+	 *  the reference describes — and the next unrelated layout event (a click on
+	 *  a tab) would write it down as an arrangement nobody made. So when the host
+	 *  changes size: write what the user did before it (still on the debounce),
+	 *  ignore the layout events the resize causes, and once it has held still
+	 *  take the new layout as the reference. */
+	#watchResize(host: HTMLElement): { dispose(): void } {
+		let width = host.clientWidth;
+		let height = host.clientHeight;
+		const observer = new ResizeObserver(() => {
+			// The observer reports the size it starts with; only a change is a resize.
+			if (host.clientWidth === width && host.clientHeight === height) return;
+			width = host.clientWidth;
+			height = host.clientHeight;
+			if (!this.#resizing) {
+				this.#resizing = true;
+				this.#flush();
+			}
+			this.#reference = null;
+			if (this.#timer) {
+				clearTimeout(this.#timer);
+				this.#timer = null;
+			}
+			if (this.#resizeTimer) clearTimeout(this.#resizeTimer);
+			this.#resizeTimer = setTimeout(() => {
+				this.#resizeTimer = null;
+				this.#resizing = false;
+				this.#takeReference();
+			}, RESIZE_SETTLE_MS);
+		});
+		observer.observe(host);
+		return {
+			dispose: () => {
+				observer.disconnect();
+				if (this.#resizeTimer) clearTimeout(this.#resizeTimer);
+				this.#resizeTimer = null;
+				this.#resizing = false;
+			}
+		};
 	}
 
 	detach() {
