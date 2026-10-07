@@ -338,7 +338,7 @@ impl Project {
     /// enclosing override). This is how a tool takes an optional per-call
     /// `ripple` argument without every edit method growing a parameter:
     ///
-    /// ```ignore
+    /// ```text
     /// project.with_ripple(args.ripple, |p| p.trim(clip, None, Some(4.0), None))?;
     /// ```
     ///
