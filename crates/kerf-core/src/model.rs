@@ -446,6 +446,17 @@ impl Asset {
         self.streams.iter().find_map(|s| s.hdr())
     }
 
+    /// Whether this asset's picture carries an alpha channel, by the probed pixel format of
+    /// its first video stream. `false` for a format that was never recorded (assets saved
+    /// before the field existed): nothing is assumed transparent that was never seen to be.
+    pub fn has_alpha(&self) -> bool {
+        self.streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(|s| s.pix_fmt.as_deref())
+            .is_some_and(pix_fmt_has_alpha)
+    }
+
     /// This asset as seen through its generated preview proxy: same metadata
     /// (so the composite geometry matches the export) but SDR, because the
     /// proxy was tone-mapped when it was encoded and must not be converted a
@@ -2180,8 +2191,11 @@ impl Clip {
     /// size-changing `scale` last). The test is on the keyed values, not on the
     /// expression the engine writes.
     pub fn zoom_animated(&self) -> bool {
-        let mut scales = self.keyframes.iter().map(|k| k.scale);
-        scales.next().is_some_and(|first| scales.any(|s| (s - first).abs() > 1e-9))
+        // Against the first key *in time*, which is the one the engine's expression holds
+        // before the clip's first moment (the stored order is not guaranteed to be sorted).
+        let keys = self.sorted_keyframes();
+        keys.first()
+            .is_some_and(|first| keys.iter().any(|k| (k.scale - first.scale).abs() > 1e-9))
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -5322,6 +5336,15 @@ mod tests {
         assert!(clip.zoom_animated());
         clip.keyframes = vec![key(2.0, 0.75, 0.0), key(0.0, 0.5, 0.0)];
         assert!(clip.zoom_animated());
+        // Held against the first key in *time*: a stored order that puts a later key first
+        // gives the same answer, at the edge of the tolerance too.
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0), key(2.0, 0.5 + 1.6e-9, 0.0)];
+        assert!(
+            clip.zoom_animated(),
+            "1.6e-9 from the first key in time, though 0.8e-9 from the stored first"
+        );
+        clip.keyframes = vec![key(1.0, 0.5 + 0.8e-9, 0.0), key(0.0, 0.5, 0.0)];
+        assert!(!clip.zoom_animated());
     }
 
     #[test]

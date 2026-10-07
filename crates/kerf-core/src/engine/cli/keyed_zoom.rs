@@ -15,6 +15,11 @@
 //! stream. Each frame is also compared with the scrubbed still of the same moment,
 //! the picture the editor is looking at while cutting.
 //!
+//! The same harness holds the neighbouring graph bugs to their pictures: how soft a blur's edge
+//! is at each zoom in the still and in the file (`a_moving_zoom_blurs_the_still_and_the_export_alike`),
+//! a picture zoomed to a fraction of a pixel, HLG footage whose fit is an odd size, and a
+//! transparent PNG / FFV1 source over a track below.
+//!
 //! `cargo test -p kerf-core --no-default-features -- --ignored keyed_zoom`
 //! (`KERF_FFMPEG` / `KERF_FFPROBE` pick the build).
 
@@ -115,6 +120,60 @@ fn two_tone_still(dir: &Path) -> Asset {
     let mut asset = test_asset(vec![image_stream(SW, SH)]);
     asset.path = path.to_string_lossy().into_owned();
     asset.duration = crate::model::DEFAULT_IMAGE_DURATION;
+    asset
+}
+
+/// The picture with its left half cut out (alpha 0), as an `rgba` filter graph.
+fn picture_with_clear_left(fps: &str, secs: f64) -> String {
+    format!(
+        "{},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,{}),0,255)'",
+        picture(fps, secs),
+        SW / 2
+    )
+}
+
+/// The transparent-left-half picture as a PNG sticker: `rgba`, which the probe records.
+fn two_tone_alpha_still(dir: &Path) -> Asset {
+    let path = dir.join("two-tone-alpha.png");
+    if !path.exists() {
+        ffmpeg(&[
+            s("-f"),
+            s("lavfi"),
+            s("-i"),
+            picture_with_clear_left("1", 1.0),
+            s("-frames:v"),
+            s("1"),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    let mut asset = test_asset(vec![image_stream(SW, SH)]);
+    asset.streams[0].pix_fmt = Some("rgba".into());
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = crate::model::DEFAULT_IMAGE_DURATION;
+    asset
+}
+
+/// The transparent-left-half picture as a lossless FFV1 clip in `yuva420p`.
+fn two_tone_alpha_video(dir: &Path, fps: &str, secs: f64) -> Asset {
+    let path = dir.join(format!("two-tone-alpha-{fps}-{secs}.mkv"));
+    if !path.exists() {
+        ffmpeg(&[
+            s("-f"),
+            s("lavfi"),
+            s("-i"),
+            picture_with_clear_left(fps, secs),
+            s("-c:v"),
+            s("ffv1"),
+            s("-pix_fmt"),
+            s("yuva420p"),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    let mut asset = test_asset(vec![video_stream(SW, SH, fps.parse().unwrap())]);
+    asset.streams[0].codec = "ffv1".into();
+    asset.streams[0].pix_fmt = Some("yuva420p".into());
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = secs;
     asset
 }
 
@@ -343,7 +402,7 @@ struct Expected {
 /// The geometry of `clip` at `local` seconds, from `Clip::transform_at` alone: crop the
 /// source, fit it into the frame, zoom it about its centre, cut it with the mask,
 /// rotate it about its centre, put that centre at the frame's centre plus the offset.
-fn expected(clip: &Clip, local: f64, fit: Fit) -> Expected {
+fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
     let tf = clip.transform_at(local);
     let (sw, sh) = (f64::from(SW), f64::from(SH));
     let (cw, ch) = (f64::from(CW), f64::from(CH));
@@ -427,10 +486,22 @@ fn expected(clip: &Clip, local: f64, fit: Fit) -> Expected {
         ];
     }
     let (ccx, ccy) = ((kept[0] + kept[2]) / 2.0, (kept[1] + kept[3]) / 2.0);
-    let blue = [(BOX[0] - ccx) * k, (BOX[1] - ccy) * k, (BOX[2] - ccx) * k, (BOX[3] - ccy) * k];
+    // A source with its left half cut out shows nothing left of the cut.
+    if clear_left {
+        visible[0] = visible[0].max((f64::from(SW / 2) - ccx) * k);
+    }
+    let mut blue = [(BOX[0] - ccx) * k, (BOX[1] - ccy) * k, (BOX[2] - ccx) * k, (BOX[3] - ccy) * k];
+    // ... and the box shows only what is inside it.
+    blue = [
+        blue[0].max(visible[0]),
+        blue[1].max(visible[1]),
+        blue[2].min(visible[2]),
+        blue[3].min(visible[3]),
+    ];
+    let nothing = |r: [f64; 4]| r[2] <= r[0] || r[3] <= r[1];
     Expected {
-        picture: place(visible),
-        blue: place(blue),
+        picture: (!nothing(visible)).then(|| place(visible)).flatten(),
+        blue: (!nothing(blue)).then(|| place(blue)).flatten(),
         opacity: tf.opacity,
     }
 }
@@ -474,6 +545,28 @@ fn keys(position: bool, rotation: bool, opacity: bool) -> Vec<Keyframe> {
     k
 }
 
+/// What the keyed clip is cut from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// The two-tone clip at this frame rate (the text the graph carries).
+    Video(&'static str),
+    /// The same picture as a still image.
+    Still,
+    /// HLG BT.2020 footage at this rate, tone-mapped to SDR by the chain.
+    Hlg(&'static str),
+    /// The picture with its **left half transparent**, as a PNG sticker (`rgba`).
+    AlphaStill,
+    /// The same with a transparent left half, as a lossless `yuva420p` clip at this rate.
+    AlphaVideo(&'static str),
+}
+
+impl Source {
+    /// The left half of the picture is cut out.
+    fn clear_left(self) -> bool {
+        matches!(self, Source::AlphaStill | Source::AlphaVideo(_))
+    }
+}
+
 /// One keyed clip over the green base, and what to hold it to.
 struct Case {
     name: String,
@@ -482,8 +575,7 @@ struct Case {
     decorate: Box<dyn Fn(&mut Clip)>,
     fit: Fit,
     rate: Rate,
-    /// The source's frame rate (the text the graph carries), or `None` for a still.
-    source_fps: Option<&'static str>,
+    source: Source,
     /// Seconds on the timeline the clip is shown for, and where it starts.
     shown: f64,
     start: f64,
@@ -495,8 +587,6 @@ struct Case {
     tolerance: f64,
     /// Export only this span of the timeline (`ExportOptions::range`).
     range: Option<(f64, f64)>,
-    /// The footage is HLG BT.2020, so the chain tone-maps it to SDR.
-    hdr: bool,
     /// A clip of the same footage ahead of the keyed one, and the transition the keyed
     /// clip comes in with; its frames are measured once the transition is over.
     transition: Option<Transition>,
@@ -510,14 +600,13 @@ impl Case {
             decorate: Box::new(|_| {}),
             fit: Fit::Contain,
             rate: R30,
-            source_fps: Some("30"),
+            source: Source::Video("30"),
             shown: 2.4,
             start: 0.5,
             blue: true,
             opacity: true,
             tolerance: 3.5,
             range: None,
-            hdr: false,
             transition: None,
         }
     }
@@ -553,8 +642,8 @@ impl Case {
         self
     }
 
-    fn hdr(mut self) -> Self {
-        self.hdr = true;
+    fn from(mut self, source: Source) -> Self {
+        self.source = source;
         self
     }
 
@@ -574,20 +663,19 @@ impl Case {
         let fps = self.rate.0;
         let total = self.start + self.shown + 0.5;
         let base = green(dir, fps, total + 1.0);
-        let (src, speed_span) = match self.source_fps {
-            Some(sf) => {
-                // A faster clip needs more source for the same time on the timeline.
-                let mut clip = Clip::new(base.id, 0.0, 1.0, 0.0);
-                (self.decorate)(&mut clip);
-                let span = self.shown * clip.speed_mag();
-                let src = if self.hdr {
-                    two_tone_hlg(dir, sf, span + 1.0).expect("the test checked that an HLG clip can be made")
-                } else {
-                    two_tone(dir, sf, span + 1.0)
-                };
-                (src, span)
-            }
-            None => (two_tone_still(dir), self.shown),
+        // A faster clip needs more source for the same time on the timeline.
+        let mut probe = Clip::new(base.id, 0.0, 1.0, 0.0);
+        (self.decorate)(&mut probe);
+        let span = self.shown * probe.speed_mag();
+        let (src, speed_span) = match self.source {
+            Source::Video(sf) => (two_tone(dir, sf, span + 1.0), span),
+            Source::Hlg(sf) => (
+                two_tone_hlg(dir, sf, span + 1.0).expect("the test checked that an HLG clip can be made"),
+                span,
+            ),
+            Source::Still => (two_tone_still(dir), self.shown),
+            Source::AlphaStill => (two_tone_alpha_still(dir), self.shown),
+            Source::AlphaVideo(sf) => (two_tone_alpha_video(dir, sf, span + 1.0), span),
         };
         let mut clip = make_clip(src.id, 0.0, speed_span, self.start);
         (self.decorate)(&mut clip);
@@ -638,7 +726,7 @@ fn check(dir: &Path, case: &Case) -> Worst {
         if t < settled.max(clip.timeline_start) + margin || t > end - margin {
             continue;
         }
-        let want = expected(clip, t - clip.timeline_start, case.fit);
+        let want = expected(clip, t - clip.timeline_start, case.fit, case.source.clear_left());
         let got_picture = bbox(frame, is_picture);
         let got_blue = bbox(frame, is_blue);
         let at = format!("{}: frame {k} (t = {t:.4}, local {:.4})", case.name, t - clip.timeline_start);
@@ -923,11 +1011,11 @@ fn keyed_zoom_works_on_hdr_footage() {
             // Tone-mapping moves the colours, so the opacity and the edge of the blue box
             // (where the tone-mapped blue meets the tone-mapped red) read differently.
             Case::new("scale + position + opacity, HLG", keys(true, false, true))
-                .hdr()
+                .from(Source::Hlg("30"))
                 .without_opacity()
                 .tolerance(6.0),
             Case::new("scale + rotation, HLG", keys(false, true, false))
-                .hdr()
+                .from(Source::Hlg("30"))
                 .without_opacity()
                 .tolerance(6.0),
         ],
@@ -957,9 +1045,9 @@ fn keyed_zoom_follows_a_range_export() {
 #[ignore = "needs the ffmpeg binary"]
 fn keyed_zoom_animates_under_either_fit_for_stills_and_retimed_clips() {
     let mut still = Case::new("still image + position", keys(true, false, false));
-    still.source_fps = None;
+    still.source = Source::Still;
     let mut still_rot = Case::new("still image + rotation + opacity", keys(false, true, true)).rotated();
-    still_rot.source_fps = None;
+    still_rot.source = Source::Still;
     run_all(
         "fits",
         vec![
@@ -993,7 +1081,7 @@ fn keyed_zoom_is_evaluated_at_the_output_frames_of_every_rate() {
         .map(|&rate| {
             let mut case = Case::new(format!("{} fps", rate.0), keys(true, false, true));
             case.rate = rate;
-            case.source_fps = Some(rate.0);
+            case.source = Source::Video(rate.0);
             case.start = 0.37;
             case
         })
@@ -1009,7 +1097,7 @@ fn keyed_zoom_is_evaluated_at_the_output_frames_of_every_rate() {
 fn a_slow_source_zooms_smoothly_on_every_output_frame() {
     let dir = scratch("slow");
     let mut case = Case::new("10 fps source in a 30 fps export", keys(true, false, false));
-    case.source_fps = Some("10");
+    case.source = Source::Video("10");
     let w = check(&dir, &case);
 
     // The blue box's width over the zoom-in (clip-local 0 to 0.9 s), frame by frame.
@@ -1062,7 +1150,7 @@ fn keyed_zoom_works_on_layers_that_share_an_input() {
         if t < clip.timeline_start + 0.05 || t > clip.timeline_start + clip.duration() - 0.05 {
             continue;
         }
-        let want = expected(clip, t - clip.timeline_start, Fit::Contain);
+        let want = expected(clip, t - clip.timeline_start, Fit::Contain, false);
         let (got, want) = (bbox(frame, is_blue).expect("blue"), want.blue.expect("blue expected"));
         assert!(got.off_by(want) <= 3.5, "frame {k}: {got:?} against {want:?}");
         measured += 1;
@@ -1119,7 +1207,7 @@ fn the_playback_stream_zooms_too() {
         if !(0.1..clip.duration() - 0.1).contains(&local) {
             continue;
         }
-        let want = expected(&clip, local, Fit::Contain);
+        let want = expected(&clip, local, Fit::Contain, false);
         let (got, want_blue) = (bbox(pixels, is_blue), want.blue);
         let at = format!("playback frame at t = {:.3} (local {local:.3})", f.time);
         match (got, want_blue) {
@@ -1147,6 +1235,281 @@ fn the_playback_stream_zooms_too() {
         "playback stream: {measured} frames, worst {worst:.1}px vs transform_at"
     )]);
     cleanup(&dir);
+}
+
+/// The 10 to 90 per cent width of the blue box's left edge, on the row through its middle: how
+/// soft the edge is. Red is 0 and blue is 1, read off the two channels that tell them apart.
+fn edge_width(frame: &[u8], blue: Rect) -> f64 {
+    let y = ((blue.y0 + blue.y1) / 2.0) as u32;
+    let blueness = |x: u32| {
+        let p = px(frame, x, y);
+        (f64::from(p[2] - p[0]) / 255.0 + 1.0) / 2.0
+    };
+    let mut x = ((blue.x0 + blue.x1) / 2.0) as u32;
+    while x > 0 && blueness(x) >= 0.9 {
+        x -= 1;
+    }
+    let at_90 = x;
+    while x > 0 && blueness(x) >= 0.1 {
+        x -= 1;
+    }
+    f64::from(at_90 - x)
+}
+
+/// A blur is part of the picture, and a moving zoom magnifies the picture: its edges are as soft
+/// as the zoom is large (the chain runs the zoom last, and so does the still). The still used to
+/// zoom first and blur after, so its edge was the same softness at every zoom while the export's
+/// grew with it: at a zoom of 0.5 the still was twice as soft as the file, at 1.6 a third sharper.
+/// Four moments of one zoom, a blur of sigma 6 (a strong one, so the edge is wide enough to
+/// measure): the export's edge width tracks the zoom, and the still's is the export's.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_moving_zoom_blurs_the_still_and_the_export_alike() {
+    let dir = scratch("softness");
+    let case = Case::new("blur on a moving zoom", zoom_keys()).decorated(|c| {
+        c.effects = vec![VideoEffect::Blur { sigma: 6.0 }];
+    });
+    let (timeline, assets) = case.timeline(&dir);
+    let opts = options(R30, Fit::Contain);
+    let frames = export_frames(&timeline, &assets, &opts, &dir, "softness");
+    let clip = &timeline.tracks[1].clips[0];
+    let mut widths = Vec::new();
+    for local in [0.11, 0.47, 0.9, 1.5] {
+        let k = ((clip.timeline_start + local) * 30.0).round() as u64;
+        let t = ffmpeg_frame_time(k, 30, 1);
+        let zoom = clip.transform_at(t - clip.timeline_start).scale;
+        let still = still_frame(&timeline, &assets, &opts, t);
+        let export = &frames[k as usize];
+        let (eb, sb) = (bbox(export, is_blue).expect("blue"), bbox(&still, is_blue).expect("blue"));
+        let (we, ws) = (edge_width(export, eb), edge_width(&still, sb));
+        assert!(
+            (we - ws).abs() <= (0.15 * we).max(2.0),
+            "zoom {zoom:.2}: the export's edge is {we} px wide, the still's {ws}"
+        );
+        widths.push((zoom, we, ws));
+    }
+    // The edge grows with the zoom: 3.2 times between 0.5 and 1.6, give or take the chroma.
+    let (small, large) = (widths[0], widths[2]);
+    let ratio = large.1 / small.1;
+    assert!((2.0..4.5).contains(&ratio), "{widths:?}");
+    report_lines(&[format!(
+        "blur edge widths (zoom, export px, still px): {}",
+        widths
+            .iter()
+            .map(|(z, e, s)| format!("({z:.2}, {e}, {s})"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )]);
+    cleanup(&dir);
+}
+
+/// A picture zoomed to a fraction of a pixel is 1 px, not full size: `scale` reads a width that
+/// evaluates to 0 as "unset" and keeps the input's. A scale of 0.0004 on a 240 px picture snapped
+/// to 240 px, at a constant zoom and at the first frames of a keyed one. The picture here is a
+/// speck (the blue box is not measurable), held to where `transform_at` puts it, in the export
+/// and in the still.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_picture_zoomed_to_a_fraction_of_a_pixel_does_not_snap_to_full_size() {
+    let held_then_up = |last: f64| {
+        let key = |time, scale| Keyframe {
+            time,
+            scale,
+            pos_x: 0.1,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        };
+        vec![key(0.0, 0.0004), key(0.8, 0.0004), key(1.4, last), key(2.0, last)]
+    };
+    run_all(
+        "tiny",
+        vec![
+            Case::new("a constant scale of 0.0004", vec![])
+                .decorated(|c| {
+                    c.transform.scale = 0.0004;
+                    c.transform.pos_x = 0.1;
+                })
+                .without_blue(),
+            Case::new("keys from 0.0004 to 0.8 (a moving zoom)", held_then_up(0.8)).without_blue(),
+            Case::new("keys held at 0.0004 (no zoom to move)", held_then_up(0.0004)).without_blue(),
+        ],
+    );
+}
+
+/// HLG footage is tone-mapped by `zscale`, which aborts the graph on a size that is not a
+/// multiple of the chroma subsampling: 4:3 footage Contain-fitted into a 9:16 frame is 180 x 135,
+/// and a constant zoom of 0.45 of that is 81 x 60. Rendered at a transform (no pad, so the fit's
+/// size is what `zscale` sees) for a constant zoom and a moving one.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn hdr_footage_with_an_odd_fit_size_renders() {
+    let (w, h) = (180u32, 320u32);
+    let dir = scratch("hdr-odd");
+    let Some(hlg) = two_tone_hlg(&dir, "30", 3.0) else {
+        report_lines(&["skipped: this ffmpeg cannot make the HLG test clip".to_string()]);
+        cleanup(&dir);
+        return;
+    };
+    let opts = ExportOptions {
+        resolution: Some((w, h)),
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    // The picture's box in this frame, from the fit (a 4:3 picture is `w` wide and 3/4 of that
+    // high), the zoom and the offset: where it is expected within a couple of pixels.
+    let expect = |scale: f64, pos_x: f64| {
+        let (pw, ph) = (f64::from(w) * scale, f64::from(w) * 0.75 * scale);
+        let (cx, cy) = (f64::from(w) / 2.0 + pos_x * f64::from(w), f64::from(h) / 2.0);
+        // (cut at the frame's edges, which a moved picture runs into)
+        (
+            (cx - pw / 2.0).max(0.0),
+            (cy - ph / 2.0).max(0.0),
+            (cx + pw / 2.0).min(f64::from(w)),
+            (cy + ph / 2.0).min(f64::from(h)),
+        )
+    };
+    let drawn = |frame: &[u8]| {
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                if frame[i..i + 3].iter().any(|v| *v > 60) {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                }
+            }
+        }
+        (f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+    };
+    let run = |name: &str, clip: Clip| {
+        let tl = timeline_of(vec![video_track(vec![clip.clone()])]);
+        let out = dir.join(format!("{name}.rgb"));
+        let mut args = build_export_args(&tl, std::slice::from_ref(&hlg), "unused.mkv", &opts).unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        args.truncate(graph + 1);
+        args.extend(
+            [
+                "-map",
+                "[outv]",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-y",
+            ]
+            .map(s),
+        );
+        args.push(out.to_string_lossy().into_owned());
+        let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{name}: {}\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let raw = std::fs::read(&out).unwrap();
+        let frames: Vec<&[u8]> = raw.chunks((w * h * 3) as usize).collect();
+        assert!(frames.len() >= 60, "{name}: {} frames", frames.len());
+        (tl, frames.iter().map(|f| f.to_vec()).collect::<Vec<_>>())
+    };
+    let near = |got: (f64, f64, f64, f64), want: (f64, f64, f64, f64), what: &str| {
+        let off = [got.0 - want.0, got.1 - want.1, got.2 - want.2, got.3 - want.3]
+            .iter()
+            .fold(0.0f64, |m, d| m.max(d.abs()));
+        assert!(off <= 4.0, "{what}: the picture is {got:?}, expected {want:?}");
+    };
+    // A constant zoom: 81 x 60.75, an odd size to the scaler.
+    let mut constant = make_clip(hlg.id, 0.0, 2.0, 0.0);
+    constant.transform.scale = 0.45;
+    let (_, frames) = run("constant", constant);
+    near(drawn(&frames[15]), expect(0.45, 0.0), "a constant zoom of 0.45");
+    // The same size with a transform that is not a zoom (no pad either).
+    let mut moved = make_clip(hlg.id, 0.0, 2.0, 0.0);
+    moved.transform.pos_x = 0.05;
+    let (_, frames) = run("moved", moved);
+    near(drawn(&frames[15]), expect(1.0, 0.05), "a moved picture");
+    // A moving zoom: the fit is even now, and the zoom runs after the tone-map.
+    let mut moving = make_clip(hlg.id, 0.0, 2.0, 0.0);
+    moving.keyframes = vec![
+        Keyframe {
+            time: 0.0,
+            scale: 0.45,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        },
+        Keyframe {
+            time: 1.8,
+            scale: 0.9,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        },
+    ];
+    let (tl, frames) = run("moving", moving);
+    let clip = &tl.tracks[0].clips[0];
+    for k in [3u64, 15, 30, 45] {
+        let scale = clip.transform_at(ffmpeg_frame_time(k, 30, 1)).scale;
+        near(
+            drawn(&frames[k as usize]),
+            expect(scale, 0.0),
+            &format!("a moving zoom at frame {k}"),
+        );
+    }
+    cleanup(&dir);
+}
+
+/// Footage with an alpha channel keeps it to the end of the chain. The terminal `format=` of a
+/// chain with no alpha plane of its own flattened a sticker's cut-out onto black (the picture drew
+/// as a whole rectangle where the still, which has no terminal format, cut it out and showed the
+/// track below), and a moving zoom, whose chain ends in `yuva420p`, flipped it back: the same sticker
+/// was opaque or transparent depending on whether its scale moved. The left half of the picture
+/// is transparent here (a PNG and an FFV1 clip), over the green frame.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_source_with_alpha_keeps_its_cut_out_in_the_export_and_the_still() {
+    let steady = |scale: f64| {
+        move |c: &mut Clip| {
+            c.transform.scale = scale;
+            c.transform.pos_x = 0.1;
+        }
+    };
+    run_all(
+        "alpha",
+        vec![
+            Case::new("transparent PNG, a constant zoom", vec![])
+                .from(Source::AlphaStill)
+                .decorated(steady(0.8)),
+            Case::new("transparent PNG, keys that hold the zoom", keys_holding_the_zoom()).from(Source::AlphaStill),
+            Case::new("transparent PNG, a moving zoom", keys(true, false, false)).from(Source::AlphaStill),
+            Case::new("transparent PNG, a moving zoom + rotation", keys(false, true, true))
+                .from(Source::AlphaStill)
+                .rotated(),
+            Case::new("transparent FFV1, a constant zoom", vec![])
+                .from(Source::AlphaVideo("30"))
+                .decorated(steady(0.8)),
+            Case::new("transparent FFV1, keys that hold the zoom", keys_holding_the_zoom()).from(Source::AlphaVideo("30")),
+            Case::new("transparent FFV1, a moving zoom", keys(true, false, false)).from(Source::AlphaVideo("30")),
+            Case::new("transparent FFV1, a moving zoom + opacity", keys(false, false, true)).from(Source::AlphaVideo("30")),
+            Case::new("transparent FFV1, cover", vec![])
+                .from(Source::AlphaVideo("30"))
+                .fit(Fit::Cover)
+                .decorated(steady(0.8)),
+        ],
+    );
+}
+
+/// Position keys over a zoom that holds still (0.8 throughout).
+fn keys_holding_the_zoom() -> Vec<Keyframe> {
+    let mut k = keys(true, false, false);
+    for key in &mut k {
+        key.scale = 0.8;
+    }
+    k
 }
 
 // ---- what it costs ----------------------------------------------------------
