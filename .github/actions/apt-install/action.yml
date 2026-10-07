@@ -38,6 +38,16 @@ runs:
           fi
           echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
           sudo dpkg --configure -a || true
+          # The runner's mirror list puts azure.archive.ubuntu.com first; when it
+          # is the mirror that stalls (every attempt dying in `update` right after
+          # it answers `Ign`), retrying through it again only stalls again. The
+          # rest of the list (archive / security.ubuntu.com) still serves.
+          if [ -f /etc/apt/apt-mirrors.txt ] \
+            && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt \
+            && grep -qv 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+            echo "::notice::dropped the Azure Ubuntu mirror for the retry"
+          fi
           sleep $((attempt * 10))
         done
         echo "::error::apt-get failed three times"
