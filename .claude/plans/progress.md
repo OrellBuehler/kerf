@@ -15,7 +15,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
 | B4 Mixer | `feat/mixer` | OrellBuehler/kerf#110 | merged | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
-| B5 Keyframes v2 | `feat/keyframe-easing` (B5a) | — | in-progress | B5a done locally: per-key `Easing` (linear / hold / CSS eases / unit-square bezier), an eased segment is a 12-piece polyline shared by `transform_at` and the export (sweep at every output frame, mutation-checked), exact head trims / slices, `set_keyframe_easing` (core, Tauri, MCP), TS mirror pinned bit for bit, Inspector picker. Next: per-property channels, dope sheet. |
+| B5 Keyframes v2 | `feat/keyframe-easing` (B5a), `feat/keyframe-channels` (B5b-1) | — | in-progress | B5a done and merged (per-key `Easing`, an eased segment is a 12-piece polyline shared by `transform_at` and the export, exact head trims / slices, `set_keyframe_easing`, TS mirror pinned bit for bit). **B5b-1 done locally** (stacked on main): per-property channels — `Clip.channels: Vec<PropertyTrack>` for scale / position / rotation / opacity, the five colour numbers and the clip volume, one resolver (`Clip::property_keys`) over the legacy bundle, old projects byte-identical (golden 0..4800 untouched, 800 channel cases appended); export: keyed colour = `eq eval=frame`, keyed volume = `asetnsamples=n=128:p=0,volume eval=frame` after `atempo`, a transform keyed in part builds the rest from the static one; plan: `color_at`, `Animated.keys` / `color`, `GpuCaps::keyed_color` / `Unsupported::KeyedColor`; `set_property_keyframes` / `copy_keyframes` / `set_keyframe_easing prop` (core, Tauri, MCP, harness), TS mirror `channels.ts`, Inspector ◇ keys for colour and volume, preview ramps a keyed volume; a split now rebases the right half's animation. **Next (B5b-2)**: dope sheet panel (rows per property, marquee, drag-retime, copy/paste, Alt-duplicate), easing popover, mask params and crop (reformulated as zoom + pan) as animatable, GPU pass + parity case for animated colour, graph editor with bezier handles. |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
 | A6 Headless agent rendering | — | — | todo | |
@@ -442,6 +442,51 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   `set_keyframe_easing`. (5) A head trim still bakes the rest of a curve into linear keys:
   lossy for the picker, exact for the picture, and now documented rather than changed (`Easing::split`
   could keep one eased key there; the picture is already right).
+
+- **2026-10-08 — B5b-1: per-property channels, and why the bundle is not migrated.** The plan said
+  `Vec<PropertyTrack{prop, keys}>` "with migration from the whole-transform `Keyframe`". Converting
+  the bundle into five tracks on load would have been lossless, but it makes every legacy clip's graph
+  depend on the conversion (the golden generator assigns `clip.keyframes` directly and ~50 tests do),
+  leaves two representations alive anyway for the UI (the Inspector's Animation list, the timeline's
+  diamonds read `clip.keyframes`), and rewrites projects a user only opened. So **the bundle stays as
+  it is and is one source for a number that has no track of its own**: `Clip::property_keys(prop)` is
+  the only reader (track → bundle → static), `transform_at` / `color_at` / `volume_at` / the export / the
+  plan are views of it, and the first per-property write *detaches* just that number (copies its bundle
+  keys into a track; an empty track means "static, whatever the bundle says" and is pruned when the bundle
+  goes). Chosen over migrate-on-first-write (which makes the Inspector show an animated clip as
+  unanimated until the UI reads tracks) and over "a track and the bundle both apply" (no answer to which
+  wins). Cost: edits have two code paths (`rebase_animation` runs the bundle and `rebase_channels`) —
+  both pinned, one TS mirror each.
+- **2026-10-08 — B5b-1: what FFmpeg does with the expressions (4.4.2 and 9.0.2 identical).**
+  *Colour*: `eq` takes an expression for every number (`brightness`, `contrast`, `saturation`, `gamma`,
+  `gamma_r`, `gamma_b`) under `eval=frame`; `t` is the frame timestamp, so after `setpts` it is timeline
+  time and the existing `(t-start)` form works. 18 rendered cases (each number, all five, late, speed 2 /
+  0.5 / reversed, beside a keyed position + opacity, under a moving zoom, beside a static grade, range
+  export, five rates) read 0 levels from the static-`eq` still at every fifth frame (3 with a keyed
+  opacity: the still's RGB round trip vs the file's `geq`). Contrast pivots on luma 128: a mid-grey
+  picture shows nothing. *Volume*: `volume=eval=frame` holds one gain per frame and the decoder's frames
+  are 1024 samples (21 ms), so the chain cuts them to 128 samples first (`asetnsamples=n=128:p=0`; the
+  default `p=1` pads the last frame with silence) — the render is then the unkeyed render scaled by
+  the curve at each frame's start to 1.5e-8, and the lag against the curve is at most 2.7 ms. It sits
+  after `atempo` (so `t` is the clip's playing time: checked at 0.5 / 2 / reversed / late / range
+  export). A hold's step landing exactly on a frame start flips on float rounding of `t` — the tests keep
+  steps off the 1/375 s grid. Mutation checks: `eval=init` and a missing `asetnsamples` both fail the
+  rendered tests; the sweep fails a changed temperature coefficient and a static opacity / turn
+  dropped from a clip keyed in part. *Not animatable yet*: crop edges (`crop`'s output size is fixed
+  when the graph is configured) and mask parameters (a `geq` expression could carry them; waits for an
+  editor that can set them).
+- **2026-10-08 — B5b-1: a split did not carry the animation (fixed).** `Timeline::split_clip` copied the
+  clip, so the right half's keys stayed clip-local to the *old* start and its animation replayed from
+  the first key — for the bundle and the reframe camera as much as for channels. It now rebases the
+  right half (`rebase_animation(at - start)`, the pose it opens on pinned, later keys shifted), with a
+  Rust and a TS test; the linked-A/V corpus did not move (no keyed clips in it).
+- **2026-10-08 — B5b-1: the plan.** A transform keyed in part is not built like one keyed in full, so
+  `Placement::keyframed` became `Option<Keyed {scale, rotation, rotates, opacity}>` (`Keyed::all` is the
+  bundle) and `Animated.keys` carries it; `Animated` is `Some` for colour-only clips too, with `keys:
+  None`. A Motion plan refuses a keyed colour (`Unsupported::KeyedColor`) until a pass and a parity
+  case exist; a still plan draws the sampled `color_at`. The preview's Web Audio gain ramps through a
+  keyed volume's points (`gainBreakpoints`); the timeline's volume line and waveform scaling still read
+  the static gain (the dope-sheet slice owns those).
 
 ## Needs a real machine
 
