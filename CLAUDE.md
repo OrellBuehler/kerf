@@ -1667,7 +1667,8 @@ no editing logic in the adapter.
 ### kerf-gpu (`crates/kerf-gpu/`)
 
 The wgpu compositor — work package A0 of `.claude/plans/gpu-compositor-and-roadmap.md`,
-a feasibility spike **not linked into kerf-app yet**. It draws a `RenderPlan` headless
+a feasibility spike that `kerf-app` now links (A2: the Preview panel's opt-in native
+surface, `crates/kerf-app/src/gpu_preview.rs`, below). It draws a `RenderPlan` headless
 (`Gpu::new(GpuOptions)`: instance / adapter / device, an `Err` rather than a panic
 when there is no adapter, `force_fallback_adapter` for the software one) and reads
 RGBA back. wgpu is built with the Vulkan / Metal / DX12 backends only — no GLES, no
@@ -1693,6 +1694,25 @@ nothing for that layer, and so does the compositor. The layers of a frame decode
 parallel, each given `budget / layers` threads even at a full CPU budget
 (`limit_ffmpeg_args(args, share)`). That is the one-shot path; `FrameSource` (below) is the
 long-lived one.
+
+**Presenting a frame (A2).** `Compositor::render_plan_texture_with` is `render_plan_with`
+without the readback: the finished composite stays on the GPU as a `RenderedFrame` (an
+`Rgba8Unorm` texture; `read_back(&Gpu)` copies it out for a test — `tests/parity.rs`'
+end-to-end case asserts the texture, read back, is the picture `render_plan` draws, bit for
+bit — and `from_rgba` uploads a picture the compositor did not draw).
+`Gpu::new_for_surface(options, target)` opens the device on an adapter that can present to a
+window (the surface is made first and the adapter asked to be compatible with it, so a
+hybrid-GPU laptop uses the one that drives the screen; a surface that cannot be made — a
+window system no backend takes — is `GpuError::Surface`, never a panic), and `Presenter`
+configures it (a **non-sRGB** format if the adapter has one, so the encoded values the
+composite holds go out as written, and an sRGB target decodes them in the shader first;
+`Opaque` alpha — the webview is what is transparent, never the surface) and draws a
+`RenderedFrame` into a rectangle (`present.wgsl`: a texel centre per pixel, so exact at 1:1
+and bilinear otherwise) with a `Surround`: a matte inside the frame where the picture is
+smaller, a backdrop beyond it. An acquire that says `Outdated` / `Lost` is reconfigured once
+and retried; `Timeout` / `Occluded` are a `GpuError::Surface` for the caller to skip.
+`present.rs`' tests (`#[ignore]`d, an adapter) hold the blit pixel-exact against an offscreen
+target in RGBA, BGRA and sRGB formats.
 
 **A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
 of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:
@@ -2336,6 +2356,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
+`get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -2440,6 +2461,74 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
+
+**GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
+(`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
+panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
+webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
+{ time_secs, max_width, overlays }` takes the plan's inputs under the project lock
+(`plan_inputs`: the working timeline, the assets as imported and the proxy-swapped ones the
+FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedia`, the
+measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
+timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
+else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
+is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
+the first frame that wants them and dropped together (`Backend`); a build failure is
+remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
+that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
+next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
+and a refused plan, a busy decode or an occluded window is only that frame's fallback.
+`set_preview_bounds` (GUI-only) is how the page says where the Preview frame is: **device
+pixels relative to the webview, plus the webview's size** (the backend maps the rectangle
+onto the surface when the two differ by a rounding), a `visible` flag, and the two colours
+painted around the picture (`--frame-matte` inside the frame, `--surface-app` beyond it). It
+is cheap and never waits for a render: a hidden frame hides a child window at once. The
+render is at about the size it is shown (`place_frame`: the width nearest the panel's, at
+most 1920, whose size keeps the canvas's shape to the row — `still_size` at 430 px is 240
+rows for a 241.9 ideal, which letterboxed the footage with a 2 px pillar), and the presenter
+draws it letterboxed in the frame (`object-fit: contain`). `gpu_preview_status` says what
+this machine does: the platform's technique, whether a device is up, the adapter and
+whether it is software, the last failure. **No MCP tool**: the agent has `preview_timeline`,
+and nothing here is an edit. **No capability permission and no CSP change**: these are the
+app's own commands (the capability file gates plugins and core APIs; `build.rs` registers no
+app manifest), and the GPU frame never reaches the webview, so no `data:` / `blob:` image
+is added. `tauri.conf.json` is **unchanged** — no `transparent`: the window still starts
+hidden with `backgroundColor`, the reveal (`reveal.ts`, the Rust failsafe) is exactly as
+before, and the one transparency there is (technique `window`, below) is applied at runtime
+after the user turned the setting on and a frame asked for it, and undone with the backend.
+
+**Two surface techniques, picked per platform** (`resolve_technique`;
+`KERF_GPU_SURFACE=off|window|child` overrides). *`window`*: wgpu draws to the **main
+window's own surface** and the webview over it is transparent
+(`WebviewWindow::set_background_color`, alpha 0, at runtime, restored when the preview goes
+off); the page keeps drawing titles, safe-area guides and the trim monitor over the picture.
+**Windows' technique, unconfirmed** (needs a real machine): tao does not set
+`WS_CLIPCHILDREN`, so the swapchain on the parent HWND should show through a transparent
+WebView2 — wry's own `wgpu` example does exactly this (with winit, which has to turn
+clip-children off). Tauri's `transparent: true` is deliberately *not* used there: on Windows
+it makes the runtime paint the window with a `softbuffer` surface on every redraw, a GDI path
+that would fight a swapchain. *`child`*: a **borderless child X11 window** of the toplevel
+(`x11rb`, an empty Shape input region so the pointer falls through to the webview) placed
+over the panel. **Linux/X11's technique, confirmed under WSLg + lavapipe**: WebKitGTK
+composes the page into the toplevel's own X window, so technique `window` there loses to
+GTK's repaints — measured: the surface presents ("GPU 430x240 · 21 ms") and the screen shows
+black where the picture should be, with the Preview's transport bar left blank — and a
+Wayland session has no way to put a window of ours inside GTK's (`Child::create` refuses a
+non-Xlib handle, which leaves the JPEG with that reason in the status). A child window sits
+*above* the page, so the page cannot draw over it: `routePreview` (frontend, pure) sends a
+frame that needs a title box, the trim monitor or safe-area guides to the JPEG, and so does
+one with a dialog, a menu or a drag ghost over the frame (`covered`: a 3x3
+`elementFromPoint` grid on the frame, every 150 ms and after each click or key — the
+Settings dialog opened *under* the picture before this existed); the in-frame badge,
+resolution and timecode are under it too (the transport bar has the timecode). **macOS has
+no technique in this build**: a surface under the webview needs a transparent window, which
+Tauri gates behind `macos-private-api` (a private WKWebView key, and a feature that changes
+every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces the attempt).
+`KERF_GPU_ADAPTER=software` takes the CPU adapter (lavapipe, WARP) instead of the machine's GPU.
+Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
+is hidden while it runs and shown again on the settled frame (A4; scrubbing at GPU speed and
+live drags are A3's). `x11.rs`' ignored test presents to a real child window and reads the
+pixels back **from the X server**, then destroys the device and draws again on a new one.
 
 **Auto-update.** The app updates itself from its own GitHub releases via
 `tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both
@@ -3216,6 +3305,24 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+**The GPU preview in the page** (`Preview.svelte`, `preview-bounds.ts`,
+`gpu-preview.svelte.ts`). With the setting on, a frame whose route is `gpu`
+(`routePreview`: pure and bun-tested — setting, platform support, playback streaming, an
+empty timeline, overlays, covered) is asked of `getPreviewFrame` instead of
+`getTimelineFrame`, and when the backend says `renderer: 'gpu'` the frame draws *nothing*
+(`gpuShown`: no image, no backdrop — the surface is what is seen); a frame it hands back is
+the JPEG as ever. The frame's content box is reported to `set_preview_bounds` by a
+`ResizeObserver`, the window events and a 150 ms poll, one report at a time (`singleFlight`),
+`deviceRect` rounding both edges so neighbours never gap at 125 / 150 %, and a hidden report
+goes out when the panel unmounts (a workspace switch) or the setting goes off. Under technique
+`window` the frame's ancestors get `data-surface-hole` (transparent, in `layout.css`) and the
+pane's surround is a layer with an even-odd `clip-path` hole at the frame (`holePolygon`), so
+nothing else on the page changes; `?gpusurface=1` makes the browser harness answer as such a
+surface (there is no GPU there), and a headless-Chrome screenshot with a transparent default
+background shows the hole. The status bar names the renderer of the frame on screen (`GPU
+430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
+Settings dialog's Preview section carries the toggle and the machine's status line.
+
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
 close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
@@ -3306,7 +3413,8 @@ never wants a model fetched or minutes of inference spent needs the whole pass
 to survive that, not to fail on the download. `TranscriptionStatus.enabled`
 reports it, so the transcript tab's empty state can say "Speech-to-text is
 off" and open Settings rather than offer a download. And **Preview**, one checkbox
-for the safe-area guides over a vertical or square cut. And **Appearance**: the
+for the safe-area guides over a vertical or square cut, and the experimental GPU preview
+toggle with this machine's status line (technique, adapter, last failure). And **Appearance**: the
 three theme presets as chips, a name and a dark/light scheme, **Import… /
 Export…** (a `.json` file through the dialog plugin and `read_text_file` /
 `write_text_file`; the harness uses an `<input type=file>` and a download), then

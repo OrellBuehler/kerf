@@ -6,8 +6,8 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112 (all merged); A1b-3: this PR | review | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on 9.0.2 here; CI's parity job runs the same ignored suite on the distro FFmpeg too) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete pending review of A1b-3. |
-| A2 Native preview surface | — | — | todo | |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112; A1b-3: OrellBuehler/kerf#113 (all merged) | merged | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on 9.0.2 here; CI's parity job runs the same ignored suite on the distro FFmpeg too) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete. |
+| A2 Native preview surface | `feat/gpu-a2-surface` | — | review | **Gate: PASS where testable, JPEG fallback intact everywhere.** Opt-in *Settings › Preview › GPU preview (experimental)* (default off; off = today's behaviour, no extra command). `kerf-gpu` gains `Gpu::new_for_surface`, `Presenter` (+ `Surround`: matte in the frame, backdrop beyond) and `Compositor::render_plan_texture_with` (frame left on the GPU; `RenderedFrame::read_back` / `from_rgba`); `kerf-app` links it (`gpu_preview.rs`: lazy `Backend`, per-frame plan decision with the FFmpeg JPEG returned *in the same call*, `Backoff`, `react` = rebuild on device/surface loss) with commands `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (GUI-only, no MCP tool, no capability, no CSP change, `tauri.conf.json` unchanged). Techniques: **Linux/X11 = child window (confirmed under WSLg + lavapipe)**, **Windows = the window's own surface under a transparent webview (unconfirmed, code only)**, **macOS = none in this build**, Wayland = JPEG. Measured on WSLg/lavapipe (debug build): 416x234 frame cached-decode 0 ms + composite 15-20 ms + present 2-3 ms; first frame decode 140-160 ms + composite 47 ms + present 17 ms; 672x378 composite 20 ms + present 4 ms. Frontend: `preview-bounds.ts` (device-pixel/DPR rounding, route policy, covered detection, hole polygon; 23 bun tests), `gpu-preview.svelte.ts`, Preview/Settings/StatusBar wiring, harness `?gpusurface=1`. Rust: 17 `gpu_preview` unit tests (technique table, bounds math, fit/placement, exact render width, backoff, fallback decision, no-adapter child process), `gpu::tests::a_window_no_backend_can_draw_to…`, 4 presenter tests, parity's `rendering_through_the_frame_source…` extended to the texture path, and an ignored X11 end-to-end test (`x11.rs`: present to a real child window, read the pixels back from the X server, destroy the device, rebuild). Remaining: A3 (scrub / live drags), A4 (playback), real-machine confirmation (below). |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
 | B3a Ripple + multi-select + zoom | `feat/timeline-editing` | — | merged (local) | `Timeline::ripple_from` (per-track, no sync lock), `move_clips`/`remove_clips`, marquee, group moves, zoom 0.05–2000 px/s. |
@@ -443,9 +443,90 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   lossy for the picker, exact for the picture, and now documented rather than changed (`Easing::split`
   could keep one eased key there; the picture is already right).
 
+- **2026-10-08 — A2: the technique is per platform, and only one is confirmed.** Spiked both on
+  WSLg (Xwayland, `GDK_BACKEND=x11`, Mesa lavapipe). *Technique 1* (wgpu on the **main window's
+  surface** under a transparent webview, `KERF_GPU_SURFACE=window`) **fails on WebKitGTK**: the
+  surface is created, configured (Bgra8Unorm, Opaque) and presents without an error ("GPU 430x240 ·
+  21 ms" in the status bar) but the screen shows black where the picture should be and the
+  Preview's transport bar is left blank, because GTK composes the page into the toplevel's own X
+  window and repaints over the swapchain (the toplevel has no native child window: `xwininfo`
+  tree is one 1x1 window). *Technique 2* (a **borderless child X11 window**, made with `x11rb`
+  with an empty Shape input region, placed over the panel) **works**: the GPU frame is the picture,
+  the window follows dock sash drags (431x242 → 198x111 → back), is unmapped for playback, for
+  frames the plan refuses (a title, a dissolve) and for dialogs, and an ignored test reads the
+  presented pixels back **from the X server** exactly. Evidence: `target/a2-evidence/*.png` in the
+  worktree (`window-technique-on-webkitgtk.png`, `x11-child-gpu-frame.png`, …). So **Linux/X11 =
+  child window**, a Wayland session = JPEG with the reason in the status (no way to put a window of
+  ours inside GTK's). **Windows = technique 1**, as the plan prefers, *without confirmation*: wry's
+  `wgpu` example is the evidence (a swapchain on the parent HWND shows through a transparent
+  WebView2), tao sets no `WS_CLIPCHILDREN`, and Tauri's own `transparent: true` is avoided on
+  purpose — the runtime then paints the window with `softbuffer` (GDI) on every redraw, which would
+  fight a DXGI swapchain; the webview is made transparent at runtime instead
+  (`set_background_color` alpha 0) and opaque again when the backend goes. **macOS = none**: a
+  surface under the webview needs a transparent window, i.e. Tauri's `macos-private-api` (a
+  private WKWebView key and a feature that changes every macOS bundle), which is not enabled blind;
+  `KERF_GPU_SURFACE=window` forces the attempt for whoever can run it.
+- **2026-10-08 — A2: the window stays as it is.** No `transparent` in `tauri.conf.json`, so the
+  hidden-until-themed reveal (`backgroundColor`, `reveal.ts`, the 3 s failsafe) cannot change; the
+  only transparency (Windows, technique `window`) is applied at runtime when the setting is on and a
+  frame asked for a backend, and undone when it goes. What that does to the first visible frame on
+  Windows is a real-machine question (below).
+- **2026-10-08 — A2: the plan decides, in the backend, and the JPEG comes back in the same call.**
+  `get_preview_frame` plans off the project lock, asks `RenderPlan::reasons(caps, size)` at the size
+  it would render, and returns the GPU result or FFmpeg's JPEG of that frame with the reasons — one
+  round trip, one decision point, no second command for the fallback; a refusal is a value, not an
+  error. The page only adds what the *surface* knows and the plan cannot: playback is streaming,
+  there is nothing to show, the page has to draw over the picture (title box, trim monitor, guides)
+  or has a dialog / menu / drag ghost over it, on a surface that sits above the page (technique
+  `child`). That last one was found live: the Settings dialog opened *underneath* the child window.
+  `covered` is a 3x3 `elementFromPoint` grid, every 150 ms and after each click / key; under a
+  transparent webview it never matters, because the page draws over the surface.
+- **2026-10-08 — A2: the render size keeps the canvas's shape.** `still_size` at 430 px is 240 rows
+  for an ideal 241.9, so the compositor letterboxed 16:9 footage into a canvas a hair taller than 16:9
+  and a 2 px pillar showed at the right edge of the surface (measured on the screenshot). The width
+  is now the nearest even one (within 48 px, ≤ 1920) whose size has the canvas's aspect to the row
+  (416x234 for a 431x242 panel); the presenter scales the ≤ 3 % difference bilinearly. A canvas with
+  no exact width nearby (1998x1080) takes the least wrong.
+- **2026-10-08 — A2: two colours, not one.** Under a transparent webview the surface is seen wherever
+  no page element paints, not only in the frame: the pane's surround is a page layer with a hole,
+  but the dock's gaps and the timeline's empty area paint through the (now transparent) ancestors.
+  The presenter therefore paints a *matte* (`--frame-matte`) inside the frame where the picture is
+  smaller and a *backdrop* (`--surface-app`) beyond it. A headless-Chrome screenshot of the harness
+  (`?gpusurface=1`, transparent default background) showed the first version leaving the area below
+  the timeline transparent.
+- **2026-10-08 — A2: Hint::Scrub for every A2 frame.** The settled frame and a scrubbed one go
+  through the same command and the frame source's `Scrub` intent (runs, a cache; `Exact` is an
+  agent's "one frame, take nothing from anyone"). Nothing is done for scrubbing at GPU speed — that is
+  A3 — but nothing is in its way: the backend is one `frame()` call per playhead position.
+- **2026-10-08 — A2: a stable route.** `routePreview` returns a new object whenever any input is
+  recomputed (the titles under the playhead are a new array each tick), and an effect that read
+  `route.via` re-ran on every seek, hiding and re-showing the child window each time (seen in the
+  backend's own log). Effects depend on `routeVia` / `routeOverlays` (primitives) now, and the
+  observers of the bounds are separate from the effect that re-reports on a change of route.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
 - B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.
+- A2 (Windows): the technique is code only. To confirm: turn *GPU preview* on in Settings with a
+  real GPU and with WARP (`KERF_GPU_ADAPTER=software`) and look for the picture in the frame (the
+  status bar says "GPU …" either way — **the page cannot tell a surface nobody sees from one it
+  does**, which is exactly what the Linux window technique does, so it is the first thing to look
+  at), titles and guides drawn *over* it, the transport bar and every other panel intact, a dialog
+  over the frame, a window resize and maximize, a move between monitors of different scale
+  (125 / 150 / 200 %: the bounds are rounded by edges and mapped through the webview's size, never
+  tested against a real DPI), minimize / restore, and the first visible frame at launch with the
+  setting on (the runtime `set_background_color` alpha 0 / back to `#0f1318`). If the surface is
+  black or the page corrupted: `KERF_GPU_SURFACE=off`, and the child-window route is the fallback
+  (a native child HWND is not written).
+- A2 (macOS): no technique; the path is Tauri's `macos-private-api` (feature + `app.macOSPrivateApi`,
+  then `transparent: true` at window creation, only when the setting is on at launch) and the same
+  `window` technique; Metal's `CAMetalLayer` replaces the content view's layer and the WKWebView is a
+  subview, as in wry's `wgpu` example. Needs a Mac, and a decision about shipping the private API.
+- A2 (Linux): a Wayland session (the default on most distributions) has no technique and says so in
+  the status; X11 on a **real GPU** (Mesa radeonsi/iris, NVIDIA) was not run — Vulkan on an Xlib
+  child window, `GDK_SCALE=2`, a compositing manager that stacks windows differently from Xwayland's.
+  Real-GPU frame times (A3's latency target of < 33 ms at 1080p) are unmeasured: the numbers above
+  are lavapipe's.
