@@ -132,6 +132,7 @@ pub mod eq;
 pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
+pub mod present;
 pub mod roundtrip;
 pub mod router;
 pub mod showinfo;
@@ -139,10 +140,11 @@ pub mod source;
 pub mod sws;
 pub mod y4m;
 
-pub use compositor::{Compositor, RenderTimings, RgbaFrame};
+pub use compositor::{Compositor, RenderTimings, RenderedFrame, RgbaFrame};
 pub use cursor::{CursorConfig, FrameCursor};
 pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;
+pub use present::{PixelRect, Presenter};
 pub use source::{decode_args, decode_layer, decode_layers, YuvFrame};

@@ -52,6 +52,12 @@ pub enum GpuError {
     /// The finished frame could not be copied back.
     #[error("could not read the frame back: {0}")]
     Readback(String),
+    /// A window surface could not be created, configured or drawn to (an unsupported
+    /// window system, a surface the adapter cannot present to, a window that is
+    /// occluded or gone). The device itself is fine: the caller shows the frame through
+    /// FFmpeg and may build a new surface.
+    #[error("the presentation surface is not usable: {0}")]
+    Surface(String),
 }
 
 impl From<crate::router::Busy> for GpuError {
@@ -101,6 +107,10 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Gpu {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    /// Kept so a surface can be created on the instance the device came from and asked
+    /// what the adapter can present (a surface belongs to one instance).
+    instance: wgpu::Instance,
+    pub(crate) adapter: wgpu::Adapter,
     info: wgpu::AdapterInfo,
     health: Arc<Health>,
 }
@@ -108,16 +118,49 @@ pub struct Gpu {
 impl Gpu {
     /// Open a device, blocking the calling thread until the adapter answers.
     pub fn new(options: GpuOptions) -> Result<Arc<Gpu>, GpuError> {
-        pollster::block_on(Self::new_async(options))
+        pollster::block_on(Self::new_async(options, None)).map(|(gpu, _)| gpu)
     }
 
-    async fn new_async(options: GpuOptions) -> Result<Arc<Gpu>, GpuError> {
+    /// Open a device on an adapter that can present to `target` (a window, in the app),
+    /// and the surface made from it, blocking the calling thread until the adapter answers.
+    ///
+    /// The surface is created first and the adapter asked to be compatible with it: on a
+    /// machine with an integrated and a discrete GPU, the one that drives the window is the
+    /// one that can show it. It is the caller's [`crate::Presenter`] to configure.
+    ///
+    /// A surface that cannot be created is a [`GpuError::Surface`] — an unsupported window
+    /// system (a Wayland handle on a build without it, a handle kind no backend takes) or a
+    /// window that is already gone — and never a panic; the caller keeps its FFmpeg preview.
+    pub fn new_for_surface(
+        options: GpuOptions,
+        target: impl Into<wgpu::SurfaceTarget<'static>>,
+    ) -> Result<(Arc<Gpu>, wgpu::Surface<'static>), GpuError> {
+        let target = target.into();
+        pollster::block_on(Self::new_async(options, Some(target))).and_then(|(gpu, surface)| {
+            surface
+                .map(|s| (gpu, s))
+                .ok_or_else(|| GpuError::Surface("no surface was created".into()))
+        })
+    }
+
+    async fn new_async(
+        options: GpuOptions,
+        target: Option<wgpu::SurfaceTarget<'static>>,
+    ) -> Result<(Arc<Gpu>, Option<wgpu::Surface<'static>>), GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = match target {
+            Some(target) => Some(
+                instance
+                    .create_surface(target)
+                    .map_err(|e| GpuError::Surface(e.to_string()))?,
+            ),
+            None => None,
+        };
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: options.force_fallback_adapter,
-                compatible_surface: None,
+                compatible_surface: surface.as_ref(),
                 apply_limit_buckets: false,
             })
             .await
@@ -154,12 +197,25 @@ impl Gpu {
             device_type = ?info.device_type,
             "kerf-gpu device ready"
         );
-        Ok(Arc::new(Gpu {
+        let gpu = Arc::new(Gpu {
             device,
             queue,
+            instance,
+            adapter,
             info,
             health,
-        }))
+        });
+        Ok((gpu, surface))
+    }
+
+    /// A surface for another window on this device's instance (the first one came with
+    /// [`Gpu::new_for_surface`]). Whether the adapter can present to it is the
+    /// [`crate::Presenter`]'s to find out.
+    pub fn create_surface(&self, target: impl Into<wgpu::SurfaceTarget<'static>>) -> Result<wgpu::Surface<'static>, GpuError> {
+        self.check_alive()?;
+        self.instance
+            .create_surface(target)
+            .map_err(|e| GpuError::Surface(e.to_string()))
     }
 
     /// The adapter this device is on.
