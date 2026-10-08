@@ -308,7 +308,8 @@ const ADDED: Record<string, string> = {
 	y: 'tool.slip',
 	u: 'tool.slide',
 	q: 'edit.trimStart',
-	w: 'edit.trimEnd'
+	w: 'edit.trimEnd',
+	s: 'tool.snap'
 };
 
 /** The chords with a modifier that were given an action after the registry existed (linked
@@ -929,7 +930,10 @@ describe('keys that act once per press', () => {
 			'file.save',
 			'file.import',
 			'file.export',
+			'file.importCaptions',
+			'file.saveCover',
 			'app.settings',
+			'app.quit',
 			'edit.copy',
 			'edit.cut',
 			'edit.paste',
@@ -942,11 +946,27 @@ describe('keys that act once per press', () => {
 			'edit.reattachAudio',
 			'edit.link',
 			'edit.unlink',
+			'tool.snap',
 			'tool.rippleMode',
 			'playback.toggle',
 			'playback.shuttleBack',
 			'playback.shuttleForward',
-			'marker.add'
+			'marker.add',
+			// Commands with no key of their own, run from the menus: one press, one run.
+			'view.minimap',
+			'view.safeAreas',
+			'workspace.edit',
+			'workspace.color',
+			'workspace.audio',
+			'workspace.motion',
+			'workspace.deliver',
+			'window.resetWorkspace',
+			'window.resetAllWorkspaces',
+			'app.keyboard',
+			'app.checkUpdate',
+			'app.releases',
+			'app.logs',
+			'app.about'
 		]);
 	});
 
@@ -1046,6 +1066,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
+			'lib/components/editor/MenuBar.svelte',
 			'lib/components/editor/MixSlider.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',

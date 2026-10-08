@@ -3,6 +3,7 @@
 	// whether an analysis pass transcribes speech, what the preview draws and
 	// what colors the editor is drawn in. A section list on the left, panels on
 	// the right, so the next one is a row in a list.
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
@@ -24,7 +25,9 @@
 		{ id: 'appearance', label: 'Appearance', icon: 'palette' },
 		{ id: 'keyboard', label: 'Keyboard', icon: 'keyboard' }
 	] as const;
-	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
+	// Opened from a menu on one section (Help › Keyboard shortcuts), else the first.
+	let section = $state<(typeof SECTIONS)[number]['id']>(untrack(() => settings.wantSection) ?? 'performance');
+	untrack(() => (settings.wantSection = null));
 
 	const cores = $derived(settings.cpuCores);
 	const threads = $derived(settings.cpuThreads);

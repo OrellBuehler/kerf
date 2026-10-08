@@ -5,10 +5,14 @@ import {
 	PANELS,
 	PANEL_IDS,
 	PRESET_LAYOUTS,
+	EARLIER_PRESETS,
+	UNSTAMPED_OFFERED,
 	WORKSPACE_IDS,
+	insertPanel,
 	openPanelIds,
 	panelState,
 	presetLayout,
+	presetPanelIds,
 	sameArrangement,
 	sanitizeLayout
 } from './layout';
@@ -514,5 +518,153 @@ describe('sameArrangement against what the dock really reports', () => {
 		dragged.grid.root.data[0].data[0].size += 150;
 		dragged.grid.root.data[0].data[1].size -= 150;
 		expect(sameArrangement(dragged, PRESET_LAYOUTS.edit)).toBe(false);
+	});
+});
+
+// ---- panels a later build adds ----------------------------------------------
+
+/** `layout` with `id` closed, as the dock does it: its view gone, an emptied group
+ *  with it, and the room it had shared out among the groups beside it. */
+const closed = (layout: any, id: string): any => {
+	const l = clone(layout);
+	const prune = (nodes: any[]): any[] => {
+		const total = nodes.reduce((sum, n) => sum + n.size, 0);
+		const kept = nodes.flatMap((n) => {
+			if (n.type === 'leaf') {
+				n.data.views = n.data.views.filter((v: string) => v !== id);
+				if (n.data.views.length === 0) return [];
+				if (!n.data.views.includes(n.data.activeView)) n.data.activeView = n.data.views[0];
+				return [n];
+			}
+			n.data = prune(n.data);
+			return n.data.length ? [n] : [];
+		});
+		const left = kept.reduce((sum, n) => sum + n.size, 0);
+		if (left > 0 && left < total) for (const n of kept) n.size = (n.size * total) / left;
+		return kept;
+	};
+	l.grid.root.data = prune(l.grid.root.data);
+	delete l.panels[id];
+	return l;
+};
+/** The sizes of the children of the branch holding group `id`. */
+const rowSizes = (raw: any, id: string): number[] => {
+	const visit = (nodes: any[]): number[] | undefined => {
+		if (nodes.some((n) => n.type === 'leaf' && n.data.id === id)) return nodes.map((n) => n.size);
+		for (const n of nodes) if (n.type === 'branch') { const r = visit(n.data); if (r) return r; }
+		return undefined;
+	};
+	return visit(raw.grid.root.data)!;
+};
+
+describe('what a preset offers', () => {
+	test('is the panels it opens, and the mixer is Audio’s alone', () => {
+		expect(presetPanelIds('audio').sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'timeline']);
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(presetPanelIds(id)).not.toContain('mixer');
+	});
+
+	test('a layout stored before the record is taken to have been offered every panel but the mixer', () => {
+		for (const id of WORKSPACE_IDS) {
+			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer'));
+		}
+	});
+
+	test('the earlier Audio preset is a layout of its own: no mixer, a tall timeline', () => {
+		const earlier = EARLIER_PRESETS.audio!;
+		expect(openPanelIds(earlier)).not.toContain('mixer');
+		expect(sanitizeLayout(clone(earlier))).toEqual(earlier);
+		expect(sameArrangement(earlier, PRESET_LAYOUTS.audio)).toBe(false);
+	});
+});
+
+describe('insertPanel', () => {
+	test('puts a closed panel back exactly where the preset has it', () => {
+		for (const id of WORKSPACE_IDS) {
+			for (const panel of presetPanelIds(id).filter((p) => p !== 'timeline')) {
+				const without = closed(PRESET_LAYOUTS[id], panel);
+				const back = insertPanel(without, panel, PRESET_LAYOUTS[id])!;
+				expect(back).not.toBeNull();
+				expect(sameArrangement(back, PRESET_LAYOUTS[id], 0.003)).toBe(true);
+				expect(sanitizeLayout(clone(back))).toEqual(back);
+				expect(viewsOf(back).filter((v) => v === panel)).toHaveLength(1);
+			}
+		}
+	});
+
+	test('the mixer goes between the preview and the inspector and takes its share from the row', () => {
+		const without = closed(PRESET_LAYOUTS.audio, 'mixer');
+		const before = rowSizes(without, 'preview');
+		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;
+		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'mixer', 'inspector']);
+		const after = rowSizes(back, 'mixer');
+		expect(after.reduce((a, b) => a + b, 0)).toBe(before.reduce((a, b) => a + b, 0));
+		expect(after[2]).toBeGreaterThanOrEqual(PANELS.mixer.minimumWidth!);
+	});
+
+	test('a layout the user arranged keeps its arrangement; the panel takes a proportional share', () => {
+		const mine = closed(PRESET_LAYOUTS.audio, 'mixer');
+		const row = mine.grid.root.data[0].data;
+		row[0].size = 380; // a wide library
+		row[1].size = 330;
+		const kept = clone(mine);
+		const back = insertPanel(mine, 'mixer', PRESET_LAYOUTS.audio)!;
+		// The inputs are not touched.
+		expect(mine).toEqual(kept);
+		expect(viewsOf(back).sort()).toEqual([...viewsOf(mine), 'mixer'].sort());
+		const sizes = rowSizes(back, 'mixer');
+		// library : preview stays 380 : 330 within rounding.
+		expect(sizes[0] / sizes[1]).toBeCloseTo(380 / 330, 1);
+	});
+
+	test('a tab mate brings it back to the group it shared', () => {
+		const without = closed(PRESET_LAYOUTS.edit, 'agent');
+		const back = insertPanel(without, 'agent', PRESET_LAYOUTS.edit)!;
+		expect(group(back, 'inspector').views).toEqual(['inspector', 'agent']);
+	});
+
+	test('with no tab mate and no neighbour in the layout it becomes a tab beside the preview', () => {
+		// Only the preview and the timeline are left.
+		let mine = PRESET_LAYOUTS.audio as any;
+		for (const p of ['library', 'inspector', 'agent']) mine = closed(mine, p);
+		mine = closed(mine, 'mixer');
+		const back = insertPanel(mine, 'agent', PRESET_LAYOUTS.audio)!;
+		// The nearest neighbour in the preset is the mixer's row; with the mixer gone too,
+		// the agent finds the preview next in line.
+		expect(viewsOf(back).sort()).toEqual(['agent', 'preview', 'timeline']);
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('a row that runs the other way is not cut into: the panel is tabbed with the preview instead', () => {
+		// The preview stacked over the timeline, nothing beside it.
+		let mine = PRESET_LAYOUTS.audio as any;
+		for (const p of ['library', 'inspector', 'agent', 'mixer']) mine = closed(mine, p);
+		mine = clone(mine);
+		mine.grid.root.data = [mine.grid.root.data[0].data[0], mine.grid.root.data[1]];
+		const clean = sanitizeLayout(clone(mine))!;
+		expect(clean).not.toBeNull();
+		expect(viewsOf(clean).sort()).toEqual(['preview', 'timeline']);
+		const back = insertPanel(clean, 'mixer', PRESET_LAYOUTS.audio)!;
+		expect(group(back, 'preview').views).toEqual(['preview', 'mixer']);
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('a panel already there is left where it is', () => {
+		const back = insertPanel(PRESET_LAYOUTS.audio, 'mixer', PRESET_LAYOUTS.audio)!;
+		expect(back).toEqual(PRESET_LAYOUTS.audio);
+		expect(back).not.toBe(PRESET_LAYOUTS.audio);
+	});
+
+	test('a panel the preset does not open is nobody’s to insert', () => {
+		expect(insertPanel(PRESET_LAYOUTS.edit, 'mixer', PRESET_LAYOUTS.edit)).toBeNull();
+	});
+
+	test('a new group never reuses a group id that is taken', () => {
+		const without = closed(PRESET_LAYOUTS.audio, 'mixer');
+		// Someone else's group is called "mixer".
+		(without.grid.root.data[1] as any).data.id = 'mixer';
+		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;
+		const ids = groupIds(back);
+		expect(new Set(ids).size).toBe(ids.length);
 	});
 });

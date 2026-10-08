@@ -5,7 +5,12 @@
 // on the Rust side — the backend never looks inside it):
 //
 //   { active, layouts: { <workspace>: <dockview layout> },
+//     offered: { <workspace>: [<panel>, …] },
 //     library: { tabs: { <workspace>: <tab> }, collapsed } }
+//
+// `offered` is, for each stored layout, the panels its workspace's preset opened
+// when the layout was saved: how a later build's new panel (the mixer in Audio)
+// can be told from one the user closed (see `adoptPanels`).
 //
 // The frontend owns that shape and validates it on the way back in, so a file
 // from an older or newer build, a hand edit, or a truncated write degrades to
@@ -13,11 +18,19 @@
 
 import type { SerializedDockview } from 'dockview';
 import {
+	EARLIER_PRESETS,
+	PANELS,
+	UNSTAMPED_OFFERED,
 	WORKSPACE_IDS,
+	insertPanel,
+	isPanelId,
 	isWorkspaceId,
+	openPanelIds,
 	presetLayout,
+	presetPanelIds,
 	sameArrangement,
 	sanitizeLayout,
+	type PanelId,
 	type WorkspaceId
 } from './layout';
 
@@ -87,11 +100,13 @@ export function workspaceSpec(id: WorkspaceId): WorkspaceSpec {
 export interface WorkspacesState {
 	active: WorkspaceId;
 	layouts: Partial<Record<WorkspaceId, SerializedDockview>>;
+	/** For each stored layout, the panels its preset opened when it was saved. */
+	offered: Partial<Record<WorkspaceId, PanelId[]>>;
 	library: { tabs: Partial<Record<WorkspaceId, LibraryTab>>; collapsed: boolean };
 }
 
 export function defaultWorkspaces(): WorkspacesState {
-	return { active: 'edit', layouts: {}, library: { tabs: {}, collapsed: false } };
+	return { active: 'edit', layouts: {}, offered: {}, library: { tabs: {}, collapsed: false } };
 }
 
 /** The tab the library shows in `workspace`: the one picked there, else the one
@@ -109,27 +124,102 @@ function isObj(v: unknown): v is Record<string, unknown> {
 	return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** A workspace that gained panels in a stored layout. */
+export interface Adopted {
+	workspace: WorkspaceId;
+	panels: PanelId[];
+}
+
+export interface WorkspacesRead {
+	state: WorkspacesState;
+	/** Whether reading changed what is stored (a layout stamped, dropped or given a
+	 *  panel), so the caller writes the result back. */
+	changed: boolean;
+	/** Panels cut into a layout the user had arranged, for a notice. */
+	adopted: Adopted[];
+}
+
+/** The panels a stored `offered` list names. Null when it is absent or not a
+ *  list (the layout predates the record). */
+function readOffered(raw: unknown): PanelId[] | null {
+	if (!Array.isArray(raw)) return null;
+	return raw.filter(isPanelId);
+}
+
+function sameSet(a: readonly string[], b: readonly string[]): boolean {
+	return a.length === b.length && a.every((x) => b.includes(x));
+}
+
+/** A stored layout brought up to its workspace's preset of today.
+ *
+ *  `offered` is what the layout's preset opened when it was saved (null: before
+ *  that was recorded, when it is taken to be the presets of that time). A panel
+ *  the preset opens now that the layout was not offered and does not hold is new
+ *  to it and is put in where the preset puts it; one the layout was offered and
+ *  lacks was closed by the user and stays closed.
+ *
+ *  A layout from before the record that is only a copy of a preset — the build
+ *  that wrote every workspace the user merely visited left one for each — is
+ *  nobody's arrangement: it is dropped (`layout: null`), so the workspace is its
+ *  preset, today's. */
+export function adoptPanels(
+	id: WorkspaceId,
+	layout: SerializedDockview,
+	offered: PanelId[] | null
+): { layout: SerializedDockview | null; offered: PanelId[]; added: PanelId[]; changed: boolean } {
+	const now = presetPanelIds(id);
+	const had = offered ?? UNSTAMPED_OFFERED[id];
+	const have = openPanelIds(layout);
+	const fresh = now.filter((p) => !had.includes(p) && !have.includes(p));
+	if (offered === null) {
+		const earlier = EARLIER_PRESETS[id];
+		if (sameArrangement(layout, presetLayout(id)) || (fresh.length > 0 && earlier && sameArrangement(layout, earlier))) {
+			return { layout: null, offered: now, added: [], changed: true };
+		}
+	}
+	let out = layout;
+	const added: PanelId[] = [];
+	for (const p of fresh) {
+		const next = insertPanel(out, p, presetLayout(id));
+		if (next) {
+			out = next;
+			added.push(p);
+		}
+	}
+	return { layout: out, offered: now, added, changed: offered === null || added.length > 0 || !sameSet(had, now) };
+}
+
 /** The stored value as a state that can be trusted. Anything missing or invalid
  *  falls back to its default, field by field — one bad layout costs that
- *  workspace its arrangement, not the other four.
+ *  workspace its arrangement, not the other four. Each surviving layout is then
+ *  brought up to date with its preset (`adoptPanels`).
  *
  *  `legacyLayout` is the single arrangement saved before workspaces existed. It
  *  becomes the Edit workspace, but only when there is no `workspaces` value at
  *  all: once there is one, Edit is whatever it says (an Edit that was reset has
  *  no entry, and must not be brought back by a layout from the old build). */
-export function parseWorkspaces(raw: unknown, legacyLayout: unknown = null): WorkspacesState {
+export function readWorkspaces(raw: unknown, legacyLayout: unknown = null): WorkspacesRead {
 	const out = defaultWorkspaces();
+	const adopted: Adopted[] = [];
+	let changed = false;
+	const keep = (id: WorkspaceId, stored: unknown, offered: unknown) => {
+		const layout = sanitizeLayout(stored);
+		if (!layout) return;
+		const r = adoptPanels(id, layout, readOffered(offered));
+		changed ||= r.changed;
+		if (!r.layout) return;
+		out.layouts[id] = r.layout;
+		out.offered[id] = r.offered;
+		if (r.added.length) adopted.push({ workspace: id, panels: r.added });
+	};
 	if (!isObj(raw)) {
-		const legacy = sanitizeLayout(legacyLayout);
-		if (legacy) out.layouts.edit = legacy;
-		return out;
+		keep('edit', legacyLayout, null);
+		return { state: out, changed, adopted };
 	}
 	if (isWorkspaceId(raw.active)) out.active = raw.active;
 	if (isObj(raw.layouts)) {
-		for (const id of WORKSPACE_IDS) {
-			const layout = sanitizeLayout(raw.layouts[id]);
-			if (layout) out.layouts[id] = layout;
-		}
+		const offered = isObj(raw.offered) ? raw.offered : {};
+		for (const id of WORKSPACE_IDS) keep(id, raw.layouts[id], offered[id]);
 	}
 	if (isObj(raw.library)) {
 		if (isObj(raw.library.tabs)) {
@@ -144,7 +234,53 @@ export function parseWorkspaces(raw: unknown, legacyLayout: unknown = null): Wor
 		}
 		if (typeof raw.library.collapsed === 'boolean') out.library.collapsed = raw.library.collapsed;
 	}
-	return out;
+	return { state: out, changed, adopted };
+}
+
+export function parseWorkspaces(raw: unknown, legacyLayout: unknown = null): WorkspacesState {
+	return readWorkspaces(raw, legacyLayout).state;
+}
+
+/** What to tell the user when a layout of theirs gained a panel, or null. */
+export function describeAdopted(adopted: Adopted[]): { message: string; description: string } | null {
+	if (adopted.length === 0) return null;
+	const title = (id: WorkspaceId) => workspaceSpec(id).label;
+	const panels = (a: Adopted) => a.panels.map((p) => PANELS[p].title).join(' and ');
+	const one = adopted.length === 1;
+	return {
+		message: one ? `${title(adopted[0].workspace)} workspace gained the ${panels(adopted[0])} panel` : 'Workspaces gained new panels',
+		description: `${one ? '' : `${adopted.map((a) => `${title(a.workspace)}: ${panels(a)}`).join('; ')}. `}New in this version, put where the default arrangement has ${one ? 'it' : 'them'}; the rest of your arrangement is kept. Resetting the workspace restores its default.`
+	};
+}
+
+// ---- changing what is stored ------------------------------------------------
+
+/** `state` with `layout` stored for `id`, recorded against the panels its preset
+ *  opens in this build. */
+export function withLayout(state: WorkspacesState, id: WorkspaceId, layout: SerializedDockview): WorkspacesState {
+	return {
+		...state,
+		layouts: { ...state.layouts, [id]: layout },
+		offered: { ...state.offered, [id]: presetPanelIds(id) }
+	};
+}
+
+/** `state` with the workspaces in `ids` back to their presets: the stored
+ *  arrangement and the library tab picked there forgotten. The library's fold is
+ *  the rail's, not a workspace's, and stays. The same object when there was
+ *  nothing to forget. */
+export function withoutWorkspaces(state: WorkspacesState, ids: readonly WorkspaceId[]): WorkspacesState {
+	const layouts = { ...state.layouts };
+	const offered = { ...state.offered };
+	const tabs = { ...state.library.tabs };
+	let touched = false;
+	for (const id of ids) {
+		touched ||= id in layouts || id in offered || id in tabs;
+		delete layouts[id];
+		delete offered[id];
+		delete tabs[id];
+	}
+	return touched ? { ...state, layouts, offered, library: { ...state.library, tabs } } : state;
 }
 
 /** The layout to put in front of the user for `id`: the one they arranged, or
