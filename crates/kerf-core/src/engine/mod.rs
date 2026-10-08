@@ -23,6 +23,11 @@ pub struct ProbeResult {
 
 mod cli;
 
+// What the decodes ask `ffprobe` per file, bounded and remembered: container, HDR, start, and
+// whether a seek lands on a keyframe.
+mod source_probe;
+pub use source_probe::source_seek_points_are_keyframes;
+
 // Waveform peak pyramids and the windows read out of them: one decode per file,
 // cached, drawn from at any zoom. Also CLI-only, so it works in every build.
 mod peaks;
