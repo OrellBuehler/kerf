@@ -1037,8 +1037,8 @@ describe('no key is hard-coded outside the registry', () => {
 			.map((f) => f.slice(SRC.length + 1))
 			.sort();
 		// Widgets with their own keys (a tab rail, a dialog's Escape, a drag's
-		// Escape, a text field's Enter) are not shortcuts and are listed so a new
-		// one is a decision.
+		// Escape, a text field's Enter, a slider's arrows) are not shortcuts and are
+		// listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
@@ -1046,6 +1046,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
+			'lib/components/editor/MixSlider.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/SettingsDialog.svelte',

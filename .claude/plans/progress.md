@@ -14,7 +14,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | merged (local) | Per-asset filmstrip (proxy preferred, keyframe sampling for long originals, capped + niced even at 100%), `get_filmstrip` (no MCP tool: `skim_asset` covers agents), height presets (UI-only), minimap. |
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
-| B4 Mixer | — | — | todo | |
+| B4 Mixer | `feat/mixer` | — | done (awaiting PR) | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
 | B5 Keyframes v2 | — | — | todo | |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
@@ -217,6 +217,52 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   the `fades`/`transitions` caps apply to Motion plans only. Parity-tested
   around dissolves, slides, pushes and dips.
 
+- **2026-10-07 — D8: per-track buses later, and only for tracks that need one.**
+  The fader and pan ride each clip after its own chain (a linear op, so the same
+  signal as a bus fader); a *bus* only buys something for a **nonlinear or
+  per-track insert** (track EQ / compressor / automation acting on the summed
+  track). Moving every export to submixes would re-shape the audio graph of every
+  project: all of the golden digests with sound re-blessed, the byte-identical
+  guarantee gone, for no change in what anyone hears. Per-clip effects already
+  exist and B5's per-property channels give clip-level volume automation, which
+  covers the use cases that exist today. So: **no buses now.** When track inserts
+  arrive, build the bus topology *only for tracks that carry one* (neutral
+  omitted, every other track stays flat and byte-identical). The cost of that is
+  already small and proven: the metered levels build (`build_filter_complex_metered`)
+  sums each track into a submix before the final sum, and equals the flat graph in
+  what it measures (an ignored test renders the export and reads it back).
+- **2026-10-07 — B4 preview: ducking export-only, limiter approximated.** Web
+  Audio has no sidechain compressor without an AudioWorklet, and a worklet would be
+  a second DSP implementation to keep in step with `sidechaincompress`. So the
+  preview plays a ducked track at its fader, and the Duck toggle's tooltip says so.
+  The master limiter previews as a hard-knee `DynamicsCompressorNode` at the ceiling,
+  with its makeup gain trimmed out. It is labelled an approximation, and Measure
+  reads the real export graph.
+- **2026-10-07 — master bus placement and limiter.** After the final sum / duck
+  bus and before `loudnorm`. The limiter is `alimiter` with `level=0` (its
+  default auto-level scales the output back up to full scale, turning a ceiling
+  into makeup gain) and `latency=1` (otherwise the lookahead delays the mix by
+  its attack and drops its tail, out of step with the picture); both verified by
+  ignored tests that fail without them, on FFmpeg 6.1.1 and 9.0.2. Ceiling is a
+  *sample*-peak ceiling (no oversampling); `get_levels` reports the true peak.
+- **2026-10-07 — levels are one pass.** The alternative to taps is one render per
+  track. A metered build of the export's own audio graph taps each track's strip
+  and the finished mix, each with sample + true peak (measured ~0.01x real time
+  per meter; true peak is about half of that, sample-only would have saved
+  half the cost on a long cut but left a track's true peak unanswered), so the
+  master reading is the file's (tested against a rendered file). A track reads *before* the duck bus and the master. Short-term
+  max comes from the frame log (None under 3 s). Gated by `cpu::lease`, a
+  120 s stall watchdog and the MCP cancel token.
+- **2026-10-07 — golden family appended, not interleaved.** The 800 master-bus
+  cases are cases 4000..4799, so the first 4000 per-case digests are identical
+  before and after (`KERF_GOLDEN_CASES` diff, checked on the whole file) and the
+  three digest files only gained block lines (`git diff`: 24 insertions, 0
+  deletions). Interleaving them would have moved every block.
+- **2026-10-07 — toolchain noise.** rustc/clippy 1.99.0 flags four
+  `redundant_clone` sites in code this WP does not touch (`planner.rs:997`,
+  `keyed_zoom.rs:1385`, two in `cli.rs` tests); present on the base commit too, so
+  left alone here. FFmpeg 9.0.2 also mis-probes some float-PCM `.wav` fixtures as
+  MPEG-TS (the byte pattern of a pure tone), so the level tests use FLAC.
 - **2026-10-07 — the frame pick is FFmpeg's arithmetic.** `fps_pick`
   replays `setpts` tick truncation, the "stream ends where the next frame
   would land" EOF rule (using the last frame's own duration), reverse
@@ -234,6 +280,25 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   decoded planes, not equal composites — a one-off RGBA mismatch on 9.0.2
   (`pip/odd-361x203-in-722x640 @ 0.5`) never recurred in nine suites and a
   six-thread stress test, and rendering one plan twice never differed.
+- **2026-10-08 — B4 review fixes (PR #110).** (1) `alimiter` has no `latency` on
+  FFmpeg 4.4 (Ubuntu 22.04's system ffmpeg), which refused every limiter-on export
+  and `get_levels`; the option is now probed once per process
+  (`alimiter_latency_available`, `ffmpeg -h filter=alimiter`) with a `cfg(test)` pin,
+  and without it the limiter is emitted without `latency` (the mix then trails the
+  picture by the 5 ms attack; not compensated). The golden oracle builds a
+  limiter case's export both ways: the first 40 blocks and `still.txt` /
+  `preview.txt` did not move, only `export.txt` blocks 40..47. The levels tests pass
+  on 4.4.2 and 9.0.2. (2) The limiter is a sample-peak limiter: on 9.0.2 at a
+  -1 dBFS ceiling an 11 kHz tone read -0.2 dBTP and 15 kHz +0.1, so "turn on the
+  limiter" looped an agent that had already done it. `Levels::new` now takes the
+  master bus; with the limiter on and the true peak over -1 dBTP the note says to
+  lower the ceiling by the overshoot + 0.5 dB, and the default ceiling is -1.5 dBFS
+  (`loudnorm`'s TP). A track over 0 dBFS is no longer said to "clip the sum" (the
+  graph is float). (3) A GUI Measure held the process-wide `cpu::lease` with no way
+  out; `cancel_levels` (the `cancel_analysis` shape) and a Stop on the Measure
+  button, still gated since it is a whole-mix decode. (4) The mixer's strip rule
+  anticipates linked A/V's `Clip.source_audio` (PR #109) rather than
+  mirroring a `clip_sounds` this base does not have.
 
 - **2026-10-08 — linked A/V, PR review fixes.** (1) *A carried partner was never lane-checked.* `trim`
   (and the beat snap, through `carry_links_since`) wrote a partner's new span with no overlap check, so a
@@ -278,4 +343,5 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
+- B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

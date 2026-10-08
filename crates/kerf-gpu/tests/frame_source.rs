@@ -103,6 +103,7 @@ fn layer(a: &Asset, t: f64) -> PlanLayer {
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     };
     let plan = RenderPlan::at(
         &tl,

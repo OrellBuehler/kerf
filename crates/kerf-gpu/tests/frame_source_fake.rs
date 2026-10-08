@@ -44,6 +44,7 @@ fn layer(a: &Asset, t: f64) -> kerf_core::PlanLayer {
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     };
     RenderPlan::at(
         &tl,

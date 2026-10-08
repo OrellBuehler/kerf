@@ -469,12 +469,76 @@ export interface Delivery {
 	fit: Fit;
 }
 
+/**
+ * The last stage of the mix — mirrors `kerf_core::MasterBus`. A fader and a
+ * safety limiter on the finished mix, after every track and the duck bus and
+ * before `loudnorm`. Absent (the default, and every project that never touched
+ * it) means unity gain, no limiter.
+ */
+export interface MasterBus {
+	/** Linear gain on the finished mix; 1 is unity, clamped to 0..4 (+12 dB). */
+	volume: number;
+	/** A lookahead limiter holding the mix under `ceiling_db`. */
+	limiter: boolean;
+	/** Limiter ceiling in dBFS, -24..0 (-1.5 by default). A sample-peak ceiling. */
+	ceiling_db: number;
+}
+
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
 	markers?: Marker[];
 	/** Unset = the shape follows the footage (the historical behaviour). */
 	format?: Delivery | null;
+	/** The master bus. Unset = unity gain, no limiter. */
+	master?: MasterBus;
+}
+
+/**
+ * What one `ebur128` meter read — mirrors `kerf_core::LevelReading`. `null`
+ * wherever there was nothing to report (silence, or a span under 3 s for the
+ * short-term maximum).
+ */
+export interface LevelReading {
+	/** Integrated (programme) loudness, LUFS. */
+	integrated_lufs: number | null;
+	/** Loudness range, LU. */
+	loudness_range_lu: number | null;
+	/** The loudest 3 s window, LUFS. */
+	short_term_max_lufs: number | null;
+	/** Highest sample, dBFS. */
+	peak_dbfs: number | null;
+	/** Highest true (inter-sample) peak, dBTP — what a re-encode can clip on. */
+	true_peak_dbtp: number | null;
+}
+
+/** One track's strip: after its fader and pan, before the duck bus and the master. */
+export interface TrackLevels {
+	track_id: string;
+	name: string;
+	kind: StreamKind;
+	ducked: boolean;
+	/** Reaches the render at all — false for a muted or solo-shadowed track. */
+	heard: boolean;
+	level: LevelReading | null;
+}
+
+/** How loud the cut is (`get_levels`) — mirrors `kerf_core::Levels`. */
+export interface Levels {
+	/** Seconds of the cut measured. */
+	duration: number;
+	/** The finished mix; null when the cut has no audio. */
+	master: LevelReading | null;
+	tracks: TrackLevels[];
+	/** The measurement ran through `loudnorm`. */
+	loudnorm: boolean;
+	/** The streaming target the notes judge against (-14 LUFS). */
+	target_lufs: number;
+	/** What the numbers mean for delivery, as advice. */
+	notes: string[];
+	/** Set **only** by the browser harness, whose numbers are a stand-in
+	 *  estimated from the sample analysis — never by the backend. */
+	estimated?: boolean;
 }
 
 export interface AssetMetadata {
@@ -566,7 +630,8 @@ export type DiffKind =
 	| 'marker_added'
 	| 'marker_removed'
 	| 'marker_changed'
-	| 'format_changed';
+	| 'format_changed'
+	| 'master_changed';
 
 export interface DiffEntry {
 	kind: DiffKind;

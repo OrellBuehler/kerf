@@ -193,6 +193,65 @@ so the feature is **only** activated through these forwards — which is what ma
   on the final mix, and `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
+  **The master bus** (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`,
+  defaulted and not written while `is_default`) is the last stage of the mix:
+  after the final `amix` / duck sum and **before** `loudnorm`, `master_filters`
+  (pure + unit-tested) appends `volume=` and `alimiter=limit=…:attack=5:release=100:
+  level=0:latency=1`, each omitted while `is_neutral` (unity and no limiter — a
+  stored ceiling alone changes nothing), so every earlier graph is byte-identical.
+  Two `alimiter` options are load-bearing: its default **auto-levels** (scales the
+  output back up so the peak sits at full scale — the ceiling would become makeup
+  gain), and without `latency=1` its lookahead delays the whole mix by the attack
+  and drops its tail (sound out of step with the picture); an ignored test fails
+  without either. **`latency` is probed, not assumed**: FFmpeg 4.4 (Ubuntu 22.04's
+  system ffmpeg) has no such option and refuses the whole graph with `Option
+  'latency' not found` — every limiter-on export and every `get_levels` —, so
+  `alimiter_latency_available()` (once per process, like `zscale_available` /
+  `graph_script_flag`: `ffmpeg -h filter=alimiter` lists a `latency` line, pure
+  `help_lists_latency`; a binary that will not run reads as having it) decides
+  whether `master_filters` spells `:latency=1`. Without it the limiter is emitted
+  as `…:level=0` and the mix trails the picture by the 5 ms attack and loses its
+  last 5 ms (under a frame at any rate; nothing compensates it). A `cfg(test)`
+  thread-local (`with_alimiter_latency`) pins the answer for the unit tests and the
+  golden oracle; an ignored test checks the probe against a real `alimiter=…:latency=1`
+  run, and the levels tests run on 4.4 as well as 6.1 and 9.0 (their delay check is
+  skipped where the option is absent). The ceiling is a **sample**-peak ceiling (no
+  oversampling), rounded to six decimals so the text never rides on a libm `pow`'s
+  last digit; `get_levels` reports the true peak, which runs *above* the sample
+  ceiling (measured on 9.0.2 at a -1 dBFS ceiling: an 11 kHz tone read -0.2 dBTP,
+  15 kHz +0.1) — which is why the default ceiling (`MASTER_DEFAULT_CEILING_DB`) is
+  **-1.5 dBFS**, `loudnorm`'s own TP target, and not the -1 dBTP that platforms ask
+  for. `for_render` / `for_delivery` / `slice` carry
+  it (range export and variants keep the mix; the playback stream has no sound),
+  `safe_volume` / `safe_ceiling_db` re-clamp in the builder (a `.kerf` never passes
+  the clamping ops), and `DiffKind::MasterChanged` stops a master-only agent
+  proposal diffing as empty and being discarded by `apply_staged`.
+  **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,
+  `engine/cli/levels.rs`; lock-free split again): one ffmpeg pass over the export's own
+  audio graph. `build_filter_complex_metered` is `build_filter_complex` plus taps
+  (byte-identical with metering off): each track's clips are summed into a submix,
+  `asplit` into an `ebur128@t<i>` meter, and the finished mix — after the master and
+  the optional `loudnorm` — is tapped last, so the master reading is what the file
+  contains (an ignored test renders the file and reads it back). A track's reading is
+  its strip output, before the duck bus and the master; every tap reads sample + **true**
+  peak (`peak=sample+true`: the oversampling roughly doubles a meter's cost — measured
+  about 5 ms of work per second of audio per tap — and which track is hot is the
+  question). `MeterParser` reads stderr line by
+  line — frame lines carry the short-term maximum (`-120.7` until the first 3 s
+  window closes is `None`), the `Summary:` block is one log call so only its first
+  line is prefixed — and `-inf` / the -70 LUFS gate floor read as `None`. Whole-file,
+  so `cpu::lease` + thread caps; a stall watchdog (120 s with no stderr line; a meter
+  logs ten a second) and `cancel` kill the child. `Levels.notes` is the advice
+  against -14 LUFS / -1 dBTP, and it takes the **master bus** the mix went through
+  (`Levels::new(.., &timeline.master)`, `level_notes`): over -1 dBTP with the limiter
+  off says turn it on, but with it **already on** says lower its ceiling by the
+  overshoot plus 0.5 dB (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at
+  the floor, lower the master instead) — the old advice looped an agent that followed
+  it, because the limiter holds the sample peak and the overshoot is between samples.
+  A track over 0 dBFS before the master is told so without claiming a clip: the graph
+  is float, so nothing clips until the mix is written and the master can still bring
+  it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
+  languages' tests pins that).
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*
@@ -1375,9 +1434,11 @@ no editing logic in the adapter.
   reaches the private builders). 4000 seeded timelines (every transition kind with / without
   a source handle / across a gap, fades, speed, reverse, stills, keyframes, masks, effects,
   chroma, reframe, HDR, overlays, delivery format and fit, the audio mix, and **every
-  `ExportOptions` field** with the one-, two- and no-pass encoder spellings) have their
+  `ExportOptions` field** with the one-, two- and no-pass encoder spellings), plus **800
+  appended** with a master bus (`master_for`, no dice of its own, so the first 4000 never
+  moved — a new family appends blocks, it does not re-bless old ones), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 40 block digests each in
+  FNV-1a digests, committed as 48 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -1386,9 +1447,14 @@ no editing logic in the adapter.
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in four places and each is pinned — the preview's
+  builders read the machine in five places and each is pinned — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
-  thread-local override; every HDR case is built both ways), `drawtext`'s resolved font path
+  thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
+  (the same kind of override, `with_alimiter_latency`; every case is built with the option,
+  and a case with the master limiter on has its **export** argv appended once more without
+  it — the still and the preview carry no sound, so those two files do not see it, and the
+  limiter families `master-limiter-no-latency[-loudnorm]` fail the test if they stop being
+  covered), `drawtext`'s resolved font path
   (no overlay names a font) and **libm** (`db_to_linear` is `powf`, whose last digits differ
   between glibc with and without FMA, macOS, Windows and arm, so `round_libm` keeps the
   compressor / gate numbers to 10 significant digits; the generator seeds dB values known to
@@ -2053,6 +2119,13 @@ through an unbounded channel to a spawned forwarder because the render itself is
 on the blocking pool and `notify_progress` is async; the forwarder drains the
 channel even with no token, so a client that asked for no progress doesn't leave
 ticks piling up.
+`set_master_volume` / `set_master_limiter` are staged edits like any other;
+`get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
+`context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
+test can pin them — send a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with
+the master tools or `loudnorm`). `set_master_limiter` names the ceiling the engine really
+defaults to (a test ties its text to `MASTER_DEFAULT_CEILING_DB`) and says that a true peak still
+over -1 dBTP with the limiter on is fixed by lowering the ceiling, not by switching it on again.
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
@@ -2083,7 +2156,10 @@ modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`;
 ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, one revision),
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
-`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
+`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
+`set_master_limiter` (the master bus; each returns the `Timeline`), `get_levels` (`range?`,
+`loudnorm?` → `Levels`; whole-file, so lock-free; `cancel_levels` stops it, rejecting with
+`levels cancelled`), `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
@@ -2128,7 +2204,10 @@ from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit
 `discard_staged_edit`) and `revision_diff`, `export_timeline` (emits
 `export-progress` events) / `cancel_export`, `cancel_analysis` (the same shape,
 for the analysis pass — importing ten clips must not be an unbreakable
-commitment to ten transcriptions), app preferences (`get_settings` /
+commitment to ten transcriptions), `cancel_levels` (the same again, for the Mixer's
+measurement: a flag on `AppState` reset when `get_levels` starts and polled as its cancel
+callback — the pass holds the process-wide `cpu::lease`, so it cannot be left
+unstoppable), app preferences (`get_settings` /
 `set_settings` → a `SettingsView`: the *effective* CPU budget read back out of
 the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
@@ -2349,8 +2428,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting six panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel` — each a Svelte component
+it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the toolbar's **Panels** menu reopens one (the library left of the
@@ -2796,7 +2875,42 @@ neutral, tooltips in dB and L/R); a silent track gets none. `src/lib/mixer.ts` i
 the *faithful* mirror of `Track::pan_gains`, because preview playback renders the
 pan as the same balance the export does — a `StereoPannerNode`'s constant-power
 law would quietly disagree with the file, and `get_audio` hands back mono, so the
-two gain legs into a merger *are* the stereo pair. The old
+two gain legs into a merger *are* the stereo pair. `src/lib/levels.ts` holds the master
+bus's limits (the Rust constants), `levelNotes` (the *faithful* mirror of the advice
+`Levels::new` writes) and `estimateLevels`, the browser harness's stand-in for `get_levels`
+(an *approximation* from the sample analysis through faders, pan, master and limiter,
+flagged `estimated`). The **Mixer panel** (`Mixer.svelte`, in the panel registry and the
+Audio workspace preset, reachable from the Panels menu) is one vertical `MixerStrip` per
+audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
+`trackHasSound`, which the track header uses too. It mirrors the export graph's
+`clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
+was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader,
+pan, M / S / Duck and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
+at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
+`slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
+nudges written once it goes quiet (or on Enter / blur). Escape abandons a gesture,
+double-click resets, and Ctrl+Z during an unwritten run takes the run back rather than
+undoing the edit before it.
+
+The meters are **measured**. `audio.ts` routes each track through a bus gain and its
+pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
+limiter, which is a `DynamicsCompressorNode` approximation (`limiterParams` in
+`audio-mix.ts` trims its automatic makeup gain; the tooltip says it is an
+approximation of the export's `alimiter`), then a master analyser. The fader moved
+from the clip envelope (`clipGainAt`) onto the bus, which is the same product, so what
+plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
+and a held peak. The meters animate only while playing. Ducking is **export-only**:
+Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
+the preview plays the track at its fader. **Measure** on the master strip calls
+`get_levels` over the whole cut, or over in → out when both marks are set, and
+`levels-view.ts` phrases the result. It is a whole-mix decode under the heavy-job lease
+(minutes on a long cut), so while it runs the button is a **Stop** (`ui.stopMeasure()` →
+`cancel_levels`, then `Stopping…` until the backend gives up): the pass rejects with
+`levels cancelled` (`isLevelsCancelled`), which is quiet — no toast, the last result
+stays. In the browser harness, `sample-audio.ts`
+synthesizes a voice-like signal per asset at its analysed loudness, so playback,
+meters and faders are drivable under `bun run dev`. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the

@@ -57,6 +57,8 @@ import {
 	setMask,
 	setTrackVolume,
 	setTrackPan,
+	setMasterVolume,
+	setMasterLimiter,
 	setDeliveryFormat,
 	setTrackMuted,
 	setTrackSolo,
@@ -788,6 +790,14 @@ class EditorState {
 	}
 	setTrackPan(trackId: string, pan: number) {
 		return this.#apply(setTrackPan(trackId, pan));
+	}
+	/** The master fader: a linear gain on the finished mix (1 is unity). */
+	setMasterVolume(volume: number) {
+		return this.#apply(setMasterVolume(volume));
+	}
+	/** The master limiter on or off; `ceilingDb` omitted keeps the ceiling it had. */
+	setMasterLimiter(enabled: boolean, ceilingDb?: number | null) {
+		return this.#apply(setMasterLimiter(enabled, ceilingDb));
 	}
 	/** The frame this project is cut for; `null` follows the footage's shape. */
 	setDeliveryFormat(format: Delivery | null) {

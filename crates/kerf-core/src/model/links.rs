@@ -1823,6 +1823,7 @@ mod tests {
             overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
+            master: Default::default(),
         }
     }
 

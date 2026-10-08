@@ -48,12 +48,13 @@ export function diffHeadline(diff: TimelineDiff): string {
 
 /** Entries grouped by what they touch, so a long proposal stays readable. */
 export function groupEntries(entries: DiffEntry[]): { label: string; entries: DiffEntry[] }[] {
-	const buckets: Record<string, DiffEntry[]> = { Tracks: [], Clips: [], Text: [], Markers: [], Delivery: [] };
+	const buckets: Record<string, DiffEntry[]> = { Tracks: [], Clips: [], Text: [], Markers: [], Mix: [], Delivery: [] };
 	for (const e of entries) {
 		if (e.kind.startsWith('track_')) buckets.Tracks.push(e);
 		else if (e.kind.startsWith('clip_')) buckets.Clips.push(e);
 		else if (e.kind.startsWith('overlay_')) buckets.Text.push(e);
 		else if (e.kind.startsWith('marker_')) buckets.Markers.push(e);
+		else if (e.kind === 'master_changed') buckets.Mix.push(e);
 		else buckets.Delivery.push(e);
 	}
 	return Object.entries(buckets)
