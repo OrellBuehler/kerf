@@ -17,9 +17,13 @@ import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, up
 import { singleFlight } from './single-flight';
 import {
 	defaultWorkspaces,
+	describeAdopted,
 	libraryTabFor,
-	parseWorkspaces,
+	readWorkspaces,
+	withLayout,
 	withLibraryTab,
+	withoutWorkspaces,
+	WORKSPACE_IDS,
 	type LibraryTab,
 	type WorkspaceId,
 	type WorkspacesState
@@ -75,8 +79,14 @@ export const CPU_PRESETS = [
 	}
 ] as const;
 
+/** The sections of the settings dialog (`SettingsDialog.svelte` lists them). */
+export type SettingsSection = 'performance' | 'speech' | 'preview' | 'appearance' | 'keyboard';
+
 class SettingsStore {
 	open = $state(false);
+	/** The section the dialog opens on, when something other than the first was
+	 *  asked for (Help › Keyboard shortcuts); the dialog takes it once. */
+	wantSection = $state<SettingsSection | null>(null);
 	loaded = $state(false);
 	saving = $state(false);
 
@@ -148,8 +158,14 @@ class SettingsStore {
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
 		if (!this.workspacesRead) {
-			this.workspaces = parseWorkspaces(view.workspaces, view.layout);
+			const read = readWorkspaces(view.workspaces, view.layout);
+			this.workspaces = read.state;
 			this.workspacesRead = true;
+			// Layouts brought up to date (stamped, a preset copy dropped, a new panel
+			// cut in) are written back, so it happens once.
+			if (read.changed) this.writeWorkspaces.request();
+			const note = describeAdopted(read.adopted);
+			if (note) toast.info(note.message, { description: note.description });
 		}
 		if (!this.keysRead) {
 			this.keyOverrides = parseKeyOverrides(view.keybindings, this.platform);
@@ -253,20 +269,25 @@ class SettingsStore {
 		this.changeWorkspaces({ ...this.workspaces, active: id });
 	}
 
-	/** Remember how `id` is arranged now. */
+	/** Remember how `id` is arranged now, against the panels its preset opens in
+	 *  this build (so a later build's new panel can be told from a closed one). */
 	saveWorkspaceLayout(id: WorkspaceId, layout: unknown) {
-		this.changeWorkspaces({
-			...this.workspaces,
-			layouts: { ...this.workspaces.layouts, [id]: layout as WorkspacesState['layouts'][WorkspaceId] }
-		});
+		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceId]>));
 	}
 
-	/** Forget how `id` was arranged, so it is its preset again. */
-	clearWorkspaceLayout(id: WorkspaceId) {
-		if (!(id in this.workspaces.layouts)) return;
-		const layouts = { ...this.workspaces.layouts };
-		delete layouts[id];
-		this.changeWorkspaces({ ...this.workspaces, layouts });
+	/** Forget how `id` was arranged and which library tab was picked in it, so it
+	 *  is its preset again. The rail's fold is not a workspace's and stays. */
+	resetWorkspace(id: WorkspaceId) {
+		this.resetWorkspaces([id]);
+	}
+
+	resetAllWorkspaces() {
+		this.resetWorkspaces(WORKSPACE_IDS);
+	}
+
+	private resetWorkspaces(ids: readonly WorkspaceId[]) {
+		const next = withoutWorkspaces(this.workspaces, ids);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
 	}
 
 	/** Pick the library's tab for the active workspace. */
@@ -446,6 +467,12 @@ class SettingsStore {
 	toggle() {
 		this.open = !this.open;
 		if (this.open && !this.loaded) void this.load();
+	}
+
+	/** Open the dialog on `section`. */
+	openSection(section: SettingsSection) {
+		this.wantSection = section;
+		if (!this.open) this.toggle();
 	}
 
 	close() {

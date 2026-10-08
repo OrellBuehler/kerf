@@ -21,8 +21,8 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe,
-    SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
+    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
 use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
 
@@ -5009,9 +5009,10 @@ fn build_filter_complex_metered(
             let quote = |v: String, dynamic: bool| if dynamic { format!("'{v}'") } else { v };
             let overlay = if clip.is_animated() {
                 // Animated picture position: per-frame overlay x / y expressions.
-                // The eased polyline `transform_at` reads too (one curve for every renderer).
-                let xs = clip.keyframe_channel(|k| k.pos_x);
-                let ys = clip.keyframe_channel(|k| k.pos_y);
+                // The eased polyline `transform_at` reads too (one curve for every renderer);
+                // an axis that is not keyed is its static offset.
+                let xs = curve_or_static(clip, Property::PosX);
+                let ys = curve_or_static(clip, Property::PosY);
                 let px = keyframe_expr(&xs, "t", clip.timeline_start);
                 let py = keyframe_expr(&ys, "t", clip.timeline_start);
                 let (px, py) = match &motion {
@@ -5500,6 +5501,51 @@ fn eq_filter(c: &Color) -> String {
     f
 }
 
+/// A keyed number's curve, or — not keyed — its static value as a one-point curve (which
+/// [`keyframe_expr`] writes as that number).
+fn curve_or_static(clip: &Clip, prop: Property) -> Vec<(f64, f64)> {
+    if clip.is_keyed(prop) {
+        clip.property_curve(prop)
+    } else {
+        vec![(0.0, clip.static_value(prop))]
+    }
+}
+
+/// The `eq` filter of a clip with a keyed colour number: `eval=frame`, and each keyed number
+/// an expression of the frame's time `t` (the frame's timestamp, which `setpts` has put on the
+/// timeline, so clip-local time is `t` minus the clip's start, as every other keyed expression
+/// here). Numbers that are not keyed stay the static ones. The temperature is the
+/// opposing gammas [`Color::temperature_gammas`] makes of it, `1 + 0.3 t` and `1 - 0.3 t`
+/// (the curve's values are held to -1..=1, so the clamp that function applies is already
+/// in them). Every expression is quoted — it has commas — and `eq` evaluates them per frame
+/// on FFmpeg 4.4 through 9.0 alike.
+fn eq_filter_keyed(clip: &Clip) -> String {
+    let c = &clip.color;
+    let expr = |prop: Property| keyframe_expr(&clip.property_curve(prop), "t", clip.timeline_start);
+    let number = |prop: Property, fixed: f64| {
+        if clip.is_keyed(prop) {
+            format!("'{}'", expr(prop))
+        } else {
+            fixed.to_string()
+        }
+    };
+    let mut f = format!(
+        "eq=brightness={}:contrast={}:saturation={}:gamma={}",
+        number(Property::Brightness, c.brightness),
+        number(Property::Contrast, c.contrast),
+        number(Property::Saturation, c.saturation),
+        number(Property::Gamma, c.gamma)
+    );
+    if clip.is_keyed(Property::Temperature) {
+        let e = expr(Property::Temperature);
+        f.push_str(&format!(":gamma_r='1+0.3*({e})':gamma_b='1-0.3*({e})'"));
+    } else if let Some((gamma_r, gamma_b)) = c.temperature_gammas() {
+        f.push_str(&format!(":gamma_r={}:gamma_b={}", fnum(gamma_r), fnum(gamma_b)));
+    }
+    f.push_str(":eval=frame");
+    f
+}
+
 /// The filter for a non-alpha video effect, or `None` for chroma key (which
 /// establishes alpha and is emitted separately, after the alpha plane exists).
 fn video_effect_filter(e: &VideoEffect) -> Option<String> {
@@ -5877,13 +5923,17 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     let s = clip.speed_mag();
     let t = &clip.transform;
     let anim = clip.is_animated();
-    let kf = clip.sorted_keyframes();
     // Which animated channels actually move (so alpha / per-frame geometry is only
-    // forced when needed). A keyframed clip's scale / position always come from the
-    // keyframes (a fresh keyframe captures the static transform), so `anim` alone
-    // drives the geometry; rotation / opacity additionally need an alpha plane.
-    let anim_rotation = anim && kf.iter().any(|k| k.rotation != 0.0);
-    let anim_opacity = anim && kf.iter().any(|k| k.opacity < 1.0);
+    // forced when needed). A clip animated through the legacy bundle has every number of its
+    // transform keyed (a fresh keyframe captures the static transform), so `anim` alone drove
+    // the geometry; a clip with per-property channels keys only some, and the rest are built
+    // from its static transform as an unkeyed clip's are. Rotation / opacity additionally
+    // need an alpha plane.
+    let scale_keyed = clip.is_keyed(Property::Scale);
+    let rotation_keyed = clip.is_keyed(Property::Rotation);
+    let opacity_keyed = clip.is_keyed(Property::Opacity);
+    let anim_rotation = clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0);
+    let anim_opacity = clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0);
     // A zoom that really moves: the picture changes size per frame, so its `scale`
     // goes last (see above). A keyed clip whose scale holds still keeps the chain
     // it always had — its picture never changes size, so nothing can be pinned.
@@ -5891,7 +5941,8 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     let chroma = clip.effects.iter().any(|e| e.produces_alpha());
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
-    let transform_alpha = (!anim && !t.is_identity() && t.needs_alpha()) || anim_rotation || anim_opacity || chroma;
+    let transform_alpha =
+        (!rotation_keyed && t.rotation != 0.0) || (!opacity_keyed && t.opacity < 1.0) || anim_rotation || anim_opacity || chroma;
     let needs_alpha = transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some();
     let timing = ClipTiming::new(clip, fx);
     let dur = timing.duration();
@@ -6003,10 +6054,10 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // A transformed clip's own zoom rides on top of that base fit.
     let mut late_zoom: Option<String> = None;
     if !geom_identity {
-        if anim {
+        if scale_keyed {
             // Per-frame zoom: re-evaluate the scale expression every frame.
-            let expr = keyframe_expr(&clip.keyframe_channel(|k| k.scale), "t", clip.timeline_start);
-            let tiny = kf.iter().any(|k| k.scale < TINY_SCALE);
+            let expr = keyframe_expr(&clip.property_curve(Property::Scale), "t", clip.timeline_start);
+            let tiny = clip.property_keys(Property::Scale).iter().any(|k| k.value < TINY_SCALE);
             // A moving zoom runs after the tone-map, at the end of the chain: even sizes
             // only matter ahead of `zscale`.
             let zoom = zoom_scale(&expr, true, tiny, tone_mapped && !zoom_keyed, &sf);
@@ -6040,7 +6091,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`
     // has no alpha-capable input format, so the graph would otherwise auto-insert a
     // conversion that drops the alpha (silently disabling opacity / rotation).
-    if !clip.color.is_identity() {
+    if clip.color_animated() {
+        p.push(eq_filter_keyed(clip));
+    } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
@@ -6067,7 +6120,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // The mask is the same alpha-plane geq, so a clip that
     // has both shares one pass — geq is per-pixel and by far the most expensive
     // filter in the chain, and two back-to-back passes would double it.
-    let opacity_expr = anim_opacity.then(|| keyframe_expr(&clip.keyframe_channel(|k| k.opacity), "T", clip.timeline_start));
+    let opacity_expr = anim_opacity.then(|| keyframe_expr(&clip.property_curve(Property::Opacity), "T", clip.timeline_start));
     match (&clip.mask, opacity_expr) {
         (Some(mask), Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
@@ -6079,7 +6132,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         )),
         (None, None) => {}
     }
-    if !anim && t.opacity < 1.0 {
+    if !opacity_keyed && t.opacity < 1.0 {
         p.push(format!("colorchannelmixer=aa={}", t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
@@ -6093,11 +6146,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // in every buffer it reuses, and the picture grows into the union of every
     // pose it has had (the "erratic" rotation, on 6.1 and 9.0 alike).
     if anim_rotation {
-        let expr = keyframe_expr(&clip.keyframe_channel(|k| k.rotation), "t", clip.timeline_start);
+        let expr = keyframe_expr(&clip.property_curve(Property::Rotation), "t", clip.timeline_start);
         p.push(format!(
             "rotate=a='({expr})*PI/180':fillcolor=black@0:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
         ));
-    } else if !anim && t.rotation != 0.0 {
+    } else if !rotation_keyed && t.rotation != 0.0 {
         let rad = t.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
@@ -6465,7 +6518,7 @@ fn build_still_args(
             "[{n}:v]{tone}{chain}[v{n}]",
             chain = still_clip_chain(
                 &tf,
-                &clip.color,
+                &ac.color(),
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
@@ -6645,7 +6698,19 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     if (s - 1.0).abs() > 1e-9 {
         p.push(atempo_chain(s));
     }
-    p.push(format!("volume={}", clip.volume));
+    if clip.volume_animated() {
+        // A keyed gain: `volume` evaluated per frame, after `atempo` so its `t` is the
+        // clip's own playing time. It holds one gain for a whole frame, so the frames are
+        // cut to a few milliseconds first (`asetnsamples`, without padding the last one) or
+        // a fade would step at the decoder's frame size — 21 ms for AAC, audible as zipper noise.
+        p.push(format!("asetnsamples=n={VOLUME_FRAME_SAMPLES}:p=0"));
+        p.push(format!(
+            "volume='{}':eval=frame",
+            keyframe_expr(&clip.property_curve(Property::Volume), "t", 0.0)
+        ));
+    } else {
+        p.push(format!("volume={}", clip.volume));
+    }
     // Per-clip audio effects (EQ / compressor / gate / filters) in author order,
     // after the clip gain.
     for e in &clip.audio {
@@ -6680,6 +6745,10 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     p.push(format!("adelay={delay_ms}:all=1"));
     p.join(",")
 }
+
+/// Samples in a frame the keyed volume is evaluated on (2.7 ms at 48 kHz): the gain steps by
+/// at most the curve's slope times that between two frames.
+const VOLUME_FRAME_SAMPLES: usize = 128;
 
 /// Decompose a tempo change into `atempo` steps each within ffmpeg's supported
 /// `[0.5, 2.0]` range (e.g. 4× → `atempo=2.0,atempo=2.0`).
@@ -6732,6 +6801,11 @@ mod picked;
 /// against `transform_at` and the scrubbed still (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_zoom;
+
+/// Per-property channels — a keyed colour and a keyed volume — against the pictures and samples
+/// the export renders (`#[ignore]`d).
+#[cfg(test)]
+mod keyed_channels;
 
 #[cfg(test)]
 mod tests {
@@ -9594,6 +9668,129 @@ mod tests {
         let g = graph_of(&single(vec![clip]), &[asset]);
         assert!(g.contains("gamma_r=1.15"), "{g}");
         assert!(g.contains("gamma_b=0.85"), "{g}");
+    }
+
+    /// The video chain of the first clip of `tl`.
+    fn first_video_chain(tl: &Timeline, assets: &[Asset]) -> String {
+        let g = graph_of(tl, assets);
+        g.split(';')
+            .find(|c| c.starts_with("[0:v]"))
+            .expect("a video chain")
+            .to_string()
+    }
+
+    fn pkey(time: f64, value: f64) -> crate::model::PropertyKey {
+        crate::model::PropertyKey::new(time, value)
+    }
+
+    #[test]
+    fn a_keyed_colour_writes_the_eq_per_frame_and_leaves_the_rest_of_the_chain_as_it_was() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut still_graded = make_clip(asset.id, 2.0, 8.0, 1.5);
+        still_graded.color.contrast = 1.2;
+        let mut keyed = still_graded.clone();
+        keyed.set_property_keys(Property::Brightness, vec![pkey(0.0, -0.3), pkey(2.0, 0.3)]);
+        keyed.set_property_keys(Property::Temperature, vec![pkey(0.0, -1.0), pkey(2.0, 0.5)]);
+        let chain = first_video_chain(&single(vec![keyed.clone()]), std::slice::from_ref(&asset));
+        // The keyed numbers are quoted expressions of `t` minus the clip's start; the others stay
+        // the numbers they were; the temperature is the gammas of its curve; one `eval=frame`.
+        assert!(
+            chain.contains("eq=brightness='if(lt((t-1.5),0),-0.3,if(lt((t-1.5),2),(-0.3+(0.6)*((t-1.5)-0)/(2)),0.3))':contrast=1.2:saturation=1:gamma=1:gamma_r='1+0.3*(if(lt((t-1.5),0),-1,"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains(":gamma_b='1-0.3*(") && chain.ends_with(":eval=frame,format=yuv420p[v0]"),
+            "{chain}"
+        );
+        // Nothing but the `eq` differs from the clip with the same grade held still.
+        let still = first_video_chain(&single(vec![still_graded]), std::slice::from_ref(&asset));
+        let strip = |c: &str| c.split(",eq=").next().unwrap().to_string();
+        assert_eq!(strip(&chain), strip(&still), "the picture is placed as a static clip's is");
+        let after = |c: &str| c.rsplit_once(",format=").unwrap().1.to_string();
+        assert_eq!(after(&chain), after(&still));
+        // A keyed clip is graded even when its static grade is the identity.
+        keyed.color = crate::model::Color::default();
+        let chain = first_video_chain(&single(vec![keyed]), std::slice::from_ref(&asset));
+        assert!(chain.contains("contrast=1:saturation=1:gamma=1:gamma_r="), "{chain}");
+    }
+
+    #[test]
+    fn a_transform_with_some_numbers_keyed_builds_the_rest_from_the_static_transform() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let assets = std::slice::from_ref(&asset);
+        let mut fading = make_clip(asset.id, 0.0, 10.0, 0.0);
+        fading.transform.scale = 1.5;
+        fading.transform.rotation = 20.0;
+        fading.set_property_keys(Property::Opacity, vec![pkey(0.0, 0.2), pkey(2.0, 1.0)]);
+        let chain = first_video_chain(&single(vec![fading.clone()]), assets);
+        // The opacity is a `geq` alpha; the zoom and the turn are the constant ones.
+        assert!(chain.contains("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='("), "{chain}");
+        assert!(chain.contains("scale=iw*1.5:ih*1.5"), "{chain}");
+        assert!(!chain.contains("eval=frame"), "no zoom is keyed: {chain}");
+        assert!(chain.contains("rotate=0.3490658503988659:fillcolor=none"), "{chain}");
+        assert!(!chain.contains("colorchannelmixer"), "{chain}");
+        // A moving position beside a static opacity: that opacity is the constant mix.
+        let mut moving = make_clip(asset.id, 0.0, 10.0, 0.0);
+        moving.transform.opacity = 0.6;
+        moving.set_property_keys(Property::PosX, vec![pkey(0.0, -0.2), pkey(3.0, 0.2)]);
+        let g = graph_of(&single(vec![moving.clone()]), assets);
+        assert!(g.contains("colorchannelmixer=aa=0.6"), "{g}");
+        assert!(
+            g.contains("overlay=x='(W-w)/2+(") && g.contains(")*W':y='(H-h)/2+(0)*H'"),
+            "{g}"
+        );
+        // Taking a number off the bundle: the bundle's other numbers still drive the rest.
+        let mut bundle = make_clip(asset.id, 0.0, 10.0, 0.0);
+        bundle.keyframes = vec![
+            crate::model::Keyframe {
+                time: 0.0,
+                scale: 1.0,
+                pos_x: 0.0,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+                easing: Default::default(),
+            },
+            crate::model::Keyframe {
+                time: 2.0,
+                scale: 2.0,
+                pos_x: 0.1,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 0.5,
+                easing: Default::default(),
+            },
+        ];
+        let keyed_chain = first_video_chain(&single(vec![bundle.clone()]), assets);
+        assert!(
+            keyed_chain.contains("geq=") && keyed_chain.contains("scale=w='iw*"),
+            "{keyed_chain}"
+        );
+        bundle.set_property_keys(Property::Opacity, vec![]);
+        bundle.transform.opacity = 0.7;
+        let off = first_video_chain(&single(vec![bundle]), assets);
+        assert!(
+            !off.contains("geq=") && off.contains("colorchannelmixer=aa=0.7") && off.contains("scale=w='iw*"),
+            "{off}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_volume_is_a_per_frame_gain_in_small_frames_and_an_unkeyed_one_is_not() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 3.0);
+        clip.volume = 0.5;
+        let plain = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
+        assert!(plain.contains("volume=0.5,") && !plain.contains("asetnsamples"), "{plain}");
+        clip.set_property_keys(Property::Volume, vec![pkey(0.0, 0.0), pkey(2.0, 1.0)]);
+        let keyed = graph_of(&single(vec![clip]), std::slice::from_ref(&asset));
+        assert!(
+            keyed.contains(
+                ",asetnsamples=n=128:p=0,volume='if(lt((t-0),0),0,if(lt((t-0),2),(0+(1)*((t-0)-0)/(2)),1))':eval=frame,"
+            ),
+            "{keyed}"
+        );
+        assert!(!keyed.contains("volume=0.5"), "the static gain is replaced: {keyed}");
     }
 
     #[test]

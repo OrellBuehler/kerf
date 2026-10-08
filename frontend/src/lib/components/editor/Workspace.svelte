@@ -2,7 +2,7 @@
 	// The editor's movable middle: dockview hosts one Svelte component per
 	// panel. Which arrangement it opens in, switching between them and saving
 	// them are `workspace`'s job (the title bar's tabs drive it); this builds the
-	// dock and mounts the panels. TitleBar, Toolbar and StatusBar stay fixed
+	// dock and mounts the panels. TitleBar (with the menu bar) and StatusBar stay fixed
 	// around it.
 	import { onMount, mount, unmount, type Component } from 'svelte';
 	import { createDockview, type CreateComponentOptions, type IContentRenderer } from 'dockview';
@@ -56,7 +56,7 @@
 		const element = document.createElement('div');
 		element.style.cssText =
 			'display:grid;place-items:center;height:100%;font-size:12px;color:var(--text-disabled)';
-		element.textContent = 'Open a panel from the toolbar';
+		element.textContent = 'Open a panel from the Window menu';
 		return { element, init() {} };
 	}
 

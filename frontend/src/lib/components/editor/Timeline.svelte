@@ -8,7 +8,7 @@
 	import HeightGlyph from './HeightGlyph.svelte';
 	import Minimap from './Minimap.svelte';
 	import { toast } from '$lib/notifications.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
+	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -23,6 +23,9 @@
 		unlinkSelection
 	} from '$lib/ops';
 	import { importCaptionFile } from '$lib/title-actions';
+	import type { ActionId } from '$lib/keymap';
+	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
+	import { setDeliveryPreset } from '$lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
 	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
@@ -43,6 +46,7 @@
 		slipDelta,
 		sourceLimits,
 		subjectsPresent,
+		TOOL_HINT,
 		type EditPreview,
 		type GestureEdit,
 		type TrimTool
@@ -518,6 +522,37 @@
 
 	function err(e: unknown) {
 		toast.error(e instanceof Error ? e.message : String(e));
+	}
+
+	// The tools, now that the toolbar row is gone: [tool, icon, name, the action whose
+	// key selects it] — the tooltip is read from the keymap, so it shows the key the user
+	// actually has. The three that move a boundary rather than a clip are set apart, and
+	// their tooltips say what the drag does, since the glyphs alone do not.
+	const TOOLS: [Tool, string, string, ActionId][] = [
+		['pointer', 'MousePointer2', 'Select', 'tool.pointer'],
+		['razor', 'Scissors', 'Razor', 'tool.razor']
+	];
+	const TRIM_TOOLS: [TrimTool, string, string, ActionId][] = [
+		['roll', 'separator-vertical', 'Roll', 'tool.roll'],
+		['slip', 'gallery-horizontal', 'Slip', 'tool.slip'],
+		['slide', 'arrow-left-right', 'Slide', 'tool.slide']
+	];
+
+	// The frame the cut is made for. Changing it reshapes the preview, the scrubbed still
+	// and the export together, so the vertical crop is something you compose against
+	// rather than discover in the rendered file.
+	const delivery = $derived(presetFor(editor.timeline.format));
+
+	function pickDelivery(e: MouseEvent) {
+		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		contextMenu.show(
+			new MouseEvent('contextmenu', { clientX: r.right, clientY: r.bottom + 2 }),
+			DELIVERY_PRESETS.map((p) => ({
+				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+				icon: p.id === delivery.id ? 'check' : undefined,
+				action: () => void setDeliveryPreset(p.id)
+			}))
+		);
 	}
 
 	function onClipPointerDown(e: PointerEvent, c: Clip, t: Track) {
@@ -1821,20 +1856,54 @@
 	}}
 />
 
+{#snippet toolBtn(title: string, label: string, icon: string, on: boolean | null, click: () => void, off = false)}
+	<button
+		{title}
+		aria-label={label}
+		aria-pressed={on === null ? undefined : on}
+		disabled={off}
+		onclick={click}
+		style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:24px;border-radius:var(--radius-sm);cursor:{off
+			? 'default'
+			: 'pointer'};border:var(--line-width) solid {on ? 'var(--border-strong)' : 'transparent'};background:{on
+			? 'var(--surface-active)'
+			: 'transparent'};color:{on ? 'var(--kerf-400)' : 'var(--text-secondary)'};opacity:{off ? 0.4 : 1}"
+	>
+		<Icon n={icon} s={14} />
+	</button>
+{/snippet}
+
 <div
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
 
-	<!-- timeline toolbar -->
+	<!-- Timeline toolbar. What used to be the app's own toolbar row lives here, where
+	     it acts: the tools, ripple, snapping, undo / redo and the delivery frame beside
+	     the view controls. It wraps onto a second row rather than clipping, so nothing
+	     becomes unreachable in a narrow window. -->
 	<div
-		style="height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:var(--line-width) solid var(--border-subtle);flex:none"
+		style="min-height:34px;display:flex;flex-wrap:wrap;align-items:center;column-gap:8px;row-gap:2px;padding:3px 12px;border-bottom:var(--line-width) solid var(--border-subtle);flex:none"
 	>
-		<span
-			style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-			>Timeline</span
-		>
+		<div role="toolbar" aria-label="Edit tools" style="display:inline-flex;align-items:center;gap:2px">
+			{#each TOOLS as [id, ic, name, action] (id)}
+				{@render toolBtn(settings.withShortcut(name, action), name, ic, ui.tool === id, () => (ui.tool = id))}
+			{/each}
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+			{#each TRIM_TOOLS as [id, ic, name, action] (id)}
+				{@render toolBtn(
+					`${settings.withShortcut(`${name} tool`, action)} — ${TOOL_HINT[id]}`,
+					`${name} tool`,
+					ic,
+					ui.tool === id,
+					() => (ui.tool = id)
+				)}
+			{/each}
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+			{@render toolBtn(settings.withShortcut('Undo', 'edit.undo'), 'Undo', 'undo', null, () => void editor.undo(), !editor.canUndo)}
+			{@render toolBtn(settings.withShortcut('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
+		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
-		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
+		<span title="Length of the cut" style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
 				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}{hasLinkedClips ? `. ${ALT_HINT}` : ''}"
@@ -1852,131 +1921,150 @@
 		{/if}
 		{#if editor.selectedClip}
 			{@const sc = editor.selectedClip}
-			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-			<span
-				style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-				>Fade</span
-			>
-			<button
-				title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
-				onclick={toggleFadeIn}
-				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_in >
-				0
-					? 'var(--surface-hover)'
-					: 'transparent'};color:{sc.fade_in > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">in</button
-			>
-			<button
-				title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
-				onclick={toggleFadeOut}
-				style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_out >
-				0
-					? 'var(--surface-hover)'
-					: 'transparent'};color:{sc.fade_out > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">out</button
-			>
-		{/if}
-		<div style="flex:1"></div>
-		<button
-			title={settings.withShortcut('Zoom out', 'view.zoomOut')}
-			aria-label="Zoom out"
-			onclick={() => ui.zoomBy(-1)}
-			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
-			><Icon n="zoom-out" s={14} /></button
-		>
-		<input
-			type="range"
-			min="0"
-			max="1"
-			step="0.001"
-			value={zoomToSlider(ui.zoom)}
-			oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
-			title="Zoom — {zoomLabel(ui.zoom)} (⌘/Ctrl + wheel zooms at the cursor)"
-			aria-label="Timeline zoom"
-			style="width:90px;height:24px;"
-		/>
-		<button
-			title={settings.withShortcut('Zoom in', 'view.zoomIn')}
-			aria-label="Zoom in"
-			onclick={() => ui.zoomBy(1)}
-			style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
-			><Icon n="zoom-in" s={14} /></button
-		>
-		<button
-			title={settings.withShortcut('Zoom to fit the whole cut', 'view.zoomFit')}
-			aria-label="Zoom to fit"
-			disabled={!hasClips}
-			onclick={() => ui.zoomToFit()}
-			style="background:none;border:none;cursor:{hasClips ? 'pointer' : 'default'};color:var(--text-muted);opacity:{hasClips ? 1 : 0.4};display:grid;place-items:center"
-			><Icon n="fold-horizontal" s={14} /></button
-		>
-		<button
-			title={ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable'}
-			aria-pressed={ui.snap}
-			onclick={() => (ui.snap = !ui.snap)}
-			style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{ui.snap
-				? 'var(--surface-hover)'
-				: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
-			>{ui.snap ? 'snap on' : 'snap off'}</button
-		>
-		<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
-		     delete and a speed change do everywhere (and an agent can flip it). So it
-		     is lit while on, with a second cue in the ruler corner. -->
-		<button
-			title={editor.rippleMode
-				? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
-				: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
-			aria-pressed={editor.rippleMode}
-			onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
-			style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode
-				? 'var(--kerf-400)'
-				: 'var(--border-strong)'};background:{editor.rippleMode
-				? 'var(--selection-fill)'
-				: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
-			><Icon n="between-horizontal-start" s={12} />Ripple</button
-		>
-		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-		<!-- Track height, every track at once (each track's own name button sets just
-		     that one). Lit when every track is at that height. -->
-		<div role="group" aria-label="Track height, all tracks" style="display:inline-flex;align-items:center;gap:2px">
-			{#each HEIGHT_PRESETS as p (p)}
-				<button
-					title="All tracks {PRESET_LABEL[p].toLowerCase()} — {PRESET_PX[p]} px"
-					aria-label="All tracks {PRESET_LABEL[p].toLowerCase()}"
-					aria-pressed={allHeight === p}
-					onclick={() => ui.setAllHeights(p)}
-					style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {allHeight ===
-					p
-						? 'var(--kerf-400)'
-						: 'var(--border-strong)'};background:{allHeight === p ? 'var(--selection-fill)' : 'transparent'};color:{allHeight ===
-					p
-						? 'var(--kerf-300)'
-						: 'var(--text-disabled)'}"><HeightGlyph preset={p} /></button
+			<span style="display:inline-flex;align-items:center;gap:6px">
+				<span
+					style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
+					>Fade</span
 				>
-			{/each}
+				<button
+					title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
+					onclick={toggleFadeIn}
+					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_in >
+					0
+						? 'var(--surface-hover)'
+						: 'transparent'};color:{sc.fade_in > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">in</button
+				>
+				<button
+					title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
+					onclick={toggleFadeOut}
+					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_out >
+					0
+						? 'var(--surface-hover)'
+						: 'transparent'};color:{sc.fade_out > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">out</button
+				>
+			</span>
+		{/if}
+		<div style="flex:1;min-width:0"></div>
+		<div style="display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;row-gap:2px">
+			<span style="display:inline-flex;align-items:center;gap:6px">
+				<button
+					title={settings.withShortcut('Zoom out', 'view.zoomOut')}
+					aria-label="Zoom out"
+					onclick={() => ui.zoomBy(-1)}
+					style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
+					><Icon n="zoom-out" s={14} /></button
+				>
+				<input
+					type="range"
+					min="0"
+					max="1"
+					step="0.001"
+					value={zoomToSlider(ui.zoom)}
+					oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
+					title="Zoom — {zoomLabel(ui.zoom)} (⌘/Ctrl + wheel zooms at the cursor)"
+					aria-label="Timeline zoom"
+					style="width:90px;height:24px;"
+				/>
+				<button
+					title={settings.withShortcut('Zoom in', 'view.zoomIn')}
+					aria-label="Zoom in"
+					onclick={() => ui.zoomBy(1)}
+					style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
+					><Icon n="zoom-in" s={14} /></button
+				>
+				<button
+					title={settings.withShortcut('Zoom to fit the whole cut', 'view.zoomFit')}
+					aria-label="Zoom to fit"
+					disabled={!hasClips}
+					onclick={() => ui.zoomToFit()}
+					style="background:none;border:none;cursor:{hasClips ? 'pointer' : 'default'};color:var(--text-muted);opacity:{hasClips ? 1 : 0.4};display:grid;place-items:center"
+					><Icon n="fold-horizontal" s={14} /></button
+				>
+			</span>
+			<button
+				title={settings.withShortcut(ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable', 'tool.snap')}
+				aria-pressed={ui.snap}
+				onclick={() => (ui.snap = !ui.snap)}
+				style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{ui.snap
+					? 'var(--surface-hover)'
+					: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+				>{ui.snap ? 'snap on' : 'snap off'}</button
+			>
+			<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
+			     delete and a speed change do everywhere (and an agent can flip it). So it
+			     is lit while on, with a second cue in the ruler corner. -->
+			<button
+				title={editor.rippleMode
+					? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
+					: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
+				aria-pressed={editor.rippleMode}
+				onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
+				style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode
+					? 'var(--kerf-400)'
+					: 'var(--border-strong)'};background:{editor.rippleMode
+					? 'var(--selection-fill)'
+					: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+				><Icon n="between-horizontal-start" s={12} />Ripple</button
+			>
+			<span style="display:inline-flex;align-items:center;gap:6px">
+				<!-- Track height, every track at once (each track's own name button sets just
+				     that one). Lit when every track is at that height. -->
+				<div role="group" aria-label="Track height, all tracks" style="display:inline-flex;align-items:center;gap:2px">
+					{#each HEIGHT_PRESETS as p (p)}
+						<button
+							title="All tracks {PRESET_LABEL[p].toLowerCase()} — {PRESET_PX[p]} px"
+							aria-label="All tracks {PRESET_LABEL[p].toLowerCase()}"
+							aria-pressed={allHeight === p}
+							onclick={() => ui.setAllHeights(p)}
+							style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {allHeight ===
+							p
+								? 'var(--kerf-400)'
+								: 'var(--border-strong)'};background:{allHeight === p ? 'var(--selection-fill)' : 'transparent'};color:{allHeight ===
+							p
+								? 'var(--kerf-300)'
+								: 'var(--text-disabled)'}"><HeightGlyph preset={p} /></button
+						>
+					{/each}
+				</div>
+				<button
+					title={ui.minimap ? 'Hide the overview strip' : 'Show the overview strip of the whole cut'}
+					aria-label="Toggle overview"
+					aria-pressed={ui.minimap}
+					onclick={() => ui.toggleMinimap()}
+					style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {ui.minimap
+						? 'var(--kerf-400)'
+						: 'var(--border-strong)'};background:{ui.minimap ? 'var(--selection-fill)' : 'transparent'};color:{ui.minimap
+						? 'var(--kerf-300)'
+						: 'var(--text-disabled)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
+				>
+			</span>
+			<span style="display:inline-flex;align-items:center;gap:6px">
+				<button
+					title="Add a video track"
+					onclick={() => onAddTrack('video')}
+					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
+					>+ V</button
+				>
+				<button
+					title="Add an audio track"
+					onclick={() => onAddTrack('audio')}
+					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
+					>+ A</button
+				>
+				<!-- The frame the cut is made for: the preview is this shape, and so is the export. -->
+				<button
+					title={delivery.format
+						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
+						: 'The frame follows the footage. Click to cut for a delivery shape.'}
+					aria-haspopup="menu"
+					onclick={pickDelivery}
+					style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {delivery.format
+						? 'var(--kerf-400)'
+						: 'var(--border-strong)'};background:transparent;color:{delivery.format ? 'var(--kerf-300)' : 'var(--text-muted)'}"
+					><Icon n="crop" s={12} />{delivery.label}</button
+				>
+			</span>
 		</div>
-		<button
-			title={ui.minimap ? 'Hide the overview strip' : 'Show the overview strip of the whole cut'}
-			aria-label="Toggle overview"
-			aria-pressed={ui.minimap}
-			onclick={() => ui.toggleMinimap()}
-			style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {ui.minimap
-				? 'var(--kerf-400)'
-				: 'var(--border-strong)'};background:{ui.minimap ? 'var(--selection-fill)' : 'transparent'};color:{ui.minimap
-				? 'var(--kerf-300)'
-				: 'var(--text-disabled)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
-		>
-		<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-		<button
-			title="Add a video track"
-			onclick={() => onAddTrack('video')}
-			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
-			>+ V</button
-		>
-		<button
-			title="Add an audio track"
-			onclick={() => onAddTrack('audio')}
-			style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
-			>+ A</button
-		>
 	</div>
 
 	<!-- The whole cut on one strip: where the view is, and a way to move it. A

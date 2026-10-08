@@ -379,6 +379,37 @@ so the feature is **only** activated through these forwards — which is what ma
   (no terminal format) kept the cut-out, and a moving zoom (terminal `yuva420p`) flipped it back;
   `ClipFx.alpha` (`Asset::has_alpha`: the probed pixel format of the first video stream is an
   alpha one; an unrecorded format is not) ends such a chain in `format=yuva420p`.
+  **Per-property channels in the graph.** A clip's transform is built number by number from
+  `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
+  `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed
+  opacity as the `geq` alpha, and builds every number it does **not** key from the static transform as
+  an unkeyed clip does (a constant `scale`, a constant `rotate=…:fillcolor=none`, `colorchannelmixer`);
+  the overlay's `x` / `y` are each the curve or the static offset (`curve_or_static`). Any keyed number
+  makes the clip "animated" for the pad / centre decision exactly as the bundle did, so a bundle clip
+  (all five keyed) is byte-identical. **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
+  each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
+  `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed
+  numbers stay the plain numbers, the temperature is `gamma_r='1+0.3*(…)'` / `gamma_b='1-0.3*(…)'`.
+  **Measured, on FFmpeg 4.4.2 and 9.0.2 alike**: every `eq` number (`brightness`, `contrast`,
+  `saturation`, `gamma`, `gamma_r`, `gamma_b`) accepts an expression under `eval=frame`, the centre
+  pixel of every fifth output frame is **0 levels** from the static-`eq` still of the same moment
+  (3 with a keyed opacity beside it: the still takes a constant opacity through the RGB round trip, the
+  file a `geq`) at 24 / 25 / 29.97 / 30 / 60 fps, late on the timeline, at speed 2 / 0.5 / reversed,
+  under a moving zoom, beside a static grade and in a range export
+  (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
+  picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
+  is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
+  export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade
+  would step audibly — so the frames are cut to 128 samples first (2.7 ms at 48 kHz); **`p=0` is
+  required** (the default pads the last frame with silence). With that, on both builds, the render is
+  the unkeyed render scaled **sample for sample** by the curve at the start of each 128-sample frame (worst
+  difference 1.5e-8 in float, five easings), and the frame size is a lag of at most 2.7 ms against the
+  curve. One knife edge: a hold's step that lands exactly on a frame's start flips on the float rounding
+  of `t` (2.2 s is frame 825 and read as "before the step"), so the tests keep steps off that grid.
+  `sweep.rs` evaluates the export's `eq` numbers and `volume` expression at every output frame / time and
+  holds them to `layer.color` / `Clip::volume_at` (and that a plan's turn or opacity is *realised* in the
+  graph — it caught the partial-keying branches in mutation checks).
   **Any such expression must be quoted in
   the filter value** — it contains commas, and an unquoted comma is where the
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`
@@ -824,6 +855,70 @@ no editing logic in the adapter.
   `frontend/src/lib/easing.ts` is the faithful mirror (both suites pin the same curve and split
   values bit for bit), used by the Inspector's sampled pose, the harness's edits
   (`insertKeyframe`, `easingProblem`) and `edit-modes.ts`'s `rebaseAnimation`.
+  **Any one number of a clip can carry keys of its own** (B5b, `model/channels.rs`): `Clip.channels:
+  Vec<PropertyTrack {prop, keys: Vec<PropertyKey {time, value, easing}>}>` for a `Property` —
+  `scale`, `pos_x`, `pos_y`, `rotation`, `opacity`, the five colour numbers or the clip's `volume`
+  (linear gain, 0..=4) — beside the legacy `keyframes` bundle, which animates the five transform numbers
+  *together*. **There is one resolver, `Clip::property_keys(prop)`, and everything reads it**: a number
+  with a track is driven by it (values held to the static setters' range on read — `Property::clamp` — so
+  a hand-edited file never hands `eq` or `volume` a value they refuse, and the export's `1 + 0.3 t` gamma
+  is `temperature_gammas`' exactly); a transform number *without* one reads the bundle's keys as stored;
+  anything else is its static value. `property_curve` (the eased polyline), `property_at`, `transform_at`,
+  `color_at`, `volume_at`, `is_animated` / `color_animated` / `volume_animated` / `zoom_animated` are all
+  views of it, so the still, the preview, the plan and the export cannot disagree. **Nothing is converted
+  behind anyone's back, and an old project renders the graph it always did** (the golden digests of the
+  first 4800 cases are untouched): the bundle is not migrated on load and not on write — the first
+  per-property write *detaches* just that number (`channel_mut` copies its bundle keys into a track, the
+  other four keep the bundle), and **a track with no keys is kept while a bundle exists to say "static,
+  whatever the bundle says"** (`prune_channels` drops it once the bundle is gone — it runs after every
+  op that can empty the bundle or a track: `set_property_keys`, `insert_property_key` and
+  `Project::set_keyframes`, which the harness's `setKeyframes` mirrors; a number can never fall back to
+  the bundle by accident). The legacy ops keep their meaning: `set_keyframes` replaces **the bundle
+  only** (an empty list clears the bundle, not the numbers that have keys of their own — the clip can
+  still be animated afterwards, and the MCP description says so; `clear_keyframes` is the one that makes
+  the whole transform static), `add_keyframe` writes the bundle (and puts an asked-for number into the
+  track that drives it, since the bundle's key for it is ignored), `set_keyframe_easing` without a
+  property shapes the transform key at that time in the bundle *and* in every transform track that has
+  one there, `clear_keyframes` takes the bundle and the transform tracks and leaves colour and volume.
+  **While a number is keyed its static value (`set_volume` / `set_color` / `set_transform`) is not used**,
+  which those tools' descriptions now state (an agent that "sets the colour" of a clip whose brightness is
+  keyed would otherwise change nothing and not know why).
+  `Project::set_property_keyframes(clip, prop, keys)` replaces one number's keys (each checked against
+  `Property::check`, at most `MAX_CHANNEL_KEYS` = 1000, bezier range; no keys = static),
+  `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
+  keyed number when `props` is empty; a negative offset cuts the head off with `rebase_head`, so the
+  destination opens on the pose; replaces the destination's tracks for those numbers; refuses a number
+  the source has no keys for and the same clip twice) are the surface ops. **Edits keep channels where
+  they were** with the B5a rules: `rebase_animation` (every head move — `Timeline::slice`, split-and-remove
+  left, roll / slide of the next clip, a linked partner's trim) runs the bundle *and* `rebase_channels`
+  (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold
+  keeps holding, a cut exactly on a key keeps its outgoing segment), `upsert` splits a segment a new key
+  lands in (`Easing::split`), `detach_audio` carries a keyed volume over through the fader ratio, and the
+  diff names the number that moved (`volume keyframes 0 → 2`, `easing changed on 1 opacity keyframe`) —
+  **judged on the keys that drive the number, not on whether it has a track**: a bundle-animated number
+  held static by an empty track diffs `opacity keyframes 2 → 0` (it used to diff as empty, and
+  `apply_staged` discarded an agent's proposal whose render had changed), and one taken over with the keys
+  the bundle already gave it diffs as nothing. **A keyed volume is read held to 0..=`MAX_CHANNEL_VOLUME`
+  (4); a static one is not**, so `detach_audio` does not fold the fader ratio into keys when that would
+  push one past the cap and silently lower the sound: it takes the equal-fader route a compressor takes
+  (a lane whose fader equals the picture track's, else a new track at it) and carries the keys as they
+  are.
+  **`Timeline::split_clip` now rebases the right half's animation** (`rebase_animation(at - start)`):
+  it did not, so every split of a keyed clip replayed the animation from its first key in the right
+  half (bundle and reframe alike; `a_split_also_keeps_the_legacy_bundle_playing_through` fails without
+  it, as does the TS mirror's); **`cut_range_pieces`** (`cut_clip_range`, `remove_silence`, the linked
+  cut) re-times its **tail** piece the same way — by the head and the removed middle — and so does a
+  sole-surviving tail, which is a head trim. **A split also puts each fade on the half that holds its
+  edge** (the left keeps `fade_in`, the right `fade_out`, each clamped to its half as for any clip that
+  shrank; `transition_in` stays on the left): both halves used to keep both, so a clip with a fade-out
+  dipped to black at every split. The links corpus did not move (no case splits a faded clip), and the
+  unit tests are mirrored by name in `links.test.ts`. **Not animatable yet**: the crop edges (`crop`'s output size is fixed
+  when the graph is configured — `w` / `h` are evaluated once — so an animated crop needs the
+  zoom-and-pan reformulation, not a number per frame) and the mask's centre / size / feather (a `geq`
+  expression could carry them; left for when the dope sheet can edit them). `frontend/src/lib/channels.ts`
+  is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges; both
+  suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
+  Inspector's sampled pose and the preview's gain (`gainAutomation`).
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
@@ -1235,7 +1330,8 @@ no editing logic in the adapter.
   frame asks for it; an `fps` FFmpeg would not parse is an error in either mode. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
   (a chroma key's colour made safe), `reframe` (`PlanReframe { pose, interp }`: sampled
   — the `sendcmd` schedule's held pose is for the pass that draws a reframe), `hdr`,
-  `projection`, `animated` (which keyed channels move) and `fx: LayerFx` — **transitions
+  `projection`, `animated` (`Animated`: which transform numbers are keyed — `keys: Option<Keyed>`, what
+  `Placement` and the geometry need — which move, and whether the colour is keyed) and `fx: LayerFx` — **transitions
   are per-layer, as in the graph**: the clip's `FadeStep`s (evaluated by
   `LayerFx::strength(tint, frame, fps)`, which counts frames like `fade` does), the slide /
   push travel at this frame (`MotionKeys::at`) and whether the layer is on its `tail`; a
@@ -1378,8 +1474,23 @@ no editing logic in the adapter.
   (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
   over a cut whose bottom layer changes the matrix the export converts with may not be the
   one a frame's own layers suggest — to be measured before the GPU encodes an export.
+  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
+  per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
+  plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the
+  file's `eq` is written per frame, and no pass or parity case draws one yet). `Animated` is `Some` for a
+  keyed transform *or* colour and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
+  opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
+  keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
+  scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed
+  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip — so the
+  matrix a translucent layer needs (`Unsupported::TranslucentMatrix`) is skipped only for a **keyed
+  opacity** (`Keyed::opacity`), not for any keyed number: a clip with only its position keyed and a static
+  opacity below 1 still takes the round trip.
+  `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
+  placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
+  evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
-  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `mask`,
+  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`,
   `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -1485,9 +1596,13 @@ no editing logic in the adapter.
   chroma, reframe, HDR, overlays, delivery format and fit, the audio mix, and **every
   `ExportOptions` field** with the one-, two- and no-pass encoder spellings), plus **800
   appended** with a master bus (`master_for`, no dice of its own, so the first 4000 never
-  moved — a new family appends blocks, it does not re-bless old ones), have their
+  moved — a new family appends blocks, it does not re-bless old ones) and **800 more** with
+  per-property channels (`channels_for`: colour numbers, a volume, some transform numbers keyed beside
+  the rest, a number taken off a legacy bundle or held static by an empty track — on its own dice
+  seeded by case and clip, so `0..4800` are the digests the commit before channels gave; coverage
+  families `colour-keyed-*`, `volume-keyed*`, `channel-*`), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 48 block digests each in
+  FNV-1a digests, committed as 56 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -2215,6 +2330,11 @@ detached (`source_audio: false`) carries none — its linked audio clip is the o
 `link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
 pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
+[{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
+a transform number, a colour number or the clip's volume — independently of the rest,
+`copy_keyframes` (`from_clip_id`, `to_clip_id`, `props?`, `offset?`) gives another clip the same
+animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
 **Edit modes over MCP**: `roll_edit` (`clip_a`
 the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
 seconds, positive = later in its own footage) and `slide_clip` answer the
@@ -2335,7 +2455,9 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
-`set_keyframe_easing { clipId, time, easing }` (the key within a millisecond of `time`),
+`set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
+`prop`, that one number's), `set_property_keyframes { clipId, prop, keys }` (one number's own keys; none =
+static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -2698,17 +2820,17 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
-`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `StatusBar` as
-fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
+`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar` (which holds the **menu bar**)
+and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
 it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
 `Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
-and closable; the toolbar's **Panels** menu reopens one (the library left of the
-preview, the deliver panel right of it, the rest beside the active group) or
-resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+and closable; the **Window** menu reopens one (the library left of the
+preview, the deliver panel and the mixer right of it, the rest beside the active
+group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -2727,8 +2849,8 @@ transcript were panels of their own: the first of `media` / `bin` / `transcript`
 found becomes `library`, the others drop, and an emptied group or branch is
 pruned (a branch left with one child collapses into it). What is stored is
 **`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
-{<workspace>: <layout>}, library: {tabs: {<workspace>: <tab>}, collapsed}}`, parsed
-field by field — one bad layout costs that workspace its arrangement, not the
+{<workspace>: <layout>}, offered: {<workspace>: [<panel>…]}, library: {tabs:
+{<workspace>: <tab>}, collapsed}}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
 other four — with the old `layout` becoming Edit only when there is *no*
 `workspaces` value at all (a reset Edit must not be brought back by a layout from
 the old build), and the old single `library.tab` becoming the active workspace's
@@ -2752,7 +2874,33 @@ and `shouldPersistLayout` (pure, bun-tested) writes only a layout that
 *shares* of each branch within 0.4 % (a dozen-pixel nudge of a sash counts; pixel
 sizes, the active group and the active tab do not) — and, with no entry yet, from
 the preset. What was written becomes the new reference; Reset clears the entry
-and leaves none. A window resize can move shares too (where a group's minimum
+and leaves none. **A stored layout is a snapshot, so each one is stored with the
+panels its preset offered when it was saved** (`offered`, written by
+`withLayout`; `readWorkspaces` / `adoptPanels` bring each one up to the preset of
+the running build as it is read). A panel the preset opens now that the layout was
+never offered and does not hold is new to it — the mixer in Audio, which a layout
+saved before it would otherwise never get — and `insertPanel` (`layout.ts`, pure)
+puts it where the preset does, reliably and in order: tabbed with the panels it
+shares a group with in the preset; else in a group of its own beside the nearest
+panel it sits next to there, taking the share the preset gives it out of that row
+(only when the row runs the same way); else as a tab beside the preview. A layout
+is never reset to make room, a notice says what was added (`describeAdopted`), and
+the result is written back once. A panel the layout *was* offered and lacks was
+closed by the user and stays closed. A layout stored before the record is taken to
+have been offered `UNSTAMPED_OFFERED` (the presets of that time: all but the
+mixer); if it is only a copy of today's preset — the build that wrote every
+workspace the user merely visited left one for each — or of the earlier Audio
+preset (`EARLIER_PRESETS`, checked with `sameArrangement`), it is dropped and the
+workspace is its preset, today's. **Reset workspace** (`workspace.reset()`,
+Window menu) forgets the arrangement, its record and the library tab picked in that
+workspace (not the rail's fold, which is the rail's), drops a save still on the
+debounce, rebuilds the dock from the preset and **says what it did** — including
+"already in its default arrangement", because a workspace that never moved looks
+the same afterwards and a reset that shows nothing reads as a broken one (that was
+the report: Reset on a workspace whose stored layout merely equalled its preset).
+It also reports a dock that takes neither the stored layout nor the preset
+(`could not arrange`), which used to be silence. **Reset all workspaces**
+(`resetAll()`) does that for the five. A window resize can move shares too (where a group's minimum
 binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
 the layout events the resize causes, and retakes the reference once the window has
 held still for 150 ms — otherwise the next unrelated event, a click on a tab,
@@ -2791,6 +2939,83 @@ group's tab strip, and hands the width it frees or takes to the group beside it
 chevron by keyboard moves focus to the rail's active tab, since the chevron
 unmounts with the content. A library sharing a group with another panel cannot
 fold — it has no width of its own to give back.
+**The chrome is a title bar over the dock, and the menu bar is in it.** There is no
+toolbar row and no rule between the title bar and the dock: the dock starts where
+the bar ends. The window keeps its native decorations (`tauri.conf.json` sets none
+of its own, so the OS caption buttons are above Kerf's `TitleBar`, which is a row of
+content — `-webkit-app-region` marks it draggable and every control `no-drag`);
+custom window decorations, which would put the menus in the caption bar like VS Code,
+are a possible follow-up and not this change. `TitleBar` is three cells (so the
+workspace tabs stay on the centre line): the logo and the **menu bar** on the left;
+the workspaces in the middle; the project's name with its Saved / Unsaved badge, the
+settings gear, the notification bell and the version chip on the right (the chip still
+turns amber when an update is waiting, which is why it stayed out of Help; Help also
+has *Check for updates…*). The project's path moved to the status bar. **The menus**
+(`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
+Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
+"as…" once the project has a file, since a saved project is its own SQLite file and
+`save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
+Duplicate, Delete / Ripple delete / Select all, **Tool** and **Clip** submenus —
+the five tools as radios, and trim / detach / link — Ripple mode and Snapping as ticks,
+Keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
+**Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
+workspace, Reset all workspaces — which asks first when any arrangement is stored),
+*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
+panel and a panel can be closed, so the whole of it is here as registry actions with
+their bindings), *Help* (Keyboard shortcuts, Check for updates…, Release page, Open the
+log folder, About). **Every entry names a keymap action**
+(`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
+`view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
+`resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
+were added, the new ones unbound by default so a build never takes a key) and runs
+the page's own `run` handler for it, so a menu and its shortcut are one piece of
+code and the key printed beside the entry is `settings.shortcut(id)`, the user's. What
+is one of a family and has no key (a delivery shape, a track height, a panel) is a
+`MenuCommand`, run by `menu-commands.ts` (`setDeliveryPreset` is shared with the
+timeline's own picker). Quit asks about unsaved work like the window's close button and
+ends in the same `destroy` that guard ends with (`quitApp` in `api.ts`) — no new
+capability. **Keyboard**: the ARIA menubar pattern with a roving tab stop; a click
+opens a menu and, once one is open, hovering another title switches to it (the click
+that finishes that hover does not close it again); ← → move along the bar and between
+open menus, ↓ ↑ Home End move in a menu, → opens a submenu and ← closes it, Enter /
+Space run, Esc closes one level and then leaves the bar, a letter jumps to the next
+entry that starts with it (`stepFocus` / `typeahead`, pure); **Alt on its own, or F10,
+focuses the bar** — F10 not when the user has bound it, neither while a field is being
+typed in. Alt counts only as a tap (`alt-tap.ts`, a pure state machine, bun-tested): it
+is never armed while a pointer button is held (the timeline reads Alt live as its
+"leave the links alone" override on a drag, a trim or a razor cut, and an Alt pressed or
+released mid-drag must not take focus — a stuck press whose release was missed is cleared by
+the next move with no button down), another key, a pointer press or a wheel turn between
+its down and up cancels it, and so does the window losing focus (Alt+Tab). A menu title
+takes focus on a click (WKWebView does not focus a button a click lands on, and Esc
+needs focus inside the bar), a pending hover timer is cleared when the pointer moves to
+another title, and a chord that closes a menu gives focus back to where it was before the
+bar took it. Menus are
+`menu` panels of `menuitem` / `menuitemcheckbox` / `menuitemradio` entries
+(`aria-checked`, `aria-haspopup`, `aria-expanded`, `aria-disabled` with the reason as the
+title); a disabled entry still takes focus. Panels are `fixed`, placed from the rect of what
+opened them and kept inside the window (a submenu flips to its parent's other side and,
+failing that, slides in over it; a menu taller than the room scrolls — nested submenus are
+not positioned inside a scrolling panel, which would clip them). Too narrow for its six
+titles the bar becomes one "Menu" button whose entries are the menus as submenus: the
+test is the width of the title bar's **left cell** (`MENU_FULL_PX`, 320 — the bar and the
+logo measure ~331 at their widest, and the workspace tabs and the right cluster take their
+share of the window first), not the window's width, so a ~1000 px window has them in full and
+the 960 px minimum collapses them. A modal closes the menus and the bar is `inert` behind it like the rest
+of the page; a letter or arrow typed in a menu never reaches the page's shortcuts (the page
+returns early for events from inside `[role=menubar]` / `[role=menu]`, and the bar
+`preventDefault`s what it takes); a chord closes the menus and goes on to the page. The
+tokens are the guarded pairs (`text-secondary` on `surface-app`, `text-primary` and
+`text-muted` on `surface-raised` / `surface-hover`, `kerf-400` for the tick), so the
+contrast guard covers it. **Where the old toolbar's controls went**: the transport (go to
+start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
+the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
+~380 px of its width; the tools, Ripple, Snapping, Undo / Redo and the delivery-frame
+picker are the **Timeline**'s toolbar, which wraps to a second row rather than clip
+(its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
+Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
+that no entry of the old toolbar lost its place.
 The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
 verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
 `SectionHead` which the dialog uses too — no fork. The shape choice and the
@@ -2817,7 +3042,19 @@ hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
 auto-keyframes at the playhead and shows the sampled pose; each key but the last has an
 **easing** picker in the Animation section — linear, ease in-out / out / in, hold and three
-own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`), a **Framing** section
+own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`; **colour and volume
+animate from the same panel**: a ◇ beside each colour number and the volume keys it at the playhead at
+the value it has there (◆ when a key sits there, and clicking it takes the key out; the last one makes
+the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
+writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
+mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
+their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
+popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
+ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
+or two keys at one time: the ramp arrives at the value the step leaves and a `setValueAtTime` lands the
+next, read `1e-9 s` either side of the step because `(start + t) - start` can fall an ulp short of `t`),
+as the export's `if(lt(t,..))` does — but the timeline's volume line and
+waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
 shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
@@ -2915,7 +3152,7 @@ title drag.
 a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
 project flag — read in `load()` (so launch, New and Open) and again on the
 `ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
-the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
+the user's own toolbar setting that moved); the timeline toolbar's **Ripple** toggle (`R`,
 `aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
 ruler underline, and its tooltip says each track ripples on its own but a moved clip takes its linked partners along.
 All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
@@ -2967,7 +3204,7 @@ bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` mak
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
 not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
 frame.
-**Roll, slip and slide** are three more tools beside Select and Razor (toolbar buttons;
+**Roll, slip and slide** are three more tools beside Select and Razor (timeline toolbar buttons, and Edit › Tool;
 `N` / `Y` / `U`; `Tool` is `'pointer' | 'razor' | TrimTool`) over `edit-modes.ts`.
 `src/lib/trim-tools.ts` is everything a drag needs of them, pure and bun-tested;
 `Timeline.svelte` is only pointer plumbing (`beginTrimTool` → `beginDrag`: capture,
@@ -3098,7 +3335,7 @@ part of the cut, so it is **UI-only** (`ui.heights`, per track id in `localStora
 convenience): `all` is the global choice (what "all tracks" last set, what a track with no
 choice of its own is, and what the **titles lane** follows), a track set to it drops its
 override, "all tracks" clears every exception, and the table is capped at 256. The toolbar's
-three glyph buttons set all tracks (lit when every track agrees); a track header's name is its
+three glyph buttons set all tracks (lit when every track agrees; View › Track height is the same choice); a track header's name is its
 menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
 so they follow the heights. The compact titles lane is 27 px (`MIN_TITLE_LANE_PX`: the 26 px
 add button plus the lane's border).
@@ -3156,7 +3393,7 @@ bus's limits (the Rust constants), `levelNotes` (the *faithful* mirror of the ad
 `Levels::new` writes) and `estimateLevels`, the browser harness's stand-in for `get_levels`
 (an *approximation* from the sample analysis through faders, pan, master and limiter,
 flagged `estimated`). The **Mixer panel** (`Mixer.svelte`, in the panel registry and the
-Audio workspace preset, reachable from the Panels menu) is one vertical `MixerStrip` per
+Audio workspace preset, reachable from the Window menu) is one vertical `MixerStrip` per
 audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
 `trackHasSound`, which the track header uses too. It mirrors the export graph's
 `clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
@@ -3188,7 +3425,7 @@ stays. In the browser harness, `sample-audio.ts`
 synthesizes a voice-like signal per asset at its analysed loudness, so playback,
 meters and faders are drivable under `bun run dev`. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
-dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
+dep is still in `package.json`, now unused). The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
@@ -3410,7 +3647,7 @@ stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* 
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
-bare keys added since (`ADDED`: N / Y / U / Q / W) and the modified chords added for linked A/V
+bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
 (`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
@@ -3560,7 +3797,7 @@ it, which the shared `ContextMenu` renders non-interactively.
 filters by, so a dropped folder of mixed files doesn't answer with one error per
 README — and runs the same `editor.importPaths` the picker resolves to), which is
 what the bin's "Drop media to start" had been promising. `editor.error` renders as a
-dismissible banner under the toolbar: it was recorded and never shown, so a `.kerf`
+dismissible banner under the title bar: it was recorded and never shown, so a `.kerf`
 that would not open opened as silence.
 
 ## Conventions

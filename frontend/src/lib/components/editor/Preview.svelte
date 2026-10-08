@@ -8,16 +8,8 @@
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import {
-		exportCover,
-		getPreviewFrame,
-		getTimelineFrame,
-		inTauri,
-		pickCoverPath,
-		revealPath,
-		setPreviewBounds,
-		startPlayback
-	} from '$lib/api';
+	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
+	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import {
 		anyCovered,
@@ -41,6 +33,8 @@
 	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
+	/** The transport bar's own width: what it can show depends on it, not on the window. */
+	let barWidth = $state(0);
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	const empty = $derived(!hasClips);
 
@@ -577,27 +571,6 @@
 		{ at: 'left:100%;top:100%', cursor: 'nwse-resize' }
 	];
 
-	/** Write the frame under the playhead as a cover image — the thumbnail a
-	 *  platform shows before anyone presses play. Rendered at the full delivery
-	 *  frame from the original media, so it is the picture people actually see,
-	 *  not the downscaled preview on screen. */
-	async function saveCover() {
-		if (!inTauri()) {
-			toast.info('Cover frames are rendered with FFmpeg in the desktop app.');
-			return;
-		}
-		const path = await pickCoverPath();
-		if (!path) return;
-		try {
-			const out = await exportCover(ui.time, path);
-			toast.success(`Cover saved → ${out}`, {
-				action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-			});
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
-	}
-
 	function onPreviewContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
 			{
@@ -628,7 +601,7 @@
 				label: 'Save cover frame…',
 				icon: 'image',
 				disabled: empty,
-				action: () => void saveCover()
+				action: () => void saveCoverFrame()
 			}
 		]);
 	}
@@ -763,22 +736,48 @@
 			</div>
 		{/if}
 	</div>
+	<!-- Transport: go to start, play / pause, go to end, the timecode with the
+	     timeline's rate, and the scrub bar. J / K / L stay on the keyboard. It narrows
+	     gracefully: below ~380 px the duration and the rate go, then the skip buttons'
+	     gaps close — the controls themselves stay. -->
 	<div
-		style="height:40px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
+		bind:clientWidth={barWidth}
+		style="height:40px;flex:none;display:flex;align-items:center;gap:{barWidth < 380 ? 6 : 10}px;padding:0 {barWidth < 380 ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
-			title={ui.playing ? 'Pause' : 'Play'}
+			title={settings.withShortcut('Go to start', 'playback.toStart')}
+			aria-label="Go to start"
+			disabled={empty}
+			onclick={() => ui.seek(0)}
+			style="background:none;border:none;cursor:{empty ? 'default' : 'pointer'};color:var(--text-secondary);opacity:{empty ? 0.4 : 1};display:grid;place-items:center;padding:3px"
+		>
+			<Icon n="skip-back" s={14} />
+		</button>
+		<button
+			title={settings.withShortcut(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
 			aria-label={ui.playing ? 'Pause' : 'Play'}
 			onclick={() => ui.togglePlay()}
-			style="background:none;border:none;cursor:pointer;color:var(--text-primary);display:grid;place-items:center"
+			style="background:var(--surface-hover);border:none;border-radius:var(--radius-sm);cursor:pointer;color:var(--text-primary);display:grid;place-items:center;padding:4px 6px"
 		>
 			<Icon n={ui.playing ? 'pause' : 'play'} s={16} />
 		</button>
-		<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-secondary)">{tc(ui.time)}</span>
+		<button
+			title={settings.withShortcut('Go to end', 'playback.toEnd')}
+			aria-label="Go to end"
+			disabled={empty}
+			onclick={() => ui.seek(editor.duration)}
+			style="background:none;border:none;cursor:{empty ? 'default' : 'pointer'};color:var(--text-secondary);opacity:{empty ? 0.4 : 1};display:grid;place-items:center;padding:3px"
+		>
+			<Icon n="skip-forward" s={14} />
+		</button>
+		<span
+			title="Timeline timecode · {editor.fps.toFixed(3)} fps · non-drop"
+			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
+		>
 		<div
 			role="presentation"
 			onclick={scrub}
-			style="flex:1;height:4px;border-radius:999px;background:var(--surface-inset);position:relative;cursor:pointer"
+			style="flex:1;min-width:24px;height:4px;border-radius:999px;background:var(--surface-inset);position:relative;cursor:pointer"
 		>
 			<div
 				style="position:absolute;inset:0 auto 0 0;width:{empty ? 0 : (ui.time / duration) * 100}%;background:var(--kerf-500);border-radius:999px"
@@ -787,6 +786,12 @@
 				style="position:absolute;left:{empty ? 0 : (ui.time / duration) * 100}%;top:50%;width:11px;height:11px;border-radius:50%;background:var(--kerf-400);transform:translate(-50%,-50%);box-shadow:0 0 0 3px var(--surface-app)"
 			></div>
 		</div>
-		<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{tc(duration)}</span>
+		{#if barWidth >= 380}
+			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);white-space:nowrap">{tc(duration)}</span>
+			<span
+				title="Timeline frame rate; non-drop timecode"
+				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
+			>
+		{/if}
 	</div>
 </div>

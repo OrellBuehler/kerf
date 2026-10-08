@@ -281,7 +281,7 @@ export function displayChord(c: Chord, platform: Platform): string {
  *  with a global one that it never competes with. */
 export type Context = 'global' | 'timeline' | 'preview';
 
-export type GroupId = 'project' | 'edit' | 'tools' | 'playback' | 'markers' | 'view';
+export type GroupId = 'project' | 'edit' | 'tools' | 'playback' | 'markers' | 'view' | 'window' | 'help';
 
 export const GROUPS: readonly { id: GroupId; label: string }[] = [
 	{ id: 'project', label: 'Project' },
@@ -289,7 +289,9 @@ export const GROUPS: readonly { id: GroupId; label: string }[] = [
 	{ id: 'tools', label: 'Tools' },
 	{ id: 'playback', label: 'Playback' },
 	{ id: 'markers', label: 'Markers and range' },
-	{ id: 'view', label: 'Timeline view' }
+	{ id: 'view', label: 'Timeline view' },
+	{ id: 'window', label: 'Workspaces and panels' },
+	{ id: 'help', label: 'Help' }
 ];
 
 export interface ActionDef {
@@ -327,7 +329,26 @@ const ACTION_LIST = [
 	},
 	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
 	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
+	{
+		id: 'file.importCaptions',
+		repeat: false,
+		label: 'Import captions…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Puts a .srt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
+	},
+	{
+		id: 'file.saveCover',
+		repeat: false,
+		label: 'Save cover frame…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Writes the frame under the playhead, at the full delivery frame, as an image.'
+	},
 	{ id: 'app.settings', repeat: false, label: 'Settings', group: 'project', context: 'global', defaults: ['Mod+,'] },
+	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', defaults: [] },
 
 	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', defaults: ['Mod+Z'] },
 	{ id: 'edit.redo', label: 'Redo', group: 'edit', context: 'global', defaults: ['Mod+Shift+Z', 'Mod+Y'] },
@@ -444,6 +465,15 @@ const ACTION_LIST = [
 		hint: 'Drag a clip along its track; the clips touching it give way.'
 	},
 	{
+		id: 'tool.snap',
+		repeat: false,
+		label: 'Toggle snapping',
+		group: 'tools',
+		context: 'global',
+		defaults: ['S'],
+		hint: 'While on, a drag snaps to the playhead, the ends of clips and titles, and the beats.'
+	},
+	{
 		id: 'tool.rippleMode',
 		repeat: false,
 		label: 'Toggle ripple mode',
@@ -474,7 +504,47 @@ const ACTION_LIST = [
 
 	{ id: 'view.zoomIn', label: 'Zoom in', group: 'view', context: 'global', defaults: ['+', '='] },
 	{ id: 'view.zoomOut', label: 'Zoom out', group: 'view', context: 'global', defaults: ['-'] },
-	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', defaults: ['Shift+Z'] }
+	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', defaults: ['Shift+Z'] },
+	{ id: 'view.minimap', repeat: false, label: 'Show / hide the overview strip', group: 'view', context: 'global', defaults: [] },
+	{
+		id: 'view.safeAreas',
+		repeat: false,
+		label: 'Show / hide the safe-area guides',
+		group: 'view',
+		context: 'global',
+		defaults: [],
+		hint: 'Shades where a platform’s own interface covers a vertical or square cut. Only drawn while the project is cut for one.'
+	},
+
+	{ id: 'workspace.edit', repeat: false, label: 'Edit workspace', group: 'window', context: 'global', defaults: [] },
+	{ id: 'workspace.color', repeat: false, label: 'Color workspace', group: 'window', context: 'global', defaults: [] },
+	{ id: 'workspace.audio', repeat: false, label: 'Audio workspace', group: 'window', context: 'global', defaults: [] },
+	{ id: 'workspace.motion', repeat: false, label: 'Motion workspace', group: 'window', context: 'global', defaults: [] },
+	{ id: 'workspace.deliver', repeat: false, label: 'Deliver workspace', group: 'window', context: 'global', defaults: [] },
+	{
+		id: 'window.resetWorkspace',
+		repeat: false,
+		label: 'Reset this workspace',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'Puts the panels of the workspace on screen back where its default has them, and its library tab.'
+	},
+	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces', group: 'window', context: 'global', defaults: [] },
+
+	{
+		id: 'app.keyboard',
+		repeat: false,
+		label: 'Keyboard shortcuts',
+		group: 'help',
+		context: 'global',
+		defaults: [],
+		hint: 'Opens Settings on this list.'
+	},
+	{ id: 'app.checkUpdate', repeat: false, label: 'Check for updates…', group: 'help', context: 'global', defaults: [] },
+	{ id: 'app.releases', repeat: false, label: 'Release page', group: 'help', context: 'global', defaults: [] },
+	{ id: 'app.logs', repeat: false, label: 'Open the log folder', group: 'help', context: 'global', defaults: [] },
+	{ id: 'app.about', repeat: false, label: 'About Kerf', group: 'help', context: 'global', defaults: [] }
 ] as const satisfies readonly ActionDef[];
 
 /** Every action id — so a handler table typed `Record<ActionId, …>` fails to
@@ -498,6 +568,7 @@ export const FIXED_KEYS: readonly { keys: string; does: string }[] = [
 	{ keys: 'Esc', does: 'Abandons a drag, closes the open menu, panel or dialog' },
 	{ keys: 'Tab', does: 'Moves focus (Shift+Tab moves back)' },
 	{ keys: 'Enter / Space', does: 'Activates the focused button, tab or menu item' },
+	{ keys: 'Alt, or F10', does: 'Focuses the menu bar; ← → move along it, ↓ opens a menu, Esc closes it' },
 	{ keys: '← → ↑ ↓', does: 'Operate a focused slider, panel tab or list' },
 	{ keys: 'Ctrl/⌘ + wheel', does: 'Zooms the timeline at the pointer' },
 	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' }

@@ -21,7 +21,8 @@
 // three ripples (the caller must not run `rippleFrom` over them); split-and-remove
 // follows the project's ripple mode like any trim.
 
-import { curve, EASE_STEPS, keyframeChannel } from './easing';
+import { curve, EASE_STEPS } from './easing';
+import { rebaseChannels, transformAt } from './channels';
 import { formatTime } from './diff';
 import { invalid, locateIndex, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
@@ -207,7 +208,7 @@ function startAfter(clips: readonly Clip[], end: number, skip: readonly number[]
  *  keyframes are clip-local, so they ride with the content. Shortened from the front
  *  (`by > 0`) the pose the clip now opens on is pinned as a key at 0 and later keys
  *  shift back; pulled earlier (`by < 0`) every key shifts later. */
-function rebaseAnimation(clip: Clip, by: number) {
+export function rebaseAnimation(clip: Clip, by: number) {
 	if (by > 0) {
 		if (clip.keyframes?.length) {
 			const pose = transformAt(clip, by);
@@ -260,6 +261,8 @@ function rebaseAnimation(clip: Clip, by: number) {
 		for (const k of clip.keyframes ?? []) k.time -= by;
 		for (const k of clip.reframe?.keyframes ?? []) k.time -= by;
 	}
+	// Per-property channels ride with the content too (`Clip::rebase_channels`).
+	rebaseChannels(clip, by);
 }
 
 // ---- keyframe sampling (kerf-core's `interpolate` / `Clip::transform_at` / `Reframe::sample`) ----
@@ -298,20 +301,6 @@ function interpolateAngle(points: [number, number][], at: number): number | unde
 	}
 	const v = interpolate(unwrapped, at);
 	return v === undefined ? undefined : wrap180(v);
-}
-
-/** The clip's static transform with its animatable channels sampled at `local` seconds. */
-function transformAt(clip: Clip, local: number): Transform {
-	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
-	const ks = clip.keyframes ?? [];
-	if (ks.length === 0) return t;
-	const chan = (get: (k: Keyframe) => number) => interpolate(keyframeChannel(ks, get), local);
-	t.scale = chan((k) => k.scale) ?? t.scale;
-	t.pos_x = chan((k) => k.pos_x) ?? t.pos_x;
-	t.pos_y = chan((k) => k.pos_y) ?? t.pos_y;
-	t.rotation = chan((k) => k.rotation) ?? t.rotation;
-	t.opacity = chan((k) => k.opacity) ?? t.opacity;
-	return t;
 }
 
 const MIN_FOV = 1;

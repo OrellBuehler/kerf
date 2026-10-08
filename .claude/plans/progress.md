@@ -15,14 +15,14 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
 | B4 Mixer | `feat/mixer` | OrellBuehler/kerf#110 | merged | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
-| B5 Keyframes v2 | `feat/keyframe-easing` (B5a) | — | in-progress | B5a done locally: per-key `Easing` (linear / hold / CSS eases / unit-square bezier), an eased segment is a 12-piece polyline shared by `transform_at` and the export (sweep at every output frame, mutation-checked), exact head trims / slices, `set_keyframe_easing` (core, Tauri, MCP), TS mirror pinned bit for bit, Inspector picker. Next: per-property channels, dope sheet. |
+| B5 Keyframes v2 | `feat/keyframe-easing` (B5a), `feat/keyframe-channels` (B5b-1) | — | in-progress | B5a done and merged (per-key `Easing`, an eased segment is a 12-piece polyline shared by `transform_at` and the export, exact head trims / slices, `set_keyframe_easing`, TS mirror pinned bit for bit). **B5b-1 done locally** (stacked on main): per-property channels — `Clip.channels: Vec<PropertyTrack>` for scale / position / rotation / opacity, the five colour numbers and the clip volume, one resolver (`Clip::property_keys`) over the legacy bundle, old projects byte-identical (golden 0..4800 untouched, 800 channel cases appended); export: keyed colour = `eq eval=frame`, keyed volume = `asetnsamples=n=128:p=0,volume eval=frame` after `atempo`, a transform keyed in part builds the rest from the static one; plan: `color_at`, `Animated.keys` / `color`, `GpuCaps::keyed_color` / `Unsupported::KeyedColor`; `set_property_keyframes` / `copy_keyframes` / `set_keyframe_easing prop` (core, Tauri, MCP, harness), TS mirror `channels.ts`, Inspector ◇ keys for colour and volume, preview ramps a keyed volume; a split now rebases the right half's animation. **Next (B5b-2)**: dope sheet panel (rows per property, marquee, drag-retime, copy/paste, Alt-duplicate), easing popover, mask params and crop (reformulated as zoom + pan) as animatable, GPU pass + parity case for animated colour, graph editor with bezier handles. |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
 | A6 Headless agent rendering | — | — | todo | |
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Done: menu bar + chrome rework (`feat/menu-bar`: VS Code-style File / Edit / View / Playback / Window / Help in the title bar over the keymap registry, the toolbar row removed and its controls moved into the Preview (transport) and Timeline (tools, ripple, snap, undo / redo, delivery frame); stored workspace layouts recorded against the panels their preset offered and brought up to date, so the mixer reaches an Audio saved before it; Reset workspace says what it did, Reset all added). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -533,9 +533,116 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   `XOpenDisplay(NULL)` (`$DISPLAY`, what tao opens too) rather than GDK's, which would put a GTK call
   on a worker thread; `--display` on the command line is not honoured by either.
 
+- **2026-10-08 — B5b-1: per-property channels, and why the bundle is not migrated.** The plan said
+  `Vec<PropertyTrack{prop, keys}>` "with migration from the whole-transform `Keyframe`". Converting
+  the bundle into five tracks on load would have been lossless, but it makes every legacy clip's graph
+  depend on the conversion (the golden generator assigns `clip.keyframes` directly and ~50 tests do),
+  leaves two representations alive anyway for the UI (the Inspector's Animation list, the timeline's
+  diamonds read `clip.keyframes`), and rewrites projects a user only opened. So **the bundle stays as
+  it is and is one source for a number that has no track of its own**: `Clip::property_keys(prop)` is
+  the only reader (track → bundle → static), `transform_at` / `color_at` / `volume_at` / the export / the
+  plan are views of it, and the first per-property write *detaches* just that number (copies its bundle
+  keys into a track; an empty track means "static, whatever the bundle says" and is pruned when the bundle
+  goes). Chosen over migrate-on-first-write (which makes the Inspector show an animated clip as
+  unanimated until the UI reads tracks) and over "a track and the bundle both apply" (no answer to which
+  wins). Cost: edits have two code paths (`rebase_animation` runs the bundle and `rebase_channels`) —
+  both pinned, one TS mirror each.
+- **2026-10-08 — B5b-1: what FFmpeg does with the expressions (4.4.2 and 9.0.2 identical).**
+  *Colour*: `eq` takes an expression for every number (`brightness`, `contrast`, `saturation`, `gamma`,
+  `gamma_r`, `gamma_b`) under `eval=frame`; `t` is the frame timestamp, so after `setpts` it is timeline
+  time and the existing `(t-start)` form works. 18 rendered cases (each number, all five, late, speed 2 /
+  0.5 / reversed, beside a keyed position + opacity, under a moving zoom, beside a static grade, range
+  export, five rates) read 0 levels from the static-`eq` still at every fifth frame (3 with a keyed
+  opacity: the still's RGB round trip vs the file's `geq`). Contrast pivots on luma 128: a mid-grey
+  picture shows nothing. *Volume*: `volume=eval=frame` holds one gain per frame and the decoder's frames
+  are 1024 samples (21 ms), so the chain cuts them to 128 samples first (`asetnsamples=n=128:p=0`; the
+  default `p=1` pads the last frame with silence) — the render is then the unkeyed render scaled by
+  the curve at each frame's start to 1.5e-8, and the lag against the curve is at most 2.7 ms. It sits
+  after `atempo` (so `t` is the clip's playing time: checked at 0.5 / 2 / reversed / late / range
+  export). A hold's step landing exactly on a frame start flips on float rounding of `t` — the tests keep
+  steps off the 1/375 s grid. Mutation checks: `eval=init` and a missing `asetnsamples` both fail the
+  rendered tests; the sweep fails a changed temperature coefficient and a static opacity / turn
+  dropped from a clip keyed in part. *Not animatable yet*: crop edges (`crop`'s output size is fixed
+  when the graph is configured) and mask parameters (a `geq` expression could carry them; waits for an
+  editor that can set them).
+- **2026-10-08 — B5b-1: a split did not carry the animation (fixed).** `Timeline::split_clip` copied the
+  clip, so the right half's keys stayed clip-local to the *old* start and its animation replayed from
+  the first key — for the bundle and the reframe camera as much as for channels. It now rebases the
+  right half (`rebase_animation(at - start)`, the pose it opens on pinned, later keys shifted), with a
+  Rust and a TS test; the linked-A/V corpus did not move (no keyed clips in it).
+- **2026-10-08 — B5b-1: the plan.** A transform keyed in part is not built like one keyed in full, so
+  `Placement::keyframed` became `Option<Keyed {scale, rotation, rotates, opacity}>` (`Keyed::all` is the
+  bundle) and `Animated.keys` carries it; `Animated` is `Some` for colour-only clips too, with `keys:
+  None`. A Motion plan refuses a keyed colour (`Unsupported::KeyedColor`) until a pass and a parity
+  case exist; a still plan draws the sampled `color_at`. The preview's Web Audio gain ramps through a
+  keyed volume's points (`gainBreakpoints`); the timeline's volume line and waveform scaling still read
+  the static gain (the dope-sheet slice owns those).
+
+- **2026-10-08 — B5b-1 review fixes.** (1) The preview collapsed a hold's two points at one time
+  into one and ramped across the whole segment where the export steps (`gainAutomation` now ramps
+  to the value a step leaves and `setValueAtTime`s the next). (2) `TranslucentMatrix` was skipped for any
+  Motion clip with a keyed number; it is skipped for a keyed *opacity* only. (3) `channel_changes`
+  compared tracks, so holding a bundle-driven number static diffed empty and `apply_staged` discarded the
+  proposal; it compares the effective keys (a detach with the bundle's own keys is rightly no change).
+  (4) `set_keyframes` now prunes empty tracks like the harness did, and the MCP descriptions of
+  `set_keyframes` / `clear_keyframes` / `set_volume` / `set_color` / `set_transform` say what an empty list
+  clears and that a keyed number ignores its static value. (5) A keyed volume is clamped to 4 on read and
+  a static one is not, so `detach_audio` sends a clip whose keys the fader ratio would push past 4 to an
+  equal-fader lane instead of folding the ratio in (chosen over clamping both, which would have changed
+  the loudness of every existing static clip above 4, and over splitting the ratio between the keys and a
+  lane gain, which has no home for it). (6) Two older bugs found by the review: `cut_range_pieces`'
+  tail replayed its animation from the first key, and `split_clip` left both fades on both halves (a
+  dip to black at the cut); each fade now stays on the half holding its edge, clamped to it (not left
+  longer than the half, though the render clamps it anyway, so the stored value is the rendered one).
+  The links corpus and the golden argv oracle did not move.
+
+- **2026-10-08 — B9: menu bar, no toolbar row; stored layouts carry what they were offered.**
+  Reported from the Windows build: *Reset Color workspace* "does nothing" and Audio looked
+  like Motion with no Mixer. The reset path was run end to end in the browser harness (a
+  rearranged layout, a tab dragged to another group, a closed panel, a stale entry from the
+  older build that wrote every visited workspace, five window sizes and device pixel ratios,
+  a folded library) and **always put the preset on the dock and cleared the entry** — so no
+  race with the single-flight write, the reference logic or the legacy `layout` was found
+  (the legacy layout only ever becomes Edit). What the report matches is state: the build
+  that wrote an entry for every workspace the user merely visited left a *copy of that day's
+  preset* behind for each, so Reset on Color put back a layout the same as the one it
+  replaced (nothing visible changed, and nothing said so), while Audio's copy predated the
+  Mixer and never would learn about it — a stored layout is a snapshot, and nothing recorded
+  what it was a snapshot of. Fixed there: each stored layout records the panels its preset
+  offered (`offered`); on read a copy of a preset is dropped, a panel the preset gained is put
+  where the preset has it (`insertPanel`: tab mates, else beside the nearest neighbour with
+  the preset's share, else a tab by the preview — never a reset to make room), a panel the
+  layout was offered and lacks stays closed; Reset forgets the library tab too, says what it
+  did (including "already default"), and a dock that takes neither layout nor preset is
+  reported. **Not found, so not claimed:** a case where the live dock ignores a reset. If the
+  Windows build still shows one, the new error toast and the log (`webview` target) will say
+  why. Chrome: the toolbar row and the rule under the title bar are gone, the dock starts under
+  the title bar; the menus are one widget over one data file, every entry a registry action
+  (so the key shown is the user's) or a typed command. **Decisions:** the version chip, the
+  gear and the bell stay at the right (the chip is the only thing that says an update is
+  waiting; Help also has *Check for updates…*); the project name and badge sit at the right
+  of the title bar and the path moved to the status bar (the left cell is the menus'); Save
+  is one entry that reads "as…" once there is a file, because `save_project_as` is the only
+  save; Quit reuses the close guard's `destroy` (no new capability); new actions are unbound
+  except `S` for snapping. The window keeps native decorations — custom ones (menus in the
+  caption bar) are a follow-up, not this change.
+
+- **2026-10-08 — B9 menu bar review fixes.** An independent review reproduced in headless
+  Chrome: (1) an Alt pressed and released *during a drag* (the timeline's links-off override)
+  armed the bar and stole focus on release, so the next Space opened File instead of playing —
+  `alt-tap.ts` now never arms while a pointer button is held and cancels on a window blur
+  (Alt+Tab); (2) a hover timer from Edit's Tool submenu reopened it after the pointer moved to
+  View — cleared on every title change; (3) a chord inside an open menu dropped focus to the
+  body — it goes back to where it was; (4) a title takes focus on click (WKWebView); (5) *Reset
+  all workspaces* throws away every arrangement and now asks first (only when one is stored);
+  (6) the transport had no menu home once the Preview panel was closed — a **Playback** menu
+  carries all of it, with the marks and markers, as registry actions. The compact-bar test is
+  the *left cell's* width (`MENU_FULL_PX`), not the window's.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
+- B9 menu bar: on Windows (WebView2) the title-bar menus under the native caption bar, Alt / F10 focus, an Alt-drag in the timeline not stealing focus, and the new Reset workspace feedback against the stored layouts of the build that reported it.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
 - B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

@@ -17,9 +17,21 @@
 	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
 	import { addTextHere, dropCaptions, makeCaptions } from '$lib/title-actions';
 	import { needsCrop } from '$lib/smart-crop';
-	import { EASING_CHOICES, easingId, keyframeChannel } from '$lib/easing';
+	import { EASING_CHOICES, easingId } from '$lib/easing';
+	import {
+		channelOf,
+		colorAnimated,
+		colorAt,
+		isKeyed,
+		propertyAt,
+		propertyKeys,
+		transformAnimated,
+		transformAt,
+		upsertKey,
+		volumeAnimated
+	} from '$lib/channels';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
-	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
+	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge } from '$lib/link-ui';
@@ -53,19 +65,11 @@
 		}
 		return points[points.length - 1][1];
 	}
-	const tf = $derived.by(() => {
-		const base = { ...DEFAULT_TRANSFORM, ...(clip?.transform ?? {}) };
-		if (clip && keyframes.length) {
-			const lt = Math.max(0, ui.time - clip.timeline_start);
-			// Each channel as the eased polyline the export draws (`keyframeChannel`).
-			base.scale = lerp(keyframeChannel(keyframes, (k) => k.scale), lt) ?? base.scale;
-			base.pos_x = lerp(keyframeChannel(keyframes, (k) => k.pos_x), lt) ?? base.pos_x;
-			base.pos_y = lerp(keyframeChannel(keyframes, (k) => k.pos_y), lt) ?? base.pos_y;
-			base.rotation = lerp(keyframeChannel(keyframes, (k) => k.rotation), lt) ?? base.rotation;
-			base.opacity = lerp(keyframeChannel(keyframes, (k) => k.opacity), lt) ?? base.opacity;
-		}
-		return base;
-	});
+	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
+	const localTime = $derived(clip ? Math.max(0, ui.time - clip.timeline_start) : 0);
+	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
+	// the numbers' own tracks drives it (`transformAt`).
+	const tf = $derived(clip ? transformAt(clip, localTime) : { ...DEFAULT_TRANSFORM });
 	const ANIM_KEYS = new Set(['scale', 'pos_x', 'pos_y', 'rotation', 'opacity']);
 	/** Route a transform edit: a keyframe at the playhead when animated, else the
 	 *  static transform. Crop (not animatable) always edits the static transform. */
@@ -76,9 +80,61 @@
 		if (keyframes.length && animatable) {
 			const time = Math.max(0, ui.time - c.timeline_start);
 			void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>));
+		} else if (animatable && transformAnimated(c)) {
+			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
+			// of those, the static transform for the rest.
+			const keyed = (Object.keys(patch) as (keyof Transform)[]).filter((k) => isKeyed(c, k as Property));
+			const rest = Object.fromEntries(Object.entries(patch).filter(([k]) => !keyed.includes(k as keyof Transform)));
+			void run(async () => {
+				for (const k of keyed) await keyAtPlayhead(c, k as Property, patch[k] as number);
+				if (Object.keys(rest).length) await editor.setTransform(c.id, rest);
+			});
 		} else {
 			void run(() => editor.setTransform(c.id, patch));
 		}
+	}
+	/** A key for `prop` at the playhead (clip-local, to the millisecond), put in as the backend does:
+	 *  re-keying a moment keeps how it leaves, a key inside a segment splits it. */
+	function keyAtPlayhead(c: Clip, prop: Property, value: number) {
+		const time = Math.round(Math.max(0, ui.time - c.timeline_start) * 1000) / 1000;
+		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time, value }));
+	}
+	/** The ◆ beside a number: key it at the playhead at the value it has there, or — a key already
+	 *  sits there — take that key out (the last one makes the number static again). */
+	function toggleKey(prop: Property) {
+		const c = clip;
+		if (!c) return;
+		const time = Math.round(localTime * 1000) / 1000;
+		const keys = propertyKeys(c, prop);
+		if (keys.some((k) => Math.abs(k.time - time) <= 0.02)) {
+			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - time) > 0.02)));
+		} else {
+			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
+		}
+	}
+	/** Route a colour edit: a key at the playhead for each number that is keyed, the static
+	 *  colour for the rest. */
+	function setCol(patch: Partial<Color>) {
+		const c = clip;
+		if (!c) return;
+		if (!colorAnimated(c)) {
+			void run(() => editor.setColor(c.id, patch));
+			return;
+		}
+		const keyed = (Object.keys(patch) as (keyof Color)[]).filter((k) => isKeyed(c, k));
+		const rest = Object.fromEntries(Object.entries(patch).filter(([k]) => !keyed.includes(k as keyof Color)));
+		void run(async () => {
+			for (const k of keyed) await keyAtPlayhead(c, k, patch[k] as number);
+			if (Object.keys(rest).length) await editor.setColor(c.id, rest);
+		});
+	}
+	/** The volume the slider shows and edits: the curve at the playhead while it is keyed. */
+	const gain = $derived(clip ? propertyAt(clip, 'volume', localTime) : 1);
+	function setGain(v: number) {
+		const c = clip;
+		if (!c) return;
+		if (volumeAnimated(c)) void run(() => keyAtPlayhead(c, 'volume', v));
+		else void run(() => editor.setVolume(c.id, v));
 	}
 	// ---- 360 reframe --------------------------------------------------------
 	const reframe = $derived(clip?.reframe ?? null);
@@ -136,7 +192,7 @@
 	}
 	const CAM_KEYS = new Set(['yaw', 'pitch', 'roll', 'fov']);
 
-	const col = $derived(clip?.color ?? DEFAULT_COLOR);
+	const col = $derived(clip ? colorAt(clip, localTime) : DEFAULT_COLOR);
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
 	const mask = $derived(clip?.mask ?? null);
@@ -341,6 +397,29 @@
 	</label>
 {/snippet}
 
+{#snippet keyToggle(prop: Property)}
+	{@const c = clip}
+	{@const keyed = c ? isKeyed(c, prop) : false}
+	{@const here = c ? propertyKeys(c, prop).some((k) => Math.abs(k.time - localTime) <= 0.02) : false}
+	<button
+		type="button"
+		disabled={editor.busy}
+		title={here
+			? `Remove the ${prop} keyframe at the playhead`
+			: keyed
+				? `Add a ${prop} keyframe at the playhead`
+				: `Animate ${prop}: key it at the playhead`}
+		aria-label={`${here ? 'Remove' : 'Add'} a ${prop} keyframe at the playhead`}
+		aria-pressed={here}
+		onclick={(e) => {
+			e.preventDefault();
+			toggleKey(prop);
+		}}
+		style={`flex:none;border:0;background:none;padding:0 2px;cursor:pointer;font-size:12px;line-height:1;color:${here ? 'var(--playhead)' : keyed ? 'var(--text-secondary)' : 'var(--text-muted)'}`}
+		>{here ? '◆' : '◇'}</button
+	>
+{/snippet}
+
 {#snippet rangeRow(
 	label: string,
 	value: number,
@@ -348,7 +427,8 @@
 	max: number,
 	step: number,
 	format: (v: number) => string,
-	onCommit: (v: number) => void
+	onCommit: (v: number) => void,
+	animate?: Property
 )}
 	<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
 		<span style="font-size:12px;color:var(--text-secondary);width:72px;flex:none">{label}</span>
@@ -374,6 +454,10 @@
 			style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
 			>{format(shown(label, value))}</span
 		>
+		<!-- After the slider: a label's control is its first labelable descendant. -->
+		{#if animate}
+			{@render keyToggle(animate)}
+		{/if}
 	</label>
 {/snippet}
 
@@ -652,14 +736,18 @@
 					</p>
 				</InspectorSection>
 			{:else if hasAudio}
-				<InspectorSection title="Volume" summary={`${Math.round(clip.volume * 100)}%`} open>
+				<InspectorSection
+					title="Volume"
+					summary={volumeAnimated(clip) ? `Animated · ${Math.round(gain * 100)}%` : `${Math.round(clip.volume * 100)}%`}
+					open
+				>
 				<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
 					<input
 						type="range"
 						min="0"
 						max={MAX_GAIN}
 						step="0.05"
-						value={clip.volume}
+						value={gain}
 						disabled={editor.busy}
 						oninput={(e) => {
 							const v = parseFloat(e.currentTarget.value);
@@ -668,14 +756,15 @@
 						onchange={(e) => {
 							const v = parseFloat(e.currentTarget.value);
 							liveDrag = null;
-							if (Number.isFinite(v)) void run(() => editor.setVolume(clip.id, v));
+							if (Number.isFinite(v)) setGain(v);
 						}}
 						style="flex:1"
 					/>
 					<span
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
-						>{Math.round(shown('Volume', clip.volume) * 100)}%</span
+						>{Math.round(shown('Volume', gain) * 100)}%</span
 					>
+					{@render keyToggle('volume')}
 				</label>
 				</InspectorSection>
 
@@ -869,31 +958,21 @@
 						<button
 							style={chip(activeLook(col)?.id === look.id)}
 							disabled={editor.busy}
-							onclick={() => run(() => editor.setColor(clip.id, look.color))}>{look.label}</button
+							onclick={() => setCol(look.color)}>{look.label}</button
 						>
 					{/each}
 					<button
 						style={chip(false)}
 						disabled={editor.busy}
 						title="Reset color"
-						onclick={() => run(() => editor.setColor(clip.id, DEFAULT_COLOR))}>Reset</button
+						onclick={() => setCol(DEFAULT_COLOR)}>Reset</button
 					>
 				</div>
-				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setColor(clip.id, { brightness: v }))
-				)}
-				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setColor(clip.id, { contrast: v }))
-				)}
-				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setColor(clip.id, { saturation: v }))
-				)}
-				{@render rangeRow('Warmth', col.temperature ?? 0, -1, 1, 0.05, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setColor(clip.id, { temperature: v }))
-				)}
-				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setColor(clip.id, { gamma: v }))
-				)}
+				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, (v) => v.toFixed(2), (v) => setCol({ brightness: v }), 'brightness')}
+				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, (v) => v.toFixed(2), (v) => setCol({ contrast: v }), 'contrast')}
+				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ saturation: v }), 'saturation')}
+				{@render rangeRow('Warmth', col.temperature ?? 0, -1, 1, 0.05, (v) => v.toFixed(2), (v) => setCol({ temperature: v }), 'temperature')}
+				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ gamma: v }), 'gamma')}
 				</InspectorSection>
 
 			{/if}

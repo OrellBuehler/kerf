@@ -24,8 +24,8 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, TimeRange,
-    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
+    TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1245,11 +1245,56 @@ fn add_keyframe(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// With `prop`, one number's segment alone; without, the transform key at `time` (the
+/// bundle's and every transform number's own track).
 #[tauri::command(async)]
-fn set_keyframe_easing(state: State<'_, AppState>, clip_id: String, time: f64, easing: kerf_core::Easing) -> CmdResult<Timeline> {
+fn set_keyframe_easing(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    easing: kerf_core::Easing,
+    prop: Option<Property>,
+) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.set_keyframe_easing(id, time, easing).map_err(|e| e.to_string())?;
+    match prop {
+        Some(prop) => project.set_property_easing(id, prop, time, easing),
+        None => project.set_keyframe_easing(id, time, easing),
+    }
+    .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Replace the keys of one animatable number — a transform number, a colour number or the
+/// clip's volume. No keys leaves it static.
+#[tauri::command(async)]
+fn set_property_keyframes(
+    state: State<'_, AppState>,
+    clip_id: String,
+    prop: Property,
+    keys: Vec<PropertyKey>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_property_keyframes(id, prop, keys).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Copy the animation of `props` (every keyed number when empty) from one clip to another,
+/// `offset` seconds later.
+#[tauri::command(async)]
+fn copy_keyframes(
+    state: State<'_, AppState>,
+    from_clip_id: String,
+    to_clip_id: String,
+    props: Option<Vec<Property>>,
+    offset: Option<f64>,
+) -> CmdResult<Timeline> {
+    let (from, to) = (id(&from_clip_id)?, id(&to_clip_id)?);
+    let project = state.project();
+    project
+        .copy_keyframes(from, to, &props.unwrap_or_default(), offset.unwrap_or(0.0))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -3047,6 +3092,8 @@ pub fn run() {
             set_keyframes,
             add_keyframe,
             set_keyframe_easing,
+            set_property_keyframes,
+            copy_keyframes,
             clear_keyframes,
             set_reframe,
             set_asset_projection,
