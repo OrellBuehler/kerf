@@ -264,10 +264,15 @@ impl Run {
     }
 }
 
-fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
-    if !(pick.speed > 0.0 && pick.speed.is_finite()) {
-        return None;
-    }
+/// Which frames of the file the chain keeps (`from..to`, indices into the file's frames) and
+/// the tick the seek makes zero.
+struct Window {
+    shift: i64,
+    from: usize,
+    to: usize,
+}
+
+fn window(pick: &FpsPick, frames: &Frames) -> Window {
     let tb = frames.time_base();
     // A still image is never seeked (its trim is absolute).
     let seek = if pick.image.is_some() { 0.0 } else { clip_seek(pick.window.0) };
@@ -283,9 +288,19 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
     }
     let from = from.max(frames.partition(|p| p - shift < lo)).min(len);
     let to = frames.partition(|p| p - shift < hi);
+    Window { shift, from, to }
+}
+
+fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
+    if !(pick.speed > 0.0 && pick.speed.is_finite()) {
+        return None;
+    }
+    let tb = frames.time_base();
+    let Window { shift, from, to } = window(pick, frames);
     if from >= to {
         return None;
     }
+    let len = frames.len();
     // The stream ends where the frame that ended it would have been: the first frame past the
     // trim, or, when the file ends first, the last frame's own duration past the last frame.
     let beyond = if to < len {
@@ -306,6 +321,21 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
     };
     run.end = run.slot(beyond);
     Some(run)
+}
+
+/// How many of `n` frames have a slot at or before `k` (slots never decrease): the last of
+/// them is the one shown at output frame `k`.
+fn slots_through(n: usize, k: i64, slot: impl Fn(usize) -> i64) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if slot(mid) <= k {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// The frame the export's `fps` filter shows at `pick.frame`, as an index into `src`
@@ -330,27 +360,158 @@ pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
     });
     let frames = still.unwrap_or(Frames::File(src));
     let run = run(pick, &frames)?;
+    match place(pick, &frames, &run) {
+        // A still has one picture, whichever of its copies it is.
+        Placed::At(i) => Some(if pick.image.is_some() { 0 } else { i }),
+        Placed::Early | Placed::Late => None,
+    }
+}
+
+/// Where an output frame falls in a run's stream.
+enum Placed {
+    /// Before the first frame's slot.
+    Early,
+    /// From the end of the stream on.
+    Late,
+    /// On this frame (an index into the file's).
+    At(usize),
+}
+
+fn place(pick: &FpsPick, frames: &Frames, run: &Run) -> Placed {
+    let Ok(k) = i64::try_from(pick.frame) else {
+        return Placed::Late;
+    };
     let n = run.kept.len();
-    let k = i64::try_from(pick.frame).ok()?;
     let slot = |j: usize| run.slot(frames.pts(run.kept.start + j) - run.shift);
     // Output order is file order, or the reverse of it carrying the forward timestamps.
-    if k < slot(0) || k >= run.end {
-        return None;
+    if k < slot(0) {
+        return Placed::Early;
     }
-    // Slots never decrease: the last output frame at or before `k`.
-    let (mut lo, mut hi) = (0, n);
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if slot(mid) <= k {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    if k >= run.end {
+        return Placed::Late;
+    }
+    let j = slots_through(n, k, slot) - 1;
+    Placed::At(run.kept.start + if pick.reverse { n - 1 - j } else { j })
+}
+
+/// How far a streaming cursor has got with a pick: see [`Pick::progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickProgress {
+    /// The frames read so far cannot decide it. Read at least one more frame (the
+    /// lookahead that shows no later frame belongs to this output frame, or the first
+    /// frame past the window), or, when the file has no more, say so (`eof`).
+    NeedMore,
+    /// A `Before` pick whose answer lies before the **first** frame read: the run began at
+    /// or after the time asked for. If it began at the start of the file the answer is
+    /// "nothing" ([`Pick::select`] says `None`); otherwise the frame is there, and only a
+    /// run started earlier can read it. The cursor knows which; this does not.
+    NeedEarlier,
+    /// Decided, and final: reading on cannot change it.
+    Ready {
+        /// The frame shown, an index into the frames read (`None`: nothing is drawn).
+        shown: Option<usize>,
+        /// The first frame whose **pixels** are still needed: everything before it can be
+        /// dropped, and a cursor that keeps `keep_from..` holds the shown frame and the
+        /// lookahead. A forward pick needs its own frame onwards; a reverse one its whole
+        /// window (it is played backwards); a clip whose first slot has not come needs the
+        /// first frame of its window; a clip that is over, nothing (the number of frames
+        /// read). Only pixels are dropped: the **timestamps** stay, as indices are positions
+        /// in the whole run.
+        keep_from: usize,
+    },
+}
+
+impl Pick {
+    /// What a streaming cursor still needs to answer this pick, over the frames it has
+    /// **read so far** (`read`: a run's `showinfo` timestamps in order, `start_us = 0` since
+    /// they are already relative to the container's start). The reference is
+    /// [`Pick::select`] over the whole file: whenever this says [`PickProgress::Ready`], the
+    /// answer is `select`'s, and it says so as soon as it can — one frame past the shown one
+    /// (the **lookahead**: slots never decrease, so the last frame at or before the output
+    /// frame is known only when a later one is not) or at the window's end, whichever is first.
+    ///
+    /// What a cursor must have read, per kind of pick:
+    /// * `AtOrAfter` / `Before`: the first frame at or after the time.
+    /// * `Fps`, forward: `STARTPTS` (the window's first frame), the shown frame, one frame of
+    ///   lookahead — and, where the window runs out first, the first frame past the window,
+    ///   or the end of the file, whose `last_duration` (the last frame's own duration, valid
+    ///   only when `eof`) fixes where the stream ends (finding 17 of the design note).
+    /// * `Fps`, reverse: **every** frame of the window and the one past it (or the end of the
+    ///   file): the forward timestamps are re-stamped onto the reversed frames, and `STARTPTS`
+    ///   is the first of them.
+    /// * a still image: its one frame — the rest is made up.
+    ///
+    /// `read` must start where the pick needs it: a run begun with the clip's own seek
+    /// ([`FpsPick::seek`]) or earlier. A frame before the first one read is not there, so
+    /// `Before` of a time the first frame is past answers [`PickProgress::NeedEarlier`].
+    pub fn progress(&self, read: &SourceFrames, eof: bool) -> PickProgress {
+        let len = read.pts.len();
+        let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
+        match *self {
+            Pick::AtOrAfter(t) => {
+                let at = read.pts.partition_point(|&p| p < still_shift(t, read));
+                match (at < len, eof) {
+                    (true, _) => ready(Some(at), at),
+                    (false, true) => ready(None, len),
+                    (false, false) => PickProgress::NeedMore,
+                }
+            }
+            Pick::Before(t) => {
+                let at = read.pts.partition_point(|&p| p < still_shift(t, read));
+                if at == 0 && len > 0 {
+                    PickProgress::NeedEarlier
+                } else if at < len || eof {
+                    ready(at.checked_sub(1), at.saturating_sub(1))
+                } else {
+                    PickProgress::NeedMore
+                }
+            }
+            Pick::Fps(p) => fps_progress(&p, read, eof),
         }
     }
-    let j = lo - 1;
-    let i = run.kept.start + if pick.reverse { n - 1 - j } else { j };
-    // A still has one picture, whichever of its copies it is.
-    Some(if pick.image.is_some() { 0 } else { i })
+}
+
+fn fps_progress(pick: &FpsPick, read: &SourceFrames, eof: bool) -> PickProgress {
+    let len = read.pts.len();
+    let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
+    if pick.image.is_some() {
+        return match fps_pick(pick, read) {
+            None => ready(None, len),
+            Some(_) if len > 0 => ready(Some(0), 0),
+            Some(_) if eof => ready(None, 0),
+            Some(_) => PickProgress::NeedMore,
+        };
+    }
+    if !(pick.speed > 0.0 && pick.speed.is_finite()) {
+        return ready(None, len);
+    }
+    let frames = Frames::File(read);
+    let w = window(pick, &frames);
+    // The window is complete once a frame at or past its end has been read, or the file ended.
+    let complete = w.to < len || eof;
+    if !complete && (w.from >= len || pick.reverse) {
+        return PickProgress::NeedMore;
+    }
+    let Some(run) = run(pick, &frames) else {
+        return ready(None, len);
+    };
+    let first = run.kept.start;
+    match place(pick, &frames, &run) {
+        Placed::Early => ready(None, first),
+        Placed::Late if complete => ready(None, len),
+        Placed::At(i) if complete => ready(Some(i), if pick.reverse { first } else { i }),
+        // A forward stream still open: the shown frame is final only with a frame after it.
+        Placed::At(i) if i + 1 < len => ready(Some(i), i),
+        Placed::At(_) | Placed::Late => PickProgress::NeedMore,
+    }
+}
+
+impl FpsPick {
+    /// The `-ss` the clip's input is opened with, in seconds: where a run that serves this pick
+    /// must begin (`None` for a still image, which is never seeked).
+    pub fn seek(&self) -> Option<f64> {
+        self.image.is_none().then(|| clip_seek(self.window.0))
+    }
 }
 
 #[cfg(test)]
@@ -590,5 +751,303 @@ mod tests {
         // Kept as a whole the clone is frame 0, which `trim=start_frame=1` removes.
         assert_eq!(fps_pick(&p(false), &src), Some(0));
         assert_eq!(fps_pick(&p(true), &src), Some(1));
+    }
+
+    /// What a cursor has read of `pts` after `m` frames: the file ends there only when `m` is all
+    /// of them, and the last frame's duration is only known (and only trusted) then.
+    fn read_of(pts: &[i64], m: usize, tb: Rational, last_duration: i64) -> (SourceFrames<'_>, bool) {
+        let eof = m == pts.len();
+        let src = SourceFrames {
+            pts: &pts[..m],
+            time_base: tb,
+            start_us: 0,
+            // Garbage while the file goes on: it must be ignored until then.
+            last_duration: if eof { last_duration } else { 7777 },
+        };
+        (src, eof)
+    }
+
+    #[test]
+    fn a_forward_pick_is_decided_one_frame_of_lookahead_after_the_frame_it_shows() {
+        let pts = frames(12, 1024);
+        // Output frame 3 of an equal-rate clip showing frames from 0: it is frame 3, and that is
+        // only known once frame 4 is read (a frame 3 *alone* could be followed by another whose
+        // slot is not after output frame 3).
+        let p = Pick::Fps(pick((0.0, 5.0), 0.0, 1.0, false, (10, 1), 3));
+        let at = |m| {
+            let (src, eof) = read_of(&pts, m, TB10, 1024);
+            p.progress(&src, eof)
+        };
+        assert_eq!(at(0), PickProgress::NeedMore);
+        assert_eq!(at(3), PickProgress::NeedMore);
+        assert_eq!(
+            at(4),
+            PickProgress::NeedMore,
+            "frame 3 is the last read: nothing says it is the last at or before slot 3"
+        );
+        assert_eq!(
+            at(5),
+            PickProgress::Ready {
+                shown: Some(3),
+                keep_from: 3
+            }
+        );
+        assert_eq!(
+            at(12),
+            PickProgress::Ready {
+                shown: Some(3),
+                keep_from: 3
+            }
+        );
+        // Before the clip's first slot nothing is shown, and the first frame is the one to keep.
+        let early = Pick::Fps(pick((0.2, 0.8), 0.5, 1.0, false, (10, 1), 1));
+        let (src, eof) = read_of(&pts, 3, TB10, 1024);
+        assert_eq!(
+            early.progress(&src, eof),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 2
+            }
+        );
+        // ...and a window with nothing in it is decided as soon as a frame past it is read.
+        let hole = Pick::Fps(pick((0.31, 0.39), 0.0, 1.0, false, (10, 1), 0));
+        let (src, eof) = read_of(&pts, 5, TB10, 1024);
+        assert_eq!(
+            hole.progress(&src, eof),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 5
+            }
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_window_and_of_the_file_are_what_close_a_clip() {
+        let pts = frames(12, 1024);
+        // The window ends at 0.6 s: frame 6 is the first past it, and a clip whose last frame is
+        // 5 is over from slot 6 on. Reading frames 0..=6 is enough to say frame 6's slot draws nothing.
+        let end = Pick::Fps(pick((0.0, 0.6), 0.0, 1.0, false, (10, 1), 6));
+        let at = |m| {
+            let (src, eof) = read_of(&pts, m, TB10, 1024);
+            end.progress(&src, eof)
+        };
+        assert_eq!(at(6), PickProgress::NeedMore);
+        assert_eq!(
+            at(7),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 7
+            }
+        );
+        // To the end of the file: the slot after the last frame is empty only once the file is
+        // known to be over, and then the last frame's own duration says how long it lasts.
+        let tail = |k| Pick::Fps(pick((0.0, 100.0), 0.0, 1.0, false, (10, 1), k));
+        let (open, ended) = read_of(&pts, 11, TB10, 1024);
+        assert!(!ended);
+        assert_eq!(tail(11).progress(&open, false), PickProgress::NeedMore);
+        let (whole, ended) = read_of(&pts, 12, TB10, 1024);
+        assert!(ended);
+        assert_eq!(
+            tail(11).progress(&whole, true),
+            PickProgress::Ready {
+                shown: Some(11),
+                keep_from: 11
+            }
+        );
+        assert_eq!(
+            tail(12).progress(&whole, true),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 12
+            }
+        );
+        // A longer last frame holds the picture through the slot after it.
+        let (long, _) = read_of(&pts, 12, TB10, 2048);
+        assert_eq!(
+            tail(12).progress(&long, true),
+            PickProgress::Ready {
+                shown: Some(11),
+                keep_from: 11
+            }
+        );
+    }
+
+    #[test]
+    fn a_reverse_pick_needs_every_frame_of_its_window() {
+        let pts = frames(12, 1024);
+        let back = Pick::Fps(pick((0.2, 0.8), 0.0, 1.0, true, (10, 1), 0));
+        // Output frame 0 is the window's *last* frame, so nothing is decided until frame 8 (the
+        // first past the window) has been read, and the whole window is to be kept.
+        let at = |m| {
+            let (src, eof) = read_of(&pts, m, TB10, 1024);
+            back.progress(&src, eof)
+        };
+        assert_eq!(at(8), PickProgress::NeedMore);
+        assert_eq!(
+            at(9),
+            PickProgress::Ready {
+                shown: Some(7),
+                keep_from: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_still_image_needs_only_its_one_frame_and_a_still_image_pick_reads_stills() {
+        let rate = Rational::new(30, 1).unwrap();
+        let still = |k| {
+            Pick::Fps(FpsPick {
+                image: Some(rate),
+                ..pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), k)
+            })
+        };
+        let pts = [0];
+        let (one, _) = read_of(&pts, 1, Rational { num: 1, den: 30 }, 1);
+        let (none, _) = read_of(&pts, 0, Rational { num: 1, den: 30 }, 1);
+        assert_eq!(still(7).progress(&none, false), PickProgress::NeedMore);
+        assert_eq!(
+            still(7).progress(&none, true),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 0
+            }
+        );
+        assert_eq!(
+            still(7).progress(&one, false),
+            PickProgress::Ready {
+                shown: Some(0),
+                keep_from: 0
+            }
+        );
+        // Past the loop the still is over, whatever was read.
+        assert_eq!(
+            still(30).progress(&one, false),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 1
+            }
+        );
+        assert_eq!(
+            FpsPick {
+                image: Some(rate),
+                ..pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), 0)
+            }
+            .seek(),
+            None
+        );
+        assert_eq!(pick((2.0, 3.0), 0.0, 1.0, false, (30, 1), 0).seek(), Some(2.0));
+        assert_eq!(pick((0.0, 3.0), 0.0, 1.0, false, (30, 1), 0).seek(), Some(0.0));
+    }
+
+    #[test]
+    fn the_still_picks_are_decided_by_the_first_frame_at_or_after_the_time() {
+        let tb = Rational { num: 1, den: 24 };
+        let pts: Vec<i64> = (0..60).collect();
+        let at = |p: Pick, m| {
+            let (src, eof) = read_of(&pts, m, tb, 1);
+            p.progress(&src, eof)
+        };
+        let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
+        assert_eq!(at(Pick::AtOrAfter(1.02), 24), PickProgress::NeedMore);
+        assert_eq!(at(Pick::AtOrAfter(1.02), 25), ready(Some(24), 24));
+        assert_eq!(at(Pick::Before(1.02), 24), PickProgress::NeedMore);
+        assert_eq!(at(Pick::Before(1.02), 25), ready(Some(23), 23));
+        // Past the end of the file there is no frame at or after, and the last one is before.
+        assert_eq!(at(Pick::AtOrAfter(99.0), 60), ready(None, 60));
+        assert_eq!(at(Pick::Before(99.0), 60), ready(Some(59), 59));
+        assert_eq!(at(Pick::AtOrAfter(99.0), 59), PickProgress::NeedMore);
+        // Before the first frame read: only the cursor knows whether the run began at the
+        // file's start (nothing there) or later (restart earlier).
+        assert_eq!(at(Pick::Before(0.0), 3), PickProgress::NeedEarlier);
+        assert_eq!(at(Pick::Before(0.0), 1), PickProgress::NeedEarlier);
+        // An empty file has nothing before anything.
+        assert_eq!(at(Pick::Before(0.0), 0), PickProgress::NeedMore);
+    }
+
+    /// The property that makes the helper safe to stream with: fed the file a frame at a time, it
+    /// never answers differently from `fps_pick` over the whole file, it answers by the end, it
+    /// keeps answering the same, and a forward pick is answered a frame after the one it shows.
+    #[test]
+    fn a_streaming_cursor_is_never_decided_differently_from_the_whole_file() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut ready_early, mut decided) = (0, 0);
+        for case in 0..4000 {
+            let tb = [(1, 12_288), (1, 1000), (1, 90_000), (1, 24)][rnd(4) as usize];
+            let tb = Rational { num: tb.0, den: tb.1 };
+            let fps = [(24, 1), (25, 1), (30_000, 1001), (30, 1)][rnd(4) as usize];
+            let step = (i64::from(tb.den) * i64::from(fps.1) / i64::from(fps.0)).max(1);
+            let n = 4 + rnd(30) as usize;
+            // A variable rate on a third of the cases, a late start on a few.
+            let mut at = if rnd(5) == 0 { rnd(40) as i64 * step / 7 } else { 0 };
+            let pts: Vec<i64> = (0..n)
+                .map(|_| {
+                    let here = at;
+                    at += if case % 3 == 0 {
+                        1 + rnd(2 * step as u64) as i64
+                    } else {
+                        step
+                    };
+                    here
+                })
+                .collect();
+            let last_duration = if rnd(2) == 0 { 0 } else { step + rnd(3) as i64 - 1 };
+            let dur = pts[n - 1] as f64 * f64::from(tb.num) / f64::from(tb.den);
+            let a = if rnd(3) == 0 { 0.0 } else { dur * rnd(70) as f64 / 100.0 };
+            let b = a + 0.02 + dur * rnd(100) as f64 / 100.0;
+            let p = FpsPick {
+                speed: [0.5, 1.0, 1.5, 2.0, 4.0][rnd(5) as usize],
+                reverse: rnd(3) == 0,
+                window: (a, b),
+                start: rnd(100) as f64 / 100.0,
+                frame: rnd(70),
+                fps: Rational::new(fps.0, fps.1).unwrap(),
+                drop_first: rnd(6) == 0,
+                image: None,
+            };
+            let full = SourceFrames {
+                pts: &pts,
+                time_base: tb,
+                start_us: 0,
+                last_duration,
+            };
+            let want = fps_pick(&p, &full);
+            let mut first = None;
+            for m in 0..=n {
+                let (read, eof) = read_of(&pts, m, tb, last_duration);
+                match Pick::Fps(p).progress(&read, eof) {
+                    PickProgress::NeedMore => assert!(first.is_none(), "case {case}: undecided again at {m} frames: {p:?}"),
+                    PickProgress::NeedEarlier => panic!("case {case}: an fps pick never needs an earlier run: {p:?}"),
+                    PickProgress::Ready { shown, keep_from } => {
+                        assert_eq!(
+                            shown, want,
+                            "case {case}: decided {shown:?} at {m} of {n} frames, the file says {want:?}: {p:?}"
+                        );
+                        assert!(
+                            keep_from <= m && shown.is_none_or(|i| keep_from <= i),
+                            "case {case}: keep {keep_from} of {m}, shown {shown:?}"
+                        );
+                        first = first.or(Some(m));
+                    }
+                }
+            }
+            let first = first.unwrap_or_else(|| panic!("case {case}: never decided: {p:?}"));
+            if let (Some(i), false) = (want, p.reverse) {
+                decided += 1;
+                assert!(
+                    first <= i + 2,
+                    "case {case}: decided after {first} frames for frame {i}: {p:?}"
+                );
+                ready_early += usize::from(first < n);
+            }
+        }
+        // The sweep has to have exercised the interesting case: most forward picks are decided
+        // before the file's last frame.
+        assert!(ready_early * 2 > decided, "{ready_early} of {decided}");
     }
 }

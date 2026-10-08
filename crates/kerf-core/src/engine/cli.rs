@@ -159,6 +159,17 @@ pub(super) fn disable_hwaccel() {
     HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// [`disable_hwaccel`] for a decoder that lives outside the engine (`kerf-gpu`'s
+/// long-lived frame decodes): call it when a run with `-hwaccel` died before its
+/// first frame and the same run in software worked. One process-wide learned
+/// fallback, shared with the preview path, so a broken accelerator costs one failed
+/// attempt in the whole process, not one per decoder.
+pub fn disable_decode_hwaccel() {
+    if HWACCEL_OK.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("hardware decode failed where software worked; decoding in software from now on");
+    }
+}
+
 /// Whether hardware encoding may be used at all. `KERF_HW_ENCODE=none` (or
 /// empty, or `0`) forces every internal encode onto the software encoders.
 fn hw_encode_enabled() -> bool {
@@ -1994,6 +2005,15 @@ pub(super) fn source_key(src: &Path) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}|{len}|{mtime}", src.display())
+}
+
+/// Which file a cached decode came from, as one number: [`source_key`] (path, size and
+/// modified time) hashed, so it changes when the file is replaced and a cache keyed by it
+/// never serves a stale frame. A proxy and its original are different paths, so different
+/// identities. A path that cannot be read hashes with size 0 and mtime 0: stable, and it
+/// changes the moment the file appears.
+pub fn source_identity(src: &Path) -> u64 {
+    fnv1a(&source_key(src))
 }
 
 /// How long after the container's start the video's first frame lies, in
@@ -6760,6 +6780,41 @@ mod tests {
         assert_eq!(head_lead(Some(1.0), None), 0.0);
         assert!(needs_head_pad(0.08) && needs_head_pad(5.0));
         assert!(!needs_head_pad(0.0) && !needs_head_pad(HEAD_PAD_MIN) && !needs_head_pad(0.0004));
+    }
+
+    #[test]
+    fn a_files_identity_follows_its_path_size_and_modified_time() {
+        let dir = std::env::temp_dir().join(format!("kerf-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"one").unwrap();
+        let first = source_identity(&a);
+        assert_eq!(first, source_identity(&a), "stable while the file is untouched");
+        assert_eq!(first, fnv1a(&source_key(&a)));
+        assert_ne!(first, source_identity(&b), "the path is part of it");
+        // A replaced file (another size) is another identity, even when written at once.
+        std::fs::write(&a, b"three").unwrap();
+        assert_ne!(first, source_identity(&a));
+        // A path that is not there is still a stable key, and it changes when the file appears.
+        let missing = dir.join("missing.bin");
+        let before = source_identity(&missing);
+        assert_eq!(before, source_identity(&missing));
+        std::fs::write(&missing, b"x").unwrap();
+        assert_ne!(before, source_identity(&missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The learned fallback is one-way and is what `decode_hwaccel()` reads, so a decoder
+    /// outside the engine that calls it silences the preview path's attempts too. (Leaves the
+    /// flag cleared: nothing else in the suite may depend on it being set — a run under
+    /// `KERF_HWACCEL=none` already decodes in software with the flag never consulted.)
+    #[test]
+    fn disabling_decode_hwaccel_is_shared_with_the_preview_path() {
+        disable_decode_hwaccel();
+        assert_eq!(decode_hwaccel(), None);
+        disable_decode_hwaccel();
+        assert_eq!(decode_hwaccel(), None);
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub struct YuvFrame {
 }
 
 /// Bytes of a `w` x `h` 8-bit 4:2:0 frame, or `None` on overflow.
-fn yuv420p_len(w: u32, h: u32) -> Option<usize> {
+pub(crate) fn yuv420p_len(w: u32, h: u32) -> Option<usize> {
     let (cw, ch) = chroma_size(w, h);
     let luma = u64::from(w).checked_mul(u64::from(h))?;
     let chroma = u64::from(cw).checked_mul(u64::from(ch))?;
