@@ -5558,7 +5558,10 @@ mod tests {
         assert_eq!(levels.target_lufs, -14.0);
         // A range that is not a span is the caller's mistake.
         let bad = project.levels(Some(TimeRange { start: 4.0, end: 2.0 }), false);
-        assert!(matches!(bad, Err(Error::InvalidArgument(_))), "{bad:?}");
+        assert!(
+            matches!(bad, Err(Error::InvalidArgument(_))),
+            "a reversed range must be refused"
+        );
     }
 
     #[test]
