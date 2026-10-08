@@ -57,12 +57,12 @@ pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
     ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome,
-    EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus, Projection, Reframe,
-    ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SkippedDetach, SourceLimits, SplitSide, StagedEdit,
-    StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track,
-    TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS,
-    LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB,
-    MIN_EDIT_CLIP,
+    EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus, Projection, Property, PropertyKey,
+    PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SkippedDetach, SourceLimits,
+    SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
+    TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover,
+    ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME,
+    MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
@@ -70,7 +70,7 @@ pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
-pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, VOICEOVER_TRACK};
+pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
     PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
