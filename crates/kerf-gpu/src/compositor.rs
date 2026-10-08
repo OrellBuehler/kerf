@@ -69,6 +69,48 @@ pub struct RenderedFrame {
 }
 
 impl RenderedFrame {
+    /// Upload `frame` (RGBA, top row first) as a texture of `gpu`: a picture the compositor did not
+    /// draw (a placeholder, a screenshot) that a [`crate::Presenter`] can show all the same.
+    pub fn from_rgba(gpu: &Gpu, frame: &RgbaFrame) -> Result<RenderedFrame, GpuError> {
+        let (w, h) = (frame.width, frame.height);
+        if w == 0 || h == 0 || frame.data.len() != (w as usize) * (h as usize) * 4 {
+            return Err(GpuError::Unsupported(format!(
+                "{} bytes are not a {w}x{h} RGBA picture",
+                frame.data.len()
+            )));
+        }
+        let limit = gpu.device.limits().max_texture_dimension_2d;
+        if w > limit || h > limit {
+            return Err(GpuError::Unsupported(format!(
+                "a {w}x{h} picture is over this device's {limit}px texture limit"
+            )));
+        }
+        gpu.guarded("uploading a frame", || {
+            let texture = gpu.device.create_texture_with_data(
+                &gpu.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("uploaded frame"),
+                    size: extent(w, h),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: CANVAS_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &frame.data,
+            );
+            Ok(RenderedFrame {
+                texture,
+                width: w,
+                height: h,
+            })
+        })
+    }
+
     /// The frame's pixels, copied back to the CPU (for a screenshot or a test; the app presents
     /// it without this). `gpu` must be the device it was rendered on.
     pub fn read_back(&self, gpu: &Gpu) -> Result<RgbaFrame, GpuError> {

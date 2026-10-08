@@ -41,7 +41,7 @@ use base64::Engine as _;
 use kerf_core::{
     composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, PlanRequest, Planner, Project, ProxyMedia, Timeline,
 };
-use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter};
+use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
 use serde::{Deserialize, Serialize};
 
 /// The widest frame the GPU preview renders; a bigger panel is drawn from this, scaled up.
@@ -139,6 +139,10 @@ pub struct BoundsReport {
     pub visible: bool,
     /// The colour around the picture, `#rrggbb` (the theme's `--frame-matte`).
     pub matte: Option<String>,
+    /// The colour of the rest of the surface, `#rrggbb` (the theme's `--surface-app`): what a
+    /// transparent webview shows where no element of the page paints.
+    #[serde(default)]
+    pub backdrop: Option<String>,
 }
 
 /// [`BoundsReport`], sanitised: whole pixels, finite, clamped to a sane range.
@@ -148,6 +152,7 @@ pub struct Bounds {
     pub viewport: (u32, u32),
     pub visible: bool,
     pub matte: [u8; 3],
+    pub backdrop: [u8; 3],
 }
 
 /// The largest coordinate taken as real: bigger is a bug in the caller, not a monitor.
@@ -182,6 +187,7 @@ impl Bounds {
             viewport,
             visible: r.visible && rect.width > 0 && rect.height > 0,
             matte: r.matte.as_deref().and_then(parse_matte).unwrap_or(DEFAULT_MATTE),
+            backdrop: r.backdrop.as_deref().and_then(parse_matte).unwrap_or(DEFAULT_MATTE),
         })
     }
 }
@@ -232,13 +238,47 @@ pub fn fit_contain(inner: (u32, u32), area: PixelRect) -> PixelRect {
     }
 }
 
-/// Where a `canvas`-sized frame goes in `area`, and the width to render it at (even, at most
-/// [`MAX_RENDER_WIDTH`]): the picture is rendered at about the size it is shown, so the
-/// presenter draws it 1:1 whenever the panel is not bigger than the cap.
-pub fn place_frame(canvas: (u32, u32), area: PixelRect) -> (u32, PixelRect) {
+/// Where a `canvas`-sized frame goes in `area`, and the width to render it at: about the width
+/// it is shown at (so the presenter draws it 1:1 whenever the panel is not wider than the cap),
+/// and one whose render size keeps the canvas's shape (see [`exact_width`]). `size_for` is the
+/// size a render at a width comes out (`RenderPlan::size`).
+pub fn place_frame(canvas: (u32, u32), area: PixelRect, size_for: impl Fn(u32) -> (u32, u32)) -> (u32, PixelRect) {
     let dest = fit_contain(canvas, area);
-    let width = dest.width.clamp(2, MAX_RENDER_WIDTH) & !1;
-    (width, dest)
+    (exact_width(canvas, dest.width, size_for), dest)
+}
+
+/// How far a render at width `w` is from the canvas's shape, in rows: the ideal height minus the
+/// one `size_for` gives. Zero when the sizes are exact.
+fn shape_error(canvas: (u32, u32), w: u32, size_for: &impl Fn(u32) -> (u32, u32)) -> f64 {
+    let (rw, rh) = size_for(w);
+    (f64::from(rw) * f64::from(canvas.1) / f64::from(canvas.0.max(1)) - f64::from(rh)).abs()
+}
+
+/// The render width nearest `target` (even, at most [`MAX_RENDER_WIDTH`], within a few dozen
+/// pixels of it) whose size has the canvas's shape to the row. A preview size is the delivery
+/// aspect at an even height rounded down, which at 430 px is 240 rows for a 241.9 ideal: the
+/// compositor then letterboxes the footage into a canvas a hair taller than its shape, and a
+/// pillar a couple of pixels wide shows. Another width of the same size class has none.
+pub fn exact_width(canvas: (u32, u32), target: u32, size_for: impl Fn(u32) -> (u32, u32)) -> u32 {
+    let cap = MAX_RENDER_WIDTH.min(canvas.0.max(2)) & !1;
+    let target = target.clamp(2, cap.max(2)) & !1;
+    let mut best = (shape_error(canvas, target, &size_for), target);
+    for step in (2..=48u32).step_by(2) {
+        if best.0 < 1e-9 {
+            break;
+        }
+        for w in [target.checked_sub(step), target.checked_add(step)].into_iter().flatten() {
+            if !(2..=cap).contains(&w) {
+                continue;
+            }
+            let err = shape_error(canvas, w, &size_for);
+            // Strictly better only: the nearer width wins a tie.
+            if err < best.0 - 1e-9 {
+                best = (err, w);
+            }
+        }
+    }
+    best.1
 }
 
 /// Where the surface is and what part of it the picture goes in.
@@ -353,9 +393,9 @@ pub fn react(error: &GpuError) -> Reaction {
 /// The surface's host: whatever has to stay alive, be placed and be shown or hidden with it.
 enum Host {
     /// The main window; its webview background is transparent while this lives.
-    Window(tauri::WebviewWindow),
+    Window(Box<tauri::WebviewWindow>),
     #[cfg(target_os = "linux")]
-    Child(x11::Child),
+    Child(Box<x11::Child>),
 }
 
 impl Host {
@@ -378,6 +418,8 @@ impl Host {
 
     /// Put the surface where `layout` says and show it.
     fn apply(&mut self, layout: &Layout) -> Result<(), String> {
+        // Only a child window has to be put anywhere.
+        let _ = layout;
         match self {
             Host::Window(_) => Ok(()),
             #[cfg(target_os = "linux")]
@@ -717,7 +759,7 @@ impl GpuPreview {
             drop(state);
             return fallback("the preview frame is outside the window".into());
         };
-        let (width, dest) = place_frame((plan.canvas.width, plan.canvas.height), layout.area);
+        let (width, dest) = place_frame((plan.canvas.width, plan.canvas.height), layout.area, |w| plan.size(w));
         let size = plan.size(width);
         let reasons = plan.reasons(&backend.compositor.caps(), size);
         if !reasons.is_empty() {
@@ -735,7 +777,15 @@ impl GpuPreview {
             // The surface is placed after the frame is drawn, just before it is shown: a child
             // window moved earlier would flash its previous contents.
             lock(&host).apply(&layout).map_err(GpuError::Surface)?;
-            backend.presenter.present(&frame, dest, bounds.matte)?;
+            backend.presenter.present(
+                &frame,
+                dest,
+                Surround {
+                    area: layout.area,
+                    matte: bounds.matte,
+                    backdrop: bounds.backdrop,
+                },
+            )?;
             Ok(GpuTimings {
                 width: frame.width,
                 height: frame.height,
@@ -751,7 +801,13 @@ impl GpuPreview {
             }
             Err(error) => {
                 let reaction = react(&error);
-                tracing::warn!(%error, ?reaction, "GPU preview frame failed; this frame goes through FFmpeg");
+                // A frame the GPU declines (a busy decode, a plan it refuses at this size) is the
+                // ordinary fallback; a device or surface that is gone is news.
+                if reaction == Reaction::Frame {
+                    tracing::debug!(%error, "GPU preview frame declined; this frame goes through FFmpeg");
+                } else {
+                    tracing::warn!(%error, "GPU preview failed; rebuilding it, and this frame goes through FFmpeg");
+                }
                 if reaction == Reaction::Rebuild {
                     let wait = state.backoff.fail(matches!(error, GpuError::DeviceLost(_)));
                     state.retry_at = Some(now + wait);
@@ -849,14 +905,14 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
             window
                 .set_background_color(Some(tauri::window::Color(r, g, b, 0)))
                 .map_err(|err| format!("making the webview transparent: {err}"))?;
-            (gpu, presenter, Host::Window(window))
+            (gpu, presenter, Host::Window(Box::new(window)))
         }
         #[cfg(target_os = "linux")]
         Technique::Child => {
             let child = x11::Child::create(&window)?;
             let (gpu, surface) = Gpu::new_for_surface(options, child.target()).map_err(e("the child window surface"))?;
             let presenter = Presenter::new(Arc::clone(&gpu), surface, (1, 1)).map_err(e("the child window surface"))?;
-            (gpu, presenter, Host::Child(child))
+            (gpu, presenter, Host::Child(Box::new(child)))
         }
         #[cfg(not(target_os = "linux"))]
         Technique::Child => return Err("a child window is only implemented for X11".into()),
@@ -876,6 +932,7 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kerf_gpu::{Gpu, GpuOptions};
 
     fn rect(x: u32, y: u32, width: u32, height: u32) -> PixelRect {
         PixelRect { x, y, width, height }
@@ -891,6 +948,7 @@ mod tests {
             viewport_height: 900.0,
             visible: true,
             matte: Some("#102030".into()),
+            backdrop: Some("#0a0b0c".into()),
         }
     }
 
@@ -923,6 +981,7 @@ mod tests {
         assert_eq!(b.rect, rect(10, 21, 800, 450));
         assert_eq!(b.viewport, (1440, 900));
         assert_eq!(b.matte, [0x10, 0x20, 0x30]);
+        assert_eq!(b.backdrop, [0x0a, 0x0b, 0x0c]);
         assert!(b.visible);
 
         let mut r = report();
@@ -985,18 +1044,62 @@ mod tests {
         assert_eq!(fit_contain((10, 10), rect(0, 0, 0, 5)), rect(0, 0, 0, 5));
     }
 
+    fn still(canvas: (u32, u32)) -> impl Fn(u32) -> (u32, u32) {
+        move |w| kerf_core::render_plan::still_size(canvas.0, canvas.1, w)
+    }
+
     #[test]
     fn the_render_width_is_the_shown_width_even_and_capped() {
-        let (w, dest) = place_frame((1920, 1080), rect(0, 0, 801, 451));
+        let canvas = (1920, 1080);
+        let (w, dest) = place_frame(canvas, rect(0, 0, 801, 451), still(canvas));
         assert_eq!(w % 2, 0);
-        assert!(w <= 801 && w >= 799);
+        assert!((w as i64 - 801).abs() <= 48, "{w}");
         assert!(dest.width <= 801 && dest.height <= 451);
         // A panel bigger than the cap renders at the cap, and the presenter scales it up.
-        let (w, dest) = place_frame((3840, 2160), rect(0, 0, 3000, 1688));
+        let canvas = (3840, 2160);
+        let (w, dest) = place_frame(canvas, rect(0, 0, 3000, 1688), still(canvas));
         assert_eq!(w, MAX_RENDER_WIDTH);
         assert!(dest.width > MAX_RENDER_WIDTH);
         // A sliver still renders at a legal size.
-        assert_eq!(place_frame((1920, 1080), rect(0, 0, 1, 1)).0, 2);
+        let (w, _) = place_frame((1920, 1080), rect(0, 0, 1, 1), still((1920, 1080)));
+        assert!(w >= 2 && w % 2 == 0 && w <= 50, "{w}");
+        // A canvas smaller than the panel is rendered at its own size, never above it.
+        assert_eq!(place_frame((640, 360), rect(0, 0, 1600, 900), still((640, 360))).0, 640);
+    }
+
+    #[test]
+    fn a_render_keeps_the_canvas_shape_to_the_row_where_a_nearby_width_can() {
+        // 430 px is 240 rows of an ideal 241.9: the footage would be letterboxed into a canvas a
+        // hair too tall. 416 px is 234 rows exactly.
+        let canvas = (1280, 720);
+        assert_eq!(kerf_core::render_plan::still_size(1280, 720, 430), (430, 240));
+        let w = exact_width(canvas, 430, still(canvas));
+        let (rw, rh) = kerf_core::render_plan::still_size(1280, 720, w);
+        assert_eq!(u64::from(rw) * 720, u64::from(rh) * 1280, "{w} -> {rw}x{rh}");
+        assert!((w as i64 - 430).abs() <= 16, "{w}");
+        // A width that is already exact stays.
+        assert_eq!(exact_width(canvas, 960, still(canvas)), 960);
+        // Every common shape finds an exact width within the search at a typical panel size.
+        for canvas in [
+            (1920u32, 1080u32),
+            (1080, 1920),
+            (1080, 1080),
+            (1080, 1350),
+            (1440, 1080),
+            (2560, 1080),
+        ] {
+            for target in [300u32, 431, 640, 801, 1100] {
+                let w = exact_width(canvas, target, still(canvas));
+                let (rw, rh) = kerf_core::render_plan::still_size(canvas.0, canvas.1, w);
+                let err = (f64::from(rw) * f64::from(canvas.1) / f64::from(canvas.0) - f64::from(rh)).abs();
+                assert!(err < 1.0, "{canvas:?} at {target}: {w} -> {rw}x{rh} is {err} rows off");
+                assert_eq!(w % 2, 0);
+            }
+        }
+        // Odd shapes with no exact width nearby take the least wrong one, never anything silly.
+        let canvas = (1998, 1080);
+        let w = exact_width(canvas, 700, still(canvas));
+        assert!((w as i64 - 700).abs() <= 48);
     }
 
     #[test]
@@ -1187,6 +1290,74 @@ mod tests {
             panic!()
         };
         assert!(r[0].contains("macos-private-api"), "{r:?}");
+    }
+
+    /// The app's first step on a machine with no Vulkan driver at all, run in a child process with
+    /// the loader pointed at nothing (a variable is process-wide, and the other tests share this
+    /// process): the device request is an error value, the frame is FFmpeg's with the reason, and
+    /// the status says why — nothing panics, and nothing is retried per frame.
+    #[test]
+    fn a_machine_with_no_adapter_gets_the_jpeg_and_a_reason_and_not_a_crash() {
+        const MARK: &str = "KERF_TEST_NO_ADAPTER";
+        if std::env::var_os(MARK).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "gpu_preview::tests::a_machine_with_no_adapter_gets_the_jpeg_and_a_reason_and_not_a_crash",
+                    "--nocapture",
+                ])
+                .env(MARK, "1")
+                .env("VK_ICD_FILENAMES", "/nonexistent/kerf-no-icd.json")
+                .env("VK_DRIVER_FILES", "/nonexistent/kerf-no-icd.json")
+                .output()
+                .expect("run the child");
+            assert!(
+                out.status.success(),
+                "the child failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // The child. A machine that has an adapter whatever the loader is told (Metal, WARP) has
+        // nothing to prove here.
+        let Err(error) = Gpu::new(GpuOptions::default()) else {
+            return;
+        };
+        assert!(matches!(error, GpuError::NoAdapter(_)), "{error:?}");
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = built.clone();
+        let preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            // The same first step `build_backend` takes, and its error mapped the same way.
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Gpu::new(GpuOptions::default())
+                    .map(|_| unreachable!("an adapter appeared"))
+                    .map_err(|e| format!("the window surface: {e}"))
+            }),
+        );
+        preview.set_enabled(true);
+        visible(&preview);
+        let inputs = inputs();
+        for n in 0..3 {
+            let Attempt::Fallback(reasons) = preview.attempt(&inputs, 0.5, false, Instant::now() + Duration::from_millis(n))
+            else {
+                panic!("drew a frame with no adapter");
+            };
+            assert!(reasons[0].contains("no usable GPU adapter"), "{reasons:?}");
+        }
+        assert_eq!(
+            built.load(Ordering::SeqCst),
+            1,
+            "a missing driver is not asked about again every frame"
+        );
+        let status = preview.status();
+        assert!(status.enabled && !status.ready);
+        assert!(status.reason.unwrap().contains("no usable GPU adapter"));
     }
 
     #[test]

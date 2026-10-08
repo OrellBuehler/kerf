@@ -2361,6 +2361,7 @@ dependencies = [
  "base64 0.23.1",
  "kerf-core",
  "kerf-gpu",
+ "libloading 0.8.9",
  "raw-window-handle",
  "rmcp",
  "schemars 1.2.2",

@@ -6,7 +6,7 @@
 //! **non-sRGB** surface format where the adapter offers one (so the hardware does not encode
 //! them a second time), and decodes them in the shader first where it does not. The frame is
 //! drawn 1:1 when the rectangle is its size (a texel centre per pixel, exact) and bilinear
-//! otherwise; the rest of the surface is a matte colour the caller chooses (the app's own
+//! otherwise; around it is a matte colour and beyond the frame a backdrop, both the caller's (the app's own
 //! background, so a gap between panels that a transparent webview lets through looks like the
 //! panel).
 //!
@@ -50,8 +50,38 @@ impl PixelRect {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct BlitParams {
     dest: [f32; 4],
+    area: [f32; 4],
     matte: [f32; 4],
+    backdrop: [f32; 4],
     flags: [u32; 4],
+}
+
+/// What a pass paints around the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Surround {
+    /// The frame the picture sits in; its part the picture does not cover is `matte`.
+    pub area: PixelRect,
+    /// The colour of that part (the letterbox bars).
+    pub matte: [u8; 3],
+    /// The colour of the rest of the surface: what a transparent webview shows where no page
+    /// element paints (the app's own background).
+    pub backdrop: [u8; 3],
+}
+
+impl Surround {
+    /// A surface that is all matte: a child window the size of the frame.
+    pub fn whole(matte: [u8; 3]) -> Self {
+        Self {
+            area: PixelRect {
+                x: 0,
+                y: 0,
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            matte,
+            backdrop: matte,
+        }
+    }
 }
 
 /// The pass that draws a frame into a target: a pipeline for one target format.
@@ -146,15 +176,15 @@ impl Blit {
         }
     }
 
-    /// Record and submit one pass: `frame` into `dest` of `target`, the rest `matte`.
-    /// `dest` is `None` for a pass that is all matte.
+    /// Record and submit one pass: `frame` into `dest` of `target`, `surround` around it.
+    /// `dest` is `None` for a pass with no picture.
     pub(crate) fn draw(
         &self,
         gpu: &Gpu,
         frame: Option<&RenderedFrame>,
         target: &wgpu::TextureView,
         dest: Option<PixelRect>,
-        matte: [u8; 3],
+        surround: Surround,
     ) {
         let device = &gpu.device;
         let encoded = |c: u8| f32::from(c) / 255.0;
@@ -165,9 +195,22 @@ impl Blit {
             width: 0,
             height: 0,
         });
+        let area = surround.area;
         let params = BlitParams {
             dest: [rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32],
-            matte: [encoded(matte[0]), encoded(matte[1]), encoded(matte[2]), 1.0],
+            area: [area.x as f32, area.y as f32, area.width as f32, area.height as f32],
+            matte: [
+                encoded(surround.matte[0]),
+                encoded(surround.matte[1]),
+                encoded(surround.matte[2]),
+                1.0,
+            ],
+            backdrop: [
+                encoded(surround.backdrop[0]),
+                encoded(surround.backdrop[1]),
+                encoded(surround.backdrop[2]),
+                1.0,
+            ],
             flags: [u32::from(self.srgb), 0, 0, 0],
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -337,23 +380,24 @@ impl Presenter {
         Ok(())
     }
 
-    /// Draw `frame` into `dest` (clamped to the surface) and the rest of the surface in `matte`,
-    /// then present. An empty rectangle is a surface of matte alone.
-    pub fn present(&mut self, frame: &RenderedFrame, dest: PixelRect, matte: [u8; 3]) -> Result<(), GpuError> {
-        self.draw(Some(frame), dest.clamped(self.size), matte)
+    /// Draw `frame` into `dest` (clamped to the surface), the rest of `surround.area` in its
+    /// matte and everything else in its backdrop, then present. An empty rectangle is a surface
+    /// without a picture.
+    pub fn present(&mut self, frame: &RenderedFrame, dest: PixelRect, surround: Surround) -> Result<(), GpuError> {
+        self.draw(Some(frame), dest.clamped(self.size), surround)
     }
 
-    /// The whole surface in `matte`.
-    pub fn clear(&mut self, matte: [u8; 3]) -> Result<(), GpuError> {
-        self.draw(None, None, matte)
+    /// The whole surface in the `surround`'s backdrop and matte, no picture.
+    pub fn clear(&mut self, surround: Surround) -> Result<(), GpuError> {
+        self.draw(None, None, surround)
     }
 
-    fn draw(&mut self, frame: Option<&RenderedFrame>, dest: Option<PixelRect>, matte: [u8; 3]) -> Result<(), GpuError> {
+    fn draw(&mut self, frame: Option<&RenderedFrame>, dest: Option<PixelRect>, surround: Surround) -> Result<(), GpuError> {
         let gpu = Arc::clone(&self.gpu);
         gpu.guarded("presenting a frame", || {
             let output = self.acquire()?;
             let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.blit.draw(&self.gpu, frame, &view, dest, matte);
+            self.blit.draw(&self.gpu, frame, &view, dest, surround);
             drop(view);
             self.gpu.queue.present(output);
             Ok(())
@@ -429,7 +473,7 @@ mod tests {
         frame: &RenderedFrame,
         size: (u32, u32),
         dest: PixelRect,
-        matte: [u8; 3],
+        surround: Surround,
         format: wgpu::TextureFormat,
     ) -> Vec<u8> {
         let blit = Blit::new(gpu, format);
@@ -452,7 +496,7 @@ mod tests {
             Some(frame),
             &target.create_view(&wgpu::TextureViewDescriptor::default()),
             dest.clamped(size),
-            matte,
+            surround,
         );
         let pitch = (size.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -523,18 +567,30 @@ mod tests {
             width: 4,
             height: 2,
         };
-        let matte = [10, 20, 30];
-        let out = blit_and_read(&gpu, &frame, size, dest, matte, wgpu::TextureFormat::Rgba8Unorm);
+        let surround = Surround {
+            area: PixelRect {
+                x: 2,
+                y: 1,
+                width: 6,
+                height: 4,
+            },
+            matte: [10, 20, 30],
+            backdrop: [200, 150, 100],
+        };
+        let out = blit_and_read(&gpu, &frame, size, dest, surround, wgpu::TextureFormat::Rgba8Unorm);
         for y in 0..size.1 {
             for x in 0..size.0 {
                 let got = pixel(&out, size.0, x, y);
                 let inside = (3..7).contains(&x) && (2..4).contains(&y);
+                let in_frame = (2..8).contains(&x) && (1..5).contains(&y);
                 let expect = if inside {
                     let i = (y - 2) * 4 + (x - 3);
                     let i = i as u8;
                     [i * 30 + 5, 255 - i * 20, i * 7, 255]
-                } else {
+                } else if in_frame {
                     [10, 20, 30, 255]
+                } else {
+                    [200, 150, 100, 255]
                 };
                 assert_eq!(got, expect, "pixel ({x}, {y})");
             }
@@ -553,9 +609,30 @@ mod tests {
             width: 4,
             height: 2,
         };
-        let rgba = blit_and_read(&gpu, &frame, size, whole, [0; 3], wgpu::TextureFormat::Rgba8Unorm);
-        let bgra = blit_and_read(&gpu, &frame, size, whole, [0; 3], wgpu::TextureFormat::Bgra8Unorm);
-        let srgb = blit_and_read(&gpu, &frame, size, whole, [0; 3], wgpu::TextureFormat::Rgba8UnormSrgb);
+        let rgba = blit_and_read(
+            &gpu,
+            &frame,
+            size,
+            whole,
+            Surround::whole([0; 3]),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let bgra = blit_and_read(
+            &gpu,
+            &frame,
+            size,
+            whole,
+            Surround::whole([0; 3]),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let srgb = blit_and_read(
+            &gpu,
+            &frame,
+            size,
+            whole,
+            Surround::whole([0; 3]),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
         for i in 0..8 {
             let (r, b, s) = (
                 pixel(&rgba, 4, i % 4, i / 4),
@@ -591,7 +668,14 @@ mod tests {
             width: 2,
             height: 1,
         };
-        let out = blit_and_read(&gpu, &frame, (2, 1), dest, [0; 3], wgpu::TextureFormat::Rgba8Unorm);
+        let out = blit_and_read(
+            &gpu,
+            &frame,
+            (2, 1),
+            dest,
+            Surround::whole([0; 3]),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         // Each pixel centre falls on the boundary between two texels of one colour.
         assert_eq!(pixel(&out, 2, 0, 0)[0], 0);
         assert_eq!(pixel(&out, 2, 1, 0)[0], 255);

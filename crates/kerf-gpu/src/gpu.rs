@@ -304,6 +304,34 @@ mod tests {
         });
     }
 
+    /// A window no native backend can draw to: a browser canvas handle.
+    struct NoWindow;
+
+    impl wgpu::rwh::HasWindowHandle for NoWindow {
+        fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
+            let raw = wgpu::rwh::RawWindowHandle::Web(wgpu::rwh::WebWindowHandle::new(1));
+            // SAFETY: the handle names nothing at all; no backend dereferences a web handle.
+            Ok(unsafe { wgpu::rwh::WindowHandle::borrow_raw(raw) })
+        }
+    }
+
+    impl wgpu::rwh::HasDisplayHandle for NoWindow {
+        fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
+            Ok(wgpu::rwh::DisplayHandle::web())
+        }
+    }
+
+    #[test]
+    fn a_window_no_backend_can_draw_to_is_an_error_and_not_a_panic() {
+        // Needs no adapter: the surface is refused before one is asked for, with or without a
+        // Vulkan loader on the machine.
+        let err = Gpu::new_for_surface(GpuOptions::for_tests(), NoWindow)
+            .err()
+            .expect("an error");
+        assert!(matches!(err, GpuError::Surface(_)), "{err:?}");
+        assert!(err.to_string().contains("surface"), "{err}");
+    }
+
     #[test]
     #[ignore = "needs a GPU adapter (lavapipe is enough)"]
     fn a_validation_error_is_returned_and_the_device_stays_usable() {
