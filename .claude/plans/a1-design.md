@@ -59,6 +59,15 @@ Phase 1 of A1 (`feat/gpu-a1`, off `f14e06d`), revised after critique. Design onl
     - Capture the source identity at spawn and carry it in the run, not at lookup.
     - Empty stdout with a non-zero exit is a **failed start**, not EOF. Exit 0 with a header-only y4m is a seek past the end: `mark_end(source, seek_tick - 1)`.
     - Cap concurrent `Exact` one-shots with a semaphore.
+- **As landed in A1b-2** (`frame_source.rs`, `Compositor::render_plan_with` / `composite_shared`, `tests/frame_source.rs`, `tests/frame_source_fake.rs`, the parity harness's frame check, `bench_frame_source_decode_vs_one_shot`; kerf-core `seek_ticks`, `decode_hwaccel` made public). Differences from the text above:
+  - **All three carried items are in**: the identity is captured at spawn and carried by the run; an empty stdout with a non-zero exit is a failed start (error with ffmpeg's stderr tail), an exit 0 with no frame `mark_end(seek_tick - 1)`; one-shots are capped (`max_oneshots`, 2, a counted wait on the source's condvar rather than a separate semaphore type).
+  - **Only `AtOrAfter`** is served; `Before` and `Fps` are `Unsupported` until the cursor (A1b-3). Every plan a compositor draws today is a still plan, whose picks are all `AtOrAfter`.
+  - **A late seek is detected, not fixed**: a run whose first frame is more than two frame intervals past a seek above 0 marks the file `late_seek`, and its frames come from `decode_layer` (the still's own seek, so parity holds: the FFmpeg still shows the same late keyframe). The design's "clamp coverage to one interval" stays, but on its own it made the frame source return the *true* frame at the time where the still returns the late keyframe — correct by the timestamps, wrong by the contract. Tolerance two intervals, so a VFR file's long gaps are not mistaken for one (a false positive only costs speed).
+  - **A run from 0 covers everything before its first frame** (`covers_from = i64::MIN`), so a picture that starts late is answered at `t = 0` without a restart.
+  - **The reaper** also drops the record of a finished run after 5 s (requests read their run's outcome from it), and the request deadline is 5 s for `Scrub` / `Forward`, the one-shot's 30 s for `Exact`.
+  - **Self-test**: `mpeg4` at 30000/1001 in mp4 on 1/30000 (no libx264 needed), from frame 5, seven frames, pts `1001 k` exactly; bounded at 10 s with a watchdog that kills either ffmpeg. `KERF_FRAME_SOURCE=oneshot` turns the path off on purpose.
+  - **Parity compares decoded planes, not composites**: the first version compared `render_plan` and `render_plan_with` RGBA and failed once on 9.0.2 (`pip/odd-361x203-in-722x640 @ 0.5`); the frames were identical on that case in every run after (seven full suites on 9.0.2, two on 6.1.1, and a six-thread stress test), and rendering the same plan twice never differed, so the one-off was not reproduced. What is asserted is what is claimed: equal planes.
+  - **Deferred**: the `proxy/` parity family and `Prefetch` (A4 drives both), the `FrameCursor` and reverse window (A1b-3).
 
 ## 2. RenderPlan, complete (kerf-core)
 

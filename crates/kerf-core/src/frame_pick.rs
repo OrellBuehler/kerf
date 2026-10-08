@@ -158,6 +158,14 @@ fn seek_shift(micros: i64, tb: Rational, start_us: i64) -> i64 {
     ticks(micros + start_us, tb)
 }
 
+/// The tick the still's `-ss {:.6}` of `seconds` becomes on a stream of `time_base` whose
+/// timestamps are relative to the container's start (`showinfo` under `-copyts
+/// -start_at_zero`): the first frame `-ss` returns is the first whose pts is at or after it.
+/// What a frame source keys a [`Pick::AtOrAfter`] by once it knows the stream's time base.
+pub fn seek_ticks(seconds: f64, time_base: Rational) -> i64 {
+    seek_shift(parse_micros_text(&seek_arg(seconds)), time_base, 0)
+}
+
 /// The shift of the still's `-ss {:.6}`.
 fn still_shift(seconds: f64, src: &SourceFrames) -> i64 {
     seek_shift(parse_micros_text(&seek_arg(seconds)), src.time_base, src.start_us)
@@ -546,6 +554,25 @@ mod tests {
             last_duration: 0,
         };
         (0..16).map(|k| fps_pick(&FpsPick { frame: k, ..*p }, &src)).collect()
+    }
+
+    #[test]
+    fn seek_ticks_is_the_tick_at_or_after_which_the_still_pick_lands() {
+        // 30000/1001 frames on 1/30000: frame k at 1001 * k.
+        let tb = Rational { num: 1, den: 30_000 };
+        let pts: Vec<i64> = (0..40).map(|k| 1001 * k).collect();
+        let src = SourceFrames {
+            pts: &pts,
+            time_base: tb,
+            start_us: 0,
+            last_duration: 0,
+        };
+        for t in [0.0, 0.0333, 0.033_366_7, 0.5, 1.0006, 1.234_567_8] {
+            let at = pts.partition_point(|&p| p < seek_ticks(t, tb));
+            assert_eq!(Pick::AtOrAfter(t).select(&src), (at < pts.len()).then_some(at), "t = {t}");
+        }
+        // The six-decimal spelling decides, not the f64: 1/30 s is 33333 us, 999.99 ticks.
+        assert_eq!(seek_ticks(1.0 / 30.0, tb), 1000);
     }
 
     #[test]

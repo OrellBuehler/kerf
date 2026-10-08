@@ -34,11 +34,12 @@
 //! still then draws nothing for that layer — black over whatever is below — so
 //! [`decode_layer`] returns `Ok(None)` and the compositor skips the layer.
 //!
-//! v0 scope, deliberately: one `ffmpeg` spawn per frame, software decode, no
-//! cache, no proxy. The long-lived per-asset decoder, the frame cache, the proxy
-//! and hardware decode are A1. The CPU budget's thread cap is applied, divided
-//! among the layers decoded side by side (it is a moment read: ungated, normal
-//! priority, like the still).
+//! This is the **one-shot** path: one `ffmpeg` spawn per frame, software decode,
+//! no cache. It is the reference the long-lived runs of
+//! [`FrameSource`](crate::FrameSource) are held to byte for byte, and what they
+//! fall back to. The CPU budget's thread cap is applied, divided among the layers
+//! decoded side by side (it is a moment read: ungated, normal priority, like the
+//! still).
 
 use std::io::Read;
 use std::process::Stdio;

@@ -185,3 +185,113 @@ fn bench_time_per_still_gpu_vs_ffmpeg() {
     let _ = std::fs::write(out.join("bench.txt"), &report);
     eprintln!("{report}");
 }
+
+/// A 30 fps source of `seconds` for the decode benchmark (the still's source is 10 frames).
+fn playback_source(dir: &Path, w: u32, h: u32, seconds: u32) -> Asset {
+    let path: PathBuf = dir.join(format!("bench-play-{w}x{h}.mp4"));
+    let out = Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc2=size={w}x{h}:rate=30:duration={seconds}"))
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-g",
+            "60",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ffmpeg");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    kerf_core::Project::probe_asset(&path).expect("probe")
+}
+
+/// Time per frame of a layer's decode: one `ffmpeg` per frame (A0) against a `FrameSource`
+/// (A1b-2), for 1x playback (frame after frame) and for a scrub (jumps of a second or so).
+/// No GPU. Same gate as the still benchmark.
+#[test]
+#[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg"]
+fn bench_frame_source_decode_vs_one_shot() {
+    if std::env::var_os("KERF_BENCH").is_none() {
+        eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+        return;
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let opts = ExportOptions::default();
+    let mut report = format!(
+        "ffmpeg: {}\n{:<7} {:<9} {:>14} {:>16}\n",
+        kerf_core::ffmpeg_path(),
+        "source",
+        "pattern",
+        "one-shot ms",
+        "frame source ms"
+    );
+    for (w, h) in [(1280u32, 720u32), (1920, 1080), (3840, 2160)] {
+        let asset = playback_source(dir, w, h, 6);
+        let tl = timeline(&asset, 1);
+        let layer_at = |t: f64| {
+            let tl = Timeline {
+                tracks: vec![Track {
+                    clips: vec![Clip::new(asset.id, 0.0, asset.duration, 0.0)],
+                    ..tl.tracks[0].clone()
+                }],
+                ..tl.clone()
+            };
+            RenderPlan::at(
+                &tl,
+                std::slice::from_ref(&asset),
+                &opts,
+                t,
+                kerf_core::CompositeColorPolicy::FixedBt601,
+            )
+            .expect("plan")
+            .layers
+            .remove(0)
+        };
+        let patterns: [(&str, Vec<f64>, kerf_gpu::Hint); 2] = [
+            (
+                "playback",
+                (0..60).map(|k| 1.0 + f64::from(k) / 30.0).collect(),
+                kerf_gpu::Hint::Forward { fps: 30.0 },
+            ),
+            (
+                "scrub",
+                (0..20).map(|k| f64::from((k * 7) % 20) * 0.27 + 0.1).collect(),
+                kerf_gpu::Hint::Scrub,
+            ),
+        ];
+        for (name, times, hint) in patterns {
+            let layers: Vec<_> = times.iter().map(|&t| layer_at(t)).collect();
+            let t0 = Instant::now();
+            for l in &layers {
+                kerf_gpu::decode_layer(l).expect("one-shot");
+            }
+            let oneshot = t0.elapsed() / layers.len() as u32;
+            let src = kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default());
+            let t0 = Instant::now();
+            for l in &layers {
+                src.frame(l, hint).expect("frame source");
+            }
+            let runs = t0.elapsed() / layers.len() as u32;
+            let line = format!(
+                "{:<7} {:<9} {:>14.1} {:>16.1}   {:?}\n",
+                format!("{h}p"),
+                name,
+                ms(oneshot),
+                ms(runs),
+                src.stats()
+            );
+            eprint!("{line}");
+            report.push_str(&line);
+        }
+    }
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
+    let _ = std::fs::create_dir_all(&out);
+    let _ = std::fs::write(out.join("bench-frame-source.txt"), &report);
+}
