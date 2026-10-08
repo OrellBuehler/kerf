@@ -45,9 +45,19 @@ pub enum GpuError {
     /// the caller should use the FFmpeg path.
     #[error("not rendered on the GPU: {0}")]
     Unsupported(String),
+    /// The frame source cannot keep up (it keeps restarting decodes): the caller renders this
+    /// frame, or the span, through FFmpeg's own stream.
+    #[error("the frame source is busy: {0}")]
+    Busy(String),
     /// The finished frame could not be copied back.
     #[error("could not read the frame back: {0}")]
     Readback(String),
+}
+
+impl From<crate::router::Busy> for GpuError {
+    fn from(busy: crate::router::Busy) -> Self {
+        GpuError::Busy(busy.to_string())
+    }
 }
 
 /// How to pick an adapter.
