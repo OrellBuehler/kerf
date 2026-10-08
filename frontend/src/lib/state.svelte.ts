@@ -37,6 +37,8 @@ import {
 	removeOverlay,
 	setAudioEffects,
 	setKeyframes,
+	setPropertyKeyframes,
+	copyKeyframes,
 	setAssetProjection,
 	setReframe,
 	setReframeKeyframes,
@@ -123,6 +125,8 @@ import type {
 	Keyframe,
 	Mask,
 	Projection,
+	Property,
+	PropertyKey,
 	Reframe,
 	ReframeKeyframe,
 	Revision,
@@ -861,8 +865,16 @@ class EditorState {
 		return this.#apply(addKeyframe(clipId, time, patch));
 	}
 	/** The easing of the segment leaving the keyframe at `time` (clip-local seconds). */
-	setKeyframeEasing(clipId: string, time: number, easing: Easing) {
-		return this.#apply(setKeyframeEasing(clipId, time, easing));
+	setKeyframeEasing(clipId: string, time: number, easing: Easing, prop?: Property) {
+		return this.#apply(setKeyframeEasing(clipId, time, easing, prop));
+	}
+	/** Replace the keys of one number — a transform number, a colour number or the volume. */
+	setPropertyKeyframes(clipId: string, prop: Property, keys: PropertyKey[]) {
+		return this.#apply(setPropertyKeyframes(clipId, prop, keys));
+	}
+	/** Copy the animation of `props` (all keyed ones when empty) to another clip, `offset` later. */
+	copyKeyframes(fromClipId: string, toClipId: string, props: Property[] = [], offset = 0) {
+		return this.#apply(copyKeyframes(fromClipId, toClipId, props, offset));
 	}
 	clearKeyframes(clipId: string) {
 		return this.#apply(clearKeyframes(clipId));

@@ -2398,6 +2398,12 @@ pub struct Clip {
     /// / opacity over the clip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keyframes: Vec<Keyframe>,
+    /// Per-property animation: any one number of the transform, the colour or the clip's
+    /// volume with keys of its own ([`PropertyTrack`]). A property with a track is driven by
+    /// it, whatever `keyframes` says; one without keeps reading the bundle (transform numbers)
+    /// or its static value. Empty for every clip saved before channels existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<PropertyTrack>,
     /// Reprojection of 360 source footage, when this clip references a spherical
     /// asset. `None` for ordinary flat video (and for a 360 clip the user has
     /// explicitly un-reframed, to work in the raw projection).
@@ -2468,6 +2474,7 @@ impl Clip {
             effects: Vec::new(),
             audio: Vec::new(),
             keyframes: Vec::new(),
+            channels: Vec::new(),
             reframe: None,
             mask: None,
             framings: Vec::new(),
@@ -2507,9 +2514,10 @@ impl Clip {
         clip
     }
 
-    /// True when the clip carries transform keyframes (i.e. is animated).
+    /// True when any number of the clip's transform is keyed (the bundle's keys or a
+    /// property's own track), i.e. the picture is animated.
     pub fn is_animated(&self) -> bool {
-        !self.keyframes.is_empty()
+        Property::TRANSFORM.iter().any(|p| self.is_keyed(*p))
     }
 
     /// True when the keyframes move the clip's *scale*, i.e. the picture the
@@ -2525,9 +2533,9 @@ impl Clip {
     pub fn zoom_animated(&self) -> bool {
         // Against the first key *in time*, which is the one the engine's expression holds
         // before the clip's first moment (the stored order is not guaranteed to be sorted).
-        let keys = self.sorted_keyframes();
+        let keys = self.property_keys(Property::Scale);
         keys.first()
-            .is_some_and(|first| keys.iter().any(|k| (k.scale - first.scale).abs() > 1e-9))
+            .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -2572,31 +2580,20 @@ impl Clip {
     }
 
     /// Sample the (possibly animated) transform at `local` seconds from the
-    /// clip's start: the static [`Transform`] with its animatable channels
+    /// clip's start: the static [`Transform`] with its animatable numbers
     /// (scale / position / rotation / opacity) overridden by the interpolated
-    /// keyframe values when the clip is animated. Used by the still / preview
+    /// value of every one that is keyed ([`Clip::property_at`]). Used by the still / preview
     /// path, which cannot evaluate the export's per-frame expressions.
     pub fn transform_at(&self, local: f64) -> Transform {
         let mut t = self.transform;
-        if self.keyframes.is_empty() {
+        if !self.is_animated() {
             return t;
         }
-        let chan = |get: fn(&Keyframe) -> f64| interpolate(&self.keyframe_channel(get), local);
-        if let Some(v) = chan(|kf| kf.scale) {
-            t.scale = v;
-        }
-        if let Some(v) = chan(|kf| kf.pos_x) {
-            t.pos_x = v;
-        }
-        if let Some(v) = chan(|kf| kf.pos_y) {
-            t.pos_y = v;
-        }
-        if let Some(v) = chan(|kf| kf.rotation) {
-            t.rotation = v;
-        }
-        if let Some(v) = chan(|kf| kf.opacity) {
-            t.opacity = v;
-        }
+        t.scale = self.property_at(Property::Scale, local);
+        t.pos_x = self.property_at(Property::PosX, local);
+        t.pos_y = self.property_at(Property::PosY, local);
+        t.rotation = self.property_at(Property::Rotation, local);
+        t.opacity = self.property_at(Property::Opacity, local);
         t
     }
 
@@ -2794,6 +2791,9 @@ impl Clip {
                     k.time -= by;
                 }
             }
+        }
+        if by != 0.0 {
+            self.rebase_channels(by);
         }
     }
 
@@ -3840,6 +3840,10 @@ impl Timeline {
         out
     }
 }
+
+mod channels;
+use channels::channel_changes;
+pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
@@ -5340,6 +5344,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
             ));
         }
     }
+    parts.extend(channel_changes(before, after));
     parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
     if before.mask != after.mask {
         parts.push(match &after.mask {

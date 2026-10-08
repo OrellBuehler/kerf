@@ -389,6 +389,34 @@ describe('split', () => {
 		expect(linkPartners(t, c)).toEqual([a]);
 	});
 
+	test('a split keeps each fade on the half that holds its edge', () => {
+		const { t, c, a } = pair();
+		for (const id of [c, a]) {
+			get(t, id).fade_in = 1;
+			get(t, id).fade_out = 2;
+		}
+		get(t, c).transition_in = { kind: 'crossfade', duration: 0.5 };
+		const [left, right] = splitClipLinked(t, c, 4);
+		expect([left.fade_in, left.fade_out]).toEqual([1, 0]);
+		expect([right.fade_in, right.fade_out]).toEqual([0, 2]);
+		expect(left.transition_in).toBeTruthy();
+		expect(right.transition_in).toBeNull();
+		const aRight = t.tracks[1].clips.find((x) => x.id !== a)!;
+		expect([get(t, a).fade_in, get(t, a).fade_out]).toEqual([1, 0]);
+		expect([aRight.fade_in, aRight.fade_out]).toEqual([0, 2]);
+	});
+
+	test('a fade longer than the half it stays on is clamped to it', () => {
+		const { t, c } = pair();
+		get(t, c).fade_in = 5;
+		get(t, c).fade_out = 6;
+		const [left, right] = splitClip(t, c, 2);
+		expect([left.fade_in, left.fade_out]).toEqual([2, 0]);
+		expect([right.fade_in, right.fade_out]).toEqual([0, 6]);
+		const [, tail] = splitClip(t, right.id, 9);
+		expect([tail.fade_in, tail.fade_out]).toEqual([0, 1]);
+	});
+
 	test('a partner the cut does not reach is left whole and the new half unlinked', () => {
 		const { t, c, a } = pair();
 		get(t, a).source_out = 3;

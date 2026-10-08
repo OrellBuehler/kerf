@@ -216,6 +216,36 @@ export interface Keyframe {
 	easing?: Easing;
 }
 
+/** One animatable number of a clip (kerf-core's `Property`): a transform number, a colour
+ *  number, or the clip's own gain (linear). */
+export type Property =
+	| 'scale'
+	| 'pos_x'
+	| 'pos_y'
+	| 'rotation'
+	| 'opacity'
+	| 'brightness'
+	| 'contrast'
+	| 'saturation'
+	| 'gamma'
+	| 'temperature'
+	| 'volume';
+
+/** One key of a property's own animation. `time` is seconds from the clip's start. */
+export interface PropertyKey {
+	time: number;
+	value: number;
+	/** The shape of the segment leaving this key; absent is linear. */
+	easing?: Easing;
+}
+
+/** The keys of one property. A property with a track is driven by it (even an empty one:
+ *  static, whatever `keyframes` says); a transform number without one reads `keyframes`. */
+export interface PropertyTrack {
+	prop: Property;
+	keys: PropertyKey[];
+}
+
 /** One keyframe of a 360 clip's animated virtual camera. */
 export interface ReframeKeyframe {
 	time: number;
@@ -358,6 +388,9 @@ export interface Clip {
 	effects?: VideoEffect[];
 	audio?: AudioEffect[];
 	keyframes?: Keyframe[];
+	/** Per-property animation (the backend omits it when empty): any one number of the
+	 *  transform, the colour or the clip's volume with keys of its own. */
+	channels?: PropertyTrack[];
 	/** 360 reprojection; absent for ordinary flat footage. */
 	reframe?: Reframe | null;
 	/** Crops kept for delivery shapes other than the project's own, written by

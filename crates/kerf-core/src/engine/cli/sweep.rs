@@ -26,7 +26,7 @@ use std::f64::consts::PI;
 use super::*;
 use crate::clip_timing::{ffmpeg_frame_time, Rational};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track};
-use crate::model::{Easing, Fit, Keyframe, TextKeyframe, Transition, TransitionKind};
+use crate::model::{Easing, Fit, Keyframe, Property, PropertyKey, TextKeyframe, Transition, TransitionKind};
 use crate::planner::{PlanRequest, Planner};
 
 /// FFmpeg's expression grammar as `keyframe_expr`, `motion_expr` and the overlay /
@@ -215,6 +215,16 @@ fn all_options(chain: &str, name: &str) -> Vec<Vec<(String, String)>> {
         .collect()
 }
 
+/// The text of the first option of the first filter called `name` in `chain`
+/// (`rotate=0.3:fillcolor=none` is `0.3`: a positional option has no key to find it by).
+fn first_option_text<'a>(chain: &'a str, name: &str) -> Option<&'a str> {
+    let chain = chain.rsplit_once('[').map_or(chain, |(f, _)| f);
+    split_outside_quotes(chain, ',')
+        .into_iter()
+        .find_map(|f| f.strip_prefix(&format!("{name}=")))
+        .map(|body| split_outside_quotes(body, ':')[0])
+}
+
 fn opt<'a>(opts: &'a [(String, String)], key: &str) -> Option<&'a str> {
     opts.iter().find(|o| o.0 == key).map(|o| o.1.as_str())
 }
@@ -326,6 +336,102 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
             }
         })
         .collect();
+    // Per-property channels. Colour numbers keyed on off-grid times with every easing, beside a
+    // clip whose static transform is not neutral; a transform with only *some* numbers keyed
+    // (an opacity ramp on a still pose, a position without a zoom, a zoom beside a static turn);
+    // and a legacy bundle with one number taken off it, keyed on its own.
+    let key = |time: f64, value: f64, easing: Easing| PropertyKey { time, value, easing };
+    let mut graded = make_clip(a, 1.0, 6.0, 0.63);
+    graded.transform.scale = 1.3;
+    graded.transform.pos_x = 0.07;
+    graded.color.contrast = 1.25;
+    graded.color.saturation = 0.9;
+    graded.set_property_keys(
+        Property::Brightness,
+        vec![
+            key(0.0, -0.3, Easing::EaseInOut),
+            key(1.7, 0.4, Easing::Hold),
+            key(2.9, -0.1, Easing::Linear),
+        ],
+    );
+    graded.set_property_keys(
+        Property::Contrast,
+        vec![key(0.31, 0.6, Easing::EaseIn), key(3.3, 2.5, Easing::Linear)],
+    );
+    graded.set_property_keys(
+        Property::Gamma,
+        vec![
+            key(0.0, 0.5, Easing::EaseOut),
+            key(2.01, 2.0, Easing::Linear),
+            key(4.2, 0.8, Easing::Linear),
+        ],
+    );
+    graded.set_property_keys(
+        Property::Temperature,
+        vec![
+            key(0.4, -1.0, Easing::Linear),
+            key(
+                1.9,
+                1.0,
+                Easing::Bezier {
+                    x1: 0.2,
+                    y1: 0.9,
+                    x2: 0.3,
+                    y2: 1.0,
+                },
+            ),
+        ],
+    );
+    // (Saturation is left static, 0.9: a graded clip with one number not keyed.)
+    let mut fading = make_clip(a, 3.0, 7.0, 0.5);
+    fading.transform.scale = 1.4;
+    fading.transform.pos_x = -0.1;
+    fading.transform.rotation = 25.0;
+    fading.set_property_keys(
+        Property::Opacity,
+        vec![
+            key(0.0, 0.1, Easing::EaseInOut),
+            key(1.3, 0.9, Easing::Linear),
+            key(3.1, 0.4, Easing::Linear),
+        ],
+    );
+    let mut drifting = make_clip(a, 3.0, 7.0, 0.5);
+    drifting.transform.scale = 0.8;
+    drifting.transform.opacity = 0.6;
+    drifting.transform.rotation = -15.0;
+    drifting.set_property_keys(
+        Property::PosY,
+        vec![key(0.0, -0.2, Easing::Linear), key(2.6, 0.2, Easing::EaseOut)],
+    );
+    drifting.set_property_keys(
+        Property::PosX,
+        vec![key(0.7, 0.1, Easing::Hold), key(2.0, -0.3, Easing::Linear)],
+    );
+    let mut zooming = make_clip(a, 3.0, 7.0, 0.5);
+    zooming.transform.rotation = 40.0;
+    zooming.transform.pos_y = 0.15;
+    zooming.set_property_keys(
+        Property::Scale,
+        vec![key(0.0, 0.6, Easing::EaseIn), key(3.0, 1.5, Easing::Linear)],
+    );
+    let mut turning = make_clip(a, 3.0, 7.0, 0.5);
+    turning.transform.scale = 1.2;
+    turning.set_property_keys(
+        Property::Rotation,
+        vec![key(0.0, -30.0, Easing::Linear), key(2.2, 50.0, Easing::EaseInOut)],
+    );
+    // The bundle's opacity taken off it and keyed on its own; its scale taken off and held.
+    let mut taken = pushed_clip_for_bundle(a);
+    taken.set_property_keys(
+        Property::Opacity,
+        vec![
+            key(0.2, 0.9, Easing::Linear),
+            key(1.5, 0.2, Easing::EaseOut),
+            key(3.5, 1.0, Easing::Linear),
+        ],
+    );
+    taken.transform.scale = 1.1;
+    taken.set_property_keys(Property::Scale, vec![]);
     let mut cuts = vec![
         ("animated clip and title", animated),
         ("slide onto a static offset", pair(slid)),
@@ -333,12 +439,40 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
         ("slide onto an identity clip", pair(plain)),
         ("eased keys", timeline_of(vec![video_track(vec![eased])])),
         ("many eased keys", timeline_of(vec![video_track(vec![many])])),
+        ("colour channels", timeline_of(vec![video_track(vec![graded])])),
+        ("opacity keyed alone", timeline_of(vec![video_track(vec![fading])])),
+        ("position keyed alone", timeline_of(vec![video_track(vec![drifting])])),
+        ("zoom keyed alone", timeline_of(vec![video_track(vec![zooming])])),
+        ("rotation keyed alone", timeline_of(vec![video_track(vec![turning])])),
+        ("numbers taken off the bundle", timeline_of(vec![video_track(vec![taken])])),
     ];
     for (_, tl) in &mut cuts {
         tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));
     }
     cuts
 }
+
+/// A clip animated through the legacy bundle (zoom, position, turn and opacity on off-grid keys).
+fn pushed_clip_for_bundle(asset: uuid::Uuid) -> Clip {
+    let mut clip = make_clip(asset, 2.0, 7.0, 0.9);
+    clip.keyframes = vec![
+        keyed(0.0, 1.0, (0.0, 0.0), 0.0, 1.0),
+        keyed(0.37, 1.4, (0.1, -0.1), 15.0, 0.8),
+        keyed(1.13, 0.8, (-0.2, 0.05), -10.0, 0.3),
+        keyed(2.5, 1.2, (0.3, 0.0), 30.0, 1.0),
+    ];
+    clip
+}
+
+/// The cuts that key single numbers of a clip (see `cuts`).
+const CHANNEL_CUTS: [&str; 6] = [
+    "colour channels",
+    "opacity keyed alone",
+    "position keyed alone",
+    "zoom keyed alone",
+    "rotation keyed alone",
+    "numbers taken off the bundle",
+];
 
 /// How many (layer, frame) pairs of the sweep carry a zoom expression to evaluate.
 const ZOOMS_AT_LEAST: usize = 1_000;
@@ -347,7 +481,7 @@ const ZOOMS_AT_LEAST: usize = 1_000;
 fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_output_frame_time() {
     let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
     let assets = [asset];
-    let (mut layers_checked, mut titles_checked, mut moved, mut zooms_checked) = (0, 0, 0, 0);
+    let (mut layers_checked, mut titles_checked, mut moved, mut zooms_checked, mut colours_checked) = (0, 0, 0, 0, 0);
     for (name, tl) in cuts(&assets[0]) {
         for (fps, (num, den)) in [
             (24.0, (24, 1)),
@@ -356,6 +490,11 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
             (30.0, (30, 1)),
             (60.0, (60, 1)),
         ] {
+            // The channel cuts take 24 and 29.97, the rates whose frame times part from `k / fps` (the sweep is the slow test
+            // of the suite); the others take all five.
+            if CHANNEL_CUTS.contains(&name) && !matches!(num, 24 | 2997) {
+                continue;
+            }
             let opts = ExportOptions {
                 fps: Some(fps),
                 ..ExportOptions::default()
@@ -410,12 +549,55 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                         zooms_checked += 1;
                     }
                     if let Some(r) = options(chain, "rotate") {
-                        let rad = eval(opt(&r, "a").unwrap(), &[("t", t), ("PI", PI)]);
+                        // A turn that is not keyed is the constant `rotate=<radians>:...`, with no `a=`.
+                        let rad = match opt(&r, "a") {
+                            Some(a) => eval(a, &[("t", t), ("PI", PI)]),
+                            None => first_option_text(chain, "rotate").unwrap().parse().unwrap(),
+                        };
                         assert!((rad - tf.rotation.to_radians()).abs() < 1e-9, "{at}: rotate {rad}");
                     }
                     if let Some(g) = options(chain, "geq") {
                         let a = opt(&g, "a").unwrap().strip_suffix("*alpha(X,Y)").unwrap();
                         assert!((eval(a, &[("T", t)]) - tf.opacity).abs() < 1e-9, "{at}: opacity");
+                    }
+                    // Whatever the plan says is turned or see-through is turned or see-through in the
+                    // graph (a number that is not keyed is its static value, however much else is).
+                    assert!(
+                        tf.rotation == 0.0 || options(chain, "rotate").is_some(),
+                        "{at}: the plan turns the picture by {} and the graph has no `rotate`",
+                        tf.rotation
+                    );
+                    assert!(
+                        tf.opacity >= 1.0 || options(chain, "geq").is_some() || options(chain, "colorchannelmixer").is_some(),
+                        "{at}: the plan has opacity {} and the graph none",
+                        tf.opacity
+                    );
+                    if let Some(m) = options(chain, "colorchannelmixer") {
+                        assert!(
+                            (opt(&m, "aa").unwrap().parse::<f64>().unwrap() - tf.opacity).abs() < 1e-9,
+                            "{at}: static opacity"
+                        );
+                    }
+                    // The grade: every number the `eq` writes, evaluated at the frame's time, is
+                    // the colour the plan sampled.
+                    if let Some(eq) = options(chain, "eq").filter(|o| opt(o, "eval") == Some("frame")) {
+                        let c = layer.color;
+                        let vars = [("t", t)];
+                        for (name, want) in [
+                            ("brightness", c.brightness),
+                            ("contrast", c.contrast),
+                            ("saturation", c.saturation),
+                            ("gamma", c.gamma),
+                        ] {
+                            let got = eval(opt(&eq, name).unwrap(), &vars);
+                            assert!((got - want).abs() < 1e-9, "{at}: eq {name} is {got}, the plan says {want}");
+                        }
+                        let (gr, gb) = c.temperature_gammas().unwrap_or((1.0, 1.0));
+                        for (name, want) in [("gamma_r", gr), ("gamma_b", gb)] {
+                            let got = opt(&eq, name).map_or(1.0, |e| eval(e, &vars));
+                            assert!((got - want).abs() < 1e-9, "{at}: eq {name} is {got}, the plan says {want}");
+                        }
+                        colours_checked += 1;
                     }
                     layers_checked += 1;
                 }
@@ -456,6 +638,8 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
     // ... and the zoom's own `scale eval=frame` has to have been found among the clip's
     // scales and evaluated (the check used to take the first `scale`, and never ran).
     assert!(zooms_checked > ZOOMS_AT_LEAST, "{zooms_checked} zoom expressions evaluated");
+    // ... and so has the keyed grade, on every frame of the clip that has one.
+    assert!(colours_checked > 200, "{colours_checked} grades evaluated");
 }
 
 #[test]
@@ -535,4 +719,97 @@ fn a_long_keyframe_expression_is_the_polyline_it_was_written_from_at_every_time(
             "t = {t}: the expression says {got}, the polyline {want}"
         );
     }
+}
+
+/// The `volume` filter of the audio chain of the first clip of `tl`: `(its options, the whole chain)`.
+fn volume_options(tl: &Timeline, assets: &[crate::model::Asset]) -> (Vec<(String, String)>, String) {
+    let args = build_export_args(tl, assets, "x.mp4", &ExportOptions::default()).unwrap();
+    let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+    let chain = graph
+        .split(';')
+        .find(|c| c.starts_with("[0:a]"))
+        .unwrap_or_else(|| panic!("no audio chain in {graph}"))
+        .to_string();
+    (options(&chain, "volume").expect("a volume filter"), chain)
+}
+
+#[test]
+fn a_keyed_volume_expression_is_the_curve_at_every_time_on_the_clips_own_clock() {
+    let mut asset = test_asset(vec![
+        video_stream(1920, 1080, 30.0),
+        crate::engine::test_support::audio_stream(48_000, 2),
+    ]);
+    asset.duration = 30.0;
+    let assets = [asset];
+    let key = |time: f64, value: f64, easing: Easing| PropertyKey { time, value, easing };
+    // Late on the timeline, sped up and slowed down: the expression is over the clip's own time
+    // (after `atempo`), never the timeline's.
+    for (start, speed) in [(0.0, 1.0), (4.37, 1.0), (2.9, 2.0), (1.1, 0.5)] {
+        let mut clip = make_clip(assets[0].id, 3.0, 3.0 + 6.0 * speed, start);
+        clip.speed = speed;
+        clip.volume = 0.77;
+        clip.set_property_keys(
+            Property::Volume,
+            vec![
+                key(0.0, 0.0, Easing::EaseIn),
+                key(0.713, 1.9, Easing::Hold),
+                key(1.9, 0.25, Easing::Linear),
+                key(2.0, 1.0, Easing::EaseInOut),
+                key(
+                    4.4,
+                    0.0,
+                    Easing::Bezier {
+                        x1: 0.2,
+                        y1: 0.9,
+                        x2: 0.3,
+                        y2: 1.0,
+                    },
+                ),
+                key(5.2, 3.0, Easing::Linear),
+            ],
+        );
+        let tl = timeline_of(vec![video_track(vec![clip.clone()])]);
+        let (vol, chain) = volume_options(&tl, &assets);
+        assert_eq!(opt(&vol, "eval"), Some("frame"), "{chain}");
+        // The frames it holds a gain over are cut small first, and after the tempo change.
+        let frames = chain
+            .find("asetnsamples=n=128:p=0,volume=")
+            .expect("frames cut before the volume");
+        if speed != 1.0 {
+            assert!(chain.find("atempo").unwrap() < frames, "{chain}");
+        }
+        // (The expression is the filter's first, positional, option.)
+        let expr = first_option_text(&chain, "volume").unwrap().trim_matches('\'');
+        // Every three milliseconds, a hair either side of every key, and past both ends.
+        let mut times: Vec<f64> = (-10..=2400).map(|i| f64::from(i) * 0.003).collect();
+        for k in clip.property_keys(Property::Volume) {
+            times.extend([k.time - 1e-7, k.time, k.time + 1e-7]);
+        }
+        for t in times {
+            let got = eval(expr, &[("t", t)]);
+            let want = clip.volume_at(t);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "start {start}, speed {speed}: at clip time {t} the expression says {got}, the model {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unkeyed_volume_is_the_gain_it_always_was() {
+    let mut asset = test_asset(vec![
+        video_stream(1920, 1080, 30.0),
+        crate::engine::test_support::audio_stream(48_000, 2),
+    ]);
+    asset.duration = 30.0;
+    let mut clip = make_clip(asset.id, 0.0, 5.0, 0.0);
+    clip.volume = 0.5;
+    let tl = timeline_of(vec![video_track(vec![clip])]);
+    let (vol, chain) = volume_options(&tl, &[asset]);
+    assert!(vol.is_empty(), "{vol:?}");
+    assert!(
+        chain.contains(",volume=0.5,") && !chain.contains("asetnsamples") && !chain.contains("eval=frame"),
+        "{chain}"
+    );
 }

@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
-    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, SplitSide,
-    StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect,
+    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
+    Region, SplitSide, StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -797,9 +797,10 @@ struct KeyframesParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
     #[schemars(
-        description = "Transform keyframes (replaces the clip's animation). Each: {\"time\":seconds_from_clip_start, \
+        description = "Whole-transform keyframes (replaces the clip's bundle of them). Each: {\"time\":seconds_from_clip_start, \
                        \"scale\":1.0,\"pos_x\":0.0,\"pos_y\":0.0,\"rotation\":0.0,\"opacity\":1.0}. Two or more animate \
-                       the clip; pass [] to clear and use the static transform."
+                       the clip; pass [] to clear these keyframes (a number with keys of its own, from \
+                       set_property_keyframes, keeps them — clear_keyframes clears everything of the transform)."
     )]
     keyframes: Vec<Keyframe>,
 }
@@ -897,11 +898,53 @@ struct AddKeyframeParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PropertyKeyframesParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "The number to animate: scale, pos_x, pos_y, rotation, opacity (the transform), brightness, \
+                       contrast, saturation, gamma, temperature (the colour grade) or volume (the clip's own gain)"
+    )]
+    prop: Property,
+    #[schemars(
+        description = "The keys (replaces this number's animation; pass [] to make it static again). Each: \
+                       {\"time\":seconds_from_clip_start, \"value\":number, \"easing\":optional, same values as \
+                       set_keyframe_easing}. A key's easing shapes the segment that leaves it. Ranges are the static \
+                       setters': opacity 0–1, brightness and temperature -1–1, contrast 0–4, saturation 0–3, gamma \
+                       0.1–10, volume 0–4 (linear gain), scale > 0. At most 1000 keys."
+    )]
+    keys: Vec<PropertyKey>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CopyKeyframesParams {
+    #[schemars(description = "UUID of the clip to copy the animation from")]
+    from_clip_id: String,
+    #[schemars(description = "UUID of the clip to give it to (its own keys for the copied numbers are replaced)")]
+    to_clip_id: String,
+    #[schemars(
+        description = "The numbers to copy (scale, pos_x, pos_y, rotation, opacity, brightness, contrast, saturation, \
+                       gamma, temperature, volume); omit or [] for every number the source animates"
+    )]
+    props: Option<Vec<Property>>,
+    #[schemars(
+        description = "Seconds to shift the keys later (negative: earlier, cutting off what falls before the \
+                       destination's start and pinning the pose it opens on). Default 0."
+    )]
+    offset: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetKeyframeEasingParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
     #[schemars(description = "Time of the keyframe, in seconds from the clip's start (within a millisecond)")]
     time: f64,
+    #[schemars(
+        description = "One number whose segment to shape (see set_property_keyframes); omit to shape the transform \
+                       keyframe at that time (the whole-transform keys and any transform number keyed on its own)"
+    )]
+    prop: Option<Property>,
     #[schemars(
         description = "How the clip travels from this keyframe's pose to the next: \"linear\" (default), \"hold\" \
                        (stay, then jump at the next key), \"ease_in\", \"ease_out\", \"ease_in_out\", or \
@@ -1999,7 +2042,9 @@ impl KerfMcp {
     #[tool(
         description = "Set the linear volume gain of a clip. A picture whose sound was detached (`source_audio: \
                        false`) carries no sound, so its volume changes nothing audible — its linked audio clip \
-                       (see `link_id`) is a separate clip to set."
+                       (see `link_id`) is a separate clip to set. While the clip's volume is animated \
+                       (set_property_keyframes with prop `volume`) this static value is not used: clear those \
+                       keys (pass []) for it to apply."
     )]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2039,7 +2084,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged."
+        description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged. A number that is animated (set_keyframes / add_keyframe, or set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared; the crop edges are never animated."
     )]
     fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2063,7 +2108,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged."
+        description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged. A number that is animated (set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared (pass [])."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2110,7 +2155,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Replace a clip's transform keyframes to animate scale / position / rotation / opacity over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). Pass an empty list to clear the animation."
+        description = "Replace a clip's whole-transform keyframes — the keys that animate scale / position / rotation / opacity together over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). An empty list clears these keyframes only: a number that has keys of its own (set_property_keyframes) keeps them, so the clip can still be animated afterwards — clear_keyframes makes the whole transform static. Colour and volume keys are never touched."
     )]
     fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2134,19 +2179,62 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set the easing of the segment leaving one transform keyframe: how the clip moves from that pose \
+        description = "Set the easing of the segment leaving one keyframe: how the clip moves from that pose \
                        to the next (ease in / out / in-out, a hold, or a custom cubic bezier). Keys are linear until set. \
-                       Returns the clip."
+                       Without prop it shapes the transform keyframe at that time; with prop, that one number's key \
+                       (a colour number, the volume, or a transform number). Returns the clip."
     )]
     fn set_keyframe_easing(&self, Parameters(p): Parameters<SetKeyframeEasingParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
-            let out = project.set_keyframe_easing(clip_id, p.time, p.easing).map_err(core_err)?;
+            let out = match p.prop {
+                Some(prop) => project.set_property_easing(clip_id, prop, p.time, p.easing),
+                None => project.set_keyframe_easing(clip_id, p.time, p.easing),
+            }
+            .map_err(core_err)?;
             json(&out)
         })
     }
 
-    #[tool(description = "Remove all transform keyframes from a clip (back to its static transform)")]
+    #[tool(
+        description = "Animate ONE number of a clip with keys of its own: a transform number (scale, pos_x, pos_y, \
+                       rotation, opacity), a colour number (brightness, contrast, saturation, gamma, temperature) or \
+                       the clip's volume (a linear gain — a swell, a duck, an audio fade that is not at the clip's ends). \
+                       Numbers are independent: key the opacity at other moments than the zoom, grade a shot that \
+                       warms over its length, ride the dialogue's level. Replaces that number's keys (pass [] to make \
+                       it static); the clip's other numbers are untouched, and a number that set_keyframes was \
+                       animating is taken over by its own keys while the rest of the transform keeps them. Each key: \
+                       time (seconds from the clip's start), value, and the easing of the segment leaving it. While a \
+                       number is animated its static value (set_color, set_volume, set_transform) is not used. \
+                       Returns the clip."
+    )]
+    fn set_property_keyframes(&self, Parameters(p): Parameters<PropertyKeyframesParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Copy the animation of a clip's numbers (all of them, or the props listed) to another clip, \
+                       shifted by offset seconds — give a second shot the same push-in, the same warm-up, the same \
+                       volume swell. The destination's own keys for those numbers are replaced. Returns the \
+                       destination clip."
+    )]
+    fn copy_keyframes(&self, Parameters(p): Parameters<CopyKeyframesParams>) -> Result<String, McpError> {
+        let (from, to) = (parse_id(&p.from_clip_id)?, parse_id(&p.to_clip_id)?);
+        self.edit(|project| {
+            let out = project
+                .copy_keyframes(from, to, &p.props.unwrap_or_default(), p.offset.unwrap_or(0.0))
+                .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Remove all transform keyframes from a clip (back to its static transform): the whole-transform keys and any scale / position / rotation / opacity keys of their own. Colour and volume keys stay — clear those with set_property_keyframes and an empty list."
+    )]
     fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
@@ -3512,7 +3600,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
              Burns zoom, a moving picture-in-picture); keys move linearly until \
              set_keyframe_easing gives a segment an ease or a hold, which is what \
-             makes motion read as deliberate rather than mechanical. 360 footage (Insta360 \
+             makes motion read as deliberate rather than mechanical. Any one number \
+             can have keys of its own with set_property_keyframes — a colour that warms \
+             over a shot, an opacity ramp that starts later than the zoom, the clip's \
+             volume swelling or ducking mid-clip — and copy_keyframes gives another \
+             clip the same animation. 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
              are reframed to an ordinary rectilinear shot automatically: aim the \
              virtual camera with set_reframe (yaw / pitch / roll / field of view) \
@@ -4128,6 +4220,38 @@ mod tests {
                 "`{name}` should warn about a detached picture: {description}"
             );
         }
+    }
+
+    /// A keyed number ignores its static value, and `set_keyframes` clears the whole-transform
+    /// keys only: the tools an agent would reach for say so, rather than the agent finding out by
+    /// a clip that is still moving after "clearing" it.
+    #[test]
+    fn the_static_setters_and_set_keyframes_say_what_an_animated_number_does_to_them() {
+        let tools = router().list_all();
+        let text = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string()
+        };
+        for name in ["set_volume", "set_color", "set_transform"] {
+            let d = text(name);
+            assert!(
+                d.contains("set_property_keyframes") && (d.contains("not used") || d.contains("not from this static value")),
+                "`{name}` should say its static value is ignored while the number is animated: {d}"
+            );
+        }
+        let d = text("set_keyframes");
+        assert!(
+            d.contains("only") && d.contains("keeps them") && d.contains("clear_keyframes"),
+            "`set_keyframes` clears the bundle only: {d}"
+        );
+        let d = text("clear_keyframes");
+        assert!(d.contains("of their own") && d.contains("Colour and volume keys stay"), "{d}");
     }
 
     /// The per-call `ripple` override belongs on the edits that follow the

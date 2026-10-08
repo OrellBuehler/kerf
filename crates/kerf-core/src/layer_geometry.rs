@@ -121,10 +121,38 @@ pub struct GeometryError(pub String);
 ///   itself travels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Placement {
-    /// `Some(rotates)` for a keyframed clip: whether any key turns the picture.
-    pub keyframed: Option<bool>,
+    /// `Some` for a clip with any keyed transform number: which of them are ([`Keyed`]).
+    pub keyframed: Option<Keyed>,
     /// The transition's travel, in frame fractions.
     pub offset: (f64, f64),
+}
+
+/// Which numbers of a keyframed clip's transform are keyed. A clip animated through the
+/// legacy bundle has all of them ([`Keyed::all`]); a clip with per-property channels can
+/// key one (an opacity ramp on a still-framed shot), and the numbers it does not key are
+/// built from its static transform as an unkeyed clip's are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keyed {
+    /// The zoom is keyed: a `scale eval=frame` that is always there, even when it lands on 1.
+    pub scale: bool,
+    /// The rotation is keyed, and `rotates` says whether any key turns the picture (else
+    /// there is no `rotate` at all). Unkeyed, the rotation is the static one.
+    pub rotation: bool,
+    pub rotates: bool,
+    /// The opacity is keyed: a `geq` alpha, not the RGB round trip a static one takes.
+    pub opacity: bool,
+}
+
+impl Keyed {
+    /// Every number keyed, `rotates` of them turning the picture: the legacy bundle.
+    pub const fn all(rotates: bool) -> Self {
+        Self {
+            scale: true,
+            rotation: true,
+            rotates,
+            opacity: true,
+        }
+    }
 }
 
 impl Placement {
@@ -299,7 +327,8 @@ impl LayerGeometry {
         // transform's own scale after it (below) the crop still sees the native
         // format and rounds to its grid; without one the first scale has already
         // converted, and it is on the 4:2:0 grid whatever the source was.
-        let second_scale = keyed.is_some() || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
+        let zoom_keyed = keyed.is_some_and(|k| k.scale);
+        let second_scale = zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
         let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
             Fit::Contain => Rect::whole(fw, fh),
@@ -373,7 +402,7 @@ impl LayerGeometry {
         // 3'. otherwise the transform's own scale: `scale=iw*sc:ih*sc`, truncated
         // (and a result of 0 means "keep the input size"). A keyframed clip's is the
         // per-frame `scale eval=frame`, always present, even when it lands on 1.
-        if keyed.is_some() || (tf.scale - 1.0).abs() > 1e-9 {
+        if zoom_keyed || (tf.scale - 1.0).abs() > 1e-9 {
             let w = (f64::from(picture.0) * tf.scale) as i64;
             let h = (f64::from(picture.1) * tf.scale) as i64;
             let (w, h) = (
@@ -402,7 +431,8 @@ impl LayerGeometry {
         // conversion leaves swscale's unscaled path for a generic one), reading
         // padding the graph never initialised. That is not something to copy; the
         // frame goes through FFmpeg, which has the same garbage to itself.
-        if keyed.is_none() && tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
+        let opacity_keyed = keyed.is_some_and(|k| k.opacity);
+        if !opacity_keyed && tf.opacity < 1.0 && (picture.0 % 2 == 1 || picture.1 % 2 == 1) {
             return Err(GeometryError(format!(
                 "a translucent layer of odd size {}x{} (FFmpeg's RGB round trip reads past the picture)",
                 picture.0, picture.1
@@ -412,9 +442,9 @@ impl LayerGeometry {
         // 4. rotate (clockwise radians, box grown to hold the corners). Keyframed
         // rotation uses a fixed `hypot(iw,ih)` square, however far it is turned this
         // frame; a keyframed clip whose keys do not turn has no `rotate` at all.
-        let rotation = match keyed {
-            Some(false) => None,
-            Some(true) => {
+        let rotation = match keyed.filter(|k| k.rotation) {
+            Some(k) if !k.rotates => None,
+            Some(_) => {
                 let side = ((f64::from(picture.0).hypot(f64::from(picture.1)) + 0.5) as u32).max(1);
                 Some(Rotation {
                     angle: tf.rotation.to_radians(),
@@ -445,13 +475,15 @@ impl LayerGeometry {
             picture_shows: layer,
             matte: false,
             origin,
-            opacity: match keyed {
+            opacity: if opacity_keyed {
                 // A `geq` alpha, whose rounding is not modelled (the plan refuses it).
-                Some(_) => tf.opacity.clamp(0.0, 1.0) as f32,
-                None if tf.opacity < 1.0 => f32::from(ffmpeg_alpha(tf.opacity)) / 255.0,
-                None => 1.0,
+                tf.opacity.clamp(0.0, 1.0) as f32
+            } else if tf.opacity < 1.0 {
+                f32::from(ffmpeg_alpha(tf.opacity)) / 255.0
+            } else {
+                1.0
             },
-            translucent: keyed.is_none() && tf.opacity < 1.0,
+            translucent: !opacity_keyed && tf.opacity < 1.0,
         })
     }
 }
@@ -815,7 +847,7 @@ mod tests {
 
     fn keyed(rotates: bool, offset: (f64, f64)) -> Placement {
         Placement {
-            keyframed: Some(rotates),
+            keyframed: Some(Keyed::all(rotates)),
             offset,
         }
     }
@@ -904,6 +936,67 @@ mod tests {
             ),
             (389, 388)
         );
+    }
+
+    #[test]
+    fn a_clip_keyed_in_part_builds_what_is_not_keyed_from_its_static_transform() {
+        let nothing_but_the_position = Placement {
+            keyframed: Some(Keyed {
+                scale: false,
+                rotation: false,
+                rotates: false,
+                opacity: false,
+            }),
+            offset: (0.0, 0.0),
+        };
+        let try_place = |tf: &Transform, placement| {
+            LayerGeometry::resolve_with((640, 360), (360, 640), Fit::Contain, tf, Subsampling::YUV420, placement)
+        };
+        let place = |tf: &Transform, placement| try_place(tf, placement).unwrap();
+        // Never identity (the overlay centres the bare picture), but nothing else is keyed: one
+        // scale, no `rotate`, and the opacity is the static one.
+        let g = place(&t(), nothing_but_the_position);
+        assert!(!g.matte && g.stages.len() == 1 && g.rotation.is_none() && !g.translucent);
+        assert_eq!(g.opacity, 1.0);
+        // The static turn is the tight box a static clip has, not the keyed `hypot` square.
+        let turned = Transform { rotation: 20.0, ..t() };
+        let g = place(&turned, nothing_but_the_position);
+        let tight = place(&turned, Placement::STILL);
+        assert_eq!(g.rotation, tight.rotation);
+        assert_ne!(
+            g.rotation.map(|r| r.out),
+            place(&t(), keyed(true, (0.0, 0.0))).rotation.map(|r| r.out)
+        );
+        // A static see-through picture takes the RGB round trip (whose reach past an odd side is
+        // why this 360x203 one is refused); a keyed one is a `geq` alpha, which has no such reach.
+        let faint = Transform { opacity: 0.5, ..t() };
+        assert!(try_place(&faint, nothing_but_the_position).is_err());
+        let even = Transform { crop_top: 0.0, ..faint };
+        let g = LayerGeometry::resolve_with(
+            (640, 360),
+            (640, 360),
+            Fit::Contain,
+            &even,
+            Subsampling::YUV420,
+            nothing_but_the_position,
+        )
+        .unwrap();
+        assert!(g.translucent && (g.opacity - f32::from(ffmpeg_alpha(0.5)) / 255.0).abs() < 1e-6);
+        let g = place(
+            &faint,
+            Placement {
+                keyframed: Some(Keyed {
+                    opacity: true,
+                    ..Keyed::all(false)
+                }),
+                offset: (0.0, 0.0),
+            },
+        );
+        assert!(!g.translucent && g.opacity == 0.5);
+        // A static zoom is the one second scale; a keyed one is there even at 1.
+        let zoomed = Transform { scale: 1.5, ..t() };
+        assert_eq!(place(&zoomed, nothing_but_the_position).stages.len(), 2);
+        assert_eq!(place(&t(), keyed(false, (0.0, 0.0))).stages.len(), 2);
     }
 
     #[test]

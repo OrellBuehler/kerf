@@ -57,8 +57,8 @@ impl EffectKinds {
 /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and nothing
 /// below.
 ///
-/// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity` and
-/// `keyed_zoom` are about the export graph and apply to [`PlanMode::Motion`] plans only:
+/// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity`,
+/// `keyed_zoom` and `keyed_color` are about the export graph and apply to [`PlanMode::Motion`] plans only:
 /// the FFmpeg still draws no fades and a still plan has no tail layers, so a *still* plan
 /// inside a fade, a travel or a tail is refused whatever these say. (`keyed_zoom` also
 /// holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
@@ -88,6 +88,11 @@ pub struct GpuCaps {
     /// `Animated`), so a compositor that sets this draws the effects, mask, rotation and
     /// grade at the fit size first and the zoom after them.
     pub keyed_zoom: bool,
+    /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
+    /// of the frame's time for each keyed number), which a compositor that sets this draws
+    /// as the colour sampled at the frame's time. Export frames only: a still plan samples
+    /// the colour and draws it like a static one.
+    pub keyed_color: bool,
     pub mask: bool,
     pub text: bool,
     pub reframe: bool,
@@ -103,6 +108,7 @@ impl GpuCaps {
         transitions: false,
         keyed_opacity: false,
         keyed_zoom: false,
+        keyed_color: false,
         mask: false,
         text: false,
         reframe: false,
@@ -159,6 +165,8 @@ pub enum Unsupported {
     /// A still plan's clip whose tail window is open: the export draws it, the plan has no layer.
     StillTail(LayerRef),
     KeyedOpacity(LayerRef),
+    /// Keyframed colour correction in an export frame (`eq` with `eval=frame`).
+    KeyedColor(LayerRef),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom in a still, with a grade, a rotation or a fade of opacity in front of it:
@@ -226,6 +234,10 @@ impl fmt::Display for Unsupported {
                 l.name
             ),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
+            Self::KeyedColor(l) => write!(
+                f,
+                "{l}: keyframed colour correction (an eq written per frame, which no compositor pass draws or has a parity case for yet)"
+            ),
             Self::KeyedZoom(l) => write!(
                 f,
                 "{l}: keyframed zoom (FFmpeg draws it as the last stage of the clip's chain, after the effects, mask and rotation)"
