@@ -538,11 +538,22 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   engine — an editor-realm `IntersectionObserver` says *intersecting* for a detached element
   there and *not* on WebKitGTK — which is why they are made in the element's own window.
 
+- **2026-10-09 — B9 detached panels review fixes.** An independent review found no blockers and
+  these: (1) a frame pending in a window that then hid or closed never ran, so the transport clock
+  and the meters froze while the picture played on the other screen — `windows.requestFrame` now
+  hands out a handle the registry moves (`visibilitychange`, window added / removed, a 250 ms
+  watchdog), tested against stand-in windows that run frames only while they show; (2) `window.open`
+  was checked for the popout path only — it also has to be the editor webview's scheme, host and
+  port (`is_popout_url(url, main)`); (3) a refused open during a restore left its spent label at the
+  front of the book — `#failed` now claims it unless dockview refused the URL; (4) a bun test pins
+  `POPOUT_URL` to `POPOUT_PATH`; (5) the last editor-window panel is greyed out in *Panel windows*
+  with the rule's reason instead of refusing with a toast.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - B9 menu bar: on Windows (WebView2) the title-bar menus under the native caption bar, Alt / F10 focus, an Alt-drag in the timeline not stealing focus, and the new Reset workspace feedback against the stored layouts of the build that reported it.
-- B9 detached panels (WebKitGTK/WSLg only so far): **WebView2** — `NewWindowRequested` + `SetNewWindow` giving a scriptable popup, building a window inside the handler without a deadlock, `window.close()` then `Destroyed`, whether features are honoured, `screenX` and the saved rectangle on mixed-DPI monitors, a main-realm `ResizeObserver` observing a popout, frames when the editor window is minimized, HTML5 tab / asset drags between windows against Tauri's drag-drop handler (kept on for file drops); **WKWebView** — `window.close()` is a no-op so `close_popout` has to be the way (untested), `window_features` placement (flipped y), window-level key events, frames in an occluded window, `javaScriptCanOpenWindowsAutomatically` (true by default per the headers); **everywhere** — real X11 / Wayland (positions cannot be set on Wayland; the 32 px offset is WSLg's), the single-instance second launch with windows open, a native menu bar not being inherited by a detached window, the packaged CSP applying to the popout page.
+- B9 detached panels (WebKitGTK/WSLg only so far): **WebView2** — `NewWindowRequested` + `SetNewWindow` giving a scriptable popup, building a window inside the handler without a deadlock, `window.close()` then `Destroyed`, whether features are honoured, `screenX` and the saved rectangle on mixed-DPI monitors, a main-realm `ResizeObserver` observing a popout, frames when the editor window is minimized (the follow-the-visible-window logic is unit-tested against stand-ins only), the editor webview's `url()` read from inside the `window.open` handler and matching the popout URL's origin (`http://tauri.localhost` here), HTML5 tab / asset drags between windows against Tauri's drag-drop handler (kept on for file drops); **WKWebView** — `window.close()` is a no-op so `close_popout` has to be the way (untested), `window_features` placement (flipped y), window-level key events, frames in an occluded window (and `visibilitychange` firing for a minimized or covered window), the origin check on `tauri://localhost`, `javaScriptCanOpenWindowsAutomatically` (true by default per the headers); **everywhere** — real X11 / Wayland (positions cannot be set on Wayland; the 32 px offset is WSLg's), the single-instance second launch with windows open, a native menu bar not being inherited by a detached window, the packaged CSP applying to the popout page.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
 - B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

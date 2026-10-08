@@ -2453,8 +2453,9 @@ so `visible: false`, the backdrop and the reveal are exactly as before; a Rust t
 in the config has none and `window.open` returns null from it. (2) **The handler answers only a
 window the page announced** (`popout_expect { rect?, size?, background? }` → `{label, position}`,
 a `PopoutQueue` of announcements taken in order, 15 s time-out, at most 32 waiting; pure and
-unit-tested) **and only for `/popout.html`**: anything else — a stray `window.open`, a
-`target="_blank"` — is denied. The window is built `window_features(features)` (what makes it
+unit-tested) **and only for `/popout.html` on the editor webview's own scheme, host and port**
+(`is_popout_url(url, main)`, `main` read from the webview): anything else — a stray `window.open`, a
+`target="_blank"`, another origin's page of that name — is denied. The window is built `window_features(features)` (what makes it
 *related* to the opener: same web process on WebKitGTK, same environment on WebView2, same
 configuration on WKWebView — the thing that makes the returned `Window` scriptable), sized and
 placed by `place` (pure): a rectangle off every screen is moved onto one, a panel detached by hand
@@ -2750,7 +2751,8 @@ fold — it has no width of its own to give back.
 **Window › Panel windows** (a tick per panel, in a window while ticked; *Return all panels to the
 editor window*, `window.dockAll`) or the tab's right-click menu (*Move to new window* / *Return to the
 editor window*, dockview's `getTabContextMenuItems`). The editor window keeps at least one panel
-(`detachBlocked`, pure). Every open goes through `PopoutState.#open`, which **announces** the window
+(`detachBlocked`, pure; the menu entry is greyed out with its reason). A window that failed to open
+gives its label up (`#failed`), unless dockview refused the URL before the backend saw it. Every open goes through `PopoutState.#open`, which **announces** the window
 (`popoutExpect`) and hands the label it gets to the window that opens (`LabelBook`, a FIFO: `window.open`
 carries nothing to say which announcement it is for, so opens are serialised and the backend hands them
 out in order); closing a window is dockview's own (it re-docks the panels where they came from) and
@@ -2772,7 +2774,11 @@ a root of its own there: the context menu is one `ContextMenu` per window (`cont
 it was opened; mounted by `Workspace.svelte`'s `window` hook). The transport clock draws frames from
 `windows.requestFrame` — the editor window's when it is showing, else a detached window that is (a
 hidden window pauses its frames) — and reads `performance.now()` itself because a frame's timestamp
-counts from its own window's start. The library cannot fold while it has a window to itself. **Layouts
+counts from its own window's start. **The choice is not final**: the registry owns the handle and a
+frame waiting in a window that then hides or closes is asked for again where one shows — on each
+window's `visibilitychange`, when a window is added or removed, and by one lazy 250 ms watchdog for a
+platform that says nothing (a frame that outlives two ticks) — so the clock and the meters do not
+freeze while the picture plays on the other screen. The library cannot fold while it has a window to itself. **Layouts
 keep their windows**: `sanitizeLayout` reads dockview's `popoutGroups` (a window of one group or a
 nested layout) through the same walk as the grid, so a panel is still shown once; the page is always
 the popout page; a place that is not numbers is the platform's choice; the group a popped-out group
