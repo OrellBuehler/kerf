@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { POPOUT_URL } from './layout';
 import { isEmbeddedPopout } from './popout-boot';
 
 describe('a page opened by another window', () => {
@@ -29,5 +30,15 @@ describe('the popout page', () => {
 
 	test('loads no script', () => {
 		expect(readFileSync(file, 'utf8')).not.toMatch(/<script|<link/i);
+	});
+
+	test('is at the path the backend opens windows for', () => {
+		// The shell opens a window for `window.open` only at this path (`POPOUT_PATH`); a
+		// page that asks for another is refused and the panel never leaves the editor.
+		const rust = readFileSync(join(import.meta.dir, '../../../crates/kerf-app/src/popout.rs'), 'utf8');
+		const path = rust.match(/const POPOUT_PATH: &str = "([^"]+)";/)?.[1];
+		expect(path).toBe(POPOUT_URL);
+		// …and the file is served there from the static folder.
+		expect(join(import.meta.dir, '..', '..', 'static', POPOUT_URL)).toBe(file);
 	});
 });
