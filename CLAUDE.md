@@ -31,7 +31,7 @@ Most rules in these files exist because a bug already happened. They record *why
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
 | `.claude/docs/core-render-plan.md` | `platform.rs`, `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
 | `.claude/docs/core-golden.md` | The golden argv oracle and how to bless it |
-| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits, `analysis.rs` |
+| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings) |
 | `.claude/docs/gpu.md` | kerf-gpu: frame cache, y4m/showinfo parsing, router, `FrameSource`, `FrameCursor`, presenting a frame (A2), parity harness findings |
 | `.claude/docs/mcp.md` | The embedded MCP server and its tools |
 | `.claude/docs/app.md` | kerf-app shell: CSP, single instance, launch args, window reveal, commands list, settings, logging, the GPU preview surface (`gpu_preview.rs`) |
@@ -124,7 +124,9 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
   *string* are not enough: render it (`#[ignore]`d tests) when the shape changes.
 - **Machine budget.** Whole-file background jobs take `cpu::lease`; what the UI draws
   from or an agent looks at is ungated but thread-capped and niced. Thread flags are
-  added at spawn time (`cpu::limit_args`), never in the pure builders.
+  added at spawn time (`cpu::limit_args`), never in the pure builders. A **proxy goes before
+  analysis**: it is the high lane and reserves its place when queued (`cpu::reserve`), and
+  analysis steps are the normal lane.
 - **Nothing waits on a child process forever** — every ffmpeg / ffprobe read has a
   timeout and a kill, and nothing is spawned or waited on under a lock.
 - **Export reads originals; preview reads proxies.** A proxy must answer `-ss T` with the

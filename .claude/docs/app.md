@@ -3,8 +3,19 @@
 Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes plus the Google Fonts stylesheet host, fonts add `fonts.gstatic.com`, images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch` (a `LaunchSlot`), and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted before the page has a listener is lost. It returns `{open: path}` once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. **A second launch that arrives while the webview is still booting** would hit the same lost event, so until the webview has asked the slot *holds* its request instead (newest wins; one lock covers both halves, so a request is delivered exactly one way) and only afterwards is it emitted. A `.kerf` argument naming nothing on disk is never opened — `Project::open` would *create* it — and comes back as `{missing: path}` (second launch: the `launch-project-missing` event), which the page toasts as `File not found: …`. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`: two animation frames *or* a 150 ms timer, since a hidden page may never get a frame), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up) — but only a `show` that *worked* (a window existed and `show()` succeeded) keeps the claim, so a request that finds no window gives it back and the failsafe retries every 500 ms. A second launch always brings the window forward (`unminimize` + `show` + `set_focus`) and marks the reveal done only if that worked — it can run before the config windows exist, and then the failsafe is still armed. It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). **Not verifiable without a display**: whether the *first visible frame* is already painted when `show()` lands (a hidden window may not render until shown, which is why `backgroundColor` exists) and how long the timer-vs-frame race takes per OS — check both on a real desktop. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
-`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset` (emits
-`analysis-progress` per step), speech-to-text (`transcription_status`,
+`get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset(assetId, steps?)` (`steps`: any of `silence`,
+`scenes`, `loudness`, `rhythm`, `transcript`, `all` — only those run, merged into the cached analysis;
+omitted, the kinds Settings leaves on. `run_analysis` is the one path the command and the MCP tool
+share: it streams `analysis-progress` per step and `analysis-status` — the per-kind state — after
+each step starts and when the run ends, merges what finished with the lock released, and keeps
+a cancelled or failed step out of the cache), `analysis_statuses`, preview proxies
+(`proxy_statuses`, `rebuild_proxy`, `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
+carries one on every change and `proxy-ready` still follows a landed proxy so the preview re-decodes.
+`spawn_proxy` queues through `kerf_core::proxy` and takes its place in front of analysis **before it
+returns** — call it from the blocking pool, it may run the cached ffprobe; the MCP import does it
+inside its `blocking` closure for that reason. `set_settings` re-queues the missing proxies after a
+`proxy_size` / `preview_source` change; `get_timeline_frame`, `get_preview_frame` and `start_playback`
+refuse under Proxy only while a clip's proxy is building, `get_frame` does not), speech-to-text (`transcription_status`,
 `set_speech_model`, `download_speech_model` → emits `model-progress`), ripple mode
 (`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
 that records no revision and returns no timeline), voiceover
@@ -74,8 +85,11 @@ commitment to ten transcriptions), `cancel_levels` (the same again, for the Mixe
 measurement: a flag on `AppState` reset when `get_levels` starts and polled as its cancel
 callback — the pass holds the process-wide `cpu::lease`, so it cannot be left
 unstoppable), app preferences (`get_settings` /
-`set_settings` → a `SettingsView`: the *effective* CPU budget read back out of
-the engine, the cores it works out to, and the machine it is a share of —
+`set_settings` → a `SettingsView`: the *effective* CPU budget, the
+automatic-analysis set (`auto_analysis`: a master and a flag per kind — the old `transcribe` flag in a
+settings file migrates into its `transcript` flag on load, `parse` / `migrate`, and is never written back),
+`proxy_size` (0 / 720 / 1080 / 1280) and `preview_source` (`auto` / `original` / `proxy_only`)
+read back out of the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
 of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.

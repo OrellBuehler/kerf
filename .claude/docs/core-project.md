@@ -115,6 +115,42 @@
   alone among the providers, because it can download a model and then run for
   minutes, which is both the only step worth reporting on and the only one worth
   being able to give up on.
-  `Project::analyze_asset` wires them and caches the `AssetAnalysis`.
+  **Analysis runs in steps, one kind at a time.** `AnalysisKind` (`silence`, `scenes`,
+  `loudness`, `rhythm`, `transcript`; `parse_list` takes the names an agent tries and `all`) is
+  what an analysis is made of: `analyze_asset_steps(asset, kinds, progress, cancel)` runs only
+  those, in pass order, and returns a `StepsRun` — a **patch** holding what the finished steps found
+  (with those kinds in `patch.ran`), the steps that failed with why, and whether it was cancelled.
+  `Project::merge_analysis(&patch)` folds it into the cached `AssetAnalysis` and leaves every other
+  kind as it was (`AssetAnalysis::merge`); a step that is cancelled or fails caches **nothing**, a
+  failed step no longer discards the ones that finished, and a run where every step failed is an
+  error. `AssetAnalysis.ran` records which kinds completed, the only way to tell "ran and found no
+  silence" from "never ran"; an analysis cached before it existed (no `ran`) counts a kind as done
+  when it has data (`AssetAnalysis::done`, mirrored in `analysis-steps.ts`). `analysis_status`
+  reads one `AnalysisState` per kind — `done`, `running`, `failed` (the session remembers the last
+  failure per asset+kind, cleared by a later success), `off` (switched off in Settings, the master
+  off, or no speech backend) or `not_run` — and `Project::analysis_statuses` all assets.
+  `AutoAnalysis` (master `enabled` + one flag per kind) is the process-wide set behind
+  Settings › Analysis; it replaces the old transcribe switch, which swapped in the null transcriber for
+  *every* pass. Now the step set decides: `analyze_asset_steps(None)` runs `default_kinds()` (the
+  per-kind toggles, minus transcript without a backend), a named list runs exactly that — so an
+  agent cannot fetch a speech model for someone who turned transcription off, and a user can still
+  transcribe one clip by hand. Transcribing with no backend is a failed step, not an empty
+  transcript. `Project::analyze_asset` is the convenience over all of it.
+- `proxy.rs` — preview proxies as something the user can see and steer. Settings the engine reads
+  (`ProxySize`: 0 / 720 / 1080 / 1280, lenient on read; `PreviewSource`: `auto` / `original` /
+  `proxy_only`, unknown reads as `auto`; size 0 forces the original), `ProxyStatus` per asset
+  (`not_needed` for a still or audio-only, `off` with a reason, `missing`, `queued`, `building`
+  with a fraction and ETA, `ready` with bytes, `failed` with the reason), and the queue: `queue_auto`
+  (an import or project open — skipped for stills, when proxies are not wanted, for a deleted
+  proxy and for one already on disk), `rebuild`, `delete`, `cancel_all`. **The registry holds only
+  what is in flight** (queued / building / failed this session); *ready* is the file on disk —
+  what `ready_proxy` and the preview themselves ask — so a status cannot claim a proxy the preview
+  would not use. Each submission has a generation; a worker only touches its own entry, never the one
+  a rebuild put in its place. The adapters pass a `Notify` that turns each change into the
+  `proxy-progress` event. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
+  meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
+  again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips
+  in range with no ready proxy; the GUI preview commands refuse to decode the original for them, an
+  agent's reads do not ask. Export never reads a proxy whatever any of this says.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
