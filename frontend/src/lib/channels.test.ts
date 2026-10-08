@@ -19,7 +19,8 @@ import {
 	volumeAt
 } from './channels';
 import { rebaseAnimation } from './edit-modes';
-import { splitClip } from './links';
+import { clipById } from './link-groups';
+import { cutClipRange, detachAudio, splitClip } from './links';
 import type { Clip, Easing, Keyframe, PropertyKey, Timeline } from './types';
 
 const key = (time: number, value: number, easing?: Easing): PropertyKey => ({ time, value, ...(easing ? { easing } : {}) });
@@ -174,6 +175,29 @@ describe('the resolver', () => {
 	});
 });
 
+describe('the diff', () => {
+	// `holding_a_bundle_driven_number_static_is_a_change_and_taking_it_over_unchanged_is_not`
+	test('holding a bundle-driven number static is a change; taking it over unchanged is not', () => {
+		const before = clip();
+		before.keyframes = [bundle(0, 1, 1), bundle(2, 2, 0)];
+		const held = structuredClone(before);
+		setPropertyKeys(held, 'opacity', []);
+		expect(held.channels?.length).toBe(1);
+		expect(channelChanges(before, held)).toEqual(['opacity keyframes 2 → 0']);
+		expect(channelChanges(held, before)).toEqual(['opacity keyframes 0 → 2']);
+		const taken = structuredClone(before);
+		setPropertyKeys(taken, 'scale', propertyKeys(before, 'scale'));
+		expect(taken.channels?.length).toBe(1);
+		expect(channelChanges(before, taken)).toEqual([]);
+		const idle = clip();
+		idle.channels = [{ prop: 'opacity', keys: [] }];
+		expect(channelChanges(clip(), idle)).toEqual([]);
+		const retimed = structuredClone(taken);
+		retimed.channels![0].keys[1].time = 3;
+		expect(channelChanges(taken, retimed)).toEqual(['scale keyframes changed']);
+	});
+});
+
 describe('edits keep channels where they were', () => {
 	/** `edited` plays, `by` seconds in, what `original` did. */
 	const sameFrom = (original: Clip, edited: Clip, by: number) => {
@@ -239,6 +263,97 @@ describe('edits keep channels where they were', () => {
 		clearTransformAnimation(c);
 		expect(c.keyframes).toEqual([]);
 		expect(c.channels?.map((t) => t.prop)).toEqual(['brightness', 'volume']);
+	});
+
+	// `a_cut_range_tail_opens_on_the_pose_the_clip_had_there`
+	test('a cut range tail opens on the pose the clip had there', () => {
+		const build = (c: Clip): Timeline => ({ tracks: [{ id: 't', kind: 'video', name: 'V1', clips: [structuredClone(c)] }] }) as unknown as Timeline;
+		const c = clip();
+		c.keyframes = [bundle(0, 1, 1, 'ease_in_out'), bundle(6, 2, 0)];
+		setPropertyKeys(c, 'brightness', [key(0, -0.5, 'ease_in'), key(8, 0.5)]);
+		setPropertyKeys(c, 'volume', [key(0, 0.2, 'hold'), key(5, 1)]);
+		const sample = (p: Clip, at: number) => [transformAt(p, at).scale, colorAt(p, at).brightness, volumeAt(p, at)];
+		const closeTo = (a: number[], b: number[], what: string) =>
+			a.forEach((x, i) => expect(Math.abs(x - b[i]), `${what}: ${a} against ${b}`).toBeLessThan(1e-9));
+		// Source 2..4 is cut out of 0..10: the head plays 0..2, the tail 4..10 from 4 s in.
+		let t = build(c);
+		let [head, tail] = cutClipRange(t, c.id, 2, 4);
+		expect([head.timeline_start, tail.timeline_start]).toEqual([0, 2]);
+		for (let i = 0; i <= 60; i++) {
+			const local = i * 0.05;
+			closeTo(sample(head, local), sample(c, local), 'head');
+			closeTo(sample(tail, local), sample(c, local + 4), 'tail');
+		}
+		// A cut at the very head is a head trim of the same amount.
+		t = build(c);
+		const pieces = cutClipRange(t, c.id, 0, 3);
+		expect(pieces.length).toBe(1);
+		expect([pieces[0].id, pieces[0].timeline_start]).toEqual([c.id, 0]);
+		for (let i = 0; i <= 40; i++) closeTo(sample(pieces[0], i * 0.05), sample(c, i * 0.05 + 3), 'sole tail');
+		// Reversed: the tail is the lower span, 6 s of head plus the 2 s removed come first.
+		const back = structuredClone(c);
+		back.speed = -1;
+		t = build(back);
+		[head, tail] = cutClipRange(t, back.id, 2, 4);
+		for (let i = 0; i <= 40; i++) closeTo(sample(tail, i * 0.05), sample(back, i * 0.05 + 8), 'reversed');
+		// At speed 2 the animation is in timeline seconds: the head is 1 s, the cut 1 s.
+		const fast = structuredClone(c);
+		fast.speed = 2;
+		t = build(fast);
+		[head, tail] = cutClipRange(t, fast.id, 2, 4);
+		for (let i = 0; i <= 40; i++) closeTo(sample(tail, i * 0.05), sample(fast, i * 0.05 + 2), 'fast');
+	});
+
+	// `a_keyed_volume_that_the_fader_ratio_would_push_past_the_cap_goes_to_an_equal_fader_lane`
+	test('a keyed volume the fader ratio would push past the cap goes to an equal-fader lane', () => {
+		const keyed = (top: number) => {
+			const c = clip();
+			setPropertyKeys(c, 'volume', [key(0, 0.5), key(4, top)]);
+			return c;
+		};
+		const build = (picture: Clip, vFader: number, aFader: number): Timeline =>
+			({
+				tracks: [
+					{ id: 'v', kind: 'video', name: 'V1', volume: vFader, clips: [structuredClone(picture)] },
+					{ id: 'a', kind: 'audio', name: 'A1', volume: aFader, clips: [] }
+				]
+			}) as unknown as Timeline;
+		const heard = (t: Timeline, id: string, at: number) => {
+			const track = t.tracks.find((x) => x.clips.some((c) => c.id === id))!;
+			return (track.volume ?? 1) * volumeAt(clipById(t, id)!, at);
+		};
+		// Picture fader 4, audio fader 1: 1.5 * 4 is past the cap of 4, so the sound takes a new
+		// lane at the picture's fader with its keys as they are, exactly as loud as it was.
+		let picture = keyed(1.5);
+		let t = build(picture, 4, 1);
+		let done = detachAudio(t, picture.id, true);
+		expect(done.created_track).toBe(true);
+		expect(t.tracks[2].volume).toBe(4);
+		expect(propertyKeys(done.clip, 'volume')[1].value).toBe(1.5);
+		for (const at of [0, 1, 2.5, 4]) expect(Math.abs(heard(t, done.clip.id, at) - 4 * volumeAt(picture, at))).toBeLessThan(1e-6);
+		// Under the cap it takes the ordinary route onto A1, scaled by the ratio: 1.5 * 2 = 3.
+		picture = keyed(1.5);
+		t = build(picture, 2, 1);
+		done = detachAudio(t, picture.id, true);
+		expect(done.created_track).toBe(false);
+		expect(t.tracks.length).toBe(2);
+		expect(propertyKeys(done.clip, 'volume')[1].value).toBe(3);
+		for (const at of [0, 2, 4]) expect(Math.abs(heard(t, done.clip.id, at) - 2 * volumeAt(picture, at))).toBeLessThan(1e-6);
+		// An existing lane with the picture's fader is used before a new one is made.
+		picture = keyed(1.5);
+		t = build(picture, 4, 1);
+		t.tracks.push({ id: 'a2', kind: 'audio', name: 'A2', volume: 4, clips: [] });
+		done = detachAudio(t, picture.id, true);
+		expect(done.created_track).toBe(false);
+		expect(t.tracks[2].clips.length).toBe(1);
+		// A ratio below one never reaches the cap, and a static volume is not capped at all.
+		picture = keyed(3);
+		expect(detachAudio(build(picture, 1, 2), picture.id, true).created_track).toBe(false);
+		const plain = clip();
+		plain.volume = 3;
+		done = detachAudio(build(plain, 4, 1), plain.id, true);
+		expect(done.created_track).toBe(false);
+		expect(done.clip.volume).toBe(12);
 	});
 
 	test('copying shifts keys, and a negative offset cuts the head', () => {

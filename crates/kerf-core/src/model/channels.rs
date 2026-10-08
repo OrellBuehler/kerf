@@ -531,11 +531,17 @@ impl Clip {
 pub(super) fn channel_changes(before: &Clip, after: &Clip) -> Vec<String> {
     let mut parts = Vec::new();
     for prop in Property::ALL {
-        let (a, b) = (before.channel(prop), after.channel(prop));
+        if before.channel(prop) == after.channel(prop) {
+            continue;
+        }
+        // What the render sees is what drives the number, not whether it has a track: a
+        // transform number the bundle animates, taken over by an empty track (held static), has
+        // no keys of its own on either side and still changed; one detached from the bundle with
+        // the same keys has not. So compare the effective keys.
+        let (a, b) = (before.property_keys(prop), after.property_keys(prop));
         if a == b {
             continue;
         }
-        let (a, b) = (a.map_or(&[][..], |t| &t.keys[..]), b.map_or(&[][..], |t| &t.keys[..]));
         let label = prop.label();
         if a.len() != b.len() {
             parts.push(format!("{label} keyframes {} → {}", a.len(), b.len()));
@@ -545,10 +551,10 @@ pub(super) fn channel_changes(before: &Clip, after: &Clip) -> Vec<String> {
             easing: Easing::Linear,
             ..*k
         };
-        if a.iter().zip(b).any(|(x, y)| plain(x) != plain(y)) {
+        if a.iter().zip(&b).any(|(x, y)| plain(x) != plain(y)) {
             parts.push(format!("{label} keyframes changed"));
         }
-        let eased = a.iter().zip(b).filter(|(x, y)| x.easing != y.easing).count();
+        let eased = a.iter().zip(&b).filter(|(x, y)| x.easing != y.easing).count();
         if eased > 0 {
             parts.push(format!(
                 "easing changed on {eased} {label} keyframe{}",
@@ -995,6 +1001,154 @@ mod tests {
         );
     }
 
+    /// The audio track's gain through its fader, which is what is heard.
+    fn heard(tl: &Timeline, id: Uuid, at: f64) -> f64 {
+        let (ti, _) = tl.locate(id).unwrap();
+        f64::from(tl.tracks[ti].volume) * tl.clip(id).unwrap().volume_at(at)
+    }
+
+    #[test]
+    fn a_keyed_volume_that_the_fader_ratio_would_push_past_the_cap_goes_to_an_equal_fader_lane() {
+        use crate::model::{Timeline, Track};
+        let keyed = |top: f64| {
+            let mut c = clip();
+            c.set_property_keys(
+                Property::Volume,
+                vec![key(0.0, 0.5, Easing::Linear), key(4.0, top, Easing::Linear)],
+            );
+            c
+        };
+        let build = |picture: &Clip, v_fader: f32, a_fader: f32| {
+            let mut video = Track::new(StreamKind::Video, "V1");
+            video.volume = v_fader;
+            video.clips.push(picture.clone());
+            let mut audio = Track::new(StreamKind::Audio, "A1");
+            audio.volume = a_fader;
+            Timeline {
+                tracks: vec![video, audio],
+                ..Timeline::default()
+            }
+        };
+        // Picture fader 4, audio fader 1: the ratio is 4, and 1.5 * 4 is past the cap of 4. The
+        // sound goes to a new lane at the picture's fader with its keys as they are, and is
+        // exactly as loud as it was (the picture's own gain through its fader).
+        let picture = keyed(1.5);
+        let mut tl = build(&picture, 4.0, 1.0);
+        let done = tl.detach_audio(picture.id, true).unwrap();
+        assert!(done.created_track);
+        assert_eq!(tl.tracks[2].volume, 4.0);
+        assert_eq!(done.clip.property_keys(Property::Volume)[1].value, 1.5);
+        for t in [0.0, 1.0, 2.5, 4.0] {
+            let was = 4.0 * picture.volume_at(t);
+            assert!((heard(&tl, done.clip.id, t) - was).abs() < 1e-6, "at {t}: {was}");
+        }
+        // The same keys that stay under the cap take the ordinary route onto A1 and are scaled
+        // by the ratio: 1.5 * 2 = 3.
+        let picture = keyed(1.5);
+        let mut tl = build(&picture, 2.0, 1.0);
+        let done = tl.detach_audio(picture.id, true).unwrap();
+        assert!(!done.created_track && tl.tracks.len() == 2);
+        assert_eq!(done.clip.property_keys(Property::Volume)[1].value, 3.0);
+        for t in [0.0, 2.0, 4.0] {
+            assert!((heard(&tl, done.clip.id, t) - 2.0 * picture.volume_at(t)).abs() < 1e-6);
+        }
+        // An existing lane with the picture's fader is used before a new one is made.
+        let picture = keyed(1.5);
+        let mut tl = build(&picture, 4.0, 1.0);
+        let mut same = Track::new(StreamKind::Audio, "A2");
+        same.volume = 4.0;
+        tl.tracks.push(same);
+        let done = tl.detach_audio(picture.id, true).unwrap();
+        assert!(!done.created_track);
+        assert_eq!(tl.tracks[2].clips.len(), 1);
+        // A ratio below one never reaches the cap, and a static volume is not capped at all.
+        let picture = keyed(3.0);
+        let mut tl = build(&picture, 1.0, 2.0);
+        assert!(!tl.detach_audio(picture.id, true).unwrap().created_track);
+        let mut plain = clip();
+        plain.volume = 3.0;
+        let mut tl = build(&plain, 4.0, 1.0);
+        let done = tl.detach_audio(plain.id, true).unwrap();
+        assert!(!done.created_track);
+        assert_eq!(done.clip.volume, 12.0, "unchanged: the static path has no cap");
+    }
+
+    #[test]
+    fn a_cut_range_tail_opens_on_the_pose_the_clip_had_there() {
+        use crate::model::{Timeline, Track};
+        let build = |c: &Clip| {
+            let mut track = Track::new(StreamKind::Video, "V1");
+            track.clips.push(c.clone());
+            Timeline {
+                tracks: vec![track],
+                ..Timeline::default()
+            }
+        };
+        let mut c = clip();
+        c.keyframes = vec![
+            bundle_key(0.0, 1.0, 1.0, Easing::EaseInOut),
+            bundle_key(6.0, 2.0, 0.0, Easing::Linear),
+        ];
+        c.set_property_keys(
+            Property::Brightness,
+            vec![key(0.0, -0.5, Easing::EaseIn), key(8.0, 0.5, Easing::Linear)],
+        );
+        c.set_property_keys(
+            Property::Volume,
+            vec![key(0.0, 0.2, Easing::Hold), key(5.0, 1.0, Easing::Linear)],
+        );
+        // Source 2..4 is cut out of a 0..10 clip: the head plays 0..2, the tail 4..10, and the
+        // tail starts 4 s into the whole clip's animation.
+        let mut tl = build(&c);
+        let pieces = tl.cut_clip_range(c.id, 2.0, 4.0).unwrap();
+        let (head, tail) = (&pieces[0], &pieces[1]);
+        assert_eq!((head.timeline_start, tail.timeline_start), (0.0, 2.0));
+        for i in 0..=60 {
+            let local = f64::from(i) * 0.05;
+            let was = |at: f64| (c.transform_at(at).scale, c.color_at(at).brightness, c.volume_at(at));
+            let now = |p: &Clip| (p.transform_at(local).scale, p.color_at(local).brightness, p.volume_at(local));
+            assert_eq!(now(head), was(local), "the head plays what it played");
+            let (a, b) = (now(tail), was(local + 4.0));
+            assert!(
+                (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9 && (a.2 - b.2).abs() < 1e-9,
+                "at {local}: {a:?} against {b:?}"
+            );
+        }
+        // A cut at the very head leaves the tail alone: a head trim of the same amount.
+        let mut tl = build(&c);
+        let pieces = tl.cut_clip_range(c.id, 0.0, 3.0).unwrap();
+        assert_eq!(pieces.len(), 1);
+        let tail = &pieces[0];
+        assert_eq!((tail.id, tail.timeline_start), (c.id, 0.0));
+        for i in 0..=40 {
+            let local = f64::from(i) * 0.05;
+            assert!((tail.volume_at(local) - c.volume_at(local + 3.0)).abs() < 1e-9);
+            assert!((tail.transform_at(local).scale - c.transform_at(local + 3.0).scale).abs() < 1e-9);
+        }
+        // A reversed clip plays its upper span first; its tail is the lower one.
+        let mut back = c.clone();
+        back.speed = -1.0;
+        let mut tl = build(&back);
+        let pieces = tl.cut_clip_range(back.id, 2.0, 4.0).unwrap();
+        let tail = &pieces[1];
+        assert_eq!((pieces[0].source_in, tail.source_out), (4.0, 2.0));
+        for i in 0..=40 {
+            let local = f64::from(i) * 0.05;
+            // 6 s of the head (source 4..10) plus the 2 s removed come first.
+            assert!((tail.volume_at(local) - back.volume_at(local + 8.0)).abs() < 1e-9);
+        }
+        // And at speed 2 the animation is in timeline seconds: the head is 1 s, the cut 1 s.
+        let mut fast = c.clone();
+        fast.speed = 2.0;
+        let mut tl = build(&fast);
+        let pieces = tl.cut_clip_range(fast.id, 2.0, 4.0).unwrap();
+        let tail = &pieces[1];
+        for i in 0..=40 {
+            let local = f64::from(i) * 0.05;
+            assert!((tail.volume_at(local) - fast.volume_at(local + 2.0)).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn copying_keys_shifts_them_and_a_negative_offset_cuts_the_head() {
         let mut c = clip();
@@ -1173,5 +1327,37 @@ mod tests {
         eased.channels[0].keys[0].easing = Easing::Hold;
         assert_eq!(channel_changes(&after, &eased), ["easing changed on 1 volume keyframe"]);
         assert!(channel_changes(&after, &after).is_empty());
+    }
+
+    #[test]
+    fn holding_a_bundle_driven_number_static_is_a_change_and_taking_it_over_unchanged_is_not() {
+        let mut before = clip();
+        before.keyframes = vec![
+            bundle_key(0.0, 1.0, 1.0, Easing::Linear),
+            bundle_key(2.0, 2.0, 0.0, Easing::Linear),
+        ];
+        // The opacity held static by an empty track: the render changed, so the diff says so.
+        let mut held = before.clone();
+        held.set_property_keys(Property::Opacity, vec![]);
+        assert_eq!(held.channels.len(), 1, "the empty track is kept: the bundle would drive it");
+        assert_eq!(channel_changes(&before, &held), ["opacity keyframes 2 → 0"]);
+        assert_eq!(channel_changes(&held, &before), ["opacity keyframes 0 → 2"]);
+        // Taking a number over with the keys the bundle already gave it changes nothing the
+        // render sees, and the diff does not claim it does.
+        let mut taken = before.clone();
+        taken.set_property_keys(Property::Scale, before.property_keys(Property::Scale));
+        assert_eq!(taken.channels.len(), 1);
+        assert!(channel_changes(&before, &taken).is_empty());
+        // ... and a track that says nothing against a bundle that says nothing is no change.
+        let (bare, mut idle) = (clip(), clip());
+        idle.channels.push(PropertyTrack {
+            prop: Property::Opacity,
+            keys: vec![],
+        });
+        assert!(channel_changes(&bare, &idle).is_empty());
+        // Retiming the keys it took over is a change to that number.
+        let mut retimed = taken.clone();
+        retimed.channels[0].keys[1].time = 3.0;
+        assert_eq!(channel_changes(&taken, &retimed), ["scale keyframes changed"]);
     }
 }

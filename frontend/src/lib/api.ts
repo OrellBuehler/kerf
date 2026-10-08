@@ -1470,7 +1470,9 @@ export async function setAudioEffects(clipId: string, effects: AudioEffect[]): P
 	return invoke<Timeline>('set_audio_effects', { clipId, effects });
 }
 
-/** Replace a clip's transform keyframes (empty list clears the animation). */
+/** Replace a clip's whole-transform keyframes. An empty list clears these only: a number with
+ *  keys of its own (`setPropertyKeyframes`) keeps them; `clearKeyframes` makes the whole
+ *  transform static. */
 export async function setKeyframes(clipId: string, keyframes: Keyframe[]): Promise<Timeline> {
 	if (!inTauri()) {
 		for (const k of keyframes) {

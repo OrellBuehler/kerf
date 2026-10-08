@@ -797,9 +797,10 @@ struct KeyframesParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
     #[schemars(
-        description = "Transform keyframes (replaces the clip's animation). Each: {\"time\":seconds_from_clip_start, \
+        description = "Whole-transform keyframes (replaces the clip's bundle of them). Each: {\"time\":seconds_from_clip_start, \
                        \"scale\":1.0,\"pos_x\":0.0,\"pos_y\":0.0,\"rotation\":0.0,\"opacity\":1.0}. Two or more animate \
-                       the clip; pass [] to clear and use the static transform."
+                       the clip; pass [] to clear these keyframes (a number with keys of its own, from \
+                       set_property_keyframes, keeps them — clear_keyframes clears everything of the transform)."
     )]
     keyframes: Vec<Keyframe>,
 }
@@ -2041,7 +2042,9 @@ impl KerfMcp {
     #[tool(
         description = "Set the linear volume gain of a clip. A picture whose sound was detached (`source_audio: \
                        false`) carries no sound, so its volume changes nothing audible — its linked audio clip \
-                       (see `link_id`) is a separate clip to set."
+                       (see `link_id`) is a separate clip to set. While the clip's volume is animated \
+                       (set_property_keyframes with prop `volume`) this static value is not used: clear those \
+                       keys (pass []) for it to apply."
     )]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2081,7 +2084,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged."
+        description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged. A number that is animated (set_keyframes / add_keyframe, or set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared; the crop edges are never animated."
     )]
     fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2105,7 +2108,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged."
+        description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged. A number that is animated (set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared (pass [])."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2152,7 +2155,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Replace a clip's transform keyframes to animate scale / position / rotation / opacity over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). Pass an empty list to clear the animation."
+        description = "Replace a clip's whole-transform keyframes — the keys that animate scale / position / rotation / opacity together over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). An empty list clears these keyframes only: a number that has keys of its own (set_property_keyframes) keeps them, so the clip can still be animated afterwards — clear_keyframes makes the whole transform static. Colour and volume keys are never touched."
     )]
     fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2229,7 +2232,9 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Remove all transform keyframes from a clip (back to its static transform)")]
+    #[tool(
+        description = "Remove all transform keyframes from a clip (back to its static transform): the whole-transform keys and any scale / position / rotation / opacity keys of their own. Colour and volume keys stay — clear those with set_property_keyframes and an empty list."
+    )]
     fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
@@ -4215,6 +4220,38 @@ mod tests {
                 "`{name}` should warn about a detached picture: {description}"
             );
         }
+    }
+
+    /// A keyed number ignores its static value, and `set_keyframes` clears the whole-transform
+    /// keys only: the tools an agent would reach for say so, rather than the agent finding out by
+    /// a clip that is still moving after "clearing" it.
+    #[test]
+    fn the_static_setters_and_set_keyframes_say_what_an_animated_number_does_to_them() {
+        let tools = router().list_all();
+        let text = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string()
+        };
+        for name in ["set_volume", "set_color", "set_transform"] {
+            let d = text(name);
+            assert!(
+                d.contains("set_property_keyframes") && (d.contains("not used") || d.contains("not from this static value")),
+                "`{name}` should say its static value is ignored while the number is animated: {d}"
+            );
+        }
+        let d = text("set_keyframes");
+        assert!(
+            d.contains("only") && d.contains("keeps them") && d.contains("clear_keyframes"),
+            "`set_keyframes` clears the bundle only: {d}"
+        );
+        let d = text("clear_keyframes");
+        assert!(d.contains("of their own") && d.contains("Colour and volume keys stay"), "{d}");
     }
 
     /// The per-call `ripple` override belongs on the edits that follow the

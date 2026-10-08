@@ -1,7 +1,18 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { addKeyframe, clearKeyframes, copyKeyframes, revertTo, setKeyframeEasing, setPropertyKeyframes, splitClip } from './api';
+import {
+	addKeyframe,
+	clearKeyframes,
+	copyKeyframes,
+	cutClipRange,
+	revertTo,
+	setFade,
+	setKeyframeEasing,
+	setKeyframes,
+	setPropertyKeyframes,
+	splitClip
+} from './api';
 import { colorAt, propertyKeys, transformAt, volumeAt } from './channels';
-import type { Clip, PropertyKey, Timeline } from './types';
+import type { Clip, Keyframe, PropertyKey, Timeline } from './types';
 
 // The browser harness's answers must hold the contract the backend does (`set_property_keyframes`,
 // `copy_keyframes`, `set_keyframe_easing` with a property in project.rs), or the editor would be
@@ -101,5 +112,50 @@ describe('property keyframes (browser harness)', () => {
 		const right = clips.find((c) => c.timeline_start === at);
 		expect(right).toBeDefined();
 		expect(volumeAt(right!, 0.25)).toBeCloseTo(volumeAt(before, dur / 2 + 0.25), 9);
+	});
+
+	test('set_keyframes clears the bundle only and drops a track that was only holding a number off it', async () => {
+		const key = (time: number, scale: number): Keyframe => ({ time, scale, pos_x: 0, pos_y: 0, rotation: 0, opacity: 1 });
+		await setKeyframes('c1', [key(0, 1), key(4, 2)]);
+		await setPropertyKeyframes('c1', 'opacity', []);
+		let t = await setPropertyKeyframes('c1', 'scale', [k(0, 1), k(4, 3)]);
+		expect(clipOf(t, 'c1').channels?.length).toBe(2);
+		t = await setKeyframes('c1', []);
+		const c = clipOf(t, 'c1');
+		expect(c.keyframes).toEqual([]);
+		// The scale's own keys survive (the clip is still animated); the empty opacity track is gone.
+		expect(c.channels?.map((x) => x.prop)).toEqual(['scale']);
+		expect(transformAt(c, 2).scale).toBe(2);
+		// clear_keyframes makes the whole transform static.
+		expect(clipOf(await clearKeyframes('c1'), 'c1').channels).toBeUndefined();
+	});
+
+	test('a split keeps each fade on the half that holds its edge', async () => {
+		await setFade('c1', 1, 2);
+		const before = clipOf(await setPropertyKeyframes('c1', 'volume', [k(0, 0), k(4, 2)]), 'c1');
+		const dur = (before.source_out - before.source_in) / Math.abs(before.speed ?? 1);
+		const at = before.timeline_start + dur / 2;
+		const t = await splitClip('c1', at, false);
+		const halves = t.tracks.flatMap((tr) => tr.clips).filter((c) => c.asset_id === before.asset_id && c.id !== 'c3');
+		const left = halves.find((c) => c.id === 'c1')!;
+		const right = halves.find((c) => c.timeline_start === at)!;
+		expect([left.fade_in, left.fade_out]).toEqual([1, 0]);
+		expect([right.fade_in, right.fade_out]).toEqual([0, 2]);
+	});
+
+	test('a cut range tail opens on the pose the clip had there', async () => {
+		const before = clipOf(await setPropertyKeyframes('c1', 'volume', [k(0, 0.2, 'hold'), k(5, 1)]), 'c1');
+		const mag = Math.abs(before.speed ?? 1);
+		const from = before.source_in + 2 * mag;
+		const to = before.source_in + 4 * mag;
+		const t = await cutClipRange('c1', from, to, false);
+		const tail = t.tracks
+			.flatMap((tr) => tr.clips)
+			.find((c) => c.id !== 'c1' && c.id !== 'c3' && c.asset_id === before.asset_id && c.timeline_start === before.timeline_start + 2);
+		expect(tail).toBeDefined();
+		// The tail starts 4 s into the whole clip's animation, not at its first key.
+		for (const local of [0, 0.5, 1, 2.5]) {
+			expect(volumeAt(tail!, local)).toBeCloseTo(volumeAt(before, local + 4), 9);
+		}
 	});
 });

@@ -3545,8 +3545,12 @@ impl Project {
 
     // ---- transform keyframes (animation) ----------------------------------
 
-    /// Replace a clip's transform keyframes (re-sorted by time). An empty list
-    /// clears the animation, so the static transform is used again.
+    /// Replace a clip's whole-transform keyframes — the bundle that animates scale, position,
+    /// rotation and opacity together — re-sorted by time. An empty list clears **the bundle**:
+    /// a transform number that has keys of its own ([`Project::set_property_keyframes`]) keeps
+    /// them, so a clip animated that way is still animated afterwards. [`Project::clear_keyframes`]
+    /// makes the whole transform static. A track left empty only to hold a number static
+    /// against the bundle is dropped with the bundle (it has nothing left to hold it off).
     pub fn set_keyframes(&self, clip_id: Uuid, mut keyframes: Vec<Keyframe>) -> Result<Clip> {
         for k in &keyframes {
             validate_keyframe(k)?;
@@ -3554,8 +3558,10 @@ impl Project {
         keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
         self.edit_timeline("Set keyframes", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips[ci].keyframes = keyframes;
-            Ok(timeline.tracks[ti].clips[ci].clone())
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.keyframes = keyframes;
+            clip.prune_channels();
+            Ok(clip.clone())
         })
     }
 
@@ -5564,6 +5570,77 @@ mod tests {
             Err(Error::ClipNotFound(_))
         ));
         assert_eq!(project.history().unwrap().len(), before, "a refused edit records nothing");
+    }
+
+    /// A proposal that only holds a bundle-driven number static changes the render, so it is a
+    /// change: it used to diff as empty and `apply_staged` discarded it without a revision.
+    #[test]
+    fn an_agent_holding_a_bundle_driven_number_static_is_a_proposal_and_it_lands() {
+        let (mut project, clip) = channel_project();
+        project
+            .add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, Some(1.0))
+            .unwrap();
+        project
+            .add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, Some(0.0))
+            .unwrap();
+        let revisions = project.history().unwrap().len();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project.set_property_keyframes(clip.id, Property::Opacity, vec![]).unwrap();
+
+        let staged = project.staged().unwrap().expect("a proposal");
+        assert!(!staged.diff.is_empty(), "{:?}", staged.diff);
+        let text = staged
+            .diff
+            .entries
+            .iter()
+            .map(|e| format!("{} {}", e.summary, e.detail.as_deref().unwrap_or("")))
+            .collect::<String>();
+        assert!(text.contains("opacity keyframes 2 → 0"), "{text}");
+        // The user's cut has not moved; applying lands one agent revision and the opacity is static.
+        assert!(project.timeline().unwrap().tracks[0].clips[0].channels.is_empty());
+        let applied = project.apply_staged(false).unwrap();
+        let landed = &applied.tracks[0].clips[0];
+        assert_eq!(landed.transform_at(2.0).opacity, 1.0, "held at the static value");
+        assert!(
+            (landed.transform_at(2.0).scale - 1.5).abs() < 1e-12,
+            "the rest still animates"
+        );
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().source, EditSource::Agent);
+    }
+
+    #[test]
+    fn set_keyframes_clears_the_bundle_only_and_drops_a_track_that_was_only_holding_it_off() {
+        let (project, clip) = channel_project();
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Easing::Linear,
+        };
+        project.set_keyframes(clip.id, vec![key(0.0, 1.0), key(4.0, 2.0)]).unwrap();
+        // The opacity held static against the bundle; the scale taken over with keys of its own.
+        project.set_property_keyframes(clip.id, Property::Opacity, vec![]).unwrap();
+        project
+            .set_property_keyframes(clip.id, Property::Scale, vec![pk(0.0, 1.0), pk(4.0, 3.0)])
+            .unwrap();
+        assert_eq!(project.timeline().unwrap().tracks[0].clips[0].channels.len(), 2);
+        let c = project.set_keyframes(clip.id, vec![]).unwrap();
+        assert!(c.keyframes.is_empty());
+        // The scale's own keys survive an emptied bundle (the clip is still animated) ...
+        assert!(c.is_animated() && c.is_keyed(Property::Scale));
+        assert_eq!(c.transform_at(2.0).scale, 2.0);
+        // ... and the empty opacity track, which had nothing left to hold off, is gone.
+        assert_eq!(c.channels.len(), 1, "{:?}", c.channels);
+        assert_eq!(c.channels[0].prop, Property::Scale);
+        // `clear_keyframes` is the one that makes the whole transform static.
+        let c = project.clear_keyframes(clip.id).unwrap();
+        assert!(!c.is_animated() && c.channels.is_empty());
     }
 
     #[test]

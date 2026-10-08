@@ -402,12 +402,16 @@ export function propertyKeysShifted(clip: Animatable, props: Property[], offset:
 	});
 }
 
-/** What a clip's channels changed, one phrase per property (`channel_changes`). */
+/** What a clip's channels changed, one phrase per property (`channel_changes`). What counts is
+ *  what drives the number, not whether it has a track: a bundle-animated number held static by an
+ *  empty track changed (its render did), and one taken over with the keys the bundle gave it did
+ *  not. */
 export function channelChanges(before: Clip, after: Clip): string[] {
 	const parts: string[] = [];
 	for (const prop of PROPERTIES) {
-		const a = channelOf(before, prop)?.keys ?? [];
-		const b = channelOf(after, prop)?.keys ?? [];
+		if (JSON.stringify(channelOf(before, prop)) === JSON.stringify(channelOf(after, prop))) continue;
+		const a = propertyKeys(before, prop);
+		const b = propertyKeys(after, prop);
 		if (JSON.stringify(a) === JSON.stringify(b)) continue;
 		const label = propertyLabel(prop);
 		if (a.length !== b.length) {
