@@ -16,9 +16,10 @@
 //!   is learned from a file's first run; until then a request can only start one.
 //! * **Where a run cannot be proved equal to the one-shot, the file is decoded one-shot**
 //!   (`State::distrusted`, from the first thing that shows it): a container that is not MP4 /
-//!   Matroska (before any run), a B frame (a seek into the frames a keyframe leads returns the
-//!   keyframe, where a run that read through has the frame itself), a first frame a whole interval
-//!   or more past its seek, and a file that contradicts itself (see `run_reader`).
+//!   Matroska and a file whose sync samples are not keyframes (intra refresh), both before any
+//!   run; then a B frame (a seek into the frames a keyframe leads returns the keyframe, where a
+//!   run that read through has the frame itself), a first frame a whole interval or more past its
+//!   seek, and a file that contradicts itself (see `run_reader`).
 //! * **A run's first frame covers from its seek tick** (within a frame interval of it; a frame
 //!   that landed later marks the file instead and claims nothing before itself); every later
 //!   frame covers from the tick after the one before it. A run that ends cleanly records the file's end
@@ -37,9 +38,9 @@
 //!   [`FrameSourceConfig::request_timeout`] (`Exact`: the one-shot's own 30 s). A run reads
 //!   ahead only as far as it was asked (plus a byte-bounded read-ahead for `Forward`): past that
 //!   it blocks, the pipe fills and `ffmpeg` idles.
-//! * **Hardware decode** is `decode_hwaccel()`'s; a run that dies before its first frame with it
-//!   is retried once in software, and if that works the process stops asking
-//!   (`disable_decode_hwaccel`).
+//! * **Runs decode in software, as the one-shot does** (no `-hwaccel`): a hardware decoder is
+//!   not always the software one (a ProRes 4:2:2 10-bit frame through FFmpeg's Vulkan decoder
+//!   differed on 79 of 80 times, by up to 24 levels), and the one-shot is the contract.
 //! * **The path can be off.** The first use runs a **self-test** ([`self_test`]): a tiny file on
 //!   a fine time base made with `ffmpeg`'s own encoder, decoded with the production flags, every
 //!   pts expected exactly. If it fails (a build whose `showinfo`, `-ss` or time base behave
@@ -178,7 +179,6 @@ struct Run {
     warm_from: i64,
     life: Life,
     frames: u64,
-    hw: bool,
     waiters: u32,
     last_used: Instant,
     last_progress: Instant,
@@ -261,7 +261,8 @@ pub struct FrameSource {
 /// The `ffmpeg` argv of a run of `path` (before the CPU cap): the production flags the self-test
 /// checks. `seek` is the text of the input `-ss` as the caller spells it (a still's
 /// `kerf_core::seek_arg`, the export's `FpsPick::seek_arg`), `None` for a run from the head with
-/// no `-ss`. `passthrough` is spelled with the engine's `fps_mode_flag()`.
+/// no `-ss`. `passthrough` is spelled with the engine's `fps_mode_flag()`. `hwaccel` is `None` for
+/// the router's runs: they decode in software, as the one-shot does.
 ///
 /// The trailing `setpts=N/TB` follows `showinfo` (which prints the file's own pts) and only keeps
 /// the muxer quiet: for a file with repeated timestamps its "Non-monotonic DTS" warning is logged
@@ -309,6 +310,22 @@ fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode
 fn frame_ticks(fps: Option<f64>, tb: Rational) -> i64 {
     fps.filter(|f| f.is_finite() && *f > 0.0)
         .map_or(1, |f| (f64::from(tb.den) / (f64::from(tb.num) * f)).round() as i64)
+        .max(1)
+}
+
+/// How many ticks past a seek the first frame of a run may be before the landing counts as late:
+/// a whole frame interval or more, **allowing for the ticks the interval is rounded to**. A frame
+/// is `x` ticks (33.33 for 30 fps on a millisecond time base) and the frames are `floor(x)` and
+/// `ceil(x)` apart, so the first frame at or after a seek is up to `ceil(x) - 1` ticks away
+/// without anything having been skipped; `ceil(x)` is the first distance that cannot be a gap's
+/// remainder (a rounded `x` marked healthy 30, 29.97 and 120 fps files whenever a seek fell just
+/// after a 34 ms gap's start). The tiny factor keeps float noise in `x` (an exact 1001 that prints
+/// as 1001.0000000000001) from rounding up a tick. One tick when the rate is unknown.
+fn late_ticks(fps: Option<f64>, tb: Rational) -> i64 {
+    fps.filter(|f| f.is_finite() && *f > 0.0)
+        .map_or(1, |f| {
+            (f64::from(tb.den) / (f64::from(tb.num) * f) * (1.0 - 1e-5)).ceil() as i64
+        })
         .max(1)
 }
 
@@ -463,6 +480,21 @@ fn unique() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Why runs are not trusted on the file at `path` before one has started, or `None`. Runs are
+/// proved against the one-shot decode on MP4 / Matroska only (a transport stream seeks to a later
+/// keyframe, and a run from 0 would not; AVI and the rest guess their timestamps), and only where
+/// a seek decodes from a keyframe (`kerf_core::source_seek_points_are_keyframes`; with intra
+/// refresh it starts late, and a run that read through has the frames the seek skipped).
+fn unproven_for_runs(path: &Path) -> Option<&'static str> {
+    if !kerf_core::source_is_indexed_container(path) {
+        return Some("not an MP4 / Matroska file (its seeks and timestamps are not the ones a run is checked against)");
+    }
+    if !kerf_core::source_seek_points_are_keyframes(path) {
+        return Some("a seek into it does not decode from a keyframe (intra refresh), where a run reads the frames it skips");
+    }
+    None
+}
+
 impl FrameSource {
     pub fn new(config: FrameSourceConfig) -> Arc<Self> {
         let shared = Arc::new(Shared {
@@ -561,10 +593,7 @@ impl FrameSource {
         if layer.is_image {
             return self.image(layer, source);
         }
-        // Runs are proved against the one-shot decode on MP4 / Matroska only: a transport
-        // stream seeks to a later keyframe (and a run from 0 would not), AVI and the rest guess
-        // their timestamps.
-        if !kerf_core::source_is_indexed_container(Path::new(&layer.path)) {
+        if unproven_for_runs(Path::new(&layer.path)).is_some() {
             return self.oneshot(layer);
         }
         let frame_bytes = yuv420p_len(w, h).unwrap_or(0);
@@ -578,9 +607,6 @@ impl FrameSource {
         let mut starts = 0;
         // The run this request started or is reading, to read its outcome.
         let mut mine: Option<RunId> = None;
-        // A software run started because the hardware one died before its first frame: if it
-        // delivers, hardware decode is broken here.
-        let mut sw_retry: Option<RunId> = None;
         // Waiting on another request's starting run before the time base was known: once it is,
         // route this target properly instead of reading that run forward however far it is.
         let mut joined_blind = false;
@@ -602,9 +628,6 @@ impl FrameSource {
                 match st.cache.at_or_after(source, target) {
                     Lookup::Hit(hit) => {
                         touch(&mut st, mine);
-                        if sw_retry.is_some() && sw_retry == mine {
-                            kerf_core::disable_decode_hwaccel();
-                        }
                         return Ok(Some(hit.frame));
                     }
                     Lookup::PastEnd => return Ok(None),
@@ -613,35 +636,20 @@ impl FrameSource {
             }
             // What became of the run this request is waiting on.
             if let Some(id) = mine {
-                match st.runs.iter().find(|r| r.id == id).map(|r| (r.life.clone(), r.frames, r.hw)) {
+                match st.runs.iter().find(|r| r.id == id).map(|r| (r.life.clone(), r.frames)) {
                     // A run joined before the file's time base was known is another request's, at
                     // a seek that is not known to be anywhere near this one's target: that it ended
                     // (or failed) with no frame says nothing about this one. Route it afresh.
-                    Some((Life::Ended | Life::Failed(_), 0, _)) if joined_blind => {
+                    Some((Life::Ended | Life::Failed(_), 0)) if joined_blind => {
                         mine = None;
                         joined_blind = false;
                     }
-                    Some((Life::Ended, 0, _)) => return Ok(None),
-                    Some((Life::Failed(why), 0, true)) if starts < 3 => {
-                        // Died before its first frame with a hardware decoder: once in software.
-                        tracing::debug!(
-                            "frame source: {} failed with -hwaccel ({why}); retrying in software",
-                            layer.path
-                        );
-                        let seek = st.runs.iter().find(|r| r.id == id).map_or(t, |r| r.seek);
-                        let warm = target;
-                        let (back, spawned) = self.spawn(st, layer, source, seek, false, None, info, warm);
-                        st = back;
-                        mine = Some(spawned?);
-                        sw_retry = mine;
-                        starts += 1;
-                        continue;
-                    }
-                    Some((Life::Failed(why), _, _)) => {
+                    Some((Life::Ended, 0)) => return Ok(None),
+                    Some((Life::Failed(why), _)) => {
                         return Err(GpuError::Decode(format!("{}: {why}", layer.path)));
                     }
-                    Some((Life::Ended, _, _)) | None => mine = None,
-                    Some((Life::Starting | Life::Streaming, _, _)) => {
+                    Some((Life::Ended, _)) | None => mine = None,
+                    Some((Life::Starting | Life::Streaming, _)) => {
                         // It read past the target and the cache still cannot prove the frame
                         // (a seek that landed late, or a passed frame not kept): this run will
                         // not answer, so route again — an earlier start, or after two, A0's
@@ -709,9 +717,8 @@ impl FrameSource {
                                 stop(&mut st, e.run);
                             }
                             let warm = target.map(|tg| req.warm_from(&route).min(tg));
-                            let hw = kerf_core::decode_hwaccel().is_some();
                             let seek = t - lead_secs(lead);
-                            let (back, spawned) = self.spawn(st, layer, source, seek, hw, ticket, info, warm);
+                            let (back, spawned) = self.spawn(st, layer, source, seek, ticket, info, warm);
                             st = back;
                             mine = Some(spawned?);
                             want_ahead(&mut st, mine, target, ahead);
@@ -721,9 +728,8 @@ impl FrameSource {
                             st.stats.replaced += 1;
                             stop(&mut st, run);
                             let warm = target.map(|tg| req.warm_from(&route).min(tg));
-                            let hw = kerf_core::decode_hwaccel().is_some();
                             let seek = t - lead_secs(lead);
-                            let (back, spawned) = self.spawn(st, layer, source, seek, hw, ticket, info, warm);
+                            let (back, spawned) = self.spawn(st, layer, source, seek, ticket, info, warm);
                             st = back;
                             mine = Some(spawned?);
                             want_ahead(&mut st, mine, target, ahead);
@@ -779,14 +785,12 @@ impl FrameSource {
         layer: &PlanLayer,
         source: SourceId,
         seek: f64,
-        hw: bool,
         ticket: Option<Ticket>,
         info: Option<FileInfo>,
         warm: Option<i64>,
     ) -> (MutexGuard<'a, State>, Result<RunId, GpuError>) {
         let seek = seek.max(0.0);
-        let hwaccel = if hw { kerf_core::decode_hwaccel() } else { None };
-        let mut args = run_args(&layer.path, Some(&kerf_core::seek_arg(seek)), hwaccel.as_deref());
+        let mut args = run_args(&layer.path, Some(&kerf_core::seek_arg(seek)), None);
         let live = st.runs.iter().filter(|r| r.alive()).count();
         kerf_core::limit_ffmpeg_args(&mut args, live + 1);
         st.next_id += 1;
@@ -804,7 +808,6 @@ impl FrameSource {
             warm_from: warm.unwrap_or(i64::MIN),
             life: Life::Starting,
             frames: 0,
-            hw: hwaccel.is_some(),
             // The request starting it is its first waiter, so that nobody takes the run (it is
             // idle to the router, and the least recently used) while the lock is released below.
             waiters: 1,
@@ -833,15 +836,37 @@ impl FrameSource {
                 }
             });
 
-        let mut st = self.shared.lock();
+        let st = self.shared.lock();
+        self.attach(
+            st,
+            id,
+            source,
+            (layer.stream.width, layer.stream.height),
+            layer.stream.fps,
+            started,
+        )
+    }
+
+    /// Give the run `id`, entered by [`spawn`](Self::spawn) with no child, the process that was
+    /// started for it, and start its reader. A run that did not start, however it failed to
+    /// (the process, its pipes, a thread, or the run was stopped or reaped meanwhile), leaves
+    /// the table through [`abandon`](Self::abandon).
+    fn attach<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, State>,
+        id: RunId,
+        source: SourceId,
+        expected: (u32, u32),
+        fps: Option<f64>,
+        started: Result<(Child, ChildStdout, ChildStderr), String>,
+    ) -> (MutexGuard<'a, State>, Result<RunId, GpuError>) {
         let (child, stdout, stderr) = match started {
             Ok(parts) => parts,
             Err(why) => {
                 let now = self.shared.now();
                 let ticket = st.runs.iter_mut().find(|r| r.id == id).and_then(|r| r.ticket.take());
                 st.guard.finished(ticket, now, StartOutcome::Failed);
-                stop(&mut st, id);
-                return (st, Err(GpuError::Decode(why)));
+                return self.abandon(st, id, why);
             }
         };
         let child = Arc::new(Mutex::new(child));
@@ -854,9 +879,10 @@ impl FrameSource {
                 run.waiters = run.waiters.saturating_sub(1);
             }
             _ => {
-                // Stopped while the process was being started.
+                // Stopped while the process was being started (or reaped: it was wanted and
+                // silent, with no child yet to kill, for the whole of a slow start).
                 reap_later(child);
-                return (st, Err(GpuError::Decode("the run was stopped as it started".into())));
+                return self.abandon(st, id, "the run was stopped as it started".into());
             }
         }
         let (tx, rx) = mpsc::channel();
@@ -866,17 +892,28 @@ impl FrameSource {
             .name("kerf-frame-stderr".into())
             .spawn(move || read_stderr(stderr, &tx, &err_tail, ShowinfoParser::new()));
         let weak = Arc::downgrade(&self.shared);
-        let expected = (layer.stream.width, layer.stream.height);
-        let fps = layer.stream.fps;
         let reading = Arc::clone(&child);
         let reader = std::thread::Builder::new()
             .name("kerf-frame-run".into())
             .spawn(move || run_reader(&weak, id, source, stdout, &rx, &tail, expected, fps, &reading));
         if reader.is_err() {
-            stop(&mut st, id);
-            return (st, Err(GpuError::Decode("could not start a decode thread".into())));
+            return self.abandon(st, id, "could not start a decode thread".into());
         }
         (st, Ok(id))
+    }
+
+    /// A run that could not start: out of the table, with the starter's claim on it and its
+    /// child if it has one (`stop`), and everybody waiting on the source told, so a request
+    /// that joined the starting run routes afresh instead of sleeping out its deadline.
+    fn abandon<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, State>,
+        id: RunId,
+        why: String,
+    ) -> (MutexGuard<'a, State>, Result<RunId, GpuError>) {
+        stop(&mut st, id);
+        self.shared.changed.notify_all();
+        (st, Err(GpuError::Decode(why)))
     }
 
     /// A still image: decoded once without a seek, kept under its file.
@@ -938,15 +975,15 @@ impl FrameSource {
             }
             Some(_) => {}
         }
-        if !kerf_core::source_is_indexed_container(Path::new(&layer.path)) {
-            return Err(GpuError::Unsupported(format!(
-                "{}: not an MP4 / Matroska file (its seeks and timestamps are not the ones a run is checked against)",
-                layer.path
-            )));
-        }
-        let source = SourceId::of(Path::new(&layer.path));
-        if let Some(why) = self.shared.lock().distrusted.get(&source) {
-            return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
+        // A still image has no container to be indexed (it probes as `png_pipe`), as in `frame`.
+        if !layer.is_image {
+            if let Some(why) = unproven_for_runs(Path::new(&layer.path)) {
+                return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
+            }
+            let source = SourceId::of(Path::new(&layer.path));
+            if let Some(why) = self.shared.lock().distrusted.get(&source) {
+                return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
+            }
         }
         crate::FrameCursor::for_layer(layer, config)
     }
@@ -1219,10 +1256,9 @@ fn run_reader(
         let Some(sh) = shared.upgrade() else { return };
         let mut st = sh.lock();
         let tb = info.time_base;
-        let ft = frame_ticks(fps, tb);
         let known = st.files.entry(source).or_insert(FileInfo {
             time_base: tb,
-            frame_ticks: ft,
+            frame_ticks: frame_ticks(fps, tb),
         });
         if known.time_base != tb {
             let said = known.time_base;
@@ -1241,10 +1277,10 @@ fn run_reader(
             let seek = run.seek;
             let seek_tick = *run.seek_tick.get_or_insert_with(|| seek_ticks(seek, tb));
             // The first frame of a seeked run is the first at or after the seek tick, which is
-            // less than one frame interval away; a whole interval or more means the demuxer
-            // landed later than asked (the frame the one-shot decode returns is then not a
-            // function of the timestamps), and that frame vouches for nothing before itself.
-            let late = prev_pts.is_none() && seek > 0.0 && info.pts.saturating_sub(seek_tick) >= ft;
+            // less than one frame interval away; a whole interval or more (`late_ticks`) means
+            // the demuxer landed later than asked (the frame the one-shot decode returns is then
+            // not a function of the timestamps), and that frame vouches for nothing before itself.
+            let late = prev_pts.is_none() && seek > 0.0 && info.pts.saturating_sub(seek_tick) >= late_ticks(fps, tb);
             let covers_from = match prev_pts {
                 Some(p) => p.saturating_add(1),
                 // A run from the start of the file: nothing comes before its first frame, however
@@ -1437,6 +1473,126 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(5));
         let killed = hung.lock().unwrap().try_wait().expect("reaped");
         assert!(killed.is_some_and(|s| !s.success()), "the child is gone: {killed:?}");
+    }
+
+    /// A run in `src`'s table as `spawn` enters it (no child, its starter counted as a waiter), in
+    /// the life given.
+    #[cfg(unix)]
+    fn entered(src: &FrameSource, life: Life) -> RunId {
+        let mut st = src.shared.lock();
+        st.next_id += 1;
+        let id = RunId(st.next_id);
+        let now = Instant::now();
+        st.runs.push(Run {
+            id,
+            file: SourceId::of(Path::new("/media/a.mp4")),
+            seek: 2.0,
+            seek_tick: None,
+            head: i64::MIN,
+            want: i64::MIN,
+            warm_from: i64::MIN,
+            life,
+            frames: 0,
+            waiters: 1,
+            last_used: now,
+            last_progress: now,
+            ticket: None,
+            child: None,
+            ended_at: None,
+        });
+        id
+    }
+
+    /// A run that did not start (the process, or the run was reaped while it started — a slow
+    /// start is silence the reaper kills a wanted run for, with no child yet to kill) is out of the
+    /// table, with its starter's claim on it, and a request asleep on the source is woken to route
+    /// afresh instead of sleeping out its deadline. The reaped run's record used to stay for good
+    /// (a waiter that was never released) and nothing was woken.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_did_not_start_leaves_the_table_and_wakes_its_waiters() {
+        let reaped = |src: &FrameSource| {
+            let id = entered(src, Life::Failed("no frame for 31 s (killed)".into()));
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("sleep");
+            (id, Some(child))
+        };
+        let refused = |src: &FrameSource| (entered(src, Life::Starting), None);
+        for (name, make) in [("reaped", &reaped as &dyn Fn(&FrameSource) -> _), ("refused", &refused)] {
+            let src = FrameSource::new(FrameSourceConfig::default());
+            let (id, mut child) = make(&src);
+            let pid = child.as_ref().map(std::process::Child::id);
+            let started = match child.as_mut() {
+                Some(c) => Ok((c.stdout.take().unwrap(), c.stderr.take().unwrap())),
+                None => Err("could not run ffmpeg: no such file".to_string()),
+            };
+            let shared = &src.shared;
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let woken = std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    let st = shared.lock();
+                    ready_tx.send(()).unwrap();
+                    // Releases the lock as it sleeps.
+                    let (_st, timeout) = shared.changed.wait_timeout(st, Duration::from_secs(5)).unwrap();
+                    !timeout.timed_out()
+                });
+                ready_rx.recv().unwrap();
+                // Only gets the lock once the waiter sleeps.
+                let st = shared.lock();
+                let started = started.map(|(stdout, stderr)| (child.take().unwrap(), stdout, stderr));
+                let (st, result) = src.attach(st, id, SourceId::of(Path::new("/media/a.mp4")), (64, 48), None, started);
+                assert!(matches!(result, Err(GpuError::Decode(_))), "{name}: {result:?}");
+                assert!(st.runs.is_empty(), "{name}: the run is still in the table");
+                drop(st);
+                waiter.join().unwrap()
+            });
+            assert!(woken, "{name}: nobody was woken");
+            if let Some(pid) = pid {
+                // Killed and reaped on its own thread.
+                let gone = (0..100).any(|_| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    !std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success())
+                });
+                assert!(gone, "{name}: the child process {pid} was left running");
+            }
+        }
+    }
+
+    #[test]
+    fn a_landing_is_late_from_the_first_distance_a_gap_cannot_leave() {
+        let ms = Rational { num: 1, den: 1000 };
+        // 33.33 ticks a frame: frames 33 and 34 ticks apart, so 33 is a gap's remainder.
+        assert_eq!(late_ticks(Some(30.0), ms), 34);
+        assert_eq!(late_ticks(Some(30000.0 / 1001.0), ms), 34);
+        // 8.33: 8 and 9. 41.67 (24 fps): 41 and 42, so 41 is the largest remainder.
+        assert_eq!(late_ticks(Some(120.0), ms), 9);
+        assert_eq!(late_ticks(Some(24.0), ms), 42);
+        // Exact intervals: a whole one is late.
+        assert_eq!(late_ticks(Some(25.0), ms), 40);
+        assert_eq!(late_ticks(Some(25.0), Rational { num: 1, den: 12800 }), 512);
+        // 30000/1001 on 1/30000 is 1001 ticks, however the float prints, and so is 29.97.
+        let tb = Rational { num: 1, den: 30000 };
+        assert_eq!(late_ticks(Some(30000.0 / 1001.0), tb), 1001);
+        assert_eq!(late_ticks(Some(29.97), tb), 1001);
+        assert_eq!(late_ticks(Some(25.0), Rational { num: 1, den: 90000 }), 3600);
+        // Unknown rate: any distance.
+        assert_eq!(late_ticks(None, tb), 1);
+        assert_eq!(late_ticks(Some(0.0), tb), 1);
+        assert_eq!(late_ticks(Some(1e9), tb), 1);
+        // Never less than a frame is `frame_ticks`', never more than it plus one is this.
+        for fps in [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 119.88, 120.0, 12.0, 15.0] {
+            let (late, frame) = (late_ticks(Some(fps), ms), frame_ticks(Some(fps), ms));
+            assert!(late == frame || late == frame + 1, "{fps}: {late} against {frame}");
+        }
     }
 
     #[test]

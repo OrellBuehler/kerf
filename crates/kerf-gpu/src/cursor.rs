@@ -17,9 +17,10 @@
 //! a *later* keyframe (finding 5 of the design note): the run starts late, as the export's own
 //! `-ss` does, and the cursor answers over the frames it was given — the export's, not `select`'s,
 //! and not proven against it. [`FrameSource::cursor`](crate::FrameSource::cursor) refuses the
-//! containers that are not MP4 / Matroska (a transport stream among them) and a file a router run
-//! has marked one-shot, and cannot know of an open-GOP mp4 before one has: the same known limit
-//! as the still's. A repeated timestamp is a file's own (a time base that rounds two frames onto one
+//! containers that are not MP4 / Matroska (a transport stream among them), a file whose sync
+//! samples are not keyframes (intra refresh, and an open GOP wherever the decoder shows it) and a
+//! file a router run has marked one-shot, and cannot know of an open-GOP mp4 whose decode does
+//! not show it before a run has read its B-frames: the same known limit as the still's. A repeated timestamp is a file's own (a time base that rounds two frames onto one
 //! tick) and is taken as it comes (the stderr is read by
 //! [`ShowinfoParser::allowing_repeats`]; the frame cache's runs keep the strict parser).
 //!
@@ -65,7 +66,9 @@ pub struct CursorConfig {
     /// The most pixels a cursor holds at once (a reversed clip's window): past it the clip is
     /// `Unsupported`.
     pub window_cap_bytes: usize,
-    /// `-hwaccel` for the run (`None`: software).
+    /// `-hwaccel` for the run. `None` (the default) is software, which is what the one-shot
+    /// decode and the frame source's runs do: a hardware decoder is not always the software one.
+    /// An export that renders with a hardware decoder names it here.
     pub hwaccel: Option<String>,
 }
 
@@ -75,7 +78,7 @@ impl Default for CursorConfig {
             first_frame_timeout: Duration::from_secs(30),
             frame_timeout: Duration::from_secs(15),
             window_cap_bytes: 512 << 20,
-            hwaccel: kerf_core::decode_hwaccel(),
+            hwaccel: None,
         }
     }
 }

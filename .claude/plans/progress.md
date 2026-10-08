@@ -381,6 +381,43 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   more than its three runs: an app renders that frame with FFmpeg). Not done: the 6.1 leg (CI's parity
   job runs it).
 
+- **2026-10-08 — A1b-2 / A1b-3, second review of the frame source and the cursor ("when in doubt,
+  one-shot", again).** (1) *Intra refresh.* x264 `intra-refresh=1:bframes=0` (25 fps mp4) marks a sync
+  sample every 2 s but only frame 0 is a keyframe; `-ss 2.0` decodes from the sync sample, the decoder
+  outputs nothing until the refresh wave ends and the one-shot returns the frame at 2.72 s, where a run that
+  read through from an earlier keyframe cached the true 2.0 to 2.68 (forward play 18 of 75 differed, with
+  `distrusted == 0`: a run's own first frame is only checked at its own seek, and a run reading through
+  never seeks there). Decided per file before any run: `kerf_core::source_seek_points_are_keyframes` lists
+  the video packets (rungs of 16 / 64 / 256 / 1024 / 4096, until four sync samples are in view: an
+  all-intra proxy costs sixteen packets) and decodes just those with `-skip_frame nokey`; every `K` packet
+  must have an `I` picture with `key_frame` at its timestamp. The limit is stated, not hidden: it looks at
+  the file's head (two encodes joined are not caught); a probe that cannot tell is "no" (one-shot), retried
+  after a minute. Chosen over a lazy check inside the run (packet flags are not in `showinfo`, and listing
+  every sync sample of a long original reads the whole file) and over seeking at each sync sample
+  (`-read_intervals START%+#1`: faithful, but one seek per sample and it depends on how each build flushes
+  its decoder). Finding while wiring it: on 9.0.2 an x264 open GOP's sync samples fail the probe (the
+  decoder drops the reordered tail under `nokey`), so the open-GOP mp4 is now refused up front and the
+  cursor's known limit shrank to "an open GOP the decoder does not show"; the run's own B-frame check stays
+  and has a deterministic fake-`ffmpeg` test (`a_run_that_shows_a_b_frame_marks_the_file`) so it does not
+  depend on a build's decoder. (2) *Hardware decode.* Runs passed `decode_hwaccel()` and the one-shot never
+  did; a ProRes 4:2:2 10-bit `.mov` through 9.0.2's Vulkan decoder differed on 79 of 80 frames by up to 24
+  levels. Runs are software, the retry-in-software code is gone, and `CursorConfig::hwaccel` defaults to
+  `None` (an export names its decoder). (3) `FrameSource::cursor` refused every still image (a PNG probes
+  as `png_pipe`): exempt like `frame`, and the cursor's gates (transport stream, intra refresh, a file a
+  run marked, unrecorded / alpha pixel format) have a test. (4) *The late-seek threshold was the rounded
+  interval*: on a 1 ms time base 30 fps is 33.33 ticks, gaps are 33 and 34, and a seek just after a 34 ms
+  gap's start reads its first frame 33 ticks on, which `>= 33` called late and marked healthy 30 / 29.97 /
+  120 fps mkv and webm files one-shot for good. `late_ticks` is the interval rounded up; an integral
+  interval (every 25 fps file here) is unchanged, so the open-GOP and x265 landings are caught as before.
+  The residual is stated in CLAUDE.md. (5) `source_traits` ran an unbounded `ffprobe` on the request path
+  and respawned it on every frame after a failure: it is killed after 20 s, one probe however many threads
+  ask, a failure remembered for 60 s (`ProbeCache`, shared with the seek-point probe). (6) A run the reaper
+  failed while it was still starting (a slow spawn is silence) left its record and its starter's claim in
+  the table, and a spawn failure woke nobody, so a request that had joined the run slept out its deadline:
+  every failed start leaves through one `abandon` (`stop` + `notify_all`), mutation-checked. Not verified
+  here: FFmpeg 6.1 (CI's parity job), a proxy made by a hardware encoder through the probe (a `-g 1` x264
+  proxy passes).
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.

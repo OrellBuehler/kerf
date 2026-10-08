@@ -73,6 +73,7 @@ fn layer(a: &Asset, t: f64) -> kerf_core::PlanLayer {
 ///
 /// * `hang.mp4` sleeps without a word, `die.mp4` exits 1 at once.
 /// * `closed.mp4` writes three frames, closes its output and never exits.
+/// * `bframe.mp4`: a run writes two I/P frames, then a B-frame, and sleeps.
 /// * `slow.mp4`: a run at the seek 1.99 s (past its end) takes a second and writes nothing.
 /// * `conflict.mp4`: its first run writes frames 3..10 of one picture, a later one frames 0..10 of
 ///   another (the same pts, other pixels) and then sleeps, as a container that guesses its pts does.
@@ -86,8 +87,8 @@ fn wrapper() -> &'static PathBuf {
         let wrapper = dir.join("ffmpeg-wrapper.sh");
         let script = r#"#!/bin/sh
 dir=$(dirname "$0")
-frame() { # pts, n, picture value
-  echo "[Parsed_showinfo_0 @ 0x1] n:$2 pts:$1 pts_time:0 duration:1 i:P iskey:0 type:I " >&2
+frame() { # pts, n, picture value, picture type
+  echo "[Parsed_showinfo_0 @ 0x1] n:$2 pts:$1 pts_time:0 duration:1 i:P iskey:0 type:${4:-I} " >&2
   printf 'FRAME\n'
   head -c 21600 /dev/zero | tr '\0' "\\$(printf '%03o' $3)"
 }
@@ -99,6 +100,11 @@ case "$*" in
     printf 'YUV4MPEG2 W160 H90 F25:1 Ip A1:1 C420jpeg\n'
     frame 0 0 60; frame 1 1 60; frame 2 2 60
     exec >&-
+    exec sleep 600 ;;
+  *bframe.mp4*showinfo*)
+    echo '[Parsed_showinfo_0 @ 0x1] config in time_base: 1/25, frame_rate: 25/1' >&2
+    printf 'YUV4MPEG2 W160 H90 F25:1 Ip A1:1 C420jpeg\n'
+    frame 0 0 60; frame 1 1 60; frame 2 2 60; frame 3 3 60 B; frame 4 4 60
     exec sleep 600 ;;
   *-ss\ 1.990000\ -i\ *slow.mp4*showinfo*) sleep 1; exit 0 ;;
   *conflict.mp4*showinfo*)
@@ -199,6 +205,39 @@ fn a_run_that_closes_its_output_and_never_exits_blocks_nothing_that_stops_it() {
     stopper.join().unwrap();
     assert_eq!(stats.runs, 0, "{stats:?}");
     let _ = asking.join();
+}
+
+/// The first B-frame a run shows ends the run and marks the file (B-frames are shown out of decode
+/// order, and a seek into the frames a keyframe leads returns the keyframe): no run is trusted on
+/// it again, a cursor is refused, and the real decode answers. Held with a fake `ffmpeg` so that it
+/// is the run's check that is exercised, whatever the seek-point probe makes of a real file.
+#[test]
+#[ignore = "needs ffmpeg and sh"]
+fn a_run_that_shows_a_b_frame_marks_the_file() {
+    let dir = wrapper();
+    let bframe = clip(dir, "bframe.mp4");
+    let src = FrameSource::new(FrameSourceConfig::default());
+    assert!(src.runs_enabled());
+    let cursor_of = |l: &kerf_core::PlanLayer| src.cursor(l, kerf_gpu::CursorConfig::default());
+    assert!(
+        cursor_of(&layer(&bframe, 0.5)).is_ok(),
+        "nothing is known against the file yet"
+    );
+    // The run reads on to frame 4, passing the B-frame that is frame 3; the request is answered by
+    // the one-shot decode once the file is marked.
+    let l = layer(&bframe, 4.0 / 25.0);
+    let got = src.frame(&l, Hint::Scrub).expect("a frame");
+    assert_eq!(got.as_deref(), decode_layer(&l).unwrap().as_ref());
+    let until = Instant::now() + Duration::from_secs(10);
+    while src.stats().distrusted == 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stats = src.stats();
+    assert_eq!(stats.distrusted, 1, "the B-frame was not noticed: {stats:?}");
+    let l = layer(&bframe, 0.5);
+    let got = src.frame(&l, Hint::Scrub).expect("a frame");
+    assert_eq!(got.as_deref(), decode_layer(&l).unwrap().as_ref());
+    assert!(matches!(cursor_of(&l), Err(GpuError::Unsupported(_))), "a cursor was opened");
 }
 
 /// Another run's pictures at the pts an earlier run cached: the run fails, the file is decoded

@@ -66,7 +66,9 @@ so the feature is **only** activated through these forwards — which is what ma
   that it is padded is a fact about the *file*, so it travels in the name
   (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
-  lead and the container. The clone is a frame the original has no counterpart
+  lead and the container — killed after 20 s, one probe however many threads ask, a failure
+  remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
+  GPU frame source's seek-point probe sits behind too). The clone is a frame the original has no counterpart
   for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
   from the very head of the source) would hold it for `lead` while the export
   starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
@@ -1756,13 +1758,35 @@ read through from an earlier keyframe has the frame itself (49, against the one-
 transport stream lands on the next keyframe whatever is asked, and a run from 0 did not. So runs
 answer only where they can be proved equal, and everything else is **one-shot, per file, from the
 first thing that shows it** (`State::distrusted`, `SourceStats::distrusted`; the cost is speed, never
-a frame):
+a frame — **within the limits stated below**: the seek-point probe looks at a file's head, and a
+timestamp on a coarse time base can hide a late landing of exactly one rounded tick):
 - **The container** is MP4 / MOV or Matroska / WebM (`kerf_core::source_is_indexed_container`, one
   cached `ffprobe` a file, off the lock): a positive allow-list, so a transport stream, AVI (whose
   pts are guessed, and guessed differently run to run: the same pts held two pictures and the
   cache's `debug_assert!` panicked a run's thread under the lock), program and elementary streams
   and a file the probe could not name go one-shot before any run. `FrameSource::cursor` refuses
-  them too.
+  them too (a still image is let through by both: it has no container to be indexed, it probes as
+  `png_pipe`).
+- **A seek into the file must be a decode from a keyframe**
+  (`kerf_core::source_seek_points_are_keyframes`, `engine/source_probe.rs`, one cached, bounded
+  probe a file, off the lock; `FrameSource::cursor` refuses a file that fails it too).
+  `-ss T` seeks to the last *sync sample* (the packets flagged `K`) at or before `T` and returns the
+  first picture the decoder outputs at or after `T`; that is the frame at `T` only if the decoder
+  outputs the sync sample's own picture first. x264's `intra-refresh` marks the start of every
+  refresh wave a sync sample but codes it as a P picture, and the decoder outputs nothing until the
+  wave is over: `-ss 2.0` returns 2.72 s, where a run that read through from an earlier keyframe has
+  the true frames 2.0 to 2.68 (forward play: 18 of 75 answers differed with nothing distrusted: a
+  run's own first frame is only checked at *its* seek, and a run reading through never seeks there). The probe lists the first packets of the video stream (16, 64, 256, 1024,
+  4096 — as many rungs as it takes to see four sync samples, so an all-intra stream costs sixteen
+  packets and a long GOP the rung that holds its first few) and decodes just those with
+  `-skip_frame nokey`, requiring a picture of type `I` with `key_frame` set at **every sync
+  sample's timestamp**; a file where one is missing, one with no sync sample in view and one the
+  probe could not read (a failure, 20 s, a timestamp `ffprobe` does not print) is "no" and goes
+  one-shot. **Limit: it looks at the file's head** (the first four sync samples), so two encodes
+  joined, the first with keyframes and the second with intra refresh, is not caught; intra refresh
+  is a property of a whole encode. B-frame streams are a different case with the same outcome: a
+  closed GOP's keyframes pass, an open GOP's often do not (the decoder drops its reordered tail),
+  and `State::distrusted` catches the rest at their first B-frame.
 - **Only I and P pictures** (`ShowFrame::pict`, the `type:` of the `showinfo` line; the self-test
   fails a build that does not print it): the first B frame a run reads ends the run and marks the
   file. That is every open-GOP file (x264 `open-gop=1`, x265's default) and, deliberately, closed-GOP
@@ -1772,7 +1796,16 @@ a frame):
   less than one frame interval away; **one interval or more** marks the file (it was two intervals,
   which let a landing one or two frames late through, and the frame's coverage was claimed from
   `pts - ft`, so cache history decided the answer). A frame that landed late claims nothing before
-  itself. This also marks a variable-frame-rate file the first time a seek falls in a gap of a frame
+  itself. "One interval" is `late_ticks`, the interval **rounded up** (`ceil` of the exact ticks, with a
+  float-noise guard), not `frame_ticks`' rounded one: on a millisecond time base a 30 fps interval is
+  33.33 ticks and the frames are 33 and 34 apart, so a seek just after a frame that a 34 ms gap follows
+  reads its first frame 33 ticks on without anything being skipped, and `>= 33` marked 30, 29.97 and
+  120 fps mkv / webm files (a seek in about one in a hundred) for good. The price, stated exactly: when
+  the interval is not a whole number of ticks, a landing one *short* frame late from a seek that was
+  on a frame's own tick (a distance of `ceil - 1`) reads as not late; that frame is still the
+  one-shot's for that seek, and only a frame another run cached could answer a later request
+  differently. An interval of a whole number of ticks (25 fps on 1/1000 or 1/12800, 30000/1001 on
+  1/30000) keeps the old test: an open GOP's landing a whole interval late is caught as before. This also marks a variable-frame-rate file the first time a seek falls in a gap of a frame
   or more (the `vfr` leg of `tests/frame_source.rs` is that case: 79 of 80 answers are one-shot, equal
   to the one-shot decode and no faster).
 - **A file that contradicts itself**: a time base that changes between runs, timestamps that cannot
@@ -1787,8 +1820,14 @@ asserts the **rendered** RGBA of `render_plan_with` equals `render_plan`'s, bit 
 cases in two orders and both hints; `tests/frame_source.rs` walks a 29.97 mp4 and a jittered-pts mp4
 (trusted: runs answer, in forward, backward and random order, every answer equal) and an open-GOP
 x264, an x265 and a long-GOP transport stream (the files above: forward, backward and random through
-one source each, every answer equal to the one-shot's, and the stats say which went one-shot), plus
-six threads at once. The rules it holds to:
+one source each, every answer equal to the one-shot's, and the stats say which went one-shot), an
+x264 `intra-refresh` mp4 (forward play, near each sync sample, backward, random: no run is started;
+without the seek-point probe 18 of 75 forward answers differed with nothing distrusted), a ProRes
+4:2:2 10-bit `.mov` and an all-intra x264 (the proxy's shape) answered from software runs, a 30 fps
+mkv on a millisecond time base (a fresh source for each time that falls just after a 34 ms gap), a
+cursor gating leg (`FrameSource::cursor` over each refusal and a still image) and, in
+`tests/frame_source_fake.rs`, a fake `ffmpeg` whose run shows a B-frame (the run's own check, whatever
+a real file's probe makes of it), plus six threads at once. The rules it holds to:
 - A run's first frame covers from its seek tick (within a frame interval of it, see above); a run
   **from 0** covers everything before its first frame (a late-starting picture). A clean end calls
   `mark_end` (a time past it is `Ok(None)`, no decode); a clean run with **no** frame is a seek
@@ -1822,8 +1861,13 @@ six threads at once. The rules it holds to:
   base behave otherwise than the two measured, 6.1.1 and 9.0.2) the process decodes with
   `decode_layer`, as does
   `KERF_FRAME_SOURCE=oneshot` and any asset that never recorded its pixel format.
-- Hardware decode is `kerf_core::decode_hwaccel()` (now public); a run that dies before its
-  first frame with it is retried once in software, and success calls `disable_decode_hwaccel`.
+- **Runs decode in software, as the one-shot does** (`run_args(.., hwaccel: None)`; `decode_args` has
+  never carried `-hwaccel`). They used to pass `kerf_core::decode_hwaccel()` (`auto` by default), and a
+  hardware decoder is not always the software one: a ProRes 4:2:2 10-bit `.mov` through FFmpeg 9.0.2's
+  Vulkan decoder (lavapipe is enough) differed from the one-shot on 79 of 80 frames, by up to 24
+  levels. The retry-in-software / `disable_decode_hwaccel` dance went with it. `CursorConfig::hwaccel`
+  stays a knob and now defaults to `None`: the export that opens a cursor says which decoder its
+  render uses.
 - `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
   holds a run that hangs and one that dies to a prompt `GpuError::Decode`, a run that closes its
   output and never exits (`release` must not wait on it) and a second run whose pictures differ
@@ -1848,7 +1892,8 @@ a long-GOP transport stream, which `FrameSource::cursor` refuses up front along 
 containers that are not MP4 / Matroska) starts the run late, as the export's own `-ss` does, and the
 cursor answers over the frames it was given — the export's, not `select`'s over the whole file, and
 not proven against the export. `FrameSource::cursor` refuses a file a router run has already marked
-(it cannot know of an open-GOP mp4 before one has): the same known limit as the still's. It
+(it cannot know of an open-GOP mp4 whose sync samples the decoder shows as keyframes before a run
+has read its B-frames): the same known limit as the still's. It
 keeps every timestamp read but only the pixels a later pick can show: `keep_from` once decided and,
 while a forward pick is undecided, the newest frame (output frames the caller skips are read through,
 not held); a forward clip holds a frame or two, a **reversed** one its whole window, capped by
@@ -1863,7 +1908,8 @@ the child's lock; the router's `run_reader` the same, `EXIT_GRACE`), a size or l
 does not draw is `Unsupported` (not a failed decode), a thread that cannot be started kills the child,
 and `Drop` kills the run. `FrameSource::cursor(layer, config)` opens one where runs are trusted
 (refused: the self-test failed, an unrecorded or alpha pixel format, a container that is not
-MP4 / Matroska, a file a router run has marked one-shot);
+MP4 / Matroska — a still image excepted — , a file whose sync samples are not keyframes, a file a
+router run has marked one-shot; `tests/frame_source.rs` holds each gate);
 `cursor::picks_through(cursor, pick, frames, |frame, shown| ..)` is the per-clip loop an export
 makes, handing each frame to a callback as it is decided (a long clip is never held whole).
 `tests/cursor.rs` (`#[ignore]`d, both FFmpegs in CI's parity job; 9.0.2 run here) decodes lossless
