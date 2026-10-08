@@ -57,6 +57,11 @@ pub mod cpu;
 mod audio;
 pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
 
+// Decoded audio as an interleaved f32 buffer (through the ffmpeg binary) and a WAV
+// writer for tests and debug renders.
+mod pcm;
+pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
 // transcript surface works in the `--no-default-features` build too.

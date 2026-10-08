@@ -658,7 +658,7 @@ pub(super) fn drain_tail(mut stderr: impl Read) -> String {
 /// and hand them, whole frames only, to `on_frames`, until it ends. A child that
 /// produces nothing for `stall` is killed and the call fails; a non-zero exit
 /// fails it too. Always reaps the child.
-fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
+pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_handle = std::thread::spawn(move || drain_tail(stderr));
 

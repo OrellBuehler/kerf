@@ -88,6 +88,12 @@
   surface adds its own transport. No video stream is `InvalidArgument`; the
   `get_filmstrip` Tauri command is `require_asset` under the lock, then
   `Project::decode_filmstrip` with it released.
+- `pcm.rs` (always compiled, CLI only): `AudioBuffer {sample_rate, channels, samples}`
+  (interleaved f32) and `decode_audio(path, rate, channels)` — the ffmpeg binary
+  resamples and remixes (`-ar` / `-ac`), so there is no Rust decoder or resampler. A
+  whole-file decode, so it takes `cpu::lease`; the pipe goes through `peaks.rs`'s
+  `pump_pcm`, so a decode silent for 60 s is killed. `write_wav` / `wav_bytes` write
+  32-bit float WAV for test fixtures and debug renders (no `hound`).
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against
