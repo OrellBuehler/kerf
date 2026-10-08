@@ -36,6 +36,10 @@ pub struct Settings {
     /// UI covers a vertical cut. Off by default: it is a check you turn on,
     /// not a view you cut behind.
     pub safe_areas: bool,
+    /// Whether the Preview panel is drawn by the GPU compositor in a native surface where
+    /// the plan allows it, instead of FFmpeg's JPEG for every frame. Experimental, and off
+    /// by default: the surface is confirmed on Linux/X11 only (see `gpu_preview`).
+    pub gpu_preview: bool,
     /// The workspace arrangement (dockview's serialized layout). Opaque here:
     /// the frontend validates it and falls back to its default layout.
     pub layout: Option<serde_json::Value>,
@@ -62,6 +66,7 @@ impl Default for Settings {
             cpu_percent: kerf_core::DEFAULT_CPU_PERCENT,
             transcribe: true,
             safe_areas: false,
+            gpu_preview: false,
             layout: None,
             theme: None,
             workspaces: None,
@@ -91,6 +96,7 @@ pub struct SettingsView {
     pub cpu_percent: u8,
     pub transcribe: bool,
     pub safe_areas: bool,
+    pub gpu_preview: bool,
     pub cpu_cores: usize,
     pub cpu_threads: usize,
     pub cpu_min_percent: u8,
@@ -111,6 +117,7 @@ impl SettingsView {
             cpu_percent: kerf_core::cpu_percent(),
             transcribe: kerf_core::transcription_enabled(),
             safe_areas: safe_areas(),
+            gpu_preview: stored.gpu_preview,
             cpu_cores: kerf_core::cpu_cores(),
             cpu_threads: kerf_core::cpu_threads(),
             cpu_min_percent: kerf_core::MIN_CPU_PERCENT,
@@ -129,10 +136,11 @@ impl SettingsView {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`].
-const KEYS: [&str; 7] = [
+const KEYS: [&str; 8] = [
     "cpu_percent",
     "transcribe",
     "safe_areas",
+    "gpu_preview",
     "layout",
     "theme",
     "workspaces",
@@ -292,6 +300,7 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"cpu_percent": 50}"#).unwrap();
         assert_eq!(s.cpu_percent, 50);
         assert!(s.transcribe);
+        assert!(!s.gpu_preview, "the GPU preview is opt-in");
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
         assert!(s.workspaces.is_none());
@@ -413,6 +422,17 @@ mod tests {
     }
 
     #[test]
+    fn the_gpu_preview_is_a_patchable_field_and_reaches_the_view() {
+        let base = Settings::default();
+        let on = merge(&base, &serde_json::json!({"gpu_preview": true})).unwrap();
+        assert!(on.gpu_preview);
+        assert_eq!(on.cpu_percent, base.cpu_percent, "nothing else moved");
+        assert!(SettingsView::current(&on).gpu_preview);
+        assert!(!SettingsView::current(&base).gpu_preview);
+        assert!(merge(&base, &serde_json::json!({"gpu_preview": "yes"})).is_err());
+    }
+
+    #[test]
     fn a_null_in_a_patch_clears_a_field() {
         let base = Settings {
             theme: Some(serde_json::json!({"name": "Mine"})),
@@ -450,6 +470,7 @@ mod tests {
         let s = Settings {
             cpu_percent: 33,
             safe_areas: true,
+            gpu_preview: true,
             keybindings: Some(keybindings.clone()),
             ..Settings::default()
         };
@@ -457,6 +478,7 @@ mod tests {
         let back = load_from(&file);
         assert_eq!(back.cpu_percent, 33);
         assert!(back.safe_areas);
+        assert!(back.gpu_preview);
         assert_eq!(back.keybindings, Some(keybindings));
         std::fs::remove_dir_all(&dir).unwrap();
     }

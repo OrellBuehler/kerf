@@ -13,6 +13,7 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod gpu_preview;
 mod mcp;
 mod settings;
 
@@ -23,8 +24,8 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, TimeRange,
-    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
+    TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1244,11 +1245,56 @@ fn add_keyframe(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// With `prop`, one number's segment alone; without, the transform key at `time` (the
+/// bundle's and every transform number's own track).
 #[tauri::command(async)]
-fn set_keyframe_easing(state: State<'_, AppState>, clip_id: String, time: f64, easing: kerf_core::Easing) -> CmdResult<Timeline> {
+fn set_keyframe_easing(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    easing: kerf_core::Easing,
+    prop: Option<Property>,
+) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.set_keyframe_easing(id, time, easing).map_err(|e| e.to_string())?;
+    match prop {
+        Some(prop) => project.set_property_easing(id, prop, time, easing),
+        None => project.set_keyframe_easing(id, time, easing),
+    }
+    .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Replace the keys of one animatable number — a transform number, a colour number or the
+/// clip's volume. No keys leaves it static.
+#[tauri::command(async)]
+fn set_property_keyframes(
+    state: State<'_, AppState>,
+    clip_id: String,
+    prop: Property,
+    keys: Vec<PropertyKey>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_property_keyframes(id, prop, keys).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Copy the animation of `props` (every keyed number when empty) from one clip to another,
+/// `offset` seconds later.
+#[tauri::command(async)]
+fn copy_keyframes(
+    state: State<'_, AppState>,
+    from_clip_id: String,
+    to_clip_id: String,
+    props: Option<Vec<Property>>,
+    offset: Option<f64>,
+) -> CmdResult<Timeline> {
+    let (from, to) = (id(&from_clip_id)?, id(&to_clip_id)?);
+    let project = state.project();
+    project
+        .copy_keyframes(from, to, &props.unwrap_or_default(), offset.unwrap_or(0.0))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1693,6 +1739,51 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
         Ok(format!("data:image/jpeg;base64,{b64}"))
     })
     .await
+}
+
+/// The frame under the playhead for the Preview panel, through the GPU compositor when that is
+/// on and draws it exactly, else FFmpeg's JPEG — the same one `get_timeline_frame` returns, in
+/// the same call, with the reasons the GPU did not draw it.
+///
+/// `overlays` is the page saying it has something to draw over the picture (a title box, the trim
+/// monitor, safe-area guides): a surface that sits above the page cannot show those, so such a
+/// frame is the JPEG. See [`gpu_preview`]; GUI-only, so there is no MCP tool.
+#[tauri::command]
+async fn get_preview_frame(
+    state: State<'_, AppState>,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    time_secs: f64,
+    max_width: Option<u32>,
+    overlays: Option<bool>,
+) -> CmdResult<gpu_preview::PreviewFrameResult> {
+    let shared = state.project.clone();
+    let gpu = gpu.inner().clone();
+    blocking(move || {
+        // The inputs are taken under the lock and the guard is gone before anything is
+        // planned from files, decoded, rendered or presented.
+        gpu.frame(
+            || gpu_preview::plan_inputs(&lock_user(&shared)),
+            time_secs,
+            max_width.unwrap_or(960),
+            overlays.unwrap_or(false),
+        )
+    })
+    .await
+}
+
+/// Where the Preview frame is in the window (device pixels, relative to the webview) and whether
+/// the native surface should be showing. Called on mount, resize, dock moves, workspace switches
+/// and window moves; cheap, and it never waits for a render.
+#[tauri::command(async)]
+fn set_preview_bounds(gpu: State<'_, Arc<gpu_preview::GpuPreview>>, bounds: gpu_preview::BoundsReport) -> CmdResult<()> {
+    gpu.set_bounds(&bounds)
+}
+
+/// What the GPU preview is doing on this machine: the setting, whether the platform has a surface
+/// technique, whether a device is up, and why not when it is not.
+#[tauri::command(async)]
+fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuPreviewStatus {
+    gpu.status()
 }
 
 /// One composited frame pushed to the webview during playback.
@@ -2336,8 +2427,20 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
 /// the dialog can show the clamped percentage and the cores it works out to
 /// without a second round-trip.
 #[tauri::command(async)]
-fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings::SettingsView> {
+fn set_settings(
+    app: AppHandle,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    patch: serde_json::Value,
+) -> CmdResult<settings::SettingsView> {
     let stored = settings::update(&app, &patch)?;
+    if patch.get("gpu_preview").is_some() {
+        // The flag flips here, now: the page asks for its next frame as soon as this returns. Only
+        // the teardown of turning it off, which may wait for a frame in flight, is off this thread.
+        if gpu.set_enabled(stored.gpu_preview) {
+            let gpu = gpu.inner().clone();
+            std::thread::spawn(move || gpu.teardown_if_off());
+        }
+    }
     Ok(settings::SettingsView::current(&stored))
 }
 
@@ -2880,7 +2983,21 @@ pub fn run() {
             install_panic_hook();
             use_bundled_ffmpeg();
             // Before anything can spawn ffmpeg: how much of the machine it may take.
-            settings::apply(&settings::load(app.handle()));
+            // The previous run died during the GPU preview's first frame (a driver crash): it must not
+            // do it again on every launch, so the setting goes off before it is read.
+            let crashed = gpu_preview::take_crash_marker_in(app.handle());
+            if crashed {
+                tracing::warn!("the last run ended while the GPU preview was starting; turning the setting off");
+                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview": false })) {
+                    tracing::warn!(error = %e, "could not turn the GPU preview setting off");
+                }
+            }
+            let stored = settings::load(app.handle());
+            settings::apply(&stored);
+            // The GPU preview builds nothing until a frame wants it; this is only the setting.
+            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed));
+            gpu.set_enabled(stored.gpu_preview);
+            app.manage(gpu);
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 os = std::env::consts::OS,
@@ -2975,6 +3092,8 @@ pub fn run() {
             set_keyframes,
             add_keyframe,
             set_keyframe_easing,
+            set_property_keyframes,
+            copy_keyframes,
             clear_keyframes,
             set_reframe,
             set_asset_projection,
@@ -3016,6 +3135,9 @@ pub fn run() {
             revert_to,
             get_frame,
             get_timeline_frame,
+            get_preview_frame,
+            set_preview_bounds,
+            gpu_preview_status,
             start_playback,
             stop_playback,
             get_waveform,

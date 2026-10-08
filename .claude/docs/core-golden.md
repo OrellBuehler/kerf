@@ -6,9 +6,13 @@
   chroma, reframe, HDR, overlays, delivery format and fit, the audio mix, and **every
   `ExportOptions` field** with the one-, two- and no-pass encoder spellings), plus **800
   appended** with a master bus (`master_for`, no dice of its own, so the first 4000 never
-  moved — a new family appends blocks, it does not re-bless old ones), have their
+  moved — a new family appends blocks, it does not re-bless old ones) and **800 more** with
+  per-property channels (`channels_for`: colour numbers, a volume, some transform numbers keyed beside
+  the rest, a number taken off a legacy bundle or held static by an empty track — on its own dice
+  seeded by case and clip, so `0..4800` are the digests the commit before channels gave; coverage
+  families `colour-keyed-*`, `volume-keyed*`, `channel-*`), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 48 block digests each in
+  FNV-1a digests, committed as 56 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and

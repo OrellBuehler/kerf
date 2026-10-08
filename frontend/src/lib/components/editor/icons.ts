@@ -73,7 +73,8 @@ import {
 	GalleryHorizontal,
 	ArrowLeftRight,
 	Link2,
-	Unlink2
+	Unlink2,
+	Menu
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -154,7 +155,8 @@ export const icons: Record<string, LucideIcon> = {
 	'arrow-left-right': ArrowLeftRight,
 	// Linked A/V: the chain on a linked clip, and the broken one for taking it apart.
 	'link': Link2,
-	'unlink': Unlink2
+	'unlink': Unlink2,
+	'menu': Menu
 };
 
 export type IconName = keyof typeof icons;

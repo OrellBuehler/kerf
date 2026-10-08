@@ -388,3 +388,165 @@ export function sameArrangement(
 export function openPanelIds(layout: SerializedDockview): PanelId[] {
 	return Object.keys(layout.panels).filter(isPanelId);
 }
+
+// ---- keeping a stored layout up to date -------------------------------------
+//
+// A stored layout is a snapshot, and a snapshot does not learn about a panel a
+// later build adds to its workspace's preset (the mixer in Audio). So each one
+// is stored with the panels its preset offered at the time (`workspaces.ts`),
+// and a panel the preset offers now that the layout was never offered is put
+// into it where the preset puts it. A panel the layout *was* offered and does
+// not hold is one the user closed, and stays closed.
+
+/** The panels a workspace's preset opens. */
+export function presetPanelIds(id: WorkspaceId): PanelId[] {
+	return openPanelIds(PRESET_LAYOUTS[id]);
+}
+
+/** What a layout stored before layouts recorded it was offered: the panels of
+ *  each preset as they stood when that was the only kind there was — every
+ *  preset as it is now, bar the mixer Audio gained. */
+export const UNSTAMPED_OFFERED: Record<WorkspaceId, PanelId[]> = Object.fromEntries(
+	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer')])
+) as Record<WorkspaceId, PanelId[]>;
+
+/** Presets as an earlier build shipped them, for the ones that changed shape
+ *  and not just size. The build that wrote a layout for every workspace the
+ *  user merely visited left a copy of the preset of its day; a copy of one of
+ *  these is nobody's arrangement and becomes today's preset rather than a
+ *  layout with a panel cut into it. */
+export const EARLIER_PRESETS: Partial<Record<WorkspaceId, SerializedDockview>> = {
+	// Before the mixer: a tall timeline and the inspector wide.
+	audio: preset(
+		330,
+		[
+			leaf('library', ['library'], 280),
+			leaf('preview', ['preview'], 740),
+			leaf('inspector', ['inspector', 'agent'], 420)
+		],
+		464
+	)
+};
+
+interface Spot {
+	leaf: Leaf;
+	/** The array the leaf sits in, and where. */
+	siblings: Node[];
+	index: number;
+	/** How deep that array is: the root's children are level 0. */
+	level: number;
+}
+
+function findLeaf(nodes: Node[], level: number, has: (views: string[]) => boolean): Spot | null {
+	for (let i = 0; i < nodes.length; i++) {
+		const n = nodes[i];
+		if (n.type === 'leaf') {
+			if (has(n.data.views)) return { leaf: n, siblings: nodes, index: i, level };
+		} else {
+			const found = findLeaf(n.data, level + 1, has);
+			if (found) return found;
+		}
+	}
+	return null;
+}
+
+function leavesOf(node: Node): Leaf[] {
+	return node.type === 'leaf' ? [node] : node.data.flatMap(leavesOf);
+}
+
+/** The way the children of the branch at `level` are laid out: the root's along
+ *  the grid's own orientation, each level down across the one above. */
+function axisAt(root: Orientation, level: number): Orientation {
+	if (level % 2 === 0) return root;
+	return root === VERTICAL ? HORIZONTAL : VERTICAL;
+}
+
+/** Cut a new group for `id` into `anchor`'s row, on the side `side`, taking the
+ *  share the preset gives it out of what is there. Null when the sizes of the
+ *  row are not numbers to work with. */
+function placeBeside(
+	anchor: Spot,
+	side: 'before' | 'after',
+	made: Leaf,
+	share: number,
+	minimum: number | undefined
+): boolean {
+	const row = anchor.siblings;
+	if (!row.every((n) => typeof n.size === 'number' && n.size > 0)) return false;
+	const total = row.reduce((sum, n) => sum + (n.size as number), 0);
+	const want = Math.min(Math.max(Math.round(share * total), minimum ?? 0, 1), Math.floor(total * 0.75));
+	const keep = (total - want) / total;
+	let used = 0;
+	for (const n of row) {
+		n.size = Math.max(1, Math.round((n.size as number) * keep));
+		used += n.size;
+	}
+	made.size = Math.max(1, total - used);
+	row.splice(anchor.index + (side === 'after' ? 1 : 0), 0, made);
+	return true;
+}
+
+/** `layout` with `id` put where `preset` puts it, or null when `preset` has no
+ *  such panel. Reliable by construction, in order of preference:
+ *  1. tabbed with a panel it shares a group with in the preset, if that is there;
+ *  2. in a group of its own beside the nearest panel it sits next to in the
+ *     preset, taking the share the preset gives it (when that panel's row runs
+ *     the same way as the preset's);
+ *  3. as a tab in the group holding the preview (or, failing that, any group).
+ *  So a layout is never reset to make room, and the panel is always reachable. */
+export function insertPanel(layout: SerializedDockview, id: PanelId, preset: SerializedDockview): SerializedDockview | null {
+	const out = structuredClone(layout);
+	const mine = (out.grid.root as Branch).data;
+	if (findLeaf(mine, 0, (v) => v.includes(id))) return out;
+	const where = findLeaf((preset.grid.root as Branch).data, 0, (v) => v.includes(id));
+	if (!where) return null;
+
+	const done = () => {
+		out.panels[id] = panelState(id);
+		return out;
+	};
+
+	// 1. Beside its tab mates.
+	for (const mate of where.leaf.data.views) {
+		if (mate === id) continue;
+		const found = findLeaf(mine, 0, (v) => v.includes(mate));
+		if (!found) continue;
+		const at = where.leaf.data.views.indexOf(id);
+		found.leaf.data.views.splice(Math.min(at, found.leaf.data.views.length), 0, id);
+		return done();
+	}
+
+	// 2. A group of its own next to a neighbour.
+	const axis = axisAt(preset.grid.orientation, where.level);
+	const groups = new Set<string>();
+	groupIds(mine, groups);
+	const taken = (gid: string) => groups.has(gid);
+	let gid = where.leaf.data.id;
+	for (let n = 2; taken(gid); n++) gid = `${id}-${n}`;
+	const share = shares(where.siblings)[where.index];
+	const spec = PANELS[id];
+	const minimum = axis === HORIZONTAL ? spec.minimumWidth : spec.minimumHeight;
+	for (let k = 1; k < where.siblings.length; k++) {
+		for (const [at, side] of [
+			[where.index - k, 'after'],
+			[where.index + k, 'before']
+		] as const) {
+			const sibling = where.siblings[at];
+			if (!sibling) continue;
+			for (const near of leavesOf(sibling)) {
+				for (const view of near.data.views) {
+					const anchor = findLeaf(mine, 0, (v) => v.includes(view));
+					if (!anchor || axisAt(out.grid.orientation, anchor.level) !== axis) continue;
+					const made: Leaf = { type: 'leaf', data: { id: gid, views: [id], activeView: id } };
+					if (placeBeside(anchor, side, made, share, minimum)) return done();
+				}
+			}
+		}
+	}
+
+	// 3. A tab where the user already looks.
+	const home = findLeaf(mine, 0, (v) => v.includes('preview')) ?? findLeaf(mine, 0, () => true);
+	if (!home) return null;
+	home.leaf.data.views.push(id);
+	return done();
+}

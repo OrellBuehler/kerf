@@ -26,11 +26,16 @@ import type {
 	ExportOptions,
 	ExportProgress,
 	Filmstrip,
+	GpuPreviewStatus,
 	ImportProgress,
 	Easing,
 	Keyframe,
+	Property,
+	PropertyKey,
 	LaunchRequest,
 	Levels,
+	PreviewBoundsReport,
+	PreviewFrameResult,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -63,6 +68,17 @@ import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
 import { baseName, CAPTION_EXTENSIONS } from './caption-import-ui';
 import { easingProblem, insertKeyframe } from './easing';
+import {
+	channelOf,
+	clearTransformAnimation,
+	insertPropertyKey,
+	pruneChannels,
+	propertyKeysProblem,
+	propertyKeysShifted,
+	setPropertyEasing,
+	setPropertyKeys,
+	transformAt
+} from './channels';
 import { formatTime as fmtTime } from './diff';
 import {
 	rollEdit as rollEditLocal,
@@ -481,6 +497,27 @@ export async function onWindowCloseRequested(
 		}
 		if (close) await win.destroy();
 	});
+}
+
+/** Quit Kerf from a menu. The window's own close button is guarded by
+ *  `onWindowCloseRequested` (a project that was never saved is asked about first);
+ *  this is the same question put to the same window, then the same `destroy` that
+ *  guard ends with — the capability the app already has, so no new one.
+ *  A no-op in the browser harness, which has no window of its own to close. */
+export async function quitApp(needsConfirm: () => boolean, confirm: () => Promise<boolean>): Promise<void> {
+	if (!inTauri()) return;
+	if (needsConfirm()) {
+		let quit = false;
+		try {
+			quit = await confirm();
+		} catch {
+			// A dialog that fails to show must not make the app unquittable.
+			quit = true;
+		}
+		if (!quit) return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().destroy();
 }
 
 /** Show the main window. The desktop app creates it hidden (`visible: false`) so
@@ -1457,7 +1494,9 @@ export async function setAudioEffects(clipId: string, effects: AudioEffect[]): P
 	return invoke<Timeline>('set_audio_effects', { clipId, effects });
 }
 
-/** Replace a clip's transform keyframes (empty list clears the animation). */
+/** Replace a clip's whole-transform keyframes. An empty list clears these only: a number with
+ *  keys of its own (`setPropertyKeyframes`) keeps them; `clearKeyframes` makes the whole
+ *  transform static. */
 export async function setKeyframes(clipId: string, keyframes: Keyframe[]): Promise<Timeline> {
 	if (!inTauri()) {
 		for (const k of keyframes) {
@@ -1465,7 +1504,11 @@ export async function setKeyframes(clipId: string, keyframes: Keyframe[]): Promi
 			if (problem) throw new Error(problem);
 		}
 		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips[found[1]].keyframes = [...keyframes].sort((a, b) => a.time - b.time);
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			clip.keyframes = [...keyframes].sort((a, b) => a.time - b.time);
+			pruneChannels(clip);
+		}
 		recordDev('Set keyframes');
 		return snapshot();
 	}
@@ -1483,7 +1526,9 @@ export async function addKeyframe(
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const clip = found[0].clips[found[1]];
-			const tf = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
+			// The clip's present pose there (`transform_at`), whichever of the bundle and the
+			// numbers' own tracks drives each number.
+			const tf = transformAt(clip, time);
 			const base: Keyframe = {
 				time,
 				scale: tf.scale,
@@ -1495,7 +1540,13 @@ export async function addKeyframe(
 			};
 			// As the backend puts a key in: re-keying a moment keeps how it leaves, and a key inside
 			// a segment splits it (a hold stays held, a curve stays the same curve).
+			const tracked = (['scale', 'pos_x', 'pos_y', 'rotation', 'opacity'] as const).filter(
+				(p) => patch[p] !== undefined && channelOf(clip, p)
+			);
 			clip.keyframes = insertKeyframe(clip.keyframes ?? [], base);
+			// A number with a track of its own ignores the bundle's key: what was asked for it
+			// goes into that track.
+			for (const p of tracked) insertPropertyKey(clip, p, { time, value: patch[p] as number });
 		}
 		recordDev('Add keyframe');
 		return snapshot();
@@ -1511,29 +1562,91 @@ export async function addKeyframe(
 	});
 }
 
-/** Set the easing of the segment leaving the keyframe at `time` (within a millisecond). */
-export async function setKeyframeEasing(clipId: string, time: number, easing: Easing): Promise<Timeline> {
+/** Set the easing of the segment leaving the keyframe at `time` (within a millisecond). With
+ *  `prop`, that one number's key; without, the transform key there — the bundle's and every
+ *  transform number's own track's. */
+export async function setKeyframeEasing(clipId: string, time: number, easing: Easing, prop?: Property): Promise<Timeline> {
 	if (!inTauri()) {
 		const problem = easingProblem(easing);
 		if (problem) throw new Error(problem);
 		const found = locate(devTimeline, clipId);
 		const clip = found ? found[0].clips[found[1]] : undefined;
-		const near = (clip?.keyframes ?? [])
+		if (!clip) throw new Error(`clip ${clipId} not found`);
+		if (prop) {
+			if (!setPropertyEasing(clip, prop, time, easing)) {
+				throw new Error(`the clip has no ${prop} keyframe at ${time.toFixed(3)} s`);
+			}
+			recordDev(`Set ${prop} keyframe easing`);
+			return snapshot();
+		}
+		const near = (clip.keyframes ?? [])
 			.filter((k) => Math.abs(k.time - time) <= 1e-3)
 			.sort((a, b) => Math.abs(a.time - time) - Math.abs(b.time - time))[0];
-		if (!near) throw new Error(`the clip has no keyframe at ${time.toFixed(3)} s`);
-		if (easing === 'linear') delete near.easing;
-		else near.easing = easing;
+		const tracked = (['scale', 'pos_x', 'pos_y', 'rotation', 'opacity'] as const).filter((p) =>
+			channelOf(clip, p)?.keys.some((k) => Math.abs(k.time - time) <= 1e-3)
+		);
+		if (!near && tracked.length === 0) throw new Error(`the clip has no keyframe at ${time.toFixed(3)} s`);
+		if (near) {
+			if (easing === 'linear') delete near.easing;
+			else near.easing = easing;
+		}
+		for (const p of tracked) setPropertyEasing(clip, p, time, easing);
 		recordDev('Set keyframe easing');
 		return snapshot();
 	}
-	return invoke<Timeline>('set_keyframe_easing', { clipId, time, easing });
+	return invoke<Timeline>('set_keyframe_easing', { clipId, time, easing, prop });
+}
+
+/** Replace the keys of one animatable number — a transform number, a colour number or the clip's
+ *  volume. No keys leaves it static (`set_property_keyframes`). */
+export async function setPropertyKeyframes(clipId: string, prop: Property, keys: PropertyKey[]): Promise<Timeline> {
+	if (!inTauri()) {
+		const problem = propertyKeysProblem(prop, keys);
+		if (problem) throw new Error(problem);
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		setPropertyKeys(found[0].clips[found[1]], prop, keys);
+		recordDev(`Set ${prop === 'pos_x' ? 'position x' : prop === 'pos_y' ? 'position y' : prop} keyframes`);
+		return snapshot();
+	}
+	return invoke<Timeline>('set_property_keyframes', { clipId, prop, keys });
+}
+
+/** Copy the animation of `props` (every keyed number when empty) from one clip to another,
+ *  `offset` seconds later (`copy_keyframes`). */
+export async function copyKeyframes(
+	fromClipId: string,
+	toClipId: string,
+	props: Property[] = [],
+	offset = 0
+): Promise<Timeline> {
+	if (!inTauri()) {
+		if (!Number.isFinite(offset) || Math.abs(offset) > 360_000) {
+			throw new Error('offset must be a number within ±360000 seconds');
+		}
+		if (fromClipId === toClipId) throw new Error('copy keyframes from one clip to another: the two ids are the same clip');
+		const from = locate(devTimeline, fromClipId);
+		const to = locate(devTimeline, toClipId);
+		if (!from) throw new Error(`clip ${fromClipId} not found`);
+		if (!to) throw new Error(`clip ${toClipId} not found`);
+		const source = from[0].clips[from[1]];
+		const tracks = propertyKeysShifted(source, props, offset);
+		if (tracks.length === 0) throw new Error('the source clip has no keyframes to copy');
+		for (const t of tracks) {
+			if (t.keys.length === 0) throw new Error(`the source clip has no ${t.prop} keyframes`);
+		}
+		const dest = to[0].clips[to[1]];
+		for (const t of tracks) setPropertyKeys(dest, t.prop, t.keys);
+		recordDev('Copy keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('copy_keyframes', { fromClipId, toClipId, props, offset });
 }
 
 export async function clearKeyframes(clipId: string): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips[found[1]].keyframes = [];
+		if (found) clearTransformAnimation(found[0].clips[found[1]]);
 		recordDev('Clear keyframes');
 		return snapshot();
 	}
@@ -2307,6 +2420,76 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
 	return invoke<string>('get_timeline_frame', { timeSecs, maxWidth });
 }
 
+/**
+ * The frame under the playhead for the Preview panel — drawn by the GPU compositor in the
+ * native surface when the GPU preview is on and draws it exactly, else FFmpeg's JPEG (the
+ * same one {@link getTimelineFrame} returns), in the same call, with the reasons. `overlays`
+ * says the page has something to draw over the picture (a title box, the trim monitor,
+ * safe-area guides), which a surface above the page cannot show. In the browser harness
+ * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
+ */
+export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays = false): Promise<PreviewFrameResult> {
+	if (!inTauri()) {
+		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
+		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
+		// at under `bun run dev`. Otherwise there is no GPU here.
+		if (harnessSurface()) {
+			return {
+				renderer: 'gpu',
+				frame: null,
+				reasons: [],
+				timings: { width: 1920, height: 1080, decode_ms: 4, composite_ms: 9, present_ms: 1 }
+			};
+		}
+		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
+	}
+	return invoke<PreviewFrameResult>('get_preview_frame', { timeSecs, maxWidth, overlays });
+}
+
+/** The browser harness was opened with `?gpusurface=1`. */
+function harnessSurface(): boolean {
+	try {
+		return new URLSearchParams(location.search).get('gpusurface') === '1';
+	} catch {
+		return false;
+	}
+}
+
+/** Tell the backend where the Preview frame is (see {@link PreviewBoundsReport}). */
+export async function setPreviewBounds(bounds: PreviewBoundsReport): Promise<void> {
+	if (!inTauri()) return;
+	await invoke<void>('set_preview_bounds', { bounds });
+}
+
+/** What the GPU preview is doing on this machine. The browser harness has none. */
+export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
+	if (!inTauri()) {
+		if (harnessSurface()) {
+			return {
+				enabled: true,
+				supported: true,
+				technique: 'window',
+				ready: true,
+				overlays: true,
+				adapter: 'browser harness (pretend)',
+				software: false,
+				reason: null
+			};
+		}
+		return {
+			enabled: false,
+			supported: false,
+			technique: null,
+			ready: false,
+			overlays: false,
+			adapter: null,
+			software: false,
+			reason: 'The GPU preview is part of the desktop app.'
+		};
+	}
+	return invoke<GpuPreviewStatus>('gpu_preview_status');
+}
+
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {
 	if (!inTauri()) {
 		// Synthetic but deterministic peaks so the browser demo shows a waveform.
@@ -2559,6 +2742,7 @@ export async function getSettings(): Promise<SettingsView> {
 			cpu_percent: readBrowserCpuPercent(),
 			transcribe: readBrowserTranscribe(),
 			safe_areas: readBrowserSafeAreas(),
+			gpu_preview: harnessSurface(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),

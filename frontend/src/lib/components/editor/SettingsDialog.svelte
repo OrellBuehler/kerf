@@ -3,11 +3,13 @@
 	// whether an analysis pass transcribes speech, what the preview draws and
 	// what colors the editor is drawn in. A section list on the left, panels on
 	// the right, so the next one is a row in a list.
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
 	import KeyboardSettings from './KeyboardSettings.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
+	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
@@ -24,7 +26,9 @@
 		{ id: 'appearance', label: 'Appearance', icon: 'palette' },
 		{ id: 'keyboard', label: 'Keyboard', icon: 'keyboard' }
 	] as const;
-	let section = $state<(typeof SECTIONS)[number]['id']>('performance');
+	// Opened from a menu on one section (Help › Keyboard shortcuts), else the first.
+	let section = $state<(typeof SECTIONS)[number]['id']>(untrack(() => settings.wantSection) ?? 'performance');
+	untrack(() => (settings.wantSection = null));
 
 	const cores = $derived(settings.cpuCores);
 	const threads = $derived(settings.cpuThreads);
@@ -36,6 +40,12 @@
 	const spare = $derived(Math.max(0, cores - threads));
 
 	const themePreset = $derived(settings.themePreset);
+
+	// What the GPU preview is doing on this machine; read when its section opens.
+	const gpuStatus = $derived(gpuPreview.status);
+	$effect(() => {
+		if (section === 'preview') void gpuPreview.refresh();
+	});
 
 	// Voiceover: whether its model is on disk, and a way to fetch it before the
 	// first script rather than in the middle of it.
@@ -303,6 +313,54 @@
 						A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
 						toggles the same setting.
 					</p>
+					<div
+						style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
+						GPU preview (experimental)
+					</div>
+					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+						<input
+							type="checkbox"
+							checked={settings.gpuPreview}
+							onchange={(e) => settings.setGpuPreview(e.currentTarget.checked)}
+							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+						/>
+						<span style="display:flex;flex-direction:column;gap:3px">
+							<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
+							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+								Frames the GPU compositor draws exactly are shown from a native surface instead of FFmpeg's
+								JPEG. Every other frame — a transition in progress, an effect it does not draw yet, anything
+								that fails — is FFmpeg's, as before. Playback still uses FFmpeg. The status bar says which
+								renderer made the frame you are looking at.
+							</span>
+						</span>
+					</label>
+					{#if gpuStatus}
+						<p
+							data-testid="gpu-preview-status"
+							style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted);font-family:var(--font-mono)"
+						>
+							{#if !gpuStatus.supported}
+								Not available here: {gpuStatus.reason ?? 'no native surface on this platform'}
+							{:else if gpuStatus.ready}
+								{gpuStatus.technique === 'child' ? 'Child window' : 'Window surface'} · {gpuStatus.adapter}{gpuStatus.software
+									? ' (software)'
+									: ''}
+							{:else if settings.gpuPreview}
+								{gpuStatus.reason ?? 'Starts with the next frame.'}
+							{:else if gpuStatus.reason}
+								{gpuStatus.reason}
+							{:else}
+								Available: {gpuStatus.technique === 'child' ? 'a child window over the preview' : 'the window surface under the preview'}.
+							{/if}
+						</p>
+					{/if}
+					{#if gpuStatus?.supported && gpuStatus.technique === 'child'}
+						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+							On this platform the surface is a window over the preview, so a frame with a title box, the trim
+							monitor or safe-area guides on it is FFmpeg's.
+						</p>
+					{/if}
 				{:else if section === 'appearance'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
 						Theme

@@ -3,37 +3,55 @@
 	import Badge from './Badge.svelte';
 	import Icon from './Icon.svelte';
 	import WorkspaceTabs from './WorkspaceTabs.svelte';
+	import MenuBar from './MenuBar.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { notifications } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import type { ActionId } from '$lib/keymap';
+	import type { MenuCommand } from '$lib/menus';
+
+	let { onAction, onCommand }: { onAction: (id: ActionId) => void; onCommand: (command: MenuCommand) => void } = $props();
+
+	// The six titles need about this much of the left cell beside the logo; narrower,
+	// they become one "Menu" button (see `MenuBar`). It is the width of that cell, which
+	// the workspace tabs and the right cluster take their share around — not the window.
+	const MENU_FULL_PX = 320;
+	let leftWidth = $state(0);
+	const compact = $derived(leftWidth > 0 && leftWidth < MENU_FULL_PX);
 
 	// An available update stays offered here after the dialog is dismissed;
 	// otherwise the version label doubles as a manual "check for updates".
 	const available = $derived(updater.update !== null);
 </script>
 
-<!-- Three cells so the workspace tabs sit on the centre line whatever the
-     project name and the path are: what the project is on the left, the
-     workspaces in the middle, the app's own controls on the right. -->
+<!-- Three cells so the workspace tabs sit on the centre line whatever else the
+     bar holds: the logo and the menus on the left, the workspaces in the middle,
+     the project's name and the app's own controls on the right. No rule under it:
+     the dock starts where the bar ends. -->
 <div
-	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);border-bottom:var(--line-width) solid var(--border-default);flex:none;-webkit-app-region:drag"
+	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
 >
-	<div style="min-width:0;display:flex;align-items:center;gap:8px">
+	<div bind:clientWidth={leftWidth} style="min-width:0;display:flex;align-items:center;gap:8px">
 		<KerfMark size={15} />
-		<span
-			title={editor.projectName}
-			style="min-width:0;font:var(--type-label);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-			>{editor.projectName}</span
-		>
-		{#if editor.saved}
-			<Badge tone="success" dot>Saved</Badge>
-		{:else}
-			<Badge tone="warning" dot>Unsaved</Badge>
-		{/if}
+		<MenuBar {compact} {onAction} {onCommand} />
 	</div>
 	<WorkspaceTabs />
 	<div style="min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:10px">
+		<!-- What the project is: its name and whether it has a file. It gives way first
+		     when the window is narrow. -->
+		<div style="min-width:0;flex:0 1 auto;display:flex;align-items:center;gap:8px;overflow:hidden">
+			<span
+				title={editor.currentPath ?? 'In-memory project — not yet saved'}
+				style="min-width:0;font:var(--type-label);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				>{editor.projectName}</span
+			>
+			{#if editor.saved}
+				<Badge tone="success" dot>Saved</Badge>
+			{:else}
+				<Badge tone="warning" dot>Unsaved</Badge>
+			{/if}
+		</div>
 		<button
 			onclick={() => settings.toggle()}
 			title={settings.withShortcut('Settings — performance, appearance and keyboard shortcuts', 'app.settings')}
@@ -90,10 +108,5 @@
 				{updater.version && updater.version !== 'dev' ? `v${updater.version}` : updater.version}
 			{/if}
 		</button>
-		<span
-			title={editor.currentPath ?? 'In-memory project — not yet saved'}
-			style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled);max-width:280px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-			>{editor.currentPath ?? 'local · in-memory'}</span
-		>
 	</div>
 </div>

@@ -12,13 +12,18 @@
 import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
+import { gpuPreview } from './gpu-preview.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
 import {
 	defaultWorkspaces,
+	describeAdopted,
 	libraryTabFor,
-	parseWorkspaces,
+	readWorkspaces,
+	withLayout,
 	withLibraryTab,
+	withoutWorkspaces,
+	WORKSPACE_IDS,
 	type LibraryTab,
 	type WorkspaceId,
 	type WorkspacesState
@@ -74,8 +79,14 @@ export const CPU_PRESETS = [
 	}
 ] as const;
 
+/** The sections of the settings dialog (`SettingsDialog.svelte` lists them). */
+export type SettingsSection = 'performance' | 'speech' | 'preview' | 'appearance' | 'keyboard';
+
 class SettingsStore {
 	open = $state(false);
+	/** The section the dialog opens on, when something other than the first was
+	 *  asked for (Help › Keyboard shortcuts); the dialog takes it once. */
+	wantSection = $state<SettingsSection | null>(null);
 	loaded = $state(false);
 	saving = $state(false);
 
@@ -88,6 +99,10 @@ class SettingsStore {
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
 	 *  chrome to stay clear of. */
 	safeAreas = $state(false);
+	/** Draw the Preview with the GPU compositor in a native surface where the plan
+	 *  allows it (experimental; off by default). The JPEG path is the fallback for
+	 *  every frame it does not draw and for every failure. */
+	gpuPreview = $state(false);
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
@@ -137,12 +152,20 @@ class SettingsStore {
 		this.savedPercent = view.cpu_percent;
 		this.transcribe = view.transcribe;
 		this.safeAreas = view.safe_areas;
+		this.gpuPreview = view.gpu_preview ?? false;
+		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
 		if (!this.workspacesRead) {
-			this.workspaces = parseWorkspaces(view.workspaces, view.layout);
+			const read = readWorkspaces(view.workspaces, view.layout);
+			this.workspaces = read.state;
 			this.workspacesRead = true;
+			// Layouts brought up to date (stamped, a preset copy dropped, a new panel
+			// cut in) are written back, so it happens once.
+			if (read.changed) this.writeWorkspaces.request();
+			const note = describeAdopted(read.adopted);
+			if (note) toast.info(note.message, { description: note.description });
 		}
 		if (!this.keysRead) {
 			this.keyOverrides = parseKeyOverrides(view.keybindings, this.platform);
@@ -206,6 +229,23 @@ class SettingsStore {
 		await this.write({ safe_areas: on }, 'safe-area setting');
 	}
 
+	/** Turn the GPU preview on or off. Off is immediate (the page stops asking at once); **on waits
+	 *  for the write** — the page flips to asking the backend only when the backend has been told, or
+	 *  its first request would find the setting still off and the pane would keep a JPEG until
+	 *  something else nudged it. Then the frame under the playhead is asked for again. The backend
+	 *  builds nothing until a frame wants it and frees everything when it goes off; the status is
+	 *  re-read either way. */
+	async setGpuPreview(on: boolean) {
+		if (on === this.gpuPreview) return;
+		if (!on) {
+			this.gpuPreview = false;
+			gpuPreview.clear();
+		}
+		await this.write({ gpu_preview: on }, 'GPU preview setting');
+		await gpuPreview.refresh();
+		ui.refreshPreview();
+	}
+
 	/** The tab the library shows in the active workspace. Each workspace keeps
 	 *  its own, so picking Transcript while editing does not follow you to Color. */
 	get libraryTab(): LibraryTab {
@@ -229,20 +269,25 @@ class SettingsStore {
 		this.changeWorkspaces({ ...this.workspaces, active: id });
 	}
 
-	/** Remember how `id` is arranged now. */
+	/** Remember how `id` is arranged now, against the panels its preset opens in
+	 *  this build (so a later build's new panel can be told from a closed one). */
 	saveWorkspaceLayout(id: WorkspaceId, layout: unknown) {
-		this.changeWorkspaces({
-			...this.workspaces,
-			layouts: { ...this.workspaces.layouts, [id]: layout as WorkspacesState['layouts'][WorkspaceId] }
-		});
+		this.changeWorkspaces(withLayout(this.workspaces, id, layout as NonNullable<WorkspacesState['layouts'][WorkspaceId]>));
 	}
 
-	/** Forget how `id` was arranged, so it is its preset again. */
-	clearWorkspaceLayout(id: WorkspaceId) {
-		if (!(id in this.workspaces.layouts)) return;
-		const layouts = { ...this.workspaces.layouts };
-		delete layouts[id];
-		this.changeWorkspaces({ ...this.workspaces, layouts });
+	/** Forget how `id` was arranged and which library tab was picked in it, so it
+	 *  is its preset again. The rail's fold is not a workspace's and stays. */
+	resetWorkspace(id: WorkspaceId) {
+		this.resetWorkspaces([id]);
+	}
+
+	resetAllWorkspaces() {
+		this.resetWorkspaces(WORKSPACE_IDS);
+	}
+
+	private resetWorkspaces(ids: readonly WorkspaceId[]) {
+		const next = withoutWorkspaces(this.workspaces, ids);
+		if (next !== this.workspaces) this.changeWorkspaces(next);
 	}
 
 	/** Pick the library's tab for the active workspace. */
@@ -422,6 +467,12 @@ class SettingsStore {
 	toggle() {
 		this.open = !this.open;
 		if (this.open && !this.loaded) void this.load();
+	}
+
+	/** Open the dialog on `section`. */
+	openSection(section: SettingsSection) {
+		this.wantSection = section;
+		if (!this.open) this.toggle();
 	}
 
 	close() {

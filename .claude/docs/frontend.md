@@ -64,17 +64,17 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
-`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar`, `Toolbar`, `StatusBar` as
-fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
+`IconBtn`, `Badge`, `Icon`, `KerfMark`) plus `TitleBar` (which holds the **menu bar**)
+and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
 it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
 `Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
-and closable; the toolbar's **Panels** menu reopens one (the library left of the
-preview, the deliver panel right of it, the rest beside the active group) or
-resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
+and closable; the **Window** menu reopens one (the library left of the
+preview, the deliver panel and the mixer right of it, the rest beside the active
+group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
 to point a tablist at; a pointer click blurs the button, because a focused button
@@ -93,8 +93,8 @@ transcript were panels of their own: the first of `media` / `bin` / `transcript`
 found becomes `library`, the others drop, and an emptied group or branch is
 pruned (a branch left with one child collapses into it). What is stored is
 **`Settings.workspaces`** (`workspaces.ts`, bun-tested): `{active, layouts:
-{<workspace>: <layout>}, library: {tabs: {<workspace>: <tab>}, collapsed}}`, parsed
-field by field — one bad layout costs that workspace its arrangement, not the
+{<workspace>: <layout>}, offered: {<workspace>: [<panel>…]}, library: {tabs:
+{<workspace>: <tab>}, collapsed}}`, parsed field by field — one bad layout costs that workspace its arrangement, not the
 other four — with the old `layout` becoming Edit only when there is *no*
 `workspaces` value at all (a reset Edit must not be brought back by a layout from
 the old build), and the old single `library.tab` becoming the active workspace's
@@ -118,7 +118,33 @@ and `shouldPersistLayout` (pure, bun-tested) writes only a layout that
 *shares* of each branch within 0.4 % (a dozen-pixel nudge of a sash counts; pixel
 sizes, the active group and the active tab do not) — and, with no entry yet, from
 the preset. What was written becomes the new reference; Reset clears the entry
-and leaves none. A window resize can move shares too (where a group's minimum
+and leaves none. **A stored layout is a snapshot, so each one is stored with the
+panels its preset offered when it was saved** (`offered`, written by
+`withLayout`; `readWorkspaces` / `adoptPanels` bring each one up to the preset of
+the running build as it is read). A panel the preset opens now that the layout was
+never offered and does not hold is new to it — the mixer in Audio, which a layout
+saved before it would otherwise never get — and `insertPanel` (`layout.ts`, pure)
+puts it where the preset does, reliably and in order: tabbed with the panels it
+shares a group with in the preset; else in a group of its own beside the nearest
+panel it sits next to there, taking the share the preset gives it out of that row
+(only when the row runs the same way); else as a tab beside the preview. A layout
+is never reset to make room, a notice says what was added (`describeAdopted`), and
+the result is written back once. A panel the layout *was* offered and lacks was
+closed by the user and stays closed. A layout stored before the record is taken to
+have been offered `UNSTAMPED_OFFERED` (the presets of that time: all but the
+mixer); if it is only a copy of today's preset — the build that wrote every
+workspace the user merely visited left one for each — or of the earlier Audio
+preset (`EARLIER_PRESETS`, checked with `sameArrangement`), it is dropped and the
+workspace is its preset, today's. **Reset workspace** (`workspace.reset()`,
+Window menu) forgets the arrangement, its record and the library tab picked in that
+workspace (not the rail's fold, which is the rail's), drops a save still on the
+debounce, rebuilds the dock from the preset and **says what it did** — including
+"already in its default arrangement", because a workspace that never moved looks
+the same afterwards and a reset that shows nothing reads as a broken one (that was
+the report: Reset on a workspace whose stored layout merely equalled its preset).
+It also reports a dock that takes neither the stored layout nor the preset
+(`could not arrange`), which used to be silence. **Reset all workspaces**
+(`resetAll()`) does that for the five. A window resize can move shares too (where a group's minimum
 binds), so a `ResizeObserver` on the dock host writes what was pending, ignores
 the layout events the resize causes, and retakes the reference once the window has
 held still for 150 ms — otherwise the next unrelated event, a click on a tab,
@@ -157,6 +183,83 @@ group's tab strip, and hands the width it frees or takes to the group beside it
 chevron by keyboard moves focus to the rail's active tab, since the chevron
 unmounts with the content. A library sharing a group with another panel cannot
 fold — it has no width of its own to give back.
+**The chrome is a title bar over the dock, and the menu bar is in it.** There is no
+toolbar row and no rule between the title bar and the dock: the dock starts where
+the bar ends. The window keeps its native decorations (`tauri.conf.json` sets none
+of its own, so the OS caption buttons are above Kerf's `TitleBar`, which is a row of
+content — `-webkit-app-region` marks it draggable and every control `no-drag`);
+custom window decorations, which would put the menus in the caption bar like VS Code,
+are a possible follow-up and not this change. `TitleBar` is three cells (so the
+workspace tabs stay on the centre line): the logo and the **menu bar** on the left;
+the workspaces in the middle; the project's name with its Saved / Unsaved badge, the
+settings gear, the notification bell and the version chip on the right (the chip still
+turns amber when an update is waiting, which is why it stayed out of Help; Help also
+has *Check for updates…*). The project's path moved to the status bar. **The menus**
+(`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
+Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
+"as…" once the project has a file, since a saved project is its own SQLite file and
+`save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
+Duplicate, Delete / Ripple delete / Select all, **Tool** and **Clip** submenus —
+the five tools as radios, and trim / detach / link — Ripple mode and Snapping as ticks,
+Keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
+**Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
+workspace, Reset all workspaces — which asks first when any arrangement is stored),
+*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
+panel and a panel can be closed, so the whole of it is here as registry actions with
+their bindings), *Help* (Keyboard shortcuts, Check for updates…, Release page, Open the
+log folder, About). **Every entry names a keymap action**
+(`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
+`view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
+`resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
+were added, the new ones unbound by default so a build never takes a key) and runs
+the page's own `run` handler for it, so a menu and its shortcut are one piece of
+code and the key printed beside the entry is `settings.shortcut(id)`, the user's. What
+is one of a family and has no key (a delivery shape, a track height, a panel) is a
+`MenuCommand`, run by `menu-commands.ts` (`setDeliveryPreset` is shared with the
+timeline's own picker). Quit asks about unsaved work like the window's close button and
+ends in the same `destroy` that guard ends with (`quitApp` in `api.ts`) — no new
+capability. **Keyboard**: the ARIA menubar pattern with a roving tab stop; a click
+opens a menu and, once one is open, hovering another title switches to it (the click
+that finishes that hover does not close it again); ← → move along the bar and between
+open menus, ↓ ↑ Home End move in a menu, → opens a submenu and ← closes it, Enter /
+Space run, Esc closes one level and then leaves the bar, a letter jumps to the next
+entry that starts with it (`stepFocus` / `typeahead`, pure); **Alt on its own, or F10,
+focuses the bar** — F10 not when the user has bound it, neither while a field is being
+typed in. Alt counts only as a tap (`alt-tap.ts`, a pure state machine, bun-tested): it
+is never armed while a pointer button is held (the timeline reads Alt live as its
+"leave the links alone" override on a drag, a trim or a razor cut, and an Alt pressed or
+released mid-drag must not take focus — a stuck press whose release was missed is cleared by
+the next move with no button down), another key, a pointer press or a wheel turn between
+its down and up cancels it, and so does the window losing focus (Alt+Tab). A menu title
+takes focus on a click (WKWebView does not focus a button a click lands on, and Esc
+needs focus inside the bar), a pending hover timer is cleared when the pointer moves to
+another title, and a chord that closes a menu gives focus back to where it was before the
+bar took it. Menus are
+`menu` panels of `menuitem` / `menuitemcheckbox` / `menuitemradio` entries
+(`aria-checked`, `aria-haspopup`, `aria-expanded`, `aria-disabled` with the reason as the
+title); a disabled entry still takes focus. Panels are `fixed`, placed from the rect of what
+opened them and kept inside the window (a submenu flips to its parent's other side and,
+failing that, slides in over it; a menu taller than the room scrolls — nested submenus are
+not positioned inside a scrolling panel, which would clip them). Too narrow for its six
+titles the bar becomes one "Menu" button whose entries are the menus as submenus: the
+test is the width of the title bar's **left cell** (`MENU_FULL_PX`, 320 — the bar and the
+logo measure ~331 at their widest, and the workspace tabs and the right cluster take their
+share of the window first), not the window's width, so a ~1000 px window has them in full and
+the 960 px minimum collapses them. A modal closes the menus and the bar is `inert` behind it like the rest
+of the page; a letter or arrow typed in a menu never reaches the page's shortcuts (the page
+returns early for events from inside `[role=menubar]` / `[role=menu]`, and the bar
+`preventDefault`s what it takes); a chord closes the menus and goes on to the page. The
+tokens are the guarded pairs (`text-secondary` on `surface-app`, `text-primary` and
+`text-muted` on `surface-raised` / `surface-hover`, `kerf-400` for the tick), so the
+contrast guard covers it. **Where the old toolbar's controls went**: the transport (go to
+start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
+the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
+~380 px of its width; the tools, Ripple, Snapping, Undo / Redo and the delivery-frame
+picker are the **Timeline**'s toolbar, which wraps to a second row rather than clip
+(its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
+Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
+that no entry of the old toolbar lost its place.
 The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
 verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
 `SectionHead` which the dialog uses too — no fork. The shape choice and the
@@ -183,7 +286,19 @@ hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
 auto-keyframes at the playhead and shows the sampled pose; each key but the last has an
 **easing** picker in the Animation section — linear, ease in-out / out / in, hold and three
-own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`), a **Framing** section
+own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`; **colour and volume
+animate from the same panel**: a ◇ beside each colour number and the volume keys it at the playhead at
+the value it has there (◆ when a key sits there, and clicking it takes the key out; the last one makes
+the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
+writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
+mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
+their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
+popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
+ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
+or two keys at one time: the ramp arrives at the value the step leaves and a `setValueAtTime` lands the
+next, read `1e-9 s` either side of the step because `(start + t) - start` can fall an ulp short of `t`),
+as the export's `if(lt(t,..))` does — but the timeline's volume line and
+waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
 shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
@@ -245,7 +360,7 @@ resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
 row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
 
 
-The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
+The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
@@ -397,6 +512,24 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+**The GPU preview in the page** (`Preview.svelte`, `preview-bounds.ts`,
+`gpu-preview.svelte.ts`). With the setting on, a frame whose route is `gpu`
+(`routePreview`: pure and bun-tested — setting, platform support, playback streaming, an
+empty timeline, overlays, covered) is asked of `getPreviewFrame` instead of
+`getTimelineFrame`, and when the backend says `renderer: 'gpu'` the frame draws *nothing*
+(`gpuShown`: no image, no backdrop — the surface is what is seen); a frame it hands back is
+the JPEG as ever. The frame's content box is reported to `set_preview_bounds` by a
+`ResizeObserver`, the window events and a 150 ms poll, one report at a time (`singleFlight`),
+`deviceRect` rounding both edges so neighbours never gap at 125 / 150 %, and a hidden report
+goes out when the panel unmounts (a workspace switch) or the setting goes off. Under technique
+`window` the frame's ancestors get `data-surface-hole` (transparent, in `layout.css`) and the
+pane's surround is a layer with an even-odd `clip-path` hole at the frame (`holePolygon`), so
+nothing else on the page changes; `?gpusurface=1` makes the browser harness answer as such a
+surface (there is no GPU there), and a headless-Chrome screenshot with a transparent default
+background shows the hole. The status bar names the renderer of the frame on screen (`GPU
+430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
+Settings dialog's Preview section carries the toggle and the machine's status line.
+
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
 close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
@@ -449,7 +582,7 @@ stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* 
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
-bare keys added since (`ADDED`: N / Y / U / Q / W) and the modified chords added for linked A/V
+bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
 (`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
@@ -487,7 +620,8 @@ never wants a model fetched or minutes of inference spent needs the whole pass
 to survive that, not to fail on the download. `TranscriptionStatus.enabled`
 reports it, so the transcript tab's empty state can say "Speech-to-text is
 off" and open Settings rather than offer a download. And **Preview**, one checkbox
-for the safe-area guides over a vertical or square cut. And **Appearance**: the
+for the safe-area guides over a vertical or square cut, and the experimental GPU preview
+toggle with this machine's status line (technique, adapter, last failure). And **Appearance**: the
 three theme presets as chips, a name and a dark/light scheme, **Import… /
 Export…** (a `.json` file through the dialog plugin and `read_text_file` /
 `write_text_file`; the harness uses an `<input type=file>` and a download), then
@@ -598,5 +732,5 @@ it, which the shared `ContextMenu` renders non-interactively.
 filters by, so a dropped folder of mixed files doesn't answer with one error per
 README — and runs the same `editor.importPaths` the picker resolves to), which is
 what the bin's "Drop media to start" had been promising. `editor.error` renders as a
-dismissible banner under the toolbar: it was recorded and never shown, so a `.kerf`
+dismissible banner under the title bar: it was recorded and never shown, so a `.kerf`
 that would not open opened as silence.

@@ -28,7 +28,9 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
-`set_keyframe_easing { clipId, time, easing }` (the key within a millisecond of `time`),
+`set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
+`prop`, that one number's), `set_property_keyframes { clipId, prop, keys }` (one number's own keys; none =
+static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -49,6 +51,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
+`get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -153,3 +156,106 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
+
+**GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
+(`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
+panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
+webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
+{ time_secs, max_width, overlays }` takes the plan's inputs under the project lock
+(`plan_inputs`: the working timeline, the assets as imported and the proxy-swapped ones the
+FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedia`, the
+measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
+timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
+else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
+is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
+the first frame that wants them and dropped together (`Backend`); a build failure is
+remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
+that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
+next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
+and a refused plan, a busy decode or an occluded window is only that frame's fallback. **Nothing
+here may freeze the preview**: a backend is built **off the render lock** and with a deadline
+(`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
+JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish
+and dropped), a panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)
+drops the backend behind the backoff, hides the surface and answers with FFmpeg's JPEG — and the
+page treats a *rejected* `get_preview_frame` the same way (the JPEG for that frame, the surface
+hidden). The setting flips **synchronously** (`set_enabled` returns whether a teardown is due; only
+`teardown_if_off`, which may wait for a frame in flight, runs on a thread), and a frame in flight
+looks at it again before it builds and before it shows anything; turning it on is a retry (the
+backoff is forgotten). `Backoff` is forgiven only by a run of 20 frames that reached the screen,
+not by one, so a device that is lost after every present waits longer each time instead of being
+rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file
+(`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed
+once a frame has reached the screen; a launch that finds it turns the setting off before reading
+it (`take_crash_marker_in`) and says so in the Settings status line. On Windows the webview is
+made transparent as the **last** step of a build and restored by a guard's `Drop`, so a build that
+fails after it cannot leave the page transparent over nothing.
+`set_preview_bounds` (GUI-only) is how the page says where the Preview frame is: **device
+pixels relative to the webview, plus the webview's size** (the backend maps the rectangle
+onto the surface when the two differ by a rounding), a `visible` flag, and the two colours
+painted around the picture (`--frame-matte` inside the frame, `--surface-app` beyond it), and
+a `seq` that counts up across every Preview the page has had (a panel replaced by a workspace
+switch can send its last report after the new one's first; the backend ignores a report older
+than the newest). It never waits for a *render*, but it is **serialized with a picture being
+shown**: `GpuPreview::set_bounds` and the present of an in-flight frame (`under_bounds`) take
+the same lock, and the frame looks at the bounds again under it. A hide that lands while a
+frame is being drawn therefore sticks (the frame is dropped to the JPEG; before, it re-mapped
+the child window the page had just had hidden, over playback or a dialog), and a frame the page
+moved meanwhile is shown at the frame's new place (`layout_for` again, the picture scaled into
+it); a shown child window also **follows** a move or resize at once rather than waiting for the
+next picture (`Child::follow`), and is re-raised with every present (`Child::place`: GTK makes
+native windows of its own and one made later would otherwise end up above it). The
+render is at about the size it is shown (`place_frame`: the width nearest the panel's, at
+most 1920, whose size keeps the canvas's shape to the row — `still_size` at 430 px is 240
+rows for a 241.9 ideal, which letterboxed the footage with a 2 px pillar), and the presenter
+draws it letterboxed in the frame (`object-fit: contain`). `gpu_preview_status` says what
+this machine does: the platform's technique, whether a device is up, the adapter and
+whether it is software, the last failure. **No MCP tool**: the agent has `preview_timeline`,
+and nothing here is an edit. **No capability permission and no CSP change**: these are the
+app's own commands (the capability file gates plugins and core APIs; `build.rs` registers no
+app manifest), and the GPU frame never reaches the webview, so no `data:` / `blob:` image
+is added. `tauri.conf.json` is **unchanged** — no `transparent`: the window still starts
+hidden with `backgroundColor`, the reveal (`reveal.ts`, the Rust failsafe) is exactly as
+before, and the one transparency there is (technique `window`, below) is applied at runtime
+after the user turned the setting on and a frame asked for it, and undone with the backend.
+
+**Two surface techniques, picked per platform** (`resolve_technique`;
+`KERF_GPU_SURFACE=off|window|child` overrides). *`window`*: wgpu draws to the **main
+window's own surface** and the webview over it is transparent
+(`WebviewWindow::set_background_color`, alpha 0, at runtime, restored when the preview goes
+off); the page keeps drawing titles, safe-area guides and the trim monitor over the picture.
+**Windows' technique, unconfirmed** (needs a real machine): tao does not set
+`WS_CLIPCHILDREN`, so the swapchain on the parent HWND should show through a transparent
+WebView2 — wry's own `wgpu` example does exactly this (with winit, which has to turn
+clip-children off). Tauri's `transparent: true` is deliberately *not* used there: on Windows
+it makes the runtime paint the window with a `softbuffer` surface on every redraw, a GDI path
+that would fight a swapchain. *`child`*: a **borderless child X11 window** of the toplevel
+(`x11rb`, an empty Shape input region so the pointer falls through to the webview) placed
+over the panel. **Linux/X11's technique, confirmed under WSLg + lavapipe**: WebKitGTK
+composes the page into the toplevel's own X window, so technique `window` there loses to
+GTK's repaints — measured: the surface presents ("GPU 430x240 · 21 ms") and the screen shows
+black where the picture should be, with the Preview's transport bar left blank — and a
+Wayland session has no way to put a window of ours inside GTK's (`Child::create` refuses a
+non-Xlib handle, which leaves the JPEG with that reason in the status). A child window sits
+*above* the page, so the page cannot draw over it: `routePreview` (frontend, pure) sends a
+frame that needs a title box, the trim monitor or safe-area guides to the JPEG, and so does
+one with a dialog, a menu or a drag ghost over the frame (`covered`: a 3x3
+`elementFromPoint` grid on the frame, every 150 ms and after each click or key — the
+Settings dialog opened *under* the picture before this existed); the in-frame badge,
+resolution and timecode are under it too (the transport bar has the timecode). **macOS has
+no technique in this build**: a surface under the webview needs a transparent window, which
+Tauri gates behind `macos-private-api` (a private WKWebView key, and a feature that changes
+every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces the attempt).
+`KERF_GPU_ADAPTER=software` takes the CPU adapter (lavapipe, WARP) instead of the machine's GPU.
+Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
+is hidden while it runs and shown again on the settled frame (A4; scrubbing at GPU speed and
+live drags are A3's). `x11.rs`' ignored tests present to a real child window and read the
+pixels back **from the X server**, destroy the device and draw again on a new one, and reach a
+server that listens on the **abstract socket only** (an `Xvfb` where `/tmp/.X11-unix` is not
+writable, WSL's case) at once: `RustConnection::connect` tries the filesystem socket and then TCP
+and never the abstract socket libxcb tries first, and waited out a TCP timeout of minutes
+(`connect` tries it first). **The Xlib `Display` is the process's own, opened once**: `tao`'s
+`display_handle()` calls `XOpenDisplay` anew on every call, never closes it and `new_unchecked`s a
+null one, so its handle is not used — only the toplevel's window id comes from the window handle —
+and one display is kept for the whole life of the process however often the backend is rebuilt.
+Every request on the child window is `check()`ed, so a server that refuses it falls back promptly.

@@ -42,7 +42,8 @@
   frame asks for it; an `fps` FFmpeg would not parse is an error in either mode. A layer carries its sampled transform and colour, `mask` (normalized), `effects`
   (a chroma key's colour made safe), `reframe` (`PlanReframe { pose, interp }`: sampled
   — the `sendcmd` schedule's held pose is for the pass that draws a reframe), `hdr`,
-  `projection`, `animated` (which keyed channels move) and `fx: LayerFx` — **transitions
+  `projection`, `animated` (`Animated`: which transform numbers are keyed — `keys: Option<Keyed>`, what
+  `Placement` and the geometry need — which move, and whether the colour is keyed) and `fx: LayerFx` — **transitions
   are per-layer, as in the graph**: the clip's `FadeStep`s (evaluated by
   `LayerFx::strength(tint, frame, fps)`, which counts frames like `fade` does), the slide /
   push travel at this frame (`MotionKeys::at`) and whether the layer is on its `tail`; a
@@ -185,8 +186,23 @@
   (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
   over a cut whose bottom layer changes the matrix the export converts with may not be the
   one a frame's own layers suggest — to be measured before the GPU encodes an export.
+  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
+  per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
+  plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the
+  file's `eq` is written per frame, and no pass or parity case draws one yet). `Animated` is `Some` for a
+  keyed transform *or* colour and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
+  opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
+  keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
+  scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed
+  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip — so the
+  matrix a translucent layer needs (`Unsupported::TranslucentMatrix`) is skipped only for a **keyed
+  opacity** (`Keyed::opacity`), not for any keyed number: a clip with only its position keyed and a static
+  opacity below 1 still takes the round trip.
+  `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
+  placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
+  evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
-  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `mask`,
+  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`,
   `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,

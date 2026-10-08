@@ -1,27 +1,51 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { PRESET_LAYOUTS, WORKSPACE_IDS, presetLayout, sanitizeLayout } from './layout';
+import {
+	EARLIER_PRESETS,
+	PRESET_LAYOUTS,
+	WORKSPACE_IDS,
+	openPanelIds,
+	presetLayout,
+	presetPanelIds,
+	sameArrangement,
+	sanitizeLayout
+} from './layout';
 import {
 	LIBRARY_TABS,
 	LIBRARY_TAB_SPECS,
 	WORKSPACE_SPECS,
+	adoptPanels,
 	defaultWorkspaces,
+	describeAdopted,
 	isLibraryTab,
 	layoutFor,
 	libraryTabFor,
 	parseWorkspaces,
+	readWorkspaces,
 	shouldPersistLayout,
 	stepTab,
+	withLayout,
 	withLibraryTab,
+	withoutWorkspaces,
 	workspaceSpec
 } from './workspaces';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const clone = (v: unknown): any => JSON.parse(JSON.stringify(v));
 
+/** A preset the user has dragged a sash of: an arrangement of their own, which no
+ *  migration may take for a copy of the preset. */
+const nudged = (id: (typeof WORKSPACE_IDS)[number], by = 60) => {
+	const l = clone(PRESET_LAYOUTS[id]);
+	const row = l.grid.root.data[0].data;
+	row[0].size += by;
+	row[1].size -= by;
+	return l;
+};
+
 /** The arrangement saved before there were workspaces (media + transcript). */
-const legacyLayout = () => {
-	const l = clone(PRESET_LAYOUTS.edit);
+const legacyLayout = (base = PRESET_LAYOUTS.edit) => {
+	const l = clone(base);
 	const group = l.grid.root.data[0].data[0].data;
 	group.views = ['media', 'transcript'];
 	group.activeView = 'media';
@@ -73,7 +97,7 @@ describe('the workspace and tab lists', () => {
 describe('parseWorkspaces', () => {
 	test('nothing stored is Edit, expanded, with no arrangements and no tab picked', () => {
 		expect(parseWorkspaces(undefined)).toEqual(defaultWorkspaces());
-		expect(parseWorkspaces(null)).toEqual({ active: 'edit', layouts: {}, library: { tabs: {}, collapsed: false } });
+		expect(parseWorkspaces(null)).toEqual({ active: 'edit', layouts: {}, offered: {}, library: { tabs: {}, collapsed: false } });
 	});
 
 	test('garbage anywhere is the default', () => {
@@ -87,7 +111,8 @@ describe('parseWorkspaces', () => {
 	test('a full value round-trips through JSON', () => {
 		const stored = {
 			active: 'audio',
-			layouts: { edit: clone(PRESET_LAYOUTS.edit), color: clone(PRESET_LAYOUTS.color) },
+			layouts: { edit: nudged('edit'), color: nudged('color') },
+			offered: { edit: presetPanelIds('edit'), color: presetPanelIds('color') },
 			library: { tabs: { edit: 'transcript', audio: 'transitions' }, collapsed: true }
 		};
 		const parsed = parseWorkspaces(clone(stored));
@@ -134,42 +159,45 @@ describe('parseWorkspaces', () => {
 			active: 'color',
 			layouts: {
 				edit: { grid: 'nope' },
-				color: clone(PRESET_LAYOUTS.color),
+				color: nudged('color'),
 				audio: null,
-				motion: clone(PRESET_LAYOUTS.motion),
+				motion: nudged('motion'),
 				deliver: 5,
 				compositing: clone(PRESET_LAYOUTS.edit)
 			}
 		});
 		expect(Object.keys(parsed.layouts).sort()).toEqual(['color', 'motion']);
-		expect(parsed.layouts.color).toEqual(PRESET_LAYOUTS.color);
+		expect(parsed.layouts.color).toEqual(nudged('color'));
 	});
 
 	test('a stored layout is sanitized on the way in: registry titles, floating groups dropped', () => {
-		const edit = clone(PRESET_LAYOUTS.edit);
+		const edit = nudged('edit');
 		edit.panels.inspector.title = 'Old name';
 		edit.floatingGroups = [{ data: {}, position: {} }];
 		const parsed = parseWorkspaces({ layouts: { edit } });
-		expect(parsed.layouts.edit).toEqual(PRESET_LAYOUTS.edit);
+		expect(parsed.layouts.edit).toEqual(nudged('edit'));
 	});
 
 	test('a stored layout from before the library is migrated, not thrown away', () => {
-		const parsed = parseWorkspaces({ layouts: { edit: legacyLayout() } });
-		expect(parsed.layouts.edit).toEqual(PRESET_LAYOUTS.edit);
+		const parsed = parseWorkspaces({ layouts: { edit: legacyLayout(nudged('edit') as never) } });
+		expect(parsed.layouts.edit).toEqual(nudged('edit'));
 	});
 
 	test('a layout saved under the wrong workspace is still a layout (it is the user’s arrangement)', () => {
-		const parsed = parseWorkspaces({ layouts: { audio: clone(PRESET_LAYOUTS.deliver) } });
-		expect(parsed.layouts.audio).toEqual(PRESET_LAYOUTS.deliver);
+		const parsed = parseWorkspaces({
+			layouts: { audio: nudged('deliver') },
+			offered: { audio: presetPanelIds('audio') }
+		});
+		expect(parsed.layouts.audio).toEqual(nudged('deliver'));
 	});
 });
 
 describe('the layout from before workspaces', () => {
 	test('becomes the Edit arrangement when there is no workspaces value', () => {
-		const parsed = parseWorkspaces(null, legacyLayout());
+		const parsed = parseWorkspaces(null, legacyLayout(nudged('edit') as never));
 		expect(parsed.active).toBe('edit');
 		// Migrated: the tabbed pair is the library now.
-		expect(parsed.layouts.edit).toEqual(PRESET_LAYOUTS.edit);
+		expect(parsed.layouts.edit).toEqual(nudged('edit'));
 		expect(parsed.layouts.color).toBeUndefined();
 	});
 
@@ -182,8 +210,8 @@ describe('the layout from before workspaces', () => {
 	});
 
 	test('a workspaces value that is not an object counts as none', () => {
-		expect(parseWorkspaces('garbage', legacyLayout()).layouts.edit).toEqual(PRESET_LAYOUTS.edit);
-		expect(parseWorkspaces([1], legacyLayout()).layouts.edit).toEqual(PRESET_LAYOUTS.edit);
+		expect(parseWorkspaces('garbage', legacyLayout(nudged('edit') as never)).layouts.edit).toEqual(nudged('edit'));
+		expect(parseWorkspaces([1], legacyLayout(nudged('edit') as never)).layouts.edit).toEqual(nudged('edit'));
 	});
 
 	test('an unusable old layout is just the defaults', () => {
@@ -340,5 +368,233 @@ describe('shouldPersistLayout', () => {
 	test('a different panel set is never the preset', () => {
 		const settled = scaled('deliver');
 		expect(shouldPersistLayout(scaled('edit'), settled, PRESET_LAYOUTS.deliver, false)).toBe(true);
+	});
+});
+
+// ---- layouts stored by an earlier build -------------------------------------
+
+/** What a dock of `width` px reports for a preset it was never rearranged from:
+ *  the preset's shares at the window's pixels. */
+const scaledTo = (layout: any, width: number) => {
+	const l = clone(layout);
+	const k = width / l.grid.width;
+	const scale = (n: any) => {
+		if (typeof n.size === 'number') n.size = Math.round(n.size * k);
+		if (n.type === 'branch') n.data.forEach(scale);
+	};
+	scale(l.grid.root);
+	l.grid.width = width;
+	return l;
+};
+const viewList = (layout: any): string[] => {
+	const visit = (n: any): string[] => (n.type === 'leaf' ? n.data.views : n.data.flatMap(visit));
+	return visit(layout.grid.root);
+};
+/** An Audio arrangement from before the mixer, which the user had changed. */
+const arrangedAudioWithoutMixer = () => {
+	const l = clone(EARLIER_PRESETS.audio);
+	l.grid.root.data[0].data[0].size = 380;
+	l.grid.root.data[0].data[1].size = 640;
+	return scaledTo(l, 1280);
+};
+
+describe('a layout saved before the mixer', () => {
+	test('a stored copy of the earlier Audio preset is dropped, so Audio is the new one (the stale Audio with no Mixer)', () => {
+		// The build that stored every workspace the user visited left this behind.
+		const stale = scaledTo(EARLIER_PRESETS.audio, 1280);
+		expect(openPanelIds(stale)).not.toContain('mixer');
+		const read = readWorkspaces({ active: 'audio', layouts: { audio: stale } });
+		expect(read.state.layouts.audio).toBeUndefined();
+		expect(read.changed).toBe(true);
+		expect(read.adopted).toEqual([]);
+		expect(openPanelIds(layoutFor(read.state, 'audio'))).toContain('mixer');
+		expect(layoutFor(read.state, 'audio')).toEqual(PRESET_LAYOUTS.audio);
+	});
+
+	test('an Audio arrangement of the user’s own gets the mixer where the preset puts it, and keeps the rest', () => {
+		const mine = arrangedAudioWithoutMixer();
+		const read = readWorkspaces({ layouts: { audio: mine } });
+		const audio = read.state.layouts.audio!;
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer'] }]);
+		expect(read.changed).toBe(true);
+		expect(viewList(audio)).toEqual(['library', 'preview', 'mixer', 'inspector', 'agent', 'timeline']);
+		expect(audio.grid.root).not.toEqual(mine.grid.root);
+		// What they had keeps its proportions (their wide library against the preview),
+		// and their timeline is as tall as it was.
+		const row = (audio.grid.root as any).data[0].data;
+		expect(row[0].size / row[1].size).toBeCloseTo(380 / 640, 1);
+		expect((audio.grid.root as any).data[1].size).toBe((mine.grid.root as any).data[1].size);
+		// It is recorded against today's preset, so this happens once.
+		expect(read.state.offered.audio).toEqual(presetPanelIds('audio'));
+		expect(sanitizeLayout(clone(audio))).toEqual(audio);
+	});
+
+	test('and once is all: reading what was written back changes nothing', () => {
+		const first = readWorkspaces({ layouts: { audio: arrangedAudioWithoutMixer() } });
+		const second = readWorkspaces(clone(first.state));
+		expect(second.changed).toBe(false);
+		expect(second.adopted).toEqual([]);
+		expect(second.state).toEqual(first.state);
+	});
+
+	test('a mixer the user closed stays closed: the layout was offered it', () => {
+		const mine = nudged('audio');
+		const closedMixer = clone(mine);
+		const row = closedMixer.grid.root.data[0].data;
+		const at = row.findIndex((n: any) => n.data.views[0] === 'mixer');
+		const [gone] = row.splice(at, 1);
+		row[at - 1].size += gone.size;
+		delete closedMixer.panels.mixer;
+		const read = readWorkspaces({
+			layouts: { audio: closedMixer },
+			offered: { audio: presetPanelIds('audio') }
+		});
+		expect(viewList(read.state.layouts.audio)).not.toContain('mixer');
+		expect(read.adopted).toEqual([]);
+		expect(read.changed).toBe(false);
+	});
+
+	test('a layout stored with a stamp from before the mixer is given it', () => {
+		const read = readWorkspaces({
+			layouts: { audio: arrangedAudioWithoutMixer() },
+			offered: { audio: ['library', 'preview', 'timeline', 'inspector', 'agent'] }
+		});
+		expect(viewList(read.state.layouts.audio)).toContain('mixer');
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer'] }]);
+	});
+
+	test('a mixer the user opened themselves is not opened twice', () => {
+		const mine = nudged('audio');
+		const read = readWorkspaces({ layouts: { audio: mine }, offered: { audio: ['library', 'preview', 'timeline', 'inspector', 'agent'] } });
+		expect(viewList(read.state.layouts.audio).filter((v) => v === 'mixer')).toHaveLength(1);
+		expect(read.adopted).toEqual([]);
+		expect(read.state.offered.audio).toEqual(presetPanelIds('audio'));
+	});
+
+	test('no other workspace is given a mixer', () => {
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) {
+			const read = readWorkspaces({ layouts: { [id]: nudged(id) } });
+			expect(viewList(read.state.layouts[id]!)).not.toContain('mixer');
+			expect(read.adopted).toEqual([]);
+		}
+	});
+
+	test('a layout that is only a copy of today’s preset is dropped, so the preset can move later', () => {
+		for (const id of WORKSPACE_IDS) {
+			const read = readWorkspaces({ layouts: { [id]: scaledTo(PRESET_LAYOUTS[id], 1000) } });
+			expect(read.state.layouts[id]).toBeUndefined();
+			expect(read.changed).toBe(true);
+		}
+		// With a stamp it is the user’s: they dragged it back, and it stays.
+		const stamped = readWorkspaces({
+			layouts: { color: scaledTo(PRESET_LAYOUTS.color, 1000) },
+			offered: { color: presetPanelIds('color') }
+		});
+		expect(stamped.state.layouts.color).toBeDefined();
+		expect(stamped.changed).toBe(false);
+	});
+
+	test('an unreadable stamp is no stamp', () => {
+		const mine = arrangedAudioWithoutMixer();
+		for (const offered of ['x', 7, { 0: 'a' }, null]) {
+			const read = readWorkspaces({ layouts: { audio: mine }, offered: { audio: offered } });
+			expect(viewList(read.state.layouts.audio)).toContain('mixer');
+		}
+		// Names that are not panels are dropped from a stamp, not trusted.
+		const read = readWorkspaces({ layouts: { audio: nudged('audio') }, offered: { audio: ['library', 'bogus', 7] } });
+		expect(read.state.offered.audio).toEqual(presetPanelIds('audio'));
+	});
+
+	test('a stamp for a layout that does not parse is forgotten with it', () => {
+		const read = readWorkspaces({ layouts: { audio: { grid: 'x' } }, offered: { audio: presetPanelIds('audio') } });
+		expect(read.state.offered).toEqual({});
+	});
+
+	test('the layout from before workspaces is the Edit arrangement, recorded', () => {
+		const read = readWorkspaces(null, legacyLayout(nudged('edit') as never));
+		expect(read.state.layouts.edit).toEqual(nudged('edit'));
+		expect(read.state.offered.edit).toEqual(presetPanelIds('edit'));
+		expect(read.changed).toBe(true);
+	});
+
+	test('nothing stored is nothing to write back', () => {
+		for (const raw of [undefined, null, {}, { active: 'color' }, { library: { collapsed: true } }]) {
+			expect(readWorkspaces(raw).changed).toBe(false);
+		}
+	});
+});
+
+describe('adoptPanels', () => {
+	test('is a no-op on an up-to-date layout', () => {
+		const mine = nudged('color');
+		const r = adoptPanels('color', mine, presetPanelIds('color'));
+		expect(r.layout).toEqual(mine);
+		expect(r.added).toEqual([]);
+		expect(r.changed).toBe(false);
+	});
+});
+
+describe('what the user is told', () => {
+	test('one workspace gaining one panel is said plainly', () => {
+		const note = describeAdopted([{ workspace: 'audio', panels: ['mixer'] }])!;
+		expect(note.message).toBe('Audio workspace gained the Mixer panel');
+		expect(note.description).toContain('Resetting the workspace restores its default');
+	});
+
+	test('several are listed', () => {
+		const note = describeAdopted([
+			{ workspace: 'audio', panels: ['mixer'] },
+			{ workspace: 'deliver', panels: ['mixer'] }
+		])!;
+		expect(note.message).toBe('Workspaces gained new panels');
+		expect(note.description).toContain('Audio: Mixer; Deliver: Mixer');
+	});
+
+	test('nothing gained is nothing said', () => {
+		expect(describeAdopted([])).toBeNull();
+	});
+});
+
+describe('storing and forgetting layouts', () => {
+	test('withLayout records the layout against the panels its preset opens now', () => {
+		const next = withLayout(defaultWorkspaces(), 'audio', nudged('audio'));
+		expect(next.layouts.audio).toEqual(nudged('audio'));
+		expect(next.offered.audio).toEqual(presetPanelIds('audio'));
+		expect(next.layouts.edit).toBeUndefined();
+	});
+
+	test('withoutWorkspaces forgets the arrangement, its record and the tab picked there — not the fold, not the others', () => {
+		let state = withLayout(withLayout(defaultWorkspaces(), 'audio', nudged('audio')), 'color', nudged('color'));
+		state = withLibraryTab(state, 'audio', 'transcript');
+		state = withLibraryTab(state, 'color', 'titles');
+		state = { ...state, library: { ...state.library, collapsed: true } };
+		const next = withoutWorkspaces(state, ['audio']);
+		expect(next.layouts.audio).toBeUndefined();
+		expect(next.offered.audio).toBeUndefined();
+		expect(next.library.tabs.audio).toBeUndefined();
+		expect(libraryTabFor(next, 'audio')).toBe('audio');
+		expect(next.layouts.color).toEqual(nudged('color'));
+		expect(next.library.tabs.color).toBe('titles');
+		expect(next.library.collapsed).toBe(true);
+		// The old state is not touched.
+		expect(state.layouts.audio).toBeDefined();
+	});
+
+	test('withoutWorkspaces on everything leaves the defaults and the fold', () => {
+		let state = withLayout(defaultWorkspaces(), 'edit', nudged('edit'));
+		state = withLibraryTab({ ...state, active: 'motion' }, 'motion', 'media');
+		const next = withoutWorkspaces(state, WORKSPACE_IDS);
+		expect(next).toEqual({ ...defaultWorkspaces(), active: 'motion' });
+	});
+
+	test('withoutWorkspaces is the same object when there was nothing to forget', () => {
+		const state = defaultWorkspaces();
+		expect(withoutWorkspaces(state, WORKSPACE_IDS)).toBe(state);
+	});
+
+	test('a forgotten workspace is its preset, and a preset is not an arrangement', () => {
+		const state = withoutWorkspaces(withLayout(defaultWorkspaces(), 'color', nudged('color')), ['color']);
+		expect(layoutFor(state, 'color')).toEqual(PRESET_LAYOUTS.color);
+		expect(sameArrangement(layoutFor(state, 'color'), nudged('color'))).toBe(false);
 	});
 });

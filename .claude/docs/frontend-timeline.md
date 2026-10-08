@@ -37,7 +37,7 @@ title drag.
 a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
 project flag — read in `load()` (so launch, New and Open) and again on the
 `ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
-the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
+the user's own toolbar setting that moved); the timeline toolbar's **Ripple** toggle (`R`,
 `aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
 ruler underline, and its tooltip says each track ripples on its own but a moved clip takes its linked partners along.
 All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
@@ -89,7 +89,7 @@ bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` mak
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
 not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
 frame.
-**Roll, slip and slide** are three more tools beside Select and Razor (toolbar buttons;
+**Roll, slip and slide** are three more tools beside Select and Razor (timeline toolbar buttons, and Edit › Tool;
 `N` / `Y` / `U`; `Tool` is `'pointer' | 'razor' | TrimTool`) over `edit-modes.ts`.
 `src/lib/trim-tools.ts` is everything a drag needs of them, pure and bun-tested;
 `Timeline.svelte` is only pointer plumbing (`beginTrimTool` → `beginDrag`: capture,
@@ -220,7 +220,7 @@ part of the cut, so it is **UI-only** (`ui.heights`, per track id in `localStora
 convenience): `all` is the global choice (what "all tracks" last set, what a track with no
 choice of its own is, and what the **titles lane** follows), a track set to it drops its
 override, "all tracks" clears every exception, and the table is capped at 256. The toolbar's
-three glyph buttons set all tracks (lit when every track agrees); a track header's name is its
+three glyph buttons set all tracks (lit when every track agrees; View › Track height is the same choice); a track header's name is its
 menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
 so they follow the heights. The compact titles lane is 27 px (`MIN_TITLE_LANE_PX`: the 26 px
 add button plus the lane's border).
@@ -278,7 +278,7 @@ bus's limits (the Rust constants), `levelNotes` (the *faithful* mirror of the ad
 `Levels::new` writes) and `estimateLevels`, the browser harness's stand-in for `get_levels`
 (an *approximation* from the sample analysis through faders, pan, master and limiter,
 flagged `estimated`). The **Mixer panel** (`Mixer.svelte`, in the panel registry and the
-Audio workspace preset, reachable from the Panels menu) is one vertical `MixerStrip` per
+Audio workspace preset, reachable from the Window menu) is one vertical `MixerStrip` per
 audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
 `trackHasSound`, which the track header uses too. It mirrors the export graph's
 `clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound

@@ -7,10 +7,11 @@
  *    (`limiterParams`), including the trim that cancels the node's automatic makeup
  *    gain. */
 
+import { propertyCurve, volumeAnimated, volumeAt } from './channels';
 import type { Clip } from './types';
 
 /** What decides a clip's gain: its volume, fades and a transition into it. */
-export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in'>;
+export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'>;
 
 /** A clip's fade-in length, seconds. A transition approximates as an extra fade-in
  *  (the export folds it in the same way). */
@@ -26,12 +27,65 @@ export const fadeOutOf = (clip: GainClip): number => clip.fade_out ?? 0;
  * is exactly what the same call with `level` used to give (the factors are one product).
  */
 export function clipGainAt(clip: GainClip, t: number, start: number, end: number, level = 1): number {
-	let v = (clip.volume ?? 1) * level;
+	// A keyed volume is the gain over the clip's own time (`volumeAt`), else its static one.
+	let v = volumeAt(clip, t - start) * level;
 	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
 	if (fi > 0 && t < start + fi) v *= Math.max(0, (t - start) / fi);
 	if (fo > 0 && t > end - fo) v *= Math.max(0, (end - t) / fo);
 	return v;
+}
+
+/** One command of a keyed clip's gain automation: ramp to `value` by `time`, or — `jump` — set
+ *  it there at once. */
+export interface GainPoint {
+	time: number;
+	value: number;
+	jump?: boolean;
+}
+
+/** How far either side of a step the gain is read for the value it leaves and the one it lands
+ *  on (seconds). Reading the step's own time is not safe: `(start + t) - start` can land an ulp
+ *  before `t`, on the wrong side of it. */
+const STEP_LEAD = 1e-9;
+
+/**
+ * What the preview does to a **keyed** clip's gain after `from`, in order: a linear ramp to
+ * every point of the volume curve (the polyline the export draws) and to the fade edges, up
+ * to `end`. Between two points that is the curve exactly where no fade overlaps it and its
+ * product with the fade's ramp (a little rounder) where one does.
+ *
+ * A **step** — a hold, or two keys at one time — has two values at one moment: the ramp
+ * arrives at the value it leaves (the gain just before) and a `jump` command sets the value
+ * it lands on, as the export's `if(lt(t,..))` steps. Collapsing the two into one point ramped
+ * a hold's whole segment to the next level. A step at `end` is not jumped (the clip is over),
+ * and one at `from` is already in the starting value. Empty for a clip whose volume is not
+ * keyed.
+ */
+export function gainAutomation(clip: GainClip, start: number, end: number, from: number): GainPoint[] {
+	if (!volumeAnimated(clip)) return [];
+	const times = new Set<number>();
+	const steps = new Set<number>();
+	const polyline = propertyCurve(clip, 'volume');
+	polyline.forEach(([t, v], i) => {
+		times.add(start + t);
+		if (i > 0 && polyline[i - 1][0] === t && polyline[i - 1][1] !== v) steps.add(start + t);
+	});
+	const fi = fadeInOf(clip);
+	const fo = fadeOutOf(clip);
+	if (fi > 0) times.add(start + fi);
+	if (fo > 0) times.add(end - fo);
+	times.add(end);
+	const out: GainPoint[] = [];
+	for (const time of [...times].filter((t) => t > from && t <= end).sort((a, b) => a - b)) {
+		if (!steps.has(time) || time >= end) {
+			out.push({ time, value: clipGainAt(clip, time, start, end) });
+			continue;
+		}
+		out.push({ time, value: clipGainAt(clip, time - STEP_LEAD, start, end) });
+		out.push({ time, value: clipGainAt(clip, time + STEP_LEAD, start, end), jump: true });
+	}
+	return out;
 }
 
 // ---- the master limiter ------------------------------------------------------

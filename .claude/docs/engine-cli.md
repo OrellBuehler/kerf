@@ -370,6 +370,37 @@ so the feature is **only** activated through these forwards — which is what ma
   (no terminal format) kept the cut-out, and a moving zoom (terminal `yuva420p`) flipped it back;
   `ClipFx.alpha` (`Asset::has_alpha`: the probed pixel format of the first video stream is an
   alpha one; an unrecorded format is not) ends such a chain in `format=yuva420p`.
+  **Per-property channels in the graph.** A clip's transform is built number by number from
+  `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
+  `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed
+  opacity as the `geq` alpha, and builds every number it does **not** key from the static transform as
+  an unkeyed clip does (a constant `scale`, a constant `rotate=…:fillcolor=none`, `colorchannelmixer`);
+  the overlay's `x` / `y` are each the curve or the static offset (`curve_or_static`). Any keyed number
+  makes the clip "animated" for the pad / centre decision exactly as the bundle did, so a bundle clip
+  (all five keyed) is byte-identical. **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
+  each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
+  `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed
+  numbers stay the plain numbers, the temperature is `gamma_r='1+0.3*(…)'` / `gamma_b='1-0.3*(…)'`.
+  **Measured, on FFmpeg 4.4.2 and 9.0.2 alike**: every `eq` number (`brightness`, `contrast`,
+  `saturation`, `gamma`, `gamma_r`, `gamma_b`) accepts an expression under `eval=frame`, the centre
+  pixel of every fifth output frame is **0 levels** from the static-`eq` still of the same moment
+  (3 with a keyed opacity beside it: the still takes a constant opacity through the RGB round trip, the
+  file a `geq`) at 24 / 25 / 29.97 / 30 / 60 fps, late on the timeline, at speed 2 / 0.5 / reversed,
+  under a moving zoom, beside a static grade and in a range export
+  (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
+  picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
+  is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
+  export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade
+  would step audibly — so the frames are cut to 128 samples first (2.7 ms at 48 kHz); **`p=0` is
+  required** (the default pads the last frame with silence). With that, on both builds, the render is
+  the unkeyed render scaled **sample for sample** by the curve at the start of each 128-sample frame (worst
+  difference 1.5e-8 in float, five easings), and the frame size is a lag of at most 2.7 ms against the
+  curve. One knife edge: a hold's step that lands exactly on a frame's start flips on the float rounding
+  of `t` (2.2 s is frame 825 and read as "before the step"), so the tests keep steps off that grid.
+  `sweep.rs` evaluates the export's `eq` numbers and `volume` expression at every output frame / time and
+  holds them to `layer.color` / `Clip::volume_at` (and that a plan's turn or opacity is *realised* in the
+  graph — it caught the partial-keying branches in mutation checks).
   **Any such expression must be quoted in
   the filter value** — it contains commas, and an unquoted comma is where the
   graph parser thinks the filter ended; an unquoted `overlay=x=` and `drawtext`

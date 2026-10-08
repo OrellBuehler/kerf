@@ -1,7 +1,8 @@
 # kerf-gpu (`crates/kerf-gpu/`)
 
 The wgpu compositor — work package A0 of `.claude/plans/gpu-compositor-and-roadmap.md`,
-a feasibility spike **not linked into kerf-app yet**. It draws a `RenderPlan` headless
+a feasibility spike that `kerf-app` now links (A2: the Preview panel's opt-in native
+surface, `crates/kerf-app/src/gpu_preview.rs`, in `app.md`). It draws a `RenderPlan` headless
 (`Gpu::new(GpuOptions)`: instance / adapter / device, an `Err` rather than a panic
 when there is no adapter, `force_fallback_adapter` for the software one) and reads
 RGBA back. wgpu is built with the Vulkan / Metal / DX12 backends only — no GLES, no
@@ -27,6 +28,25 @@ nothing for that layer, and so does the compositor. The layers of a frame decode
 parallel, each given `budget / layers` threads even at a full CPU budget
 (`limit_ffmpeg_args(args, share)`). That is the one-shot path; `FrameSource` (below) is the
 long-lived one.
+
+**Presenting a frame (A2).** `Compositor::render_plan_texture_with` is `render_plan_with`
+without the readback: the finished composite stays on the GPU as a `RenderedFrame` (an
+`Rgba8Unorm` texture; `read_back(&Gpu)` copies it out for a test — `tests/parity.rs`'
+end-to-end case asserts the texture, read back, is the picture `render_plan` draws, bit for
+bit — and `from_rgba` uploads a picture the compositor did not draw).
+`Gpu::new_for_surface(options, target)` opens the device on an adapter that can present to a
+window (the surface is made first and the adapter asked to be compatible with it, so a
+hybrid-GPU laptop uses the one that drives the screen; a surface that cannot be made — a
+window system no backend takes — is `GpuError::Surface`, never a panic), and `Presenter`
+configures it (a **non-sRGB** format if the adapter has one, so the encoded values the
+composite holds go out as written, and an sRGB target decodes them in the shader first;
+`Opaque` alpha — the webview is what is transparent, never the surface) and draws a
+`RenderedFrame` into a rectangle (`present.wgsl`: a texel centre per pixel, so exact at 1:1
+and bilinear otherwise) with a `Surround`: a matte inside the frame where the picture is
+smaller, a backdrop beyond it. An acquire that says `Outdated` / `Lost` is reconfigured once
+and retried; `Timeout` / `Occluded` are a `GpuError::Surface` for the caller to skip.
+`present.rs`' tests (`#[ignore]`d, an adapter) hold the blit pixel-exact against an offscreen
+target in RGBA, BGRA and sRGB formats.
 
 **A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
 of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:

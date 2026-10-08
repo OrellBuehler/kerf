@@ -2,6 +2,8 @@
 	import Icon from './Icon.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { gpuPreview } from '$lib/gpu-preview.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 
@@ -44,6 +46,17 @@
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
+	{#if settings.gpuPreview && gpuPreview.label}
+		<!-- Which renderer made the frame on screen (a dev aid; only with the GPU preview on). -->
+		<span
+			data-testid="preview-renderer"
+			title={gpuPreview.reasons.length ? gpuPreview.reasons.join('\n') : 'Drawn by the GPU compositor'}
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:10px;color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+		>
+			{gpuPreview.label}
+		</span>
+		<span style="width:1px;height:12px;background:var(--border-default)"></span>
+	{/if}
 	{#if editor.loading}
 		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--text-muted)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--text-muted);border-top-color:transparent;border-radius:50%"></span>
@@ -90,6 +103,13 @@
 				: 's'}
 		</span>
 	{/if}
+	<!-- Where the project lives; the title bar has its name. -->
+	<span style="width:1px;height:12px;background:var(--border-default)"></span>
+	<span
+		title={editor.currentPath ?? 'In-memory project — not yet saved'}
+		style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);max-width:min(320px,40vw);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+		>{editor.currentPath ?? 'local · in-memory'}</span
+	>
 	{#if showLogs}
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 		<button

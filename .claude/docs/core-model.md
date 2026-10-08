@@ -40,6 +40,70 @@
   `frontend/src/lib/easing.ts` is the faithful mirror (both suites pin the same curve and split
   values bit for bit), used by the Inspector's sampled pose, the harness's edits
   (`insertKeyframe`, `easingProblem`) and `edit-modes.ts`'s `rebaseAnimation`.
+  **Any one number of a clip can carry keys of its own** (B5b, `model/channels.rs`): `Clip.channels:
+  Vec<PropertyTrack {prop, keys: Vec<PropertyKey {time, value, easing}>}>` for a `Property` —
+  `scale`, `pos_x`, `pos_y`, `rotation`, `opacity`, the five colour numbers or the clip's `volume`
+  (linear gain, 0..=4) — beside the legacy `keyframes` bundle, which animates the five transform numbers
+  *together*. **There is one resolver, `Clip::property_keys(prop)`, and everything reads it**: a number
+  with a track is driven by it (values held to the static setters' range on read — `Property::clamp` — so
+  a hand-edited file never hands `eq` or `volume` a value they refuse, and the export's `1 + 0.3 t` gamma
+  is `temperature_gammas`' exactly); a transform number *without* one reads the bundle's keys as stored;
+  anything else is its static value. `property_curve` (the eased polyline), `property_at`, `transform_at`,
+  `color_at`, `volume_at`, `is_animated` / `color_animated` / `volume_animated` / `zoom_animated` are all
+  views of it, so the still, the preview, the plan and the export cannot disagree. **Nothing is converted
+  behind anyone's back, and an old project renders the graph it always did** (the golden digests of the
+  first 4800 cases are untouched): the bundle is not migrated on load and not on write — the first
+  per-property write *detaches* just that number (`channel_mut` copies its bundle keys into a track, the
+  other four keep the bundle), and **a track with no keys is kept while a bundle exists to say "static,
+  whatever the bundle says"** (`prune_channels` drops it once the bundle is gone — it runs after every
+  op that can empty the bundle or a track: `set_property_keys`, `insert_property_key` and
+  `Project::set_keyframes`, which the harness's `setKeyframes` mirrors; a number can never fall back to
+  the bundle by accident). The legacy ops keep their meaning: `set_keyframes` replaces **the bundle
+  only** (an empty list clears the bundle, not the numbers that have keys of their own — the clip can
+  still be animated afterwards, and the MCP description says so; `clear_keyframes` is the one that makes
+  the whole transform static), `add_keyframe` writes the bundle (and puts an asked-for number into the
+  track that drives it, since the bundle's key for it is ignored), `set_keyframe_easing` without a
+  property shapes the transform key at that time in the bundle *and* in every transform track that has
+  one there, `clear_keyframes` takes the bundle and the transform tracks and leaves colour and volume.
+  **While a number is keyed its static value (`set_volume` / `set_color` / `set_transform`) is not used**,
+  which those tools' descriptions now state (an agent that "sets the colour" of a clip whose brightness is
+  keyed would otherwise change nothing and not know why).
+  `Project::set_property_keyframes(clip, prop, keys)` replaces one number's keys (each checked against
+  `Property::check`, at most `MAX_CHANNEL_KEYS` = 1000, bezier range; no keys = static),
+  `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
+  keyed number when `props` is empty; a negative offset cuts the head off with `rebase_head`, so the
+  destination opens on the pose; replaces the destination's tracks for those numbers; refuses a number
+  the source has no keys for and the same clip twice) are the surface ops. **Edits keep channels where
+  they were** with the B5a rules: `rebase_animation` (every head move — `Timeline::slice`, split-and-remove
+  left, roll / slide of the next clip, a linked partner's trim) runs the bundle *and* `rebase_channels`
+  (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold
+  keeps holding, a cut exactly on a key keeps its outgoing segment), `upsert` splits a segment a new key
+  lands in (`Easing::split`), `detach_audio` carries a keyed volume over through the fader ratio, and the
+  diff names the number that moved (`volume keyframes 0 → 2`, `easing changed on 1 opacity keyframe`) —
+  **judged on the keys that drive the number, not on whether it has a track**: a bundle-animated number
+  held static by an empty track diffs `opacity keyframes 2 → 0` (it used to diff as empty, and
+  `apply_staged` discarded an agent's proposal whose render had changed), and one taken over with the keys
+  the bundle already gave it diffs as nothing. **A keyed volume is read held to 0..=`MAX_CHANNEL_VOLUME`
+  (4); a static one is not**, so `detach_audio` does not fold the fader ratio into keys when that would
+  push one past the cap and silently lower the sound: it takes the equal-fader route a compressor takes
+  (a lane whose fader equals the picture track's, else a new track at it) and carries the keys as they
+  are.
+  **`Timeline::split_clip` now rebases the right half's animation** (`rebase_animation(at - start)`):
+  it did not, so every split of a keyed clip replayed the animation from its first key in the right
+  half (bundle and reframe alike; `a_split_also_keeps_the_legacy_bundle_playing_through` fails without
+  it, as does the TS mirror's); **`cut_range_pieces`** (`cut_clip_range`, `remove_silence`, the linked
+  cut) re-times its **tail** piece the same way — by the head and the removed middle — and so does a
+  sole-surviving tail, which is a head trim. **A split also puts each fade on the half that holds its
+  edge** (the left keeps `fade_in`, the right `fade_out`, each clamped to its half as for any clip that
+  shrank; `transition_in` stays on the left): both halves used to keep both, so a clip with a fade-out
+  dipped to black at every split. The links corpus did not move (no case splits a faded clip), and the
+  unit tests are mirrored by name in `links.test.ts`. **Not animatable yet**: the crop edges (`crop`'s output size is fixed
+  when the graph is configured — `w` / `h` are evaluated once — so an animated crop needs the
+  zoom-and-pan reformulation, not a number per frame) and the mask's centre / size / feather (a `geq`
+  expression could carry them; left for when the dope sheet can edit them). `frontend/src/lib/channels.ts`
+  is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges; both
+  suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
+  Inspector's sampled pose and the preview's gain (`gainAutomation`).
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
