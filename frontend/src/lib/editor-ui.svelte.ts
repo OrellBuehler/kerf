@@ -292,7 +292,7 @@ class EditorUi {
 		const name =
 			(kind ? kindInfo(kind).doing : undefined) ??
 			{
-				waiting: 'waiting for the preview proxy',
+				waiting: p.detail ?? 'waiting its turn',
 				download_model: 'downloading speech model',
 				done: 'analyzing'
 			}[p.stage] ??

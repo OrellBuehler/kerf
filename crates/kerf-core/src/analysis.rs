@@ -806,11 +806,27 @@ pub fn analyze_steps(
             run.cancelled = true;
             break;
         }
-        // The step is about to ask the machine for its one heavy-job slot; if a preview
-        // proxy has a place in front of it, say so rather than look hung.
-        if crate::engine::cpu::high_pending() {
-            progress(AnalysisProgress::stage("waiting"));
-        }
+        // Wait for the machine's one heavy-job slot here rather than inside the step, so
+        // the wait can be said out loud — "a preview proxy goes first" — instead of the
+        // step looking hung while it sits in the queue. The step's own lease then nests.
+        // Transcription is left to take its own: its model download is not heavy work
+        // and must not hold the slot while it fetches.
+        let _slot = (kind != AnalysisKind::Transcript).then(|| {
+            if let Some(wait) = crate::engine::cpu::normal_wait() {
+                progress(AnalysisProgress {
+                    stage: "waiting".to_string(),
+                    fraction: None,
+                    detail: Some(
+                        match wait {
+                            crate::engine::cpu::Wait::Proxy => "waiting for the preview proxy",
+                            crate::engine::cpu::Wait::Job => "waiting for another job to finish",
+                        }
+                        .to_string(),
+                    ),
+                });
+            }
+            crate::engine::cpu::lease()
+        });
         progress(AnalysisProgress::stage(match kind {
             AnalysisKind::Transcript => "transcribe",
             other => other.name(),
@@ -977,6 +993,7 @@ mod tests {
 
     #[test]
     fn only_the_named_steps_run_and_in_pass_order() {
+        let _gate = crate::engine::cpu::test_lock();
         let fake = Fake::new();
         let a = asset();
         let out = run(&fake, &a, &[AnalysisKind::Transcript, AnalysisKind::Silence]);
@@ -994,6 +1011,7 @@ mod tests {
 
     #[test]
     fn a_partial_result_merges_without_wiping_the_other_kinds() {
+        let _gate = crate::engine::cpu::test_lock();
         let a = asset();
         // Everything cached from an earlier full pass…
         let mut cached = run(&Fake::new(), &a, &AnalysisKind::ALL).patch;
@@ -1018,6 +1036,7 @@ mod tests {
 
     #[test]
     fn a_failed_step_is_reported_and_the_rest_still_land() {
+        let _gate = crate::engine::cpu::test_lock();
         let mut fake = Fake::new();
         fake.fail = Some(AnalysisKind::Scenes);
         let a = asset();
@@ -1051,7 +1070,67 @@ mod tests {
     }
 
     #[test]
+    fn a_step_says_it_is_waiting_for_a_proxy_and_does_not_start_until_the_proxy_is_done() {
+        let _gate = crate::engine::cpu::test_lock();
+        // A preview proxy is queued: analysis that starts now goes behind it, and says so.
+        let reservation = crate::engine::cpu::reserve();
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen = stages.clone();
+        let asset = asset();
+        let worker = std::thread::spawn(move || {
+            let fake = Fake::new();
+            let (si, sc, lo, rh, tr) = (
+                Probe(&fake, AnalysisKind::Silence),
+                Probe(&fake, AnalysisKind::Scenes),
+                Probe(&fake, AnalysisKind::Loudness),
+                Probe(&fake, AnalysisKind::Rhythm),
+                Probe(&fake, AnalysisKind::Transcript),
+            );
+            let providers = AnalysisProviders {
+                silence: &si,
+                scene: &sc,
+                transcriber: &tr,
+                loudness: &lo,
+                rhythm: &rh,
+            };
+            analyze_steps(
+                &asset,
+                &[AnalysisKind::Silence],
+                &providers,
+                &mut |p| seen.lock().unwrap().push((p.stage, p.detail)),
+                NEVER_CANCEL,
+            )
+        });
+        let start = std::time::Instant::now();
+        while stages.lock().unwrap().is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "no word from the waiting step"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        {
+            let said = stages.lock().unwrap();
+            assert_eq!(
+                said.len(),
+                1,
+                "only the wait was announced, the step has not started: {said:?}"
+            );
+            assert_eq!(said[0].0, "waiting");
+            assert!(said[0].1.as_deref().unwrap().contains("proxy"), "{said:?}");
+        }
+        // The proxy takes the slot, finishes, and the analysis goes.
+        drop(reservation.lease());
+        let run = worker.join().unwrap();
+        assert_eq!(run.patch.ran, [AnalysisKind::Silence]);
+        let said: Vec<String> = stages.lock().unwrap().iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(said, ["waiting", "silence", "done"]);
+    }
+
+    #[test]
     fn a_run_where_everything_fails_is_an_error() {
+        let _gate = crate::engine::cpu::test_lock();
         let mut fake = Fake::new();
         fake.fail = Some(AnalysisKind::Silence);
         let err = run(&fake, &asset(), &[AnalysisKind::Silence]).into_result().unwrap_err();
@@ -1060,6 +1139,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_step_caches_nothing_and_ends_the_run() {
+        let _gate = crate::engine::cpu::test_lock();
         let mut fake = Fake::new();
         fake.cancel_at = Some(AnalysisKind::Loudness);
         let out = run(&fake, &asset(), &AnalysisKind::ALL);

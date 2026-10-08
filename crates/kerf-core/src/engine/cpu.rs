@@ -231,6 +231,29 @@ pub fn high_pending() -> bool {
     state(gate()).high > 0
 }
 
+/// Why a `Normal` job asking for the slot now would have to wait, if it would: a
+/// `High` job in front of it, or the slot being taken. For saying so; never for
+/// deciding (the answer is stale the moment it is given).
+pub fn normal_wait() -> Option<Wait> {
+    let s = state(gate());
+    if s.high > 0 {
+        Some(Wait::Proxy)
+    } else if s.busy || !s.normal.is_empty() {
+        Some(Wait::Job)
+    } else {
+        None
+    }
+}
+
+/// What a waiting `Normal` job is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// A preview proxy is queued or being built, and goes first.
+    Proxy,
+    /// Another heavy job holds the slot (or is ahead in the queue).
+    Job,
+}
+
 /// Wait for the heavy-job slot and take it.
 ///
 /// Every pass that reads a whole file goes through here, which is what keeps
@@ -448,15 +471,24 @@ fn lower_priority(cmd: &mut Command) {
     }
 }
 
+/// Held by every test that takes the heavy-job slot or moves the budget: they share one
+/// process-wide gate, and a test that waits for it (or counts who is waiting) cannot be
+/// run beside one that holds it.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The budget is process-global, so the tests that move it cannot run
-    /// beside each other (cargo runs them on threads of one process).
+    /// The budget and the gate are process-global, so the tests that move them cannot run
+    /// beside each other (cargo runs them on threads of one process) — nor beside any
+    /// other test that takes the slot (see [`test_lock`]).
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        test_lock()
     }
 
     #[test]
@@ -692,5 +724,18 @@ mod tests {
         drop(inner);
         drop(outer);
         let _next = lease();
+    }
+
+    #[test]
+    fn a_normal_job_can_be_told_why_it_would_wait() {
+        let _serial = exclusive();
+        assert_eq!(normal_wait(), None, "the slot is free");
+        let held = lease();
+        assert_eq!(normal_wait(), Some(Wait::Job), "another job has it");
+        let reservation = reserve();
+        assert_eq!(normal_wait(), Some(Wait::Proxy), "a proxy is queued, and goes first");
+        drop(reservation);
+        drop(held);
+        assert_eq!(normal_wait(), None);
     }
 }
