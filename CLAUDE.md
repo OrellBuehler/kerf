@@ -2477,12 +2477,39 @@ the first frame that wants them and dropped together (`Backend`); a build failur
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
 next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
-and a refused plan, a busy decode or an occluded window is only that frame's fallback.
+and a refused plan, a busy decode or an occluded window is only that frame's fallback. **Nothing
+here may freeze the preview**: a backend is built **off the render lock** and with a deadline
+(`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
+JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish
+and dropped), a panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)
+drops the backend behind the backoff, hides the surface and answers with FFmpeg's JPEG — and the
+page treats a *rejected* `get_preview_frame` the same way (the JPEG for that frame, the surface
+hidden). The setting flips **synchronously** (`set_enabled` returns whether a teardown is due; only
+`teardown_if_off`, which may wait for a frame in flight, runs on a thread), and a frame in flight
+looks at it again before it builds and before it shows anything; turning it on is a retry (the
+backoff is forgotten). `Backoff` is forgiven only by a run of 20 frames that reached the screen,
+not by one, so a device that is lost after every present waits longer each time instead of being
+rebuilt every other frame. **A hard driver crash does not repeat on every launch**: a marker file
+(`gpu-preview-attempt`, in the config directory) is written before a backend is built and removed
+once a frame has reached the screen; a launch that finds it turns the setting off before reading
+it (`take_crash_marker_in`) and says so in the Settings status line. On Windows the webview is
+made transparent as the **last** step of a build and restored by a guard's `Drop`, so a build that
+fails after it cannot leave the page transparent over nothing.
 `set_preview_bounds` (GUI-only) is how the page says where the Preview frame is: **device
 pixels relative to the webview, plus the webview's size** (the backend maps the rectangle
 onto the surface when the two differ by a rounding), a `visible` flag, and the two colours
-painted around the picture (`--frame-matte` inside the frame, `--surface-app` beyond it). It
-is cheap and never waits for a render: a hidden frame hides a child window at once. The
+painted around the picture (`--frame-matte` inside the frame, `--surface-app` beyond it), and
+a `seq` that counts up across every Preview the page has had (a panel replaced by a workspace
+switch can send its last report after the new one's first; the backend ignores a report older
+than the newest). It never waits for a *render*, but it is **serialized with a picture being
+shown**: `GpuPreview::set_bounds` and the present of an in-flight frame (`under_bounds`) take
+the same lock, and the frame looks at the bounds again under it. A hide that lands while a
+frame is being drawn therefore sticks (the frame is dropped to the JPEG; before, it re-mapped
+the child window the page had just had hidden, over playback or a dialog), and a frame the page
+moved meanwhile is shown at the frame's new place (`layout_for` again, the picture scaled into
+it); a shown child window also **follows** a move or resize at once rather than waiting for the
+next picture (`Child::follow`), and is re-raised with every present (`Child::place`: GTK makes
+native windows of its own and one made later would otherwise end up above it). The
 render is at about the size it is shown (`place_frame`: the width nearest the panel's, at
 most 1920, whose size keeps the canvas's shape to the row — `still_size` at 430 px is 240
 rows for a 241.9 ideal, which letterboxed the footage with a 2 px pillar), and the presenter
@@ -2527,8 +2554,16 @@ every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces t
 `KERF_GPU_ADAPTER=software` takes the CPU adapter (lavapipe, WARP) instead of the machine's GPU.
 Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
 is hidden while it runs and shown again on the settled frame (A4; scrubbing at GPU speed and
-live drags are A3's). `x11.rs`' ignored test presents to a real child window and reads the
-pixels back **from the X server**, then destroys the device and draws again on a new one.
+live drags are A3's). `x11.rs`' ignored tests present to a real child window and read the
+pixels back **from the X server**, destroy the device and draw again on a new one, and reach a
+server that listens on the **abstract socket only** (an `Xvfb` where `/tmp/.X11-unix` is not
+writable, WSL's case) at once: `RustConnection::connect` tries the filesystem socket and then TCP
+and never the abstract socket libxcb tries first, and waited out a TCP timeout of minutes
+(`connect` tries it first). **The Xlib `Display` is the process's own, opened once**: `tao`'s
+`display_handle()` calls `XOpenDisplay` anew on every call, never closes it and `new_unchecked`s a
+null one, so its handle is not used — only the toplevel's window id comes from the window handle —
+and one display is kept for the whole life of the process however often the backend is rebuilt.
+Every request on the child window is `check()`ed, so a server that refuses it falls back promptly.
 
 **Auto-update.** The app updates itself from its own GitHub releases via
 `tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both

@@ -7,7 +7,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
 | A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112; A1b-3: OrellBuehler/kerf#113 (all merged) | merged | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on 9.0.2 here; CI's parity job runs the same ignored suite on the distro FFmpeg too) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete. |
-| A2 Native preview surface | `feat/gpu-a2-surface` | — | review | **Gate: PASS where testable, JPEG fallback intact everywhere.** Opt-in *Settings › Preview › GPU preview (experimental)* (default off; off = today's behaviour, no extra command). `kerf-gpu` gains `Gpu::new_for_surface`, `Presenter` (+ `Surround`: matte in the frame, backdrop beyond) and `Compositor::render_plan_texture_with` (frame left on the GPU; `RenderedFrame::read_back` / `from_rgba`); `kerf-app` links it (`gpu_preview.rs`: lazy `Backend`, per-frame plan decision with the FFmpeg JPEG returned *in the same call*, `Backoff`, `react` = rebuild on device/surface loss) with commands `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (GUI-only, no MCP tool, no capability, no CSP change, `tauri.conf.json` unchanged). Techniques: **Linux/X11 = child window (confirmed under WSLg + lavapipe)**, **Windows = the window's own surface under a transparent webview (unconfirmed, code only)**, **macOS = none in this build**, Wayland = JPEG. Measured on WSLg/lavapipe (debug build): 416x234 frame cached-decode 0 ms + composite 15-20 ms + present 2-3 ms; first frame decode 140-160 ms + composite 47 ms + present 17 ms; 672x378 composite 20 ms + present 4 ms. Frontend: `preview-bounds.ts` (device-pixel/DPR rounding, route policy, covered detection, hole polygon; 23 bun tests), `gpu-preview.svelte.ts`, Preview/Settings/StatusBar wiring, harness `?gpusurface=1`. Rust: 17 `gpu_preview` unit tests (technique table, bounds math, fit/placement, exact render width, backoff, fallback decision, no-adapter child process), `gpu::tests::a_window_no_backend_can_draw_to…`, 4 presenter tests, parity's `rendering_through_the_frame_source…` extended to the texture path, and an ignored X11 end-to-end test (`x11.rs`: present to a real child window, read the pixels back from the X server, destroy the device, rebuild). Remaining: A3 (scrub / live drags), A4 (playback), real-machine confirmation (below). |
+| A2 Native preview surface | `feat/gpu-a2-surface` | — | review | **Gate: PASS where testable, JPEG fallback intact everywhere.** Opt-in *Settings › Preview › GPU preview (experimental)* (default off; off = today's behaviour, no extra command). `kerf-gpu` gains `Gpu::new_for_surface`, `Presenter` (+ `Surround`: matte in the frame, backdrop beyond) and `Compositor::render_plan_texture_with` (frame left on the GPU; `RenderedFrame::read_back` / `from_rgba`); `kerf-app` links it (`gpu_preview.rs`: lazy `Backend`, per-frame plan decision with the FFmpeg JPEG returned *in the same call*, `Backoff`, `react` = rebuild on device/surface loss) with commands `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (GUI-only, no MCP tool, no capability, no CSP change, `tauri.conf.json` unchanged). Techniques: **Linux/X11 = child window (confirmed under WSLg + lavapipe)**, **Windows = the window's own surface under a transparent webview (unconfirmed, code only)**, **macOS = none in this build**, Wayland = JPEG. Measured on WSLg/lavapipe (debug build): 416x234 frame cached-decode 0 ms + composite 15-20 ms + present 2-3 ms; first frame decode 140-160 ms + composite 47 ms + present 17 ms; 672x378 composite 20 ms + present 4 ms. Frontend: `preview-bounds.ts` (device-pixel/DPR rounding, route policy, covered detection, hole polygon; 23 bun tests), `gpu-preview.svelte.ts`, Preview/Settings/StatusBar wiring, harness `?gpusurface=1`. Rust: 30 `gpu_preview` unit tests (technique table, bounds math, fit/placement, exact render width, backoff + its forgiveness, fallback decision, no-adapter child process, a hide landing mid-present, stale reports, a stalled / panicking build, a panic in the GPU path, the crash marker), `gpu::tests::a_window_no_backend_can_draw_to…`, 4 presenter tests, parity's `rendering_through_the_frame_source…` extended to the texture path, an ignored X11 end-to-end test (`x11.rs`: present to a real child window, read the pixels back from the X server, destroy the device, rebuild) and two more beside it (one process-wide display; an abstract-socket-only `Xvfb` reached at once), and `frame-pump.test.ts` (the frame effect's reactivity, run on Svelte's own runtime). The independent review of the branch found nine issues, all fixed (decisions below). Remaining: A3 (scrub / live drags), A4 (playback), real-machine confirmation (below). |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
 | B3a Ripple + multi-select + zoom | `feat/timeline-editing` | — | merged (local) | `Timeline::ripple_from` (per-track, no sync lock), `move_clips`/`remove_clips`, marquee, group moves, zoom 0.05–2000 px/s. |
@@ -498,11 +498,40 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   through the same command and the frame source's `Scrub` intent (runs, a cache; `Exact` is an
   agent's "one frame, take nothing from anyone"). Nothing is done for scrubbing at GPU speed — that is
   A3 — but nothing is in its way: the backend is one `frame()` call per playhead position.
-- **2026-10-08 — A2: a stable route.** `routePreview` returns a new object whenever any input is
-  recomputed (the titles under the playhead are a new array each tick), and an effect that read
-  `route.via` re-ran on every seek, hiding and re-showing the child window each time (seen in the
-  backend's own log). Effects depend on `routeVia` / `routeOverlays` (primitives) now, and the
-  observers of the bounds are separate from the effect that re-reports on a change of route.
+- **2026-10-08 — A2: a stable route, and a pump that reads nothing.** `routePreview` returns a new
+  object whenever any input is recomputed (the titles under the playhead are a new array each tick),
+  and an effect that read `route.via` re-ran on every seek, hiding and re-showing the child window
+  each time (seen in the backend's own log). The first fix made the effect depend on `routeVia` /
+  `routeOverlays` but left `pump()` reading `route` synchronously from the effect, so the effect still
+  re-ran on every change of the trim monitor, an overlay selection or the GPU status object being
+  replaced — one redundant FFmpeg composite each, **also with the setting off**. The fetching is now
+  `frame-pump.svelte.ts`: `run()` (the effect body) reads the route as primitives, and only reads
+  `routeOverlays` on the GPU route, where the backend takes it; `pump()` reads nothing reactive before
+  its first await. `frame-pump.test.ts` compiles the module with Svelte's own compiler, runs it on
+  Svelte's runtime under bun and counts what the pump asked for (setting off: trim monitor, titles,
+  covered, status churn = no fetch; on: one fetch per answer however often the status is replaced;
+  both mutations — reading `routeOverlays` always, reading it in `pump` — fail it).
+- **2026-10-08 — A2 review round (independent review of the branch).** Nine findings, all fixed.
+  (1) *A hide that landed during a frame was undone by it*: `attempt` checked `bounds.visible` once at
+  the top and `Child::place` re-mapped the window after a long decode, and the page's `sameReport`
+  never re-sent. The bounds lock is now held across re-check + apply + present and by `set_bounds`
+  around store + hide; a hide wins (the frame is dropped to the JPEG); a *moved* frame is shown at its
+  new place instead (re-laid-out under the lock, the picture scaled into it) rather than bailing to a
+  JPEG per frame of a drag. (2) the pump above. (3) *`RustConnection::connect` hung 132 s on an
+  abstract-only X server inside the render lock*: the abstract socket is tried first, the backend is
+  built off the render lock with a 10 s deadline on its own thread. (4) the enable flag flips
+  synchronously, a frame in flight re-checks it before it builds and before it shows. (5) panics are
+  caught (the GPU path, the build thread) and the page treats a rejected command as a JPEG frame; an
+  attempt marker file turns the setting off on the next launch if the process died during the first
+  GPU frame. (6) the Windows transparency is the last build step and restored by `Drop`. (7) one
+  process-wide Xlib display (tao's `display_handle()` opens a new one per call and never closes it),
+  and `Backoff` forgives only a run of 20 shown frames. (8) every X request on the child is checked.
+  (9) turning the setting on is a retry; the page flips to the GPU only after the settings write
+  resolves and then asks for the frame again; a shown child window follows the frame's move at once
+  and is re-raised per present; bounds reports carry a sequence number; the scroll listener is
+  throttled to a frame. *Not done, by choice*: the name of the display is `XDisplayString` of our own
+  `XOpenDisplay(NULL)` (`$DISPLAY`, what tao opens too) rather than GDK's, which would put a GTK call
+  on a worker thread; `--display` on the command line is not honoured by either.
 
 ## Needs a real machine
 
@@ -530,3 +559,13 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   child window, `GDK_SCALE=2`, a compositing manager that stacks windows differently from Xwayland's.
   Real-GPU frame times (A3's latency target of < 33 ms at 1080p) are unmeasured: the numbers above
   are lavapipe's.
+- A2 (Windows, more): `tao` registers the window class with its own background brush and the runtime
+  paints the window on `WM_ERASEBKGND`; whether that opaque erase of the parent window, which sits
+  *under* the swapchain, is covered by the swapchain's present (DXGI flip model: it should be, the
+  swapchain replaces the redirection surface) or flashes at a resize is unverifiable here and is the
+  first thing to look at when the picture is black on Windows. `set_background_color` alpha 0 reaches
+  the webview layer only (the window layer ignores alpha).
+- A2 (binary size, for Windows and macOS bundles): linking `wgpu` (Vulkan / Metal / DX12 backends) into
+  `kerf-app` grows the Linux release binary by **7.4 MB (7.1 MiB, +9.8 %)**: 76,145,104 → 83,575,232 bytes, `cargo build --release -p kerf-app --no-default-features --locked` of `main` and of this branch, same toolchain, `strip = "debuginfo"`; the Windows installer and the macOS
+  bundle were not built here and will grow by a comparable amount (DX12 and Metal pull in different
+  crates), which is worth a look at the PR-build artifacts.
