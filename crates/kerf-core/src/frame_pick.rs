@@ -53,7 +53,7 @@
 //! Pure: no I/O.
 
 use crate::clip_timing::{clip_seek, parse_micros, parse_micros_text, Rational};
-use crate::engine::seek_arg;
+use crate::engine::{export_seek_arg, seek_arg};
 
 /// The frames of one decoded file as ffprobe or `showinfo` state them.
 #[derive(Debug, Clone, Copy)]
@@ -284,7 +284,15 @@ fn window(pick: &FpsPick, frames: &Frames) -> Window {
     let tb = frames.time_base();
     // A still image is never seeked (its trim is absolute).
     let seek = if pick.image.is_some() { 0.0 } else { clip_seek(pick.window.0) };
-    let shift = seek_shift(if seek > 0.0 { parse_micros(seek) } else { 0 }, tb, frames.start_us());
+    let shift = seek_shift(
+        if seek > 0.0 {
+            parse_micros_text(&export_seek_arg(seek))
+        } else {
+            0
+        },
+        tb,
+        frames.start_us(),
+    );
     // What the chain's `trim` keeps, in ticks relative to the seek: `[lo, hi)`.
     let lo = ticks(parse_micros(pick.window.0 - seek), tb);
     let hi = ticks(parse_micros(pick.window.1 - seek), tb);
@@ -520,6 +528,13 @@ impl FpsPick {
     pub fn seek(&self) -> Option<f64> {
         self.image.is_none().then(|| clip_seek(self.window.0))
     }
+
+    /// The text of that `-ss` as the export spells it ([`export_seek_arg`], which FFmpeg
+    /// truncates to whole microseconds — not the still's `{:.6}`), or `None` where the export
+    /// passes none: a still image, and a window that starts at the head of the file.
+    pub fn seek_arg(&self) -> Option<String> {
+        self.seek().filter(|&s| s > 0.0).map(export_seek_arg)
+    }
 }
 
 #[cfg(test)]
@@ -573,6 +588,33 @@ mod tests {
         }
         // The six-decimal spelling decides, not the f64: 1/30 s is 33333 us, 999.99 ticks.
         assert_eq!(seek_ticks(1.0 / 30.0, tb), 1000);
+    }
+
+    #[test]
+    fn a_clips_seek_is_spelled_as_the_export_spells_it_not_as_the_still_does() {
+        let p = pick((2.0 / 30.0, 1.0), 0.0, 1.0, false, (30, 1), 0);
+        // FFmpeg truncates `-ss` to whole microseconds: 66666, where the still's `{:.6}` is 66667
+        // and would drop a frame at 66666 that the export keeps.
+        assert_eq!(p.seek_arg().as_deref(), Some("0.06666666666666667"));
+        assert_eq!(parse_micros_text(&p.seek_arg().unwrap()), 66_666);
+        assert_eq!(parse_micros_text(&seek_arg(2.0 / 30.0)), 66_667);
+        // The export passes no `-ss` for a window at the head of the file, nor for a still image.
+        assert_eq!(pick((0.0005, 1.0), 0.0, 1.0, false, (30, 1), 0).seek_arg(), None);
+        assert_eq!(pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), 0).seek_arg(), None);
+        let image = FpsPick {
+            image: Some(Rational::new(30, 1).unwrap()),
+            ..pick((2.0, 3.0), 0.0, 1.0, false, (30, 1), 0)
+        };
+        assert_eq!(image.seek_arg(), None);
+        // The pick's own model of the seek is that text: a frame at 66666 is kept.
+        let pts = [0, 33_333, 66_666, 100_000, 133_333];
+        let src = SourceFrames {
+            pts: &pts,
+            time_base: Rational { num: 1, den: 1_000_000 },
+            start_us: 0,
+            last_duration: 33_333,
+        };
+        assert_eq!(Pick::Fps(p).select(&src), Some(2));
     }
 
     #[test]

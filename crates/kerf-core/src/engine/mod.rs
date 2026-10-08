@@ -23,6 +23,11 @@ pub struct ProbeResult {
 
 mod cli;
 
+// What the decodes ask `ffprobe` per file, bounded and remembered: container, HDR, start, and
+// whether a seek lands on a keyframe.
+mod source_probe;
+pub use source_probe::source_seek_points_are_keyframes;
+
 // Waveform peak pyramids and the windows read out of them: one decode per file,
 // cached, drawn from at any zoom. Also CLI-only, so it works in every build.
 mod peaks;
@@ -81,7 +86,10 @@ pub(crate) use cli::insta360_pair_name;
 pub(crate) use cli::proxy_sidecar_path;
 pub(crate) use cli::proxy_video_info;
 pub(crate) use cli::render_geometry;
-pub use cli::{composite_color_policy, ffmpeg_command, ffmpeg_path, limit_ffmpeg_args};
+pub use cli::{
+    composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, limit_ffmpeg_args,
+    source_is_indexed_container,
+};
 pub(crate) use cli::{safe_color, valid_color};
 
 // Speech models: the download itself, plus what can be downloaded. Re-exported

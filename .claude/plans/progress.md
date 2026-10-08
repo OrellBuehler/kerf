@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107 (merged); A1b-1: OrellBuehler/kerf#111 | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (cursor) next. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112 (all merged); A1b-3: this PR | review | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on 9.0.2 here; CI's parity job runs the same ignored suite on the distro FFmpeg too) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete pending review of A1b-3. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -316,6 +316,107 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   clips counted once; `reattachSelection` has one Undo. (3) `set_volume` / `set_fade` / `set_clip_enabled`
   say a detached picture carries no sound. (4) A clippy `nonminimal_bool` in `with_linked_cuts` rewritten
   with its short-circuit kept; a duplicated phrase in `CLAUDE.md` fixed.
+
+- **2026-10-08 — A1b-3 `FrameCursor`, review fixes.** (1) *Repeated timestamps split the parser, not the
+  contract.* `ShowinfoParser` is strict (`new()`: pts strictly ascending) because the frame cache keys a
+  frame by pts, and a repeat would be one key for two pictures. The cursor has no cache and `Pick::select`
+  takes a file's repeated timestamps as they come, so it reads with `ShowinfoParser::allowing_repeats()`:
+  an equal pts passes, an earlier one is still `OutOfOrder`. The router's runs stay strict. Until then the
+  `repeated-pts` clip of `tests/cursor.rs` failed on main's strict parser; it now passes and is asserted to
+  repeat (4290 output frames on 9.0.2; the distro FFmpeg is CI's parity job). (2) *The run's `-ss` is the
+  export's spelling for an `Fps` pick*: `kerf_core::export_seek_arg` (`format!("{seek}")`, truncated by
+  FFmpeg to whole microseconds), shared by `push_inputs` and the pick's own model of the seek, and none at
+  the head of the file; the still's `{:.6}` rounds, and a window start between two microseconds on a
+  one-microsecond time base started the run a frame late (an ignored µs-mp4 test; mutating only the
+  cursor's spelling fails it). (3) *Skipped output frames are read through*: a forward cursor keeps only
+  the newest frame while a pick is undecided (a reversed one its whole window), so skipping no longer
+  trips the reversed-window cap. (4) `picks_through` hands each frame to a callback. (5) A run that
+  closes stdout and never exits is killed after `frame_timeout` (bounded `try_wait`, the child lock never
+  held across a wait; the router's `run_reader` too, `EXIT_GRACE`); a wrong-sized picture is
+  `Unsupported`; `for_layer` refuses `Before` without spawning; a failed thread start kills the child;
+  `run_args` and the media-making tests spell `passthrough` with `fps_mode_flag()` (now public). (6) The
+  cursor's "answer is `select`'s" holds where `-ss` lands on the frame the timestamps say; a long-GOP
+  transport stream lands on a later keyframe as the export does, the same known limit as the still's.
+  `tests/cursor_fake.rs` (a shell script as `KERF_FFMPEG`) holds the parts that need no FFmpeg.
+
+- **2026-10-08 — A1b-2 `FrameSource`, post-merge review fixes (PR #112's contract: "byte-identical to the
+  one-shot decode"; when in doubt, one-shot).** (1) *Cache history decided the answer.* What `-ss t` returns is
+  not "the frame at `t`": a seek into the frames an open GOP's keyframe leads returns the keyframe, a
+  long-GOP transport stream lands on the next one, and a run that read through from an earlier keyframe (or
+  from 0) has the frame the one-shot does not. Reproduced on 9.0.2 with an x264 `open-gop=1` mp4 (frame 49
+  against 50 at 1.96 s), an x265 mp4 (11 of 400 times) and a long-GOP `.ts` played from 0 (394 of 400 differ).
+  A run therefore answers only for what it can be proved equal on, and every other file is decoded one-shot
+  from the first thing that shows it (`State::distrusted`): the container is MP4 / MOV or Matroska / WebM
+  (`kerf_core::source_is_indexed_container`, a positive allow-list on `ffprobe`'s `format_name`; the cursor
+  refuses the rest too), no B frame (`showinfo`'s `type:`, which the self-test now requires: a closed-GOP file
+  with B frames pays too, because `showinfo` does not give the decode order that would tell it from an open
+  one), a first frame a whole interval or more after its seek (was two; the coverage claim from `pts - ft`
+  went, and a VFR gap now reads as a late seek: speed only), and a file that contradicts itself (time base,
+  unreadable or unpaired timestamps, another size, another picture at a cached pts). That last is also the
+  negative cache: a file whose runs always died was spawned and killed once a request. Fixtures that would
+  have caught it: open-GOP x264, x265 and long-GOP TS walked forward, backward and random through one source
+  each against the one-shot (`tests/frame_source.rs`; the old VFR and TS legs are one-shot by design and say
+  so), and a jittered-pts mp4 and the CFR mp4 for the files runs *do* answer. (2) *The reaper killed a parked
+  run the moment it was reused* (silence counted from the frame it parked after): `Run::want_to` starts the
+  clock when a run is wanted again. (3) *Nothing under the state lock waits on a process*: `run_reader`
+  held the child's lock across `wait()` (a run that closes stdout and never exits blocked `kill`, and with
+  it every request through `stop`); it is a bounded `try_wait` (`EXIT_GRACE`), `stop` kills on a short
+  thread, and `spawn` registers the run, releases the lock for `Command::spawn` and takes it again. Tested
+  with a wrapper that closes its output and sleeps, and mutation-checked. (4) *`FrameCache::put` panicked
+  in a debug build* when two runs of an AVI-like file put two pictures at one pts (release silently kept
+  the first): the cache refuses and counts it, the run fails and the file goes one-shot. (5) *A repeated
+  timestamp made `Non-monotonic DTS` warnings that mangled `showinfo` lines* (the muxer logs from another
+  thread between the calls that make one line: 5 runs in 200 lost a frame line, and the repeated-pts leg of the
+  cursor test failed once in five suites): the run's filter chain ends in `setpts=N/TB`, after `showinfo`, which silences the muxer
+  (0 in 200). (6) `render_plan_with` has an end-to-end test (five cases, both orders and hints, rendered
+  RGBA equal to `render_plan`'s, after checking the compositor is deterministic). (7) *A latent bug the
+  container probe's timing exposed*: a request made before a file's time base is known joins the run
+  another request has starting (it cannot tell where it is), and when that run ended with no frame —
+  because *its* seek (1.99 s) was past the end — the joiner was answered "no frame" for 0.5 s. The
+  parity suite hit it in one run of three once its 28 threads reached the frame source together (the
+  `ffprobe` they all wait for); a joiner now routes afresh (a fake `ffmpeg` that is slow and empty at
+  1.99 s reproduces it; mutation-checked). With the process started off the lock a fresh run is also
+  entered with its starter as a waiter (it is otherwise idle to the router and the first to be taken
+  while the lock is released), and the parity harness asks again on `Busy` (28 threads for one file is
+  more than its three runs: an app renders that frame with FFmpeg). Not done: the 6.1 leg (CI's parity
+  job runs it).
+
+- **2026-10-08 — A1b-2 / A1b-3, second review of the frame source and the cursor ("when in doubt,
+  one-shot", again).** (1) *Intra refresh.* x264 `intra-refresh=1:bframes=0` (25 fps mp4) marks a sync
+  sample every 2 s but only frame 0 is a keyframe; `-ss 2.0` decodes from the sync sample, the decoder
+  outputs nothing until the refresh wave ends and the one-shot returns the frame at 2.72 s, where a run that
+  read through from an earlier keyframe cached the true 2.0 to 2.68 (forward play 18 of 75 differed, with
+  `distrusted == 0`: a run's own first frame is only checked at its own seek, and a run reading through
+  never seeks there). Decided per file before any run: `kerf_core::source_seek_points_are_keyframes` lists
+  the video packets (rungs of 16 / 64 / 256 / 1024 / 4096, until four sync samples are in view: an
+  all-intra proxy costs sixteen packets) and decodes just those with `-skip_frame nokey`; every `K` packet
+  must have an `I` picture with `key_frame` at its timestamp. The limit is stated, not hidden: it looks at
+  the file's head (two encodes joined are not caught); a probe that cannot tell is "no" (one-shot), retried
+  after a minute. Chosen over a lazy check inside the run (packet flags are not in `showinfo`, and listing
+  every sync sample of a long original reads the whole file) and over seeking at each sync sample
+  (`-read_intervals START%+#1`: faithful, but one seek per sample and it depends on how each build flushes
+  its decoder). Finding while wiring it: on 9.0.2 an x264 open GOP's sync samples fail the probe (the
+  decoder drops the reordered tail under `nokey`), so the open-GOP mp4 is now refused up front and the
+  cursor's known limit shrank to "an open GOP the decoder does not show"; the run's own B-frame check stays
+  and has a deterministic fake-`ffmpeg` test (`a_run_that_shows_a_b_frame_marks_the_file`) so it does not
+  depend on a build's decoder. (2) *Hardware decode.* Runs passed `decode_hwaccel()` and the one-shot never
+  did; a ProRes 4:2:2 10-bit `.mov` through 9.0.2's Vulkan decoder differed on 79 of 80 frames by up to 24
+  levels. Runs are software, the retry-in-software code is gone, and `CursorConfig::hwaccel` defaults to
+  `None` (an export names its decoder). (3) `FrameSource::cursor` refused every still image (a PNG probes
+  as `png_pipe`): exempt like `frame`, and the cursor's gates (transport stream, intra refresh, a file a
+  run marked, unrecorded / alpha pixel format) have a test. (4) *The late-seek threshold was the rounded
+  interval*: on a 1 ms time base 30 fps is 33.33 ticks, gaps are 33 and 34, and a seek just after a 34 ms
+  gap's start reads its first frame 33 ticks on, which `>= 33` called late and marked healthy 30 / 29.97 /
+  120 fps mkv and webm files one-shot for good. `late_ticks` is the interval rounded up; an integral
+  interval (every 25 fps file here) is unchanged, so the open-GOP and x265 landings are caught as before.
+  The residual is stated in CLAUDE.md. (5) `source_traits` ran an unbounded `ffprobe` on the request path
+  and respawned it on every frame after a failure: it is killed after 20 s, one probe however many threads
+  ask, a failure remembered for 60 s (`ProbeCache`, shared with the seek-point probe). (6) A run the reaper
+  failed while it was still starting (a slow spawn is silence) left its record and its starter's claim in
+  the table, and a spawn failure woke nobody, so a request that had joined the run slept out its deadline:
+  every failed start leaves through one `abandon` (`stop` + `notify_all`), mutation-checked. Not verified
+  here: FFmpeg 6.1 (CI's parity job), a proxy made by a hardware encoder through the probe (a `-g 1` x264
+  proxy passes).
 
 - **2026-10-08 — B5a: an eased segment is a polyline.** The plan said to realize easing
   in `keyframe_expr` by sampling 8–12 linear pieces. Doing that only in the graph would

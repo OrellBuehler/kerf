@@ -14,6 +14,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cpu;
+use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
     clip_seek, clip_source_window, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint, HEAD_PADDED_SUFFIX,
@@ -844,7 +845,7 @@ fn measure_composite_color_policy(ffmpeg: &str, ffprobe: &str, timeout: std::tim
 /// cannot wedge the caller; on a timeout those threads are left to finish on
 /// their own (a wrapper script that spawned the real ffmpeg keeps the pipe open
 /// past the kill, and the caller must not wait for it).
-fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
+pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::{Read, Write};
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -1054,41 +1055,44 @@ pub(crate) struct SourceTraits {
     /// Seconds between the container's start and the video's first frame (see
     /// [`head_lead`]); `0.0` for an ordinary file.
     pub lead: f64,
+    /// The container is an MP4/MOV or Matroska/WebM file: a per-packet timestamp of its own
+    /// and a seek index. Transport streams, AVI, program streams and bare elementary streams
+    /// are not (their timestamps are measured or guessed and their seeks land on a later
+    /// keyframe), and neither is a file whose format the probe did not name.
+    pub indexed: bool,
 }
 
-/// [`SourceTraits`] of the file at `path`, probed once per file and cached
-/// against the file's size and modified time. `None` when the probe itself
-/// fails (not cached, so a transient failure is retried).
+/// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
+/// size and modified time. One `ffprobe`, killed after [`SOURCE_PROBE_TIMEOUT`]; `None` when the
+/// probe itself fails or outlasts it, and the failure is remembered for a minute (a broken or
+/// hung `ffprobe` is not respawned by every frame that asks), then retried.
+///
+/// It spawns a process: not under a lock.
 pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
-    static CACHE: OnceLock<Mutex<HashMap<String, SourceTraits>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = source_key(path);
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
-        return Some(hit);
-    }
-    let output = command(&ffprobe_bin())
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=color_transfer,start_time:format=start_time,format_name",
-        ])
-        // JSON rather than `csv`/`default`: the stream and the format both have a
-        // `start_time`, and a file with side data (a phone's display matrix) makes
-        // the csv writer append a stray empty field to the value.
-        .args(["-of", "json"])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let traits = parse_source_traits(&String::from_utf8_lossy(&output.stdout));
-    if let Ok(mut c) = cache.lock() {
-        c.insert(key, traits);
-    }
-    Some(traits)
+    static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
+    CACHE
+        .get_or_init(ProbeCache::new)
+        .get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
+}
+
+/// One `ffprobe` of `path`, killed after `timeout`.
+fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration) -> Option<SourceTraits> {
+    let mut cmd = command(ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=color_transfer,start_time:format=start_time,format_name",
+    ])
+    // JSON rather than `csv`/`default`: the stream and the format both have a
+    // `start_time`, and a file with side data (a phone's display matrix) makes
+    // the csv writer append a stray empty field to the value.
+    .args(["-of", "json"])
+    .arg(path);
+    let output = run_piped_until(&mut cmd, Vec::new(), Instant::now() + timeout)?;
+    Some(parse_source_traits(&String::from_utf8_lossy(&output)))
 }
 
 /// The pure half of [`source_traits`]: read the probe's JSON. Anything missing
@@ -1131,7 +1135,19 @@ fn parse_source_traits(json: &str) -> SourceTraits {
             secs(format.and_then(|f| f.get("start_time"))),
         )
     };
-    SourceTraits { hdr, lead }
+    let indexed = format
+        .and_then(|f| f.get("format_name"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.split(',').any(|n| matches!(n, "mp4" | "matroska")));
+    SourceTraits { hdr, lead, indexed }
+}
+
+/// Whether the file at `path` is an MP4/MOV or Matroska/WebM file (see
+/// [`SourceTraits::indexed`]): the only containers whose frame timestamps and seeks the
+/// GPU frame source's decode runs are checked against. One cached `ffprobe` per file (it
+/// spawns a process: not under a lock); `false` when the probe fails.
+pub fn source_is_indexed_container(path: &Path) -> bool {
+    source_traits(path).is_some_and(|t| t.indexed)
 }
 
 /// The HDR transfer of the first video stream of the file at `path`, for the
@@ -3517,7 +3533,7 @@ fn push_inputs(
             let seek = clip_seek(start);
             if seek > 0.0 {
                 args.push("-ss".to_string());
-                args.push(format!("{seek}"));
+                args.push(export_seek_arg(seek));
             }
         }
         args.push("-i".to_string());
@@ -4552,8 +4568,9 @@ fn fps_mode_flag_for(knows_fps_mode: bool, knows_vsync: bool) -> &'static str {
     }
 }
 
-/// [`fps_mode_flag_for`] for this machine's ffmpeg, probed once per process.
-fn fps_mode_flag() -> &'static str {
+/// [`fps_mode_flag_for`] for this machine's ffmpeg, probed once per process: the spelling
+/// every spawn outside the engine that passes `passthrough` uses.
+pub fn fps_mode_flag() -> &'static str {
     static FLAG: OnceLock<&'static str> = OnceLock::new();
     FLAG.get_or_init(|| {
         let help = help_flags();
@@ -6350,6 +6367,15 @@ pub fn seek_arg(seconds: f64) -> String {
     format!("{seconds:.6}")
 }
 
+/// How the export spells a clip's input `-ss`: the shortest text of the `f64`, which FFmpeg
+/// reads and truncates to whole microseconds. [`seek_arg`] rounds to the nearest instead, so
+/// for a window start like 2/30 s on a one-microsecond time base the two land on frames a tick
+/// apart; whatever has to see the frames the export sees (`FpsPick::seek_arg`, the frame pick's
+/// model of the seek) takes this one.
+pub fn export_seek_arg(seconds: f64) -> String {
+    format!("{seconds}")
+}
+
 /// Pure arg builder for a composited still, parameterized by its sink (no I/O,
 /// unit-tested).
 ///
@@ -7074,6 +7100,51 @@ mod tests {
         let mp4 =
             r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"1.4"}}"#;
         assert!((parse_source_traits(mp4).lead - 0.121333).abs() < 1e-9);
+    }
+
+    /// A hung `ffprobe` is killed at the timeout and a failing one is no answer, where
+    /// `Command::output()` waited for as long as the process cared to run.
+    #[cfg(unix)]
+    #[test]
+    fn probing_a_source_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kerf-source-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let file = Path::new("/media/a.mp4");
+        let limit = std::time::Duration::from_millis(400);
+        let started = Instant::now();
+        assert_eq!(probe_source_traits(&script("hang", "exec sleep 30"), file, limit), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(probe_source_traits(&script("fail", "exit 1"), file, limit), None);
+        assert_eq!(probe_source_traits("/no/such/ffprobe", file, limit), None);
+        let json = r#"{"streams":[{"color_transfer":"smpte2084"}],"format":{"format_name":"matroska,webm"}}"#;
+        let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
+        assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_mp4_and_matroska_are_indexed_containers() {
+        let indexed =
+            |name: &str| parse_source_traits(&format!(r#"{{"streams":[{{}}],"format":{{"format_name":"{name}"}}}}"#)).indexed;
+        assert!(indexed("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert!(indexed("matroska,webm"));
+        for other in ["mpegts", "avi", "mpeg", "mpegvideo", "h264", "flv", "asf", "mxf", "image2"] {
+            assert!(!indexed(other), "{other}");
+        }
+        // No format named (a failed or odd probe) is not indexed.
+        assert!(!parse_source_traits(r#"{"streams":[{}],"format":{}}"#).indexed);
+        assert!(!parse_source_traits("not json").indexed);
     }
 
     #[test]

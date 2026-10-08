@@ -8,11 +8,11 @@
 //! * **Coverage makes a miss exact.** Every frame states `covers_from`: "no frame of this file
 //!   has a pts in `covers_from..pts`", so it is the answer to `AtOrAfter(t)` for every tick `t`
 //!   in `covers_from..=pts` ([`FrameCache::at_or_after`]). A frame decoded right after another
-//!   covers from the tick after it; a run's *first* frame covers from the seek tick (clamped by
-//!   the caller to one frame interval before the frame: an `mpegts` seek may land a whole GOP
-//!   late and must not claim the frames it skipped). That is one `BTreeMap` range query and is
-//!   exact on a variable frame rate, where "the frame containing `t`" is not. The same fact
-//!   answers `Before(t)` ([`FrameCache::before`]): the frame at `covers_from - 1`.
+//!   covers from the tick after it; a run's *first* frame covers from the seek tick (the caller
+//!   marks the file instead when the frame came a whole frame interval or more after it, as a
+//!   seek that lands on a later keyframe does, and then claims nothing before the frame). That
+//!   is one `BTreeMap` range query and is exact on a variable frame rate, where "the frame
+//!   containing `t`" is not. The same fact answers `Before(t)` ([`FrameCache::before`]): the frame at `covers_from - 1`.
 //! * **The end of a file is remembered** ([`FrameCache::mark_end`]): a time past the last frame
 //!   is [`Lookup::PastEnd`] — FFmpeg draws nothing there — not a miss that decodes again.
 //! * **A hit is an `Arc`**, so a frame being composited outlives its eviction; what the cache
@@ -173,6 +173,8 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Passed frames that were not kept because keeping them would have cost a warm one.
     pub cold_dropped: u64,
+    /// Pictures offered for a pts that already held another one (and refused).
+    pub conflicts: u64,
 }
 
 /// See the [module](self).
@@ -206,7 +208,8 @@ impl FrameCache {
     /// return the frame the cache now holds. A frame already there stays and only widens its
     /// coverage: two true statements about the same file add up. A file has one picture at a
     /// pts (a run whose pts repeat or go back is refused by the `showinfo` parser), so the frame
-    /// offered for a held key must be that picture; a debug build checks it.
+    /// offered for a held key must be that picture; one that is not is refused and counted
+    /// (`conflicts`), and [`FrameCache::conflicts_with`] says so beforehand.
     /// Older unpinned frames go until the cap is met (cold ones first); the one inserted never does.
     pub fn insert(&mut self, key: FrameKey, frame: Arc<YuvFrame>, covers_from: i64) -> Arc<YuvFrame> {
         let held = self.put(key, frame, covers_from, false);
@@ -241,10 +244,12 @@ impl FrameCache {
         let used = self.clock;
         match self.frames.get_mut(&key) {
             Some(e) => {
-                debug_assert!(
-                    Arc::ptr_eq(&e.frame, &frame) || e.frame == frame,
-                    "a different picture offered for {key:?}, which is already cached"
-                );
+                if !(Arc::ptr_eq(&e.frame, &frame) || e.frame == frame) {
+                    // Not a panic: the caller is told by `conflicts_with` first and fails the
+                    // run; this keeps the cache true to the first picture if it was not asked.
+                    self.stats.conflicts += 1;
+                    return Arc::clone(&e.frame);
+                }
                 e.covers_from = e.covers_from.min(covers_from);
                 if !cold {
                     (e.used, e.cold) = (used, false);
@@ -272,6 +277,16 @@ impl FrameCache {
                 frame
             }
         }
+    }
+
+    /// The cache holds a **different** picture under `key`: the file does not have one picture
+    /// per pts (a container that guesses its timestamps, and a decoder that guesses differently
+    /// on another run). Offering `frame` would keep the first and serve it for a time that
+    /// belongs to the second, so the caller fails the run instead.
+    pub fn conflicts_with(&self, key: FrameKey, frame: &Arc<YuvFrame>) -> bool {
+        self.frames
+            .get(&key)
+            .is_some_and(|e| !(Arc::ptr_eq(&e.frame, frame) || e.frame == *frame))
     }
 
     /// The frame at exactly `key`.
@@ -481,23 +496,21 @@ mod tests {
     }
 
     /// Two pictures under one key would be served as the first for a time that belongs to the
-    /// second: a debug build refuses to let that pass silently.
-    #[cfg(debug_assertions)]
+    /// second: that is told to the caller, who fails the run — never a panic on a run's thread
+    /// under the source's lock.
     #[test]
-    #[should_panic(expected = "a different picture offered")]
-    fn a_different_picture_under_a_held_key_is_not_silently_dropped() {
+    fn a_different_picture_under_a_held_key_is_refused_and_reported_not_a_panic() {
         let mut c = FrameCache::new(1 << 20);
-        c.insert(key(A, 10), frame(1), 5);
-        c.insert(key(A, 10), frame(2), 5);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "a different picture offered")]
-    fn a_different_picture_offered_cold_under_a_held_key_is_not_silently_dropped() {
-        let mut c = FrameCache::new(1 << 20);
-        c.insert(key(A, 10), frame(1), 5);
-        c.insert_cold(key(A, 10), frame(2), 5);
+        let first = c.insert(key(A, 10), frame(1), 5);
+        assert!(!c.conflicts_with(key(A, 10), &frame(1)), "the same picture is no conflict");
+        assert!(!c.conflicts_with(key(A, 11), &frame(2)), "nor is a key nobody holds");
+        assert!(c.conflicts_with(key(A, 10), &frame(2)));
+        let held = c.insert(key(A, 10), frame(2), 5);
+        assert!(Arc::ptr_eq(&first, &held), "the first picture stays");
+        let cold = c.insert_cold(key(A, 10), frame(3), 5);
+        assert!(Arc::ptr_eq(&first, &cold));
+        assert_eq!((c.stats().conflicts, c.stats().entries), (2, 1));
+        assert_eq!(tag(c.at_or_after(A, 7)), Some(1));
     }
 
     #[test]
