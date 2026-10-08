@@ -301,7 +301,22 @@ so the feature is **only** activated through these forwards — which is what ma
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
-  `keyframe_expr` over clip-local time). **The keyframed zoom is the one stage that changes a
+  `keyframe_expr` over clip-local time). **An expression may nest about 100 levels** (libavutil's
+  `av_expr_parse` stack: the whole text, each bracket and each function argument is one level; the
+  next is `EMFILE`, which the filter reports as `Invalid argument` — the 101st on 4.4.2, a level
+  sooner on 9.0.2) **and a chain of `if(lt(..))` is a level per polyline point**, twelve to an
+  eased segment: ten eased keys failed the export *and* the playback stream. So above
+  `KEYFRAME_TREE_POINTS` (24) points `keyframe_expr` writes a **balanced binary tree** over the
+  segments (`if(lt(t,t_mid),left,right)`, the head and tail holds wrapped around it): `log2(n)`
+  levels, and `log2(n)` comparisons an evaluation where the chain walked all of them (a `geq`
+  pays that per pixel). Up to the threshold the text is the chain every earlier graph carried, so
+  the golden oracle did not move. Chain and tree pick the one segment whose span holds the time
+  (a step's empty span is never reached), so they evaluate alike: the sweep's evaluator enforces
+  the limit (`NESTING_LIMIT`) and holds the tree to `interpolate`, a unit test bounds the nesting
+  of 40 eased keys, and `keyed_zoom.rs`'s `a_clip_with_many_eased_keys_exports_and_plays_back`
+  renders thirteen eased keys on every animated channel through the export and `stream_preview`
+  against `transform_at` (it failed on both FFmpegs before the tree). Anything else that writes
+  an expression per input item must be a tree too. **The keyframed zoom is the one stage that changes a
   picture's size from frame to frame, and almost nothing after it can follow**:
   `format` negotiation inserts a fixed-size converter (`overlay` takes `yuva420p`
   only, so a chain ending `format=yuv420p` got one), and `geq` / `rotate` / `eq` /
@@ -776,7 +791,39 @@ no editing logic in the adapter.
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
   `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
-  motion).
+  motion). **Each key carries an `Easing`** for the segment that *leaves* it (`Linear` —
+  the default, omitted from the JSON so every existing project and graph is
+  byte-identical — `Hold`, `EaseIn` / `EaseOut` / `EaseInOut` (CSS's curves) or a
+  `Bezier {x1, y1, x2, y2}` held to the unit square: no overshoot, so a value never leaves
+  its two keys' range and the tiny-scale / opacity guards on the keys stay true). **An
+  eased segment *is* a polyline** of `EASE_STEPS` (12) straight pieces through the true
+  curve (`eased_points`; a hold is an equal-time step), and `Clip::keyframe_channel` is the
+  one place a channel's points come from: `transform_at` interpolates it and the export's
+  `keyframe_expr` (straight lines only) is written from it, so the still, the export and a
+  GPU pass agree exactly rather than approximately — the sweep checks an eased cut at every
+  output frame time at five rates, and fails if the export ignores easing. A head trim or a
+  slice inside an eased segment — or **exactly on a key** (`rebase_animation` finds the segment
+  with `a.time <= by`; a strict `<` read a cut on a key as "before the segment" and dropped the
+  key's outgoing easing, so a hold became a ramp in the playback hand-over's `Timeline::slice`,
+  a range export, `split_remove` left and a roll / slide head move) — is exact for the same
+  reason: `rebase_animation` turns the rest of the curve into plain keys (a hold just keeps
+  holding). **That bake is lossy for the picker and exact for the picture**: after a head trim
+  the remainder of a curve is up to eleven linear keys, not one eased key, so the Inspector
+  reads them as Linear and the curve cannot be re-edited as one; what renders is identical.
+  Re-keying a moment (`add_keyframe` at an existing time) keeps its easing, and **a key added
+  inside a segment splits it** (`Clip::insert_keyframe`, `Easing::split`): a hold stays held
+  through the new key (a Linear one turned the rest of the hold into a ramp) and a curve is cut
+  where its x is the key's fraction (de Casteljau, each half normalized to its own unit square,
+  so a preset becomes two beziers). That is exact for every preset and any bezier whose control
+  points rise (`x1 <= x2`, `y1 <= y2`; the tests hold it to 1e-9 / 1e-4); a half of an S that
+  turns back needs a control point outside the square, is clamped into it and so **re-fitted**
+  (0.04 off for `(0.2, 0.9, 0.3, 0.1)`), and a half whose value does not change is Linear. The
+  new key sits on the sampled pose, as ever. `validate_keyframe` (what `set_keyframes` runs)
+  applies the same bezier range check as `set_keyframe_easing` (`validate_easing`), and the diff
+  says "easing changed on N keyframes" for a change of nothing else, not "keyframes retimed".
+  `frontend/src/lib/easing.ts` is the faithful mirror (both suites pin the same curve and split
+  values bit for bit), used by the Inspector's sampled pose, the harness's edits
+  (`insertKeyframe`, `easingProblem`) and `edit-modes.ts`'s `rebaseAnimation`.
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
@@ -2268,6 +2315,7 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
+`set_keyframe_easing { clipId, time, easing }` (the key within a millisecond of `time`),
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -2643,7 +2691,9 @@ over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
-auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
+auto-keyframes at the playhead and shows the sampled pose; each key but the last has an
+**easing** picker in the Animation section — linear, ease in-out / out / in, hold and three
+own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
 shot already matches the frame or is 360), a **Mask** section (None / Rectangle /

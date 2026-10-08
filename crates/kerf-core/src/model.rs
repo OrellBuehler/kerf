@@ -1226,11 +1226,157 @@ fn default_text_color() -> String {
     "white".to_string()
 }
 
+/// How a keyframe's value travels to the next one: the shape of the **outgoing** segment.
+///
+/// Every renderer reads the same curve because the curve *is* a polyline: a non-linear
+/// segment is [`EASE_STEPS`] straight pieces through points of the true curve
+/// ([`eased_points`]), which is what the still / preview path interpolates
+/// ([`Clip::transform_at`]), what the export writes into its per-frame expressions
+/// (`keyframe_expr`, which only knows straight lines) and what a GPU pass will sample — so
+/// they agree exactly rather than approximately, and slicing an eased segment
+/// ([`Timeline::slice`], a trimmed head) is exact too: its pieces become plain keys.
+/// `Hold` keeps the value until the next key and jumps there. `Linear` is the default and is
+/// omitted from the JSON, so every existing project and graph is byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Easing {
+    #[default]
+    Linear,
+    Hold,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    /// A CSS-style cubic bezier from (0, 0) to (1, 1). Both control points are held to the unit
+    /// square: no overshoot, so an eased value never leaves the range of its two keys (and the
+    /// engine's tiny-scale and opacity guards, which look at the keys, stay true).
+    Bezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+}
+
+/// Straight pieces an eased segment is drawn with (see [`Easing`]).
+pub const EASE_STEPS: usize = 12;
+
+impl Easing {
+    pub fn is_linear(&self) -> bool {
+        matches!(self, Easing::Linear)
+    }
+
+    /// The control points of a curved easing (`None` for `Linear` and `Hold`).
+    fn bezier(&self) -> Option<(f64, f64, f64, f64)> {
+        let unit = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        match *self {
+            Easing::Linear | Easing::Hold => None,
+            Easing::EaseIn => Some((0.42, 0.0, 1.0, 1.0)),
+            Easing::EaseOut => Some((0.0, 0.0, 0.58, 1.0)),
+            Easing::EaseInOut => Some((0.42, 0.0, 0.58, 1.0)),
+            Easing::Bezier { x1, y1, x2, y2 } => Some((unit(x1), unit(y1), unit(x2), unit(y2))),
+        }
+    }
+
+    /// The true curve's progress at `u` in `[0, 1]` (`Hold` is 0 until the end).
+    pub fn curve(&self, u: f64) -> f64 {
+        let u = u.clamp(0.0, 1.0);
+        let Some((x1, y1, x2, y2)) = self.bezier() else {
+            return if matches!(self, Easing::Hold) && u < 1.0 { 0.0 } else { u };
+        };
+        bezier_axis(bezier_param(x1, x2, u), y1, y2)
+    }
+
+    /// The two easings a segment becomes when a key is put `u` of the way along it
+    /// (`0 < u < 1`): the first for the part before the new key, the second for the part
+    /// after, each normalized to its own unit square, so the curve is the same curve drawn in
+    /// two pieces (de Casteljau at the parameter where the curve is `u` of the way across).
+    /// A hold stays a hold on both sides and a linear segment linear; the preset curves come
+    /// back as the beziers they are. A half whose value does not change (the new key sits
+    /// on a plateau) has no shape and is linear. Exact for every preset and for any bezier
+    /// whose control points rise (`x1 <= x2`, `y1 <= y2`); a curve whose half would need a
+    /// control point outside the unit square (an S whose `y` turns back) has it clamped there —
+    /// the same ends and a smooth curve between them, re-fitted: a few hundredths off.
+    pub fn split(&self, u: f64) -> (Easing, Easing) {
+        let Some((x1, y1, x2, y2)) = self.bezier() else {
+            return (*self, *self);
+        };
+        let lerp = |a: (f64, f64), b: (f64, f64), s: f64| (a.0 + (b.0 - a.0) * s, a.1 + (b.1 - a.1) * s);
+        let (p0, p1, p2, p3) = ((0.0, 0.0), (x1, y1), (x2, y2), (1.0, 1.0));
+        let s = bezier_param(x1, x2, u.clamp(0.0, 1.0));
+        let (a, b, c) = (lerp(p0, p1, s), lerp(p1, p2, s), lerp(p2, p3, s));
+        let (d, e) = (lerp(a, b, s), lerp(b, c, s));
+        let at = lerp(d, e, s);
+        let unit = |v: f64| v.clamp(0.0, 1.0);
+        let half = |from: (f64, f64), h1: (f64, f64), h2: (f64, f64), to: (f64, f64)| {
+            let (w, h) = (to.0 - from.0, to.1 - from.1);
+            if w < 1e-9 || h < 1e-9 {
+                return Easing::Linear;
+            }
+            let norm = |p: (f64, f64)| (unit((p.0 - from.0) / w), unit((p.1 - from.1) / h));
+            let (n1, n2) = (norm(h1), norm(h2));
+            Easing::Bezier {
+                x1: n1.0,
+                y1: n1.1,
+                x2: n2.0,
+                y2: n2.1,
+            }
+        };
+        (half(p0, a, d, at), half(at, e, c, p3))
+    }
+}
+
+/// One axis of the cubic bezier from 0 to 1 with inner control values `p1` and `p2`, at `s`.
+fn bezier_axis(s: f64, p1: f64, p2: f64) -> f64 {
+    let r = 1.0 - s;
+    3.0 * r * r * s * p1 + 3.0 * r * s * s * p2 + s * s * s
+}
+
+/// The bezier parameter at which its x is `u`: x(s) is monotonic on the unit square, so it is
+/// found by bisection (exact enough in 40 halvings).
+fn bezier_param(x1: f64, x2: f64, u: f64) -> f64 {
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if bezier_axis(mid, x1, x2) < u {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// The polyline a channel of `(time, value, outgoing easing)` keys is drawn as (sorted by time):
+/// a linear segment is its two ends, a `Hold` a step (an equal-time pair at the next key), a
+/// curve [`EASE_STEPS`] pieces through the true curve. All-linear keys come back as they went
+/// in. [`interpolate`] over the result is the channel's value at any time.
+pub fn eased_points(keys: &[(f64, f64, Easing)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, &(t0, v0, easing)) in keys.iter().enumerate() {
+        out.push((t0, v0));
+        let Some(&(t1, v1, _)) = keys.get(i + 1) else { break };
+        if t1 - t0 < 1e-9 {
+            continue;
+        }
+        match easing {
+            Easing::Linear => {}
+            Easing::Hold => out.push((t1, v0)),
+            curved => {
+                for j in 1..EASE_STEPS {
+                    let u = j as f64 / EASE_STEPS as f64;
+                    out.push((t0 + (t1 - t0) * u, v0 + (v1 - v0) * curved.curve(u)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One keyframe of a clip's animated transform: the value of each animatable
 /// channel at `time` (seconds from the clip's start). With two or more keyframes
-/// the engine interpolates linearly between them and renders the motion with
-/// per-frame ffmpeg expressions; crop and the rest of the static [`Transform`]
-/// are unaffected.
+/// the engine interpolates between them — along each key's [`Easing`], linearly unless
+/// set — and renders the motion with per-frame ffmpeg expressions; crop and the rest of
+/// the static [`Transform`] are unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Keyframe {
     /// Offset from the clip's `timeline_start`, in seconds.
@@ -1245,11 +1391,14 @@ pub struct Keyframe {
     pub rotation: f64,
     #[serde(default = "one")]
     pub opacity: f64,
+    /// The shape of the segment from this key to the next.
+    #[serde(default, skip_serializing_if = "Easing::is_linear")]
+    pub easing: Easing,
 }
 
 impl Keyframe {
     /// A keyframe at `time` carrying the values of `transform`'s animatable
-    /// channels (the static defaults for a fresh keyframe).
+    /// channels (the static defaults for a fresh keyframe), linear out.
     pub fn from_transform(time: f64, t: &Transform) -> Self {
         Self {
             time,
@@ -1258,6 +1407,21 @@ impl Keyframe {
             pos_y: t.pos_y,
             rotation: t.rotation,
             opacity: t.opacity,
+            easing: Easing::Linear,
+        }
+    }
+
+    /// Every animatable channel `progress` of the way from `self` to `next`, at `time`.
+    fn toward(&self, next: &Keyframe, progress: f64, time: f64) -> Keyframe {
+        let mix = |a: f64, b: f64| a + (b - a) * progress;
+        Keyframe {
+            time,
+            scale: mix(self.scale, next.scale),
+            pos_x: mix(self.pos_x, next.pos_x),
+            pos_y: mix(self.pos_y, next.pos_y),
+            rotation: mix(self.rotation, next.rotation),
+            opacity: mix(self.opacity, next.opacity),
+            easing: Easing::Linear,
         }
     }
 }
@@ -2374,6 +2538,39 @@ impl Clip {
         k
     }
 
+    /// One animatable channel of the keyframes as the polyline every renderer draws
+    /// ([`eased_points`]): what [`Clip::transform_at`] interpolates and what the export's
+    /// per-frame expression is written from, so the two cannot disagree.
+    pub fn keyframe_channel(&self, get: fn(&Keyframe) -> f64) -> Vec<(f64, f64)> {
+        let keys: Vec<(f64, f64, Easing)> = self.sorted_keyframes().iter().map(|k| (k.time, get(k), k.easing)).collect();
+        eased_points(&keys)
+    }
+
+    /// Put `key` into the animation. A key within a microsecond of an existing one replaces it
+    /// and keeps how that one leaves (re-keying a moment moves the pose, not the shape). A key
+    /// that lands inside a segment splits it ([`Easing::split`]): the key before it eases into
+    /// the new one along the first part of the curve and the new one eases out along the rest —
+    /// a hold stays held through the new key rather than turning the rest of it into a ramp. The
+    /// key's own `easing` is replaced when it replaces or splits a key; a key before the first
+    /// or after the last keeps the one it came with.
+    pub fn insert_keyframe(&mut self, mut key: Keyframe) {
+        const SAME: f64 = 1e-6;
+        let sorted = self.sorted_keyframes();
+        if let Some(old) = sorted.iter().find(|k| (k.time - key.time).abs() <= SAME) {
+            key.easing = old.easing;
+        } else if let Some(w) = sorted.windows(2).find(|w| w[0].time < key.time && key.time < w[1].time) {
+            let u = (key.time - w[0].time) / (w[1].time - w[0].time);
+            let (before, after) = w[0].easing.split(u);
+            key.easing = after;
+            if let Some(a) = self.keyframes.iter_mut().find(|k| k.time == w[0].time) {
+                a.easing = before;
+            }
+        }
+        self.keyframes.retain(|k| (k.time - key.time).abs() > SAME);
+        self.keyframes.push(key);
+        self.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+    }
+
     /// Sample the (possibly animated) transform at `local` seconds from the
     /// clip's start: the static [`Transform`] with its animatable channels
     /// (scale / position / rotation / opacity) overridden by the interpolated
@@ -2384,8 +2581,7 @@ impl Clip {
         if self.keyframes.is_empty() {
             return t;
         }
-        let k = self.sorted_keyframes();
-        let chan = |get: fn(&Keyframe) -> f64| interpolate(&k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>(), local);
+        let chan = |get: fn(&Keyframe) -> f64| interpolate(&self.keyframe_channel(get), local);
         if let Some(v) = chan(|kf| kf.scale) {
             t.scale = v;
         }
@@ -2547,8 +2743,30 @@ impl Clip {
             if !self.keyframes.is_empty() {
                 let pose = self.transform_at(by);
                 let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
+                // Cut inside an eased segment: the rest of it is kept exactly. A hold keeps
+                // holding to the next key; a curve's remaining pieces become plain keys (the
+                // curve *is* those pieces, see `Easing`).
+                let sorted = self.sorted_keyframes();
+                let segment = sorted
+                    .windows(2)
+                    .find(|w| w[0].time <= by && by < w[1].time && w[1].time - w[0].time >= 1e-9);
+                if let Some(&[a, b]) = segment {
+                    match a.easing {
+                        Easing::Linear => {}
+                        Easing::Hold => kfs[0].easing = Easing::Hold,
+                        curved => {
+                            for j in 1..EASE_STEPS {
+                                let u = j as f64 / EASE_STEPS as f64;
+                                let at = a.time + (b.time - a.time) * u;
+                                if at > by {
+                                    kfs.push(a.toward(&b, curved.curve(u), at - by));
+                                }
+                            }
+                        }
+                    }
+                }
                 kfs.extend(
-                    self.keyframes
+                    sorted
                         .iter()
                         .filter(|k| k.time > by)
                         .map(|k| Keyframe { time: k.time - by, ..*k }),
@@ -5105,7 +5323,22 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     if before.keyframes.len() != after.keyframes.len() {
         parts.push(format!("keyframes {} → {}", before.keyframes.len(), after.keyframes.len()));
     } else if before.keyframes != after.keyframes {
-        parts.push("keyframes retimed".to_string());
+        // Keys that only leave their poses differently were not moved or retimed.
+        let plain = |k: &Keyframe| Keyframe {
+            easing: Easing::Linear,
+            ..*k
+        };
+        let pairs = || before.keyframes.iter().zip(&after.keyframes);
+        if pairs().any(|(a, b)| plain(a) != plain(b)) {
+            parts.push("keyframes retimed".to_string());
+        }
+        let eased = pairs().filter(|(a, b)| a.easing != b.easing).count();
+        if eased > 0 {
+            parts.push(format!(
+                "easing changed on {eased} keyframe{}",
+                if eased == 1 { "" } else { "s" }
+            ));
+        }
     }
     parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
     if before.mask != after.mask {
@@ -5711,6 +5944,7 @@ mod tests {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         };
         let mut clip = clip_at(0.0, 4.0);
         // Nothing keyed, and one key (a held pose): the picture never changes size.
@@ -6065,6 +6299,384 @@ mod tests {
         assert!(!t.muted && !t.solo && !t.locked);
     }
 
+    // ---- keyframe easing -----------------------------------------------------------
+
+    fn eased(time: f64, scale: f64, easing: Easing) -> Keyframe {
+        Keyframe {
+            easing,
+            ..Keyframe::from_transform(
+                time,
+                &Transform {
+                    scale,
+                    ..Transform::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn easing_curves_start_at_zero_end_at_one_and_never_go_back() {
+        let curves = [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+            Easing::Bezier {
+                x1: 0.2,
+                y1: 0.9,
+                x2: 0.3,
+                y2: 0.1,
+            },
+        ];
+        for e in curves {
+            assert!(e.curve(0.0).abs() < 1e-9, "{e:?}");
+            assert!((e.curve(1.0) - 1.0).abs() < 1e-9, "{e:?}");
+            let mut last = 0.0;
+            for i in 1..=100 {
+                let v = e.curve(f64::from(i) / 100.0);
+                assert!(v >= last - 1e-9 && v <= 1.0 + 1e-9, "{e:?} at {i}: {v} after {last}");
+                last = v;
+            }
+        }
+        // The named curves are CSS's: ease-in is slow at first, ease-out slow at the end.
+        assert!(Easing::EaseIn.curve(0.25) < 0.25 && Easing::EaseOut.curve(0.25) > 0.25);
+        assert!((Easing::EaseInOut.curve(0.5) - 0.5).abs() < 1e-6);
+        // A hold stays put until the next key.
+        assert_eq!(Easing::Hold.curve(0.99), 0.0);
+        // Control points outside the unit square are held to it (no overshoot).
+        let wild = Easing::Bezier {
+            x1: 0.5,
+            y1: 3.0,
+            x2: 0.5,
+            y2: -2.0,
+        };
+        assert!((0..=20).all(|i| (0.0..=1.0).contains(&wild.curve(f64::from(i) / 20.0))));
+    }
+
+    /// The same numbers `frontend/src/lib/easing.test.ts` pins for its mirror: the two
+    /// implementations do the same arithmetic in the same order, so they agree exactly.
+    #[test]
+    fn easing_curves_match_the_frontend_mirror_bit_for_bit() {
+        let bezier = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        };
+        assert_eq!(Easing::EaseIn.curve(0.25), 0.093_464_650_718_456_97);
+        assert_eq!(Easing::EaseOut.curve(0.25), 0.378_138_130_824_722_36);
+        assert_eq!(Easing::EaseInOut.curve(0.3), 0.187_395_906_704_947_93);
+        assert_eq!(bezier.curve(0.5), 0.551_329_682_020_157_3);
+        assert_eq!(Easing::EaseInOut.curve(7.0 / 12.0), 0.641_173_603_406_141_9);
+    }
+
+    #[test]
+    fn linear_keys_are_their_own_polyline_and_eased_ones_are_twelve_pieces() {
+        let lin = [(0.0, 1.0, Easing::Linear), (2.0, 3.0, Easing::Linear)];
+        assert_eq!(eased_points(&lin), vec![(0.0, 1.0), (2.0, 3.0)]);
+        let ease = [(0.0, 1.0, Easing::EaseInOut), (2.0, 3.0, Easing::Linear)];
+        let pts = eased_points(&ease);
+        assert_eq!(pts.len(), EASE_STEPS + 1);
+        assert_eq!(pts.first(), Some(&(0.0, 1.0)));
+        assert_eq!(pts.last(), Some(&(2.0, 3.0)));
+        // A hold is a step at the next key.
+        let hold = [(0.0, 1.0, Easing::Hold), (2.0, 3.0, Easing::Linear)];
+        assert_eq!(eased_points(&hold), vec![(0.0, 1.0), (2.0, 1.0), (2.0, 3.0)]);
+        assert_eq!(interpolate(&eased_points(&hold), 1.999), Some(1.0));
+        assert_eq!(interpolate(&eased_points(&hold), 2.0), Some(3.0));
+    }
+
+    #[test]
+    fn transform_at_follows_each_keys_outgoing_easing() {
+        let mut clip = clip_at(0.0, 10.0);
+        clip.keyframes = vec![
+            eased(0.0, 1.0, Easing::EaseIn),
+            eased(2.0, 3.0, Easing::Hold),
+            eased(4.0, 5.0, Easing::Linear),
+            eased(6.0, 1.0, Easing::Linear),
+        ];
+        // Slow out of the first key, at the key values on the keys.
+        assert!(clip.transform_at(0.5).scale < 1.5);
+        assert!((clip.transform_at(2.0).scale - 3.0).abs() < 1e-12);
+        // Held from 2 to 4, then the jump.
+        assert!((clip.transform_at(3.9).scale - 3.0).abs() < 1e-12);
+        assert!((clip.transform_at(4.0).scale - 5.0).abs() < 1e-12);
+        // A linear segment is exactly linear.
+        assert!((clip.transform_at(5.0).scale - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn keys_saved_before_easing_existed_are_linear_and_linear_is_not_written() {
+        let k: Keyframe = serde_json::from_str(r#"{"time":1.0,"scale":2.0}"#).unwrap();
+        assert_eq!(k.easing, Easing::Linear);
+        assert!(!serde_json::to_string(&k).unwrap().contains("easing"));
+        let b = eased(
+            0.0,
+            1.0,
+            Easing::Bezier {
+                x1: 0.1,
+                y1: 0.2,
+                x2: 0.3,
+                y2: 0.4,
+            },
+        );
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains(r#""easing":{"bezier":{"x1":0.1,"y1":0.2,"x2":0.3,"y2":0.4}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Keyframe>(&json).unwrap(), b);
+        let hold = serde_json::to_string(&eased(0.0, 1.0, Easing::EaseInOut)).unwrap();
+        assert!(hold.contains(r#""easing":"ease_in_out""#), "{hold}");
+    }
+
+    #[test]
+    fn cutting_into_an_eased_segment_keeps_the_curve_exactly() {
+        for easing in [Easing::EaseInOut, Easing::Hold, Easing::EaseOut] {
+            let mut original = clip_at(0.0, 8.0);
+            original.keyframes = vec![
+                eased(0.0, 1.0, easing),
+                eased(3.0, 4.0, Easing::EaseIn),
+                eased(6.0, 2.0, Easing::Linear),
+            ];
+            let tl = Timeline {
+                tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
+                overlays: Vec::new(),
+                markers: Vec::new(),
+                format: None,
+                master: Default::default(),
+            };
+            // A cut inside the first (eased) segment, not on one of its pieces.
+            let from = 1.1;
+            let sliced = tl.slice(from, 8.0);
+            let c = &sliced.tracks[0].clips[0];
+            for i in 0..=120 {
+                let t = f64::from(i) * 0.05;
+                let (a, b) = (c.transform_at(t).scale, original.transform_at(from + t).scale);
+                assert!((a - b).abs() < 1e-9, "{easing:?} at {t}: sliced {a}, original {b}");
+            }
+        }
+    }
+
+    /// A head cut that lands exactly on a key used to read as "before the segment": the key's
+    /// outgoing easing was dropped and a hold became a ramp from its value to the next key's.
+    #[test]
+    fn cutting_exactly_on_a_key_keeps_the_easing_that_leaves_it() {
+        let bezier = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        };
+        for easing in [Easing::EaseInOut, Easing::Hold, bezier, Easing::EaseOut] {
+            let mut original = clip_at(0.0, 8.0);
+            original.keyframes = vec![
+                eased(0.0, 1.0, Easing::Linear),
+                eased(3.0, 4.0, easing),
+                eased(6.0, 2.0, Easing::Linear),
+            ];
+            let tl = Timeline {
+                tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
+                overlays: Vec::new(),
+                markers: Vec::new(),
+                format: None,
+                master: Default::default(),
+            };
+            let id = original.id;
+            // The range cut, and the edit that trims the head and moves the clip: same result.
+            let sliced = tl.slice(3.0, 8.0).tracks[0].clips[0].clone();
+            let mut trimmed = tl.clone();
+            let trimmed_clip = trimmed.split_remove(id, 3.0, SplitSide::Left).unwrap();
+            for c in [sliced, trimmed_clip] {
+                // Between the pieces of a curve and a hold's step, never on one.
+                for i in 0..60 {
+                    let t = (f64::from(i) + 0.5) * 0.05;
+                    let (a, b) = (c.transform_at(t).scale, original.transform_at(3.0 + t).scale);
+                    assert!((a - b).abs() < 1e-9, "{easing:?} at {t}: cut {a}, original {b}");
+                }
+                if easing == Easing::Hold {
+                    assert_eq!(c.keyframes[0].easing, Easing::Hold);
+                    assert_eq!(c.transform_at(2.9).scale, 4.0);
+                }
+            }
+        }
+    }
+
+    /// The curve `easing` draws over `[0, 1]`, as the two halves of a split at `u` draw it.
+    fn split_deviation(easing: Easing, u: f64) -> f64 {
+        let (before, after) = easing.split(u);
+        let v = easing.curve(u);
+        let mut worst: f64 = 0.0;
+        for i in 0..=20 {
+            let w = f64::from(i) / 20.0;
+            // The first part stretched back to its size in the whole, then the second.
+            worst = worst.max((v * before.curve(w) - easing.curve(u * w)).abs());
+            worst = worst.max((v + (1.0 - v) * after.curve(w) - easing.curve(u + (1.0 - u) * w)).abs());
+        }
+        worst
+    }
+
+    #[test]
+    fn splitting_an_easing_draws_the_same_curve_in_two_pieces() {
+        let at = [0.05, 0.3, 0.5, 0.7, 0.95];
+        // Every preset the editor offers, exactly...
+        let named = [
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+            Easing::Bezier {
+                x1: 0.2,
+                y1: 0.9,
+                x2: 0.3,
+                y2: 1.0,
+            },
+            Easing::Bezier {
+                x1: 0.45,
+                y1: 0.05,
+                x2: 0.55,
+                y2: 0.95,
+            },
+            Easing::Bezier {
+                x1: 0.1,
+                y1: 0.6,
+                x2: 0.4,
+                y2: 1.0,
+            },
+        ];
+        for easing in named {
+            for u in at {
+                assert!(split_deviation(easing, u) < 1e-9, "{easing:?} split at {u}");
+            }
+        }
+        // ... and so is any bezier whose control points rise, over a grid of them.
+        let grid = [0.0, 0.25, 0.5, 0.75, 1.0];
+        for x1 in grid {
+            for y1 in grid {
+                for x2 in grid.into_iter().filter(|x2| *x2 >= x1) {
+                    for y2 in grid.into_iter().filter(|y2| *y2 >= y1) {
+                        let easing = Easing::Bezier { x1, y1, x2, y2 };
+                        for u in at {
+                            let off = split_deviation(easing, u);
+                            assert!(off < 1e-4, "{easing:?} split at {u} is {off} off");
+                        }
+                    }
+                }
+            }
+        }
+        // An S that turns back needs a control point outside the square: re-fitted, not exact.
+        let s_curve = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        };
+        let off = at.map(|u| split_deviation(s_curve, u)).into_iter().fold(0.0, f64::max);
+        assert!((1e-4..0.05).contains(&off), "{off}");
+        // Not curves: a line stays a line, a hold stays held on both sides.
+        assert_eq!(Easing::Linear.split(0.4), (Easing::Linear, Easing::Linear));
+        assert_eq!(Easing::Hold.split(0.4), (Easing::Hold, Easing::Hold));
+        // A plateau at the start has nothing to draw before the new key.
+        let late = Easing::Bezier {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 0.0,
+            y2: 0.0,
+        };
+        assert_eq!(late.split(1e-12).0, Easing::Linear);
+    }
+
+    /// The numbers `frontend/src/lib/easing.test.ts` pins for `splitEasing`.
+    #[test]
+    fn easing_splits_match_the_frontend_mirror_bit_for_bit() {
+        let bezier = |x1, y1, x2, y2| Easing::Bezier { x1, y1, x2, y2 };
+        assert_eq!(
+            Easing::EaseInOut.split(0.3),
+            (
+                bezier(0.387_469_928_603_703_55, 0.0, 0.708_554_541_138_148_6, 0.408_751_946_428_076),
+                bezier(
+                    0.326_400_214_186_121_75,
+                    0.356_304_039_690_523_16,
+                    0.566_058_540_830_177_7,
+                    1.0
+                ),
+            )
+        );
+        assert_eq!(
+            Easing::EaseIn.split(0.25),
+            (
+                bezier(
+                    0.317_162_150_132_499_54,
+                    0.0,
+                    0.657_134_238_921_790_6,
+                    0.381_326_296_917_524_73
+                ),
+                bezier(0.491_095_208_371_804_6, 0.274_086_177_201_424_27, 1.0, 1.0),
+            )
+        );
+    }
+
+    #[test]
+    fn a_key_added_inside_a_segment_splits_it_and_leaves_the_motion_where_it_was() {
+        let bezier = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 1.0,
+        };
+        for easing in [Easing::EaseInOut, Easing::EaseIn, bezier, Easing::Hold] {
+            let mut clip = clip_at(0.0, 10.0);
+            clip.keyframes = vec![eased(1.0, 1.0, easing), eased(5.0, 3.0, Easing::Linear)];
+            let before = clip.clone();
+            // Pin the present pose a third of the way in, as the editor does.
+            let pose = Keyframe::from_transform(2.3, &clip.transform_at(2.3));
+            clip.insert_keyframe(pose);
+            assert_eq!(clip.keyframes.len(), 3);
+            for i in 0..=80 {
+                // Never on a hold's step. The two are the same curve drawn in different pieces,
+                // so they differ by how a steep curve is drawn in 12 of them (about 0.014 of a
+                // range of 2 for the steepest here); a linear key in the middle is 0.3 off.
+                let t = (f64::from(i) + 0.5) * 0.05;
+                let (a, b) = (clip.transform_at(t).scale, before.transform_at(t).scale);
+                assert!((a - b).abs() < 0.03, "{easing:?} at {t}: now {a}, was {b}");
+            }
+            if easing == Easing::Hold {
+                assert_eq!(
+                    (clip.keyframes[0].easing, clip.keyframes[1].easing),
+                    (Easing::Hold, Easing::Hold)
+                );
+                assert_eq!(clip.transform_at(4.9).scale, 1.0);
+            } else {
+                assert!(matches!(clip.keyframes[0].easing, Easing::Bezier { .. }));
+                assert!(matches!(clip.keyframes[1].easing, Easing::Bezier { .. }));
+            }
+            assert_eq!(clip.keyframes[2].easing, Easing::Linear);
+        }
+    }
+
+    #[test]
+    fn a_key_outside_every_segment_or_on_a_key_changes_no_neighbours_shape() {
+        let mut clip = clip_at(0.0, 10.0);
+        clip.keyframes = vec![eased(1.0, 1.0, Easing::EaseIn), eased(5.0, 3.0, Easing::Hold)];
+        // Before the first and after the last there is no segment to split: the key comes as it is
+        // and the ones next to it are untouched.
+        clip.insert_keyframe(eased(0.0, 2.0, Easing::Hold));
+        clip.insert_keyframe(eased(8.0, 2.0, Easing::EaseOut));
+        let shapes: Vec<_> = clip.keyframes.iter().map(|k| (k.time, k.easing)).collect();
+        assert_eq!(
+            shapes,
+            vec![
+                (0.0, Easing::Hold),
+                (1.0, Easing::EaseIn),
+                (5.0, Easing::Hold),
+                (8.0, Easing::EaseOut)
+            ]
+        );
+        // On a key: the pose moves, the way it leaves does not.
+        clip.insert_keyframe(eased(1.0000004, 9.0, Easing::Linear));
+        assert_eq!((clip.keyframes[1].scale, clip.keyframes[1].easing), (9.0, Easing::EaseIn));
+        assert_eq!(clip.keyframes.len(), 4);
+    }
+
     #[test]
     fn slice_shifts_markers_into_the_window_and_drops_the_rest() {
         let mk = |t: f64, n: &str| Marker {
@@ -6103,6 +6715,41 @@ mod tests {
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);
+    }
+
+    #[test]
+    fn diff_says_when_only_the_easing_of_keys_changed() {
+        let mut clip = clip_at(0.0, 4.0);
+        clip.keyframes = vec![
+            eased(0.0, 1.0, Easing::Linear),
+            eased(2.0, 2.0, Easing::Linear),
+            eased(3.0, 3.0, Easing::Linear),
+        ];
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip])],
+            ..Timeline::new()
+        };
+        let summary = |after: &Timeline| tl.diff(after).entries[0].detail.clone().unwrap_or_default();
+        let mut one = tl.clone();
+        one.tracks[0].clips[0].keyframes[0].easing = Easing::Hold;
+        assert!(summary(&one).contains("easing changed on 1 keyframe"), "{}", summary(&one));
+        assert!(!summary(&one).contains("retimed"), "{}", summary(&one));
+        let mut two = one.clone();
+        two.tracks[0].clips[0].keyframes[1].easing = Easing::EaseOut;
+        assert!(summary(&two).contains("easing changed on 2 keyframes"), "{}", summary(&two));
+        // A key that moved is still a retime, and both are said when both happened.
+        let mut moved = two.clone();
+        moved.tracks[0].clips[0].keyframes[2].time = 3.5;
+        assert!(summary(&moved).contains("keyframes retimed"), "{}", summary(&moved));
+        assert!(
+            summary(&moved).contains("easing changed on 2 keyframes"),
+            "{}",
+            summary(&moved)
+        );
+        let mut only_moved = tl.clone();
+        only_moved.tracks[0].clips[0].keyframes[2].time = 3.5;
+        assert!(summary(&only_moved).contains("keyframes retimed"), "{}", summary(&only_moved));
+        assert!(!summary(&only_moved).contains("easing"), "{}", summary(&only_moved));
     }
 
     #[test]
@@ -8108,6 +8755,7 @@ mod tests {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         }
     }
 

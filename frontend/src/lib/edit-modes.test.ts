@@ -12,6 +12,7 @@ import {
 	splitRemoveClips,
 	type SourceLimits
 } from './edit-modes';
+import { keyframeChannel } from './easing';
 import { rippleFrom } from './ripple';
 import type { Clip, Keyframe, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -658,6 +659,55 @@ describe('splitRemove', () => {
 		const tail = splitRemove(right, c.id, 2, 'right');
 		expect(win(tail)).toEqual([16, 20]);
 		expect([tail.timeline_start, clipDuration(tail)]).toEqual([0, 2]);
+	});
+
+	test('left inside an eased segment keeps the curve exactly (model.rs: cutting_into_an_eased_segment…)', () => {
+		const sample = (keys: Keyframe[], at: number) => {
+			const pts = keyframeChannel(keys, (k) => k.scale);
+			if (at <= pts[0][0]) return pts[0][1];
+			for (let i = 0; i + 1 < pts.length; i++) {
+				const [[t0, v0], [t1, v1]] = [pts[i], pts[i + 1]];
+				if (at < t1) return t1 <= t0 ? v0 : v0 + ((v1 - v0) * (at - t0)) / (t1 - t0);
+			}
+			return pts[pts.length - 1][1];
+		};
+		for (const easing of ['ease_in_out', 'hold', 'ease_out'] as const) {
+			const keys: Keyframe[] = [{ ...kf(0, 1), easing }, { ...kf(3, 4), easing: 'ease_in' }, kf(6, 2)];
+			const c = sclip(0, 8, 0, { keyframes: clone(keys) });
+			const kept = splitRemove(oneLane([c]), c.id, 1.1, 'left');
+			for (let i = 0; i <= 120; i++) {
+				const t = i * 0.05;
+				expect(Math.abs(sample(kept.keyframes ?? [], t) - sample(keys, 1.1 + t))).toBeLessThan(1e-9);
+			}
+		}
+	});
+
+	test('left exactly on a key keeps the easing that leaves it (model.rs: cutting_exactly_on_a_key…)', () => {
+		const sample = (keys: Keyframe[], at: number) => {
+			const pts = keyframeChannel(keys, (k) => k.scale);
+			if (at <= pts[0][0]) return pts[0][1];
+			for (let i = 0; i + 1 < pts.length; i++) {
+				const [[t0, v0], [t1, v1]] = [pts[i], pts[i + 1]];
+				if (at < t1) return t1 <= t0 ? v0 : v0 + ((v1 - v0) * (at - t0)) / (t1 - t0);
+			}
+			return pts[pts.length - 1][1];
+		};
+		const bezier = { bezier: { x1: 0.2, y1: 0.9, x2: 0.3, y2: 0.1 } };
+		for (const easing of ['ease_in_out', 'hold', 'ease_out', bezier] as const) {
+			const keys: Keyframe[] = [kf(0, 1), { ...kf(3, 4), easing }, kf(6, 2)];
+			const c = sclip(0, 8, 0, { keyframes: clone(keys) });
+			const kept = splitRemove(oneLane([c]), c.id, 3, 'left');
+			const cut = kept.keyframes ?? [];
+			if (easing === 'hold') {
+				expect(cut[0].easing).toBe('hold');
+				expect(sample(cut, 2.9)).toBe(4);
+			}
+			// Between the pieces of a curve and a hold's step, never on one.
+			for (let i = 0; i < 60; i++) {
+				const t = (i + 0.5) * 0.05;
+				expect(Math.abs(sample(cut, t) - sample(keys, 3 + t))).toBeLessThan(1e-9);
+			}
+		}
 	});
 
 	test('left carries the animation with the footage that stays', () => {

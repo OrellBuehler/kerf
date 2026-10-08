@@ -29,7 +29,7 @@ use std::process::Stdio;
 use super::*;
 use crate::clip_timing::ffmpeg_frame_time;
 use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::model::{Asset, Clip, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect};
+use crate::model::{Asset, Clip, Easing, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect};
 
 /// The export frame.
 const CW: u32 = 320;
@@ -271,7 +271,7 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, di
         [
             "-map",
             "[outv]",
-            "-fps_mode",
+            fps_mode_flag(),
             "passthrough",
             "-f",
             "rawvideo",
@@ -285,6 +285,8 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, di
     if std::env::var_os("KERF_ZOOM_KEEP").is_some() {
         std::fs::write(dir.join(format!("{tag}.args")), args.join(" ")).unwrap();
     }
+    // Windows caps a whole command line at 32767 characters, as the export does.
+    let _script = externalize_filter_complex(&mut args, tag).unwrap();
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
         run.status.success(),
@@ -519,6 +521,7 @@ fn zoom_keys() -> Vec<Keyframe> {
         pos_y: 0.0,
         rotation: 0.0,
         opacity: 1.0,
+        easing: Default::default(),
     };
     vec![key(0.0, 0.35), key(0.9, 1.6), key(1.8, 0.5)]
 }
@@ -1166,8 +1169,13 @@ fn keyed_zoom_works_on_layers_that_share_an_input() {
 #[ignore = "needs the ffmpeg binary"]
 fn the_playback_stream_zooms_too() {
     let dir = scratch("stream");
-    let case = Case::new("playback", keys(true, true, true)).rotated();
-    let (timeline, assets) = case.timeline(&dir);
+    playback_matches_transform_at(&dir, &Case::new("playback", keys(true, true, true)).rotated());
+    cleanup(&dir);
+}
+
+/// Stream `case`'s keyed clip through `stream_preview` and hold what comes out to `transform_at`.
+fn playback_matches_transform_at(dir: &Path, case: &Case) {
+    let (timeline, assets) = case.timeline(dir);
     let clip = timeline.tracks[1].clips[0].clone();
 
     let mut frames: Vec<PreviewFrame> = Vec::new();
@@ -1232,8 +1240,42 @@ fn the_playback_stream_zooms_too() {
     }
     assert!(measured >= 30, "{measured} frames measured");
     report_lines(&[format!(
-        "playback stream: {measured} frames, worst {worst:.1}px vs transform_at"
+        "{}: {measured} frames, worst {worst:.1}px vs transform_at",
+        case.name
     )]);
+}
+
+/// Thirteen keys 0.2 s apart on every animated channel, each easing into the next: the
+/// polyline is ~145 points per channel.
+fn many_eased_keys() -> Vec<Keyframe> {
+    let easings = [Easing::EaseInOut, Easing::EaseOut, Easing::EaseIn, Easing::Linear];
+    (0..13)
+        .map(|i| {
+            let side = if i % 2 == 0 { -1.0 } else { 1.0 };
+            Keyframe {
+                time: f64::from(i) * 0.2,
+                scale: 0.7 + 0.25 * f64::from(i % 3),
+                pos_x: 0.2 * side,
+                pos_y: 0.1 * side,
+                rotation: 20.0 * side,
+                opacity: if i % 4 == 1 { 0.7 } else { 1.0 },
+                easing: easings[i as usize % easings.len()],
+            }
+        })
+        .collect()
+}
+
+/// An eased segment is twelve pieces, and written as a chain of nested `if`s a clip with ten
+/// eased keys is past libavutil's 100 levels of expression nesting: the export and the
+/// playback stream both died with `Invalid argument` on 4.4 and 9.0 alike. A long channel is a
+/// balanced tree (`keyframe_expr`), which both render and which still is `transform_at`.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_clip_with_many_eased_keys_exports_and_plays_back() {
+    let dir = scratch("many-eased");
+    let case = Case::new("many eased keys", many_eased_keys()).rotated();
+    run_in(&dir, vec![Case::new("many eased keys", many_eased_keys()).rotated()]);
+    playback_matches_transform_at(&dir, &case);
     cleanup(&dir);
 }
 
@@ -1319,6 +1361,7 @@ fn a_picture_zoomed_to_a_fraction_of_a_pixel_does_not_snap_to_full_size() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         };
         vec![key(0.0, 0.0004), key(0.8, 0.0004), key(1.4, last), key(2.0, last)]
     };
@@ -1440,6 +1483,7 @@ fn hdr_footage_with_an_odd_fit_size_renders() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         },
         Keyframe {
             time: 1.8,
@@ -1448,6 +1492,7 @@ fn hdr_footage_with_an_odd_fit_size_renders() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         },
     ];
     let (tl, frames) = run("moving", moving);
@@ -1551,6 +1596,7 @@ fn keyed_zoom_cost() {
     let keyed = |scale: [f64; 2], rotation: f64, opacity: f64, position: bool| {
         let mut clip = make_clip(asset.id, 0.0, 3.0, 0.0);
         let key = |time, scale, rotation, opacity, pos_x| Keyframe {
+            easing: Default::default(),
             time,
             scale,
             pos_x,

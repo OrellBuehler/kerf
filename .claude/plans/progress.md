@@ -14,8 +14,8 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | merged (local) | Per-asset filmstrip (proxy preferred, keyframe sampling for long originals, capped + niced even at 100%), `get_filmstrip` (no MCP tool: `skim_asset` covers agents), height presets (UI-only), minimap. |
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
-| B4 Mixer | `feat/mixer` | — | done (awaiting PR) | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
-| B5 Keyframes v2 | — | — | todo | |
+| B4 Mixer | `feat/mixer` | OrellBuehler/kerf#110 | merged | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
+| B5 Keyframes v2 | `feat/keyframe-easing` (B5a) | — | in-progress | B5a done locally: per-key `Easing` (linear / hold / CSS eases / unit-square bezier), an eased segment is a 12-piece polyline shared by `transform_at` and the export (sweep at every output frame, mutation-checked), exact head trims / slices, `set_keyframe_easing` (core, Tauri, MCP), TS mirror pinned bit for bit, Inspector picker. Next: per-property channels, dope sheet. |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
 | A6 Headless agent rendering | — | — | todo | |
@@ -417,6 +417,31 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   every failed start leaves through one `abandon` (`stop` + `notify_all`), mutation-checked. Not verified
   here: FFmpeg 6.1 (CI's parity job), a proxy made by a hardware encoder through the probe (a `-g 1` x264
   proxy passes).
+
+- **2026-10-08 — B5a: an eased segment is a polyline.** The plan said to realize easing
+  in `keyframe_expr` by sampling 8–12 linear pieces. Doing that only in the graph would
+  leave the still (`transform_at`) on the exact curve and the export on the
+  approximation — a few thousandths apart, and every exactness test (sweep, parity, the
+  plan's motion samples) would need a tolerance. So the curve is *defined* as the 12
+  pieces, in one function both read; the true bezier only places their points. Overshoot
+  is refused (control points in the unit square) so value ranges stay those of the keys;
+  overshoot belongs with the graph editor (B5b).
+
+- **2026-10-08 — B5a review fixes.** (1) A chain of nested `if(lt(..))` is a level per
+  polyline point and libavutil refuses expressions nested past ~100, so ten eased keys (12
+  points each) failed the export and the playback stream on 4.4.2 and 9.0.2 alike. Rather than
+  cut `EASE_STEPS` (the curve is *defined* by those pieces; fewer is a visibly coarser ease) or
+  limit the key count, `keyframe_expr` writes a balanced tree above 24 points and the old
+  chain below it, so no existing graph changed (golden oracle untouched). (2) A head cut exactly
+  on a key read as "before the segment" and dropped the key's easing (`<` is `<=`, Rust and TS).
+  (3) A key added inside a segment is a split, not a Linear insert: a hold stays held, a curve
+  is cut with de Casteljau; presets and rising beziers are exact, an S that turns back is
+  clamped into the unit square (re-fitted, 0.04 off at worst measured) — chosen over keeping
+  the neighbour's easing and the new key Linear, which changed the motion of a cut that only
+  pinned the present pose. (4) `set_keyframes` validates bezier control points like
+  `set_keyframe_easing`. (5) A head trim still bakes the rest of a curve into linear keys:
+  lossy for the picker, exact for the picture, and now documented rather than changed (`Easing::split`
+  could keep one eased key there; the picture is already right).
 
 ## Needs a real machine
 

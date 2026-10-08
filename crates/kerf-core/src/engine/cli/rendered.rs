@@ -494,6 +494,7 @@ fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_st
     // follows the keys (1.0 at 0 s to 0.2 at 2 s of a 320 px wide fit).
     let widths = |opacity: f64, tag: &str| {
         let key = |time, scale, opacity| Keyframe {
+            easing: Default::default(),
             time,
             scale,
             pos_x: 0.0,
