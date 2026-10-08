@@ -637,7 +637,10 @@ impl GpuPreview {
     /// hidden frame hides the surface at once, a shown one is drawn at the next frame.
     pub fn set_bounds(&self, report: &BoundsReport) -> Result<(), String> {
         let bounds = Bounds::from_report(report).ok_or("the preview bounds are not a rectangle on a screen")?;
-        *lock(&self.bounds) = Some(bounds);
+        let before = lock(&self.bounds).replace(bounds);
+        if before.map(|b| b.visible) != Some(bounds.visible) {
+            tracing::debug!(visible = bounds.visible, rect = ?bounds.rect, "preview surface visibility changed");
+        }
         if !bounds.visible {
             self.hide();
         }
@@ -797,6 +800,7 @@ impl GpuPreview {
         match outcome {
             Ok(timings) => {
                 state.backoff.succeeded();
+                tracing::debug!(?timings, t, "GPU preview frame presented");
                 Attempt::Presented(timings)
             }
             Err(error) => {

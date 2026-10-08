@@ -224,8 +224,8 @@
 		void ui.previewEpoch;
 		// A change of route (the GPU takes a frame over, or hands it back for a title box) and of
 		// where the surface is both want the frame drawn again.
-		void route.via;
-		void route.overlays;
+		void routeVia;
+		void routeOverlays;
 		void boundsEpoch;
 		if (!hasClips) {
 			frameUrl = null;
@@ -308,9 +308,15 @@
 			covered
 		})
 	);
+	// The route is a fresh object whenever any input is recomputed (the titles under the playhead
+	// are a new array each tick); what an effect may depend on is its primitives, which only
+	// notify when they change.
+	const routeVia = $derived(route.via);
+	const routeOverlays = $derived(route.overlays);
+	const routeWhy = $derived(route.why);
 	const technique = $derived(gpuPreview.status?.technique ?? null);
 	/** The native surface is what is on show in the frame. */
-	const onSurface = $derived(surfaceShowing(route, gpuPreview.renderer) && gpuShown);
+	const onSurface = $derived(routeVia === 'gpu' && surfaceShowing(route, gpuPreview.renderer) && gpuShown);
 
 	let rootEl = $state<HTMLElement | null>(null);
 	let frameEl = $state<HTMLElement | null>(null);
@@ -362,20 +368,24 @@
 		});
 	}
 
+	/** Measure the frame and tell the backend (newest wins). */
+	function pushBounds() {
+		if (!settings.gpuPreview || !frameEl) return;
+		covered = frameCovered();
+		wantedBounds = measure(route.via === 'gpu');
+		sendBounds.request();
+	}
+
+	// The observers live as long as the frame does and the setting is on; what they report is read
+	// when they fire, so a change of route or theme does not tear them down.
 	$effect(() => {
 		if (!settings.gpuPreview || !frameEl) return;
-		const wantSurface = route.via === 'gpu';
-		void settings.theme; // the matte follows the theme
-		const update = () => {
-			covered = frameCovered();
-			wantedBounds = measure(wantSurface && !covered);
-			sendBounds.request();
-		};
-		update();
+		const el = frameEl;
+		const update = () => pushBounds();
 		// Size changes are observed; position changes (a dock move, a scrolled pane, a window move,
 		// a different monitor's ratio) are caught by the window events and a slow poll.
 		const observer = new ResizeObserver(update);
-		observer.observe(frameEl);
+		observer.observe(el);
 		if (rootEl) observer.observe(rootEl);
 		observer.observe(document.documentElement);
 		window.addEventListener('resize', update);
@@ -386,6 +396,7 @@
 		const poll = setInterval(update, 150);
 		const soon = () => requestAnimationFrame(() => requestAnimationFrame(update));
 		for (const type of ['pointerup', 'contextmenu', 'keyup']) window.addEventListener(type, soon, true);
+		untrack(update);
 		return () => {
 			observer.disconnect();
 			window.removeEventListener('resize', update);
@@ -408,14 +419,22 @@
 		};
 	});
 
+	// A different route, theme or technique changes what is reported (visible, the colours) at once.
+	$effect(() => {
+		void routeVia;
+		void settings.theme;
+		void technique;
+		untrack(pushBounds);
+	});
+
 	// Turning the setting off forgets the renderer, so the status bar goes quiet; while it is on, a
 	// frame that is the JPEG by the page's own choice (playback, a dialog over the frame) says so.
 	$effect(() => {
 		if (!settings.gpuPreview) {
 			gpuShown = false;
 			gpuPreview.clear();
-		} else if (route.via === 'jpeg' && route.why) {
-			gpuPreview.noteJpeg(describeWhy(route.why));
+		} else if (routeVia === 'jpeg' && routeWhy) {
+			gpuPreview.noteJpeg(describeWhy(routeWhy));
 		}
 	});
 
