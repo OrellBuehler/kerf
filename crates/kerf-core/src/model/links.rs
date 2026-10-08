@@ -848,6 +848,26 @@ impl Timeline {
         } else {
             clip.volume * picture_fader / dest_fader
         };
+        // A keyed volume *is* the gain, so it rides over with the sound, through the same
+        // fader ratio the static one is.
+        if let Some(track) = clip.channel(Property::Volume).filter(|t| !t.keys.is_empty()) {
+            let ratio = if (picture_fader - dest_fader).abs() <= FADER_EPS {
+                1.0
+            } else {
+                f64::from(picture_fader) / f64::from(dest_fader)
+            };
+            audio.channels.push(PropertyTrack {
+                prop: Property::Volume,
+                keys: track
+                    .keys
+                    .iter()
+                    .map(|k| PropertyKey {
+                        value: k.value * ratio,
+                        ..*k
+                    })
+                    .collect(),
+            });
+        }
         audio.fade_in = clip.fade_in;
         audio.fade_out = clip.fade_out;
         audio.audio = clip.audio.clone();
@@ -1279,6 +1299,10 @@ impl Timeline {
         right.timeline_start = at;
         right.transition_in = None; // the transition stays with the left (start) half
         right.link_id = None;
+        // The animation is clip-local: the right half starts `at - start` into it, so it
+        // opens on the pose the whole clip had there and keeps the keys after it (without
+        // this the right half played the animation again from its first key).
+        right.rebase_animation(at - left.timeline_start);
         if left.is_reversed() {
             let split_src = (left.source_out - offset).clamp(left.source_in, left.source_out);
             left.source_in = split_src;

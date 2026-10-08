@@ -27,7 +27,7 @@ use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational};
 use crate::engine::Fit;
 use crate::error::Result;
 use crate::frame_pick::Pick;
-use crate::layer_geometry::{LayerGeometry, Placement};
+use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
     pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection, ResolvedReframe, StreamInfo,
     StreamKind, Subsampling, Timeline, Transform, VideoEffect,
@@ -53,6 +53,11 @@ impl ActiveClip<'_> {
     /// its pose rather than the static one.
     pub(crate) fn transform(&self) -> Transform {
         self.clip.transform_at(self.local_time)
+    }
+
+    /// The clip's colour sampled at this instant (a keyed number is its curve's value).
+    pub(crate) fn color(&self) -> crate::model::Color {
+        self.clip.color_at(self.local_time)
     }
 }
 
@@ -319,8 +324,15 @@ impl PlanStream {
 /// Which of a keyframed clip's channels move. The export graph builds a keyframed
 /// clip differently from a static one whatever its pose at one instant ([`Placement`]),
 /// and what it needs a renderer to refuse depends on which channels the keys drive.
+///
+/// A layer has one when anything it is drawn from is keyed: a transform number
+/// ([`Animated::keys`]) or a colour number ([`Animated::color`]) — the clip's volume is not
+/// a picture and is not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Animated {
+    /// Which transform numbers are keyed; `None` when none is (a clip animated in colour only
+    /// is placed as a static one).
+    pub keys: Option<Keyed>,
     /// Some key turns the picture (so the graph has a `rotate`, in a `hypot(iw,ih)` box).
     pub rotates: bool,
     /// Some key is below full opacity (so the graph has a `geq` alpha).
@@ -333,6 +345,11 @@ pub struct Animated {
     /// rest" as it does a constant one, so a moving zoom in an export frame is refused until
     /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it.
     pub zooms: bool,
+    /// Some colour number is keyed: the export's `eq` is written per frame (`eval=frame`),
+    /// off a colour sampled at the frame's time. A still plan samples it too and draws that
+    /// colour like a static one; an export frame is refused until the compositor says it draws
+    /// one (`GpuCaps::keyed_color`).
+    pub color: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -505,7 +522,7 @@ pub struct PlanLayer {
     pub mask: Option<Mask>,
     pub reframe: Option<PlanReframe>,
     pub fx: LayerFx,
-    /// `Some` for a keyframed clip.
+    /// `Some` for a clip with a keyed transform or colour number.
     pub animated: Option<Animated>,
     pub timing: PlanTiming,
 }
@@ -698,7 +715,7 @@ impl RenderPlan {
             // `kerf-gpu`'s `roundtrip`), out of YCbCr with the picture's own matrix,
             // which has to be known for the arithmetic to be reproduced. A keyframed
             // clip's opacity is a `geq` alpha instead, refused below.
-            let keyed = self.mode == PlanMode::Motion && layer.animated.is_some();
+            let keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some());
             if layer.transform.opacity < 1.0 && stream.matrix().is_none() && !keyed {
                 let detail = match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
                     (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
@@ -747,6 +764,9 @@ impl RenderPlan {
             }
             if keyed && layer.animated.is_some_and(|a| a.opacity) && !caps.keyed_opacity {
                 out.push(Unsupported::KeyedOpacity(at()));
+            }
+            if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color) && !caps.keyed_color {
+                out.push(Unsupported::KeyedColor(at()));
             }
             if layer.animated.is_some_and(|a| a.zooms) && !caps.keyed_zoom {
                 if keyed {
@@ -860,7 +880,7 @@ impl RenderPlan {
     /// A still's layer is placed by its sampled transform alone.
     pub fn placement(&self, layer: &PlanLayer) -> Placement {
         Placement {
-            keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).map(|a| a.rotates),
+            keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).and_then(|a| a.keys),
             offset: layer.fx.motion,
         }
     }

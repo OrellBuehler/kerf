@@ -58,8 +58,9 @@ use crate::clip_timing::{
 use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
+use crate::layer_geometry::Keyed;
 use crate::media::{MediaResolver, OriginalMedia, SourceMedia};
-use crate::model::{Asset, Hdr, Projection, StreamKind, TextOverlay, Timeline, VideoEffect};
+use crate::model::{Asset, Hdr, Projection, Property, StreamKind, TextOverlay, Timeline, VideoEffect};
 use crate::plan_caps::{GpuCaps, LayerRef};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
@@ -249,7 +250,6 @@ impl Planner {
                 continue;
             }
             let timing = ClipTiming::new(clip, &fx);
-            let kf = clip.sorted_keyframes();
             let effects = clip
                 .effects
                 .iter()
@@ -283,10 +283,17 @@ impl Planner {
                 fades: timing.fades(),
                 keys: timing.motion_keys(),
                 tail: fx.tail > 0.0,
-                animated: clip.is_animated().then(|| Animated {
-                    rotates: kf.iter().any(|k| k.rotation != 0.0),
-                    opacity: kf.iter().any(|k| k.opacity < 1.0),
+                animated: (clip.is_animated() || clip.color_animated()).then(|| Animated {
+                    keys: clip.is_animated().then(|| Keyed {
+                        scale: clip.is_keyed(Property::Scale),
+                        rotation: clip.is_keyed(Property::Rotation),
+                        rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                        opacity: clip.is_keyed(Property::Opacity),
+                    }),
+                    rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                    opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
                     zooms: clip.zoom_animated(),
+                    color: clip.color_animated(),
                 }),
                 effects,
             });
@@ -552,7 +559,7 @@ impl Planner {
                     clip_time: local,
                     stream,
                     transform: clip.transform_at(local),
-                    color: clip.color,
+                    color: clip.color_at(local),
                     name: asset.name.clone(),
                     projection: asset.projection,
                     hdr: planned.hdr,
@@ -1169,6 +1176,7 @@ mod tests {
             transitions: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            keyed_color: true,
             mask: true,
             text: true,
             reframe: true,
@@ -1292,6 +1300,107 @@ mod tests {
         };
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(15).unwrap();
         assert!(plan.reasons(&caps, plan.size(u32::MAX)).is_empty());
+    }
+
+    #[test]
+    fn a_keyed_colour_is_sampled_per_frame_and_only_an_export_frame_is_refused_it() {
+        use crate::model::{Property, PropertyKey};
+        let a = asset();
+        let assets = [a.clone()];
+        let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+        clip.color.contrast = 1.25;
+        clip.set_property_keys(
+            Property::Brightness,
+            vec![PropertyKey::new(0.0, -0.4), PropertyKey::new(2.0, 0.4)],
+        );
+        let tl = single(vec![clip.clone()]);
+        // Frame 60 of 30 fps is t = 2.0, a second into the clip: halfway along the ramp.
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(30.0)).at_frame(60).unwrap();
+        let motion = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(60).unwrap();
+        for plan in [&still, &motion] {
+            let c = plan.layers[0].color;
+            assert!((c.brightness - 0.0).abs() < 1e-9 && c.contrast == 1.25, "{c:?}");
+            // Only the colour is animated: the picture is placed as a static clip's is.
+            let animated = plan.layers[0].animated.unwrap();
+            assert!(animated.color && animated.keys.is_none() && !animated.zooms && !animated.rotates && !animated.opacity);
+        }
+        // The sample follows the frame.
+        let later = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(90).unwrap();
+        assert!(
+            (later.layers[0].color.brightness - 0.4).abs() < 1e-9,
+            "held after the last key"
+        );
+        // Refusals: a still draws a sampled colour like a static one; an export frame has an `eq`
+        // written per frame that no pass draws yet, until the compositor says it does.
+        let why = |plan: &RenderPlan, caps: &GpuCaps| plan.reasons(caps, plan.size(u32::MAX));
+        assert!(!has(&why(&still, &GpuCaps::A0), |u| matches!(u, Unsupported::KeyedColor(_))));
+        assert!(has(&why(&motion, &GpuCaps::A0), |u| matches!(u, Unsupported::KeyedColor(_))));
+        let drawn = GpuCaps {
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let left = why(&motion, &drawn);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].to_string().contains("keyframed colour"), "{}", left[0]);
+        assert!(why(
+            &motion,
+            &GpuCaps {
+                keyed_color: true,
+                ..drawn
+            }
+        )
+        .is_empty());
+        // A static clip has no such flag, and neither does one animated in volume alone.
+        let mut quiet = make_clip(a.id, 0.0, 4.0, 1.0);
+        quiet.set_property_keys(Property::Volume, vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(2.0, 1.0)]);
+        let plan = planner(&single(vec![quiet]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(60)
+            .unwrap();
+        assert!(plan.layers[0].animated.is_none());
+    }
+
+    #[test]
+    fn a_transform_keyed_in_part_is_placed_as_the_graph_places_it() {
+        use crate::model::{Property, PropertyKey};
+        let a = asset();
+        let assets = [a.clone()];
+        let mut fading = make_clip(a.id, 0.0, 4.0, 0.0);
+        fading.transform.scale = 1.5;
+        fading.transform.rotation = 20.0;
+        fading.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 1.0)],
+        );
+        let plan = planner(&single(vec![fading.clone()]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(30)
+            .unwrap();
+        let layer = &plan.layers[0];
+        let animated = layer.animated.unwrap();
+        let keys = animated.keys.unwrap();
+        // Only the opacity is keyed (and it is below full somewhere): the turn is the static one.
+        assert_eq!((keys.scale, keys.rotation, keys.opacity), (false, false, true));
+        assert!(animated.opacity && !animated.rotates && !animated.zooms && !animated.color);
+        assert!((layer.transform.opacity - 0.6).abs() < 1e-9);
+        assert_eq!((layer.transform.scale, layer.transform.rotation), (1.5, 20.0));
+        // The geometry has the constant zoom and the constant `rotate` box, and the alpha is a `geq`.
+        let geom = plan.layer_geometry(layer, (plan.canvas.width, plan.canvas.height)).unwrap();
+        assert!(!geom.translucent && geom.rotation.is_some_and(|r| r.out != (geom.picture.0, geom.picture.0)));
+        let key_rotates = Some(Keyed::all(true));
+        assert_ne!(plan.placement(layer).keyframed, key_rotates);
+        // The same clip with the opacity static is a static clip; keyed in part it is never identity.
+        let mut still_pose = make_clip(a.id, 0.0, 4.0, 0.0);
+        still_pose.set_property_keys(Property::PosX, vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(2.0, 0.0)]);
+        let plan = planner(&single(vec![still_pose]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(30)
+            .unwrap();
+        let geom = plan
+            .layer_geometry(&plan.layers[0], (plan.canvas.width, plan.canvas.height))
+            .unwrap();
+        assert!(
+            !geom.matte,
+            "the overlay centres the bare picture: it is not padded to the frame"
+        );
+        assert_eq!(geom.stages.len(), 1, "no zoom is keyed, so no second scale");
     }
 
     #[test]
