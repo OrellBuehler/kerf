@@ -870,12 +870,19 @@ no editing logic in the adapter.
   first 4800 cases are untouched): the bundle is not migrated on load and not on write — the first
   per-property write *detaches* just that number (`channel_mut` copies its bundle keys into a track, the
   other four keep the bundle), and **a track with no keys is kept while a bundle exists to say "static,
-  whatever the bundle says"** (`prune_channels` drops it once the bundle is gone; a number can never
-  fall back to the bundle by accident). The legacy ops keep their meaning: `set_keyframes` /
-  `add_keyframe` write the bundle (and `add_keyframe` puts an asked-for number into the track that drives
-  it, since the bundle's key for it is ignored), `set_keyframe_easing` without a property shapes the
-  transform key at that time in the bundle *and* in every transform track that has one there,
-  `clear_keyframes` takes the bundle and the transform tracks and leaves colour and volume.
+  whatever the bundle says"** (`prune_channels` drops it once the bundle is gone — it runs after every
+  op that can empty the bundle or a track: `set_property_keys`, `insert_property_key` and
+  `Project::set_keyframes`, which the harness's `setKeyframes` mirrors; a number can never fall back to
+  the bundle by accident). The legacy ops keep their meaning: `set_keyframes` replaces **the bundle
+  only** (an empty list clears the bundle, not the numbers that have keys of their own — the clip can
+  still be animated afterwards, and the MCP description says so; `clear_keyframes` is the one that makes
+  the whole transform static), `add_keyframe` writes the bundle (and puts an asked-for number into the
+  track that drives it, since the bundle's key for it is ignored), `set_keyframe_easing` without a
+  property shapes the transform key at that time in the bundle *and* in every transform track that has
+  one there, `clear_keyframes` takes the bundle and the transform tracks and leaves colour and volume.
+  **While a number is keyed its static value (`set_volume` / `set_color` / `set_transform`) is not used**,
+  which those tools' descriptions now state (an agent that "sets the colour" of a clip whose brightness is
+  keyed would otherwise change nothing and not know why).
   `Project::set_property_keyframes(clip, prop, keys)` replaces one number's keys (each checked against
   `Property::check`, at most `MAX_CHANNEL_KEYS` = 1000, bezier range; no keys = static),
   `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
@@ -887,17 +894,31 @@ no editing logic in the adapter.
   (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold
   keeps holding, a cut exactly on a key keeps its outgoing segment), `upsert` splits a segment a new key
   lands in (`Easing::split`), `detach_audio` carries a keyed volume over through the fader ratio, and the
-  diff names the number that moved (`volume keyframes 0 → 2`, `easing changed on 1 opacity keyframe`).
+  diff names the number that moved (`volume keyframes 0 → 2`, `easing changed on 1 opacity keyframe`) —
+  **judged on the keys that drive the number, not on whether it has a track**: a bundle-animated number
+  held static by an empty track diffs `opacity keyframes 2 → 0` (it used to diff as empty, and
+  `apply_staged` discarded an agent's proposal whose render had changed), and one taken over with the keys
+  the bundle already gave it diffs as nothing. **A keyed volume is read held to 0..=`MAX_CHANNEL_VOLUME`
+  (4); a static one is not**, so `detach_audio` does not fold the fader ratio into keys when that would
+  push one past the cap and silently lower the sound: it takes the equal-fader route a compressor takes
+  (a lane whose fader equals the picture track's, else a new track at it) and carries the keys as they
+  are.
   **`Timeline::split_clip` now rebases the right half's animation** (`rebase_animation(at - start)`):
   it did not, so every split of a keyed clip replayed the animation from its first key in the right
   half (bundle and reframe alike; `a_split_also_keeps_the_legacy_bundle_playing_through` fails without
-  it, as does the TS mirror's). **Not animatable yet**: the crop edges (`crop`'s output size is fixed
+  it, as does the TS mirror's); **`cut_range_pieces`** (`cut_clip_range`, `remove_silence`, the linked
+  cut) re-times its **tail** piece the same way — by the head and the removed middle — and so does a
+  sole-surviving tail, which is a head trim. **A split also puts each fade on the half that holds its
+  edge** (the left keeps `fade_in`, the right `fade_out`, each clamped to its half as for any clip that
+  shrank; `transition_in` stays on the left): both halves used to keep both, so a clip with a fade-out
+  dipped to black at every split. The links corpus did not move (no case splits a faded clip), and the
+  unit tests are mirrored by name in `links.test.ts`. **Not animatable yet**: the crop edges (`crop`'s output size is fixed
   when the graph is configured — `w` / `h` are evaluated once — so an animated crop needs the
   zoom-and-pan reformulation, not a number per frame) and the mask's centre / size / feather (a `geq`
   expression could carry them; left for when the dope sheet can edit them). `frontend/src/lib/channels.ts`
   is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges; both
   suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
-  Inspector's sampled pose and the preview's gain (`gainBreakpoints`).
+  Inspector's sampled pose and the preview's gain (`gainAutomation`).
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
@@ -1461,7 +1482,10 @@ no editing logic in the adapter.
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
   scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed
-  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip.
+  opacity is the `geq` alpha with no odd-size restriction, an unkeyed one the RGB round trip — so the
+  matrix a translucent layer needs (`Unsupported::TranslucentMatrix`) is skipped only for a **keyed
+  opacity** (`Keyed::opacity`), not for any keyed number: a clip with only its position keyed and a static
+  opacity below 1 still takes the round trip.
   `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
@@ -2798,8 +2822,11 @@ the number static), and once a number is keyed its slider shows the curve at the
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
 mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
 their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
-popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainBreakpoints`
-ramps linearly through the curve's points and the fade edges — but the timeline's volume line and
+popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
+ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
+or two keys at one time: the ramp arrives at the value the step leaves and a `setValueAtTime` lands the
+next, read `1e-9 s` either side of the step because `(start + t) - start` can fall an ulp short of `t`),
+as the export's `if(lt(t,..))` does — but the timeline's volume line and
 waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the

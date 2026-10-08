@@ -488,6 +488,24 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   keyed volume's points (`gainBreakpoints`); the timeline's volume line and waveform scaling still read
   the static gain (the dope-sheet slice owns those).
 
+- **2026-10-08 — B5b-1 review fixes.** (1) The preview collapsed a hold's two points at one time
+  into one and ramped across the whole segment where the export steps (`gainAutomation` now ramps
+  to the value a step leaves and `setValueAtTime`s the next). (2) `TranslucentMatrix` was skipped for any
+  Motion clip with a keyed number; it is skipped for a keyed *opacity* only. (3) `channel_changes`
+  compared tracks, so holding a bundle-driven number static diffed empty and `apply_staged` discarded the
+  proposal; it compares the effective keys (a detach with the bundle's own keys is rightly no change).
+  (4) `set_keyframes` now prunes empty tracks like the harness did, and the MCP descriptions of
+  `set_keyframes` / `clear_keyframes` / `set_volume` / `set_color` / `set_transform` say what an empty list
+  clears and that a keyed number ignores its static value. (5) A keyed volume is clamped to 4 on read and
+  a static one is not, so `detach_audio` sends a clip whose keys the fader ratio would push past 4 to an
+  equal-fader lane instead of folding the ratio in (chosen over clamping both, which would have changed
+  the loudness of every existing static clip above 4, and over splitting the ratio between the keys and a
+  lane gain, which has no home for it). (6) Two older bugs found by the review: `cut_range_pieces`'
+  tail replayed its animation from the first key, and `split_clip` left both fades on both halves (a
+  dip to black at the cut); each fade now stays on the half holding its edge, clamped to it (not left
+  longer than the half, though the render clamps it anyway, so the stored value is the rendered one).
+  The links corpus and the golden argv oracle did not move.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
