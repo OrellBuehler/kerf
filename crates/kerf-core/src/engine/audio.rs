@@ -9,6 +9,7 @@ use std::process::Stdio;
 
 use super::cli::{bg_command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use super::cpu;
+use super::music;
 use crate::error::{Error, Result};
 use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 
@@ -96,10 +97,16 @@ pub fn analyze_rhythm(path: &Path, sensitivity: f64) -> Result<Rhythm> {
     const SR: u32 = 22_050;
     let samples = decode_audio_mono_f32(path, SR)?;
     let (env, frame_rate) = onset_envelope(&samples, SR);
+    let music = music::cached(path).unwrap_or_else(|| {
+        let fresh = music::analyze_music(&samples, SR);
+        music::store(path, &fresh);
+        fresh
+    });
     Ok(Rhythm {
         onsets: pick_onsets(&env, frame_rate, sensitivity),
         tempo: estimate_tempo(&env, frame_rate),
         audio_class: classify_samples(&samples),
+        music,
     })
 }
 

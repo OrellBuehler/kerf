@@ -688,6 +688,92 @@ pub struct Tempo {
     pub confidence: f64,
 }
 
+/// A fixed beat grid fitted to a piece of music: beat `k` is at `phase_s + k * period_s`,
+/// and the beats `downbeat_offset`, `downbeat_offset + beats_per_bar`, … start bars.
+/// `phase_s` is the first beat: it lies in `[-0.02, period_s - 0.02)`, so a beat on the
+/// file's first sample that the fit places a hair early is still the first beat.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BeatGrid {
+    pub period_s: f64,
+    pub phase_s: f64,
+    pub downbeat_offset: u32,
+    pub beats_per_bar: u32,
+}
+
+impl BeatGrid {
+    pub fn bpm(&self) -> f64 {
+        60.0 / self.period_s
+    }
+
+    pub fn bar_s(&self) -> f64 {
+        self.period_s * self.beats_per_bar as f64
+    }
+
+    /// The first downbeat (at most a few ms before 0).
+    pub fn first_downbeat(&self) -> f64 {
+        self.phase_s + self.downbeat_offset as f64 * self.period_s
+    }
+
+    /// Where bar `k` starts (counted from the first downbeat).
+    pub fn bar_start(&self, k: usize) -> f64 {
+        self.first_downbeat() + k as f64 * self.bar_s()
+    }
+
+    /// How many whole bars fit between the first downbeat and `duration`.
+    pub fn whole_bars(&self, duration: f64) -> usize {
+        let span = duration - self.first_downbeat();
+        if span <= 0.0 || self.bar_s() <= 0.0 {
+            return 0;
+        }
+        // A bar that ends within a microsecond of the end still counts as whole.
+        ((span + 1e-6) / self.bar_s()).floor() as usize
+    }
+
+    /// Every beat in `[0, duration)`.
+    pub fn beats(&self, duration: f64) -> Vec<f64> {
+        if self.period_s <= 0.0 {
+            return Vec::new();
+        }
+        (0..)
+            .map(|k| self.phase_s + k as f64 * self.period_s)
+            .take_while(|t| *t < duration)
+            .collect()
+    }
+
+    /// Every downbeat in `[0, duration)`.
+    pub fn downbeats(&self, duration: f64) -> Vec<f64> {
+        if self.bar_s() <= 0.0 {
+            return Vec::new();
+        }
+        (0..).map(|k| self.bar_start(k)).take_while(|t| *t < duration).collect()
+    }
+}
+
+/// Two phrases of `bars` bars, starting at bars `a` and `b` (counted from the first
+/// downbeat), whose bars all match in harmony — jumping from one to the other is a
+/// splice the ear does not hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhraseMatch {
+    pub a: usize,
+    pub b: usize,
+    pub bars: usize,
+}
+
+/// The bar-level structure of a piece of music: its beat grid, the harmony of each
+/// whole bar and the repeating phrases between them. What "fit music to length"
+/// plans its splices from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MusicAnalysis {
+    pub grid: BeatGrid,
+    /// Length of the analysed audio in seconds.
+    pub duration: f64,
+    /// L2-normalized 12-bin chroma (C = 0 … B = 11, A4 = 440 Hz) of every whole bar,
+    /// from the first downbeat. All zeros for a silent bar.
+    pub bar_chroma: Vec<[f32; 12]>,
+    /// Repeating 8- and 4-bar phrases (`a < b`), the legal splice points.
+    pub phrases: Vec<PhraseMatch>,
+}
+
 /// Everything the rhythm analysis pass derives from one decoded PCM stream:
 /// onsets, tempo and the speech/music class. Bundled because the three share
 /// the decode (and onsets/tempo the onset envelope) — computing them together
@@ -697,6 +783,7 @@ pub struct Rhythm {
     pub onsets: Vec<f64>,
     pub tempo: Option<Tempo>,
     pub audio_class: Option<AudioClassification>,
+    pub music: Option<MusicAnalysis>,
 }
 
 /// One kind of analysis an asset can have: each is a step of its own, can be run alone
@@ -808,6 +895,10 @@ pub struct AssetAnalysis {
     /// video-only assets. Route ducking/leveling decisions off this.
     #[serde(default)]
     pub audio_class: Option<AudioClassification>,
+    /// Bar-level structure (fitted beat grid, chroma, repeating phrases), when the
+    /// audio has a steady enough pulse to fit one.
+    #[serde(default)]
+    pub music: Option<MusicAnalysis>,
     /// The kinds whose step has run to completion — the only way to tell "ran and
     /// found nothing" (no silence, no speech) from "never ran", both of which leave the
     /// data empty. Absent in an analysis cached before kinds were recorded: for those
@@ -855,6 +946,7 @@ impl AssetAnalysis {
                     self.onsets = patch.onsets.clone();
                     self.tempo = patch.tempo.clone();
                     self.audio_class = patch.audio_class;
+                    self.music = patch.music.clone();
                 }
                 AnalysisKind::Transcript => self.transcript = patch.transcript.clone(),
             }

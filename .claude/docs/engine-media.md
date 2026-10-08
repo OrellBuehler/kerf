@@ -94,6 +94,24 @@
   whole-file decode, so it takes `cpu::lease`; the pipe goes through `peaks.rs`'s
   `pump_pcm`, so a decode silent for 60 s is killed. `write_wav` / `wav_bytes` write
   32-bit float WAV for test fixtures and debug renders (no `hound`).
+- `music.rs` (always compiled, pure DSP + a cache): `analyze_music(mono, rate)` →
+  `MusicAnalysis {grid: BeatGrid, duration, bar_chroma, phrases}`, computed inside
+  `analyze_rhythm` from the same 22.05 kHz decode and cached at
+  `<cache>/kerf/music/<hash>.json` (file identity like the waveform cache; a "no pulse"
+  result is cached too). Onsets are log-magnitude spectral flux (`realfft`, Hann 1024 /
+  hop 128 at 22.05 kHz — the 46 ms of a 2048 window at 44.1 kHz). The **grid is fitted,
+  not tracked**: autocorrelation (weighted towards 120 BPM against octave errors,
+  parabola-refined) gives a first period, then a brute-force scan (period ±1 % at
+  0.2 ms, phase at 3 ms, then 10× finer around the winner) maximizes the mean flux under
+  the grid; a grid under 1.5× the mean flux is no pulse (`None`). **The flux of a sharp
+  attack peaks ~7–10 ms early** (the window gains it fastest while it enters at the edge),
+  so `ONSET_LEAD_S` (8.5 ms) is added back — without it a click track misses the ±5 ms
+  phase test. `phase_s` may sit up to 20 ms *before* 0 so a beat on the first sample is
+  not wrapped a period later. The downbeat is the beat (mod 4) with the most kick-band
+  (< 150 Hz) flux. Chroma (4096 / hop 1024, 55 Hz–4.2 kHz, A4 = 440) is summed per
+  whole bar and L2-normalized (zeros when silent); `phrase_matches` lists 8- and 4-bar
+  phrases on 4-bar boundaries whose bars all match above `SPLICE_SIMILARITY` (0.95) —
+  the legal splice points. Loudness stays ffmpeg's (`measure_loudness`), not `ebur128`.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

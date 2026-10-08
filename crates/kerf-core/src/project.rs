@@ -3629,6 +3629,7 @@ impl Project {
                 confidence: 0.71,
             }),
             ran: crate::model::AnalysisKind::ALL.to_vec(),
+            music: None,
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.

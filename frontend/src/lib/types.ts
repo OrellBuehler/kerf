@@ -84,6 +84,26 @@ export interface Tempo {
 	confidence: number;
 }
 
+export interface BeatGrid {
+	period_s: number;
+	phase_s: number;
+	downbeat_offset: number;
+	beats_per_bar: number;
+}
+
+export interface PhraseMatch {
+	a: number;
+	b: number;
+	bars: number;
+}
+
+export interface MusicAnalysis {
+	grid: BeatGrid;
+	duration: number;
+	bar_chroma: number[][];
+	phrases: PhraseMatch[];
+}
+
 export type AudioClass = 'speech' | 'music' | 'mixed' | 'unknown';
 
 export interface AudioClassification {
@@ -104,6 +124,7 @@ export interface AssetAnalysis {
 	 *  "never ran". Absent in an analysis cached before it was recorded (a kind then
 	 *  counts as done when it has data). */
 	ran?: AnalysisKind[];
+	music: MusicAnalysis | null;
 }
 
 /** One kind of analysis: each is a step of its own, run alone and cached independently. */

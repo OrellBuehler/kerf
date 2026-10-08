@@ -924,6 +924,7 @@ fn run_steps(
                 run.patch.onsets = r.onsets;
                 run.patch.tempo = r.tempo;
                 run.patch.audio_class = r.audio_class;
+                run.patch.music = r.music;
             }),
             AnalysisKind::Transcript => providers
                 .transcriber
@@ -1040,6 +1041,7 @@ mod tests {
                     class: AudioClass::Music,
                     confidence: 0.8,
                 }),
+                music: None,
             })
         }
     }

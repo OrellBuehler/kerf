@@ -60,6 +60,10 @@ pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
 // Decoded audio as an interleaved f32 buffer (through the ffmpeg binary) and a WAV
 // writer for tests and debug renders.
 mod pcm;
+
+// Bar-level music structure (fitted beat grid, downbeat, chroma, repeating phrases):
+// pure DSP on decoded PCM, cached per file.
+pub mod music;
 pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
