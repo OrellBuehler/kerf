@@ -52,6 +52,7 @@ describe('the context menu', () => {
 		expect(proxyActions(st('missing')).rebuild.label).toBe('Build proxy');
 		expect(proxyActions(st('missing')).remove).toMatchObject({ disabled: true, reason: 'there is no proxy to delete' });
 		expect(proxyActions(st('failed')).remove.disabled).toBe(false);
+		expect(proxyActions(st('failed')).rebuild.label).toBe('Retry proxy');
 		expect(proxyActions(st('not_needed')).rebuild).toMatchObject({ disabled: true, reason: 'this file needs no proxy' });
 	});
 

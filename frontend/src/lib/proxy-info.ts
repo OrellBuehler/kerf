@@ -131,7 +131,7 @@ export function proxyActions(status: ProxyStatus | null | undefined): {
 	const hasFile = status?.state === 'ready' || (status?.bytes ?? 0) > 0;
 	return {
 		rebuild: {
-			label: busy ? 'Restart proxy' : status?.state === 'ready' ? 'Rebuild proxy' : 'Build proxy',
+			label: busy ? 'Restart proxy' : status?.state === 'ready' ? 'Rebuild proxy' : status?.state === 'failed' ? 'Retry proxy' : 'Build proxy',
 			disabled: notNeeded,
 			reason: notNeeded ? 'this file needs no proxy' : undefined
 		},
