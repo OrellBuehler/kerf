@@ -1,0 +1,215 @@
+import { describe, expect, test } from 'bun:test';
+import './test-runes';
+
+const { Windows } = await import('./windows.svelte');
+const { parseEventKey, windowOf, documentOf, resizeObserverFor, intersectionObserverFor } = await import('./realm');
+const { onWindow } = await import('./window-events');
+
+/** A window as far as the registry can tell: it takes listeners and says what it shows. */
+function fakeWindow(name: string, visible = true) {
+	const listeners: Array<[string, unknown, unknown]> = [];
+	const rafs: number[] = [];
+	const win = {
+		name,
+		closed: false,
+		document: { visibilityState: visible ? 'visible' : 'hidden' },
+		listeners,
+		rafs,
+		addEventListener(type: string, handler: unknown, options?: unknown) {
+			listeners.push([type, handler, options]);
+		},
+		removeEventListener(type: string, handler: unknown, options?: unknown) {
+			const i = listeners.findIndex((l) => l[0] === type && l[1] === handler && l[2] === options);
+			if (i >= 0) listeners.splice(i, 1);
+		},
+		requestAnimationFrame: (cb: () => void) => {
+			void cb;
+			rafs.push(1);
+			return rafs.length;
+		},
+		cancelAnimationFrame: (id: number) => {
+			rafs.push(-id);
+		}
+	};
+	return win as typeof win & Window;
+}
+
+describe('the windows registry', () => {
+	test('the editor window is always first, then the detached ones in the order they opened', () => {
+		const main = fakeWindow('main');
+		const w = new Windows(main);
+		const a = fakeWindow('a');
+		const b = fakeWindow('b');
+		expect(w.all).toEqual([main]);
+		w.add(a);
+		w.add(b);
+		expect(w.all).toEqual([main, a, b]);
+		expect(w.popups).toEqual([a, b]);
+		w.remove(a);
+		expect(w.all).toEqual([main, b]);
+	});
+
+	test('a window opening or closing moves the version, and a repeat does not', () => {
+		const w = new Windows(fakeWindow('main'));
+		const a = fakeWindow('a');
+		const v = w.version;
+		w.add(a);
+		expect(w.version).toBe(v + 1);
+		w.add(a);
+		expect(w.version).toBe(v + 1);
+		w.touch();
+		expect(w.version).toBe(v + 2);
+		w.remove(a);
+		w.remove(a);
+		expect(w.version).toBe(v + 3);
+	});
+
+	test('a listener hears every window — the ones that are there and the ones that come', () => {
+		const main = fakeWindow('main');
+		const early = fakeWindow('early');
+		const w = new Windows(main);
+		w.add(early);
+		const handler = () => {};
+		const stop = w.listen('pointerdown', handler, true);
+		const late = fakeWindow('late');
+		w.add(late);
+		for (const win of [main, early, late]) expect(win.listeners, win.name).toEqual([['pointerdown', handler, true]]);
+		w.remove(early);
+		expect(early.listeners).toEqual([]);
+		stop();
+		expect(main.listeners).toEqual([]);
+		expect(late.listeners).toEqual([]);
+		// And none arrives after it was stopped.
+		w.add(fakeWindow('later'));
+		expect(w.popups.at(-1)!.name).toBe('later');
+		expect((w.popups.at(-1) as unknown as { listeners: unknown[] }).listeners).toEqual([]);
+	});
+
+	test('a window that throws when listened to does not stop the others hearing', () => {
+		const main = fakeWindow('main');
+		const bad = fakeWindow('bad');
+		bad.addEventListener = () => {
+			throw new Error('gone');
+		};
+		const w = new Windows(main);
+		w.add(bad);
+		const stop = w.listen('blur', () => {});
+		expect(main.listeners).toHaveLength(1);
+		stop();
+	});
+
+	test('rafs are drawn in the editor window while it shows', () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		expect(w.frameWindow()).toBe(main);
+		const h = w.requestFrame(() => {});
+		expect(h.win).toBe(main);
+		expect(main.rafs).toEqual([1]);
+		w.cancelFrame(h);
+		expect(main.rafs).toEqual([1, -1]);
+	});
+
+	test('…and in a detached one when the editor window is hidden — minimized, say', () => {
+		const main = fakeWindow('main', false);
+		const hidden = fakeWindow('hidden', false);
+		const shown = fakeWindow('shown');
+		const w = new Windows(main);
+		w.add(hidden);
+		w.add(shown);
+		expect(w.frameWindow()).toBe(shown);
+		expect(w.requestFrame(() => {}).win).toBe(shown);
+	});
+
+	test('…and in the editor window when none shows, or one is closed or unreadable', () => {
+		const main = fakeWindow('main', false);
+		const w = new Windows(main);
+		const closed = fakeWindow('closed');
+		closed.closed = true;
+		const broken = fakeWindow('broken');
+		Object.defineProperty(broken, 'document', {
+			get() {
+				throw new Error('detached');
+			}
+		});
+		w.add(closed);
+		w.add(broken);
+		expect(w.frameWindow()).toBe(main);
+		w.cancelFrame(null);
+		w.cancelFrame({ win: broken, id: 3 });
+	});
+});
+
+describe('which window an element is in', () => {
+	const win = { name: 'popup' } as unknown as Window;
+	const doc = { nodeType: 9, ownerDocument: null, defaultView: win } as unknown as Document;
+	const el = { nodeType: 1, ownerDocument: doc };
+
+	test('is the window of its document', () => {
+		expect(windowOf(el)).toBe(win);
+		expect(documentOf(el)).toBe(doc);
+		// A document is its own window's.
+		expect(windowOf(doc)).toBe(win);
+	});
+
+	test('is the editor window for no element, or one in no document', () => {
+		const fallback = (globalThis as unknown as { window?: Window }).window;
+		const main = { name: 'main' } as unknown as Window;
+		(globalThis as unknown as { window: Window; document: Document }).window = main;
+		(globalThis as unknown as { document: Document }).document = { defaultView: main } as unknown as Document;
+		try {
+			expect(windowOf(null)).toBe(main);
+			expect(windowOf(undefined)).toBe(main);
+			expect(windowOf({ nodeType: 1, ownerDocument: null })).toBe(main);
+			// A document with no window (a detached one).
+			expect(windowOf({ nodeType: 1, ownerDocument: { defaultView: null } as unknown as Document })).toBe(main);
+		} finally {
+			(globalThis as unknown as { window?: Window }).window = fallback;
+		}
+	});
+
+	test('observers are made with the constructors of that window', () => {
+		const made: string[] = [];
+		const popup = {
+			ResizeObserver: class {
+				constructor(cb: unknown) {
+					made.push(`resize:${typeof cb}`);
+				}
+			},
+			IntersectionObserver: class {
+				constructor(cb: unknown, init: unknown) {
+					made.push(`intersect:${typeof cb}:${JSON.stringify(init)}`);
+				}
+			}
+		} as unknown as Window;
+		const inPopup = { nodeType: 1, ownerDocument: { nodeType: 9, defaultView: popup } };
+		resizeObserverFor(inPopup as never, () => {});
+		intersectionObserverFor(inPopup as never, () => {}, { threshold: 0.5 });
+		expect(made).toEqual(['resize:function', 'intersect:function:{"threshold":0.5}']);
+	});
+});
+
+describe('window handlers', () => {
+	test('a capture suffix is the capture phase, as <svelte:window onpointerdowncapture> has it', () => {
+		expect(parseEventKey('pointerdown')).toEqual({ type: 'pointerdown', capture: false });
+		expect(parseEventKey('pointerdowncapture')).toEqual({ type: 'pointerdown', capture: true });
+		expect(parseEventKey('pointermove')).toEqual({ type: 'pointermove', capture: false });
+		// An event that merely ends in the word is not a phase.
+		expect(parseEventKey('capture')).toEqual({ type: 'capture', capture: false });
+	});
+
+	test('the attachment listens on the window its element is in, and stops when it goes', () => {
+		const win = fakeWindow('popup');
+		const el = { nodeType: 1, ownerDocument: { nodeType: 9, defaultView: win } };
+		const move = () => {};
+		const key = () => {};
+		const stop = onWindow({ pointermove: move, pointerdowncapture: key })(el as never) as () => void;
+		expect(win.listeners).toEqual([
+			['pointermove', move, false],
+			['pointerdown', key, true]
+		]);
+		stop();
+		expect(win.listeners).toEqual([]);
+	});
+});
