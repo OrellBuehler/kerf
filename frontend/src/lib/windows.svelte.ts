@@ -13,10 +13,24 @@
    Plain state, no dockview: `popout.svelte.ts` is what opens and closes the windows
    and tells this about them. */
 
+/** A frame that was asked for and has not run. Owned by `Windows`, which moves it to another
+ *  window when the one it waits in stops showing — callers only hand it back to
+ *  `cancelFrame`. */
 export interface FrameHandle {
-	win: Window;
+	/** The window the frame is requested in at the moment; null once it ran or was cancelled. */
+	win: Window | null;
 	id: number;
+	/** Whether the callback is still owed. */
+	live: boolean;
+	/** Watchdog ticks it has waited through without running. */
+	waits: number;
+	cb: FrameRequestCallback;
 }
+
+/** How often the watchdog looks at frames that have not run. Short enough that a picture
+ *  does not stay frozen for a noticeable time after a window stopped showing, long enough
+ *  that a loop running at screen rate never meets it. */
+const WATCHDOG_MS = 250;
 
 interface Listener {
 	type: string;
@@ -41,10 +55,18 @@ export class Windows {
 	readonly #popups = new Set<Window>();
 	readonly #listeners = new Set<Listener>();
 	readonly #main: Window;
+	/** Frames asked for and not yet run. */
+	readonly #frames = new Set<FrameHandle>();
+	/** What stops each window's visibility listener. */
+	readonly #visibility = new Map<Window, () => void>();
+	#watch: ReturnType<typeof setInterval> | null = null;
+	readonly #watchdogMs: number;
 
-	/** `main` is the editor window; a test stands a fake in. */
-	constructor(main: Window = globalThis as unknown as Window) {
+	/** `main` is the editor window; a test stands a fake in and a short watchdog. */
+	constructor(main: Window = globalThis as unknown as Window, watchdogMs = WATCHDOG_MS) {
 		this.#main = main;
+		this.#watchdogMs = watchdogMs;
+		this.#watchVisibility(main);
 	}
 
 	/** The detached windows, oldest first. */
@@ -62,14 +84,20 @@ export class Windows {
 		if (this.#popups.has(win)) return;
 		this.#popups.add(win);
 		for (const l of this.#listeners) this.#attach(win, l);
+		this.#watchVisibility(win);
 		this.version++;
+		// A window that shows now is a better place for a frame than one that does not.
+		this.#kickStale();
 	}
 
-	/** A detached window closed. */
+	/** A detached window closed. A frame that was waiting in it will never run there. */
 	remove(win: Window): void {
 		if (!this.#popups.delete(win)) return;
 		for (const l of this.#listeners) this.#detach(win, l);
+		this.#visibility.get(win)?.();
+		this.#visibility.delete(win);
 		this.version++;
+		this.#kickStale();
 	}
 
 	/** A panel moved between windows (or into one): whatever resolved its window
@@ -122,18 +150,110 @@ export class Windows {
 
 	/** `requestAnimationFrame` in `frameWindow()`. The timestamp the callback is given
 	 *  counts from *that* window's start, so a caller that moves between windows reads
-	 *  its own clock (`performance.now()`) instead. */
+	 *  its own clock (`performance.now()`) instead.
+	 *
+	 *  The choice is not final. A frame already waiting in a window that then stops
+	 *  showing (the editor minimized while the preview plays on the other screen) or
+	 *  closes would never run there, and a loop that asks for its next frame from inside
+	 *  the last one would stop for good — so the frame follows the windows: it is asked
+	 *  for again where one is showing when a window's visibility changes, when a window
+	 *  is added or removed, and, as a backstop for a platform that reports none of it,
+	 *  when a short watchdog finds it has not run. The callback runs once. */
 	requestFrame(cb: FrameRequestCallback): FrameHandle {
-		const win = this.frameWindow();
-		return { win, id: win.requestAnimationFrame(cb) };
+		const handle: FrameHandle = { win: null, id: 0, live: true, waits: 0, cb };
+		this.#frames.add(handle);
+		this.#arm(handle);
+		this.#ensureWatchdog();
+		return handle;
 	}
 
 	cancelFrame(handle: FrameHandle | null): void {
 		if (!handle) return;
+		handle.live = false;
+		this.#frames.delete(handle);
+		this.#disarm(handle);
+	}
+
+	/** Ask `handle`'s window for its frame. */
+	#arm(handle: FrameHandle): void {
+		const win = this.frameWindow();
+		handle.win = win;
+		handle.waits = 0;
 		try {
-			handle.win.cancelAnimationFrame(handle.id);
+			handle.id = win.requestAnimationFrame((time) => this.#run(handle, win, time));
+		} catch {
+			// A window that cannot be asked is found out by the watchdog.
+			handle.id = -1;
+		}
+	}
+
+	#disarm(handle: FrameHandle): void {
+		const win = handle.win;
+		handle.win = null;
+		try {
+			win?.cancelAnimationFrame(handle.id);
 		} catch {
 			// the window went with the frame
+		}
+	}
+
+	#run(handle: FrameHandle, win: Window, time: number): void {
+		// A frame the handle was moved away from may still fire where it was.
+		if (!handle.live || handle.win !== win) return;
+		handle.live = false;
+		handle.win = null;
+		this.#frames.delete(handle);
+		handle.cb(time);
+	}
+
+	/** Move every frame waiting in a window that is not where frames are drawn now to
+	 *  the window that is. */
+	#kickStale(): void {
+		for (const handle of [...this.#frames]) {
+			if (!handle.live || handle.win === this.frameWindow()) continue;
+			this.#disarm(handle);
+			this.#arm(handle);
+		}
+	}
+
+	#watchVisibility(win: Window): void {
+		const onChange = () => this.#kickStale();
+		try {
+			win.document.addEventListener('visibilitychange', onChange);
+		} catch {
+			return;
+		}
+		this.#visibility.set(win, () => {
+			try {
+				win.document.removeEventListener('visibilitychange', onChange);
+			} catch {
+				// the document went first
+			}
+		});
+	}
+
+	#ensureWatchdog(): void {
+		if (this.#watch === null) this.#watch = setInterval(() => this.#tick(), this.#watchdogMs);
+	}
+
+	/** A frame that has waited through two ticks (a quarter second at least) without
+	 *  running is asked for again where one should run now. If that is the window it is
+	 *  already in, it keeps waiting: when nothing shows there is nowhere better. */
+	#tick(): void {
+		if (this.#frames.size === 0) {
+			if (this.#watch !== null) clearInterval(this.#watch);
+			this.#watch = null;
+			return;
+		}
+		for (const handle of [...this.#frames]) {
+			if (!handle.live) continue;
+			if (++handle.waits < 2) continue;
+			if (handle.win !== this.frameWindow()) {
+				this.#disarm(handle);
+				this.#arm(handle);
+			} else {
+				handle.waits = 0;
+			}
 		}
 	}
 }

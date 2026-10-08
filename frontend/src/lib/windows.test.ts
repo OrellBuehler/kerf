@@ -5,16 +5,30 @@ const { Windows } = await import('./windows.svelte');
 const { parseEventKey, windowOf, documentOf, resizeObserverFor, intersectionObserverFor } = await import('./realm');
 const { onWindow } = await import('./window-events');
 
-/** A window as far as the registry can tell: it takes listeners and says what it shows. */
+/** A window as far as the registry can tell: it takes listeners, says what it shows and,
+ *  like a real one, runs its animation frames only while it shows (`paint()`). */
 function fakeWindow(name: string, visible = true) {
 	const listeners: Array<[string, unknown, unknown]> = [];
 	const rafs: number[] = [];
+	const pending = new Map<number, FrameRequestCallback>();
+	const changes = new Set<() => void>();
+	let last = 0;
 	const win = {
 		name,
 		closed: false,
-		document: { visibilityState: visible ? 'visible' : 'hidden' },
+		document: {
+			visibilityState: visible ? 'visible' : 'hidden',
+			addEventListener(type: string, handler: () => void) {
+				if (type === 'visibilitychange') changes.add(handler);
+			},
+			removeEventListener(type: string, handler: () => void) {
+				if (type === 'visibilitychange') changes.delete(handler);
+			}
+		},
 		listeners,
 		rafs,
+		pending,
+		changes,
 		addEventListener(type: string, handler: unknown, options?: unknown) {
 			listeners.push([type, handler, options]);
 		},
@@ -22,13 +36,26 @@ function fakeWindow(name: string, visible = true) {
 			const i = listeners.findIndex((l) => l[0] === type && l[1] === handler && l[2] === options);
 			if (i >= 0) listeners.splice(i, 1);
 		},
-		requestAnimationFrame: (cb: () => void) => {
-			void cb;
-			rafs.push(1);
-			return rafs.length;
+		requestAnimationFrame: (cb: FrameRequestCallback) => {
+			pending.set(++last, cb);
+			rafs.push(last);
+			return last;
 		},
 		cancelAnimationFrame: (id: number) => {
+			pending.delete(id);
 			rafs.push(-id);
+		},
+		/** The screen refreshes: a window that shows runs the frames it was asked for. */
+		paint(time = 1) {
+			if (win.closed || win.document.visibilityState !== 'visible') return;
+			const due = [...pending];
+			pending.clear();
+			for (const [, cb] of due) cb(time);
+		},
+		/** The window is minimized, covered or brought back. */
+		show(shown: boolean) {
+			win.document.visibilityState = shown ? 'visible' : 'hidden';
+			for (const h of [...changes]) h();
 		}
 	};
 	return win as typeof win & Window;
@@ -137,7 +164,195 @@ describe('the windows registry', () => {
 		w.add(broken);
 		expect(w.frameWindow()).toBe(main);
 		w.cancelFrame(null);
-		w.cancelFrame({ win: broken, id: 3 });
+		w.cancelFrame({ win: broken, id: 3, live: true, waits: 0, cb: () => {} });
+	});
+});
+
+describe('frames follow the windows that show', () => {
+	const later = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+	test('a frame runs once, in the window that painted it', () => {
+		const main = fakeWindow('main');
+		const w = new Windows(main);
+		const ran: number[] = [];
+		w.requestFrame((t) => ran.push(t));
+		main.paint(7);
+		main.paint(8);
+		expect(ran).toEqual([7]);
+	});
+
+	test('a frame waiting in a window that goes hidden moves to one that shows', () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		const ran: string[] = [];
+		const h = w.requestFrame(() => ran.push('step'));
+		expect(h.win).toBe(main);
+		// The editor is minimized while the preview plays on the other screen.
+		main.show(false);
+		main.paint();
+		expect(ran).toEqual([]);
+		expect(h.win).toBe(pop);
+		pop.paint();
+		expect(ran).toEqual(['step']);
+		// The frame it left behind is gone, not queued to run twice.
+		expect(main.pending.size).toBe(0);
+	});
+
+	test('…and a frame that was asked for in the detached window comes home when that one hides', () => {
+		const main = fakeWindow('main', false);
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		const ran: string[] = [];
+		w.requestFrame(() => ran.push('step'));
+		pop.show(false);
+		main.show(true);
+		main.paint();
+		expect(ran).toEqual(['step']);
+	});
+
+	test('a loop that asks again from inside its frame keeps going across a hide', () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		let n = 0;
+		const step = () => {
+			n++;
+			w.requestFrame(step);
+		};
+		w.requestFrame(step);
+		main.paint();
+		expect(n).toBe(1);
+		main.show(false);
+		pop.paint();
+		expect(n).toBe(2);
+		pop.show(false);
+		main.show(true);
+		main.paint();
+		expect(n).toBe(3);
+	});
+
+	test('a window closing hands its frame on', () => {
+		const main = fakeWindow('main', false);
+		const pop = fakeWindow('pop');
+		const other = fakeWindow('other');
+		const w = new Windows(main);
+		w.add(pop);
+		w.add(other);
+		const ran: string[] = [];
+		const h = w.requestFrame(() => ran.push('step'));
+		expect(h.win).toBe(pop);
+		pop.closed = true;
+		w.remove(pop);
+		expect(h.win).toBe(other);
+		other.paint();
+		expect(ran).toEqual(['step']);
+	});
+
+	test('a window opening takes a frame that has nowhere to run', () => {
+		const main = fakeWindow('main', false);
+		const w = new Windows(main);
+		const ran: string[] = [];
+		const h = w.requestFrame(() => ran.push('step'));
+		expect(h.win).toBe(main);
+		const pop = fakeWindow('pop');
+		w.add(pop);
+		expect(h.win).toBe(pop);
+		pop.paint();
+		expect(ran).toEqual(['step']);
+	});
+
+	test('a window that stops listening is not heard from again', () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		expect(pop.changes.size).toBe(1);
+		w.remove(pop);
+		expect(pop.changes.size).toBe(0);
+	});
+
+	test('a cancelled frame never runs, wherever it was moved', () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main);
+		w.add(pop);
+		const ran: string[] = [];
+		const h = w.requestFrame(() => ran.push('step'));
+		main.show(false);
+		w.cancelFrame(h);
+		pop.paint();
+		main.show(true);
+		main.paint();
+		expect(ran).toEqual([]);
+		expect(main.pending.size + pop.pending.size).toBe(0);
+	});
+
+	test('the watchdog asks again where one shows when no event said a window went', async () => {
+		const main = fakeWindow('main');
+		const pop = fakeWindow('pop');
+		const w = new Windows(main, 5);
+		w.add(pop);
+		const ran: string[] = [];
+		const h = w.requestFrame(() => ran.push('step'));
+		// The editor stops painting and says nothing — no visibilitychange arrives.
+		main.document.visibilityState = 'hidden';
+		await later(40);
+		expect(h.win).toBe(pop);
+		pop.paint();
+		expect(ran).toEqual(['step']);
+		await later(30);
+	});
+
+	test('the watchdog leaves a frame that is waiting in the one window that shows', async () => {
+		const main = fakeWindow('main');
+		const w = new Windows(main, 5);
+		const h = w.requestFrame(() => {});
+		const id = h.id;
+		await later(40);
+		expect(h.win).toBe(main);
+		expect(h.id).toBe(id);
+		expect(main.pending.size).toBe(1);
+		w.cancelFrame(h);
+		await later(20);
+	});
+
+	test('the watchdog stops by itself once nothing waits', async () => {
+		const main = fakeWindow('main');
+		const w = new Windows(main, 5);
+		const timers: unknown[] = [];
+		const realSet = globalThis.setInterval;
+		const realClear = globalThis.clearInterval;
+		globalThis.setInterval = ((...a: Parameters<typeof setInterval>) => {
+			const t = realSet(...a);
+			timers.push(t);
+			return t;
+		}) as typeof setInterval;
+		let cleared = 0;
+		globalThis.clearInterval = ((t: Parameters<typeof clearInterval>[0]) => {
+			cleared++;
+			return realClear(t);
+		}) as typeof clearInterval;
+		try {
+			const a = w.requestFrame(() => {});
+			const b = w.requestFrame(() => {});
+			// One timer serves every frame.
+			expect(timers).toHaveLength(1);
+			main.paint();
+			w.cancelFrame(a);
+			w.cancelFrame(b);
+			await later(30);
+			expect(cleared).toBe(1);
+			w.requestFrame(() => {});
+			expect(timers).toHaveLength(2);
+			w.cancelFrame(null);
+		} finally {
+			globalThis.setInterval = realSet;
+			globalThis.clearInterval = realClear;
+		}
 	});
 });
 
