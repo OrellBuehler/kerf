@@ -326,6 +326,22 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   is refused (control points in the unit square) so value ranges stay those of the keys;
   overshoot belongs with the graph editor (B5b).
 
+- **2026-10-08 — B5a review fixes.** (1) A chain of nested `if(lt(..))` is a level per
+  polyline point and libavutil refuses expressions nested past ~100, so ten eased keys (12
+  points each) failed the export and the playback stream on 4.4.2 and 9.0.2 alike. Rather than
+  cut `EASE_STEPS` (the curve is *defined* by those pieces; fewer is a visibly coarser ease) or
+  limit the key count, `keyframe_expr` writes a balanced tree above 24 points and the old
+  chain below it, so no existing graph changed (golden oracle untouched). (2) A head cut exactly
+  on a key read as "before the segment" and dropped the key's easing (`<` is `<=`, Rust and TS).
+  (3) A key added inside a segment is a split, not a Linear insert: a hold stays held, a curve
+  is cut with de Casteljau; presets and rising beziers are exact, an S that turns back is
+  clamped into the unit square (re-fitted, 0.04 off at worst measured) — chosen over keeping
+  the neighbour's easing and the new key Linear, which changed the motion of a cut that only
+  pinned the present pose. (4) `set_keyframes` validates bezier control points like
+  `set_keyframe_easing`. (5) A head trim still bakes the rest of a curve into linear keys:
+  lossy for the picker, exact for the picture, and now documented rather than changed (`Easing::split`
+  could keep one eased key there; the picture is already right).
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
