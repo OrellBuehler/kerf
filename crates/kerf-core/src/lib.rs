@@ -55,11 +55,11 @@ pub use frame_pick::{fps_pick, FpsPick, Pick, SourceFrames};
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, DiffEntry, DiffKind, EditOutcome, EditSource, Framing, Keyframe,
-    Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SourceLimits,
-    SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
-    TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS,
-    MIN_EDIT_CLIP,
+    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, Framing,
+    Keyframe, Marker, Mask, MaskShape, Projection, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
+    SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay,
+    TimeRange, Timeline, TimelineDiff, Track, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover,
+    ADJACENT_EPS, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};

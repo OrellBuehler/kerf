@@ -26,6 +26,7 @@ import type {
 	ExportProgress,
 	Filmstrip,
 	ImportProgress,
+	Easing,
 	Keyframe,
 	LaunchRequest,
 	Projection,
@@ -1465,6 +1466,9 @@ export async function addKeyframe(
 				opacity: tf.opacity,
 				...patch
 			};
+			// Re-keying a moment keeps the shape of the segment that leaves it (as the backend does).
+			const old = (clip.keyframes ?? []).find((k) => Math.abs(k.time - time) <= 1e-6);
+			if (old?.easing && !patch.easing) base.easing = old.easing;
 			const kfs = (clip.keyframes ?? []).filter((k) => Math.abs(k.time - time) > 1e-6);
 			kfs.push(base);
 			kfs.sort((a, b) => a.time - b.time);
@@ -1482,6 +1486,26 @@ export async function addKeyframe(
 		rotation: patch.rotation,
 		opacity: patch.opacity
 	});
+}
+
+/** Set the easing of the segment leaving the keyframe at `time` (within a millisecond). */
+export async function setKeyframeEasing(clipId: string, time: number, easing: Easing): Promise<Timeline> {
+	if (!inTauri()) {
+		if (typeof easing !== 'string' && Object.values(easing.bezier).some((v) => !Number.isFinite(v) || v < 0 || v > 1)) {
+			throw new Error('bezier control points must be within 0.0..=1.0 (no overshoot)');
+		}
+		const found = locate(devTimeline, clipId);
+		const clip = found ? found[0].clips[found[1]] : undefined;
+		const near = (clip?.keyframes ?? [])
+			.filter((k) => Math.abs(k.time - time) <= 1e-3)
+			.sort((a, b) => Math.abs(a.time - time) - Math.abs(b.time - time))[0];
+		if (!near) throw new Error(`the clip has no keyframe at ${time.toFixed(3)} s`);
+		if (easing === 'linear') delete near.easing;
+		else near.easing = easing;
+		recordDev('Set keyframe easing');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_keyframe_easing', { clipId, time, easing });
 }
 
 export async function clearKeyframes(clipId: string): Promise<Timeline> {

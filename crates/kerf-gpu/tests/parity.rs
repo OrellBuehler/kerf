@@ -1342,6 +1342,7 @@ fn opacity() {
         ..Color::default()
     };
     let key = |time: f64, opacity: f64| Keyframe {
+        easing: Default::default(),
         time,
         scale: 1.0,
         pos_x: 0.0,
@@ -1515,6 +1516,7 @@ fn source_time_speed_reverse_and_keyframes() {
     // stage of FFmpeg's chain, so a grade, a rotation or a fade of opacity is applied to the
     // picture at its fit size and magnified; the plan refuses that, see below).
     let key = |time: f64, scale: f64, pos: (f64, f64), rotation: f64, opacity: f64| Keyframe {
+        easing: Default::default(),
         time,
         scale,
         pos_x: pos.0,
@@ -1818,6 +1820,7 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
     // size and are magnified with it, an order the compositor does not have. The same keys
     // at an instant where all of them are neutral are drawn (`time/keyframes`).
     let key = |time: f64, scale: f64, rotation: f64, opacity: f64| Keyframe {
+        easing: Default::default(),
         time,
         scale,
         pos_x: 0.0,

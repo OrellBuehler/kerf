@@ -12,6 +12,7 @@ import {
 	importCaptions,
 	importCaptionsText,
 	clearKeyframes,
+	setKeyframeEasing,
 	clearReframe,
 	concatenate,
 	cutClip,
@@ -109,6 +110,7 @@ import type {
 	Color,
 	Delivery,
 	ExportOptions,
+	Easing,
 	Keyframe,
 	Mask,
 	Projection,
@@ -818,6 +820,10 @@ class EditorState {
 	}
 	addKeyframe(clipId: string, time: number, patch: Partial<Omit<Keyframe, 'time'>> = {}) {
 		return this.#apply(addKeyframe(clipId, time, patch));
+	}
+	/** The easing of the segment leaving the keyframe at `time` (clip-local seconds). */
+	setKeyframeEasing(clipId: string, time: number, easing: Easing) {
+		return this.#apply(setKeyframeEasing(clipId, time, easing));
 	}
 	clearKeyframes(clipId: string) {
 		return this.#apply(clearKeyframes(clipId));

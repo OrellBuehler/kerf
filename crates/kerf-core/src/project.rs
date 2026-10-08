@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
-    Delivery, EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision,
+    Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Marker, Mask, Projection, Reframe, ReframeKeyframe, Revision,
     SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay, TimeRange,
     Timeline, TimelineDiff, Track, TranscriptSegment, Transition, VideoEffect, Voiceover, MAX_FOV, MIN_FOV,
 };
@@ -3016,9 +3016,38 @@ impl Project {
             if let Some(v) = opacity {
                 kf.opacity = v;
             }
+            // Re-keying a moment keeps the shape of the segment that leaves it.
+            if let Some(old) = clip.keyframes.iter().find(|k| (k.time - time).abs() <= 1e-6) {
+                kf.easing = old.easing;
+            }
             clip.keyframes.retain(|k| (k.time - time).abs() > 1e-6);
             clip.keyframes.push(kf);
             clip.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+            Ok(clip.clone())
+        })
+    }
+
+    /// Set the easing of the segment that leaves the keyframe at `time` seconds from the
+    /// clip's start (the key nearest it within a millisecond): how the clip travels from that
+    /// pose to the next. The last key's easing has nothing to shape until a key follows it.
+    pub fn set_keyframe_easing(&self, clip_id: Uuid, time: f64, easing: Easing) -> Result<Clip> {
+        if let Easing::Bezier { x1, y1, x2, y2 } = easing {
+            if [x1, y1, x2, y2].iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
+                return Err(Error::InvalidArgument(
+                    "bezier control points must be within 0.0..=1.0 (no overshoot)".to_string(),
+                ));
+            }
+        }
+        self.edit_timeline("Set keyframe easing", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let key = clip
+                .keyframes
+                .iter_mut()
+                .filter(|k| (k.time - time).abs() <= 1e-3)
+                .min_by(|a, b| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
+                .ok_or_else(|| Error::InvalidArgument(format!("the clip has no keyframe at {time:.3} s")))?;
+            key.easing = easing;
             Ok(clip.clone())
         })
     }
@@ -4648,6 +4677,43 @@ mod tests {
         let replaced = project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
         assert_eq!(replaced.keyframes.len(), 2);
         assert!(!project.clear_keyframes(clip.id).unwrap().is_animated());
+    }
+
+    #[test]
+    fn a_keys_easing_is_set_by_time_kept_when_the_key_is_rekeyed_and_checked() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        project.add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, None).unwrap();
+        // Found within a millisecond of its time.
+        let eased = project.set_keyframe_easing(clip.id, 0.0004, Easing::EaseInOut).unwrap();
+        assert_eq!(eased.keyframes[0].easing, Easing::EaseInOut);
+        assert!(
+            (eased.transform_at(1.0).scale - 1.25).abs() > 0.05,
+            "the curve is not the line"
+        );
+        // Moving the pose at that moment keeps how it leaves.
+        let rekeyed = project.add_keyframe(clip.id, 0.0, Some(1.1), None, None, None, None).unwrap();
+        assert_eq!(rekeyed.keyframes[0].easing, Easing::EaseInOut);
+        // No key there, a control point out of range: refused, nothing written.
+        let before = project.history().unwrap().len();
+        assert!(matches!(
+            project.set_keyframe_easing(clip.id, 2.0, Easing::Hold),
+            Err(Error::InvalidArgument(_))
+        ));
+        let wild = Easing::Bezier {
+            x1: 0.2,
+            y1: 1.4,
+            x2: 0.8,
+            y2: 0.5,
+        };
+        assert!(matches!(
+            project.set_keyframe_easing(clip.id, 0.0, wild),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), before);
     }
 
     #[test]

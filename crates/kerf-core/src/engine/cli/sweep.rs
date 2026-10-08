@@ -209,6 +209,7 @@ fn keyed(time: f64, scale: f64, (pos_x, pos_y): (f64, f64), rotation: f64, opaci
         pos_y,
         rotation,
         opacity,
+        easing: Default::default(),
     }
 }
 
@@ -263,11 +264,31 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
     pushed.transition_in = transition(TransitionKind::PushUp, 0.9);
     let mut plain = make_clip(a, 10.0, 14.0, 3.0);
     plain.transition_in = transition(TransitionKind::SlideRight, 0.5);
+    // The same motion along every kind of easing: the graph writes each curve as the polyline
+    // `transform_at` samples, a hold as a step.
+    let mut eased = pushed.clone();
+    eased.timeline_start = 0.4;
+    eased.transition_in = None;
+    let easings = [
+        crate::model::Easing::EaseInOut,
+        crate::model::Easing::Hold,
+        crate::model::Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        },
+        crate::model::Easing::EaseOut,
+    ];
+    for (k, e) in eased.keyframes.iter_mut().zip(easings) {
+        k.easing = e;
+    }
     let mut cuts = vec![
         ("animated clip and title", animated),
         ("slide onto a static offset", pair(slid)),
         ("push onto an animated clip", pair(pushed)),
         ("slide onto an identity clip", pair(plain)),
+        ("eased keys", timeline_of(vec![video_track(vec![eased])])),
     ];
     for (_, tl) in &mut cuts {
         tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));

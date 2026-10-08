@@ -519,6 +519,7 @@ fn zoom_keys() -> Vec<Keyframe> {
         pos_y: 0.0,
         rotation: 0.0,
         opacity: 1.0,
+        easing: Default::default(),
     };
     vec![key(0.0, 0.35), key(0.9, 1.6), key(1.8, 0.5)]
 }
@@ -1319,6 +1320,7 @@ fn a_picture_zoomed_to_a_fraction_of_a_pixel_does_not_snap_to_full_size() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         };
         vec![key(0.0, 0.0004), key(0.8, 0.0004), key(1.4, last), key(2.0, last)]
     };
@@ -1440,6 +1442,7 @@ fn hdr_footage_with_an_odd_fit_size_renders() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         },
         Keyframe {
             time: 1.8,
@@ -1448,6 +1451,7 @@ fn hdr_footage_with_an_odd_fit_size_renders() {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         },
     ];
     let (tl, frames) = run("moving", moving);
@@ -1551,6 +1555,7 @@ fn keyed_zoom_cost() {
     let keyed = |scale: [f64; 2], rotation: f64, opacity: f64, position: bool| {
         let mut clip = make_clip(asset.id, 0.0, 3.0, 0.0);
         let key = |time, scale, rotation, opacity, pos_x| Keyframe {
+            easing: Default::default(),
             time,
             scale,
             pos_x,

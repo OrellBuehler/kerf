@@ -15,7 +15,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
 | B4 Mixer | — | — | todo | |
-| B5 Keyframes v2 | — | — | todo | |
+| B5 Keyframes v2 | `feat/keyframe-easing` (B5a) | — | in-progress | B5a done locally: per-key `Easing` (linear / hold / CSS eases / unit-square bezier), an eased segment is a 12-piece polyline shared by `transform_at` and the export (sweep at every output frame, mutation-checked), exact head trims / slices, `set_keyframe_easing` (core, Tauri, MCP), TS mirror pinned bit for bit, Inspector picker. Next: per-property channels, dope sheet. |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
 | A6 Headless agent rendering | — | — | todo | |
@@ -146,6 +146,15 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   mp4/mkv/ts/avi/nut time bases, VFR, speeds and reverse on both FFmpegs.
   Proxies carry a `StreamInfo` sidecar so the interactive path never
   ffprobes; `Handover` pins the canvas for A4's stream restarts.
+
+- **2026-10-08 — B5a: an eased segment is a polyline.** The plan said to realize easing
+  in `keyframe_expr` by sampling 8–12 linear pieces. Doing that only in the graph would
+  leave the still (`transform_at`) on the exact curve and the export on the
+  approximation — a few thousandths apart, and every exactness test (sweep, parity, the
+  plan's motion samples) would need a tolerance. So the curve is *defined* as the 12
+  pieces, in one function both read; the true bezier only places their points. Overshoot
+  is refused (control points in the unit square) so value ranges stay those of the keys;
+  overshoot belongs with the graph editor (B5b).
 
 ## Needs a real machine
 

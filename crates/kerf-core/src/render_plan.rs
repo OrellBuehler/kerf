@@ -1012,6 +1012,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 0.0,
                 opacity: 1.0,
+                easing: Default::default(),
             },
             Keyframe {
                 time: 2.0,
@@ -1020,6 +1021,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 10.0,
                 opacity: 0.0,
+                easing: Default::default(),
             },
         ];
         let tl = timeline(vec![vec![clip]]);

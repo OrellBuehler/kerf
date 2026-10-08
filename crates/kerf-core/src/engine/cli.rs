@@ -4914,9 +4914,9 @@ fn build_filter_complex(
             let quote = |v: String, dynamic: bool| if dynamic { format!("'{v}'") } else { v };
             let overlay = if clip.is_animated() {
                 // Animated picture position: per-frame overlay x / y expressions.
-                let kf = clip.sorted_keyframes();
-                let xs: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_x)).collect();
-                let ys: Vec<(f64, f64)> = kf.iter().map(|k| (k.time, k.pos_y)).collect();
+                // The eased polyline `transform_at` reads too (one curve for every renderer).
+                let xs = clip.keyframe_channel(|k| k.pos_x);
+                let ys = clip.keyframe_channel(|k| k.pos_y);
                 let px = keyframe_expr(&xs, "t", clip.timeline_start);
                 let py = keyframe_expr(&ys, "t", clip.timeline_start);
                 let (px, py) = match &motion {
@@ -5732,11 +5732,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if !geom_identity {
         if anim {
             // Per-frame zoom: re-evaluate the scale expression every frame.
-            let expr = keyframe_expr(
-                &kf.iter().map(|k| (k.time, k.scale)).collect::<Vec<_>>(),
-                "t",
-                clip.timeline_start,
-            );
+            let expr = keyframe_expr(&clip.keyframe_channel(|k| k.scale), "t", clip.timeline_start);
             let tiny = kf.iter().any(|k| k.scale < TINY_SCALE);
             // A moving zoom runs after the tone-map, at the end of the chain: even sizes
             // only matter ahead of `zscale`.
@@ -5798,13 +5794,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // The mask is the same alpha-plane geq, so a clip that
     // has both shares one pass — geq is per-pixel and by far the most expensive
     // filter in the chain, and two back-to-back passes would double it.
-    let opacity_expr = anim_opacity.then(|| {
-        keyframe_expr(
-            &kf.iter().map(|k| (k.time, k.opacity)).collect::<Vec<_>>(),
-            "T",
-            clip.timeline_start,
-        )
-    });
+    let opacity_expr = anim_opacity.then(|| keyframe_expr(&clip.keyframe_channel(|k| k.opacity), "T", clip.timeline_start));
     match (&clip.mask, opacity_expr) {
         (Some(mask), Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
@@ -5830,11 +5820,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // in every buffer it reuses, and the picture grows into the union of every
     // pose it has had (the "erratic" rotation, on 6.1 and 9.0 alike).
     if anim_rotation {
-        let expr = keyframe_expr(
-            &kf.iter().map(|k| (k.time, k.rotation)).collect::<Vec<_>>(),
-            "t",
-            clip.timeline_start,
-        );
+        let expr = keyframe_expr(&clip.keyframe_channel(|k| k.rotation), "t", clip.timeline_start);
         p.push(format!(
             "rotate=a='({expr})*PI/180':fillcolor=black@0:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
         ));
@@ -7567,6 +7553,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 0.0,
                 opacity: 1.0,
+                easing: Default::default(),
             },
             crate::model::Keyframe {
                 time: 4.0,
@@ -7575,6 +7562,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 0.0,
                 opacity: 1.0,
+                easing: Default::default(),
             },
         ];
         // Per-frame zoom is in the clip chain…
@@ -7611,6 +7599,7 @@ mod tests {
             pos_y: 0.0,
             rotation,
             opacity,
+            easing: Default::default(),
         }
     }
 
@@ -9229,6 +9218,7 @@ mod tests {
         let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
         clip.mask = Some(crate::model::Mask::default());
         let key = |time: f64, opacity: f64| crate::model::Keyframe {
+            easing: Default::default(),
             time,
             scale: 1.0,
             pos_x: 0.0,
@@ -10987,6 +10977,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 0.0,
                 opacity: 1.0,
+                easing: Default::default(),
             },
             crate::model::Keyframe {
                 time: 2.0,
@@ -10995,6 +10986,7 @@ mod tests {
                 pos_y: 0.0,
                 rotation: 0.0,
                 opacity: 1.0,
+                easing: Default::default(),
             },
         ];
         let mut timeline = single(vec![clip]);

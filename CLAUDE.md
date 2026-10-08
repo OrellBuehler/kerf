@@ -714,7 +714,22 @@ no editing logic in the adapter.
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
   `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
-  motion).
+  motion). **Each key carries an `Easing`** for the segment that *leaves* it (`Linear` —
+  the default, omitted from the JSON so every existing project and graph is
+  byte-identical — `Hold`, `EaseIn` / `EaseOut` / `EaseInOut` (CSS's curves) or a
+  `Bezier {x1, y1, x2, y2}` held to the unit square: no overshoot, so a value never leaves
+  its two keys' range and the tiny-scale / opacity guards on the keys stay true). **An
+  eased segment *is* a polyline** of `EASE_STEPS` (12) straight pieces through the true
+  curve (`eased_points`; a hold is an equal-time step), and `Clip::keyframe_channel` is the
+  one place a channel's points come from: `transform_at` interpolates it and the export's
+  `keyframe_expr` (straight lines only) is written from it, so the still, the export and a
+  GPU pass agree exactly rather than approximately — the sweep checks an eased cut at every
+  output frame time at five rates, and fails if the export ignores easing. A head trim or a
+  slice inside an eased segment is exact for the same reason: `rebase_animation` turns the
+  rest of the curve into plain keys (a hold just keeps holding). Re-keying a moment
+  (`add_keyframe` at an existing time) keeps its easing. `frontend/src/lib/easing.ts` is the
+  faithful mirror (both suites pin the same curve values bit for bit), used by the
+  Inspector's sampled pose, the harness's edits and `edit-modes.ts`'s `rebaseAnimation`.
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a
@@ -1735,6 +1750,7 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
+`set_keyframe_easing { clipId, time, easing }` (the key within a millisecond of `time`),
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -2102,7 +2118,9 @@ over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio
 effect chains** (add / tune / remove), **keyframe animation** (the Transform panel
-auto-keyframes at the playhead and shows the sampled pose), a **Framing** section
+auto-keyframes at the playhead and shows the sampled pose; each key but the last has an
+**easing** picker in the Animation section — linear, ease in-out / out / in, hold and three
+own bezier presets, `EASING_CHOICES` — which writes `set_keyframe_easing`), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
 shot already matches the frame or is 360), a **Mask** section (None / Rectangle /

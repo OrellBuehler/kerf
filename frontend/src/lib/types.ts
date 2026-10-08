@@ -196,6 +196,15 @@ export type AudioEffect =
 	| { type: 'gate'; threshold_db: number };
 
 /** One keyframe of a clip's animated transform. */
+/** How a keyframe travels to the next one (kerf-core's `Easing`); omitted is linear. */
+export type Easing =
+	| 'linear'
+	| 'hold'
+	| 'ease_in'
+	| 'ease_out'
+	| 'ease_in_out'
+	| { bezier: { x1: number; y1: number; x2: number; y2: number } };
+
 export interface Keyframe {
 	time: number;
 	scale: number;
@@ -203,6 +212,8 @@ export interface Keyframe {
 	pos_y: number;
 	rotation: number;
 	opacity: number;
+	/** The shape of the segment leaving this key; absent is linear. */
+	easing?: Easing;
 }
 
 /** One keyframe of a 360 clip's animated virtual camera. */

@@ -17,6 +17,7 @@
 	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
 	import { addTextHere, dropCaptions, makeCaptions } from '$lib/title-actions';
 	import { needsCrop } from '$lib/smart-crop';
+	import { EASING_CHOICES, easingId, keyframeChannel } from '$lib/easing';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
 	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
@@ -47,12 +48,12 @@
 		const base = { ...DEFAULT_TRANSFORM, ...(clip?.transform ?? {}) };
 		if (clip && keyframes.length) {
 			const lt = Math.max(0, ui.time - clip.timeline_start);
-			const ks = [...keyframes].sort((a, b) => a.time - b.time);
-			base.scale = lerp(ks.map((k) => [k.time, k.scale]), lt) ?? base.scale;
-			base.pos_x = lerp(ks.map((k) => [k.time, k.pos_x]), lt) ?? base.pos_x;
-			base.pos_y = lerp(ks.map((k) => [k.time, k.pos_y]), lt) ?? base.pos_y;
-			base.rotation = lerp(ks.map((k) => [k.time, k.rotation]), lt) ?? base.rotation;
-			base.opacity = lerp(ks.map((k) => [k.time, k.opacity]), lt) ?? base.opacity;
+			// Each channel as the eased polyline the export draws (`keyframeChannel`).
+			base.scale = lerp(keyframeChannel(keyframes, (k) => k.scale), lt) ?? base.scale;
+			base.pos_x = lerp(keyframeChannel(keyframes, (k) => k.pos_x), lt) ?? base.pos_x;
+			base.pos_y = lerp(keyframeChannel(keyframes, (k) => k.pos_y), lt) ?? base.pos_y;
+			base.rotation = lerp(keyframeChannel(keyframes, (k) => k.rotation), lt) ?? base.rotation;
+			base.opacity = lerp(keyframeChannel(keyframes, (k) => k.opacity), lt) ?? base.opacity;
 		}
 		return base;
 	});
@@ -174,6 +175,12 @@
 		if (!c) return;
 		const time = Math.max(0, ui.time - c.timeline_start);
 		void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000));
+	}
+	function setEasing(k: { time: number }, id: string) {
+		const c = clip;
+		const choice = EASING_CHOICES.find((e) => e.id === id);
+		if (!c || !choice) return;
+		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
 	function removeKeyframe(i: number) {
 		const c = clip;
@@ -981,6 +988,24 @@
 										k.rotation
 									)}° · {Math.round(k.opacity * 100)}%</span
 								>
+								{#if i < keyframes.length - 1}
+									{@const current = easingId(k.easing)}
+									<select
+										value={current}
+										disabled={editor.busy}
+										title="How the clip moves from this keyframe to the next"
+										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
+										onchange={(e) => setEasing(k, e.currentTarget.value)}
+										style={selectCss + ';flex:none;width:96px'}
+									>
+										{#each EASING_CHOICES as e (e.id)}
+											<option value={e.id}>{e.label}</option>
+										{/each}
+										{#if current === 'custom'}
+											<option value="custom" disabled>Custom</option>
+										{/if}
+									</select>
+								{/if}
 								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
 							</div>
 						{/each}

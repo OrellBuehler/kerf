@@ -1076,11 +1076,113 @@ fn default_text_color() -> String {
     "white".to_string()
 }
 
+/// How a keyframe's value travels to the next one: the shape of the **outgoing** segment.
+///
+/// Every renderer reads the same curve because the curve *is* a polyline: a non-linear
+/// segment is [`EASE_STEPS`] straight pieces through points of the true curve
+/// ([`eased_points`]), which is what the still / preview path interpolates
+/// ([`Clip::transform_at`]), what the export writes into its per-frame expressions
+/// (`keyframe_expr`, which only knows straight lines) and what a GPU pass will sample — so
+/// they agree exactly rather than approximately, and slicing an eased segment
+/// ([`Timeline::slice`], a trimmed head) is exact too: its pieces become plain keys.
+/// `Hold` keeps the value until the next key and jumps there. `Linear` is the default and is
+/// omitted from the JSON, so every existing project and graph is byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Easing {
+    #[default]
+    Linear,
+    Hold,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    /// A CSS-style cubic bezier from (0, 0) to (1, 1). Both control points are held to the unit
+    /// square: no overshoot, so an eased value never leaves the range of its two keys (and the
+    /// engine's tiny-scale and opacity guards, which look at the keys, stay true).
+    Bezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+}
+
+/// Straight pieces an eased segment is drawn with (see [`Easing`]).
+pub const EASE_STEPS: usize = 12;
+
+impl Easing {
+    pub fn is_linear(&self) -> bool {
+        matches!(self, Easing::Linear)
+    }
+
+    /// The control points of a curved easing (`None` for `Linear` and `Hold`).
+    fn bezier(&self) -> Option<(f64, f64, f64, f64)> {
+        let unit = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        match *self {
+            Easing::Linear | Easing::Hold => None,
+            Easing::EaseIn => Some((0.42, 0.0, 1.0, 1.0)),
+            Easing::EaseOut => Some((0.0, 0.0, 0.58, 1.0)),
+            Easing::EaseInOut => Some((0.42, 0.0, 0.58, 1.0)),
+            Easing::Bezier { x1, y1, x2, y2 } => Some((unit(x1), unit(y1), unit(x2), unit(y2))),
+        }
+    }
+
+    /// The true curve's progress at `u` in `[0, 1]` (`Hold` is 0 until the end).
+    pub fn curve(&self, u: f64) -> f64 {
+        let u = u.clamp(0.0, 1.0);
+        let Some((x1, y1, x2, y2)) = self.bezier() else {
+            return if matches!(self, Easing::Hold) && u < 1.0 { 0.0 } else { u };
+        };
+        // B(s) = 3(1-s)^2 s P1 + 3(1-s) s^2 P2 + s^3, per axis; x(s) is monotonic on the unit
+        // square, so `s` for `x(s) = u` is found by bisection (exact enough in 40 halvings).
+        let axis = |s: f64, p1: f64, p2: f64| {
+            let r = 1.0 - s;
+            3.0 * r * r * s * p1 + 3.0 * r * s * s * p2 + s * s * s
+        };
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if axis(mid, x1, x2) < u {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        axis(0.5 * (lo + hi), y1, y2)
+    }
+}
+
+/// The polyline a channel of `(time, value, outgoing easing)` keys is drawn as (sorted by time):
+/// a linear segment is its two ends, a `Hold` a step (an equal-time pair at the next key), a
+/// curve [`EASE_STEPS`] pieces through the true curve. All-linear keys come back as they went
+/// in. [`interpolate`] over the result is the channel's value at any time.
+pub fn eased_points(keys: &[(f64, f64, Easing)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, &(t0, v0, easing)) in keys.iter().enumerate() {
+        out.push((t0, v0));
+        let Some(&(t1, v1, _)) = keys.get(i + 1) else { break };
+        if t1 - t0 < 1e-9 {
+            continue;
+        }
+        match easing {
+            Easing::Linear => {}
+            Easing::Hold => out.push((t1, v0)),
+            curved => {
+                for j in 1..EASE_STEPS {
+                    let u = j as f64 / EASE_STEPS as f64;
+                    out.push((t0 + (t1 - t0) * u, v0 + (v1 - v0) * curved.curve(u)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One keyframe of a clip's animated transform: the value of each animatable
 /// channel at `time` (seconds from the clip's start). With two or more keyframes
-/// the engine interpolates linearly between them and renders the motion with
-/// per-frame ffmpeg expressions; crop and the rest of the static [`Transform`]
-/// are unaffected.
+/// the engine interpolates between them — along each key's [`Easing`], linearly unless
+/// set — and renders the motion with per-frame ffmpeg expressions; crop and the rest of
+/// the static [`Transform`] are unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Keyframe {
     /// Offset from the clip's `timeline_start`, in seconds.
@@ -1095,11 +1197,14 @@ pub struct Keyframe {
     pub rotation: f64,
     #[serde(default = "one")]
     pub opacity: f64,
+    /// The shape of the segment from this key to the next.
+    #[serde(default, skip_serializing_if = "Easing::is_linear")]
+    pub easing: Easing,
 }
 
 impl Keyframe {
     /// A keyframe at `time` carrying the values of `transform`'s animatable
-    /// channels (the static defaults for a fresh keyframe).
+    /// channels (the static defaults for a fresh keyframe), linear out.
     pub fn from_transform(time: f64, t: &Transform) -> Self {
         Self {
             time,
@@ -1108,6 +1213,21 @@ impl Keyframe {
             pos_y: t.pos_y,
             rotation: t.rotation,
             opacity: t.opacity,
+            easing: Easing::Linear,
+        }
+    }
+
+    /// Every animatable channel `progress` of the way from `self` to `next`, at `time`.
+    fn toward(&self, next: &Keyframe, progress: f64, time: f64) -> Keyframe {
+        let mix = |a: f64, b: f64| a + (b - a) * progress;
+        Keyframe {
+            time,
+            scale: mix(self.scale, next.scale),
+            pos_x: mix(self.pos_x, next.pos_x),
+            pos_y: mix(self.pos_y, next.pos_y),
+            rotation: mix(self.rotation, next.rotation),
+            opacity: mix(self.opacity, next.opacity),
+            easing: Easing::Linear,
         }
     }
 }
@@ -2206,6 +2326,14 @@ impl Clip {
         k
     }
 
+    /// One animatable channel of the keyframes as the polyline every renderer draws
+    /// ([`eased_points`]): what [`Clip::transform_at`] interpolates and what the export's
+    /// per-frame expression is written from, so the two cannot disagree.
+    pub fn keyframe_channel(&self, get: fn(&Keyframe) -> f64) -> Vec<(f64, f64)> {
+        let keys: Vec<(f64, f64, Easing)> = self.sorted_keyframes().iter().map(|k| (k.time, get(k), k.easing)).collect();
+        eased_points(&keys)
+    }
+
     /// Sample the (possibly animated) transform at `local` seconds from the
     /// clip's start: the static [`Transform`] with its animatable channels
     /// (scale / position / rotation / opacity) overridden by the interpolated
@@ -2216,8 +2344,7 @@ impl Clip {
         if self.keyframes.is_empty() {
             return t;
         }
-        let k = self.sorted_keyframes();
-        let chan = |get: fn(&Keyframe) -> f64| interpolate(&k.iter().map(|kf| (kf.time, get(kf))).collect::<Vec<_>>(), local);
+        let chan = |get: fn(&Keyframe) -> f64| interpolate(&self.keyframe_channel(get), local);
         if let Some(v) = chan(|kf| kf.scale) {
             t.scale = v;
         }
@@ -2367,8 +2494,30 @@ impl Clip {
             if !self.keyframes.is_empty() {
                 let pose = self.transform_at(by);
                 let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
+                // Cut inside an eased segment: the rest of it is kept exactly. A hold keeps
+                // holding to the next key; a curve's remaining pieces become plain keys (the
+                // curve *is* those pieces, see `Easing`).
+                let sorted = self.sorted_keyframes();
+                let segment = sorted
+                    .windows(2)
+                    .find(|w| w[0].time < by && by < w[1].time && w[1].time - w[0].time >= 1e-9);
+                if let Some(&[a, b]) = segment {
+                    match a.easing {
+                        Easing::Linear => {}
+                        Easing::Hold => kfs[0].easing = Easing::Hold,
+                        curved => {
+                            for j in 1..EASE_STEPS {
+                                let u = j as f64 / EASE_STEPS as f64;
+                                let at = a.time + (b.time - a.time) * u;
+                                if at > by {
+                                    kfs.push(a.toward(&b, curved.curve(u), at - by));
+                                }
+                            }
+                        }
+                    }
+                }
                 kfs.extend(
-                    self.keyframes
+                    sorted
                         .iter()
                         .filter(|k| k.time > by)
                         .map(|k| Keyframe { time: k.time - by, ..*k }),
@@ -5319,6 +5468,7 @@ mod tests {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         };
         let mut clip = clip_at(0.0, 4.0);
         // Nothing keyed, and one key (a held pose): the picture never changes size.
@@ -5664,6 +5814,164 @@ mod tests {
             serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000003","kind":"video","name":"V1","clips":[]}"#)
                 .unwrap();
         assert!(!t.muted && !t.solo && !t.locked);
+    }
+
+    // ---- keyframe easing -----------------------------------------------------------
+
+    fn eased(time: f64, scale: f64, easing: Easing) -> Keyframe {
+        Keyframe {
+            easing,
+            ..Keyframe::from_transform(
+                time,
+                &Transform {
+                    scale,
+                    ..Transform::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn easing_curves_start_at_zero_end_at_one_and_never_go_back() {
+        let curves = [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+            Easing::Bezier {
+                x1: 0.2,
+                y1: 0.9,
+                x2: 0.3,
+                y2: 0.1,
+            },
+        ];
+        for e in curves {
+            assert!(e.curve(0.0).abs() < 1e-9, "{e:?}");
+            assert!((e.curve(1.0) - 1.0).abs() < 1e-9, "{e:?}");
+            let mut last = 0.0;
+            for i in 1..=100 {
+                let v = e.curve(f64::from(i) / 100.0);
+                assert!(v >= last - 1e-9 && v <= 1.0 + 1e-9, "{e:?} at {i}: {v} after {last}");
+                last = v;
+            }
+        }
+        // The named curves are CSS's: ease-in is slow at first, ease-out slow at the end.
+        assert!(Easing::EaseIn.curve(0.25) < 0.25 && Easing::EaseOut.curve(0.25) > 0.25);
+        assert!((Easing::EaseInOut.curve(0.5) - 0.5).abs() < 1e-6);
+        // A hold stays put until the next key.
+        assert_eq!(Easing::Hold.curve(0.99), 0.0);
+        // Control points outside the unit square are held to it (no overshoot).
+        let wild = Easing::Bezier {
+            x1: 0.5,
+            y1: 3.0,
+            x2: 0.5,
+            y2: -2.0,
+        };
+        assert!((0..=20).all(|i| (0.0..=1.0).contains(&wild.curve(f64::from(i) / 20.0))));
+    }
+
+    /// The same numbers `frontend/src/lib/easing.test.ts` pins for its mirror: the two
+    /// implementations do the same arithmetic in the same order, so they agree exactly.
+    #[test]
+    fn easing_curves_match_the_frontend_mirror_bit_for_bit() {
+        let bezier = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        };
+        assert_eq!(Easing::EaseIn.curve(0.25), 0.093_464_650_718_456_97);
+        assert_eq!(Easing::EaseOut.curve(0.25), 0.378_138_130_824_722_36);
+        assert_eq!(Easing::EaseInOut.curve(0.3), 0.187_395_906_704_947_93);
+        assert_eq!(bezier.curve(0.5), 0.551_329_682_020_157_3);
+        assert_eq!(Easing::EaseInOut.curve(7.0 / 12.0), 0.641_173_603_406_141_9);
+    }
+
+    #[test]
+    fn linear_keys_are_their_own_polyline_and_eased_ones_are_twelve_pieces() {
+        let lin = [(0.0, 1.0, Easing::Linear), (2.0, 3.0, Easing::Linear)];
+        assert_eq!(eased_points(&lin), vec![(0.0, 1.0), (2.0, 3.0)]);
+        let ease = [(0.0, 1.0, Easing::EaseInOut), (2.0, 3.0, Easing::Linear)];
+        let pts = eased_points(&ease);
+        assert_eq!(pts.len(), EASE_STEPS + 1);
+        assert_eq!(pts.first(), Some(&(0.0, 1.0)));
+        assert_eq!(pts.last(), Some(&(2.0, 3.0)));
+        // A hold is a step at the next key.
+        let hold = [(0.0, 1.0, Easing::Hold), (2.0, 3.0, Easing::Linear)];
+        assert_eq!(eased_points(&hold), vec![(0.0, 1.0), (2.0, 1.0), (2.0, 3.0)]);
+        assert_eq!(interpolate(&eased_points(&hold), 1.999), Some(1.0));
+        assert_eq!(interpolate(&eased_points(&hold), 2.0), Some(3.0));
+    }
+
+    #[test]
+    fn transform_at_follows_each_keys_outgoing_easing() {
+        let mut clip = clip_at(0.0, 10.0);
+        clip.keyframes = vec![
+            eased(0.0, 1.0, Easing::EaseIn),
+            eased(2.0, 3.0, Easing::Hold),
+            eased(4.0, 5.0, Easing::Linear),
+            eased(6.0, 1.0, Easing::Linear),
+        ];
+        // Slow out of the first key, at the key values on the keys.
+        assert!(clip.transform_at(0.5).scale < 1.5);
+        assert!((clip.transform_at(2.0).scale - 3.0).abs() < 1e-12);
+        // Held from 2 to 4, then the jump.
+        assert!((clip.transform_at(3.9).scale - 3.0).abs() < 1e-12);
+        assert!((clip.transform_at(4.0).scale - 5.0).abs() < 1e-12);
+        // A linear segment is exactly linear.
+        assert!((clip.transform_at(5.0).scale - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn keys_saved_before_easing_existed_are_linear_and_linear_is_not_written() {
+        let k: Keyframe = serde_json::from_str(r#"{"time":1.0,"scale":2.0}"#).unwrap();
+        assert_eq!(k.easing, Easing::Linear);
+        assert!(!serde_json::to_string(&k).unwrap().contains("easing"));
+        let b = eased(
+            0.0,
+            1.0,
+            Easing::Bezier {
+                x1: 0.1,
+                y1: 0.2,
+                x2: 0.3,
+                y2: 0.4,
+            },
+        );
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains(r#""easing":{"bezier":{"x1":0.1,"y1":0.2,"x2":0.3,"y2":0.4}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Keyframe>(&json).unwrap(), b);
+        let hold = serde_json::to_string(&eased(0.0, 1.0, Easing::EaseInOut)).unwrap();
+        assert!(hold.contains(r#""easing":"ease_in_out""#), "{hold}");
+    }
+
+    #[test]
+    fn cutting_into_an_eased_segment_keeps_the_curve_exactly() {
+        for easing in [Easing::EaseInOut, Easing::Hold, Easing::EaseOut] {
+            let mut original = clip_at(0.0, 8.0);
+            original.keyframes = vec![
+                eased(0.0, 1.0, easing),
+                eased(3.0, 4.0, Easing::EaseIn),
+                eased(6.0, 2.0, Easing::Linear),
+            ];
+            let tl = Timeline {
+                tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
+                overlays: Vec::new(),
+                markers: Vec::new(),
+                format: None,
+            };
+            // A cut inside the first (eased) segment, not on one of its pieces.
+            let from = 1.1;
+            let sliced = tl.slice(from, 8.0);
+            let c = &sliced.tracks[0].clips[0];
+            for i in 0..=120 {
+                let t = f64::from(i) * 0.05;
+                let (a, b) = (c.transform_at(t).scale, original.transform_at(from + t).scale);
+                assert!((a - b).abs() < 1e-9, "{easing:?} at {t}: sliced {a}, original {b}");
+            }
+        }
     }
 
     #[test]
@@ -7445,6 +7753,7 @@ mod tests {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         }
     }
 
