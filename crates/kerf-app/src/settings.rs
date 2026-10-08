@@ -28,10 +28,21 @@ pub struct Settings {
     /// Share of the machine one heavy job (analysis, transcription, proxy,
     /// stitch, export) may take, in percent. See `kerf_core::engine::cpu`.
     pub cpu_percent: u8,
-    /// Whether the analysis pass transcribes speech. Off, importing media still
-    /// detects silence / scenes / loudness / rhythm but never fetches a speech
-    /// model or runs inference.
-    pub transcribe: bool,
+    /// Which analyses run by themselves when media is imported: a master switch and
+    /// one per kind (silence, scenes, loudness, rhythm, transcript). Replaces the old
+    /// `transcribe` flag, which a file written by an older build still carries: see
+    /// [`migrate`].
+    pub auto_analysis: kerf_core::AutoAnalysis,
+    /// The pre-`auto_analysis` transcription flag. Read once to carry an older file
+    /// forward and never written back.
+    #[serde(skip_serializing)]
+    pub transcribe: Option<bool>,
+    /// How wide preview proxies are — 720, 1080 or 1280 pixels across, or 0 for none.
+    /// The default is what Kerf always made, so its cache stays good.
+    pub proxy_size: kerf_core::ProxySize,
+    /// Which file the preview decodes: the proxy once it is ready (`auto`), always the
+    /// original, or only the proxy (waiting for it). Export always reads the originals.
+    pub preview_source: kerf_core::PreviewSource,
     /// Whether the preview shades the delivery safe areas — where a phone's own
     /// UI covers a vertical cut. Off by default: it is a check you turn on,
     /// not a view you cut behind.
@@ -64,7 +75,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             cpu_percent: kerf_core::DEFAULT_CPU_PERCENT,
-            transcribe: true,
+            auto_analysis: kerf_core::AutoAnalysis::default(),
+            transcribe: None,
+            proxy_size: kerf_core::ProxySize::default(),
+            preview_source: kerf_core::PreviewSource::default(),
             safe_areas: false,
             gpu_preview: false,
             layout: None,
@@ -94,7 +108,9 @@ pub fn set_safe_areas(on: bool) {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsView {
     pub cpu_percent: u8,
-    pub transcribe: bool,
+    pub auto_analysis: kerf_core::AutoAnalysis,
+    pub proxy_size: kerf_core::ProxySize,
+    pub preview_source: kerf_core::PreviewSource,
     pub safe_areas: bool,
     pub gpu_preview: bool,
     pub cpu_cores: usize,
@@ -115,7 +131,9 @@ impl SettingsView {
     pub fn current(stored: &Settings) -> Self {
         Self {
             cpu_percent: kerf_core::cpu_percent(),
-            transcribe: kerf_core::transcription_enabled(),
+            auto_analysis: kerf_core::auto_analysis(),
+            proxy_size: kerf_core::proxy::proxy_size(),
+            preview_source: kerf_core::proxy::preview_source_setting(),
             safe_areas: safe_areas(),
             gpu_preview: stored.gpu_preview,
             cpu_cores: kerf_core::cpu_cores(),
@@ -136,9 +154,11 @@ impl SettingsView {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`].
-const KEYS: [&str; 8] = [
+const KEYS: [&str; 10] = [
     "cpu_percent",
-    "transcribe",
+    "auto_analysis",
+    "proxy_size",
+    "preview_source",
     "safe_areas",
     "gpu_preview",
     "layout",
@@ -192,7 +212,7 @@ fn load_from(file: &Path) -> Settings {
             return Settings::default();
         }
     };
-    match serde_json::from_str(&raw) {
+    match parse(&raw) {
         Ok(settings) => settings,
         Err(e) => {
             let ms = std::time::SystemTime::now()
@@ -215,6 +235,27 @@ fn load_from(file: &Path) -> Settings {
                 ),
             }
             Settings::default()
+        }
+    }
+}
+
+/// Read a settings file, carrying an older one forward ([`migrate`]).
+fn parse(raw: &str) -> Result<Settings, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let has_auto_analysis = value.get("auto_analysis").is_some();
+    let mut settings: Settings = serde_json::from_value(value)?;
+    migrate(&mut settings, has_auto_analysis);
+    Ok(settings)
+}
+
+/// The `transcribe` flag of a file written before `auto_analysis` existed becomes
+/// that set's `transcript` switch (everything else stays on, as it always was). A
+/// file that has both keeps `auto_analysis`: the newer one is the one the user last
+/// touched. Either way the old flag is dropped, so the next save no longer has it.
+fn migrate(settings: &mut Settings, has_auto_analysis: bool) {
+    if let Some(transcribe) = settings.transcribe.take() {
+        if !has_auto_analysis {
+            settings.auto_analysis.transcript = transcribe;
         }
     }
 }
@@ -262,8 +303,14 @@ pub fn update(app: &AppHandle, patch: &serde_json::Value) -> Result<Settings, St
     let file = path(app).ok_or("no config directory available for settings")?;
     let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut merged = merge(&load_from(&file), patch)?;
-    if patch.get("transcribe").is_some() {
-        kerf_core::set_transcription_enabled(merged.transcribe);
+    if patch.get("auto_analysis").is_some() {
+        kerf_core::set_auto_analysis(merged.auto_analysis);
+    }
+    if patch.get("proxy_size").is_some() {
+        kerf_core::proxy::set_proxy_size(merged.proxy_size);
+    }
+    if patch.get("preview_source").is_some() {
+        kerf_core::proxy::set_preview_source_setting(merged.preview_source);
     }
     if patch.get("safe_areas").is_some() {
         set_safe_areas(merged.safe_areas);
@@ -281,7 +328,9 @@ pub fn update(app: &AppHandle, patch: &serde_json::Value) -> Result<Settings, St
 /// environment meant it for this run. Moving the slider afterwards still takes
 /// effect — a runtime choice is the newer instruction of the two.
 pub fn apply(settings: &Settings) {
-    kerf_core::set_transcription_enabled(settings.transcribe);
+    kerf_core::set_auto_analysis(settings.auto_analysis);
+    kerf_core::proxy::set_proxy_size(settings.proxy_size);
+    kerf_core::proxy::set_preview_source_setting(settings.preview_source);
     set_safe_areas(settings.safe_areas);
     if std::env::var_os(CPU_ENV).is_some() {
         tracing::info!(percent = kerf_core::cpu_percent(), "CPU budget set from {CPU_ENV}");
@@ -299,7 +348,9 @@ mod tests {
     fn an_older_file_reads_as_defaults_for_what_it_lacks() {
         let s: Settings = serde_json::from_str(r#"{"cpu_percent": 50}"#).unwrap();
         assert_eq!(s.cpu_percent, 50);
-        assert!(s.transcribe);
+        assert_eq!(s.auto_analysis, kerf_core::AutoAnalysis::default());
+        assert_eq!(s.proxy_size, kerf_core::ProxySize::W1280);
+        assert_eq!(s.preview_source, kerf_core::PreviewSource::Auto);
         assert!(!s.gpu_preview, "the GPU preview is opt-in");
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
@@ -393,7 +444,7 @@ mod tests {
         assert_eq!(merged.theme, base.theme);
         assert_eq!(merged.workspaces, base.workspaces);
         // A patch for something else leaves the shortcuts alone…
-        let other = merge(&base, &serde_json::json!({"transcribe": false})).unwrap();
+        let other = merge(&base, &serde_json::json!({"safe_areas": true})).unwrap();
         assert_eq!(other.keybindings, base.keybindings);
         // …and a null is "back to the defaults".
         let cleared = merge(&merged, &serde_json::json!({"keybindings": null})).unwrap();
@@ -414,8 +465,9 @@ mod tests {
             theme: Some(serde_json::json!({"name": "Mine"})),
             ..Settings::default()
         };
-        let merged = merge(&base, &serde_json::json!({"transcribe": false})).unwrap();
-        assert!(!merged.transcribe);
+        let merged = merge(&base, &serde_json::json!({"auto_analysis": {"transcript": false}})).unwrap();
+        assert!(!merged.auto_analysis.transcript);
+        assert!(merged.auto_analysis.silence, "the rest of the set is its default");
         assert_eq!(merged.cpu_percent, 40);
         assert_eq!(merged.layout, base.layout);
         assert_eq!(merged.theme, base.theme);
@@ -508,5 +560,75 @@ mod tests {
         assert!(loaded.theme.is_none());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_old_transcribe_flag_becomes_the_transcript_switch_and_is_not_written_back() {
+        let off = parse(r#"{"cpu_percent": 40, "transcribe": false}"#).unwrap();
+        assert!(!off.auto_analysis.transcript);
+        assert!(
+            off.auto_analysis.enabled && off.auto_analysis.silence && off.auto_analysis.scenes,
+            "everything else stays on, as it always was"
+        );
+        assert_eq!(off.cpu_percent, 40);
+        assert!(off.transcribe.is_none(), "the flag is consumed");
+        let saved = serde_json::to_value(&off).unwrap();
+        assert!(saved.get("transcribe").is_none(), "the next save drops it: {saved}");
+        assert_eq!(saved["auto_analysis"]["transcript"], false);
+
+        let on = parse(r#"{"transcribe": true}"#).unwrap();
+        assert!(on.auto_analysis.transcript);
+
+        // A file with neither is the defaults.
+        assert_eq!(parse("{}").unwrap().auto_analysis, kerf_core::AutoAnalysis::default());
+    }
+
+    #[test]
+    fn a_file_that_has_both_keeps_the_newer_auto_analysis() {
+        let both = parse(
+            r#"{"transcribe": false, "auto_analysis": {"enabled": true, "silence": true, "scenes": true, "loudness": true, "rhythm": true, "transcript": true}}"#,
+        )
+        .unwrap();
+        assert!(
+            both.auto_analysis.transcript,
+            "the set the user chose last wins over the old flag"
+        );
+        assert!(both.transcribe.is_none());
+    }
+
+    #[test]
+    fn analysis_proxy_and_preview_settings_patch_round_trip_and_reach_the_view() {
+        let base = Settings::default();
+        let merged = merge(
+            &base,
+            &serde_json::json!({
+                "auto_analysis": {"enabled": false, "silence": true, "scenes": false, "loudness": true, "rhythm": true, "transcript": false},
+                "proxy_size": 720,
+                "preview_source": "proxy_only"
+            }),
+        )
+        .unwrap();
+        assert!(!merged.auto_analysis.enabled && !merged.auto_analysis.scenes);
+        assert_eq!(merged.proxy_size, kerf_core::ProxySize::W720);
+        assert_eq!(merged.preview_source, kerf_core::PreviewSource::ProxyOnly);
+        assert_eq!(merged.cpu_percent, base.cpu_percent, "nothing else moved");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
+        assert_eq!(back.proxy_size, kerf_core::ProxySize::W720);
+        assert_eq!(back.auto_analysis, merged.auto_analysis);
+        let view = serde_json::to_value(SettingsView::current(&merged)).unwrap();
+        assert!(view.get("transcribe").is_none(), "the old key is gone from the view");
+        assert!(view.get("auto_analysis").is_some() && view.get("proxy_size").is_some() && view.get("preview_source").is_some());
+        // A size this build does not offer rounds to one it does, and a value that is no
+        // number is refused as a bad patch.
+        let odd = merge(&base, &serde_json::json!({"proxy_size": 900})).unwrap();
+        assert_eq!(odd.proxy_size, kerf_core::ProxySize::W1080);
+        assert!(merge(&base, &serde_json::json!({"proxy_size": "big"})).is_err());
+        assert!(
+            merge(&base, &serde_json::json!({"transcribe": false})).is_err(),
+            "the old key is no longer a setting"
+        );
+        // A stored source this build has not heard of is Auto, not a corrupt file.
+        let unknown = parse(r#"{"preview_source": "somewhere_else"}"#).unwrap();
+        assert_eq!(unknown.preview_source, kerf_core::PreviewSource::Auto);
     }
 }

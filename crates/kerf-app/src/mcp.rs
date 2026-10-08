@@ -89,6 +89,28 @@ struct AssetIdParams {
     asset_id: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AnalyzeParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(
+        description = "Which analyses to run: any of `silence`, `scenes`, `loudness`, `rhythm` (onsets, tempo, \
+                       speech/music class), `transcript`, or `all`. Only these run, and their results are merged \
+                       into what is already cached — the other kinds are left as they were. Omit it for the \
+                       analyses the user has left switched on in Settings › Analysis (so an agent does not fetch \
+                       a speech model for someone who turned transcription off); name `transcript` yourself to \
+                       transcribe anyway. Run only what you need: `silence` before remove_silence, `rhythm` \
+                       before snap_to_beats, `transcript` before generate_captions."
+    )]
+    steps: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct ProxyStatusParams {
+    #[schemars(description = "UUID of the asset; omit for every asset in the project")]
+    asset_id: Option<String>,
+}
+
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct VoiceoverParams {
     #[schemars(
@@ -1249,6 +1271,28 @@ struct CoverParams {
 struct AssetMetadata {
     asset: kerf_core::Asset,
     analysis: Option<kerf_core::AssetAnalysis>,
+    /// Which analyses are done, running, failed or switched off.
+    analysis_status: kerf_core::AnalysisStatus,
+    /// The preview proxy: ready, building (with `fraction`), failed (with `reason`), …
+    proxy: kerf_core::ProxyStatus,
+}
+
+/// What `analyze_asset` returns: the cached analysis (as it always was) with what the run
+/// did beside it.
+#[derive(Serialize)]
+struct AnalyzeResult {
+    #[serde(flatten)]
+    analysis: kerf_core::AssetAnalysis,
+    analysis_status: kerf_core::AnalysisStatus,
+    /// Steps that failed, with why; the others still landed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failed: Vec<FailedStep>,
+}
+
+#[derive(Serialize)]
+struct FailedStep {
+    step: kerf_core::AnalysisKind,
+    reason: String,
 }
 
 /// A span of a track where nothing renders.
@@ -1333,12 +1377,15 @@ impl KerfMcp {
                 let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
             };
             let probed = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(core_err)?;
-            lock_agent(&project).insert_or_get_asset(&probed).map_err(core_err)
+            let asset = lock_agent(&project).insert_or_get_asset(&probed).map_err(core_err)?;
+            // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
+            // is not a seek into a long GOP. It takes its place in front of any analysis the
+            // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
+            // it is here on the blocking pool and not in the async tool body.
+            crate::spawn_proxy(&app, &asset);
+            Ok(asset)
         })
         .await?;
-        // Preview decodes come off a proxy; queue it now so the first frame
-        // anyone asks for is not a seek into a long GOP.
-        crate::spawn_proxy(&self.app, &asset);
         self.changed();
         json(&asset)
     }
@@ -1350,14 +1397,82 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class)"
+        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
+                       `analysis_status` (per kind: done / not_run / running / failed with a reason / off) and `proxy` \
+                       (the preview proxy: ready, building with a fraction, failed with a reason, off or not_needed)"
     )]
-    fn get_asset_metadata(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+    async fn get_asset_metadata(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.lock();
-        let asset = project.require_asset(id).map_err(core_err)?;
-        let analysis = project.get_analysis(id).map_err(core_err)?;
-        json(&AssetMetadata { asset, analysis })
+        let project = self.project.clone();
+        let meta = blocking(move || {
+            let (input, analysis) = {
+                let project = lock_agent(&project);
+                (
+                    project.proxy_input(id).map_err(core_err)?,
+                    project.get_analysis(id).map_err(core_err)?,
+                )
+            };
+            // The proxy's state touches the disk (and, once per file, a cached ffprobe): lock released.
+            Ok(AssetMetadata {
+                analysis_status: kerf_core::analysis_status(id, analysis.as_ref()),
+                proxy: kerf_core::proxy::status(&input),
+                asset: input.asset,
+                analysis,
+            })
+        })
+        .await?;
+        json(&meta)
+    }
+
+    #[tool(
+        description = "The preview proxy of one asset (asset_id) or of every asset: `state` is ready, building (with \
+                       `fraction` 0..1 and `eta_secs`), queued, failed (with the `reason`), missing, off (proxies \
+                       are off, previews use the original, or the user deleted this one) or not_needed (a still or an \
+                       audio-only file). Previews decode the original until the proxy is ready; export always reads \
+                       the original. A proxy is built before any analysis waiting for the machine."
+    )]
+    async fn proxy_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
+        let wanted = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let project = self.project.clone();
+        let statuses = blocking(move || {
+            let mut inputs = lock_agent(&project).proxy_inputs().map_err(core_err)?;
+            if let Some(id) = wanted {
+                inputs.retain(|i| i.asset.id == id);
+                if inputs.is_empty() {
+                    return Err(core_err(kerf_core::Error::AssetNotFound(id)));
+                }
+            }
+            Ok(kerf_core::proxy::statuses(&inputs))
+        })
+        .await?;
+        json(&statuses)
+    }
+
+    #[tool(
+        description = "Build an asset's preview proxy again from the original: the current one (and any build in \
+                       progress) is dropped first, and a proxy the user had deleted is wanted again. Use it when \
+                       previews of an asset look wrong or stale. Returns where the build starts; poll proxy_status \
+                       for its progress. Not part of your staged proposal — a proxy is a cache, not an edit."
+    )]
+    async fn rebuild_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let (project, app) = (self.project.clone(), self.app.clone());
+        let status =
+            blocking(move || crate::rebuild_proxy_now(&app, &project, id).map_err(|e| McpError::invalid_params(e, None))).await?;
+        json(&status)
+    }
+
+    #[tool(
+        description = "Delete an asset's preview proxy files (at every size) and stop any build of them, freeing \
+                       the disk. Previews decode the original until it is rebuilt (rebuild_proxy), and it is not \
+                       built again by itself on a later open. Returns the bytes freed and the asset's new status."
+    )]
+    async fn delete_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let (project, app) = (self.project.clone(), self.app.clone());
+        let (freed, status) =
+            blocking(move || crate::delete_proxy_now(&app, &project, id).map_err(|e| McpError::invalid_params(e, None))).await?;
+        json(&serde_json::json!({ "bytes_freed": freed, "proxy": status }))
     }
 
     #[tool(
@@ -1390,23 +1505,37 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Analyze an asset (silence + scene detection, EBU R128 loudness, onset/transient detection, tempo/beat estimation, speech-vs-music classification, and speech-to-text transcription) and cache the result. The first call that transcribes downloads a speech model (~148 MB) and inference then runs for a good fraction of the media's duration, so expect this one to be slow; see transcription_status if the transcript comes back empty."
+        description = "Analyze an asset and cache the result: silence, scene changes, EBU R128 loudness, rhythm \
+                       (onsets, tempo/beat grid, speech-vs-music class) and speech-to-text transcript. Pass `steps` to \
+                       run only some of them — the results are merged into what is cached and the other kinds are left \
+                       alone, so run just what the next edit needs. Omit `steps` for the analyses the user has \
+                       switched on in Settings. A cancelled or failed step caches nothing; a step that fails does not \
+                       stop the others (see `failed` and `analysis_status` in the result). Transcribing downloads a \
+                       speech model on first use (~148 MB) and then runs for a good fraction of the media's duration, so \
+                       expect that step to be slow; see transcription_status if the transcript comes back empty. A \
+                       preview proxy that is queued is built first."
     )]
-    async fn analyze_asset(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+    async fn analyze_asset(&self, Parameters(p): Parameters<AnalyzeParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.project.clone();
-        let analysis = blocking(move || {
-            // Resolve under the lock, run the heavy ffmpeg analysis with the lock
-            // released, then re-lock only to cache it — so analysis doesn't freeze
-            // the GUI or stall other tools for its whole (multi-second) duration.
-            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            let analysis = kerf_core::analyze_asset_media(&asset).map_err(core_err)?;
-            lock_agent(&project).set_analysis(&analysis).map_err(core_err)?;
-            Ok(analysis)
+        let steps = crate::parse_steps(p.steps).map_err(|e| McpError::invalid_params(e, None))?;
+        let (project, app) = (self.project.clone(), self.app.clone());
+        let outcome = blocking(move || {
+            // Resolve under the lock, run the heavy ffmpeg analysis with the lock released, then
+            // re-lock only to merge it into the cache (`run_analysis`) — so analysis doesn't
+            // freeze the GUI or stall other tools for its whole (multi-second) duration.
+            crate::run_analysis(&app, &project, id, steps.as_deref(), &|| false).map_err(|e| McpError::internal_error(e, None))
         })
         .await?;
         self.changed();
-        json(&analysis)
+        json(&AnalyzeResult {
+            analysis: outcome.analysis,
+            analysis_status: outcome.status,
+            failed: outcome
+                .failed
+                .into_iter()
+                .map(|(step, reason)| FailedStep { step, reason })
+                .collect(),
+        })
     }
 
     #[tool(
@@ -4107,6 +4236,67 @@ mod tests {
         for name in ["path", "text", "format", "base", "asset_id", "style"] {
             assert!(props.contains_key(name), "{name} is missing from the schema");
         }
+    }
+
+    /// `analyze_asset` runs only the steps it is asked for, and an agent that names none gets
+    /// the user's own choice: the schema keeps `steps` optional, names every kind, and a bad name
+    /// is refused before anything runs. The proxy tools an agent steers a cache with exist.
+    #[test]
+    fn analyze_asset_takes_optional_steps_and_the_proxy_tools_are_registered() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let analyze = tool("analyze_asset");
+        let required: Vec<&str> = analyze
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(required, ["asset_id"], "`steps` must stay optional");
+        let schema = serde_json::to_string(&*analyze.input_schema).unwrap();
+        for kind in ["silence", "scenes", "loudness", "rhythm", "transcript", "all"] {
+            assert!(schema.contains(kind), "`steps` does not name `{kind}`: {schema}");
+        }
+        for name in ["proxy_status", "rebuild_proxy", "delete_proxy"] {
+            let tool = tool(name);
+            assert!(!tool.description.as_deref().unwrap_or_default().is_empty(), "{name}");
+        }
+        let status_required = tool("proxy_status")
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.len());
+        assert!(
+            status_required.is_none_or(|n| n == 0),
+            "proxy_status takes no required argument"
+        );
+        assert!(tool("get_asset_metadata")
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("analysis_status"));
+
+        // The names an agent sends are parsed the way the tool parses them.
+        let parsed = crate::parse_steps(Some(vec!["transcript".into(), "silence".into()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed,
+            [kerf_core::AnalysisKind::Silence, kerf_core::AnalysisKind::Transcript]
+        );
+        assert!(crate::parse_steps(None).unwrap().is_none(), "no steps means the default set");
+        assert!(crate::parse_steps(Some(vec!["colour".into()]))
+            .unwrap_err()
+            .contains("colour"));
+        assert!(
+            crate::parse_steps(Some(Vec::new())).is_err(),
+            "an empty list is a mistake, not a no-op"
+        );
     }
 
     /// Every tool the agent can call must reach it with a description and an
