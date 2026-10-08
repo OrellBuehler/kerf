@@ -96,6 +96,9 @@ function fakeDock(failing = false) {
 			handlers.push(h);
 			return { dispose() {} };
 		},
+		onDidPopoutGroupPositionChange: () => ({ dispose() {} }),
+		onDidPopoutGroupSizeChange: () => ({ dispose() {} }),
+		popoutRestorationPromise: Promise.resolve() as Promise<void>,
 		/** What dockview does after most things: report a change. */
 		changed() {
 			handlers.forEach((h) => h());
@@ -251,5 +254,135 @@ describe('Reset all workspaces', () => {
 		expect(toasts).toEqual([['success', 'All workspaces reset to their default arrangements']]);
 		jest.advanceTimersByTime(2000);
 		expect(fakeSettings.workspaces.layouts).toEqual({});
+	});
+});
+
+// ---- detached windows ---------------------------------------------------------
+
+/** The Edit preset with its inspector group in a window, as dockview writes it. */
+function detached(): any {
+	const l = clone(PRESET_LAYOUTS.edit);
+	const visit = (n: any): any => (n.type === 'leaf' ? (n.data.id === 'inspector' ? n : undefined) : n.data.map(visit).find(Boolean));
+	const leaf = visit(l.grid.root);
+	const views = leaf.data.views;
+	leaf.data.views = [];
+	delete leaf.data.activeView;
+	leaf.visible = false;
+	l.popoutGroups = [
+		{ data: { id: 'win-1', views, activeView: views[0] }, gridReferenceGroup: 'inspector', position: { left: 2400, top: 90, width: 640, height: 700 }, url: '/popout.html' }
+	];
+	return l;
+}
+
+const flush = async () => {
+	for (let i = 0; i < 6; i++) await Promise.resolve();
+};
+
+describe('a workspace with a panel in a window of its own', () => {
+	test('announces its windows, in order, and builds the dock once that is done', async () => {
+		const { popout } = await import('./popout.svelte');
+		let release!: () => void;
+		const announce = spyOn(popout, 'announce').mockImplementation(() => new Promise<void>((done) => (release = done)));
+		const settle = spyOn(popout, 'settle').mockImplementation(() => {});
+		try {
+			const { dock } = await boot(withLayout(defaultWorkspaces(), 'edit', detached()));
+			expect(announce).toHaveBeenCalledTimes(1);
+			expect(announce.mock.calls[0][0]).toEqual([{ left: 2400, top: 90, width: 640, height: 700 }]);
+			expect(dock.fromJSONCalls).toHaveLength(0);
+			await flush();
+			expect(dock.fromJSONCalls).toHaveLength(0);
+			release();
+			await flush();
+			expect(dock.fromJSONCalls).toHaveLength(1);
+			expect(dock.fromJSONCalls[0].popoutGroups).toHaveLength(1);
+			// The windows are up: what was announced and not taken is let go.
+			await flush();
+			expect(settle).toHaveBeenCalled();
+		} finally {
+			announce.mockRestore();
+			settle.mockRestore();
+		}
+	});
+
+	test('a workspace without windows is built at once, with nothing announced', async () => {
+		const { popout } = await import('./popout.svelte');
+		const announce = spyOn(popout, 'announce').mockResolvedValue();
+		try {
+			const { dock } = await boot(defaultWorkspaces());
+			expect(announce).not.toHaveBeenCalled();
+			expect(dock.fromJSONCalls).toHaveLength(1);
+		} finally {
+			announce.mockRestore();
+		}
+	});
+
+	test('writes nothing while its windows are still opening, and the arrangement once they are up', async () => {
+		const { popout } = await import('./popout.svelte');
+		const announce = spyOn(popout, 'announce').mockResolvedValue();
+		const settle = spyOn(popout, 'settle').mockImplementation(() => {});
+		try {
+			let up!: () => void;
+			const { dock } = await boot(withLayout(defaultWorkspaces(), 'edit', detached()));
+			dock.popoutRestorationPromise = new Promise<void>((done) => (up = done));
+			await flush();
+			// dockview reports each window opening as a layout change; none is the user's.
+			dock.changed();
+			jest.advanceTimersByTime(2000);
+			expect(fakeSettings.writes).toBe(0);
+			up();
+			await flush();
+			jest.advanceTimersByTime(100);
+			dock.drag();
+			jest.advanceTimersByTime(600);
+			expect(fakeSettings.workspaces.layouts.edit?.popoutGroups).toHaveLength(1);
+		} finally {
+			announce.mockRestore();
+			settle.mockRestore();
+		}
+	});
+
+	test('a window that never loads does not keep the dock from saving for good', async () => {
+		const { popout } = await import('./popout.svelte');
+		const announce = spyOn(popout, 'announce').mockResolvedValue();
+		const settle = spyOn(popout, 'settle').mockImplementation(() => {});
+		try {
+			const { dock } = await boot(withLayout(defaultWorkspaces(), 'edit', detached()));
+			await flush();
+			dock.popoutRestorationPromise = new Promise<void>(() => {});
+			// (the dock above was built with the resolved promise; give the next restore a hung one)
+			const { workspace } = await import('./workspace.svelte');
+			workspace.switchTo('color');
+			workspace.switchTo('edit');
+			await flush();
+			jest.advanceTimersByTime(9000);
+			await flush();
+			jest.advanceTimersByTime(100);
+			dock.drag();
+			jest.advanceTimersByTime(600);
+			expect(fakeSettings.writes).toBeGreaterThan(0);
+		} finally {
+			announce.mockRestore();
+			settle.mockRestore();
+		}
+	});
+
+	test('choosing another workspace before the windows are announced builds only that one', async () => {
+		const { popout } = await import('./popout.svelte');
+		let release!: () => void;
+		const announce = spyOn(popout, 'announce').mockImplementation(() => new Promise<void>((done) => (release = done)));
+		try {
+			const state = withLayout(withLayout(defaultWorkspaces(), 'edit', detached()), 'color', arranged('color'));
+			const { workspace, dock } = await boot(state);
+			workspace.switchTo('color');
+			expect(dock.fromJSONCalls).toHaveLength(1);
+			expect(sameArrangement(dock.current, arranged('color'))).toBe(true);
+			release();
+			await flush();
+			// The overtaken restore did nothing.
+			expect(dock.fromJSONCalls).toHaveLength(1);
+			expect(sameArrangement(dock.current, arranged('color'))).toBe(true);
+		} finally {
+			announce.mockRestore();
+		}
 	});
 });

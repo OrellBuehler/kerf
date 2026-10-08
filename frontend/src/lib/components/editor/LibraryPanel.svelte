@@ -92,6 +92,8 @@
 	/** The group to the right of this one, side by side with it — the one the
 	 *  width this group gives up (or takes) should come from (or go to). */
 	function neighbour() {
+		// A library in a window of its own has no row beside it to hand width to.
+		if (panelApi?.group.api.location.type === 'popout') return null;
 		const box = panelApi?.group.api.boundingBox;
 		if (!box || !dock) return null;
 		for (const g of dock.groups) {
@@ -153,14 +155,21 @@
 		if (!panelApi) return;
 		const subs: Array<{ dispose(): void }> = [];
 		let watching: unknown = null;
+		// A window of its own is its own width to fill: the rail cannot fold there, and a
+		// workspace that remembers it folded must not show a 40 px rail in a big window.
+		const alone = (group: DockviewPanelApi['group']) => group.panels.length <= 1 && group.api.location.type !== 'popout';
 		const watch = () => {
 			const group = panelApi.group;
-			solo = group.panels.length <= 1;
+			solo = alone(group);
 			if (watching === group) return;
 			watching = group;
 			for (const s of subs.splice(0)) s.dispose();
-			const recount = () => (solo = group.panels.length <= 1);
-			subs.push(group.model.onDidAddPanel(recount), group.model.onDidRemovePanel(recount));
+			const recount = () => (solo = alone(group));
+			subs.push(
+				group.model.onDidAddPanel(recount),
+				group.model.onDidRemovePanel(recount),
+				group.api.onDidLocationChange(recount)
+			);
 		};
 		watch();
 		subs.push(panelApi.onDidGroupChange(() => watch()));

@@ -21,7 +21,9 @@ export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' |
 export type MenuCommand =
 	| { type: 'delivery'; preset: string }
 	| { type: 'height'; preset: HeightPreset }
-	| { type: 'panel'; panel: PanelId };
+	| { type: 'panel'; panel: PanelId }
+	/** Move a panel into a window of its own, or give it back. */
+	| { type: 'detach'; panel: PanelId };
 
 /** How an entry is announced and drawn: a plain item, a tickable one, or one of a
  *  group of which exactly one is ticked. */
@@ -71,6 +73,8 @@ export interface MenuState {
 	allHeight: HeightPreset | null;
 	workspace: WorkspaceId;
 	openPanels: readonly PanelId[];
+	/** The panels that are in a window of their own. */
+	detachedPanels: readonly PanelId[];
 	/** The desktop app: some commands have nothing to act on in a browser. */
 	desktop: boolean;
 }
@@ -262,6 +266,28 @@ export function buildMenus(s: MenuState): MenuDef[] {
 					checked: s.openPanels.includes(id)
 				})
 			),
+			sep,
+			{
+				kind: 'submenu',
+				label: 'Panel windows',
+				icon: 'external-link',
+				items: [
+					...PANEL_IDS.map(
+						(id): MenuEntry => ({
+							kind: 'command',
+							command: { type: 'detach', panel: id },
+							label: PANELS[id].title,
+							role: 'check',
+							checked: s.detachedPanels.includes(id),
+							...(s.openPanels.includes(id) ? {} : { disabled: true, reason: 'Open the panel first' })
+						})
+					),
+					sep,
+					act('window.dockAll', {
+						...(s.detachedPanels.length === 0 ? { disabled: true, reason: 'No panel is in a window of its own' } : {})
+					})
+				]
+			},
 			sep,
 			act('window.resetWorkspace', { icon: 'rotate-ccw', label: `Reset ${label} workspace` }),
 			act('window.resetAllWorkspaces', { label: 'Reset all workspaces' })

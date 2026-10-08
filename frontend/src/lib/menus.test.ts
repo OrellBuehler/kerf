@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ACTIONS, actionDef } from './keymap';
-import { PANEL_IDS } from './layout';
+import { PANEL_IDS, type PanelId } from './layout';
 import { WORKSPACE_IDS } from './workspaces';
 import { DELIVERY_PRESETS } from './delivery-formats';
 import { buildMenus, collapseMenus, entryLabel, flatten, focusable, stepFocus, typeahead, type MenuEntry, type MenuState } from './menus';
@@ -24,6 +24,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	allHeight: 'medium',
 	workspace: 'edit',
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
+	detachedPanels: [],
 	desktop: true,
 	...over
 });
@@ -258,6 +259,31 @@ describe('Window', () => {
 		expect(panels.map((p) => (p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
 		expect(panels.every((p) => p.role === 'check')).toBe(true);
 		expect(panels.filter((p) => p.checked).map((p) => p.label)).toEqual(['Preview', 'Timeline', 'Mixer']);
+	});
+
+	test('panels can go to windows of their own: one entry each, ticked while it is in one', () => {
+		const m = menu('window', { openPanels: ['preview', 'timeline', 'inspector'], detachedPanels: ['inspector'] });
+		const sub = m.items.find((e) => e.kind === 'submenu' && e.label === 'Panel windows') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect(sub).toBeTruthy();
+		const entries = sub.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
+		expect(entries.map((e) => (e.command.type === 'detach' ? e.command.panel : null))).toEqual([...PANEL_IDS]);
+		expect(entries.every((e) => e.role === 'check')).toBe(true);
+		expect(entries.filter((e) => e.checked).map((e) => e.label)).toEqual(['Inspector']);
+		// A panel that is not open has nothing to move, and says so.
+		const closed = entries.find((e) => e.label === 'Mixer')!;
+		expect(closed.disabled).toBe(true);
+		expect(closed.reason).toBeTruthy();
+		expect(entries.find((e) => e.label === 'Timeline')!.disabled).toBeFalsy();
+	});
+
+	test('giving them all back is offered only while some are out', () => {
+		const dockAll = (detachedPanels: PanelId[]) => {
+			const sub = menu('window', { detachedPanels }).items.find((e) => e.kind === 'submenu') as Extract<MenuEntry, { kind: 'submenu' }>;
+			return sub.items.find((e) => e.kind === 'action' && e.id === 'window.dockAll') as Extract<MenuEntry, { kind: 'action' }>;
+		};
+		expect(dockAll([]).disabled).toBe(true);
+		expect(dockAll([]).reason).toBeTruthy();
+		expect(dockAll(['preview']).disabled).toBeFalsy();
 	});
 
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {

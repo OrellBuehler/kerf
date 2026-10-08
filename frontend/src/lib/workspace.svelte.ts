@@ -14,6 +14,7 @@ import type { SerializedDockview } from 'dockview';
 import { layoutFor, shouldPersistLayout, workspaceSpec, type WorkspaceId } from './workspaces';
 import { settings } from './settings.svelte';
 import { toast } from './notifications.svelte';
+import { popout } from './popout.svelte';
 
 /** Where a panel opens when it is brought back from the Window menu: the
  *  library on the preview's left and the deliver panel and the mixer on its
@@ -23,6 +24,11 @@ const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'l
 
 /** How long after the last layout change the arrangement is written. */
 const SAVE_DELAY_MS = 500;
+
+/** The longest a restored workspace waits for its detached windows to open before it
+ *  takes the layout as it is. A window that never loads would otherwise leave the dock
+ *  unable to save anything. */
+const POPOUT_RESTORE_MS = 8000;
 
 /** How long the window must hold still before a resize counts as over. Dockview
  *  re-lays the grid out a frame after each size it is given, so this is a few
@@ -51,6 +57,9 @@ class WorkspaceState {
 	 *  workspace merely visited as customised. */
 	#reference: SerializedDockview | null = null;
 	#settle = 0;
+	/** Counts restores that wait on windows, so a restore that was overtaken (another
+	 *  workspace was chosen meanwhile) does nothing when its windows are announced. */
+	#restoreToken = 0;
 	#resizing = false;
 	#resizeTimer: ReturnType<typeof setTimeout> | null = null;
 	#subs: Array<{ dispose(): void }> = [];
@@ -65,14 +74,19 @@ class WorkspaceState {
 		this.#restore(this.active);
 		const sync = () => (this.open = api.panels.map((p) => p.id as PanelId));
 		sync();
+		const changed = () => {
+			if (this.#restoring || !this.#reference) return;
+			if (this.#timer) clearTimeout(this.#timer);
+			this.#timer = setTimeout(() => this.#save(), SAVE_DELAY_MS);
+		};
 		this.#subs.push(
 			api.onDidAddPanel(sync),
 			api.onDidRemovePanel(sync),
-			api.onDidLayoutChange(() => {
-				if (this.#restoring || !this.#reference) return;
-				if (this.#timer) clearTimeout(this.#timer);
-				this.#timer = setTimeout(() => this.#save(), SAVE_DELAY_MS);
-			}),
+			api.onDidLayoutChange(changed),
+			// A window the user moved or resized is no layout change to dockview, but it is
+			// where the window will open next time.
+			api.onDidPopoutGroupPositionChange(changed),
+			api.onDidPopoutGroupSizeChange(changed),
 			this.#watchResize(host)
 		);
 	}
@@ -120,6 +134,7 @@ class WorkspaceState {
 	}
 
 	detach() {
+		this.#restoreToken++;
 		this.#flush();
 		for (const s of this.#subs.splice(0)) s.dispose();
 		this.#api = null;
@@ -136,14 +151,38 @@ class WorkspaceState {
 
 	/** Build `id`'s layout — the user's arrangement or its preset. A layout
 	 *  dockview rejects falls back to the preset, and then the dock is still
-	 *  something the editor can be used in. */
+	 *  something the editor can be used in.
+	 *
+	 *  A layout with detached panels in it opens a window for each. The desktop app
+	 *  only answers a `window.open` that was announced (`popout.rs`), and dockview
+	 *  restores a window from a timer with nothing to say which one it is for, so the
+	 *  windows are announced first, in order, and the dock built once that is done. */
 	#restore(id: WorkspaceId) {
 		const api = this.#api;
 		if (!api) return;
+		const token = ++this.#restoreToken;
+		const layout = layoutFor(settings.workspaces, id);
+		const boxes = (layout.popoutGroups ?? []).map((p) => p.position);
+		if (boxes.length === 0) {
+			this.#restoreNow(id, layout);
+			return;
+		}
+		// Nothing is saved while this is pending: the layout events are not the user's.
+		this.#restoring = true;
+		void popout.announce(boxes).then(() => {
+			if (token !== this.#restoreToken || this.#api !== api) return;
+			this.#restoreNow(id, layout);
+		});
+	}
+
+	#restoreNow(id: WorkspaceId, layout: SerializedDockview) {
+		const api = this.#api;
+		if (!api) return;
+		const withWindows = (layout.popoutGroups?.length ?? 0) > 0;
 		this.#restoring = true;
 		try {
 			try {
-				api.fromJSON(layoutFor(settings.workspaces, id));
+				api.fromJSON(layout);
 			} catch (e) {
 				console.error('could not restore the layout', e);
 				try {
@@ -166,7 +205,20 @@ class WorkspaceState {
 			this.#restoring = false;
 		}
 		this.open = api.panels.map((p) => p.id as PanelId);
-		this.#takeReference();
+		if (!withWindows) {
+			this.#takeReference();
+			return;
+		}
+		// Its windows open from timers, after this returns, each as a layout change that
+		// is no rearrangement. The baseline is the layout once they are all up.
+		this.#reference = null;
+		const settle = ++this.#settle;
+		const token = this.#restoreToken;
+		const up = Promise.race([api.popoutRestorationPromise, new Promise<void>((done) => setTimeout(done, POPOUT_RESTORE_MS))]);
+		void up.then(() => {
+			popout.settle();
+			if (token === this.#restoreToken && settle === this.#settle && this.#api === api) this.#takeReference();
+		});
 	}
 
 	/** Wait for the layout to stop moving, then call it the baseline. The panels
@@ -245,6 +297,8 @@ class WorkspaceState {
 		const existing = api.getPanel(id);
 		if (existing) {
 			existing.api.setActive();
+			// A panel in a window of its own is brought to the front of the screen too.
+			if (popout.isDetached(id)) popout.reveal(id);
 			return;
 		}
 		const spec = PANELS[id];

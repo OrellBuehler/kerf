@@ -13,8 +13,10 @@
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
-	import type { PanelId } from '$lib/layout';
+	import ContextMenu from './ContextMenu.svelte';
+	import { POPOUT_URL, isPanelId, type PanelId } from '$lib/layout';
 	import { workspace } from '$lib/workspace.svelte';
+	import { popout } from '$lib/popout.svelte';
 
 	const COMPONENTS: Record<PanelId, Component<any>> = {
 		library: LibraryPanel,
@@ -27,6 +29,20 @@
 	};
 
 	let el = $state<HTMLDivElement | null>(null);
+
+	/** A detached window needs a context menu of its own: it is drawn in the document of
+	 *  the window that was clicked, and a Svelte root registers its delegated event
+	 *  handlers on its own container, so the menu is mounted in the window's body rather
+	 *  than reached from the editor's. */
+	function menuIn(win: Window): () => void {
+		const host = win.document.createElement('div');
+		win.document.body.appendChild(host);
+		const menu = mount(ContextMenu, { target: host, props: { win } });
+		return () => {
+			void unmount(menu);
+			host.remove();
+		};
+	}
 
 	function createComponent(o: CreateComponentOptions): IContentRenderer {
 		const element = document.createElement('div');
@@ -65,11 +81,29 @@
 			createComponent,
 			createWatermarkComponent,
 			theme: { name: 'kerf', className: 'dockview-theme-kerf' },
-			disableFloatingGroups: true
+			disableFloatingGroups: true,
+			// What a panel moved into a window of its own opens at (`static/popout.html`).
+			popoutUrl: POPOUT_URL,
+			// The tab's right-click menu: the way to a window of its own and back.
+			getTabContextMenuItems: ({ panel }) => {
+				const id = panel.id;
+				if (!isPanelId(id)) return [];
+				if (popout.isDetached(id)) {
+					return [{ label: 'Return to the editor window', action: () => popout.dockBack(id) }, 'separator', 'close'];
+				}
+				return [
+					{ label: 'Move to new window', disabled: popout.blocked(id) !== null, action: () => void popout.popOut(id) },
+					'separator',
+					'close'
+				];
+			}
 		});
+		// Before the workspace is restored: a saved layout may hold windows to open.
+		popout.attach(api, { window: menuIn });
 		workspace.attach(api, el!);
 		return () => {
 			workspace.detach();
+			popout.detach();
 			api.dispose();
 		};
 	});
