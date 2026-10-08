@@ -7,7 +7,13 @@
 // truncated file must fall back to the preset rather than leave the editor
 // without a timeline.
 
-import type { GroupviewPanelState, Orientation, SerializedDockview } from 'dockview';
+import type { GroupviewPanelState, Orientation, SerializedDockview, SerializedPopoutGroup } from 'dockview';
+
+/** The page a detached panel's window opens at (`frontend/static/popout.html`). */
+export const POPOUT_URL = '/popout.html';
+/** How many windows a stored layout may hold: one per panel there is, none of them
+ *  a reason to trust a hand-edited file to be reasonable. */
+export const MAX_POPOUTS = 7;
 
 export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
@@ -224,9 +230,18 @@ function walk(node: unknown, w: Walk): Node[] | null {
 	const hidden = node.visible === false;
 	if (node.type === 'leaf') {
 		const d = node.data;
-		if (!isObj(d) || typeof d.id !== 'string' || !Array.isArray(d.views) || d.views.length === 0) return null;
+		if (!isObj(d) || typeof d.id !== 'string' || !Array.isArray(d.views)) return null;
+		if (d.views.length === 0 && !hidden) return null;
 		if (w.groups.has(d.id)) return null;
 		w.groups.add(d.id);
+		// What a group that was popped out into a window leaves behind in the grid: empty
+		// and hidden, holding the place its panels return to. Kept for now; it is dropped
+		// below unless a stored window still points at it.
+		if (d.views.length === 0) {
+			const empty: Leaf = { type: 'leaf', data: { id: d.id, views: [] }, visible: false };
+			if (s !== undefined) empty.size = s;
+			return [empty];
+		}
 		const views: string[] = [];
 		let activeView: string | undefined;
 		for (const v of d.views) {
@@ -282,36 +297,20 @@ function groupIds(nodes: Node[], out: Set<string>) {
 	}
 }
 
-/** A stored layout, or `null` when it cannot be trusted. Titles and minimum
- *  sizes are always taken from `PANELS`, so a rename or a retuned minimum
- *  reaches layouts saved before it. Floating and popout groups are dropped:
- *  the workspace does not enable them. A layout saved when the media bin and
- *  the transcript were panels of their own is migrated: the first of those two
- *  becomes the library, the other is dropped, and a group (or branch) that
- *  leaves empty goes with it. */
-export function sanitizeLayout(raw: unknown): SerializedDockview | null {
-	if (!isObj(raw) || !isObj(raw.grid) || !isObj(raw.panels)) return null;
-	const grid = raw.grid;
-	const orientation = grid.orientation;
+/** The grid of a layout (the editor window's, or a detached window's own), or `null`
+ *  when it cannot be trusted: the nodes walked, a root left with one branch child
+ *  turned a level, the sizes kept. */
+function sanitizeGrid(raw: unknown, w: Walk): SerializedDockview['grid'] | null {
+	if (!isObj(raw)) return null;
+	const orientation = raw.orientation;
 	if (orientation !== 'HORIZONTAL' && orientation !== 'VERTICAL') return null;
-	const width = size(grid.width);
-	const height = size(grid.height);
+	const width = size(raw.width);
+	const height = size(raw.height);
 	if (!width || !height) return null;
-	if (!isObj(grid.root)) return null;
-
-	const stored: string[] = [];
-	viewIds(grid.root, stored);
-	const w: Walk = {
-		stored: new Set(),
-		views: new Map(),
-		groups: new Set(),
-		hasLibrary: stored.includes('library'),
-		libraryTaken: false
-	};
+	if (!isObj(raw.root)) return null;
 	// The root is always a branch; a lone group is wrapped in one.
-	let kids = grid.root.type === 'branch' ? walkKids(grid.root, w) : walk(grid.root, w);
-	if (!kids || kids.length === 0 || w.views.size === 0) return null;
-
+	let kids = raw.root.type === 'branch' ? walkKids(raw.root, w) : walk(raw.root, w);
+	if (!kids || kids.length === 0) return null;
 	// A root left with a single branch child is that branch, one axis over.
 	let axis = orientation as Orientation;
 	while (kids.length === 1 && kids[0].type === 'branch') {
@@ -319,8 +318,135 @@ export function sanitizeLayout(raw: unknown): SerializedDockview | null {
 		axis = axis === VERTICAL ? HORIZONTAL : VERTICAL;
 	}
 	const root: Branch = { type: 'branch', data: kids };
-	const rootSize = size(grid.root.size);
+	const rootSize = size(raw.root.size);
 	if (rootSize !== undefined) root.size = rootSize;
+	return { root, width, height, orientation: axis };
+}
+
+/** `nodes` without the empty (hidden) groups `keep` does not name. A branch left
+ *  with nothing goes, one left with a single child is that child — `walk`'s rules. */
+function pruneEmpty(nodes: Node[], keep: ReadonlySet<string>): Node[] {
+	const out: Node[] = [];
+	for (const n of nodes) {
+		if (n.type === 'leaf') {
+			if (n.data.views.length > 0 || keep.has(n.data.id)) out.push(n);
+			continue;
+		}
+		const kids = pruneEmpty(n.data, keep);
+		if (kids.length === 0) continue;
+		if (kids.length === 1) {
+			const only = kids[0];
+			if (only.type === 'branch') out.push(...only.data);
+			else out.push(n.size !== undefined ? { ...only, size: n.size } : only);
+			continue;
+		}
+		out.push({ ...n, data: kids });
+	}
+	return out;
+}
+
+/** The popped-out groups of a stored layout that can be trusted. dockview writes a
+ *  window as `data` (one group) or `grid` (a nested layout, once the user has split the
+ *  window); both are read, through the same walk as the editor's own grid, so a panel
+ *  is still shown once and a group id is still unique. The page is always the popout
+ *  page — a stored URL is never opened — and a reference group the editor window no
+ *  longer has is dropped (dockview then re-docks at the root). */
+function sanitizePopouts(raw: unknown, w: Walk): SerializedPopoutGroup[] {
+	if (!Array.isArray(raw)) return [];
+	const out: SerializedPopoutGroup[] = [];
+	for (const p of raw.slice(0, MAX_POPOUTS)) {
+		if (!isObj(p)) continue;
+		const popout: SerializedPopoutGroup = { url: POPOUT_URL, position: sanitizeBox(p.position) };
+		// A window that does not read cleanly costs that window, not the layout: what was
+		// walked of it is undone so its panels are free for the grid's to claim.
+		const seen = snapshot(w);
+		if (isObj(p.grid)) {
+			const grid = sanitizeGrid(p.grid, w);
+			if (!grid) {
+				restore(w, seen);
+				continue;
+			}
+			popout.grid = grid as NonNullable<SerializedPopoutGroup['grid']>;
+		} else if (isObj(p.data)) {
+			const nodes = walk({ type: 'leaf', data: p.data }, w);
+			const only = nodes?.[0];
+			if (!nodes || nodes.length !== 1 || only?.type !== 'leaf' || only.data.views.length === 0) {
+				restore(w, seen);
+				continue;
+			}
+			popout.data = only.data;
+		} else {
+			continue;
+		}
+		if (typeof p.gridReferenceGroup === 'string') popout.gridReferenceGroup = p.gridReferenceGroup;
+		out.push(popout);
+	}
+	return out;
+}
+
+/** A window's place: finite numbers, a size that is a size. `null` (the platform's
+ *  choice) for anything else. */
+function sanitizeBox(raw: unknown): SerializedPopoutGroup['position'] {
+	if (!isObj(raw)) return null;
+	const { left, top, width, height } = raw;
+	if (![left, top, width, height].every((v) => typeof v === 'number' && Number.isFinite(v))) return null;
+	if ((width as number) < 1 || (height as number) < 1) return null;
+	return { left: left as number, top: top as number, width: width as number, height: height as number };
+}
+
+function snapshot(w: Walk): Walk {
+	return { ...w, stored: new Set(w.stored), views: new Map(w.views), groups: new Set(w.groups) };
+}
+
+function restore(w: Walk, from: Walk) {
+	w.stored = from.stored;
+	w.views = from.views;
+	w.groups = from.groups;
+	w.libraryTaken = from.libraryTaken;
+}
+
+/** A stored layout, or `null` when it cannot be trusted. Titles and minimum
+ *  sizes are always taken from `PANELS`, so a rename or a retuned minimum
+ *  reaches layouts saved before it. Floating groups are dropped (the workspace
+ *  does not enable them); **popped-out groups are kept** — panels the user moved
+ *  into windows of their own — if each reads cleanly, at most `MAX_POPOUTS` of
+ *  them, and the editor window keeps a panel of its own. A layout saved when the
+ *  media bin and the transcript were panels of their own is migrated: the first
+ *  of those two becomes the library, the other is dropped, and a group (or
+ *  branch) that leaves empty goes with it. */
+export function sanitizeLayout(raw: unknown): SerializedDockview | null {
+	if (!isObj(raw) || !isObj(raw.grid) || !isObj(raw.panels)) return null;
+	const stored: string[] = [];
+	viewIds(raw.grid.root, stored);
+	for (const p of Array.isArray(raw.popoutGroups) ? raw.popoutGroups : []) {
+		if (!isObj(p)) continue;
+		if (isObj(p.data)) viewIds({ type: 'leaf', data: p.data }, stored);
+		if (isObj(p.grid)) viewIds(p.grid.root, stored);
+	}
+	const w: Walk = {
+		stored: new Set(),
+		views: new Map(),
+		groups: new Set(),
+		hasLibrary: stored.includes('library'),
+		libraryTaken: false
+	};
+	const grid = sanitizeGrid(raw.grid, w);
+	if (!grid) return null;
+	const popouts = sanitizePopouts(raw.popoutGroups, w);
+	// The empty groups kept for a window to come back to are kept only for one that
+	// survived; the rest are noise.
+	const keep = new Set(popouts.flatMap((p) => (p.gridReferenceGroup ? [p.gridReferenceGroup] : [])));
+	const rootKids = pruneEmpty((grid.root as Branch).data, keep);
+	if (rootKids.length === 0 || !hasShownPanel(rootKids)) return null;
+	let kids = rootKids;
+	let axis = grid.orientation as Orientation;
+	while (kids.length === 1 && kids[0].type === 'branch') {
+		kids = kids[0].data;
+		axis = axis === VERTICAL ? HORIZONTAL : VERTICAL;
+	}
+	const root: Branch = { type: 'branch', data: kids };
+	if ((grid.root as Branch).size !== undefined) root.size = (grid.root as Branch).size;
+	if (w.views.size === 0) return null;
 
 	const panels: Record<string, GroupviewPanelState> = {};
 	for (const [id, from] of w.views) {
@@ -329,11 +455,25 @@ export function sanitizeLayout(raw: unknown): SerializedDockview | null {
 		if (!isObj(p) || p.contentComponent !== from) return null;
 		panels[id] = panelState(id);
 	}
-	const layout: SerializedDockview = { grid: { root, width, height, orientation: axis }, panels };
+	const layout: SerializedDockview = { grid: { root, width: grid.width, height: grid.height, orientation: axis }, panels };
 	const groups = new Set<string>();
 	groupIds(kids, groups);
+	// A reference group that is not in the grid any more is not pointed at.
+	if (popouts.length > 0) {
+		layout.popoutGroups = popouts.map((p) => (p.gridReferenceGroup && !groups.has(p.gridReferenceGroup) ? omitReference(p) : p));
+	}
 	if (typeof raw.activeGroup === 'string' && groups.has(raw.activeGroup)) layout.activeGroup = raw.activeGroup;
 	return layout;
+}
+
+function omitReference(p: SerializedPopoutGroup): SerializedPopoutGroup {
+	const { gridReferenceGroup: _ignored, ...rest } = p;
+	return rest;
+}
+
+/** Whether the editor window holds a panel at all. */
+function hasShownPanel(nodes: Node[]): boolean {
+	return nodes.some((n) => (n.type === 'leaf' ? n.data.views.length > 0 : hasShownPanel(n.data)));
 }
 
 // ---- comparing arrangements ------------------------------------------------
@@ -381,7 +521,40 @@ export function sameArrangement(
 	b: SerializedDockview,
 	tolerance = ARRANGEMENT_TOLERANCE
 ): boolean {
-	return a.grid.orientation === b.grid.orientation && sameNode(a.grid.root, b.grid.root, tolerance);
+	return (
+		a.grid.orientation === b.grid.orientation &&
+		sameNode(a.grid.root, b.grid.root, tolerance) &&
+		samePopouts(a.popoutGroups ?? [], b.popoutGroups ?? [])
+	);
+}
+
+/** How far a window may have moved or been resized, in pixels, and still be where it
+ *  was: the platform nudges a window by a title bar or a shadow when it places one. A
+ *  window the user took hold of moves further than this. */
+export const WINDOW_TOLERANCE_PX = 12;
+
+/** The panels a detached window shows, in order, whichever way it was written. */
+export function popoutViews(p: SerializedPopoutGroup): string[] {
+	if (p.data) return [...p.data.views];
+	const out: string[] = [];
+	if (p.grid) viewIds(p.grid.root, out);
+	return out;
+}
+
+/** Whether two sets of detached windows are the same: the same panels in each, in the
+ *  same order, each window where it was (within `WINDOW_TOLERANCE_PX`) and returning
+ *  to the same group. */
+function samePopouts(a: readonly SerializedPopoutGroup[], b: readonly SerializedPopoutGroup[]): boolean {
+	if (a.length !== b.length) return false;
+	return a.every((x, i) => {
+		const y = b[i];
+		const xv = popoutViews(x);
+		const yv = popoutViews(y);
+		if (xv.length !== yv.length || !xv.every((v, k) => v === yv[k])) return false;
+		if (x.gridReferenceGroup !== y.gridReferenceGroup) return false;
+		if (!x.position || !y.position) return !x.position && !y.position;
+		return (['left', 'top', 'width', 'height'] as const).every((k) => Math.abs(x.position![k] - y.position![k]) <= WINDOW_TOLERANCE_PX);
+	});
 }
 
 /** The panels a layout shows. */
