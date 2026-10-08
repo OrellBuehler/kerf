@@ -366,6 +366,97 @@ fn special_cases() -> Vec<Case> {
         }
     }
 
+    // Reattach several: one revision for the lot, all or nothing, a pair named by both its clips counted once.
+    {
+        let mut ids = Ids::new();
+        let (mut p1, mut p2) = (ids.clip(AV, 0.0, 10.0, 0.0), ids.clip(AV, 20.0, 26.0, 10.0));
+        p1.source_audio = false;
+        p2.source_audio = false;
+        let (mut s1, mut s2) = (p1.clone(), p2.clone());
+        (s1.id, s2.id) = (ids.id(), ids.id());
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![p1.clone(), p2.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![s1.clone(), s2.clone()]),
+        ]);
+        link(&mut t, &mut ids, &[p1.id, s1.id]);
+        link(&mut t, &mut ids, &[p2.id, s2.id]);
+        out.push(case(
+            "reattach several is one revision and counts a pair named twice once",
+            t.clone(),
+            json!({"kind": "reattach_audio_clips", "clip_ids": [s2.id, p2.id, p1.id]}),
+        ));
+        let mut unlinked = t.clone();
+        for c in unlinked.tracks.iter_mut().flat_map(|tr| tr.clips.iter_mut()) {
+            if c.id == p2.id || c.id == s2.id {
+                c.link_id = None;
+            }
+        }
+        out.push(case(
+            "reattach several is all or nothing: one pair that would double refuses the lot",
+            unlinked,
+            json!({"kind": "reattach_audio_clips", "clip_ids": [p1.id, p2.id]}),
+        ));
+        out.push(case(
+            "reattach several on an empty list is an error",
+            t.clone(),
+            json!({"kind": "reattach_audio_clips", "clip_ids": []}),
+        ));
+        let mut locked = t;
+        locked.tracks[1].locked = true;
+        out.push(case(
+            "reattach several refuses a locked sound track",
+            locked,
+            json!({"kind": "reattach_audio_clips", "clip_ids": [p1.id]}),
+        ));
+    }
+
+    // A trim carries its edge to the sound; the sound may not land on a clip outside its group, once
+    // the ripple (which can push that clip away) has run.
+    {
+        let mut ids = Ids::new();
+        let mut pic = ids.clip(AV, 0.0, 5.0, 0.0);
+        pic.source_audio = false;
+        let mut snd = pic.clone();
+        snd.id = ids.id();
+        let vo = ids.clip(MUS, 0.0, 3.0, 6.0);
+        let mut t = timeline(vec![
+            lane(StreamKind::Video, "V1", 0, vec![pic.clone()]),
+            lane(StreamKind::Audio, "A1", 1, vec![snd.clone(), vo]),
+        ]);
+        link(&mut t, &mut ids, &[pic.id, snd.id]);
+        for (name, ripple, op) in [
+            (
+                "a trim that extends the sound over an unlinked clip is refused",
+                false,
+                json!({"kind": "trim", "clip_id": pic.id, "source_out": 6.5}),
+            ),
+            (
+                "a move by trim that lands the sound on an unlinked clip is refused",
+                false,
+                json!({"kind": "trim", "clip_id": pic.id, "timeline_start": 1.5}),
+            ),
+            (
+                "a ripple pushes the unlinked clip ahead of the extended sound",
+                true,
+                json!({"kind": "trim", "clip_id": pic.id, "source_out": 6.5}),
+            ),
+            (
+                "a move by trim is refused under ripple too, nothing rippling",
+                true,
+                json!({"kind": "trim", "clip_id": pic.id, "timeline_start": 1.5}),
+            ),
+            (
+                "a trim that stops short of the unlinked clip is carried",
+                false,
+                json!({"kind": "trim", "clip_id": pic.id, "source_out": 5.9}),
+            ),
+        ] {
+            let mut c = case(name, t.clone(), op);
+            c.ripple = ripple;
+            out.push(c);
+        }
+    }
+
     // Paste: a lone muted picture gets its sound back; a muted picture pasted with its sound stays muted.
     {
         let mut ids = Ids::new();
@@ -787,6 +878,9 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
         "detach_audio" => p.detach_audio(uuid_of(&op["clip_id"])).map(|_| Value::Null),
         "detach_audio_clips" => p.detach_audio_clips(&ids_of(&op["clip_ids"])).map(report),
         "reattach_audio" => p.reattach_audio(uuid_of(&op["clip_id"])).map(|_| Value::Null),
+        "reattach_audio_clips" => p
+            .reattach_audio_clips(&ids_of(&op["clip_ids"]))
+            .map(|done| json!({"reattached": done.len()})),
         "extract_audio" => p.extract_audio(uuid_of(&op["asset"])).map(report),
         "add_asset_audio" => p.add_asset_audio(uuid_of(&op["asset"])).map(|_| Value::Null),
         "link_clips" => p.link_clips(&ids_of(&op["clip_ids"])).map(|_| Value::Null),
@@ -982,6 +1076,7 @@ fn the_corpus_covers_the_ops_and_both_outcomes() {
         "detach_audio",
         "detach_audio_clips",
         "reattach_audio",
+        "reattach_audio_clips",
         "extract_audio",
         "add_asset_audio",
         "link_clips",

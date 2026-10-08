@@ -7,7 +7,8 @@
 //
 //   edit                       the partners…
 //   move (withLinkedMoves)     move by the same Δt, on their own tracks
-//   trim (carryExtentEdit)     follow the edge that changed when they share it, clamped to their footage
+//   trim (carryExtentEdit)     follow the edge that changed when they share it, clamped to their footage; one that
+//                              then overlaps a clip outside its group refuses (checkCarriedLanes, after the ripple)
 //   split (splitClipLinked)    are split at the same time (if it is inside them); the pieces on each side link up
 //   remove / ripple delete     are removed too
 //   cut a source span          lose the same stretch of *timeline*; what survives of a partner is put back in step
@@ -43,7 +44,7 @@ import {
 	STEP_EPS,
 	unlockedPartners
 } from './link-groups';
-import { applyShifts, conformLinks, DIFF_EPS, settleLinked, spansOverlap } from './ripple';
+import { applyShifts, conformLinks, DIFF_EPS, runsIntoUnlinked, settleLinked, spansOverlap } from './ripple';
 import type { AudioEffect, Clip, ClipCut, ClipMove, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
@@ -221,6 +222,23 @@ export function soundAlreadyPlaying(timeline: Timeline, picture: Clip, without: 
 		);
 }
 
+/** The picture a reattach of `clipId` means: the clip itself on a video track, else the linked
+ *  picture on one whose sound was detached (`Timeline::detached_picture`). */
+function detachedPicture(timeline: Timeline, clipId: string): string {
+	const at = locateIndex(timeline, clipId);
+	if (!at) throw clipNotFound(clipId);
+	const [ti, ci] = at;
+	if (timeline.tracks[ti].kind === 'video') return clipId;
+	const named = timeline.tracks[ti].clips[ci];
+	const found = linkPartners(timeline, clipId).find((p) => {
+		const c = clipById(timeline, p);
+		const [pt] = locateIndex(timeline, p)!;
+		return !!c && c.source_audio === false && c.asset_id === named.asset_id && timeline.tracks[pt].kind === 'video';
+	});
+	if (!found) throw invalid('no linked picture whose sound was detached');
+	return found;
+}
+
 /**
  * **Reattach** detached sound: the audio clip(s) linked to the picture clip that carry
  * the same asset are deleted and the picture clip plays its own sound again. Name either
@@ -229,20 +247,7 @@ export function soundAlreadyPlaying(timeline: Timeline, picture: Clip, without: 
  * (unmuting would double the sound), which is refused. Returns the picture clip.
  */
 export function reattachAudio(timeline: Timeline, clipId: string): Clip {
-	const at = locateIndex(timeline, clipId);
-	if (!at) throw clipNotFound(clipId);
-	const [ti, ci] = at;
-	const named = timeline.tracks[ti].clips[ci];
-	let pictureId = clipId;
-	if (timeline.tracks[ti].kind !== 'video') {
-		const found = linkPartners(timeline, clipId).find((p) => {
-			const c = clipById(timeline, p);
-			const [pt] = locateIndex(timeline, p)!;
-			return !!c && c.source_audio === false && c.asset_id === named.asset_id && timeline.tracks[pt].kind === 'video';
-		});
-		if (!found) throw invalid('no linked picture whose sound was detached');
-		pictureId = found;
-	}
+	const pictureId = detachedPicture(timeline, clipId);
 	const [vi, vc] = locateIndex(timeline, pictureId)!;
 	const picture = timeline.tracks[vi].clips[vc];
 	if (picture.source_audio !== false) throw invalid("this clip's sound is not detached");
@@ -268,6 +273,35 @@ export function reattachAudio(timeline: Timeline, clipId: string): Clip {
 		if (members === 1) delete picture.link_id;
 	}
 	return structuredClone(picture);
+}
+
+/**
+ * `reattachAudio` on several clips, **all or nothing** (`Timeline::reattach_audio_many`). Each id
+ * names a picture or its sound; a picture named twice is reattached once. Every reattach is judged
+ * against the cut the earlier ones left, so they run on a copy that replaces `timeline` only when
+ * all went through; the first refusal is the error (naming its clip when there are several).
+ * Returns the pictures in the order named.
+ */
+export function reattachAudioMany(timeline: Timeline, ids: readonly string[]): Clip[] {
+	if (ids.length === 0) throw invalid('no clips to reattach');
+	const pictures: string[] = [];
+	for (const id of ids) {
+		const picture = detachedPicture(timeline, id);
+		if (!pictures.includes(picture)) pictures.push(picture);
+	}
+	const scratch = structuredClone(timeline);
+	const out: Clip[] = [];
+	for (const picture of pictures) {
+		try {
+			out.push(reattachAudio(scratch, picture));
+		} catch (e) {
+			if (pictures.length > 1 && e instanceof Error && e.message.startsWith('invalid argument: '))
+				throw invalid(`${e.message.slice('invalid argument: '.length)} (clip ${picture})`);
+			throw e;
+		}
+	}
+	timeline.tracks = scratch.tracks;
+	return out;
 }
 
 // ---- move ------------------------------------------------------------------------
@@ -342,8 +376,9 @@ export function extentEdit(was: Clip, now: Clip, looping: boolean): ExtentEdit |
  * linked partners. A **move** (same length, new start) moves them by the same Δt. A
  * **trim** moves a partner's edge by the same amount *when the partner shares that edge*
  * with the clip as it was (within `ADJACENT_EPS`), clamped to the footage the partner
- * has. It writes no overlap check — like a trim, it leaves what the ripple pass or the
- * user is about to settle. A **sound** carried before 0 loses what hangs off the front
+ * has. It writes no lane check of its own, because the ripple pass may yet make room:
+ * whoever calls it hands the partners it returns to `checkCarriedLanes` once the ripple has
+ * run (`runEdit` does). A **sound** carried before 0 loses what hangs off the front
  * (its track's name is pushed to `notes`); a **picture** is never trimmed to fit and
  * refuses, as does a clip that would be left under `MIN_EDIT_CLIP`. Throws when a partner
  * is on a locked track or would be trimmed away entirely. Returns the partners as they
@@ -412,13 +447,39 @@ export function carryExtentEdit(
 }
 
 /**
+ * The lane check for the partners a trim carried (`Timeline::check_carried_lanes`), run on the
+ * timeline *after* the per-lane ripple and the sync lock, because the ripple is what makes room.
+ * A partner that now overlaps a clip of its lane that is not in its own group, where the two did
+ * not overlap in `before`, refuses the edit — the rule `moveClips` holds a moved partner to (an
+ * overlap that was already there is old news). The named clip's own lane is not looked at.
+ */
+export function checkCarriedLanes(timeline: Timeline, before: Timeline, carried: readonly string[]) {
+	if (carried.length === 0) return;
+	const prior = new Map<string, Clip>();
+	for (const c of before.tracks.flatMap((t) => t.clips)) prior.set(c.id, c);
+	const span = (c: Clip): [number, number] => [c.timeline_start, endOf(c)];
+	for (const track of timeline.tracks) {
+		for (const p of track.clips.filter((c) => carried.includes(c.id))) {
+			for (const q of track.clips) {
+				const sameGroup = !!p.link_id && q.link_id === p.link_id;
+				if (q.id === p.id || sameGroup || !spansOverlap(span(p), span(q))) continue;
+				const [a, b] = [prior.get(p.id), prior.get(q.id)];
+				if (a && b && spansOverlap(span(a), span(b))) continue;
+				throw runsIntoUnlinked(track.name, Math.max(p.timeline_start, q.timeline_start));
+			}
+		}
+	}
+}
+
+/**
  * `carryExtentEdit` for every clip an edit changed, read off a snapshot: a lane-level op
  * (the beat snap) retimes clips without knowing about links, and this carries each one's
  * change to its partners afterwards. A group where more than one member changed is left
- * alone — the edit named them explicitly.
+ * alone — the edit named them explicitly. Returns the partners it carried, for `checkCarriedLanes`.
  */
-export function carryLinksSince(timeline: Timeline, before: Timeline, footage: SourceLimits, notes: string[] = []) {
-	if (!timeline.tracks.some((t) => t.clips.some((c) => c.link_id))) return;
+export function carryLinksSince(timeline: Timeline, before: Timeline, footage: SourceLimits, notes: string[] = []): string[] {
+	const carried: string[] = [];
+	if (!timeline.tracks.some((t) => t.clips.some((c) => c.link_id))) return carried;
 	const changed = (was: Clip, now: Clip) =>
 		Math.abs(was.timeline_start - now.timeline_start) > DIFF_EPS ||
 		Math.abs(was.source_in - now.source_in) > DIFF_EPS ||
@@ -432,8 +493,9 @@ export function carryLinksSince(timeline: Timeline, before: Timeline, footage: S
 	for (const ids of drivers.values()) {
 		if (ids.length !== 1) continue;
 		const was = structuredClone(clipById(before, ids[0])!);
-		carryExtentEdit(timeline, ids[0], was, footage, notes);
+		carried.push(...carryExtentEdit(timeline, ids[0], was, footage, notes).map((p) => p.id));
 	}
+	return carried;
 }
 
 // ---- split -----------------------------------------------------------------------

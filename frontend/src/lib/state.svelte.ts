@@ -69,6 +69,7 @@ import {
 	removeMarker,
 	linkClips,
 	reattachAudio,
+	reattachAudioClips,
 	reorderClip,
 	rippleDelete,
 	cutClipRange,
@@ -1025,6 +1026,10 @@ class EditorState {
 	 *  again. Name either clip of the pair. */
 	reattachAudio(clipId: string) {
 		return this.#apply(reattachAudio(clipId));
+	}
+	/** Reattach several pairs as **one** `Reattach audio (N clips)` revision, all or nothing. */
+	reattachAudioClips(clipIds: string[]) {
+		return this.#apply(reattachAudioClips(clipIds));
 	}
 	/** Link clips (two or more, one per track) so an edit to one is carried to the others. */
 	linkClips(clipIds: string[]) {

@@ -103,26 +103,6 @@ export function selectionLinkPlans(): LinkPlans {
 	return linkPlans(editor.timeline, (id) => audible.has(id), editor.selectedClipIds);
 }
 
-/** Undo `n` revisions — a reattach across several clips is one revision each. */
-async function undoTimes(n: number): Promise<void> {
-	for (let i = 0; i < n; i++) await editor.undo().catch(() => {});
-}
-
-/** Run `one` on each of `ids` in turn, stopping at the first refusal. Resolves to how many
- *  went through; the refusal, when there was one, is toasted here (what was done stays done). */
-async function eachClip(ids: readonly string[], one: (id: string) => Promise<unknown>): Promise<number> {
-	let done = 0;
-	try {
-		for (const id of ids) {
-			await one(id);
-			done++;
-		}
-	} catch (e) {
-		toast.error(errorMessage(e));
-	}
-	return done;
-}
-
 /** **Detach audio** (⇧D, the clip menu): each selected picture clip still playing its own
  *  sound hands it to a linked clip on an audio track and goes quiet, so it is heard once.
  *  One revision for the lot (`detach_audio_clips`); the toast's Undo takes it back. A clip the
@@ -147,16 +127,21 @@ export async function detachSelection(): Promise<void> {
 }
 
 /** **Reattach audio** (⇧⌘D, the clip menu): the linked audio clip goes and the picture
- *  plays its own sound again. */
+ *  plays its own sound again. One revision for the whole selection (`reattach_audio_clips`),
+ *  all or nothing — a refusal changes nothing — and the toast's Undo takes it back. */
 export async function reattachSelection(): Promise<void> {
 	const plan = selectionLinkPlans().reattach;
 	if (plan.reason !== null) {
 		toast.info(plan.reason);
 		return;
 	}
-	const done = await eachClip(plan.ids, (id) => editor.reattachAudio(id));
-	if (done === 0) return;
-	toast(reattachedNotice(done), { action: { label: 'Undo', onClick: () => void undoTimes(done) } });
+	try {
+		await editor.reattachAudioClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(reattachedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }
 
 /** **Link** the selected clips (⌘L, the clip menu): one clip per track, a move / trim / split

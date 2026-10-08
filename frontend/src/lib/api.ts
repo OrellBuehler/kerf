@@ -1918,6 +1918,16 @@ export async function reattachAudio(clipId: string): Promise<Timeline> {
 	return invoke<Timeline>('reattach_audio', { clipId });
 }
 
+/** **Reattach audio** on several pictures as **one** revision, all or nothing: name either
+ *  clip of each pair. Rejects — changing nothing — when any pair cannot be reattached. */
+export async function reattachAudioClips(clipIds: string[]): Promise<Timeline> {
+	if (!inTauri()) {
+		devRun((tl) => ops.reattachClips(tl, devEnv(false, undefined), clipIds));
+		return snapshot();
+	}
+	return invoke<Timeline>('reattach_audio_clips', { clipIds });
+}
+
 /** Link clips (at least two, on different tracks) so an edit to one is carried to the
  *  others. One revision. */
 export async function linkClips(clipIds: string[]): Promise<Timeline> {

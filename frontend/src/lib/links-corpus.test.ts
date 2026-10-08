@@ -87,6 +87,10 @@ function replay(c: Case): Outcome {
 		}
 		case 'reattach_audio':
 			return { ...ops.reattach(tl, e, op.clip_id), report: null };
+		case 'reattach_audio_clips': {
+			const done = ops.reattachClips(tl, e, op.clip_ids);
+			return { ...done, report: { reattached: done.result.length } };
+		}
 		case 'extract_audio': {
 			const done = ops.extractAudio(tl, e, op.asset);
 			return { ...done, report: many(done) };

@@ -225,6 +225,23 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   Proxies carry a `StreamInfo` sidecar so the interactive path never
   ffprobes; `Handover` pins the canvas for A4's stream restarts.
 
+- **2026-10-08 — linked A/V, PR review fixes.** (1) *A carried partner was never lane-checked.* `trim`
+  (and the beat snap, through `carry_links_since`) wrote a partner's new span with no overlap check, so a
+  move by trim or a tail extension put a detached sound on an unlinked voice-over where `move_clip` refuses.
+  The check cannot sit inside `carry_extent_edit`: ripple legitimately makes room (a tail extension pushes
+  the clip behind the sound), so it runs in `run_edit` **after** the per-lane ripple and the sync lock
+  (`Timeline::check_carried_lanes` on the partners recorded in `Project::edit_carried`), refusing with the
+  lane named when a carried partner now overlaps a clip outside its group that it did not overlap before
+  (the `settle_followers` wording, shared). The named clip's own lane is still unchecked, as a trim always
+  was. Under ripple a move by trim is still refused: no length changed, so nothing ripples. TS mirror
+  (`checkCarriedLanes`, `runEdit`'s third argument, the trim preview) and five corpus cases; corpus 93 →
+  102. (2) *Multi-select Reattach was N revisions and partial on error.* `reattach_audio_clips` (core,
+  Tauri, MCP, harness) is one `Reattach audio (N clips)` revision, **all or nothing** (unlike the detach
+  batch, which skips and reports: half a reattach is a half-undone selection), a pair named by both its
+  clips counted once; `reattachSelection` has one Undo. (3) `set_volume` / `set_fade` / `set_clip_enabled`
+  say a detached picture carries no sound. (4) A clippy `nonminimal_bool` in `with_linked_cuts` rewritten
+  with its short-circuit kept; a duplicated phrase in `CLAUDE.md` fixed.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.

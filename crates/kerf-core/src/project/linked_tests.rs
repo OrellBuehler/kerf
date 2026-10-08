@@ -242,6 +242,56 @@ fn detaching_several_clips_is_one_revision_and_skips_what_cannot_be() {
 }
 
 #[test]
+fn reattaching_several_clips_is_one_revision_that_undoes_as_one() {
+    let cut = detached_cut();
+    let p = &cut.project;
+    let before = revisions(p);
+    // A selection names a picture and its sound both: each pair is reattached once.
+    let done = p.reattach_audio_clips(&[cut.c[0], cut.a[0], cut.a[1]]).unwrap();
+    assert_eq!(revisions(p), before + 1, "one revision however many");
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Reattach audio (2 clips)");
+    assert_eq!(done.iter().map(|c| c.id).collect::<Vec<_>>(), vec![cut.c[0], cut.c[1]]);
+    assert!(timeline(p).tracks[A1].clips.is_empty());
+    assert!(clip_of(p, cut.c[0]).source_audio && clip_of(p, cut.c[1]).source_audio);
+    p.undo().unwrap();
+    assert_eq!(timeline(p).tracks[A1].clips.len(), 2, "and one undo takes them all back");
+    assert!(!clip_of(p, cut.c[0]).source_audio && !clip_of(p, cut.c[1]).source_audio);
+    // One pair is the plain label.
+    p.reattach_audio_clips(&[cut.a[1]]).unwrap();
+    assert_eq!(p.history().unwrap().last().unwrap().label, "Reattach audio");
+}
+
+#[test]
+fn reattaching_several_clips_is_all_or_nothing() {
+    let cut = detached_cut();
+    let p = &cut.project;
+    // The second pair is unlinked, its muted picture and its sound both still there: reattaching
+    // it would play the footage twice, and that refuses the lot — the first pair included.
+    p.unlink_clips(&[cut.c[1]]).unwrap();
+    let (before, json) = (revisions(p), p.timeline_json().unwrap());
+    let err = p.reattach_audio_clips(&[cut.c[0], cut.c[1]]).unwrap_err().to_string();
+    assert!(err.contains("heard twice") && err.contains(&cut.c[1].to_string()), "{err}");
+    assert_eq!(
+        (revisions(p), p.timeline_json().unwrap()),
+        (before, json),
+        "not a byte changed"
+    );
+    // A clip that is not a detached pair, or not there, refuses it too; an empty call is an error.
+    let plain = p
+        .add_clip_to_timeline(timeline(p).clip(cut.a[0]).unwrap().asset_id, None, 0.0, 5.0, Some(30.0))
+        .unwrap();
+    assert!(p.reattach_audio_clips(&[cut.c[0], plain.id]).is_err());
+    assert!(p.reattach_audio_clips(&[cut.c[0], Uuid::new_v4()]).is_err());
+    assert!(p.reattach_audio_clips(&[]).is_err());
+    // A locked sound track refuses it.
+    lock(p, A1);
+    let (before, json) = (revisions(p), p.timeline_json().unwrap());
+    let err = p.reattach_audio_clips(&[cut.c[0]]).unwrap_err().to_string();
+    assert!(err.contains("locked"), "{err}");
+    assert_eq!((revisions(p), p.timeline_json().unwrap()), (before, json));
+}
+
+#[test]
 fn detaching_folds_the_picture_tracks_fader_into_the_new_clip() {
     let (project, asset) = av_project();
     let p = &project;
@@ -430,6 +480,129 @@ fn without_ripple_a_trim_still_carries_the_edge_but_leaves_the_gap() {
     p.trim(cut.c[1], Some(22.0), None, Some(12.0)).unwrap();
     assert_eq!(span(p, cut.a[1]), (12.0, 16.0));
     assert_eq!(clip_of(p, cut.a[1]).source_in, 22.0);
+}
+
+/// V1 holds a 5 s picture at 0 whose sound was detached onto A1, with an unlinked 3 s voice-over
+/// on A1 at 6..9 — one second of room after the sound.
+fn pair_before_a_voiceover() -> (Project, Uuid, Uuid, Uuid) {
+    let (p, a) = av_project();
+    let pic = p.add_clip_to_timeline(a.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+    let sound = p.detach_audio(pic.id).unwrap().clip;
+    let vo = asset("/vo.wav", 20.0, vec![stream(StreamKind::Audio)]);
+    p.insert_asset(&vo).unwrap();
+    let a1 = timeline(&p).tracks[A1].id;
+    let vo_clip = p.add_clip_to_timeline(vo.id, Some(a1), 0.0, 3.0, Some(6.0)).unwrap();
+    (p, pic.id, sound.id, vo_clip.id)
+}
+
+#[test]
+fn a_trim_that_would_carry_the_sound_over_an_unlinked_clip_is_refused_like_a_move() {
+    let (p, pic, sound, vo) = pair_before_a_voiceover();
+    let (revs, json) = (revisions(&p), p.timeline_json().unwrap());
+    // `move_clip` refuses the partner landing on the voice-over; a move by trim is the same move.
+    let moved = p.move_clip(pic, 1.5, None).unwrap_err().to_string();
+    assert!(moved.contains("overlap") && moved.contains("A1"), "{moved}");
+    let by_trim = p.trim(pic, None, None, Some(1.5)).unwrap_err().to_string();
+    assert!(
+        by_trim.contains("A1") && by_trim.contains("not linked to it") && by_trim.contains("0:06.0"),
+        "{by_trim}"
+    );
+    // Extending the tail over it is the same overlap.
+    let tail = p.trim(pic, None, Some(6.5), None).unwrap_err().to_string();
+    assert!(tail.contains("A1") && tail.contains("not linked to it"), "{tail}");
+    assert_eq!(
+        (revisions(&p), p.timeline_json().unwrap()),
+        (revs, json),
+        "a refusal leaves no trace"
+    );
+    // Short of the voice-over is fine, and so is leaving it alone with the links off.
+    p.trim(pic, None, Some(5.9), None).unwrap();
+    assert_eq!(span(&p, sound), (0.0, 5.9));
+    p.with_links(Some(false), |p| p.trim(pic, None, Some(6.5), None)).unwrap();
+    assert_eq!(span(&p, vo), (6.0, 9.0));
+    assert_eq!(span(&p, sound), (0.0, 5.9), "the sound stayed");
+}
+
+#[test]
+fn a_staged_trim_is_lane_checked_too_and_a_refusal_leaves_the_proposal_alone() {
+    let (mut p, pic, sound, _) = pair_before_a_voiceover();
+    p.set_actor(EditSource::Agent);
+    p.begin_staging(None, None).unwrap();
+    let before = p.staged().unwrap().unwrap().edits.len();
+    let err = p.trim(pic, None, Some(6.5), None).unwrap_err().to_string();
+    assert!(err.contains("A1") && err.contains("not linked to it"), "{err}");
+    assert_eq!(p.staged().unwrap().unwrap().edits.len(), before, "nothing was staged");
+    p.trim(pic, None, Some(5.5), None).unwrap();
+    assert_eq!(p.working_timeline().unwrap().clip(sound).unwrap().timeline_end(), 5.5);
+    assert_eq!(span(&p, sound), (0.0, 5.0), "and the live cut never moved");
+}
+
+#[test]
+fn ripple_that_makes_room_lets_the_carried_sound_extend_but_a_move_by_trim_is_still_refused() {
+    let (p, pic, sound, vo) = pair_before_a_voiceover();
+    p.set_ripple_mode(true).unwrap();
+    // The tail grows by 1.5 s: A1 ripples, so the voice-over is pushed ahead of the sound.
+    p.trim(pic, None, Some(6.5), None).unwrap();
+    assert_eq!(span(&p, sound), (0.0, 6.5));
+    assert_eq!(span(&p, vo), (7.5, 10.5));
+    // A pure move changes no length, so nothing ripples and the sound would land on it.
+    let (revs, json) = (revisions(&p), p.timeline_json().unwrap());
+    let err = p.trim(pic, None, None, Some(4.0)).unwrap_err().to_string();
+    assert!(err.contains("A1") && err.contains("not linked to it"), "{err}");
+    assert_eq!((revisions(&p), p.timeline_json().unwrap()), (revs, json));
+}
+
+#[test]
+fn an_overlap_that_was_already_there_is_not_the_trims_to_refuse() {
+    let (p, pic, sound, vo) = pair_before_a_voiceover();
+    // The voice-over already runs under the sound's tail (put there by hand, links off).
+    p.with_links(Some(false), |p| p.trim(sound, None, Some(7.0), None)).unwrap();
+    assert_eq!(span(&p, sound), (0.0, 7.0));
+    // Shortening the picture's tail by a second does not go near it: the sound's tail is not shared.
+    p.trim(pic, None, Some(4.0), None).unwrap();
+    assert_eq!(span(&p, sound), (0.0, 7.0));
+    assert_eq!(span(&p, vo), (6.0, 9.0));
+}
+
+#[test]
+fn the_beat_snap_does_not_carry_a_sound_over_an_unlinked_clip_either() {
+    let project = Project::open_in_memory().unwrap();
+    let video = asset(
+        "/beat-video.mp4",
+        10.0,
+        vec![stream(StreamKind::Video), stream(StreamKind::Audio)],
+    );
+    let music = asset("/beat-music.wav", 10.0, vec![stream(StreamKind::Audio)]);
+    project.insert_asset(&video).unwrap();
+    project.insert_asset(&music).unwrap();
+    project
+        .set_analysis(&AssetAnalysis {
+            asset_id: music.id,
+            tempo: Some(crate::model::Tempo {
+                bpm: 120.0,
+                beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
+                confidence: 0.8,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    project.add_asset_audio(music.id).unwrap();
+    let v1 = project.cut_clip(video.id, 0.0, 1.1).unwrap();
+    let v2 = project.cut_clip(video.id, 2.0, 3.3).unwrap();
+    project.detach_audio(v1.id).unwrap();
+    let s2 = project.detach_audio(v2.id).unwrap();
+    // v2 ends at 2.4 and the snap moves that cut to the beat at 2.5; its sound (on A2) would follow onto this clip.
+    let vo = asset("/vo.wav", 5.0, vec![stream(StreamKind::Audio)]);
+    project.insert_asset(&vo).unwrap();
+    project
+        .add_clip_to_timeline(vo.id, Some(s2.track_id), 0.0, 0.6, Some(2.4))
+        .unwrap();
+    let (revs, json) = (revisions(&project), project.timeline_json().unwrap());
+    let err = project.snap_to_beats(None, None).unwrap_err().to_string();
+    assert!(err.contains("A2") && err.contains("not linked to it"), "{err}");
+    assert_eq!((revisions(&project), project.timeline_json().unwrap()), (revs, json));
+    // The links off, the lanes are snapped as they stand.
+    project.with_links(Some(false), |p| p.snap_to_beats(None, None)).unwrap();
 }
 
 #[test]

@@ -954,6 +954,16 @@ fn reattach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Time
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// **Reattach audio** on several pictures in **one** revision, all or nothing: name
+/// either clip of each pair; a pair that cannot be reattached refuses the lot.
+#[tauri::command(async)]
+fn reattach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.reattach_audio_clips(&ids).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Link clips (at least two, on different tracks) so an edit to one is carried to
 /// the others. One revision.
 #[tauri::command(async)]
@@ -2920,6 +2930,7 @@ pub fn run() {
             detach_audio,
             detach_audio_clips,
             reattach_audio,
+            reattach_audio_clips,
             link_clips,
             unlink_clips,
             concatenate,

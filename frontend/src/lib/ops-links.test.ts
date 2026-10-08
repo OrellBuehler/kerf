@@ -49,6 +49,39 @@ describe('reattach and detach', () => {
 		expect(clipIds(1)).toEqual(['c3']);
 	});
 
+	test('reattach on several pairs is ONE revision, and one Undo takes them all back', async () => {
+		await editor.add('11111111-1111-1111-1111-111111111111', 20, 28, 'v1', 30);
+		const second = editor.timeline.tracks[0].clips.find((c) => c.timeline_start === 30)!.id;
+		await editor.detachAudioClips([second]);
+		shown.length = 0;
+		const before = await head();
+		editor.selectClips(['c1', 'c3', second]);
+		await reattachSelection();
+		expect(await head()).toBe(before + 1);
+		expect((await labels()).at(-1)).toBe('Reattach audio (2 clips)');
+		expect(clipIds(1)).toEqual([]);
+		expect(shown.map((s) => [s.kind, s.text])).toEqual([['note', 'Audio reattached on 2 clips']]);
+		shown[0].undo!();
+		await new Promise((r) => setTimeout(r, 20));
+		expect(clipIds(1)).toHaveLength(2);
+		expect(await head()).toBe(before);
+	});
+
+	test('a pair that cannot be reattached refuses the whole selection and records nothing', async () => {
+		await editor.add('11111111-1111-1111-1111-111111111111', 20, 28, 'v1', 30);
+		const second = editor.timeline.tracks[0].clips.find((c) => c.timeline_start === 30)!.id;
+		await editor.detachAudioClips([second]);
+		await editor.unlinkClips([second]); // its muted picture and its sound are still there: reattaching would double it
+		shown.length = 0;
+		const before = await head();
+		editor.selectClips(['c1', second]);
+		await reattachSelection();
+		expect(await head()).toBe(before);
+		expect(editor.timeline.tracks[0].clips.find((c) => c.id === 'c1')!.source_audio).toBe(false);
+		expect(shown).toHaveLength(1);
+		expect(shown[0]).toMatchObject({ kind: 'info' });
+	});
+
 	test('detach: each picture still playing its sound gets a linked clip, selected with it; Undo takes them all back', async () => {
 		await reattachSelectionOf('c1');
 		shown.length = 0;

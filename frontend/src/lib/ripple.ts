@@ -54,6 +54,13 @@ export function spansOverlap(a: [number, number], b: [number, number]): boolean 
 	return a[0] < b[1] - DIFF_EPS && b[0] < a[1] - DIFF_EPS;
 }
 
+/** The refusal for a linked clip that would land on a clip it is not linked to (`runs_into_unlinked`). */
+export function runsIntoUnlinked(track: string, at: number): Error {
+	return invalid(
+		`the clip linked to this one would run into another clip on ${track} at ${formatTime(at)} that is not linked to it — move that clip first`
+	);
+}
+
 /**
  * The cut after a **ripple edit**: `after` is what an edit left behind and
  * `before` is what it started from. Pure — neither argument is modified — and
@@ -247,10 +254,7 @@ function settleFollowers(track: Track, movers: ReadonlySet<string>, linked: Read
 		const laterLoses = movers.has(cs[i].id) && !movers.has(cs[i + 1].id);
 		const loser = laterLoses ? i + 1 : i;
 		const at = formatTime(cs[loser].timeline_start);
-		if (!linked.has(cs[loser].id))
-			throw invalid(
-				`the clip linked to this one would run into another clip on ${track.name} at ${at} that is not linked to it — move that clip first`
-			);
+		if (!linked.has(cs[loser].id)) throw runsIntoUnlinked(track.name, cs[loser].timeline_start);
 		if (picture)
 			throw invalid(
 				`the clip linked to this one would cut into a picture on ${track.name} at ${at} — a picture is never trimmed to make room; move one of them first`

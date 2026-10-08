@@ -22,10 +22,12 @@ import {
 import {
 	carryExtentEdit,
 	carryLinksSince,
+	checkCarriedLanes,
 	cutClipRangeLinked,
 	detachAudio,
 	detachAudioMany,
 	reattachAudio,
+	reattachAudioMany,
 	rippleDeleteLinked,
 	setSpeedLinked,
 	splitClip,
@@ -343,6 +345,30 @@ describe('trim', () => {
 		carryExtentEdit(t, c, was, footage);
 		expect(extent(t, s)).toEqual([4, 10]);
 		expect(get(t, s).source_in).toBeGreaterThanOrEqual(0);
+	});
+
+	test('a carried partner may not land on a clip outside its group', () => {
+		const { t, c, a, asset } = pair();
+		t.tracks[1].clips.push(clip(uuid(), 0, 3, 12));
+		const other = idOf(t, 1, 1);
+		const before = structuredClone(t);
+		const was = structuredClone(get(t, c));
+		get(t, c).source_out = 13;
+		const carried = carryExtentEdit(t, c, was, limits([asset])).map((p) => p.id);
+		expect(extent(t, a)).toEqual([0, 13]); // the carry itself writes no lane check
+		expect(() => checkCarriedLanes(t, before, carried)).toThrow(/A1.*0:12\.0.*not linked to it/);
+		// Short of it, or with the clip out of the way (the ripple pushed it), nothing is wrong.
+		get(t, a).source_out = 11.5;
+		expect(() => checkCarriedLanes(t, before, carried)).not.toThrow();
+		get(t, a).source_out = 13;
+		get(t, other).timeline_start = 14;
+		expect(() => checkCarriedLanes(t, before, carried)).not.toThrow();
+		// An overlap that was there before the edit is old news.
+		get(t, other).timeline_start = 12;
+		const wasOverlapping = structuredClone(before);
+		get(wasOverlapping, a).source_out = 12.5;
+		expect(() => checkCarriedLanes(t, wasOverlapping, carried)).not.toThrow();
+		expect(() => checkCarriedLanes(t, before, [])).not.toThrow();
 	});
 });
 
@@ -1216,6 +1242,41 @@ describe('detach / reattach', () => {
 		lock(t, 1);
 		expect(() => reattachAudio(t, id)).toThrow('locked');
 		expect(get(t, id).source_audio).toBe(false);
+	});
+
+	test('reattaching several is all or nothing and a pair named twice counts once', () => {
+		const asset = uuid();
+		const t = timeline([
+			lane('video', 'V1', [clip(asset, 0, 5, 0), clip(asset, 10, 15, 5)]),
+			lane('audio', 'A1', [])
+		]);
+		const [x1, x2] = [idOf(t, 0, 0), idOf(t, 0, 1)];
+		const s1 = detachAudio(t, x1, true).clip.id;
+		const s2 = detachAudio(t, x2, true).clip.id;
+		// The picture and its sound are one pair; the order named is the order returned.
+		const done = structuredClone(t);
+		expect(reattachAudioMany(done, [s2, x2, x1]).map((c) => c.id)).toEqual([x2, x1]);
+		expect(done.tracks[1].clips).toHaveLength(0);
+		expect([get(done, x1).source_audio, get(done, x2).source_audio]).toEqual([undefined, undefined]);
+		// A second picture whose reattach is refused leaves the first one's sound where it was.
+		unlinkClips(t, [x2]);
+		const before = structuredClone(t);
+		expect(() => reattachAudioMany(t, [x1, x2])).toThrow(new RegExp(`heard twice.*\\(clip ${x2}\\)`));
+		expect(t).toEqual(before);
+		expect(get(t, s1)).toBeDefined();
+		expect(get(t, s2)).toBeDefined();
+		// Alone, the refusal is reattachAudio's own words.
+		const alone = (() => {
+			try {
+				reattachAudio(structuredClone(t), x2);
+			} catch (e) {
+				return (e as Error).message;
+			}
+		})();
+		expect(() => reattachAudioMany(t, [x2])).toThrow(alone!);
+		expect(() => reattachAudioMany(t, [])).toThrow('no clips to reattach');
+		expect(() => reattachAudioMany(t, [x1, uuid()])).toThrow('clip not found');
+		expect(t).toEqual(before);
 	});
 
 	test('a pair split after detaching reattaches piecewise', () => {

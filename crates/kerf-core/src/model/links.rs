@@ -14,7 +14,7 @@
 //! | edit | the partners… |
 //! |---|---|
 //! | move (`with_linked_moves`) | move by the same Δt, **on their own tracks** — a track change belongs to the clip you named |
-//! | trim (`carry_extent_edit`) | follow the edge that changed **when they share it** (within 1 ms), clamped to their own footage |
+//! | trim (`carry_extent_edit`) | follow the edge that changed **when they share it** (within 1 ms), clamped to their own footage; one that would then overlap a clip outside its group refuses the edit (`check_carried_lanes`, after the ripple) |
 //! | split (`split_clip_linked`) | are split at the same timeline time (if it is inside them); the pieces on each side form a group of their own (`relink_sides`) |
 //! | remove (`with_link_partners`) / ripple delete (`ripple_delete_linked`) | are removed too |
 //! | cut a source span (`cut_clip_range_linked`) | lose the same stretch of *timeline*; the part of a partner that survives it is put back in step with the named clip (a partner whose head was inside the stretch resumes at the cut) |
@@ -96,6 +96,14 @@ fn content_offset(clip: &Clip) -> f64 {
 
 fn locked_partner(track: &Track) -> Error {
     Error::InvalidArgument(format!("a linked clip is on locked track {} — unlock it first", track.name))
+}
+
+/// The refusal for a linked clip that would land on a clip it is not linked to.
+fn runs_into_unlinked(track: &str, at: f64) -> Error {
+    Error::InvalidArgument(format!(
+        "the clip linked to this one would run into another clip on {track} at {} that is not linked to it — move that clip first",
+        fmt_time(at)
+    ))
 }
 
 /// Offsets closer than this are the same offset: a microsecond of float noise from
@@ -183,10 +191,7 @@ impl Track {
             let loser = if later_loses { i + 1 } else { i };
             let at = fmt_time(self.clips[loser].timeline_start);
             if !linked.contains(&self.clips[loser].id) {
-                return Err(Error::InvalidArgument(format!(
-                    "the clip linked to this one would run into another clip on {} at {} that is not linked to it — move that clip first",
-                    self.name, at
-                )));
+                return Err(runs_into_unlinked(&self.name, self.clips[loser].timeline_start));
             }
             if picture {
                 return Err(Error::InvalidArgument(format!(
@@ -920,6 +925,25 @@ impl Timeline {
             })
     }
 
+    /// The picture a reattach of `clip_id` means: the clip itself when it is on a video
+    /// track, else the linked picture on one whose sound was detached.
+    fn detached_picture(&self, clip_id: Uuid) -> Result<Uuid> {
+        let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        if self.tracks[ti].kind == StreamKind::Video {
+            return Ok(clip_id);
+        }
+        let named = &self.tracks[ti].clips[ci];
+        self.link_partners(clip_id)
+            .into_iter()
+            .find(|p| {
+                self.clip(*p).is_some_and(|c| !c.source_audio && c.asset_id == named.asset_id)
+                    && self
+                        .locate(*p)
+                        .is_some_and(|(pt, _)| self.tracks[pt].kind == StreamKind::Video)
+            })
+            .ok_or_else(|| Error::InvalidArgument("no linked picture whose sound was detached".to_string()))
+    }
+
     /// **Reattach** detached sound: the audio clip(s) linked to the picture clip that
     /// carry the same asset are deleted and the picture clip plays its own sound
     /// again, exactly as it was before the detach (edits made to the audio clip are
@@ -929,21 +953,7 @@ impl Timeline {
     /// unmuting would double the sound and the reattach is refused with that reason.
     /// Returns the picture clip.
     pub fn reattach_audio(&mut self, clip_id: Uuid) -> Result<Clip> {
-        let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-        let named = &self.tracks[ti].clips[ci];
-        let picture_id = if self.tracks[ti].kind == StreamKind::Video {
-            clip_id
-        } else {
-            self.link_partners(clip_id)
-                .into_iter()
-                .find(|p| {
-                    self.clip(*p).is_some_and(|c| !c.source_audio && c.asset_id == named.asset_id)
-                        && self
-                            .locate(*p)
-                            .is_some_and(|(pt, _)| self.tracks[pt].kind == StreamKind::Video)
-                })
-                .ok_or_else(|| Error::InvalidArgument("no linked picture whose sound was detached".to_string()))?
-        };
+        let picture_id = self.detached_picture(clip_id)?;
         let (vi, vc) = self.locate(picture_id).expect("the picture is on the timeline");
         let picture = self.tracks[vi].clips[vc].clone();
         if picture.source_audio {
@@ -981,6 +991,39 @@ impl Timeline {
             self.dissolve_orphans(&HashSet::from([group]));
         }
         Ok(self.clip(picture_id).expect("the picture stays").clone())
+    }
+
+    /// [`Timeline::reattach_audio`] on several clips, **all or nothing**. Each id names a
+    /// picture or its sound; a picture named twice (itself and its sound, as a selection
+    /// does) is reattached once. Every reattach is judged against the cut the earlier ones
+    /// left, so they run on a copy that replaces `self` only when all went through; the
+    /// first refusal is the error (naming its clip when there are several) and `self` is as
+    /// it was. Returns the pictures in the order named.
+    pub fn reattach_audio_many(&mut self, ids: &[Uuid]) -> Result<Vec<Clip>> {
+        if ids.is_empty() {
+            return Err(Error::InvalidArgument("no clips to reattach".to_string()));
+        }
+        let mut pictures: Vec<Uuid> = Vec::new();
+        for id in ids {
+            let picture = self.detached_picture(*id)?;
+            if !pictures.contains(&picture) {
+                pictures.push(picture);
+            }
+        }
+        let many = pictures.len() > 1;
+        let mut scratch = self.clone();
+        let mut out = Vec::with_capacity(pictures.len());
+        for picture in pictures {
+            match scratch.reattach_audio(picture) {
+                Ok(clip) => out.push(clip),
+                Err(Error::InvalidArgument(why)) if many => {
+                    return Err(Error::InvalidArgument(format!("{why} (clip {picture})")));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        *self = scratch;
+        Ok(out)
     }
 
     // ---- move ---------------------------------------------------------------
@@ -1038,10 +1081,11 @@ impl Timeline {
     /// partner shares that edge* with the clip as it was (within [`ADJACENT_EPS`]) —
     /// a partner that was never in sync at that edge is left alone there — clamped
     /// to the footage the partner has (the partner's end stops where its asset's
-    /// footage does, and the pair then differs by what it lacked). It never writes
-    /// an overlap check: like a trim, it leaves what the ripple pass or the user is
-    /// about to settle. An edit that changed the clip's speed is not this function's
-    /// (`set_speed_linked`).
+    /// footage does, and the pair then differs by what it lacked). It writes no lane
+    /// check of its own, because the ripple pass may yet make room: whoever calls it
+    /// hands the partners it returns to [`Timeline::check_carried_lanes`] once the
+    /// ripple has run (`Project::run_edit` does). An edit that changed the clip's
+    /// speed is not this function's (`set_speed_linked`).
     ///
     /// A **sound** carried before 0 loses what hangs off the front (and its track is
     /// pushed to `notes`); a **picture** is never trimmed to fit and refuses, as does a
@@ -1143,13 +1187,20 @@ impl Timeline {
     /// where **more than one** member changed is left alone — the edit named them
     /// explicitly — and so is a partner that changed itself.
     pub fn carry_links_since(&mut self, before: &Timeline, footage: &SourceLimits) -> Result<()> {
-        self.carry_links_since_noted(before, footage, &mut Vec::new())
+        self.carry_links_since_noted(before, footage, &mut Vec::new()).map(|_| ())
     }
 
-    /// [`Timeline::carry_links_since`] reporting the sounds it trimmed in `notes`.
-    pub fn carry_links_since_noted(&mut self, before: &Timeline, footage: &SourceLimits, notes: &mut Vec<String>) -> Result<()> {
+    /// [`Timeline::carry_links_since`] reporting the sounds it trimmed in `notes` and
+    /// returning the partners it carried, for [`Timeline::check_carried_lanes`].
+    pub fn carry_links_since_noted(
+        &mut self,
+        before: &Timeline,
+        footage: &SourceLimits,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<Uuid>> {
+        let mut carried = Vec::new();
         if !self.tracks.iter().any(|t| t.clips.iter().any(|c| c.link_id.is_some())) {
-            return Ok(());
+            return Ok(carried);
         }
         let changed = |was: &Clip, now: &Clip| {
             (was.timeline_start - now.timeline_start).abs() > DIFF_EPS
@@ -1169,7 +1220,38 @@ impl Timeline {
             // Exactly one changed member means no partner changed on its own.
             let [driver] = ids.as_slice() else { continue };
             let was = before.clip(*driver).expect("a driver was on the timeline before").clone();
-            self.carry_extent_edit_noted(*driver, &was, footage, notes)?;
+            let partners = self.carry_extent_edit_noted(*driver, &was, footage, notes)?;
+            carried.extend(partners.iter().map(|p| p.id));
+        }
+        Ok(carried)
+    }
+
+    /// The lane check for the partners a trim carried ([`Timeline::carry_extent_edit`]),
+    /// run on the timeline **after** the per-lane ripple and the sync lock, because the
+    /// ripple is what makes room: a sound extended with its picture's tail pushes the
+    /// clips behind it. A partner that now overlaps a clip of its lane that is not in its
+    /// own group, where the two did not overlap in `before`, refuses the edit — the rule
+    /// [`Timeline::move_clips`] holds a moved partner to (an overlap that was already
+    /// there is old news). The named clip's own lane is not looked at, as a trim never has.
+    pub fn check_carried_lanes(&self, before: &Timeline, carried: &[Uuid]) -> Result<()> {
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let prior: HashMap<Uuid, &Clip> = before.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| (c.id, c)).collect();
+        let span = |c: &Clip| (c.timeline_start, c.timeline_end());
+        for track in &self.tracks {
+            for p in track.clips.iter().filter(|c| carried.contains(&c.id)) {
+                for q in &track.clips {
+                    let same_group = p.link_id.is_some() && q.link_id == p.link_id;
+                    if q.id == p.id || same_group || !spans_overlap(span(p), span(q)) {
+                        continue;
+                    }
+                    if matches!((prior.get(&p.id), prior.get(&q.id)), (Some(a), Some(b)) if spans_overlap(span(a), span(b))) {
+                        continue;
+                    }
+                    return Err(runs_into_unlinked(&track.name, p.timeline_start.max(q.timeline_start)));
+                }
+            }
         }
         Ok(())
     }
@@ -1561,7 +1643,7 @@ impl Timeline {
                 }
                 let (ti, ci) = self.locate(partner).expect("a partner is on the timeline");
                 let p = &self.tracks[ti].clips[ci];
-                if !(p.timeline_start + DIFF_EPS < cut.at && cut.at < p.timeline_end() - DIFF_EPS) || !lanes.insert(ti) {
+                if !(p.timeline_start + DIFF_EPS < cut.at && cut.at < p.timeline_end() - DIFF_EPS && lanes.insert(ti)) {
                     continue;
                 }
                 if self.tracks[ti].locked {
@@ -2139,6 +2221,44 @@ mod tests {
         t.carry_extent_edit(c, &was, &footage).unwrap();
         assert_eq!(extent(&t, s), (4.0, 10.0), "a still's window is its length");
         assert!(get(&t, s).source_in >= 0.0, "never a negative in-point");
+    }
+
+    #[test]
+    fn a_carried_partner_may_not_land_on_a_clip_outside_its_group() {
+        let (mut t, c, a, asset) = pair();
+        let vo = Uuid::new_v4();
+        t.tracks[1].clips.push(clip(vo, 0.0, 3.0, 12.0));
+        let other = id_of(&t, 1, 1);
+        let before = t.clone();
+        let was = get(&t, c).clone();
+        t.clip_mut(c).unwrap().source_out = 13.0;
+        let carried: Vec<Uuid> = t
+            .carry_extent_edit(c, &was, &limits(&[asset]))
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(extent(&t, a), (0.0, 13.0), "the carry itself writes no lane check");
+        let err = t.check_carried_lanes(&before, &carried).unwrap_err().to_string();
+        assert!(
+            err.contains("A1") && err.contains("0:12.0") && err.contains("not linked to it"),
+            "{err}"
+        );
+        // Short of it, or with the clip out of the way (the ripple pushed it), nothing is wrong.
+        t.clip_mut(a).unwrap().source_out = 11.5;
+        assert!(t.check_carried_lanes(&before, &carried).is_ok());
+        t.clip_mut(a).unwrap().source_out = 13.0;
+        t.clip_mut(other).unwrap().timeline_start = 14.0;
+        assert!(t.check_carried_lanes(&before, &carried).is_ok(), "room made by a ripple");
+        // An overlap that was there before the edit is old news.
+        t.clip_mut(other).unwrap().timeline_start = 12.0;
+        let mut was_overlapping = before.clone();
+        was_overlapping.clip_mut(a).unwrap().source_out = 12.5;
+        assert!(t.check_carried_lanes(&was_overlapping, &carried).is_ok());
+        assert!(
+            t.check_carried_lanes(&before, &[]).is_ok(),
+            "nothing carried, nothing to check"
+        );
     }
 
     // ---- split ---------------------------------------------------------------
@@ -3074,6 +3194,40 @@ mod tests {
         lock(&mut t, 1);
         assert!(t.reattach_audio(id).is_err());
         assert!(!get(&t, id).source_audio, "still detached");
+    }
+
+    #[test]
+    fn reattaching_several_is_all_or_nothing_and_a_pair_named_twice_counts_once() {
+        let asset = Uuid::new_v4();
+        let mut t = timeline(vec![
+            lane(
+                StreamKind::Video,
+                "V1",
+                vec![clip(asset, 0.0, 5.0, 0.0), clip(asset, 10.0, 15.0, 5.0)],
+            ),
+            lane(StreamKind::Audio, "A1", vec![]),
+        ]);
+        let (x1, x2) = (id_of(&t, 0, 0), id_of(&t, 0, 1));
+        let s1 = t.detach_audio(x1, true).unwrap().clip.id;
+        let s2 = t.detach_audio(x2, true).unwrap().clip.id;
+        // The picture and its sound are one pair; the order named is the order returned.
+        let mut done = t.clone();
+        let pictures = done.reattach_audio_many(&[s2, x2, x1]).unwrap();
+        assert_eq!(pictures.iter().map(|c| c.id).collect::<Vec<_>>(), vec![x2, x1]);
+        assert!(done.tracks[1].clips.is_empty() && get(&done, x1).source_audio && get(&done, x2).source_audio);
+        // A second picture whose reattach is refused leaves the first one's sound where it was.
+        t.unlink_clips(&[x2]).unwrap();
+        let before = serde_json::to_string(&t).unwrap();
+        let err = t.reattach_audio_many(&[x1, x2]).unwrap_err().to_string();
+        assert!(err.contains("heard twice") && err.contains(&x2.to_string()), "{err}");
+        assert_eq!(serde_json::to_string(&t).unwrap(), before, "a refusal changes nothing");
+        assert!(t.clip(s1).is_some() && t.clip(s2).is_some());
+        // Alone, the refusal is reattach_audio's own words.
+        let alone = t.reattach_audio_many(&[x2]).unwrap_err().to_string();
+        assert_eq!(alone, t.clone().reattach_audio(x2).unwrap_err().to_string());
+        assert!(t.reattach_audio_many(&[]).is_err());
+        assert!(t.reattach_audio_many(&[x1, Uuid::new_v4()]).is_err());
+        assert_eq!(serde_json::to_string(&t).unwrap(), before);
     }
 
     #[test]

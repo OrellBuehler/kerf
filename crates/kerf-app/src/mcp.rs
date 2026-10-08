@@ -241,7 +241,7 @@ struct TrimParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: a partner that shares the edge you move (within 1 ms) has that edge moved by the same amount, clamped to its own footage; a pure move carries it by the same time. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+        description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: a partner that shares the edge you move (within 1 ms) has that edge moved by the same amount, clamped to its own footage; a pure move carries it by the same time; a partner that would then land on a clip outside its group refuses the call (ripple may make room). false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -334,6 +334,14 @@ struct LinkClipsParams {
 struct DetachClipsParams {
     #[schemars(
         description = "UUIDs of the picture clips whose own sound to detach (on video tracks); one that cannot be is skipped and reported"
+    )]
+    clip_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReattachClipsParams {
+    #[schemars(
+        description = "UUIDs of the clips whose detached sound to reattach — each names a picture or its sound (a pair named twice counts once); all or nothing: one that cannot be reattached refuses the lot"
     )]
     clip_ids: Vec<String>,
 }
@@ -1387,8 +1395,9 @@ impl KerfMcp {
                        passed). In ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track \
                        follow the change in the clip's length and a left-edge trim keeps the clip's start. \
                        A linked partner that shares the edge you move (its detached sound or picture) has \
-                       that edge moved with it; pass link=false to trim only this clip. \
-                       Returns the clip as it ended up."
+                       that edge moved with it — and the trim is refused if that would put the partner on a clip \
+                       outside its group (as move_clip refuses), unless ripple makes room; pass link=false to \
+                       trim only this clip. Returns the clip as it ended up."
     )]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -1795,7 +1804,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Enable or disable one clip. A disabled clip keeps its position, trims, effects and \
-                       keyframes but drops out of the render — the reversible way to try a cut without it."
+                       keyframes but drops out of the render — the reversible way to try a cut without it. \
+                       A picture whose sound was detached (`source_audio: false`) carries no sound: disabling it \
+                       leaves its linked audio clip playing, so disable that clip too."
     )]
     fn set_clip_enabled(&self, Parameters(p): Parameters<SetClipEnabledParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -1910,7 +1921,11 @@ impl KerfMcp {
         json(&serde_json::json!({ "ripple_mode": on }))
     }
 
-    #[tool(description = "Set the linear volume gain of a clip")]
+    #[tool(
+        description = "Set the linear volume gain of a clip. A picture whose sound was detached (`source_audio: \
+                       false`) carries no sound, so its volume changes nothing audible — its linked audio clip \
+                       (see `link_id`) is a separate clip to set."
+    )]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
@@ -1919,7 +1934,12 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Set a clip's fade-in / fade-out duration in seconds (omit a field to leave it unchanged, 0 to clear)")]
+    #[tool(
+        description = "Set a clip's fade-in / fade-out duration in seconds (omit a field to leave it unchanged, 0 to \
+                       clear). On a picture whose sound was detached (`source_audio: false`) the fade only fades the \
+                       picture — it carries no sound, so nothing audible changes; its linked audio clip (see \
+                       `link_id`) is a separate clip to fade."
+    )]
     fn set_fade(&self, Parameters(p): Parameters<FadeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
@@ -2440,12 +2460,28 @@ impl KerfMcp {
                        picture play its own again, as it was before detach_audio (edits made to the audio clip are \
                        not carried back). Name either clip of the pair. A picture whose audio clip is already gone \
                        is just unmuted — unless another audio clip is already playing the same footage in step with \
-                       it (unmuting would double the sound), which is refused. One revision. Returns the picture clip."
+                       it (unmuting would double the sound), which is refused. One revision. Returns the picture clip. \
+                       reattach_audio_clips does several in one revision."
     )]
     fn reattach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
         self.edit(|project| {
             let out = project.reattach_audio(clip_id).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "REATTACH the detached sound of SEVERAL pictures in ONE revision (one undo step) — reattach_audio \
+                       for each; name either clip of each pair (a pair named twice counts once). ALL OR NOTHING, unlike \
+                       detach_audio_clips: a pair that cannot be reattached (a locked track, or the picture's sound \
+                       already playing from another audio clip, which would double it) refuses the whole call and the \
+                       error names the clip, changing nothing. Returns the picture clips."
+    )]
+    fn reattach_audio_clips(&self, Parameters(p): Parameters<ReattachClipsParams>) -> Result<String, McpError> {
+        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        self.edit(|project| {
+            let out = project.reattach_audio_clips(&ids).map_err(core_err)?;
             json(&out)
         })
     }
@@ -3347,7 +3383,7 @@ impl ServerHandler for KerfMcp {
              LINKED: detach_audio splits a clip's own sound onto an audio track \
              (muting the picture's, so it is not heard twice — extract_audio does the \
              same for every use of an asset, detach_audio_clips for several clips \
-             in one revision) and links the two, and from then on \
+             in one revision; reattach_audio / reattach_audio_clips undo it) and links the two, and from then on \
              move / trim / split / remove / speed / roll-slip-slide / ripple carry \
              a linked partner along (link_clips / unlink_clips edit the groups; \
              `link_id` in get_timeline_state shows them; pass `link: false` on any \
@@ -3946,6 +3982,25 @@ mod tests {
         assert!(ok("middle").is_err());
     }
 
+    /// A detached picture carries no sound, so the property edits an agent would try on it
+    /// (volume, fade, disabling) change nothing audible: the tools say so, and where its
+    /// sound is instead.
+    #[test]
+    fn the_property_tools_say_a_detached_picture_carries_no_sound() {
+        let tools = router().list_all();
+        for name in ["set_volume", "set_fade", "set_clip_enabled"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("source_audio: false") && description.contains("linked audio clip"),
+                "`{name}` should warn about a detached picture: {description}"
+            );
+        }
+    }
+
     /// The per-call `ripple` override belongs on the edits that follow the
     /// project's ripple mode and on none that decide their own layout — an
     /// override on `move_clip` or `ripple_delete` would promise something the
@@ -4073,6 +4128,7 @@ mod tests {
             "detach_audio",
             "detach_audio_clips",
             "reattach_audio",
+            "reattach_audio_clips",
             "link_clips",
             "unlink_clips",
         ] {
@@ -4086,6 +4142,7 @@ mod tests {
         assert_eq!(schema("detach_audio_clips").1, ["clip_ids"]);
         assert_eq!(schema("add_asset_audio").1, ["asset_id"]);
         assert_eq!(schema("reattach_audio").1, ["clip_id"]);
+        assert_eq!(schema("reattach_audio_clips").1, ["clip_ids"]);
         assert_eq!(schema("link_clips").1, ["clip_ids"]);
         assert_eq!(schema("unlink_clips").1, ["clip_ids"]);
     }

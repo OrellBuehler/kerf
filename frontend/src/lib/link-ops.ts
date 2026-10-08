@@ -7,7 +7,8 @@
 // `runEdit` is `run_edit`: the edit runs on a scratch copy, then — when ripple applies — the
 // per-lane ripple, then — with links in force and something linked — the sync lock
 // (`conformLinks`, the clips the edit named as its anchors, judging which of them it moved
-// apart on the timeline as the edit itself left it) and the sync guard, and finally a link left
+// apart on the timeline as the edit itself left it), the lane check on the partners a trim
+// carried (`checkCarriedLanes`) and the sync guard, and finally a link left
 // with one clip is dissolved. A throw leaves the caller's timeline exactly as it was. A sound
 // trimmed to make room for a linked clip is reported: the label ends `(trimmed sound on A2)`.
 //
@@ -35,11 +36,13 @@ import {
 import {
 	carryExtentEdit,
 	carryLinksSince,
+	checkCarriedLanes,
 	cutClipRange,
 	cutClipRangeLinked,
 	detachAudio,
 	detachAudioMany,
 	reattachAudio,
+	reattachAudioMany,
 	rippleDeleteClip,
 	rippleDeleteLinked,
 	setSpeedLinked,
@@ -95,13 +98,19 @@ export function trimmedSuffix(notes: readonly string[]): string {
 }
 
 /** `Project::run_edit`: run `edit` on a scratch copy of `timeline` and settle what it left. `edit`
- *  gets the notes list to report the sounds it trims into. */
-export function runEdit<R>(timeline: Timeline, opts: RunOptions, edit: (scratch: Timeline, notes: string[]) => R): Ran<R> {
+ *  gets the notes list to report the sounds it trims into and the list to put the partners a trim
+ *  carried on (`Project::edit_carried`), which are lane-checked once the ripple has run. */
+export function runEdit<R>(
+	timeline: Timeline,
+	opts: RunOptions,
+	edit: (scratch: Timeline, notes: string[], carried: string[]) => R
+): Ran<R> {
 	let next: Timeline = structuredClone(timeline);
 	const notes: string[] = [];
+	const carried: string[] = [];
 	const sync = opts.links && hasLinks(next);
 	const before = opts.ripple || sync ? structuredClone(next) : null;
-	const result = edit(next, notes);
+	const result = edit(next, notes, carried);
 	if (before) {
 		// What the edit itself left, before the per-lane ripple moves each track by its own
 		// length: which of the clips it named it *moved apart* is judged there.
@@ -109,6 +118,7 @@ export function runEdit<R>(timeline: Timeline, opts: RunOptions, edit: (scratch:
 		if (opts.ripple) next = rippleLanes(next, before);
 		if (sync) {
 			conformLinks(next, before, new Set(opts.anchors ?? []), new Map(), left, notes);
+			checkCarriedLanes(next, before, carried);
 			const broke = firstSyncBreak(next, before);
 			if (broke) throw syncBreakError(broke);
 		}
@@ -149,7 +159,7 @@ export function trim(
 	timelineStart?: number | null
 ): Edited<void> {
 	return edited(
-		runEdit(tl, { ...env, anchors: [clipId] }, (t, notes) => {
+		runEdit(tl, { ...env, anchors: [clipId] }, (t, notes, carried) => {
 			const found = locate(t, clipId);
 			if (!found) throw clipNotFound(clipId);
 			const [track, ci] = found;
@@ -162,7 +172,7 @@ export function trim(
 				clip.timeline_start = Math.max(0, timelineStart);
 				track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
 			}
-			if (env.links) carryExtentEdit(t, clipId, was, env.footage, notes);
+			if (env.links) carried.push(...carryExtentEdit(t, clipId, was, env.footage, notes).map((p) => p.id));
 		}),
 		'Trim clip'
 	);
@@ -276,10 +286,10 @@ export function splitRemoveClips(tl: Timeline, env: EditEnv, cuts: readonly Clip
 /** `Project::snap_to_beats`'s re-sync half: `carryLinksSince` over a lane-level retime. */
 export function carrySince(tl: Timeline, env: EditEnv, retime: (t: Timeline) => void): Edited<void> {
 	return edited(
-		runEdit(tl, { ...env, ripple: false }, (t, notes) => {
+		runEdit(tl, { ...env, ripple: false }, (t, notes, carried) => {
 			const snapshot = structuredClone(t);
 			retime(t);
-			if (env.links) carryLinksSince(t, snapshot, env.footage, notes);
+			if (env.links) carried.push(...carryLinksSince(t, snapshot, env.footage, notes));
 		}),
 		'Cut to the beat'
 	);
@@ -311,6 +321,12 @@ export function reattach(tl: Timeline, env: EditEnv, clipId: string): Edited<Cli
 		runEdit(tl, { ...env, ripple: false }, (t) => reattachAudio(t, clipId)),
 		'Reattach audio'
 	);
+}
+
+/** `Project::reattach_audio_clips`: several pairs, one revision, all or nothing. */
+export function reattachClips(tl: Timeline, env: EditEnv, ids: readonly string[]): Edited<Clip[]> {
+	const done = runEdit(tl, { ...env, ripple: false }, (t) => reattachAudioMany(t, ids));
+	return edited(done, done.result.length === 1 ? 'Reattach audio' : `Reattach audio (${done.result.length} clips)`);
 }
 
 /** `Project::extract_audio`: every clip of the asset on a video track still playing its own

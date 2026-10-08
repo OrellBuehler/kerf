@@ -230,9 +230,25 @@ describe('linkedTrimPreview', () => {
 
 	test('a lane left overlapping is not ok, but has no reason of its own', () => {
 		// Stretch a's tail over b on V1 with ripple off: the clip itself ends up on b.
-		const p = linkedTrimPreview(pairs(), 'a', 'r', 13, opts())!;
+		const p = linkedTrimPreview(pairs(), 'a', 'r', 13, opts({ links: false }))!;
 		expect(p.ok).toBe(false);
 		expect(p.reason).toBeNull();
+	});
+
+	test('a partner that would land on a clip outside its group refuses, naming the lane', () => {
+		// The same stretch with the links on carries the sound over pb on A1: refused, as `move_clips` would.
+		const p = linkedTrimPreview(pairs(), 'a', 'r', 13, opts())!;
+		expect(p.ok).toBe(false);
+		expect(p.reason).toBe(
+			'The clip linked to this one would run into another clip on A1 at 0:10.0 that is not linked to it — move that clip first (or hold Alt to edit this clip on its own)'
+		);
+	});
+
+	test('with ripple the neighbours give way, so the same stretch is fine', () => {
+		const p = linkedTrimPreview(pairs(), 'a', 'r', 13, opts({ ripple: true }))!;
+		expect(p.ok).toBe(true);
+		expect(p.reason).toBeNull();
+		expect(p.ghosts.find((g) => g.id === 'pb')!.start).toBe(13);
 	});
 
 	test('the partner clamps to its footage and the preview shows it', () => {

@@ -171,6 +171,9 @@ pub struct Project {
     /// edit runs and drained when it lands; a `RefCell` for the same reason as the
     /// overrides above.
     edit_notes: RefCell<Vec<String>>,
+    /// The linked partners an edit carried a trim to (`Timeline::carry_extent_edit`), so
+    /// `run_edit` can lane-check them once the ripple has run. Filled while an edit runs.
+    edit_carried: RefCell<Vec<Uuid>>,
 }
 
 /// What an edit's revision label says about the sounds it trimmed to make room: nothing
@@ -200,6 +203,7 @@ impl Project {
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
             edit_notes: RefCell::new(Vec::new()),
+            edit_carried: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -215,6 +219,7 @@ impl Project {
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
             edit_notes: RefCell::new(Vec::new()),
+            edit_carried: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -229,6 +234,7 @@ impl Project {
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
             edit_notes: RefCell::new(Vec::new()),
+            edit_carried: RefCell::new(Vec::new()),
         };
         project.init()?;
         Ok(project)
@@ -1080,6 +1086,8 @@ impl Project {
         let anchors: HashSet<Uuid> = anchors.iter().copied().collect();
         let notes = &self.edit_notes;
         notes.borrow_mut().clear();
+        let carried = &self.edit_carried;
+        carried.borrow_mut().clear();
         let f = move |timeline: &mut Timeline| -> Result<R> {
             // The sync lock and guard: with links in force and something linked, the
             // partners of what the edit moved follow it, and an edit that would
@@ -1100,6 +1108,8 @@ impl Project {
                     let mut trimmed = Vec::new();
                     timeline.conform_links_noted(before, &anchors, &HashMap::new(), left.as_ref(), &mut trimmed)?;
                     notes.borrow_mut().extend(trimmed);
+                    // The partners a trim carried, now that the ripple has made what room it will.
+                    timeline.check_carried_lanes(before, &carried.take())?;
                     if let Some((a, b)) = timeline.first_sync_break(before) {
                         return Err(Error::InvalidArgument(format!(
                             "that edit would leave the linked clips on {a} and {b} out of step with each other — unlink them first if they are meant to part"
@@ -1556,8 +1566,10 @@ impl Project {
     /// **Linked clips follow the edge**: a partner that shares the edge being
     /// trimmed (within 1 ms) has that edge moved by the same amount, clamped to its
     /// own footage; a pure move (`timeline_start` alone) moves them by the same Δt.
-    /// A locked partner refuses the trim. `with_links(Some(false))` trims the named
-    /// clip alone.
+    /// A locked partner refuses the trim, and so does one that would land on a clip
+    /// outside its group — judged after the ripple, which may have made room — as
+    /// [`Project::move_clip`] refuses a move onto one. `with_links(Some(false))` trims
+    /// the named clip alone.
     pub fn trim(
         &self,
         clip_id: Uuid,
@@ -1597,8 +1609,9 @@ impl Project {
                 if links {
                     // The partners follow the edge that moved (see `carry_extent_edit`).
                     let mut trimmed = Vec::new();
-                    timeline.carry_extent_edit_noted(clip_id, &was, &footage, &mut trimmed)?;
+                    let partners = timeline.carry_extent_edit_noted(clip_id, &was, &footage, &mut trimmed)?;
                     self.edit_notes.borrow_mut().extend(trimmed);
+                    self.edit_carried.borrow_mut().extend(partners.iter().map(|p| p.id));
                 }
                 Ok(out)
             },
@@ -2799,7 +2812,8 @@ impl Project {
     /// knowing about links, so each clip it retimed carries the change to its
     /// partners (`Timeline::carry_links_since` — a partner follows an edge it
     /// shared, a group the snap changed in several members is left as the snap made
-    /// it). `with_links(Some(false))` snaps the lanes alone.
+    /// it; one that would land on a clip outside its group refuses the snap).
+    /// `with_links(Some(false))` snaps the lanes alone.
     pub fn snap_to_beats(&self, track_id: Option<Uuid>, tolerance: Option<f64>) -> Result<usize> {
         let mut limits = HashMap::new();
         let mut tempos: HashMap<Uuid, Tempo> = HashMap::new();
@@ -2844,8 +2858,9 @@ impl Project {
             }
             if let Some(before) = before {
                 let mut trimmed = Vec::new();
-                timeline.carry_links_since_noted(&before, &limits, &mut trimmed)?;
+                let carried = timeline.carry_links_since_noted(&before, &limits, &mut trimmed)?;
                 self.edit_notes.borrow_mut().extend(trimmed);
+                self.edit_carried.borrow_mut().extend(carried);
             }
             Ok(aligned)
         })
@@ -2974,6 +2989,19 @@ impl Project {
     /// footage sits ahead of anything.
     pub fn reattach_audio(&self, clip_id: Uuid) -> Result<Clip> {
         self.edit_timeline_exact("Reattach audio", |timeline| timeline.reattach_audio(clip_id))
+    }
+
+    /// [`Project::reattach_audio`] on several clips as **one** `Reattach audio (N clips)`
+    /// revision — a multi-select reattach that undoes in a step. Name either clip of each
+    /// pair. All or nothing, unlike [`Project::detach_audio_clips`]: a clip that cannot be
+    /// reattached refuses the lot (the error names it) and records nothing. Returns the
+    /// pictures.
+    pub fn reattach_audio_clips(&self, clip_ids: &[Uuid]) -> Result<Vec<Clip>> {
+        let label = |done: &Vec<Clip>| match done.len() {
+            1 => "Reattach audio".to_string(),
+            n => format!("Reattach audio ({n} clips)"),
+        };
+        self.edit_named_exact(&[], label, |timeline| timeline.reattach_audio_many(clip_ids))
     }
 
     /// **Link** clips into one group (one `Link N clips` revision): from then on an

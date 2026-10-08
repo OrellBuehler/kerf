@@ -4,17 +4,18 @@
  *
  *  - *The bounds.* `trim_clip` carries the edge to every partner that shares it
  *    (`carryExtentEdit`): clamped to the partner's own footage — which only makes the
- *    partner trim less, the way a roll or slide would be held — but never overlap-checked,
- *    so it is the *drag* that has to keep the partner off its own neighbours
- *    (`linkedTrimBounds`: the named clip's bounds intersected with each sharing partner's,
- *    footage aside).
+ *    partner trim less, the way a roll or slide would be held. The backend refuses a
+ *    partner that would then overlap a clip outside its group (`checkCarriedLanes`, once the
+ *    ripple has made what room it will), so the *drag* keeps the partner off its own
+ *    neighbours (`linkedTrimBounds`: the named clip's bounds intersected with each sharing
+ *    partner's, footage aside).
  *  - *The outcome.* With ripple on, the backend ripples every lane, and its sync lock
  *    (`conform_links`) makes the clips a ripple pushed drag their partners along: trim a title
  *    on V1 and the next shot's sound on A1 moves too, a J/L-cut offset kept. `linkedTrimPreview`
  *    applies the trim to a scratch copy of the lanes that matter, then the same steps the
  *    backend takes (`carryExtentEdit`, the per-lane ripple, then `conformLinks` with the
  *    trimmed clip as its anchor and the trim itself as the timeline it judges "moved apart"
- *    on), then the sync guard, and reads off every clip that changed — on any track — so the
+ *    on), the lane check on the carried partners, then the sync guard, and reads off every clip that changed — on any track — so the
  *    ghosts of the partners' ripple are drawn live, and a refusal (a locked partner, an
  *    unlinked clip or a picture in the way, a pair pulled out of step) is drawn red with its
  *    reason instead of found out on release. A sound the trim cuts back to make room is
@@ -25,7 +26,7 @@ import { ADJACENT_EPS, type SourceLimits } from './edit-modes';
 import { trimEdit } from './frames';
 import { firstSyncBreak, hasLinks, linkPartners, locateIndex, syncBreakError } from './link-groups';
 import { gestureReason, reasonOf } from './link-ui';
-import { carryExtentEdit } from './links';
+import { carryExtentEdit, checkCarriedLanes } from './links';
 import { conformLinks, DIFF_EPS, rippleLanes } from './ripple';
 import { trimBounds, type TrimBounds } from './ripple-trim';
 import { plainCopy } from './trim-tools';
@@ -136,9 +137,10 @@ export function linkedTrimPreview(
 	}
 	let reason: string | null = null;
 	const notes: string[] = [];
+	let carried: string[] = [];
 	if (opts.links) {
 		try {
-			carryExtentEdit(after, clipId, was, opts.footage, notes);
+			carried = carryExtentEdit(after, clipId, was, opts.footage, notes).map((p) => p.id);
 		} catch (err) {
 			reason = gestureReason(reasonOf(err));
 		}
@@ -150,6 +152,7 @@ export function linkedTrimPreview(
 		try {
 			// `left`: what the trim itself left, before the ripple (`Project::run_edit`).
 			conformLinks(result, before, new Set([clipId]), new Map(), opts.ripple ? after : undefined, notes);
+			checkCarriedLanes(result, before, carried);
 		} catch (err) {
 			reason = gestureReason(reasonOf(err));
 		}

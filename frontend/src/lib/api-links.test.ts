@@ -13,6 +13,7 @@ import {
 	moveClip,
 	moveClips,
 	reattachAudio,
+	reattachAudioClips,
 	removeClip,
 	removeClips,
 	reorderClip,
@@ -134,6 +135,31 @@ describe('linked A/V (browser harness)', () => {
 		expect(await lastLabel()).toBe('Reattach audio');
 	});
 
+	test('reattaching several is one revision, all or nothing', async () => {
+		let t = await addClip(INTERVIEW, 20, 28, 'v1', 30);
+		const second = t.tracks[0].clips.find((c) => c.timeline_start === 30)!.id;
+		await detachAudioClips(['c1', second]);
+		await removeClip(c3); // the whole interview on A1 would play c1's sound a second time
+		const soundOfFirst = soundOf(await getTimeline(), 'c1').id;
+		const before = await headSeq();
+		// A pair named by both its clips counts once.
+		t = await reattachAudioClips([soundOfFirst, 'c1', second]);
+		expect(await headSeq()).toBe(before + 1);
+		expect(await lastLabel()).toBe('Reattach audio (2 clips)');
+		expect([clip(t, 'c1')!.source_audio, clip(t, second)!.source_audio]).toEqual([undefined, undefined]);
+		expect(clip(t, soundOfFirst)).toBeUndefined();
+		t = await undo();
+		expect(clip(t, 'c1')!.source_audio).toBe(false);
+		expect(clip(t, second)!.source_audio).toBe(false);
+		// One pair that would be heard twice refuses the lot and records nothing.
+		await unlinkClips([second]);
+		const seq = await headSeq();
+		const json = JSON.stringify(await getTimeline());
+		await expect(reattachAudioClips(['c1', second])).rejects.toThrow(`heard twice (clip ${second})`);
+		expect(await headSeq()).toBe(seq);
+		expect(JSON.stringify(await getTimeline())).toBe(json);
+	});
+
 	test('detaching several clips is one revision and skips what cannot be', async () => {
 		const before = await headSeq();
 		const done = await detachAudioClips(['c1', 'c2']);
@@ -194,6 +220,30 @@ describe('linked A/V (browser harness)', () => {
 		expect(clip(trimmed, 'c1')!.source_out).toBe(8);
 		expect(clip(trimmed, soundId)!.source_out).toBe(8);
 		expect(clip(trimmed, 'c2')!.timeline_start).toBe(8);
+	});
+
+	test('a trim that would carry the sound onto an unlinked clip is refused like a move, unless ripple makes room', async () => {
+		let t = await detachAudio('c1');
+		const sound = soundOf(t, 'c1');
+		const lane = t.tracks.find((tr) => tr.clips.some((c) => c.id === sound.id))!;
+		await addClip(INTERVIEW, 0, 3, lane.id, 13);
+		const before = await headSeq();
+		const json = JSON.stringify(await getTimeline());
+		await expect(moveClip('c1', 1)).rejects.toThrow('overlap');
+		await expect(trimClip('c1', undefined, 14)).rejects.toThrow(/A2 at 0:13\.0 that is not linked to it/);
+		await expect(trimClip('c1', undefined, undefined, 1)).rejects.toThrow(/A2 at 0:13\.0 that is not linked to it/);
+		expect(await headSeq()).toBe(before);
+		expect(JSON.stringify(await getTimeline())).toBe(json);
+		// With links off the picture is trimmed alone; with ripple on the clip is pushed ahead of the sound.
+		t = await trimClip('c1', undefined, 14, undefined, false);
+		expect(clip(t, sound.id)!.source_out).toBe(12.5);
+		await revertTo(before);
+		await setRippleMode(true);
+		t = await trimClip('c1', undefined, 14);
+		expect(clip(t, sound.id)!.source_out).toBe(14);
+		const pushed = t.tracks.find((tr) => tr.id === lane.id)!.clips.find((c) => c.id !== sound.id)!;
+		expect(pushed.timeline_start).toBe(14.5);
+		await expect(trimClip('c1', undefined, undefined, 1)).rejects.toThrow('not linked to it');
 	});
 
 	test('a split cuts the partner too and the new halves are a pair of their own', async () => {
