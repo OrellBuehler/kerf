@@ -3011,8 +3011,10 @@ tokens are the guarded pairs (`text-secondary` on `surface-app`, `text-primary` 
 contrast guard covers it. **Where the old toolbar's controls went**: the transport (go to
 start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
 the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
-~380 px of its width; the tools, Ripple, Snapping, Undo / Redo and the delivery-frame
-picker are the **Timeline**'s toolbar, which wraps to a second row rather than clip
+~380 px of its *measured* width (`transport-bar.ts`, bun-tested: an unknown or 0 width is the
+full bar, and the buttons, timecode and scrub bar never go); the tools, Ripple, Snapping,
+Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar, which wraps to a
+second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
@@ -3588,8 +3590,10 @@ the JPEG as ever. The frame's content box is reported to `set_preview_bounds` by
 `deviceRect` rounding both edges so neighbours never gap at 125 / 150 %, and a hidden report
 goes out when the panel unmounts (a workspace switch) or the setting goes off. Under technique
 `window` the frame's ancestors get `data-surface-hole` (transparent, in `layout.css`) and the
-pane's surround is a layer with an even-odd `clip-path` hole at the frame (`holePolygon`), so
-nothing else on the page changes; `?gpusurface=1` makes the browser harness answer as such a
+pane's surround is a layer with an even-odd `clip-path` hole at the frame (`holePolygon`) that
+covers the **pane only** — it is positioned, so it paints above the unpositioned transport bar,
+and one spanning the whole panel hid every control in the bar but the scrub dot — so nothing else
+on the page changes; `?gpusurface=1` makes the browser harness answer as such a
 surface (there is no GPU there), and a headless-Chrome screenshot with a transparent default
 background shows the hole. The status bar names the renderer of the frame on screen (`GPU
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the

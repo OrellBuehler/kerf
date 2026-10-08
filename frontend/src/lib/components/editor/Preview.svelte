@@ -25,6 +25,7 @@
 	} from '$lib/preview-bounds';
 	import { createFramePump } from '$lib/frame-pump.svelte';
 	import { singleFlight } from '$lib/single-flight';
+	import { measuredWidth, transportParts } from '$lib/transport-bar';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
@@ -33,8 +34,12 @@
 	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
-	/** The transport bar's own width: what it can show depends on it, not on the window. */
-	let barWidth = $state(0);
+	/** The transport bar's own width, or undefined until it has been measured (and while it
+	 *  reads 0: hidden, mid-rebuild). What the bar can show depends on it, not on the window;
+	 *  an unknown width shows all of it (`transportParts`). */
+	let barEl = $state<HTMLElement | null>(null);
+	let barWidth = $state<number | undefined>(undefined);
+	const parts = $derived(transportParts(barWidth));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	const empty = $derived(!hasClips);
 
@@ -187,6 +192,25 @@
 	// box) and when the surface moved. Suspended while the stream is feeding frames, so the two
 	// don't fight over the pane. What it depends on is what `run` reads, and nothing else.
 	$effect(() => frames.run());
+
+	// Read the bar's width when it mounts (again after the next frame, once layout has
+	// settled), when it resizes and when the window does. A read that finds no width
+	// (a hidden dock tab, a rebuild) leaves it unknown rather than zero.
+	$effect(() => {
+		const el = barEl;
+		if (!el) return;
+		const read = () => (barWidth = measuredWidth(el.clientWidth));
+		read();
+		const settled = requestAnimationFrame(read);
+		const observer = new ResizeObserver(read);
+		observer.observe(el);
+		window.addEventListener('resize', read);
+		return () => {
+			cancelAnimationFrame(settled);
+			observer.disconnect();
+			window.removeEventListener('resize', read);
+		};
+	});
 
 	function scrub(e: MouseEvent) {
 		const el = e.currentTarget as HTMLElement;
@@ -620,17 +644,20 @@
 
 <div
 	bind:this={rootEl}
-	style="flex:1;min-height:0;display:flex;flex-direction:column;{onSurface && technique === 'window' ? 'position:relative;background:transparent' : 'background:var(--surface-void)'}"
+	style="flex:1;min-height:0;display:flex;flex-direction:column;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
 >
-	{#if onSurface && technique === 'window'}
-		<!-- The pane's surround, with a hole where the frame is: the surface shows through there. -->
-		<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
-	{/if}
 	<div
 		role="presentation"
 		oncontextmenu={onPreviewContextMenu}
 		style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative;container-type:size"
 	>
+		{#if onSurface && technique === 'window'}
+			<!-- The pane's surround, with a hole where the frame is: the surface shows through
+			     there. It covers the pane and nothing else: a positioned layer paints above the
+			     unpositioned transport bar, so one spanning this whole root hid every control in
+			     the bar but the scrub dot. -->
+			<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
+		{/if}
 		{#if empty}
 			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-disabled)">
 				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>
@@ -738,11 +765,11 @@
 	</div>
 	<!-- Transport: go to start, play / pause, go to end, the timecode with the
 	     timeline's rate, and the scrub bar. J / K / L stay on the keyboard. It narrows
-	     gracefully: below ~380 px the duration and the rate go, then the skip buttons'
-	     gaps close — the controls themselves stay. -->
+	     gracefully: below ~380 px of a measured width the duration and the rate go and
+	     the gaps close — the controls themselves always stay (`transport-bar.ts`). -->
 	<div
-		bind:clientWidth={barWidth}
-		style="height:40px;flex:none;display:flex;align-items:center;gap:{barWidth < 380 ? 6 : 10}px;padding:0 {barWidth < 380 ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
+		bind:this={barEl}
+		style="height:40px;flex:none;display:flex;align-items:center;gap:{parts.tight ? 6 : 10}px;padding:0 {parts.tight ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
 			title={settings.withShortcut('Go to start', 'playback.toStart')}
@@ -786,8 +813,10 @@
 				style="position:absolute;left:{empty ? 0 : (ui.time / duration) * 100}%;top:50%;width:11px;height:11px;border-radius:50%;background:var(--kerf-400);transform:translate(-50%,-50%);box-shadow:0 0 0 3px var(--surface-app)"
 			></div>
 		</div>
-		{#if barWidth >= 380}
+		{#if parts.duration}
 			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);white-space:nowrap">{tc(duration)}</span>
+		{/if}
+		{#if parts.rate}
 			<span
 				title="Timeline frame rate; non-drop timecode"
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
