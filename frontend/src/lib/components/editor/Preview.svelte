@@ -8,6 +8,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
+	import { onWindow } from '$lib/window-events';
 	import { getTimelineFrame, startPlayback } from '$lib/api';
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { toast } from '$lib/notifications.svelte';
@@ -406,18 +407,20 @@
 	}
 </script>
 
-<svelte:window
-	onkeydowncapture={(e) => {
-		// Abandoning a drag is all Escape does then — not also "clear the selection".
-		if (e.key === 'Escape' && tdrag && !tdrag.committing) {
-			cancelTitleDrag();
-			e.stopPropagation();
-		}
-	}}
-	onblur={cancelTitleDrag}
-/>
-
-<div style="flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-void)">
+<div
+	{@attach onWindow({
+		// Abandoning a drag is all Escape does then — not also "clear the selection". These
+		// listen to the window the panel is in, which is a detached window's when it is in one.
+		keydowncapture: (e: KeyboardEvent) => {
+			if (e.key === 'Escape' && tdrag && !tdrag.committing) {
+				cancelTitleDrag();
+				e.stopPropagation();
+			}
+		},
+		blur: cancelTitleDrag
+	})}
+	style="flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-void)"
+>
 	<div
 		role="presentation"
 		oncontextmenu={onPreviewContextMenu}

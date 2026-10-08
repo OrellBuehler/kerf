@@ -15,11 +15,20 @@ function sync(el: HTMLInputElement) {
 
 const isRange = (n: unknown): n is HTMLInputElement => n instanceof HTMLInputElement && n.type === 'range';
 
-export function installSliderFill(root: Document = document) {
+/** The `value` setter is patched once for the page: elements are made by the editor's
+ *  realm whichever window they end up in, so one patch covers them all. */
+let patched = false;
+
+/** Keep `--slider-fill` current for every range input in `root`. The editor window's
+ *  document is installed once at start-up; a detached window's document is installed
+ *  when it opens, because its listeners and observer are its own. Returns what takes
+ *  them down again. */
+export function installSliderFill(root: Document = document): () => void {
 	const all = () => root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach(sync);
 
 	const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-	if (desc?.set && desc.get) {
+	if (!patched && desc?.set && desc.get) {
+		patched = true;
 		Object.defineProperty(HTMLInputElement.prototype, 'value', {
 			...desc,
 			set(this: HTMLInputElement, v: string) {
@@ -29,8 +38,12 @@ export function installSliderFill(root: Document = document) {
 		});
 	}
 
-	root.addEventListener('input', (e) => isRange(e.target) && sync(e.target), true);
-	new MutationObserver((records) => {
+	const onInput = (e: Event) => isRange(e.target) && sync(e.target);
+	root.addEventListener('input', onInput, true);
+	// The window's own constructor: an observer made by another window's is not told
+	// what happens in this one's document on every engine.
+	const Observer = (root.defaultView as (Window & typeof globalThis) | null)?.MutationObserver ?? MutationObserver;
+	const observer = new Observer((records) => {
 		for (const r of records) {
 			if (r.type === 'attributes' && isRange(r.target)) sync(r.target);
 			for (const n of r.addedNodes) {
@@ -38,11 +51,16 @@ export function installSliderFill(root: Document = document) {
 				else if (n instanceof Element) n.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach(sync);
 			}
 		}
-	}).observe(root.documentElement, {
+	});
+	observer.observe(root.documentElement, {
 		subtree: true,
 		childList: true,
 		attributes: true,
 		attributeFilter: ['min', 'max', 'value', 'type']
 	});
 	all();
+	return () => {
+		root.removeEventListener('input', onInput, true);
+		observer.disconnect();
+	};
 }
