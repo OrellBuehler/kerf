@@ -472,7 +472,7 @@ export interface MasterBus {
 	volume: number;
 	/** A lookahead limiter holding the mix under `ceiling_db`. */
 	limiter: boolean;
-	/** Limiter ceiling in dBFS, -24..0 (-1 by default). A sample-peak ceiling. */
+	/** Limiter ceiling in dBFS, -24..0 (-1.5 by default). A sample-peak ceiling. */
 	ceiling_db: number;
 }
 

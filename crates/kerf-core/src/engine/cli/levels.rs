@@ -648,7 +648,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             .is_none());
     }
 
-    // ---- the real thing (`#[ignore]`d: they drive the ffmpeg binary, 6.1 and 9.0 alike) --------
+    // ---- the real thing (`#[ignore]`d: they drive the ffmpeg binary, 4.4, 6.1 and 9.0 alike) ---
     //
     // `cargo test -p kerf-core --no-default-features -- --ignored levels`
 
@@ -801,15 +801,19 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
 
         // The lookahead is compensated: the first 4 ms already carry the tone. Left
         // at its default the limiter delays the whole mix by its attack time (the
-        // sound would trail the picture) and the first milliseconds are silence.
-        let head = mix_levels(&tl, assets, Some(TimeRange { start: 0.0, end: 0.004 }), false, &|| false)
-            .unwrap()
-            .master
-            .unwrap();
-        assert!(
-            head.peak_dbfs.is_some_and(|p| p > -30.0),
-            "the head of the mix is silent: {head:?}"
-        );
+        // sound would trail the picture) and the first milliseconds are silence. Only
+        // where `alimiter` has `latency` to compensate with: FFmpeg 4.4's does not,
+        // and its graph carries the 5 ms delay.
+        if alimiter_latency_available() {
+            let head = mix_levels(&tl, assets, Some(TimeRange { start: 0.0, end: 0.004 }), false, &|| false)
+                .unwrap()
+                .master
+                .unwrap();
+            assert!(
+                head.peak_dbfs.is_some_and(|p| p > -30.0),
+                "the head of the mix is silent: {head:?}"
+            );
+        }
 
         // A limiter that has nothing to limit leaves the mix alone. (Its default
         // auto-level would scale -20 dBFS up to the ceiling: this is the regression

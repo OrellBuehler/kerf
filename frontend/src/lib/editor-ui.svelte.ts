@@ -4,11 +4,19 @@
    in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
-import { cancelAnalysis, downloadSpeechModel, getLevels, listFonts, setSpeechModel, transcriptionStatus } from './api';
+import {
+	cancelAnalysis,
+	cancelLevels,
+	downloadSpeechModel,
+	getLevels,
+	listFonts,
+	setSpeechModel,
+	transcriptionStatus
+} from './api';
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
 import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, Levels, TranscriptionStatus } from './types';
-import { measureRange, type MeasureStamp } from './levels-view';
+import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
@@ -101,10 +109,12 @@ class EditorUi {
 	 *  audio the export would render, which takes seconds on a long cut. Held here and
 	 *  not in the panel because the panel is rebuilt whenever the workspace changes —
 	 *  a measurement under way should survive a switch to Edit and back, and its
-	 *  result should be there when the Mixer is. The backend has no way to stop the
-	 *  pass, so it is waited out (`running`) rather than cancelled. */
-	measure = $state<{ running: boolean; result: MeasureResult | null; error: string | null }>({
+	 *  result should be there when the Mixer is. `stopMeasure` abandons the pass
+	 *  (`stopping` until the backend has given up); a stopped one leaves the last
+	 *  result in place and reports nothing. */
+	measure = $state<{ running: boolean; stopping: boolean; result: MeasureResult | null; error: string | null }>({
 		running: false,
+		stopping: false,
 		result: null,
 		error: null
 	});
@@ -152,11 +162,23 @@ class EditorUi {
 		try {
 			this.measure.result = { levels: await getLevels(range), range, stamp };
 		} catch (e) {
-			this.measure.error = message(e);
-			toast.error(`Couldn't measure the loudness — ${this.measure.error}`);
+			// A stop is the user's own doing, not a failure to report.
+			if (!isLevelsCancelled(e)) {
+				this.measure.error = message(e);
+				toast.error(`Couldn't measure the loudness — ${this.measure.error}`);
+			}
 		} finally {
 			this.measure.running = false;
+			this.measure.stopping = false;
 		}
+	}
+
+	/** Ask the running measurement to give up. It reads the whole mix, so on a long
+	 *  cut that is minutes the user should not have to wait out. */
+	stopMeasure() {
+		if (!this.measure.running || this.measure.stopping) return;
+		this.measure.stopping = true;
+		void cancelLevels();
 	}
 
 	openVoiceover(prefill: VoiceoverPrefill | null = null) {

@@ -11,6 +11,7 @@ const real = { ...(await import('./api')) };
 const calls: unknown[][] = [];
 let fail: Error | null = null;
 let gate: Promise<void> | null = null;
+let stops = 0;
 
 mock.module('./api', () => ({
 	...real,
@@ -19,7 +20,8 @@ mock.module('./api', () => ({
 		if (gate) await gate;
 		if (fail) throw fail;
 		return real.getLevels(...args);
-	}
+	},
+	cancelLevels: async () => void stops++
 }));
 const shown: { kind: string; text: string }[] = [];
 const note = (kind: string) => (text: string) => void shown.push({ kind, text });
@@ -50,9 +52,10 @@ beforeEach(async () => {
 	shown.length = 0;
 	fail = null;
 	gate = null;
+	stops = 0;
 	ui.markIn = null;
 	ui.markOut = null;
-	ui.measure = { running: false, result: null, error: null };
+	ui.measure = { running: false, stopping: false, result: null, error: null };
 });
 
 const now = () => ({ seq: editor.history.find((r) => r.current)?.seq ?? null, path: editor.currentPath });
@@ -109,6 +112,49 @@ describe('ui.measureLevels', () => {
 		fail = null;
 		await ui.measureLevels();
 		expect(ui.measure.error).toBeNull();
+	});
+
+	test('a stop abandons the pass quietly and leaves the last answer in place', async () => {
+		await ui.measureLevels();
+		const kept = ui.measure.result;
+		let giveUp!: (e: Error) => void;
+		gate = new Promise<void>((_, reject) => (giveUp = reject));
+		const pass = ui.measureLevels();
+		expect(ui.measure.running).toBe(true);
+		expect(ui.measure.stopping).toBe(false);
+		ui.stopMeasure();
+		// Asked once; the pass is still running until the backend gives up.
+		ui.stopMeasure();
+		expect(stops).toBe(1);
+		expect(ui.measure.stopping).toBe(true);
+		expect(ui.measure.running).toBe(true);
+		giveUp(new Error('levels cancelled'));
+		await pass;
+		expect(ui.measure).toMatchObject({ running: false, stopping: false, error: null });
+		expect(ui.measure.result).toBe(kept);
+		expect(shown).toEqual([]);
+		// And the next press measures again.
+		gate = null;
+		await ui.measureLevels();
+		expect(ui.measure.result).not.toBe(kept);
+	});
+
+	test('stopping with nothing running asks for nothing', () => {
+		ui.stopMeasure();
+		expect(stops).toBe(0);
+		expect(ui.measure.stopping).toBe(false);
+	});
+
+	test('only the backend’s own cancel string is quiet — a real failure is still reported mid-stop', async () => {
+		let giveUp!: (e: Error) => void;
+		gate = new Promise<void>((_, reject) => (giveUp = reject));
+		const pass = ui.measureLevels();
+		ui.stopMeasure();
+		giveUp(new Error('ffmpeg exited with exit status: 1'));
+		await pass;
+		expect(ui.measure.error).toBe('ffmpeg exited with exit status: 1');
+		expect(ui.measure.stopping).toBe(false);
+		expect(shown).toHaveLength(1);
 	});
 
 	test('an answer goes out of date with the next edit, and not before', async () => {

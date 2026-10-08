@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { getHistory, getLevels, revertTo, setMasterLimiter, setMasterVolume, setTrackVolume } from './api';
+import { cancelLevels, getHistory, getLevels, revertTo, setMasterLimiter, setMasterVolume, setTrackVolume } from './api';
 
 // Under bun there is no Tauri, so these drive the browser harness's master bus and
 // its stand-in for `get_levels`, which have to keep the backend's contract: the
@@ -13,7 +13,7 @@ beforeEach(async () => {
 describe('the master bus (browser harness)', () => {
 	test('an untouched timeline has no master, and moving the fader writes one', async () => {
 		const t = await setMasterVolume(0.5);
-		expect(t.master).toEqual({ volume: 0.5, limiter: false, ceiling_db: -1 });
+		expect(t.master).toEqual({ volume: 0.5, limiter: false, ceiling_db: -1.5 });
 		// Back at the defaults it is absent again, as the saved file has it.
 		const back = await setMasterVolume(1);
 		expect(back.master).toBeUndefined();
@@ -79,5 +79,9 @@ describe('get_levels (browser harness)', () => {
 		const norm = await getLevels(null, true);
 		expect(norm.loudnorm).toBe(true);
 		expect(norm.master?.integrated_lufs).toBe(-14);
+	});
+
+	test('there is nothing to stop in the browser, and asking is not an error', async () => {
+		await expect(cancelLevels()).resolves.toBeUndefined();
 	});
 });

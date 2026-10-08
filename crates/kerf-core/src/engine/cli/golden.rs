@@ -15,14 +15,16 @@
 //! moved no existing case — `KERF_GOLDEN_CASES` on the commit before and after agrees
 //! on all of `0..CASES` — and only appended block lines to the three digest files.
 //!
-//! **Machine-independent by construction.** The builders read the machine in four
+//! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
 //! `build_preview_args_with` seam), `zscale_available()` (`with_zscale`; a case
-//! holding HDR footage is built *both* ways), `drawtext`'s resolved font path (no
-//! overlay names a font, so none is looked up), and libm: the compressor and gate
-//! thresholds go through `powf`, whose last digits differ between glibc builds
-//! (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those numbers
-//! to 10 significant digits, which still pins the dB mapping. The digest files are
+//! holding HDR footage is built *both* ways), `alimiter_latency_available()`
+//! (`with_alimiter_latency`; every case is built with the option, and a case with the
+//! limiter on has its export argv appended once more without it), `drawtext`'s
+//! resolved font path (no overlay names a font, so none is looked up), and libm: the
+//! compressor and gate thresholds go through `powf`, whose last digits differ between
+//! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
+//! numbers to 10 significant digits, which still pins the dB mapping. The digest files are
 //! LF whatever the checkout (`.gitattributes`, and the comparison ignores `\r`).
 //!
 //! **Bless** after an intended argv change, from the repo root:
@@ -165,6 +167,8 @@ loudnorm loudnorm=
 master-fader dropout_transition=0,volume=
 master-limiter ,alimiter=limit=
 master-limiter-loudnorm :latency=1,loudnorm=
+master-limiter-no-latency :level=0[outa]
+master-limiter-no-latency-loudnorm :level=0,loudnorm=
 master-fader-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,volume=
 master-limiter-ducked [aducked]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=
 master-fader-clamped ,volume=4,
@@ -781,16 +785,29 @@ fn repr(args: &Result<Vec<String>>) -> String {
 }
 
 /// What one case builds: the argv text of each builder (a case holding HDR footage
-/// built with `zscale` present *and* absent), and the transition branches it took.
+/// built with `zscale` present *and* absent; a case with the master limiter on has its
+/// export built once more for an ffmpeg whose `alimiter` has no `latency`, the one
+/// place the other two builders — which carry no sound — would only repeat
+/// themselves), and the transition branches it took.
 fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     let hdr = |id| assets.iter().any(|a| a.id == id && a.hdr().is_some());
     let both = c.timeline.tracks.iter().flat_map(|t| &t.clips).any(|k| hdr(k.asset_id));
     let mut text = [String::new(), String::new(), String::new()];
+    let (pass, null_sink, passlog) = c.pass;
+    let export = || {
+        repr(&build_export_args_phase(
+            &c.timeline,
+            assets,
+            "/golden/out.mp4",
+            &c.opts,
+            pass,
+            null_sink,
+            passlog,
+        ))
+    };
     for &zscale in if both { &[true, false][..] } else { &[true][..] } {
-        with_zscale(zscale, || {
-            let (pass, null_sink, passlog) = c.pass;
-            let export = build_export_args_phase(&c.timeline, assets, "/golden/out.mp4", &c.opts, pass, null_sink, passlog);
-            text[0] += &repr(&export);
+        pinned(zscale, true, || {
+            text[0] += &export();
             for (t, out) in &c.stills {
                 text[1] += &repr(&build_still_args(
                     &c.timeline,
@@ -807,7 +824,15 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
             text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, quality, hw));
         });
     }
+    if c.timeline.master.limiter {
+        pinned(true, false, || text[0] += &export());
+    }
     (text, transitions(c, assets))
+}
+
+/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`.
+fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
+    with_zscale(zscale, || with_alimiter_latency(latency, f))
 }
 
 /// Which way each transition went, from what `transition_fx` did with it: a dip

@@ -5146,6 +5146,56 @@ fn build_filter_complex_metered(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`alimiter_latency_available`] answers on this thread while a test pins it.
+    static ALIMITER_LATENCY_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` as if this ffmpeg's `alimiter` did (`true`) or did not (`false`) have `latency`.
+#[cfg(test)]
+fn with_alimiter_latency<R>(available: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ALIMITER_LATENCY_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(ALIMITER_LATENCY_OVERRIDE.with(|c| c.replace(Some(available))));
+    f()
+}
+
+/// Whether `ffmpeg -h filter=alimiter` lists a `latency` option (pure, unit-tested).
+fn help_lists_latency(help: &str) -> bool {
+    help.lines().any(|l| l.split_whitespace().next() == Some("latency"))
+}
+
+/// Whether this ffmpeg's `alimiter` takes `latency`, probed once per process. The
+/// option arrived after FFmpeg 4.4 (Ubuntu 22.04's ffmpeg), which refuses the whole
+/// graph with `Option 'latency' not found` — every limiter-on export and level
+/// measurement. A binary that will not run reads as having it (the modern spelling,
+/// like [`zscale_available`]: any render on it is about to fail anyway, and it keeps
+/// the builders' output from depending on whether a test machine has ffmpeg).
+fn alimiter_latency_available() -> bool {
+    // Tests pin the answer so an argv oracle does not depend on the ffmpeg
+    // installed where it runs (see `golden`).
+    #[cfg(test)]
+    if let Some(forced) = ALIMITER_LATENCY_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=alimiter"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| help_lists_latency(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or(true);
+        tracing::debug!(available = ok, "probed ffmpeg for alimiter latency");
+        ok
+    })
+}
+
 /// The filters the master bus adds after the final sum — its fader, then its
 /// limiter — each led by the comma that joins it to the `amix` before it, or
 /// the empty string while the master is neutral (the graph exactly as it was
@@ -5156,7 +5206,10 @@ fn build_filter_complex_metered(
 /// the peak lands at full scale, which would turn a ceiling into a makeup gain —
 /// and `latency=1`, because without it the lookahead delays the whole mix by the
 /// attack time and drops the last few milliseconds at the end, putting the sound
-/// out of step with the picture. Attack 5 ms is the filter's own lookahead; the
+/// out of step with the picture. An ffmpeg whose `alimiter` has no `latency`
+/// ([`alimiter_latency_available`]) is given the limiter without it: the mix then
+/// trails the picture by the 5 ms attack and loses its last 5 ms, under a frame at
+/// any rate. Attack 5 ms is the filter's own lookahead; the
 /// 100 ms release is slow enough not to pump on low notes. The ceiling is
 /// rounded to six decimals, which is far below anything audible and keeps the
 /// text from depending on the last digit of a libm `pow`.
@@ -5168,7 +5221,8 @@ fn master_filters(master: &crate::model::MasterBus) -> String {
     }
     if master.limiter {
         let limit = (master.limit_linear() * 1e6).round() / 1e6;
-        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0:latency=1", fnum(limit));
+        let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
+        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit));
     }
     out
 }
@@ -9543,15 +9597,82 @@ mod tests {
             limiter: true,
             ..MasterBus::default()
         });
-        let g = mix_of(&tl, &assets, &ExportOptions::default());
-        // -1 dB is 0.891251 linear. `level=0` because the default auto-levels the
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &ExportOptions::default()));
+        // -1.5 dB is 0.841395 linear. `level=0` because the default auto-levels the
         // output back up to full scale; `latency=1` because without it the lookahead
         // delays the sound against the picture and drops its tail.
         assert!(
-            g.contains("dropout_transition=0,alimiter=limit=0.891251:attack=5:release=100:level=0:latency=1[outa]"),
+            g.contains("dropout_transition=0,alimiter=limit=0.841395:attack=5:release=100:level=0:latency=1[outa]"),
             "{g}"
         );
         assert!(!g.contains("dropout_transition=0,volume"), "no fader at unity: {g}");
+    }
+
+    #[test]
+    fn an_alimiter_without_latency_is_given_the_limiter_without_it() {
+        // FFmpeg 4.4 refuses the option (`Option 'latency' not found`) and with it the
+        // whole graph; the rest of the limiter is spelled exactly as before.
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        let g = with_alimiter_latency(false, || mix_of(&tl, &assets, &ExportOptions::default()));
+        assert!(
+            g.contains("dropout_transition=0,alimiter=limit=0.841395:attack=5:release=100:level=0[outa]"),
+            "{g}"
+        );
+        assert!(!g.contains("latency"), "{g}");
+        // A fader-only master has no limiter to spell.
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.5,
+            ..MasterBus::default()
+        });
+        let g = with_alimiter_latency(false, || mix_of(&tl, &assets, &ExportOptions::default()));
+        assert!(g.contains("dropout_transition=0,volume=0.5[outa]"), "{g}");
+    }
+
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_latency_probe_agrees_with_whether_this_ffmpeg_accepts_the_option() {
+        // The probe reads help text; what matters is that a graph spelled by the answer
+        // runs. FFmpeg 4.4 exits 1 on `latency=1` ("Option 'latency' not found").
+        let accepts = |opts: &str| {
+            command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "quiet", "-f", "lavfi", "-i", "sine=d=0.1"])
+                .args(["-af", &format!("alimiter={opts}"), "-f", "null", "-"])
+                .status_bounded()
+                .expect("run ffmpeg")
+                .success()
+        };
+        assert!(accepts("limit=0.8:attack=5:release=100:level=0"), "the limiter itself");
+        assert_eq!(
+            accepts("limit=0.8:attack=5:release=100:level=0:latency=1"),
+            alimiter_latency_available()
+        );
+        let tl = master_cut(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        let g = mix_of(&tl.0, &tl.1, &ExportOptions::default());
+        assert_eq!(g.contains(":latency=1"), alimiter_latency_available(), "{g}");
+    }
+
+    #[test]
+    fn the_latency_option_is_read_off_the_filters_own_help() {
+        // `ffmpeg -h filter=alimiter` as FFmpeg 4.4.2 (Ubuntu 22.04) prints it, and 9.0.2.
+        let old = "Filter alimiter\n  Audio lookahead limiter.\nalimiter AVOptions:\n  \
+                   level_in          <double>     ..F.A...... set input level (from 0.015625 to 64) (default 1)\n  \
+                   release           <double>     ..F.A...... set release (from 1 to 8000) (default 50)\n  \
+                   level             <boolean>    ..F.A...... auto level (default true)\n";
+        let new = format!(
+            "{old}   latency           <boolean>    ..F.A....T. compensate delay (default false)\n\n\
+             This filter has support for timeline through the 'enable' option.\n"
+        );
+        assert!(!help_lists_latency(old));
+        assert!(help_lists_latency(&new));
+        // Only an option of that name: a description that mentions it is not one.
+        assert!(!help_lists_latency("  asc <boolean> set the latency of the asc\n"));
+        assert!(!help_lists_latency(""));
     }
 
     #[test]
@@ -9598,7 +9719,7 @@ mod tests {
             range: Some(crate::model::TimeRange { start: 2.0, end: 6.0 }),
             ..ExportOptions::default()
         };
-        assert!(mix_of(&tl, &assets, &opts).contains("alimiter=limit=0.891251"));
+        assert!(mix_of(&tl, &assets, &opts).contains("alimiter=limit=0.841395"));
     }
 
     #[test]
@@ -9635,21 +9756,22 @@ mod tests {
             limiter: true,
             ceiling_db,
         };
+        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus));
         // Not a number: no fader, the default ceiling.
         assert_eq!(
-            master_filters(&bus(f64::NAN, f64::NAN)),
-            ",alimiter=limit=0.891251:attack=5:release=100:level=0:latency=1"
+            filters(bus(f64::NAN, f64::NAN)),
+            ",alimiter=limit=0.841395:attack=5:release=100:level=0:latency=1"
         );
         // Beyond the ends: clamped to what `alimiter` accepts (its `limit` is 0.0625..=1).
         assert_eq!(
-            master_filters(&bus(9.0, 12.0)),
+            filters(bus(9.0, 12.0)),
             ",volume=4,alimiter=limit=1:attack=5:release=100:level=0:latency=1"
         );
         assert_eq!(
-            master_filters(&bus(-1.0, -90.0)),
+            filters(bus(-1.0, -90.0)),
             ",volume=0,alimiter=limit=0.063096:attack=5:release=100:level=0:latency=1"
         );
-        assert_eq!(master_filters(&MasterBus::default()), "");
+        assert_eq!(filters(MasterBus::default()), "");
     }
 
     #[test]

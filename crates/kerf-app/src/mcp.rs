@@ -485,7 +485,7 @@ struct SetMasterLimiterParams {
     #[schemars(description = "true switches the limiter on, false switches it off")]
     enabled: bool,
     #[schemars(
-        description = "Where the limiter stops the signal, in dBFS: -1 keeps the mix a decibel under full scale. Clamped to -24..0. Omit to keep the current ceiling (-1 until one is chosen)"
+        description = "Where the limiter stops the signal, in dBFS: -1.5 keeps the mix a decibel and a half under full scale. Clamped to -24..0. Omit to keep the current ceiling (-1.5 until one is chosen)"
     )]
     ceiling_db: Option<f64>,
 }
@@ -1595,12 +1595,15 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Switch the master limiter on or off, optionally moving its ceiling (dBFS, default -1). A \
+        description = "Switch the master limiter on or off, optionally moving its ceiling (dBFS, default -1.5). A \
                        lookahead limiter on the finished mix that holds the loudest peaks under the ceiling \
                        instead of letting them clip — turn it on for a cut destined for a platform, which asks for \
-                       a true peak under -1 dBTP. It is a sample-peak ceiling, so confirm the true peak with \
-                       get_levels. A limiter has nothing to do on a mix already under its ceiling and leaves it \
-                       alone. Returns the master bus."
+                       a true peak under -1 dBTP. It is a sample-peak ceiling: the true peak between samples can \
+                       read above it (up to about 1 dB on a pure high tone), which is why the default sits half a \
+                       decibel under that line. Confirm the true peak with get_levels, and if it is still over \
+                       -1 dBTP with the limiter on, lower the ceiling by the overshoot plus half a decibel (the \
+                       notes say to what) instead of switching it on again. A limiter has nothing to do on a mix \
+                       already under its ceiling and leaves it alone. Returns the master bus."
     )]
     fn set_master_limiter(&self, Parameters(p): Parameters<SetMasterLimiterParams>) -> Result<String, McpError> {
         self.edit(|project| {
@@ -4078,6 +4081,21 @@ mod tests {
             schema("get_levels"),
             (vec!["loudnorm".to_string(), "range".to_string()], Vec::<String>::new())
         );
+    }
+
+    /// The words an agent reads have to name the ceiling the engine actually defaults to
+    /// (it moved from -1 to -1.5 dBFS once the limiter was measured to overshoot).
+    #[test]
+    fn the_limiter_tool_names_the_default_ceiling_it_really_has() {
+        let default = format!("{}", kerf_core::MASTER_DEFAULT_CEILING_DB);
+        let tools = router().list_all();
+        let limiter = tools.iter().find(|t| t.name == "set_master_limiter").expect("registered");
+        let text = limiter.description.as_deref().unwrap_or_default();
+        assert!(text.contains(&format!("default {default}")), "{text}");
+        let param = limiter.input_schema["properties"]["ceiling_db"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(param.contains(&format!("({default} until")), "{param}");
     }
 
     #[test]

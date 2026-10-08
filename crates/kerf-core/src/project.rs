@@ -830,7 +830,13 @@ impl Project {
                 level: measured.tracks.iter().find(|(ti, _)| *ti == i).map(|(_, l)| *l),
             })
             .collect();
-        Ok(Levels::new(measured.duration, measured.master, tracks, loudnorm))
+        Ok(Levels::new(
+            measured.duration,
+            measured.master,
+            tracks,
+            loudnorm,
+            &timeline.master,
+        ))
     }
 
     /// [`Project::measure_levels`] over the working timeline, holding `&self`
@@ -5472,7 +5478,7 @@ mod tests {
         let project = Project::sample().unwrap();
         let on = project.set_master_limiter(true, None).unwrap();
         assert!(on.limiter);
-        assert_eq!(on.ceiling_db, -1.0, "the default ceiling when none was ever chosen");
+        assert_eq!(on.ceiling_db, -1.5, "the default ceiling when none was ever chosen");
 
         let moved = project.set_master_limiter(true, Some(-3.5)).unwrap();
         assert_eq!(moved.ceiling_db, -3.5);

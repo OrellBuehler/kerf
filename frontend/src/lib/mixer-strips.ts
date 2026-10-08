@@ -5,12 +5,14 @@
  * A track is *audible* when it can put sound in the mix: an audio track always
  * (even an empty one — its fader is the thing you reach for before dropping a clip
  * on it), a video track only while one of its clips plays sound of its own. A
- * picture whose sound was **detached** onto an audio track (`Clip.source_audio`
- * false) is silent, so a video track made only of those has no strip: its sound
- * rides the audio track it was detached to, and that track's fader is the one that
- * moves it. This is `clip_sounds` in the export graph (kerf-core `engine/cli.rs`),
- * which is what the render does with such a clip — so the faders offered are the
- * faders that do something. */
+ * picture whose sound was **detached** onto an audio track is silent, so a video
+ * track made only of those has no strip: its sound rides the audio track it was
+ * detached to, and that track's fader is the one that moves it.
+ *
+ * This anticipates linked A/V (the unmerged feat/linked-av PR), whose
+ * `Clip.source_audio` — written only when false — marks a detached picture. Until it
+ * lands no clip carries the field and every clip with an audio stream sounds; the
+ * export graph's own rule arrives with it, and this one is to match it. */
 
 import { trackRenders } from './levels';
 import type { StreamKind, Timeline, Track } from './types';
@@ -23,7 +25,7 @@ export interface SoundingClip {
 }
 
 /** Whether a clip puts sound in the mix: its asset has an audio stream *and* the clip
- *  still plays it — `clip_sounds` in the export graph. A detached picture does not. */
+ *  still plays it (`source_audio` not false, see above). A detached picture does not. */
 export function clipSounds(clip: SoundingClip, audibleAssets: ReadonlySet<string>): boolean {
 	return clip.source_audio !== false && audibleAssets.has(clip.asset_id);
 }

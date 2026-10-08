@@ -2374,6 +2374,13 @@ export async function cancelExport(): Promise<void> {
 	return invoke<void>('cancel_export');
 }
 
+/** Ask the running loudness measurement (`getLevels`) to give up; it then rejects
+ *  with `levels cancelled`. */
+export async function cancelLevels(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_levels');
+}
+
 /** Ask the running analysis pass to give up. It stops between steps, and about
  *  once a second during transcription — the step that runs for minutes. */
 export async function cancelAnalysis(): Promise<void> {

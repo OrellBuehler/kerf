@@ -24,12 +24,16 @@ import { clipDuration } from './types';
 export const MASTER_MAX_VOLUME = 4;
 /** The lowest limiter ceiling (`MASTER_MIN_CEILING_DB`): the filter's floor of 0.0625. */
 export const MASTER_MIN_CEILING_DB = -24;
-/** The default limiter ceiling, dBFS (`MASTER_DEFAULT_CEILING_DB`). */
-export const MASTER_DEFAULT_CEILING_DB = -1;
+/** The default limiter ceiling, dBFS (`MASTER_DEFAULT_CEILING_DB`): the limiter holds the
+ *  *sample* peak and the peak between samples runs above it, so it sits half a dB under
+ *  the -1 dBTP that platforms ask for. */
+export const MASTER_DEFAULT_CEILING_DB = -1.5;
 /** The streaming loudness target the notes judge against (`LEVELS_TARGET_LUFS`). */
 export const LEVELS_TARGET_LUFS = -14;
 /** The true-peak ceiling platforms ask of a delivery (`LEVELS_TRUE_PEAK_CEILING_DBTP`). */
 export const LEVELS_TRUE_PEAK_CEILING_DBTP = -1;
+/** How much further than the overshoot the notes advise lowering a ceiling (`LEVELS_CEILING_MARGIN_DB`). */
+const LEVELS_CEILING_MARGIN_DB = 0.5;
 
 /** A master that does nothing — what a project that never touched it holds. */
 export const DEFAULT_MASTER: MasterBus = { volume: 1, limiter: false, ceiling_db: MASTER_DEFAULT_CEILING_DB };
@@ -80,9 +84,11 @@ const signed1 = (x: number): string => `${x >= 0 ? '+' : ''}${f1(x)}`;
 /**
  * The advice behind `Levels.notes` — the mirror of `level_notes` in
  * crates/kerf-core/src/model.rs, word for word, so the harness reads like the
- * backend about the same numbers.
+ * backend about the same numbers. `bus` is the master the mix went through: a true
+ * peak over the line with the limiter already on is a ceiling to lower, not a limiter
+ * to turn on.
  */
-export function levelNotes(master: LevelReading | null, tracks: TrackLevels[]): string[] {
+export function levelNotes(master: LevelReading | null, tracks: TrackLevels[], bus: MasterBus = DEFAULT_MASTER): string[] {
 	if (!master) return ['The cut has no audio to measure.'];
 	const notes: string[] = [];
 	const i = master.integrated_lufs;
@@ -102,15 +108,29 @@ export function levelNotes(master: LevelReading | null, tracks: TrackLevels[]): 
 	}
 	const tp = master.true_peak_dbtp;
 	if (tp !== null && tp > LEVELS_TRUE_PEAK_CEILING_DBTP) {
-		notes.push(
-			`True peak ${f1(tp)} dBTP is over the ${f0(LEVELS_TRUE_PEAK_CEILING_DBTP)} dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter (set_master_limiter) or lower the master.`
-		);
+		const over = `True peak ${f1(tp)} dBTP is over the ${f0(LEVELS_TRUE_PEAK_CEILING_DBTP)} dBTP platforms ask for and can clip when re-encoded.`;
+		if (bus.limiter) {
+			// The limiter holds the sample peak at its ceiling, so what is left over is the
+			// peak between samples: take the ceiling down by that, and a margin.
+			const ceiling = Number.isFinite(bus.ceiling_db) ? clampCeiling(bus.ceiling_db) : MASTER_DEFAULT_CEILING_DB;
+			const lower = Math.max(
+				ceiling - (tp - LEVELS_TRUE_PEAK_CEILING_DBTP) - LEVELS_CEILING_MARGIN_DB,
+				MASTER_MIN_CEILING_DB
+			);
+			notes.push(
+				lower < ceiling
+					? `${over} The master limiter is already on, but it holds the sample peak at ${f1(ceiling)} dBFS and the peak between samples runs above that. Lower its ceiling to about ${f1(lower)} dBFS (set_master_limiter).`
+					: `${over} The master limiter is already on at its lowest ceiling. Lower the master or the loudest track.`
+			);
+		} else {
+			notes.push(`${over} Turn on the master limiter (set_master_limiter) or lower the master.`);
+		}
 	}
 	for (const t of tracks) {
 		const peak = t.level?.peak_dbfs;
 		if (peak !== null && peak !== undefined && peak > 0) {
 			notes.push(
-				`Track ${t.name} peaks at ${signed1(peak)} dBFS before the master and will clip the sum — lower its fader.`
+				`Track ${t.name} peaks at ${signed1(peak)} dBFS before the master, over full scale. Nothing clips until the mix is written, so the master can still bring it under (its fader or limiter); otherwise lower this track's fader.`
 			);
 		}
 	}
@@ -238,7 +258,7 @@ export function estimateLevels(
 		tracks,
 		loudnorm,
 		target_lufs: LEVELS_TARGET_LUFS,
-		notes: levelNotes(master, tracks),
+		notes: levelNotes(master, tracks, masterOf(timeline)),
 		estimated: true
 	};
 }

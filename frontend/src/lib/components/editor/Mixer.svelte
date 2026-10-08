@@ -108,9 +108,11 @@
 			{master}
 			meter={meterOf('master')}
 			measuring={measure.running}
+			stopping={measure.stopping}
 			{result}
 			{stale}
 			onmeasure={() => void ui.measureLevels()}
+			onstop={() => ui.stopMeasure()}
 			onclear={() => clear('master')}
 		/>
 	</div>

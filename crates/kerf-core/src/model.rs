@@ -515,6 +515,10 @@ pub struct Loudness {
 pub const LEVELS_TARGET_LUFS: f64 = -14.0;
 /// The true-peak ceiling platforms ask of a delivery, in dBTP.
 pub const LEVELS_TRUE_PEAK_CEILING_DBTP: f64 = -1.0;
+/// How much further than the overshoot the notes advise lowering a limiter's ceiling:
+/// the peak between samples moves with the signal, so landing exactly on the line is
+/// not landing under it.
+const LEVELS_CEILING_MARGIN_DB: f64 = 0.5;
 
 /// What one `ebur128` meter read over a stretch of the mix. Every number is
 /// `None` where there is nothing to report — a silent stretch has no integrated
@@ -573,9 +577,11 @@ pub struct Levels {
 }
 
 impl Levels {
-    /// Put a measurement together with the tracks it came from and judge it.
-    pub fn new(duration: f64, master: Option<LevelReading>, tracks: Vec<TrackLevels>, loudnorm: bool) -> Self {
-        let notes = level_notes(master.as_ref(), &tracks);
+    /// Put a measurement together with the tracks it came from and judge it, given
+    /// the master bus the mix went through (the advice for a hot peak depends on
+    /// whether its limiter is already on).
+    pub fn new(duration: f64, master: Option<LevelReading>, tracks: Vec<TrackLevels>, loudnorm: bool, bus: &MasterBus) -> Self {
+        let notes = level_notes(master.as_ref(), &tracks, bus);
         Self {
             duration,
             master,
@@ -588,7 +594,7 @@ impl Levels {
 }
 
 /// The advice behind [`Levels::notes`], pure so the thresholds are tested.
-fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels]) -> Vec<String> {
+fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels], bus: &MasterBus) -> Vec<String> {
     let Some(master) = master else {
         return vec!["The cut has no audio to measure.".to_string()];
     };
@@ -610,15 +616,36 @@ fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels]) -> Vec<Str
         )),
     }
     if let Some(tp) = master.true_peak_dbtp.filter(|tp| *tp > LEVELS_TRUE_PEAK_CEILING_DBTP) {
-        notes.push(format!(
+        let over = format!(
             "True peak {tp:.1} dBTP is over the {LEVELS_TRUE_PEAK_CEILING_DBTP:.0} dBTP platforms ask for and can clip when \
-             re-encoded. Turn on the master limiter (set_master_limiter) or lower the master."
-        ));
+             re-encoded."
+        );
+        if bus.limiter {
+            // The limiter holds the *sample* peak at its ceiling, so what is left over
+            // is the peak between samples: take the ceiling down by that, and a margin.
+            let ceiling = bus.safe_ceiling_db();
+            let lower = (ceiling - (tp - LEVELS_TRUE_PEAK_CEILING_DBTP) - LEVELS_CEILING_MARGIN_DB).max(MASTER_MIN_CEILING_DB);
+            if lower < ceiling {
+                notes.push(format!(
+                    "{over} The master limiter is already on, but it holds the sample peak at {ceiling:.1} dBFS and the peak \
+                     between samples runs above that. Lower its ceiling to about {lower:.1} dBFS (set_master_limiter)."
+                ));
+            } else {
+                notes.push(format!(
+                    "{over} The master limiter is already on at its lowest ceiling. Lower the master or the loudest track."
+                ));
+            }
+        } else {
+            notes.push(format!(
+                "{over} Turn on the master limiter (set_master_limiter) or lower the master."
+            ));
+        }
     }
     for track in tracks {
         if let Some(peak) = track.level.and_then(|l| l.peak_dbfs).filter(|p| *p > 0.0) {
             notes.push(format!(
-                "Track {} peaks at {peak:+.1} dBFS before the master and will clip the sum — lower its fader.",
+                "Track {} peaks at {peak:+.1} dBFS before the master, over full scale. Nothing clips until the mix is written, \
+                 so the master can still bring it under (its fader or limiter); otherwise lower this track's fader.",
                 track.name
             ));
         }
@@ -3180,8 +3207,11 @@ pub const MASTER_MAX_VOLUME: f64 = 4.0;
 /// The lowest ceiling the limiter can be given: `alimiter` takes a linear
 /// `limit` of at least 0.0625, which is -24.08 dB.
 pub const MASTER_MIN_CEILING_DB: f64 = -24.0;
-/// The default limiter ceiling, in dBFS.
-pub const MASTER_DEFAULT_CEILING_DB: f64 = -1.0;
+/// The default limiter ceiling, in dBFS: `loudnorm`'s own true-peak target. The limiter
+/// holds the *sample* peak, and the peak between samples runs above it (an 11 kHz tone
+/// at a -1 dBFS ceiling read -0.2 dBTP, one at 15 kHz +0.1), so the default leaves a
+/// half decibel under the -1 dBTP that platforms ask for.
+pub const MASTER_DEFAULT_CEILING_DB: f64 = -1.5;
 
 fn unity_master_volume() -> f64 {
     1.0
@@ -6351,7 +6381,7 @@ mod tests {
             MasterBus {
                 volume: 1.0,
                 limiter: true,
-                ceiling_db: -1.0
+                ceiling_db: -1.5
             }
         );
     }
@@ -6395,7 +6425,7 @@ mod tests {
             ..MasterBus::default()
         };
         assert_eq!(m.safe_volume(), 0.0);
-        assert!((MasterBus::default().limit_linear() - 0.891_250_938).abs() < 1e-6, "-1 dB");
+        assert!((MasterBus::default().limit_linear() - 0.841_395_142).abs() < 1e-6, "-1.5 dB");
     }
 
     #[test]
@@ -6440,13 +6470,13 @@ mod tests {
         let mut limited = tl.clone();
         limited.master.limiter = true;
         let detail = tl.diff(&limited).entries[0].detail.clone().unwrap();
-        assert_eq!(detail, "limiter on at -1.0 dB");
+        assert_eq!(detail, "limiter on at -1.5 dB");
         // Moving the ceiling matters only while the limiter is on.
         let mut moved = limited.clone();
         moved.master.ceiling_db = -3.0;
         assert_eq!(
             limited.diff(&moved).entries[0].detail.as_deref(),
-            Some("limiter ceiling -1.0 → -3.0 dB")
+            Some("limiter ceiling -1.5 → -3.0 dB")
         );
         let mut parked = tl.clone();
         parked.master.ceiling_db = -3.0;
@@ -6484,7 +6514,7 @@ mod tests {
 
     #[test]
     fn the_levels_notes_judge_the_mix_against_the_streaming_target() {
-        let notes = |i, tp| Levels::new(10.0, Some(reading(i, tp)), Vec::new(), false).notes;
+        let notes = |i, tp| Levels::new(10.0, Some(reading(i, tp)), Vec::new(), false, &MasterBus::default()).notes;
         assert!(notes(Some(-14.0), Some(-3.0))[0].contains("close to"), "on target");
         assert!(notes(Some(-13.2), Some(-3.0))[0].contains("close to"), "within a LU of it");
         assert!(notes(Some(-9.0), Some(-3.0))[0].contains("5.0 LU over"), "too loud");
@@ -6505,16 +6535,76 @@ mod tests {
     }
 
     #[test]
-    fn the_levels_notes_name_a_track_that_clips_the_sum() {
+    fn the_levels_notes_name_a_track_over_full_scale() {
         let tracks = vec![strip("A1", -6.0), strip("Music", 1.5)];
-        let notes = Levels::new(10.0, Some(reading(Some(-14.0), Some(-3.0))), tracks, false).notes;
+        let bus = MasterBus::default();
+        let notes = Levels::new(10.0, Some(reading(Some(-14.0), Some(-3.0))), tracks, false, &bus).notes;
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[1].contains("Music") && notes[1].contains("+1.5 dBFS"), "{notes:?}");
+        // The mix is float, so a hot strip is not a clip yet: the note must not claim one.
+        assert!(!notes[1].contains("will clip"), "{notes:?}");
         // No audio at all is one plain note.
         assert_eq!(
-            Levels::new(0.0, None, Vec::new(), false).notes,
+            Levels::new(0.0, None, Vec::new(), false, &bus).notes,
             ["The cut has no audio to measure."]
         );
+    }
+
+    #[test]
+    fn a_true_peak_over_the_ceiling_with_the_limiter_on_lowers_the_ceiling() {
+        // The limiter holds the sample peak, so "turn on the limiter" is advice already
+        // taken: an agent following it again would loop. It is told how far to lower the
+        // ceiling instead — the overshoot past -1 dBTP, and half a decibel more.
+        let on = |ceiling_db| MasterBus {
+            limiter: true,
+            ceiling_db,
+            ..MasterBus::default()
+        };
+        let notes = |tp, bus: &MasterBus| Levels::new(10.0, Some(reading(Some(-14.0), Some(tp))), Vec::new(), false, bus).notes;
+
+        // 11 kHz at a -1 dBFS ceiling, as measured: -0.2 dBTP is 0.8 over, so -2.3.
+        let n = notes(-0.2, &on(-1.0));
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert!(!n[1].contains("Turn on"), "{n:?}");
+        assert!(
+            n[1].contains("-0.2 dBTP") && n[1].contains("-1.0 dBFS") && n[1].contains("about -2.3 dBFS"),
+            "{n:?}"
+        );
+        assert!(n[1].contains("set_master_limiter"), "{n:?}");
+        // Word for word the string in the frontend's `levels.test.ts` (the harness mirrors this).
+        assert_eq!(
+            n[1],
+            "True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already \
+             on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Lower its ceiling to \
+             about -2.3 dBFS (set_master_limiter)."
+        );
+        // From the default ceiling: 0.4 dBTP is 1.4 over.
+        assert!(
+            notes(0.4, &on(MASTER_DEFAULT_CEILING_DB))[1].contains("about -3.4 dBFS"),
+            "from -1.5"
+        );
+        // Never below what the limiter can be given; at the floor there is nothing to lower.
+        assert!(notes(10.0, &on(-20.0))[1].contains("about -24.0 dBFS"));
+        let floor = notes(0.4, &on(MASTER_MIN_CEILING_DB));
+        assert!(
+            floor[1].contains("lowest ceiling") && !floor[1].contains("about"),
+            "{floor:?}"
+        );
+        // A ceiling a `.kerf` file stored out of range reads as the engine clamps it.
+        assert!(notes(0.4, &on(f64::NAN))[1].contains("about -3.4 dBFS"));
+        // With the limiter off the advice is still to turn it on, and a stored ceiling alone is not "on".
+        let off = MasterBus {
+            ceiling_db: -6.0,
+            ..MasterBus::default()
+        };
+        assert_eq!(
+            notes(0.4, &MasterBus::default())[1],
+            "True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter \
+             (set_master_limiter) or lower the master."
+        );
+        assert!(notes(0.4, &off)[1].contains("Turn on the master limiter"));
+        // Under the line: no note, limiter or not.
+        assert_eq!(notes(-1.0, &on(-1.5)).len(), 1);
     }
 
     #[test]

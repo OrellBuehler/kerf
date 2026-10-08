@@ -32,17 +32,21 @@
 		master,
 		meter,
 		measuring,
+		stopping,
 		result,
 		stale,
 		onmeasure,
+		onstop,
 		onclear
 	}: {
 		master: MasterBus;
 		meter: StereoMeter;
 		measuring: boolean;
+		stopping: boolean;
 		result: MeasureResult | null;
 		stale: boolean;
 		onmeasure: () => void;
+		onstop: () => void;
 		onclear: () => void;
 	} = $props();
 
@@ -169,13 +173,17 @@
 	<button
 		type="button"
 		class="measure"
-		disabled={measuring}
+		disabled={stopping}
 		aria-busy={measuring}
-		title="Measure the loudness of the cut — integrated LUFS, true peak and loudness range, for the finished mix and each track — over the whole cut, or the in / out range when both marks are set. It reads the audio the export would render, so it takes a while on a long cut."
-		onclick={onmeasure}
+		title={measuring
+			? 'Stop measuring. The pass reads the whole mix, so on a long cut it can run for minutes; stopping keeps the last result.'
+			: 'Measure the loudness of the cut — integrated LUFS, true peak and loudness range, for the finished mix and each track — over the whole cut, or the in / out range when both marks are set. It reads the audio the export would render, so it takes a while on a long cut.'}
+		onclick={measuring ? onstop : onmeasure}
 	>
 		{#if measuring}
-			<span class="kerf-spin" style="display:inline-flex"><Icon n="loader" s={13} /></span>Measuring…
+			<span class="kerf-spin" style="display:inline-flex"><Icon n="loader" s={13} /></span>{stopping
+				? 'Stopping…'
+				: 'Stop'}
 		{:else}
 			<Icon n="audio-waveform" s={13} />Measure
 		{/if}

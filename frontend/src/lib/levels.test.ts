@@ -8,12 +8,14 @@ import {
 	estimateLevels,
 	isNeutralMaster,
 	levelNotes,
+	MASTER_DEFAULT_CEILING_DB,
+	MASTER_MIN_CEILING_DB,
 	masterOf,
 	nudgeCeiling,
 	posToCeiling,
 	trackRenders
 } from './levels';
-import type { Asset, LevelReading, Loudness, Timeline, TrackLevels } from './types';
+import type { Asset, LevelReading, Loudness, MasterBus, Timeline, TrackLevels } from './types';
 
 const reading = (integrated: number | null, truePeak: number | null): LevelReading => ({
 	integrated_lufs: integrated,
@@ -26,7 +28,7 @@ const reading = (integrated: number | null, truePeak: number | null): LevelReadi
 describe('the master bus', () => {
 	test('an absent or partial master is the default, and the default is neutral', () => {
 		expect(masterOf({})).toEqual(DEFAULT_MASTER);
-		expect(masterOf({ master: { volume: 0.5 } as never })).toEqual({ volume: 0.5, limiter: false, ceiling_db: -1 });
+		expect(masterOf({ master: { volume: 0.5 } as never })).toEqual({ volume: 0.5, limiter: false, ceiling_db: -1.5 });
 		expect(isNeutralMaster(DEFAULT_MASTER)).toBe(true);
 		// A ceiling the limiter is not using changes nothing, like the engine.
 		expect(isNeutralMaster({ ...DEFAULT_MASTER, ceiling_db: -6 })).toBe(true);
@@ -65,7 +67,33 @@ describe('levelNotes', () => {
 		expect(notes(-14, -1)).toHaveLength(1);
 	});
 
-	test('a track that clips the sum is named, and a cut with no audio says so', () => {
+	test('a true peak over the line with the limiter already on lowers its ceiling instead of asking for it again', () => {
+		const on = (ceiling_db: number): MasterBus => ({ volume: 1, limiter: true, ceiling_db });
+		const hot = (tp: number, bus: MasterBus) => levelNotes(reading(-14, tp), [], bus);
+		// 11 kHz at a -1 dBFS ceiling, as measured: -0.2 dBTP is 0.8 over, so -2.3. Word for
+		// word the string in kerf-core's `a_true_peak_over_the_ceiling_with_the_limiter_on_…`.
+		const n = hot(-0.2, on(-1));
+		expect(n).toHaveLength(2);
+		expect(n[1]).toBe(
+			'True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Lower its ceiling to about -2.3 dBFS (set_master_limiter).'
+		);
+		expect(hot(0.4, on(MASTER_DEFAULT_CEILING_DB))[1]).toContain('about -3.4 dBFS');
+		// Never below what the limiter can be given; at the floor there is nothing to lower.
+		expect(hot(10, on(-20))[1]).toContain('about -24.0 dBFS');
+		const floor = hot(0.4, on(MASTER_MIN_CEILING_DB));
+		expect(floor[1]).toContain('lowest ceiling');
+		expect(floor[1]).not.toContain('about');
+		expect(hot(0.4, on(Number.NaN))[1]).toContain('about -3.4 dBFS');
+		// Limiter off: still told to turn it on, and a stored ceiling alone is not "on".
+		expect(hot(0.4, { volume: 1, limiter: false, ceiling_db: -6 })[1]).toContain('Turn on the master limiter');
+		expect(hot(0.4, DEFAULT_MASTER)[1]).toBe(
+			'True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter (set_master_limiter) or lower the master.'
+		);
+		// Under the line: no note, limiter or not.
+		expect(hot(-1, on(-1.5))).toHaveLength(1);
+	});
+
+	test('a track that peaks over full scale is named, and a cut with no audio says so', () => {
 		const strip = (name: string, peak: number): TrackLevels => ({
 			track_id: name,
 			name,
@@ -78,6 +106,8 @@ describe('levelNotes', () => {
 		expect(n).toHaveLength(2);
 		expect(n[1]).toContain('Music');
 		expect(n[1]).toContain('+1.5 dBFS');
+		// The mix is float, so a hot strip is not a clip yet: the note must not claim one.
+		expect(n[1]).not.toContain('will clip');
 		expect(levelNotes(null, [])).toEqual(['The cut has no audio to measure.']);
 	});
 });

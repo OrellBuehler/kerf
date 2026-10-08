@@ -48,6 +48,14 @@ export function verdict(levels: Pick<Levels, 'master' | 'target_lufs'>): { text:
 	return { text: `${head} — on the ${target} target`, tone: 'ok' };
 }
 
+/** The error a stopped measurement rejects with (`LEVELS_CANCELLED` in kerf-app). */
+export const LEVELS_CANCELLED = 'levels cancelled';
+
+/** Whether a rejected measurement was stopped by the user rather than broken. */
+export function isLevelsCancelled(e: unknown): boolean {
+	return (e instanceof Error ? e.message : String(e)) === LEVELS_CANCELLED;
+}
+
 /** The tone of one of the engine's advice lines. The first line judges loudness and
  *  says "close to" when it is fine; every other line is a problem to fix. */
 export function noteTone(note: string): Tone {

@@ -192,6 +192,25 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   mp4/mkv/ts/avi/nut time bases, VFR, speeds and reverse on both FFmpegs.
   Proxies carry a `StreamInfo` sidecar so the interactive path never
   ffprobes; `Handover` pins the canvas for A4's stream restarts.
+- **2026-10-08 — B4 review fixes (PR #110).** (1) `alimiter` has no `latency` on
+  FFmpeg 4.4 (Ubuntu 22.04's system ffmpeg), which refused every limiter-on export
+  and `get_levels`; the option is now probed once per process
+  (`alimiter_latency_available`, `ffmpeg -h filter=alimiter`) with a `cfg(test)` pin,
+  and without it the limiter is emitted without `latency` (the mix then trails the
+  picture by the 5 ms attack; not compensated). The golden oracle builds a
+  limiter case's export both ways: the first 40 blocks and `still.txt` /
+  `preview.txt` did not move, only `export.txt` blocks 40..47. The levels tests pass
+  on 4.4.2 and 9.0.2. (2) The limiter is a sample-peak limiter: on 9.0.2 at a
+  -1 dBFS ceiling an 11 kHz tone read -0.2 dBTP and 15 kHz +0.1, so "turn on the
+  limiter" looped an agent that had already done it. `Levels::new` now takes the
+  master bus; with the limiter on and the true peak over -1 dBTP the note says to
+  lower the ceiling by the overshoot + 0.5 dB, and the default ceiling is -1.5 dBFS
+  (`loudnorm`'s TP). A track over 0 dBFS is no longer said to "clip the sum" (the
+  graph is float). (3) A GUI Measure held the process-wide `cpu::lease` with no way
+  out; `cancel_levels` (the `cancel_analysis` shape) and a Stop on the Measure
+  button, still gated since it is a whole-mix decode. (4) The mixer's strip rule
+  anticipates linked A/V's `Clip.source_audio` (PR #109, merging first) rather than
+  mirroring a `clip_sounds` this base does not have.
 
 ## Needs a real machine
 
