@@ -233,10 +233,15 @@ pub fn is_popout_label(label: &str) -> bool {
             .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// Whether `url` is the popout page, whichever origin the app is served from
-/// (`tauri://localhost`, `http://tauri.localhost`, the dev server).
-fn is_popout_url(url: &Url) -> bool {
+/// Whether `url` is the popout page of the app `main` (the editor webview's own URL) is
+/// serving: the same scheme, host and port — whichever those are on this platform
+/// (`tauri://localhost`, `http://tauri.localhost`, the dev server) — and the popout path.
+/// A script in the editor page could otherwise ask for any page at that path.
+fn is_popout_url(url: &Url, main: &Url) -> bool {
     url.path() == POPOUT_PATH
+        && url.scheme() == main.scheme()
+        && url.host_str() == main.host_str()
+        && url.port_or_known_default() == main.port_or_known_default()
 }
 
 /// A window the editor announced and has yet to open.
@@ -477,8 +482,12 @@ pub fn create_main_window(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 
 /// Answer a `window.open`: a window for the announced panel, or nothing.
 fn open_popout(app: &AppHandle, url: &Url, features: tauri::webview::NewWindowFeatures) -> NewWindowResponse<tauri::Wry> {
-    if !is_popout_url(url) {
-        tracing::warn!(%url, "window.open refused: not the popout page");
+    let Some(main) = app.get_webview_window("main").and_then(|w| w.url().ok()) else {
+        tracing::warn!(%url, "window.open refused: the editor's own URL is unknown");
+        return NewWindowResponse::Deny;
+    };
+    if !is_popout_url(url, &main) {
+        tracing::warn!(%url, %main, "window.open refused: not the app's popout page");
         return NewWindowResponse::Deny;
     }
     let Some(state) = app.try_state::<PopoutState>() else {
@@ -763,21 +772,38 @@ mod tests {
 
     #[test]
     fn only_the_popout_page_is_opened() {
-        for ok in [
-            "tauri://localhost/popout.html",
-            "http://tauri.localhost/popout.html",
-            "http://localhost:1420/popout.html",
-        ] {
-            assert!(is_popout_url(&ok.parse().unwrap()), "{ok}");
-        }
-        for bad in [
+        // The page the editor webview is on, per platform: macOS and Linux, Windows
+        // (plain and with `use_https_scheme`), and the dev server.
+        let mains = [
             "tauri://localhost/",
-            "tauri://localhost/index.html",
-            "https://example.com/",
-            "tauri://localhost/popout.html/x",
-            "tauri://localhost/other/popout.html",
-        ] {
-            assert!(!is_popout_url(&bad.parse().unwrap()), "{bad}");
+            "http://tauri.localhost/",
+            "https://tauri.localhost/",
+            "http://localhost:1420/",
+        ];
+        for main in mains {
+            let main: Url = main.parse().unwrap();
+            let own = main.join("popout.html").unwrap();
+            assert!(is_popout_url(&own, &main), "{own} on {main}");
+            for bad in [
+                "https://example.com/popout.html",
+                "ftp://x/popout.html",
+                "http://127.0.0.1:9999/popout.html",
+                "file:///popout.html",
+                "tauri://elsewhere/popout.html",
+                "http://localhost:1421/popout.html",
+                "http://tauri.localhost:8080/popout.html",
+            ] {
+                assert!(!is_popout_url(&bad.parse().unwrap(), &main), "{bad} on {main}");
+            }
+            for bad in ["/", "/index.html", "/popout.html/x", "/other/popout.html", "/popout.htm"] {
+                let url = own.join(bad).unwrap();
+                assert!(!is_popout_url(&url, &main), "{url} on {main}");
+            }
+        }
+        // Another platform's origin is not this one's.
+        let main: Url = "tauri://localhost/".parse().unwrap();
+        for other in ["http://tauri.localhost/popout.html", "http://localhost:1420/popout.html"] {
+            assert!(!is_popout_url(&other.parse().unwrap(), &main), "{other}");
         }
     }
 
