@@ -355,6 +355,14 @@ export interface Clip {
 	framings?: Framing[];
 	/** Whether the clip renders. Absent means enabled (the backend omits it when true). */
 	enabled?: boolean;
+	/** The link group: clips sharing a `link_id` (a picture and its detached sound) are
+	 *  edited together — moved, trimmed, split, removed. Absent is unlinked (the backend
+	 *  omits it). A group of one is not a link; `linkPartners` is the question to ask. */
+	link_id?: string | null;
+	/** Whether the clip plays the audio of its own asset. `false` once its sound was
+	 *  detached onto an audio track (the picture is then silent). Absent means it does
+	 *  (the backend omits it when true). */
+	source_audio?: boolean;
 }
 
 /** A crop for one delivery shape (`aspect_w:aspect_h` in lowest terms). */
@@ -865,3 +873,13 @@ export const clipDuration = (clip: Clip): number => {
 	const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
 	return span / speed;
 };
+
+/** What detaching sound from several clips did (`AudioDetached` in `crates/kerf-app/src/lib.rs`, the
+ *  answer of `extract_audio` and `detach_audio_clips`): the refreshed timeline, how many clips were
+ *  detached, and the ones left alone with the reason (a locked track, an asset without audio, a sound
+ *  already detached). */
+export interface AudioDetached {
+	timeline: Timeline;
+	detached: number;
+	skipped: { clip_id: string; reason: string }[];
+}

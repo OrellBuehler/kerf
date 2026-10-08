@@ -71,7 +71,9 @@ import {
 	ChartNoAxesGantt,
 	SeparatorVertical,
 	GalleryHorizontal,
-	ArrowLeftRight
+	ArrowLeftRight,
+	Link2,
+	Unlink2
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -149,7 +151,10 @@ export const icons: Record<string, LucideIcon> = {
 	// window, and a clip trading places with its neighbours.
 	'separator-vertical': SeparatorVertical,
 	'gallery-horizontal': GalleryHorizontal,
-	'arrow-left-right': ArrowLeftRight
+	'arrow-left-right': ArrowLeftRight,
+	// Linked A/V: the chain on a linked clip, and the broken one for taking it apart.
+	'link': Link2,
+	'unlink': Unlink2
 };
 
 export type IconName = keyof typeof icons;

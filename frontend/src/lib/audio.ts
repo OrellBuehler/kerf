@@ -69,6 +69,9 @@ class AudioEngine {
 			if (track.muted || (anySolo && track.kind === 'audio' && !track.solo)) continue;
 			for (const clip of track.clips) {
 				if (clip.enabled === false) continue;
+				// A picture whose sound was detached is silent — its audio clip plays it
+				// (`clip_sounds` in the export graph): scheduling both is the doubling.
+				if (clip.source_audio === false) continue;
 				if (!audioAssets.has(clip.asset_id)) continue;
 				const dur = (clip.source_out - clip.source_in) / speedMag(clip);
 				if (clip.timeline_start + dur <= t) continue;

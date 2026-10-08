@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import './test-runes';
-import { getHistory, revertTo, setRippleMode, setTrackLocked } from './api';
+import { getHistory, revertTo, setRippleMode, setTrackLocked, unlinkClips } from './api';
 
 // The editor's selection actions over the browser harness's cut — V1 `c1 [0, 12.5)`
-// `c2 [12.5, 20.5)` over A1 `c3 [0, 120)` — which enforces the same locking and
-// all-or-nothing rules as the backend.
+// `c2 [12.5, 20.5)` over A1 `c3 [0, 12.5)` — which enforces the same locking and
+// all-or-nothing rules as the backend. c1 and c3 start out linked (a picture and its
+// detached sound); the plain selection tests unlink them first, so a click is one clip.
 
 const { editor } = await import('./state.svelte');
 const ids = () => editor.timeline.tracks.flatMap((t) => t.clips.map((c) => c.id));
@@ -14,6 +15,7 @@ beforeEach(async () => {
 	await setRippleMode(false);
 	await setTrackLocked('v1', false);
 	await revertTo(0);
+	await unlinkClips(['c1']);
 	await editor.load();
 	editor.clearSelection();
 	editor.clipboard = [];
@@ -123,5 +125,75 @@ describe('the selection set', () => {
 		]);
 		await expect(refused).rejects.toThrow('overlap');
 		expect((await revision()) - before).toBe(1);
+	});
+});
+
+describe('selecting linked clips', () => {
+	// The harness cut as it starts: c1 and c3 are a picture and its detached sound.
+	beforeEach(async () => {
+		await revertTo(0);
+		await editor.load();
+		editor.clearSelection();
+	});
+
+	test('a click selects the clip and its partner, the clicked one primary; Alt selects just the one', () => {
+		editor.selectClip('c1');
+		expect([...editor.selectedClipIds].sort()).toEqual(['c1', 'c3']);
+		expect(editor.selectedClipId).toBe('c1');
+		editor.selectClip('c3');
+		expect(editor.selectedClipId).toBe('c3');
+		editor.selectClip('c1', 'replace', true);
+		expect(editor.selectedClipIds).toEqual(['c1']);
+		editor.selectClip('c2'); // unlinked: just itself
+		expect(editor.selectedClipIds).toEqual(['c2']);
+	});
+
+	test('Ctrl toggles the pair in and out together, Alt toggles one of it', () => {
+		editor.selectClip('c2');
+		editor.selectClip('c3', 'toggle');
+		expect([...editor.selectedClipIds].sort()).toEqual(['c1', 'c2', 'c3']);
+		editor.selectClip('c1', 'toggle');
+		expect(editor.selectedClipIds).toEqual(['c2']);
+		editor.selectClip('c1', 'toggle', true);
+		expect([...editor.selectedClipIds].sort()).toEqual(['c1', 'c2']);
+	});
+
+	test('detaching, reattaching, linking and unlinking go through the editor, one revision each', async () => {
+		const before = await revision();
+		await editor.unlinkClips(['c1', 'c3']);
+		expect(editor.selectedClipIds).toEqual([]);
+		editor.selectClip('c1');
+		expect(editor.selectedClipIds).toEqual(['c1']); // no partner now
+		await editor.linkClips(['c1', 'c3']);
+		editor.selectClip('c3');
+		expect([...editor.selectedClipIds].sort()).toEqual(['c1', 'c3']);
+		await editor.reattachAudio('c1');
+		expect(ids()).toEqual(['c1', 'c2']);
+		expect(editor.timeline.tracks[0].clips[0].source_audio).toBeUndefined();
+		await editor.detachAudio('c1');
+		expect(editor.timeline.tracks[0].clips[0].source_audio).toBe(false);
+		expect((await revision()) - before).toBe(4);
+	});
+
+	test('deleting a clip whose partner is on a locked track says so, and changes nothing', async () => {
+		await setTrackLocked('a1', true);
+		await editor.load();
+		editor.selectClip('c1');
+		const before = await revision();
+		await expect(editor.removeSelected(false)).rejects.toThrow('A linked clip is on locked track A1');
+		expect(await revision()).toBe(before);
+		expect(ids()).toEqual(['c1', 'c2', 'c3']);
+		expect([...editor.selectedClipIds].sort()).toEqual(['c1', 'c3']); // the selection is left as it was
+		// Without the link in the way, the unlocked picture goes alone.
+		await editor.remove('c1', false);
+		expect(ids()).toEqual(['c2', 'c3']);
+		await setTrackLocked('a1', false);
+	});
+
+	test('removing one of a pair with links off leaves the other, and the selection follows', async () => {
+		editor.selectClip('c1');
+		await editor.remove('c1', false);
+		expect(ids()).toEqual(['c2', 'c3']);
+		expect(editor.selectedClipIds).not.toContain('c1');
 	});
 });

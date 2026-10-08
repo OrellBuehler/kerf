@@ -20,7 +20,8 @@ import type { Timeline } from './types';
 // edit-mode surface — the same contract as the backend's (the pure math is
 // `edit-modes.ts`, tested case for case against the Rust tests). The harness cut
 // is V1 `c1 [0, 12.5)` of the 120 s interview (source 0..12.5) abutting
-// `c2 [12.5, 20.5)` of the 45 s b-roll (source 0..8), over A1 `c3`.
+// `c2 [12.5, 20.5)` of the 45 s b-roll (source 0..8), over A1 `c3`, the interview's
+// sound for the same span — linked to c1 (its picture is muted: sound detached).
 
 const starts = (t: Timeline, track = 0) => t.tracks[track].clips.map((c) => c.timeline_start);
 const clip = (t: Timeline, id: string) => t.tracks.flatMap((tr) => tr.clips).find((c) => c.id === id)!;
@@ -94,15 +95,24 @@ describe('roll / slip / slide (browser harness)', () => {
 
 describe('split and remove (browser harness)', () => {
 	test('off, the gap stays where the removed half was; the survivor keeps its id', async () => {
+		// c1's linked sound is cut at the same moment: it is a group edit, one revision.
 		const t = await splitRemove('c1', 5, 'left');
 		const c1 = clip(t, 'c1');
 		expect([c1.timeline_start, c1.source_in, c1.source_out]).toEqual([5, 5, 12.5]);
 		expect(starts(t, 0)).toEqual([5, 12.5]);
-		expect((await getHistory()).at(-1)!.label).toBe('Split and remove left');
+		expect(starts(t, 1)).toEqual([5]);
+		expect((await getHistory()).at(-1)!.label).toBe('Split and remove left (2 clips)');
 
 		const right = await splitRemove('c2', 16.5, 'right');
 		expect(clip(right, 'c2').source_out).toBe(4);
 		expect((await getHistory()).at(-1)!.label).toBe('Split and remove right');
+	});
+
+	test('with links off only the named clip is cut', async () => {
+		const t = await splitRemove('c1', 5, 'left', false);
+		expect(starts(t, 0)).toEqual([5, 12.5]);
+		expect(starts(t, 1)).toEqual([0]);
+		expect((await getHistory()).at(-1)!.label).toBe('Split and remove left');
 	});
 
 	test('on, the track closes up behind it and a left removal keeps the clips start', async () => {
@@ -116,7 +126,7 @@ describe('split and remove (browser harness)', () => {
 	});
 
 	test('a group cut is ONE revision, undone in one step, and a refused one records nothing', async () => {
-		// c1 [0,12.5) on V1 over c3 [0,120) on A1: a picture and its sound.
+		// c1 [0,12.5) on V1 over c3 [0,12.5) on A1: a picture and its sound.
 		const before = await headSeq();
 		const t = await splitRemoveClips(
 			[
