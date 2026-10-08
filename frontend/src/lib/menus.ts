@@ -12,6 +12,7 @@
 import { actionDef, type ActionId } from './keymap';
 import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
+import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
 import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
 
@@ -253,6 +254,9 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	};
 
 	const label = workspaceSpec(s.workspace).label;
+	// Where each open panel is, for the rule that the editor window keeps one.
+	const where: Partial<Record<PanelId, PanelLocation>> = {};
+	for (const id of s.openPanels) where[id] = s.detachedPanels.includes(id) ? 'popout' : 'grid';
 	const win: MenuDef = {
 		id: 'window',
 		label: 'Window',
@@ -272,16 +276,17 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				label: 'Panel windows',
 				icon: 'external-link',
 				items: [
-					...PANEL_IDS.map(
-						(id): MenuEntry => ({
+					...PANEL_IDS.map((id): MenuEntry => {
+						const blocked = detachBlocked(id, where);
+						return {
 							kind: 'command',
 							command: { type: 'detach', panel: id },
 							label: PANELS[id].title,
 							role: 'check',
 							checked: s.detachedPanels.includes(id),
-							...(s.openPanels.includes(id) ? {} : { disabled: true, reason: 'Open the panel first' })
-						})
-					),
+							...(blocked ? { disabled: true, reason: blocked } : {})
+						};
+					}),
 					sep,
 					act('window.dockAll', {
 						...(s.detachedPanels.length === 0 ? { disabled: true, reason: 'No panel is in a window of its own' } : {})

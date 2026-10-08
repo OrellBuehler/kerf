@@ -276,6 +276,27 @@ describe('Window', () => {
 		expect(entries.find((e) => e.label === 'Timeline')!.disabled).toBeFalsy();
 	});
 
+	test('the last panel in the editor window cannot go, and the entry says why', () => {
+		const entries = (openPanels: PanelId[], detachedPanels: PanelId[]) => {
+			const sub = menu('window', { openPanels, detachedPanels }).items.find((e) => e.kind === 'submenu' && e.label === 'Panel windows') as Extract<MenuEntry, { kind: 'submenu' }>;
+			return sub.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
+		};
+		const named = (list: ReturnType<typeof entries>, title: string) => list.find((e) => e.label === title)!;
+		// Two in the editor window: either can go.
+		let list = entries(['preview', 'timeline'], []);
+		expect(named(list, 'Preview').disabled).toBeFalsy();
+		expect(named(list, 'Timeline').disabled).toBeFalsy();
+		// One has gone: the other is the last, and is greyed out with the reason.
+		list = entries(['preview', 'timeline'], ['preview']);
+		expect(named(list, 'Timeline').disabled).toBe(true);
+		expect(named(list, 'Timeline').reason).toBe('The editor window keeps at least one panel');
+		// The one in a window can always come back.
+		expect(named(list, 'Preview').disabled).toBeFalsy();
+		expect(named(list, 'Preview').checked).toBe(true);
+		// A closed panel says to open it.
+		expect(named(list, 'Mixer').reason).toContain('open it from the Window menu');
+	});
+
 	test('giving them all back is offered only while some are out', () => {
 		const dockAll = (detachedPanels: PanelId[]) => {
 			const sub = menu('window', { detachedPanels }).items.find((e) => e.kind === 'submenu') as Extract<MenuEntry, { kind: 'submenu' }>;
