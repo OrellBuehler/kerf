@@ -35,7 +35,7 @@
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
 import { panGains } from './mixer';
-import { clipGainAt, fadeInOf, fadeOutOf, gainBreakpoints, limiterParams } from './audio-mix';
+import { clipGainAt, fadeInOf, fadeOutOf, gainAutomation, limiterParams } from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
@@ -365,10 +365,14 @@ export class AudioEngine {
 		const env = (tl: number) => clipGainAt(clip, tl, clipStart, clipEnd);
 		const t0 = Math.max(clipStart, nowT);
 		gain.gain.setValueAtTime(env(t0), Math.max(at(t0), now));
-		const keyed = gainBreakpoints(clip, clipStart, clipEnd, t0);
+		const keyed = gainAutomation(clip, clipStart, clipEnd, t0);
 		if (keyed.length) {
-			// A keyed volume: ramp through the curve's points and the fade edges.
-			for (const t of keyed) gain.gain.linearRampToValueAtTime(env(t), at(t));
+			// A keyed volume: ramp through the curve's points and the fade edges, and jump where
+			// the curve steps (a hold) instead of ramping across the whole segment.
+			for (const p of keyed) {
+				if (p.jump) gain.gain.setValueAtTime(p.value, at(p.time));
+				else gain.gain.linearRampToValueAtTime(p.value, at(p.time));
+			}
 			return;
 		}
 		if (fi > 0 && clipStart + fi > t0) gain.gain.linearRampToValueAtTime(env(clipStart + fi), at(clipStart + fi));
