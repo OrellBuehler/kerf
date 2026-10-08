@@ -2121,7 +2121,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses."
+        description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses. A key added inside an eased segment splits it (a hold stays held, a curve stays the same curve); re-keying a moment keeps how it leaves."
     )]
     fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;

@@ -225,7 +225,7 @@ function rebaseAnimation(clip: Clip, by: number) {
 			const sorted = [...clip.keyframes].sort(byTime);
 			for (let i = 0; i + 1 < sorted.length; i++) {
 				const [a, b] = [sorted[i], sorted[i + 1]];
-				if (!(a.time < by && by < b.time && b.time - a.time >= 1e-9)) continue;
+				if (!(a.time <= by && by < b.time && b.time - a.time >= 1e-9)) continue;
 				const easing = a.easing ?? 'linear';
 				if (easing === 'hold') pinned.easing = 'hold';
 				else if (easing !== 'linear') {

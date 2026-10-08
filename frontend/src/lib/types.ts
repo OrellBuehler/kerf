@@ -195,7 +195,6 @@ export type AudioEffect =
 	  }
 	| { type: 'gate'; threshold_db: number };
 
-/** One keyframe of a clip's animated transform. */
 /** How a keyframe travels to the next one (kerf-core's `Easing`); omitted is linear. */
 export type Easing =
 	| 'linear'
@@ -205,6 +204,7 @@ export type Easing =
 	| 'ease_in_out'
 	| { bezier: { x1: number; y1: number; x2: number; y2: number } };
 
+/** One keyframe of a clip's animated transform. */
 export interface Keyframe {
 	time: number;
 	scale: number;

@@ -62,6 +62,7 @@ import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from 
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
 import { baseName, CAPTION_EXTENSIONS } from './caption-import-ui';
+import { easingProblem, insertKeyframe } from './easing';
 import { formatTime as fmtTime } from './diff';
 import {
 	rollEdit as rollEditLocal,
@@ -1459,6 +1460,10 @@ export async function setAudioEffects(clipId: string, effects: AudioEffect[]): P
 /** Replace a clip's transform keyframes (empty list clears the animation). */
 export async function setKeyframes(clipId: string, keyframes: Keyframe[]): Promise<Timeline> {
 	if (!inTauri()) {
+		for (const k of keyframes) {
+			const problem = easingProblem(k.easing);
+			if (problem) throw new Error(problem);
+		}
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips[found[1]].keyframes = [...keyframes].sort((a, b) => a.time - b.time);
 		recordDev('Set keyframes');
@@ -1488,13 +1493,9 @@ export async function addKeyframe(
 				opacity: tf.opacity,
 				...patch
 			};
-			// Re-keying a moment keeps the shape of the segment that leaves it (as the backend does).
-			const old = (clip.keyframes ?? []).find((k) => Math.abs(k.time - time) <= 1e-6);
-			if (old?.easing && !patch.easing) base.easing = old.easing;
-			const kfs = (clip.keyframes ?? []).filter((k) => Math.abs(k.time - time) > 1e-6);
-			kfs.push(base);
-			kfs.sort((a, b) => a.time - b.time);
-			clip.keyframes = kfs;
+			// As the backend puts a key in: re-keying a moment keeps how it leaves, and a key inside
+			// a segment splits it (a hold stays held, a curve stays the same curve).
+			clip.keyframes = insertKeyframe(clip.keyframes ?? [], base);
 		}
 		recordDev('Add keyframe');
 		return snapshot();
@@ -1513,9 +1514,8 @@ export async function addKeyframe(
 /** Set the easing of the segment leaving the keyframe at `time` (within a millisecond). */
 export async function setKeyframeEasing(clipId: string, time: number, easing: Easing): Promise<Timeline> {
 	if (!inTauri()) {
-		if (typeof easing !== 'string' && Object.values(easing.bezier).some((v) => !Number.isFinite(v) || v < 0 || v > 1)) {
-			throw new Error('bezier control points must be within 0.0..=1.0 (no overshoot)');
-		}
+		const problem = easingProblem(easing);
+		if (problem) throw new Error(problem);
 		const found = locate(devTimeline, clipId);
 		const clip = found ? found[0].clips[found[1]] : undefined;
 		const near = (clip?.keyframes ?? [])
