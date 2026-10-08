@@ -2441,6 +2441,58 @@ separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
 
+**Detached panels (`popout.rs`).** A panel moved into a window of its own is dockview's
+popout: `window.open`, then the panel's DOM is moved into the new window's document while
+its script keeps running in the editor window's JavaScript realm — so the `editor` / `ui`
+singletons, the transport clock, the Web Audio engine and every Tauri `Channel` are the same
+objects in every window and **nothing is synchronised**. The shell has three jobs.
+(1) **The main window is built in code** — `tauri.conf.json` says `"create": false` for it and
+`popout::create_main_window` builds it from that very entry (`WebviewWindowBuilder::from_config`,
+so `visible: false`, the backdrop and the reveal are exactly as before; a Rust test pins
+`create: false`), because only a builder can carry the `on_new_window` handler: a window declared
+in the config has none and `window.open` returns null from it. (2) **The handler answers only a
+window the page announced** (`popout_expect { rect?, size?, background? }` → `{label, position}`,
+a `PopoutQueue` of announcements taken in order, 15 s time-out, at most 32 waiting; pure and
+unit-tested) **and only for `/popout.html`**: anything else — a stray `window.open`, a
+`target="_blank"` — is denied. The window is built `window_features(features)` (what makes it
+*related* to the opener: same web process on WebKitGTK, same environment on WebView2, same
+configuration on WKWebView — the thing that makes the returned `Window` scriptable), sized and
+placed by `place` (pure): a rectangle off every screen is moved onto one, a panel detached by hand
+goes to the centre of **another** monitor when there is one, WebKitGTK ignores the `window.open`
+features (`NewWindowFeatures` arrive as `None`), so the rectangle comes from the announcement.
+`popout_cancel` forgets one the page did not open, `popout_focus` raises one (`window.focus()`
+does not raise a native window), `popout_move` applies the one-shot correction below, and
+`close_popout` destroys one by label. (3) **Closing**, per platform, because wry differs: its
+WebKitGTK `close` signal destroys the webview widget only (a blank window stays — the Linux hook
+connects the widget's `destroy` to the window's), WebView2 destroys the window itself, and
+WKWebView has no `webViewDidClose:` so `window.close()` is a no-op there and the page asks
+`close_popout` from dockview's `onWillClosePopoutWindow`. The editor window going away destroys
+every popout (`on_window_event`), as does its page reloading (`on_page_load`: the panels in them
+are that page's); a popout going away emits `popout-closed`. Also Linux-only
+(`gtk`, `webkit2gtk`, the versions Tauri resolves): WebKitGTK defaults
+`javascript-can-open-windows-automatically` to **false** and blocks a `window.open` no gesture
+asked for — a restored layout opens windows at launch with none — so `with_webview` turns it on
+for the editor window (the handler still decides). No capability and no CSP change: the panels
+run in the editor's realm and use its IPC, and a popout is served by the same `tauri://` protocol,
+so the same CSP applies to it (measured: an inline script and a foreign image are blocked there).
+The popout page `frontend/static/popout.html` must be a real file — the static fallback would
+answer the path with `index.html` and start a second editor — and `+layout.svelte` refuses to
+boot when a window has an opener. **dockview ≥ 8.4.1** is required: 8.3.1 refuses any
+non-http(s) popout URL, which is every packaged Linux / macOS build (`tauri://localhost`), and
+only 8.4 polls the popout's `closed` flag, the one signal a shell that destroys a webview gives.
+Tauri's `window.screenX` is the outer position and `innerWidth` the inner size, but the position
+the platform *reads* is not always the one it was *set* to (WSLg: 32 px), and a layout saves the
+read one; `popout.svelte.ts` therefore moves a window that opened a little off by the error, once
+(`positionCorrection`, pure), so a restored window does not creep at every launch.
+Windows are positioned in logical pixels clamped against `available_monitors` (work areas).
+**Not verified outside Linux/WSLg**: WebView2's `NewWindowRequested` + `SetNewWindow` (the popup
+being scriptable, no deadlock building a window inside the handler), WKWebView's `close_popout`
+path and `window_features` placement, `screenX` against mixed-DPI monitors, `requestAnimationFrame`
+in a main window that is minimized, HTML5 tab drags between windows against Tauri's drag-drop
+handler on Windows (`dragDropEnabled` — Kerf keeps it on for file drops). The GPU preview
+(`feat/gpu-a2-surface`, not merged) hard-codes the `main` window for its surface and its bounds:
+when it lands, a Preview in a popout must take the JPEG path.
+
 **Auto-update.** The app updates itself from its own GitHub releases via
 `tauri-plugin-updater` (+ `tauri-plugin-process` for the relaunch), both
 registered in `run()`. `plugins.updater` in `tauri.conf.json` points at
@@ -2693,6 +2745,44 @@ group's tab strip, and hands the width it frees or takes to the group beside it
 chevron by keyboard moves focus to the rail's active tab, since the chevron
 unmounts with the content. A library sharing a group with another panel cannot
 fold — it has no width of its own to give back.
+**Detached panels** (`popout.svelte.ts` over dockview's popout groups; the backend half is
+`popout.rs`, see kerf-app). Any panel can go into a window of its own for a second screen:
+**Window › Panel windows** (a tick per panel, in a window while ticked; *Return all panels to the
+editor window*, `window.dockAll`) or the tab's right-click menu (*Move to new window* / *Return to the
+editor window*, dockview's `getTabContextMenuItems`). The editor window keeps at least one panel
+(`detachBlocked`, pure). Every open goes through `PopoutState.#open`, which **announces** the window
+(`popoutExpect`) and hands the label it gets to the window that opens (`LabelBook`, a FIFO: `window.open`
+carries nothing to say which announcement it is for, so opens are serialised and the backend hands them
+out in order); closing a window is dockview's own (it re-docks the panels where they came from) and
+the *Return* entries just close the window. What it gives a window beyond dockview's: the live theme
+(`mirrorRoot` copies `<html>`'s class and inline custom properties from a MutationObserver, otherwise a
+window shows the stylesheet's defaults whatever the theme), a title (`Library — Kerf`), a slider-fill
+observer of its own, **`inert` while a modal is open**, and the shortcut handler (`windows.listen`).
+**The rule for panel code: `window` and `document` are the editor window's, and an event that happens in a
+detached window is dispatched there and never reaches a listener on this one.** So `windows.svelte.ts`
+(the registry; `version` moves when a window opens or closes or a panel moves) and `realm.ts` (pure:
+`windowOf(el)`, `documentOf(el)`, `resizeObserverFor` / `intersectionObserverFor` — an observer made by the
+editor window's constructor reports a detached window's element **not intersecting for good**) are how a
+panel asks which window it is in; `window-events.ts`'s `onWindow({ pointermove, … })` is
+`<svelte:window on…>` as an attachment that follows the element (a `capture` suffix is the capture phase);
+`windows.listen` is for what is the app's (shortcuts, the click that dismisses a menu), heard in every
+window. `beginDrag` listens on the window of its element. **Svelte registers delegated handlers
+(`click`, …) on its own mount root**, so anything drawn outside a panel's root in a detached window needs
+a root of its own there: the context menu is one `ContextMenu` per window (`contextMenu.win` is where
+it was opened; mounted by `Workspace.svelte`'s `window` hook). The transport clock draws frames from
+`windows.requestFrame` — the editor window's when it is showing, else a detached window that is (a
+hidden window pauses its frames) — and reads `performance.now()` itself because a frame's timestamp
+counts from its own window's start. The library cannot fold while it has a window to itself. **Layouts
+keep their windows**: `sanitizeLayout` reads dockview's `popoutGroups` (a window of one group or a
+nested layout) through the same walk as the grid, so a panel is still shown once; the page is always
+the popout page; a place that is not numbers is the platform's choice; the group a popped-out group
+leaves behind in the grid — empty and hidden, holding the place its panels return to — is kept only while
+a window points at it; `sameArrangement` counts each window's panels and place (12 px of slack for the
+title bars a platform adds), so a window the user moved is written and one the platform nudged is not.
+Restoring a workspace with windows **announces them first** (`announce`, in order — dockview restores
+each from a timer) and then builds the dock; saving waits until `popoutRestorationPromise` (8 s at most)
+so the windows opening are not taken for a rearrangement, and `settle` forgets any announcement nobody
+took. Each workspace has its own windows: a switch closes one set and opens the other.
 **The chrome is a title bar over the dock, and the menu bar is in it.** There is no
 toolbar row and no rule between the title bar and the dock: the dock starts where
 the bar ends. The window keeps its native decorations (`tauri.conf.json` sets none
