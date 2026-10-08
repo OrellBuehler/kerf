@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-use tauri::webview::NewWindowResponse;
+use serde::{Deserialize, Serialize};
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Emitter, Manager, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent};
 
 /// Every detached panel's window label starts with this.
@@ -111,31 +111,46 @@ pub struct Placement {
     pub position: Option<(f64, f64)>,
 }
 
-/// Where `want` may open, given the screens there are.
+/// A window's size, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct Size {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Size {
+    fn is_finite(&self) -> bool {
+        self.width.is_finite() && self.height.is_finite()
+    }
+}
+
+/// Where a detached panel's window may open, given the screens there are.
 ///
-/// * No rectangle asked for: the platform places it, at the default size capped to
-///   the screen the editor is on.
-/// * A rectangle on a screen: kept, shrunk to that screen if it is bigger and shifted
-///   in if it hangs over an edge.
+/// * A rectangle asked for (a layout being restored) on a screen: kept, shrunk to that
+///   screen if it is bigger and shifted in if it hangs over an edge.
 /// * A rectangle that no longer reaches any screen (the monitor it was saved on is
 ///   gone, or the resolution fell): the same size, on `home`, cascaded from `home`'s
 ///   corner.
+/// * No rectangle (a panel being detached by hand): `size` — the panel's own, or the
+///   default — **centred on another screen** when there is one, which is what a second
+///   monitor is for; on a single screen the platform places it.
 ///
 /// `monitors` and `home` are in the same logical pixels as `want`. With no monitor
 /// known at all (a platform that would not say) the rectangle is trusted as it is,
 /// bar the minimum size: nothing here may stop a window opening.
-pub fn place(want: Option<Rect>, monitors: &[Rect], home: Option<Rect>) -> Placement {
+pub fn place(want: Option<Rect>, size: Option<Size>, monitors: &[Rect], home: Option<Rect>) -> Placement {
     let home = home.or_else(|| monitors.first().copied());
     let Some(want) = want.filter(Rect::is_finite) else {
-        let (width, height) = match home {
-            Some(h) => (default_size().0.min(h.width), default_size().1.min(h.height)),
-            None => default_size(),
-        };
-        return Placement {
-            width: width.max(MIN_WIDTH),
-            height: height.max(MIN_HEIGHT),
-            position: None,
-        };
+        let size = size.filter(Size::is_finite).unwrap_or(Size {
+            width: default_size().0,
+            height: default_size().1,
+        });
+        let other = monitors.iter().find(|m| Some(**m) != home);
+        let on = other.copied().or(home);
+        let width = on.map_or(size.width, |m| size.width.min(m.width)).max(MIN_WIDTH);
+        let height = on.map_or(size.height, |m| size.height.min(m.height)).max(MIN_HEIGHT);
+        let position = other.map(|m| (m.x + (m.width - width) / 2.0, m.y + (m.height - height) / 2.0));
+        return Placement { width, height, position };
     };
     let width = want.width.max(MIN_WIDTH);
     let height = want.height.max(MIN_HEIGHT);
@@ -312,9 +327,11 @@ impl PopoutState {
 /// What the page asks for when it is about to open a detached panel's window.
 #[derive(Debug, Deserialize)]
 pub struct ExpectRequest {
-    /// Where it should open, in `screenX` / `innerWidth` pixels; absent for a platform
-    /// default.
+    /// Where it should open, in `screenX` / `innerWidth` pixels (a layout being
+    /// restored); absent for a panel detached by hand.
     pub rect: Option<Rect>,
+    /// How big it should be when there is no rectangle: the panel's own size.
+    pub size: Option<Size>,
     /// The window's backdrop until the panel is in it (`#rrggbb`): the live theme's
     /// app surface, so a light theme does not flash dark.
     pub background: Option<String>,
@@ -343,14 +360,24 @@ fn screens(app: &AppHandle) -> (Vec<Rect>, Option<Rect>) {
     (monitors.iter().map(area).collect(), home)
 }
 
+/// What `popout_expect` answers: the label, and where the window will open — which is not
+/// always where it was asked to (a rectangle off every screen is moved onto one), so the
+/// page compares the window it gets with this, not with its own request.
+#[derive(Debug, Serialize)]
+pub struct Announced {
+    pub label: String,
+    pub position: Option<(f64, f64)>,
+}
+
 /// Announce a detached panel's window, and get its label. The page calls this right
 /// before `window.open` (dockview's `addPopoutGroup`, or `fromJSON` restoring one) and
 /// keeps the label for [`close_popout`]. The rectangle is placed onto a live monitor
 /// here, so the page can hand over whatever a saved layout holds.
 #[tauri::command(async)]
-pub fn popout_expect(app: AppHandle, state: State<'_, PopoutState>, request: ExpectRequest) -> Result<String, String> {
+pub fn popout_expect(app: AppHandle, state: State<'_, PopoutState>, request: ExpectRequest) -> Result<Announced, String> {
     let (monitors, home) = screens(&app);
-    let placement = place(request.rect, &monitors, home);
+    let placement = place(request.rect, request.size, &monitors, home);
+    tracing::info!(?placement, ?home, monitors = ?monitors, "detached panel window placed");
     let label = format!("{LABEL_PREFIX}{}", state.next.fetch_add(1, Ordering::Relaxed));
     let background = request.background.as_deref().and_then(parse_color);
     let now = Instant::now();
@@ -358,7 +385,30 @@ pub fn popout_expect(app: AppHandle, state: State<'_, PopoutState>, request: Exp
         .queue()
         .expect(Expected::new(label.clone(), placement, background, now), now)
         .map_err(str::to_string)?;
-    Ok(label)
+    Ok(Announced {
+        label,
+        position: placement.position,
+    })
+}
+
+/// Move a detached panel's window. The page uses it once, right after a window opened
+/// where a saved layout asked: the platform reads a window's position (`screenX`) from
+/// where it puts it (`position`) a title bar or a shadow apart, and a window saved at the
+/// first and reopened at the second would creep that far at every launch.
+#[tauri::command(async)]
+pub fn popout_move(app: AppHandle, label: String, x: f64, y: f64) -> Result<(), String> {
+    if !is_popout_label(&label) {
+        return Err(format!("{label} is not a detached panel window"));
+    }
+    if !x.is_finite() || !y.is_finite() {
+        return Err("a window cannot be moved to a place that is not a number".to_string());
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .set_position(tauri::LogicalPosition::new(x, y))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// The page announced a window and then did not open it (dockview refused, or
@@ -383,6 +433,20 @@ pub fn close_popout(app: AppHandle, label: String) -> Result<(), String> {
     }
 }
 
+/// Bring a detached panel's window to the front. `window.focus()` from the page asks, and
+/// a webview is free to ignore it without raising the native window; this raises it.
+#[tauri::command(async)]
+pub fn popout_focus(app: AppHandle, label: String) -> Result<(), String> {
+    if !is_popout_label(&label) {
+        return Err(format!("{label} is not a detached panel window"));
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.unminimize();
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// The editor window, built from `tauri.conf.json` with the handler that lets
 /// `window.open` make a detached panel's window.
 pub fn create_main_window(app: &tauri::App) -> tauri::Result<WebviewWindow> {
@@ -397,6 +461,14 @@ pub fn create_main_window(app: &tauri::App) -> tauri::Result<WebviewWindow> {
     let handle = app.handle().clone();
     let window = WebviewWindowBuilder::from_config(app.handle(), &config)?
         .on_new_window(move |url, features| open_popout(&handle, &url, features))
+        // The panels in a detached window are the editor page's; when that page goes (a
+        // reload in development) they have nothing left to show or do, and the page
+        // restores the windows it should have when it is back.
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Started {
+                destroy_popouts(window.app_handle());
+            }
+        })
         .build()?;
     #[cfg(target_os = "linux")]
     linux::allow_script_windows(&window);
@@ -467,14 +539,19 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     }
     let label = window.label();
     if label == "main" {
-        for (other, popout) in window.app_handle().webview_windows() {
-            if is_popout_label(&other) {
-                let _ = popout.destroy();
-            }
-        }
+        destroy_popouts(window.app_handle());
     } else if is_popout_label(label) {
         tracing::info!(label, "detached panel window closed");
         let _ = window.app_handle().emit_to("main", CLOSED_EVENT, label.to_string());
+    }
+}
+
+/// Destroy every detached panel's window.
+fn destroy_popouts(app: &AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if is_popout_label(&label) {
+            let _ = window.destroy();
+        }
     }
 }
 
@@ -538,7 +615,7 @@ mod tests {
 
     #[test]
     fn a_rectangle_on_a_screen_is_kept() {
-        let p = place(want(2100.0, 100.0, 800.0, 600.0), &[MAIN, SECOND], Some(MAIN));
+        let p = place(want(2100.0, 100.0, 800.0, 600.0), None, &[MAIN, SECOND], Some(MAIN));
         assert_eq!(p.position, Some((2100.0, 100.0)));
         assert_eq!((p.width, p.height), (800.0, 600.0));
     }
@@ -546,16 +623,16 @@ mod tests {
     #[test]
     fn a_rectangle_hanging_over_an_edge_is_pulled_in() {
         // Mostly on the second screen, 300 px past its right edge.
-        let p = place(want(4180.0, 100.0, 800.0, 600.0), &[MAIN, SECOND], Some(MAIN));
+        let p = place(want(4180.0, 100.0, 800.0, 600.0), None, &[MAIN, SECOND], Some(MAIN));
         assert_eq!(p.position, Some((4480.0 - 800.0, 100.0)));
         // Past the bottom.
-        let p = place(want(100.0, 900.0, 800.0, 600.0), &[MAIN], Some(MAIN));
+        let p = place(want(100.0, 900.0, 800.0, 600.0), None, &[MAIN], Some(MAIN));
         assert_eq!(p.position, Some((100.0, 1040.0 - 600.0)));
     }
 
     #[test]
     fn a_rectangle_larger_than_its_screen_shrinks_to_it() {
-        let p = place(want(10.0, 10.0, 5000.0, 3000.0), &[MAIN], Some(MAIN));
+        let p = place(want(10.0, 10.0, 5000.0, 3000.0), None, &[MAIN], Some(MAIN));
         assert_eq!((p.width, p.height), (1920.0, 1040.0));
         assert_eq!(p.position, Some((0.0, 0.0)));
     }
@@ -563,60 +640,99 @@ mod tests {
     #[test]
     fn a_rectangle_on_a_monitor_that_is_gone_opens_on_the_editors_screen() {
         // Saved on a screen at x = 1920; only the main one is left.
-        let p = place(want(2100.0, 100.0, 800.0, 600.0), &[MAIN], Some(MAIN));
+        let p = place(want(2100.0, 100.0, 800.0, 600.0), None, &[MAIN], Some(MAIN));
         assert_eq!(p.position, Some((CASCADE, CASCADE)));
         assert_eq!((p.width, p.height), (800.0, 600.0));
         // …and on the other screen when that is where the editor is.
-        let p = place(want(-1200.0, 50.0, 800.0, 600.0), &[MAIN, SECOND], Some(SECOND));
+        let p = place(want(-1200.0, 50.0, 800.0, 600.0), None, &[MAIN, SECOND], Some(SECOND));
         assert_eq!(p.position, Some((SECOND.x + CASCADE, SECOND.y + CASCADE)));
     }
 
     #[test]
     fn a_window_whose_title_bar_is_off_every_screen_is_brought_back() {
         // Its body overlaps the screen by a sliver but the part you grab does not.
-        let p = place(want(100.0, -590.0, 800.0, 600.0), &[MAIN], Some(MAIN));
+        let p = place(want(100.0, -590.0, 800.0, 600.0), None, &[MAIN], Some(MAIN));
         let (x, y) = p.position.unwrap();
         assert!(y >= 0.0 && y + p.height <= MAIN.bottom(), "y {y} h {}", p.height);
         assert!(x >= 0.0 && x + p.width <= MAIN.right());
     }
 
     #[test]
-    fn nothing_asked_for_leaves_the_position_to_the_platform() {
-        let p = place(None, &[MAIN], Some(MAIN));
+    fn on_a_single_screen_the_platform_places_a_window_nobody_placed() {
+        let p = place(None, None, &[MAIN], Some(MAIN));
         assert_eq!(p.position, None);
         assert_eq!((p.width, p.height), default_size());
         // On a screen smaller than the default.
         let tiny = screen(0.0, 0.0, 500.0, 300.0);
-        let p = place(None, &[tiny], Some(tiny));
+        let p = place(None, None, &[tiny], Some(tiny));
         assert_eq!((p.width, p.height), (500.0, 300.0));
     }
 
     #[test]
+    fn a_panel_detached_by_hand_goes_to_the_other_screen_at_its_own_size() {
+        let size = Some(Size {
+            width: 800.0,
+            height: 600.0,
+        });
+        let p = place(None, size, &[MAIN, SECOND], Some(MAIN));
+        assert_eq!((p.width, p.height), (800.0, 600.0));
+        assert_eq!(
+            p.position,
+            Some((SECOND.x + (SECOND.width - 800.0) / 2.0, (SECOND.height - 600.0) / 2.0))
+        );
+        // From the other screen it goes back to the first.
+        let p = place(None, size, &[MAIN, SECOND], Some(SECOND));
+        assert_eq!(p.position, Some(((MAIN.width - 800.0) / 2.0, (MAIN.height - 600.0) / 2.0)));
+    }
+
+    #[test]
+    fn a_size_that_does_not_fit_the_screen_it_is_sent_to_is_cut_down() {
+        let size = Some(Size {
+            width: 9000.0,
+            height: 9000.0,
+        });
+        let p = place(None, size, &[MAIN, SECOND], Some(MAIN));
+        assert_eq!((p.width, p.height), (SECOND.width, SECOND.height));
+        assert_eq!(p.position, Some((SECOND.x, SECOND.y)));
+        // A size that is not a number is the default.
+        let p = place(
+            None,
+            Some(Size {
+                width: f64::NAN,
+                height: 10.0,
+            }),
+            &[MAIN],
+            Some(MAIN),
+        );
+        assert_eq!((p.width, p.height), default_size());
+    }
+
+    #[test]
     fn the_smallest_window_is_enforced() {
-        let p = place(want(100.0, 100.0, 10.0, 10.0), &[MAIN], Some(MAIN));
+        let p = place(want(100.0, 100.0, 10.0, 10.0), None, &[MAIN], Some(MAIN));
         assert_eq!((p.width, p.height), (MIN_WIDTH, MIN_HEIGHT));
     }
 
     #[test]
     fn a_platform_that_reports_no_monitor_is_trusted() {
-        let p = place(want(-5000.0, 40.0, 700.0, 500.0), &[], None);
+        let p = place(want(-5000.0, 40.0, 700.0, 500.0), None, &[], None);
         assert_eq!(p.position, Some((-5000.0, 40.0)));
         assert_eq!((p.width, p.height), (700.0, 500.0));
-        assert_eq!(place(None, &[], None).position, None);
+        assert_eq!(place(None, None, &[], None).position, None);
     }
 
     #[test]
     fn a_rectangle_that_is_not_a_number_is_ignored() {
-        let p = place(want(f64::NAN, 0.0, 800.0, 600.0), &[MAIN], Some(MAIN));
+        let p = place(want(f64::NAN, 0.0, 800.0, 600.0), None, &[MAIN], Some(MAIN));
         assert_eq!(p.position, None);
-        let p = place(want(0.0, 0.0, f64::INFINITY, 600.0), &[MAIN], Some(MAIN));
+        let p = place(want(0.0, 0.0, f64::INFINITY, 600.0), None, &[MAIN], Some(MAIN));
         assert_eq!(p.position, None);
     }
 
     #[test]
     fn the_nearest_screen_wins_when_a_window_straddles_two() {
         // 700 px on the first screen, 100 on the second.
-        let p = place(want(1220.0, 100.0, 800.0, 600.0), &[MAIN, SECOND], Some(MAIN));
+        let p = place(want(1220.0, 100.0, 800.0, 600.0), None, &[MAIN, SECOND], Some(MAIN));
         assert_eq!(p.position, Some((1120.0, 100.0)));
     }
 
@@ -666,7 +782,7 @@ mod tests {
     }
 
     fn item(label: &str, now: Instant) -> Expected {
-        Expected::new(label.to_string(), place(None, &[], None), None, now)
+        Expected::new(label.to_string(), place(None, None, &[], None), None, now)
     }
 
     #[test]

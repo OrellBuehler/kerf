@@ -3057,7 +3057,9 @@ pub fn run() {
             take_launch_project,
             popout::popout_expect,
             popout::popout_cancel,
-            popout::close_popout
+            popout::close_popout,
+            popout::popout_focus,
+            popout::popout_move
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerf")
