@@ -12,7 +12,7 @@
 	import { getFrame, inTauri, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { thumbnails } from '$lib/thumbnails';
-	import { analysisFacts, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
+	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
@@ -154,11 +154,38 @@
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)
 		});
-		if (info.kind === 'video' && info.audio)
+		// The label says what will happen (`audioExtraction` mirrors the backend's two operations): the
+		// asset's own sound is detached (`extract_audio`) from every clip on the timeline still playing
+		// it — so it is heard once — and only an asset with none such has its whole audio appended to an
+		// audio track (`add_asset_audio`, a separate operation the backend never falls back to).
+		const extraction = info.kind === 'video' ? audioExtraction(asset, editor.timeline) : null;
+		if (extraction)
 			items.push({
-				label: 'Extract audio to a track',
+				label: extraction.label,
 				icon: 'audio-waveform',
-				action: () => void editor.extractAudio(asset.id).catch(err)
+				action: () => {
+					if (extraction.mode === 'append') {
+						void editor
+							.addAssetAudio(asset.id)
+							.then(() =>
+								toast.success(`Added the audio of ${asset.name}`, {
+									action: { label: 'Undo', onClick: () => void editor.undo() }
+								})
+							)
+							.catch(err);
+						return;
+					}
+					void editor
+						.extractAudio(asset.id)
+						.then((done) =>
+							toast.success(
+								`Detached audio from ${done.detached} ${done.detached === 1 ? 'clip' : 'clips'}` +
+									(done.skipped.length > 0 ? ` — ${done.skipped.length} skipped (${done.skipped[0].reason})` : ''),
+								{ action: { label: 'Undo', onClick: () => void editor.undo() } }
+							)
+						)
+						.catch(err);
+				}
 			});
 		items.push({
 			label: 'Remove silences',

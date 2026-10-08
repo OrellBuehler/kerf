@@ -9,7 +9,7 @@
 
 import type { GroupviewPanelState, Orientation, SerializedDockview } from 'dockview';
 
-export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver'] as const;
+export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
 
 /** The width of the library's icon rail. The panel's registry minimum, so a
@@ -37,7 +37,10 @@ export const PANELS: Record<PanelId, PanelSpec> = {
 	timeline: { title: 'Timeline', minimumHeight: 140 },
 	inspector: { title: 'Inspector', minimumWidth: 250 },
 	agent: { title: 'Agent', minimumWidth: 260 },
-	deliver: { title: 'Deliver', minimumWidth: 280, defaultWidth: 420 }
+	deliver: { title: 'Deliver', minimumWidth: 280, defaultWidth: 420 },
+	// A strip is ~84 px wide and the master another ~130: two tracks and the master
+	// fit in 340 px, and a third scrolls. Tall enough for a fader to have travel.
+	mixer: { title: 'Mixer', minimumWidth: 340, minimumHeight: 230, defaultWidth: 460 }
 };
 
 export function isPanelId(id: unknown): id is PanelId {
@@ -127,15 +130,18 @@ export const PRESET_LAYOUTS: Record<WorkspaceId, SerializedDockview> = {
 		],
 		234
 	),
-	// Mixing: the timeline is where the waveforms are, so it gets the height.
+	// Mixing: the mixer beside the picture, the timeline under both with the waveforms
+	// it is read against. The library is narrow — audio effects and voiceover, not
+	// browsing — and the inspector keeps what a clip's volume and effects need.
 	audio: preset(
-		330,
+		450,
 		[
-			leaf('library', ['library'], 280),
-			leaf('preview', ['preview'], 740),
-			leaf('inspector', ['inspector', 'agent'], 420)
+			leaf('library', ['library'], 240),
+			leaf('preview', ['preview'], 470),
+			leaf('mixer', ['mixer'], 430),
+			leaf('inspector', ['inspector', 'agent'], 300)
 		],
-		464
+		344
 	),
 	// Animating: preview, a wide inspector for keyframes, the timeline under it.
 	motion: preset(

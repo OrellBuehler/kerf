@@ -19,7 +19,15 @@
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { cutSelection, deleteSelection, trimSelection } from '$lib/ops';
+	import {
+		cutSelection,
+		deleteSelection,
+		detachSelection,
+		linkSelection,
+		reattachSelection,
+		trimSelection,
+		unlinkSelection
+	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
@@ -360,6 +368,12 @@
 		// why when there is nothing to cut, so neither returns `false`.
 		'edit.trimStart': () => void trimSelection('left'),
 		'edit.trimEnd': () => void trimSelection('right'),
+		// Linked A/V: each says why when it cannot (nothing selected, nothing to detach), so
+		// none returns `false`.
+		'edit.detachAudio': () => void detachSelection(),
+		'edit.reattachAudio': () => void reattachSelection(),
+		'edit.link': () => void linkSelection(),
+		'edit.unlink': () => void unlinkSelection(),
 		'edit.clearSelection': () => {
 			// Whatever else Escape is for gets it first: a menu or the notification
 			// panel closing, a drag being abandoned (those stop the event; a dialog

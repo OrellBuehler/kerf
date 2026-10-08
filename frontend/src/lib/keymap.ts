@@ -373,6 +373,42 @@ const ACTION_LIST = [
 		hint: 'Removes the part of the selected clip after the playhead. Follows ripple mode: on, the later clips close the gap.'
 	},
 	{
+		id: 'edit.detachAudio',
+		repeat: false,
+		label: 'Detach audio',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Shift+D'],
+		hint: 'Gives each selected picture clip its own sound as a linked clip on an audio track, and mutes the picture — so it is heard once, from the audio track.'
+	},
+	{
+		id: 'edit.reattachAudio',
+		repeat: false,
+		label: 'Reattach audio',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+Shift+D'],
+		hint: 'The way back: deletes the linked audio clip and lets the picture play its own sound again.'
+	},
+	{
+		id: 'edit.link',
+		repeat: false,
+		label: 'Link clips',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+L'],
+		hint: 'Joins the selected clips (one per track) so a move, trim, split or delete of one is carried to the others. Alt on a drag, trim or razor leaves the links out for that edit.'
+	},
+	{
+		id: 'edit.unlink',
+		repeat: false,
+		label: 'Unlink clips',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+Shift+L'],
+		hint: 'Takes the selected clips out of their link groups; each then edits on its own.'
+	},
+	{
 		id: 'edit.clearSelection',
 		label: 'Clear selection',
 		group: 'edit',

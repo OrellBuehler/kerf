@@ -4,10 +4,19 @@
    in-browser sample backend; there is no scripted demo workflow. */
 
 import { editor } from './state.svelte';
-import { cancelAnalysis, downloadSpeechModel, listFonts, setSpeechModel, transcriptionStatus } from './api';
+import {
+	cancelAnalysis,
+	cancelLevels,
+	downloadSpeechModel,
+	getLevels,
+	listFonts,
+	setSpeechModel,
+	transcriptionStatus
+} from './api';
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
-import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, TranscriptionStatus } from './types';
+import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, Levels, TranscriptionStatus } from './types';
+import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
@@ -27,6 +36,15 @@ import {
 /** The timeline's tools: select and razor, then the three that move a boundary
  *  rather than a clip (`trim-tools.ts`). */
 export type Tool = 'pointer' | 'razor' | TrimTool;
+
+/** A loudness measurement and what it was a measurement *of*. */
+export interface MeasureResult {
+	levels: Levels;
+	/** The span measured, or `null` for the whole cut. */
+	range: { start: number; end: number } | null;
+	/** The project state it was taken against — to say when it has gone out of date. */
+	stamp: MeasureStamp;
+}
 
 class EditorUi {
 	tool = $state<Tool>('pointer');
@@ -87,6 +105,19 @@ class EditorUi {
 	captionImportKeepLines = $state<boolean | null>(null);
 	/** Seconds the imported cues are shifted by, as typed (`null` = empty). */
 	captionImportOffset = $state<number | null>(null);
+	/** The Mixer's loudness measurement (`get_levels`): one metered pass over the
+	 *  audio the export would render, which takes seconds on a long cut. Held here and
+	 *  not in the panel because the panel is rebuilt whenever the workspace changes —
+	 *  a measurement under way should survive a switch to Edit and back, and its
+	 *  result should be there when the Mixer is. `stopMeasure` abandons the pass
+	 *  (`stopping` until the backend has given up); a stopped one leaves the last
+	 *  result in place and reports nothing. */
+	measure = $state<{ running: boolean; stopping: boolean; result: MeasureResult | null; error: string | null }>({
+		running: false,
+		stopping: false,
+		result: null,
+		error: null
+	});
 	/** Playhead position, seconds. */
 	time = $state(0);
 	/** Shuttle rate while playing: 1 = normal, ±2/±4/±8 from J/L taps.
@@ -116,6 +147,39 @@ class EditorUi {
 	availableFonts = $state<string[]>([]);
 
 	#raf: number | null = null;
+
+	/** Measure the cut's loudness — the whole of it, or the in / out range when both
+	 *  marks are set (the export dialog's rule). A no-op while one is already running. */
+	async measureLevels(): Promise<void> {
+		if (this.measure.running) return;
+		const range = measureRange(this.markIn, this.markOut);
+		const stamp: MeasureStamp = {
+			seq: editor.history.find((r) => r.current)?.seq ?? null,
+			path: editor.currentPath
+		};
+		this.measure.running = true;
+		this.measure.error = null;
+		try {
+			this.measure.result = { levels: await getLevels(range), range, stamp };
+		} catch (e) {
+			// A stop is the user's own doing, not a failure to report.
+			if (!isLevelsCancelled(e)) {
+				this.measure.error = message(e);
+				toast.error(`Couldn't measure the loudness — ${this.measure.error}`);
+			}
+		} finally {
+			this.measure.running = false;
+			this.measure.stopping = false;
+		}
+	}
+
+	/** Ask the running measurement to give up. It reads the whole mix, so on a long
+	 *  cut that is minutes the user should not have to wait out. */
+	stopMeasure() {
+		if (!this.measure.running || this.measure.stopping) return;
+		this.measure.stopping = true;
+		void cancelLevels();
+	}
 
 	openVoiceover(prefill: VoiceoverPrefill | null = null) {
 		this.voiceoverDialog = { prefill };

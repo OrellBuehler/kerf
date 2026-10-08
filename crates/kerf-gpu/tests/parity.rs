@@ -284,6 +284,13 @@ fn compositor() -> &'static Compositor {
     C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
 }
 
+/// One frame source for the whole suite, as the app would have: every case's frames are decoded
+/// through it as well, and must be the one-shot decode's byte for byte.
+fn frame_source() -> &'static kerf_gpu::FrameSource {
+    static S: OnceLock<Arc<kerf_gpu::FrameSource>> = OnceLock::new();
+    S.get_or_init(|| kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default()))
+}
+
 thread_local! {
     /// A policy a test forces on its own thread (see [`with_policy`]).
     static FORCED_POLICY: std::cell::Cell<Option<CompositeColorPolicy>> = const { std::cell::Cell::new(None) };
@@ -629,6 +636,7 @@ fn timeline(tracks: Vec<Vec<Clip>>, format: Option<Delivery>) -> Timeline {
         overlays: Vec::new(),
         markers: Vec::new(),
         format,
+        master: Default::default(),
     }
 }
 
@@ -825,6 +833,17 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
 
         let (frame, timings) = compositor().render_plan(&plan, size).expect("GPU render");
         assert_eq!((frame.width as usize, frame.height as usize), (w, h));
+        // The layers' frames from long-lived runs: identical to the one-shot decode's, not merely close.
+        let shared = frame_source()
+            .frames(&plan.layers, kerf_gpu::Hint::Scrub)
+            .unwrap_or_else(|e| panic!("{case} @ {t}: the frame source: {e}"));
+        let oneshot = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        for (n, (a, b)) in shared.iter().zip(&oneshot).enumerate() {
+            assert!(
+                a.as_deref() == b.as_ref(),
+                "{case} @ {t}: layer {n}: the frame source's frame is not the one-shot decode's"
+            );
+        }
         let gpu_rgb = rgba_to_rgb(&frame.data);
 
         let (m, band) = compare(&reference, &gpu_rgb, w, h, limits.edge_step);

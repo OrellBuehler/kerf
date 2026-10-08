@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withLinkedMoves } from './links';
 import { moveClips } from './multi-edit';
 import { moveTracks, planMove, type MoveTrack } from './multi-move';
 import type { Clip, StreamKind, Timeline, Track } from './types';
@@ -329,3 +330,248 @@ describe('planMove agrees with move_clips', () => {
 		expect(refused).toBeGreaterThan(50);
 	});
 });
+
+
+// ---- linked clips ---------------------------------------------------------------------
+
+const linked = (c: Clip, link: string): Clip => ({ ...c, link_id: link });
+
+// V1: p 0-10 (L1), q 12-20          A1: s 0-10 (L1), t 12-20 (L2)
+// V2: r 30-40 (L2)                   A2: u 5-9
+function pairs(): Timeline {
+	return {
+		tracks: [
+			track('v1', 'video', [linked(clip('p', 0, 10), 'L1'), clip('q', 12, 8)]),
+			track('v2', 'video', [linked(clip('r', 30, 10), 'L2')]),
+			track('a1', 'audio', [linked(clip('s', 0, 10), 'L1'), linked(clip('t', 12, 8), 'L2')]),
+			track('a2', 'audio', [clip('u', 5, 4)])
+		]
+	};
+}
+const links = { links: true };
+const alone = { links: false };
+
+describe('moveTracks reads the links', () => {
+	test('a clip’s link id rides along, and only when it has one', () => {
+		const t = moveTracks(pairs());
+		expect(t[0].clips[0]).toEqual({ id: 'p', start: 0, dur: 10, link: 'L1' });
+		expect(t[0].clips[1]).toEqual({ id: 'q', start: 12, dur: 8 });
+	});
+});
+
+describe('planMove — linked partners', () => {
+	test('without options nothing about links is looked at', () => {
+		const p = planMove(moveTracks(pairs()), ['q'], 'q', 13, 'v1');
+		expect(p.carried).toEqual([]);
+		expect(p.link).toBe(false);
+	});
+
+	test('a dragged clip carries its partner by the same Δt on its own track', () => {
+		const p = planMove(moveTracks(pairs()), ['p'], 'p', 1, 'v1', links);
+		expect(p.ok).toBe(true);
+		expect(p.link).toBe(true);
+		expect(p.carried).toEqual(['s']);
+		expect(p.ghosts).toEqual([
+			{ clipId: 'p', trackId: 'v1', start: 1, dur: 10 },
+			{ clipId: 's', trackId: 'a1', start: 1, dur: 10, carried: true }
+		]);
+		// Only the dragged clip is named: the backend adds the partner, as it was just drawn.
+		expect(p.moves).toEqual([{ clip_id: 'p', timeline_start: 1 }]);
+	});
+
+	test('dragging the sound carries the picture the same way', () => {
+		const p = planMove(moveTracks(pairs()), ['s'], 's', 2, 'a1', links);
+		expect(p.ok).toBe(true);
+		expect(p.carried).toEqual(['p']);
+		expect(p.moves).toEqual([{ clip_id: 's', timeline_start: 2 }]);
+	});
+
+	test('a track change is the dragged clip’s alone: the partner stays on its lane', () => {
+		// p to V2 (r is at 30-40, p lands 0-10): the sound stays on A1.
+		const p = planMove(moveTracks(pairs()), ['p'], 'p', 0, 'v2', links);
+		expect(p.ok).toBe(true);
+		expect(p.laneShift).toBe(1);
+		expect(p.moves).toEqual([{ clip_id: 'p', timeline_start: 0, track_id: 'v2' }]);
+		expect(p.ghosts.find((g) => g.clipId === 's')).toEqual({ clipId: 's', trackId: 'a1', start: 0, dur: 10, carried: true });
+	});
+
+	test('the partner is checked with the group: it may not land on a clip that stays', () => {
+		// The picture has room (q is out of the way) but its sound, shifted by 3, would sit on t at 12-20.
+		const tl = pairs();
+		tl.tracks[0].clips[1].timeline_start = 40;
+		const p = planMove(moveTracks(tl), ['p'], 'p', 3, 'v1', links);
+		expect(p.ok).toBe(false);
+		expect(p.reason).toBe('The clips would overlap on track A1 at 0:03.0 — hold Alt to move this clip on its own');
+		expect(p.carried).toEqual(['s']); // still drawn, red
+		// Alt: the picture alone fits.
+		expect(planMove(moveTracks(tl), ['p'], 'p', 3, 'v1', alone).ok).toBe(true);
+	});
+
+	test('a partner on a locked track refuses, and says how to leave it behind', () => {
+		const tl = pairs();
+		tl.tracks[2].locked = true;
+		const p = planMove(moveTracks(tl), ['p'], 'p', 1, 'v1', links);
+		expect(p.ok).toBe(false);
+		expect(p.reason).toBe('A linked clip is on locked track A1 — unlock it, or hold Alt to move this clip on its own');
+		// With links off the partner is not part of it.
+		const q = planMove(moveTracks(tl), ['p'], 'p', 1, 'v1', alone);
+		expect(q.ok).toBe(true);
+		expect(q.carried).toEqual([]);
+	});
+
+	test('a partner that would start before 0 refuses the drop', () => {
+		const tl = pairs();
+		tl.tracks[2].clips[0].timeline_start = 0;
+		tl.tracks[0].clips[0].timeline_start = 4; // p 4-14, its sound at 0-10
+		const p = planMove(moveTracks(tl), ['p'], 'p', 2, 'v1', links); // Δ -2: s would start at -2
+		expect(p.ok).toBe(false);
+		expect(p.reason).toContain('before the beginning of the timeline');
+		expect(p.reason).toContain('linked clip on A1');
+	});
+
+	test('with links off — Alt — the clip moves alone and its partner stays', () => {
+		const p = planMove(moveTracks(pairs()), ['p'], 'p', 1, 'v1', alone);
+		expect(p.ok).toBe(true);
+		expect(p.link).toBe(false);
+		expect(p.carried).toEqual([]);
+		expect(p.ghosts.map((g) => g.clipId)).toEqual(['p']);
+		expect(p.moves).toEqual([{ clip_id: 'p', timeline_start: 1 }]);
+	});
+
+	test('a selection that already holds the pair is the same drag as grabbing one clip', () => {
+		// Clicking a linked clip selects its partners, so the group is [p, s]: s is carried, not lane-shifted.
+		const sel = planMove(moveTracks(pairs()), ['p', 's'], 'p', 1, 'v1', links);
+		const one = planMove(moveTracks(pairs()), ['p'], 'p', 1, 'v1', links);
+		expect(sel).toEqual(one);
+		// Lane change: the selection's sound does not follow the picture to another lane.
+		const lane = planMove(moveTracks(pairs()), ['p', 's'], 'p', 0, 'v2', links);
+		expect(lane.moves).toEqual([{ clip_id: 'p', timeline_start: 0, track_id: 'v2' }]);
+		expect(lane.ghosts.find((g) => g.clipId === 's')!.trackId).toBe('a1');
+	});
+
+	test('Alt on a selection that holds the pair leaves the grabbed clip’s partner behind', () => {
+		const p = planMove(moveTracks(pairs()), ['p', 's'], 'p', 1, 'v1', alone);
+		expect(p.carried).toEqual([]);
+		expect(p.moves).toEqual([{ clip_id: 'p', timeline_start: 1 }]);
+		expect(p.ghosts.map((g) => g.clipId)).toEqual(['p']);
+	});
+
+	test('two groups at once: every dragged clip carries its own partner, once', () => {
+		// p (L1) and r (L2) dragged together +1: s and t follow, each once.
+		const p = planMove(moveTracks(pairs()), ['p', 'r'], 'p', 1, 'v1', links);
+		expect(p.ok).toBe(true);
+		expect(p.carried.sort()).toEqual(['s', 't']);
+		expect(p.moves.map((m) => m.clip_id).sort()).toEqual(['p', 'r']);
+	});
+
+	test('an unlinked clip carries nothing', () => {
+		const p = planMove(moveTracks(pairs()), ['q'], 'q', 13, 'v1', links);
+		expect(p.carried).toEqual([]);
+		expect(p.ghosts).toHaveLength(1);
+	});
+
+	test('a no-op drop names nothing, partners or not', () => {
+		const p = planMove(moveTracks(pairs()), ['p'], 'p', 0, 'v1', links);
+		expect(p.noop).toBe(true);
+		expect(p.moves).toEqual([]);
+	});
+});
+
+// Again against the backend: the plan with links, and what `move_clips` does with the
+// moves it names once `withLinkedMoves` has added the partners — accepted exactly when
+// the backend accepts, every ghost (carried ones included) where the clip ends up.
+describe('planMove with links agrees with move_clips', () => {
+	let state = 777;
+	const rand = () => {
+		state = (state * 1103515245 + 12345) & 0x7fffffff;
+		return state / 0x7fffffff;
+	};
+
+	function layout(): Timeline {
+		return {
+			tracks: [
+				track('v1', 'video', [linked(clip('a', 0, 4), 'L1'), clip('b', 5, 3), linked(clip('c', 12, 6), 'L2')]),
+				track('v2', 'video', [linked(clip('d', 2, 5), 'L3'), clip('e', 20, 2)]),
+				track('v3', 'video', []),
+				track('a1', 'audio', [linked(clip('f', 0, 4), 'L1'), linked(clip('g', 12, 6), 'L2')]),
+				track('a2', 'audio', [linked(clip('h', 2, 5), 'L3'), clip('i', 14, 2)])
+			]
+		};
+	}
+	const all = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'];
+
+	test('on a few hundred random drags, links on and off', () => {
+		let accepted = 0;
+		let refused = 0;
+		let carried = 0;
+		for (let n = 0; n < 800; n++) {
+			const tl = layout();
+			if (rand() < 0.15) tl.tracks[Math.floor(rand() * tl.tracks.length)].locked = true;
+			const members = all.filter(() => rand() < 0.3);
+			const grabbed = all[Math.floor(rand() * all.length)];
+			const withLinks = rand() < 0.6;
+			const kinds = new Map(tl.tracks.flatMap((t) => t.clips.map((c) => [c.id, t.kind] as const)));
+			const sameKind = tl.tracks.filter((t) => t.kind === kinds.get(grabbed));
+			const dest = sameKind[Math.floor(rand() * sameKind.length)].id;
+			const start = Math.round((rand() * 24 - 4) * 4) / 4;
+
+			const plan = planMove(moveTracks(tl), members, grabbed, start, dest, { links: withLinks });
+			const trial = structuredClone(tl);
+			// What the backend is asked, independent of the plan: the dragged clips (the
+			// grabbed clip's partners are not among them) on the lane offset, partners added by the backend.
+			const group = new Set([...members, grabbed]);
+			for (const p of linkedPartners(tl, grabbed)) group.delete(p);
+			const delta = start - clipStart(tl, grabbed);
+			const lanes = (k: StreamKind) => tl.tracks.filter((t) => t.kind === k);
+			const shift =
+				lanes(kinds.get(grabbed)!).findIndex((t) => t.id === dest) -
+				lanes(kinds.get(grabbed)!).findIndex((t) => t.clips.some((c) => c.id === grabbed));
+			const asked = tl.tracks.flatMap((t) =>
+				t.clips
+					.filter((c) => group.has(c.id))
+					.map((c) => {
+						const row = lanes(t.kind);
+						const to = row[row.findIndex((x) => x.id === t.id) + shift];
+						return { clip_id: c.id, timeline_start: c.timeline_start + delta, track_id: to?.id ?? '__missing__' };
+					})
+			);
+			let threw = false;
+			try {
+				moveClips(trial, withLinks ? withLinkedMoves(tl, asked) : asked);
+			} catch {
+				threw = true;
+			}
+			expect([n, threw]).toEqual([n, !plan.ok]);
+			if (plan.ok) {
+				accepted++;
+				carried += plan.carried.length;
+				const after = new Map(trial.tracks.flatMap((t) => t.clips.map((c) => [c.id, { t: t.id, s: c.timeline_start, d: clipDuration(c) }] as const)));
+				for (const g of plan.ghosts) {
+					const at = after.get(g.clipId)!;
+					expect(at.t).toBe(g.trackId);
+					expect(at.s).toBeCloseTo(g.start, 9);
+					expect(at.d).toBeCloseTo(g.dur, 9);
+				}
+				// Nothing else moved.
+				const ghostIds = new Set(plan.ghosts.map((g) => g.clipId));
+				for (const c of tl.tracks.flatMap((t) => t.clips)) {
+					if (ghostIds.has(c.id)) continue;
+					expect(after.get(c.id)!.s).toBe(c.timeline_start);
+				}
+			} else {
+				refused++;
+			}
+		}
+		expect(accepted).toBeGreaterThan(50);
+		expect(refused).toBeGreaterThan(50);
+		expect(carried).toBeGreaterThan(20);
+	});
+});
+
+function clipStart(tl: Timeline, id: string): number {
+	return tl.tracks.flatMap((t) => t.clips).find((c) => c.id === id)!.timeline_start;
+}
+function linkedPartners(tl: Timeline, id: string): string[] {
+	const l = tl.tracks.flatMap((t) => t.clips).find((c) => c.id === id)?.link_id;
+	return l ? tl.tracks.flatMap((t) => t.clips).filter((c) => c.link_id === l && c.id !== id).map((c) => c.id) : [];
+}

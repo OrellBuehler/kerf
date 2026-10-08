@@ -311,12 +311,23 @@ const ADDED: Record<string, string> = {
 	w: 'edit.trimEnd'
 };
 
-/** What a keypress should do now: the old handler's answer, plus the added bare keys. */
+/** The chords with a modifier that were given an action after the registry existed (linked
+ *  A/V), by what the key is and which modifiers it carries. `Mod` is ⌘ / Ctrl as everywhere.
+ *  Like `ADDED`, writing a new one here is how the decision is recorded. */
+const ADDED_SHIFT: Record<string, string> = { d: 'edit.detachAudio' };
+const ADDED_MOD: Record<string, string> = { l: 'edit.link' };
+const ADDED_MOD_SHIFT: Record<string, string> = { d: 'edit.reattachAudio', l: 'edit.unlink' };
+
+/** What a keypress should do now: the keys and chords added since take their own answer (a
+ *  new ⇧⌘D is not the old handler's accidental ⇧⌘D), anything else the old handler's. */
 function expectedAction(e: KeyEventLike): string | null {
-	const was = legacyAction(e);
-	if (was) return was;
-	if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return null;
-	return ADDED[e.key.toLowerCase()] ?? null;
+	const k = e.key.toLowerCase();
+	const mod = e.metaKey || e.ctrlKey;
+	if (!e.altKey) {
+		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : ADDED[k];
+		if (added) return added;
+	}
+	return legacyAction(e);
 }
 
 describe('the default keys are the ones the editor always had', () => {
@@ -338,7 +349,10 @@ describe('the default keys are the ones the editor always had', () => {
 			['c', {}, 'edit.copy'],
 			['x', {}, 'edit.cut'],
 			['v', {}, 'edit.paste'],
-			['d', {}, 'edit.duplicate']
+			['d', {}, 'edit.duplicate'],
+			['d', { shift: true }, 'edit.reattachAudio'], // ⇧⌘D: the way back from ⇧D
+			['l', {}, 'edit.link'],
+			['l', { shift: true }, 'edit.unlink']
 		];
 		const bare: [string, Mods, string][] = [
 			['v', {}, 'tool.pointer'],
@@ -348,6 +362,7 @@ describe('the default keys are the ones the editor always had', () => {
 			['u', {}, 'tool.slide'],
 			['q', {}, 'edit.trimStart'],
 			['w', {}, 'edit.trimEnd'],
+			['d', { shift: true }, 'edit.detachAudio'],
 			['r', {}, 'tool.rippleMode'],
 			['z', { shift: true }, 'view.zoomFit'],
 			['m', {}, 'marker.add'],
@@ -439,7 +454,7 @@ describe('the default keys are the ones the editor always had', () => {
 			const b = resolveBindings(emptyOverrides(), p);
 			for (const key of KEYS) {
 				const e = ev(key, primary(p));
-				expect([key, matchAction(e, b)]).toEqual([key, legacyAction(e)]);
+				expect([key, matchAction(e, b)]).toEqual([key, expectedAction(e)]);
 			}
 		}
 	});
@@ -455,7 +470,7 @@ describe('the default keys are the ones the editor always had', () => {
 				const e = ev(key, { shift: true });
 				const now = matchAction(e, b);
 				if (accidents.has(key)) expect([key, now]).toEqual([key, null]);
-				else expect([key, now]).toEqual([key, legacyAction(e)]);
+				else expect([key, now]).toEqual([key, expectedAction(e)]);
 			}
 		}
 	});
@@ -466,7 +481,7 @@ describe('the default keys are the ones the editor always had', () => {
 			for (const key of KEYS) {
 				const e = ev(key, { ...primary(p), shift: true });
 				const now = matchAction(e, b);
-				const was = legacyAction(e);
+				const was = expectedAction(e);
 				if (now !== was) expect([key, now]).toEqual([key, null]);
 			}
 			expect(matchAction(ev('s', { ...primary(p), shift: true }), b)).toBe('file.save');
@@ -923,6 +938,10 @@ describe('keys that act once per press', () => {
 			'edit.rippleDelete',
 			'edit.trimStart',
 			'edit.trimEnd',
+			'edit.detachAudio',
+			'edit.reattachAudio',
+			'edit.link',
+			'edit.unlink',
 			'tool.rippleMode',
 			'playback.toggle',
 			'playback.shuttleBack',
@@ -1018,8 +1037,8 @@ describe('no key is hard-coded outside the registry', () => {
 			.map((f) => f.slice(SRC.length + 1))
 			.sort();
 		// Widgets with their own keys (a tab rail, a dialog's Escape, a drag's
-		// Escape, a text field's Enter) are not shortcuts and are listed so a new
-		// one is a decision.
+		// Escape, a text field's Enter, a slider's arrows) are not shortcuts and are
+		// listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
@@ -1027,6 +1046,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
+			'lib/components/editor/MixSlider.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/SettingsDialog.svelte',

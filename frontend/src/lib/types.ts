@@ -366,6 +366,14 @@ export interface Clip {
 	framings?: Framing[];
 	/** Whether the clip renders. Absent means enabled (the backend omits it when true). */
 	enabled?: boolean;
+	/** The link group: clips sharing a `link_id` (a picture and its detached sound) are
+	 *  edited together — moved, trimmed, split, removed. Absent is unlinked (the backend
+	 *  omits it). A group of one is not a link; `linkPartners` is the question to ask. */
+	link_id?: string | null;
+	/** Whether the clip plays the audio of its own asset. `false` once its sound was
+	 *  detached onto an audio track (the picture is then silent). Absent means it does
+	 *  (the backend omits it when true). */
+	source_audio?: boolean;
 }
 
 /** A crop for one delivery shape (`aspect_w:aspect_h` in lowest terms). */
@@ -472,12 +480,76 @@ export interface Delivery {
 	fit: Fit;
 }
 
+/**
+ * The last stage of the mix — mirrors `kerf_core::MasterBus`. A fader and a
+ * safety limiter on the finished mix, after every track and the duck bus and
+ * before `loudnorm`. Absent (the default, and every project that never touched
+ * it) means unity gain, no limiter.
+ */
+export interface MasterBus {
+	/** Linear gain on the finished mix; 1 is unity, clamped to 0..4 (+12 dB). */
+	volume: number;
+	/** A lookahead limiter holding the mix under `ceiling_db`. */
+	limiter: boolean;
+	/** Limiter ceiling in dBFS, -24..0 (-1.5 by default). A sample-peak ceiling. */
+	ceiling_db: number;
+}
+
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
 	markers?: Marker[];
 	/** Unset = the shape follows the footage (the historical behaviour). */
 	format?: Delivery | null;
+	/** The master bus. Unset = unity gain, no limiter. */
+	master?: MasterBus;
+}
+
+/**
+ * What one `ebur128` meter read — mirrors `kerf_core::LevelReading`. `null`
+ * wherever there was nothing to report (silence, or a span under 3 s for the
+ * short-term maximum).
+ */
+export interface LevelReading {
+	/** Integrated (programme) loudness, LUFS. */
+	integrated_lufs: number | null;
+	/** Loudness range, LU. */
+	loudness_range_lu: number | null;
+	/** The loudest 3 s window, LUFS. */
+	short_term_max_lufs: number | null;
+	/** Highest sample, dBFS. */
+	peak_dbfs: number | null;
+	/** Highest true (inter-sample) peak, dBTP — what a re-encode can clip on. */
+	true_peak_dbtp: number | null;
+}
+
+/** One track's strip: after its fader and pan, before the duck bus and the master. */
+export interface TrackLevels {
+	track_id: string;
+	name: string;
+	kind: StreamKind;
+	ducked: boolean;
+	/** Reaches the render at all — false for a muted or solo-shadowed track. */
+	heard: boolean;
+	level: LevelReading | null;
+}
+
+/** How loud the cut is (`get_levels`) — mirrors `kerf_core::Levels`. */
+export interface Levels {
+	/** Seconds of the cut measured. */
+	duration: number;
+	/** The finished mix; null when the cut has no audio. */
+	master: LevelReading | null;
+	tracks: TrackLevels[];
+	/** The measurement ran through `loudnorm`. */
+	loudnorm: boolean;
+	/** The streaming target the notes judge against (-14 LUFS). */
+	target_lufs: number;
+	/** What the numbers mean for delivery, as advice. */
+	notes: string[];
+	/** Set **only** by the browser harness, whose numbers are a stand-in
+	 *  estimated from the sample analysis — never by the backend. */
+	estimated?: boolean;
 }
 
 export interface AssetMetadata {
@@ -569,7 +641,8 @@ export type DiffKind =
 	| 'marker_added'
 	| 'marker_removed'
 	| 'marker_changed'
-	| 'format_changed';
+	| 'format_changed'
+	| 'master_changed';
 
 export interface DiffEntry {
 	kind: DiffKind;
@@ -876,3 +949,13 @@ export const clipDuration = (clip: Clip): number => {
 	const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
 	return span / speed;
 };
+
+/** What detaching sound from several clips did (`AudioDetached` in `crates/kerf-app/src/lib.rs`, the
+ *  answer of `extract_audio` and `detach_audio_clips`): the refreshed timeline, how many clips were
+ *  detached, and the ones left alone with the reason (a locked track, an asset without audio, a sound
+ *  already detached). */
+export interface AudioDetached {
+	timeline: Timeline;
+	detached: number;
+	skipped: { clip_id: string; reason: string }[];
+}

@@ -1,0 +1,48 @@
+Input #0, matroska,webm, from 'b.mkv':
+  Metadata:
+    ENCODER         : Lavf60.16.100
+  Duration: 00:00:00.40, start: 0.000000, bitrate: 38 kb/s
+  Stream #0:0: Video: h264 (High 4:4:4 Intra), yuv420p(progressive), 16x16 [SAR 1:1 DAR 1:1], 30 fps, 30 tbr, 1k tbn
+    Metadata:
+      ENCODER         : Lavc60.31.102 libx264
+      DURATION        : 00:00:00.400000000
+Stream mapping:
+  Stream #0:0 -> #0:0 (h264 (native) -> wrapped_avframe (native))
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] config in time_base: 1/1000, frame_rate: 30/1
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] config out time_base: 0/0, frame_rate: 0/0
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   0 pts:      0 pts_time:0       duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0]   side data - H.26[45] User Data Unregistered SEI message: UUID=dc45e9bd-e6d9-48b7-962c-d820d923eeef
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] User Data=78323634202d20636f7265203136342072333130382033316531396639202d20482e3236342f4d5045472d342041564320636f646563202d20436f70796c65667420323030332d32303233202d20687474703a2f2f7777772e766964656f6c616e2e6f72672f783236342e68746d6c202d206f7074696f6e733a2063616261633d31207265663d31206465626c6f636b3d313a303a3020616e616c7973653d3078333a3078313133206d653d686578207375626d653d37207073793d30206d697865645f7265663d30206d655f72616e67653d3136206368726f6d615f6d653d31207472656c6c69733d30203878386463743d312063716d3d3020646561647a6f6e653d32312c313120666173745f70736b69703d30206368726f6d615f71705f6f66667365743d3020746872656164733d31206c6f6f6b61686561645f746872656164733d3120736c696365645f746872656164733d30206e723d3020646563696d6174653d3120696e7465726c616365643d3020626c757261795f636f6d7061743d3020636f6e73747261696e65645f696e7472613d3020626672616d65733d3020776569676874703d30206b6579696e743d31206b6579696e745f6d696e3d31207363656e656375743d343020696e7472615f726566726573683d302072633d637170206d62747265653d302071703d3000
+[Parsed_showinfo_0 @ 0x7f5f18001bc0]
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+Output #0, yuv4mpegpipe, to 'pipe:1':
+  Metadata:
+    encoder         : Lavf63.1.102
+  Stream #0:0: Video: wrapped_avframe, yuv420p(tv, progressive), 16x16 [SAR 1:1 DAR 1:1], q=2-31, 200 kb/s, 30 fps, 30 tbn
+    Metadata:
+      encoder         : Lavc63.1.102 wrapped_avframe
+      DURATION        : 00:00:00.400000000
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   1 pts:     33 pts_time:0.033   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   2 pts:     67 pts_time:0.067   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   3 pts:    100 pts_time:0.1     duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   4 pts:    133 pts_time:0.133   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   5 pts:    167 pts_time:0.167   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   6 pts:    200 pts_time:0.2     duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   7 pts:    233 pts_time:0.233   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   8 pts:    267 pts_time:0.267   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:   9 pts:    300 pts_time:0.3     duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:  10 pts:    333 pts_time:0.333   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] n:  11 pts:    367 pts_time:0.367   duration:     33 duration_time:0.033   fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f5f18001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[out#0/yuv4mpegpipe @ 0x55a15bfa0d80] video:5KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=   12 fps=0.0 q=-0.0 Lsize=       5KiB time=00:00:00.00 bitrate=N/A speed=   0x elapsed=0:00:00.00

@@ -23,8 +23,9 @@
 	 * settles, so the line does not flick back to the old value for the round trip.
 	 *
 	 * Fades apply to picture and sound alike (the export fades both), so every clip
-	 * gets fade handles; only a clip whose asset has an audio stream gets a volume
-	 * line. */
+	 * gets fade handles; only a clip that plays an audio stream of its own gets a volume
+	 * line — a picture whose sound was detached does not (its volume is inert, the audio
+	 * clip linked to it carries the level), and its fades are the picture's alone. */
 	import type { Keyframe, Clip } from '$lib/types';
 	import { clipDuration } from '$lib/types';
 	import { beginDrag } from '$lib/drag';
@@ -55,7 +56,8 @@
 		pxPerSec: number;
 		/** The timeline's frame rate: fades land on frames. */
 		fps: number;
-		/** Whether the clip's asset has an audio stream — what a volume line is for. */
+		/** Whether the clip plays an audio stream of its own (its asset has one and it was
+		 *  not detached onto an audio track) — what a volume line is for. */
 		sound: boolean;
 		selected: boolean;
 		locked: boolean;

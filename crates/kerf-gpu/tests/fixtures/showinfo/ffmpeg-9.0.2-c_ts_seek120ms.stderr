@@ -1,0 +1,27 @@
+Input #0, mpegts, from 'c.ts':
+  Duration: 00:00:00.28, start: 1.400000, bitrate: 91 kb/s
+  Program 1
+    Metadata:
+      service_name    : Service01
+      service_provider: FFmpeg
+  Stream #0:0[0x100]: Video: h264 (High 4:4:4 Intra) ([27][0][0][0] / 0x001B), yuv420p(progressive), 16x16 [SAR 1:1 DAR 1:1], 25 fps, 25 tbr, 90k tbn, start 1.400000
+Stream mapping:
+  Stream #0:0 -> #0:0 (h264 (native) -> wrapped_avframe (native))
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] config in time_base: 1/90000, frame_rate: 25/1
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] config out time_base: 0/0, frame_rate: 0/0
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] n:   0 pts:  10800 pts_time:0.12    duration:   3600 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+Output #0, yuv4mpegpipe, to 'pipe:1':
+  Metadata:
+    encoder         : Lavf63.1.102
+  Stream #0:0: Video: wrapped_avframe, yuv420p(tv, progressive), 16x16 [SAR 1:1 DAR 1:1], q=2-31, 200 kb/s, 25 fps, 25 tbn
+    Metadata:
+      encoder         : Lavc63.1.102 wrapped_avframe
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] n:   1 pts:  14400 pts_time:0.16    duration:   3600 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] n:   2 pts:  18000 pts_time:0.2     duration:   3600 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] n:   3 pts:  21600 pts_time:0.24    duration:   3600 duration_time:0.04    fmt:yuv420p cl:left sar:1/1 s:16x16 i:P iskey:1 type:I
+[Parsed_showinfo_0 @ 0x7f2a24001bc0] color_range:unknown color_space:unknown color_primaries:unknown color_trc:unknown
+[out#0/yuv4mpegpipe @ 0x560675859d40] video:2KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    4 fps=0.0 q=-0.0 Lsize=       2KiB time=00:00:00.00 bitrate=N/A speed=   0x elapsed=0:00:00.00

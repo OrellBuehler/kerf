@@ -114,15 +114,32 @@
 //!   tracked ([`gpu`]). After [`GpuError::DeviceLost`] the owner builds a new
 //!   [`Gpu`] and a new [`Compositor`] on it. Reading the frame back waits a bounded
 //!   time (`READBACK_TIMEOUT`) and reports a timeout instead of hanging the caller.
+//!
+//! # The frame source's pure pieces (A1b-1)
+//!
+//! Decoding goes through long-lived `ffmpeg` runs (`.claude/plans/a1-design.md` §1), and
+//! everything about them that can be decided without a process is its own module, so every
+//! rule is a unit test: [`frame_cache`] (which frame of which file is held, under a byte cap,
+//! and what a miss proves), [`y4m`] (frames read straight into planes, the probed size checked
+//! first), [`showinfo`] (the pts of each frame, off stderr) and [`router`] (which run serves a
+//! request, and when to give up and let FFmpeg's own stream render). Which frame of a file a
+//! layer shows, and how much of the file a cursor must have read to know, is `kerf-core`'s
+//! (`Pick::progress`).
 
 pub mod compositor;
 pub mod eq;
+pub mod frame_cache;
+pub mod frame_source;
 pub mod gpu;
 pub mod roundtrip;
+pub mod router;
+pub mod showinfo;
 pub mod source;
 pub mod sws;
+pub mod y4m;
 
 pub use compositor::{Compositor, RenderTimings, RgbaFrame};
+pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;

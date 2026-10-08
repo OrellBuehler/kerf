@@ -73,7 +73,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. An **Insta360 lens pair imports as one 360 asset** — Kerf stitches the two capture files into an equirect sphere once and caches it. Spherical sources are detected on import; anything unflagged can be marked by hand. |
 | **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, and SRT export. **Captions follow the cut**: the transcript is projected through the clips that actually show its footage (trim / speed / reverse honored), so words you cut out get no caption — in a subtitle **Lines** style or the social **Word punch** style, one large word on the beat of the speech, fitted to the delivery frame. |
 | **Edit by transcript** | The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and `×` cuts that sentence out of the timeline and ripples the gap closed. |
-| **Smart mixing** | A **mixer strip** per audible track (fader + pan, mirrored exactly in preview), per-track **ducking** (music dips under dialogue via sidechain) and single-pass **loudnorm** to −14 LUFS on export. |
+| **Smart mixing** | A **mixer strip** per audible track (fader + pan, mirrored exactly in preview), per-track **ducking** (music dips under dialogue via sidechain), a **master bus** (fader + safety limiter), single-pass **loudnorm** to −14 LUFS on export, and measured **levels** (LUFS / true peak, per track and master) an agent can check before it calls a cut finished. |
 | **GPU-accelerated export** | NVENC / QSV / VideoToolbox / AMF are **verified with a real test encode** before being offered, hardware decode falls back to software on its own, and **range export** renders just the region between your in/out marks. |
 | **Agent workflow** | 87 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
 | **Plays nicely with your machine** | One heavy FFmpeg job at a time, at a **CPU budget** you set (Background / Balanced / Full speed in Settings, or `KERF_CPU_PERCENT`) and below-normal priority — an agent analyzing eight sources no longer takes the desktop down. Every toast lands in a **notification center**, so a failure is still readable after it fades. |
@@ -165,6 +165,7 @@ frame at full source detail.
 `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
+`set_master_volume` · `set_master_limiter` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
 `generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
@@ -173,7 +174,7 @@ frame at full source detail.
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `platform_check` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `platform_check` · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·

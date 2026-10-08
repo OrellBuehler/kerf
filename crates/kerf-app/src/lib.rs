@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask,
-    Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
-    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
+    Mask, Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, TimeRange,
+    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -40,6 +40,9 @@ struct AppState {
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
     analysis_cancel: Arc<AtomicBool>,
+    /// Same, for the Mixer's loudness measurement. It holds the heavy-job lease for
+    /// a whole-mix decode (minutes on a long cut), so it has to be stoppable.
+    levels_cancel: Arc<AtomicBool>,
     /// Same, for a voiceover being synthesized (or its model downloading).
     voiceover_cancel: Arc<AtomicBool>,
     /// Whether the main window has been shown. It is created hidden (`visible:
@@ -668,11 +671,13 @@ fn add_clip(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Split a clip at timeline time `at`. A clip's linked partners (a picture and its
+/// detached sound) are split at the same moment unless `link` is `false`.
 #[tauri::command(async)]
-fn split_clip(state: State<'_, AppState>, clip_id: String, at: f64) -> CmdResult<Timeline> {
+fn split_clip(state: State<'_, AppState>, clip_id: String, at: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.split_at(id, at).map_err(|e| e.to_string())?;
+    project.with_links(link, |p| p.split_at(id, at)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -683,11 +688,12 @@ fn trim_clip(
     source_in: Option<f64>,
     source_out: Option<f64>,
     timeline_start: Option<f64>,
+    link: Option<bool>,
 ) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
     project
-        .trim(id, source_in, source_out, timeline_start)
+        .with_links(link, |p| p.trim(id, source_in, source_out, timeline_start))
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
@@ -702,94 +708,122 @@ fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, n
 }
 
 #[tauri::command(async)]
-fn move_clip(state: State<'_, AppState>, clip_id: String, timeline_start: f64, track_id: Option<String>) -> CmdResult<Timeline> {
+fn move_clip(
+    state: State<'_, AppState>,
+    clip_id: String,
+    timeline_start: f64,
+    track_id: Option<String>,
+    link: Option<bool>,
+) -> CmdResult<Timeline> {
     let clip = id(&clip_id)?;
     let track = track_id.as_deref().map(id).transpose()?;
     let project = state.project();
-    project.move_clip(clip, timeline_start, track).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.move_clip(clip, timeline_start, track))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Move several clips in **one** revision — a marquee selection dragged
 /// together. Each move names a clip, its absolute start and optionally another
 /// track of the same kind; the whole group is checked as a group and an illegal
-/// one changes nothing. Never ripples.
+/// one changes nothing. Never ripples. Linked partners of the named clips move
+/// with them (by the same Δt, on their own tracks) unless `link` is `false`.
 #[tauri::command(async)]
-fn move_clips(state: State<'_, AppState>, moves: Vec<ClipMove>) -> CmdResult<Timeline> {
+fn move_clips(state: State<'_, AppState>, moves: Vec<ClipMove>, link: Option<bool>) -> CmdResult<Timeline> {
     let project = state.project();
-    project.move_clips(&moves).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.move_clips(&moves))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
-fn ripple_delete(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+fn ripple_delete(state: State<'_, AppState>, clip_id: String, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.ripple_delete(id).map_err(|e| e.to_string())?;
+    project.with_links(link, |p| p.ripple_delete(id)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
-fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f64) -> CmdResult<Timeline> {
+fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.cut_clip_range(id, from, to).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.cut_clip_range(id, from, to))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Roll the cut between two adjacent clips of one track: `clip_a`'s end and
 /// `clip_b`'s start move together by `delta` seconds (positive is later), clamped
-/// to each clip's footage and a 0.05 s floor. Never ripples.
+/// to each clip's footage and a 0.05 s floor. Never ripples. The cuts of linked
+/// partner pairs roll with it unless `link` is `false`.
 #[tauri::command(async)]
-fn roll_edit(state: State<'_, AppState>, clip_a: String, clip_b: String, delta: f64) -> CmdResult<Timeline> {
+fn roll_edit(state: State<'_, AppState>, clip_a: String, clip_b: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let (a, b) = (id(&clip_a)?, id(&clip_b)?);
     let project = state.project();
-    project.roll_edit(a, b, delta).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.roll_edit(a, b, delta))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Slip a clip: show a different part of its footage in the same place and for
 /// the same length. `delta` is in **source** seconds, positive = starts later in
 /// its own footage (mirrored window for a reversed clip). Clamped to the footage.
-/// Never ripples.
+/// Never ripples. Linked partners slip by the same moment of footage unless `link`
+/// is `false`.
 #[tauri::command(async)]
-fn slip_clip(state: State<'_, AppState>, clip_id: String, delta: f64) -> CmdResult<Timeline> {
+fn slip_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.slip_clip(id, delta).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.slip_clip(id, delta))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Slide a clip along its track by `delta` timeline seconds, the neighbours that
 /// touch it giving way. Clamped to their footage and a 0.05 s floor. Never ripples.
+/// Linked partners slide with it unless `link` is `false`.
 #[tauri::command(async)]
-fn slide_clip(state: State<'_, AppState>, clip_id: String, delta: f64) -> CmdResult<Timeline> {
+fn slide_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.slide_clip(id, delta).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.slide_clip(id, delta))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Split a clip at timeline time `at` and remove one half (`side` is `"left"` or
-/// `"right"`): trim the start / end to the playhead. Follows ripple mode.
+/// `"right"`): trim the start / end to the playhead. Follows ripple mode. Linked
+/// partners that span `at` are trimmed with it unless `link` is `false`.
 #[tauri::command(async)]
-fn split_remove(state: State<'_, AppState>, clip_id: String, at: f64, side: String) -> CmdResult<Timeline> {
+fn split_remove(state: State<'_, AppState>, clip_id: String, at: f64, side: String, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
     let project = state.project();
-    project.split_remove(id, at, side).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.split_remove(id, at, side))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Split and remove on several clips as **one** revision — the playhead trim of a
 /// selection, V1 and its A1 partner together, undone in one step. Each cut names a
 /// clip and its time; `side` is the same for all. All or nothing, one clip per track;
-/// follows ripple mode, each track on its own.
+/// follows ripple mode, each track on its own. Linked partners of a named clip that
+/// are not named are cut with it unless `link` is `false`.
 #[tauri::command(async)]
-fn split_remove_clips(state: State<'_, AppState>, cuts: Vec<ClipCut>, side: String) -> CmdResult<Timeline> {
+fn split_remove_clips(state: State<'_, AppState>, cuts: Vec<ClipCut>, side: String, link: Option<bool>) -> CmdResult<Timeline> {
     let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
     let project = state.project();
-    project.split_remove_clips(&cuts, side).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.split_remove_clips(&cuts, side))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -833,6 +867,60 @@ fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdR
     let project = state.project();
     project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set the master fader — the linear gain on the finished mix, after every
+/// track and the duck bus and before loudness normalisation.
+#[tauri::command(async)]
+fn set_master_volume(state: State<'_, AppState>, volume: f64) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_volume(volume).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Switch the master limiter on or off, optionally moving its ceiling (dBFS).
+/// Omitting `ceiling_db` keeps the one it had.
+#[tauri::command(async)]
+fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Option<f64>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_limiter(enabled, ceiling_db).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Measure how loud the cut is — the finished mix and each track — in one pass
+/// over the audio the export would render. Whole-file work, so it resolves its
+/// inputs under the project lock and runs ffmpeg with it released. `range` is a
+/// `{start, end}` span of the cut (default all of it); `loudnorm` measures the
+/// mix as an export with normalisation on would write it. `cancel_levels` stops
+/// the pass, which then rejects with `"levels cancelled"`.
+#[tauri::command]
+async fn get_levels(state: State<'_, AppState>, range: Option<TimeRange>, loudnorm: Option<bool>) -> CmdResult<Levels> {
+    let shared = state.project.clone();
+    // Fresh cancel flag for this pass; `cancel_levels` flips it from the UI.
+    let cancel = state.levels_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).levels_inputs().map_err(|e| e.to_string())?;
+        Project::measure_levels(&timeline, &assets, range, loudnorm.unwrap_or(false), &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(|e| match e {
+            kerf_core::Error::Cancelled => LEVELS_CANCELLED.to_string(),
+            other => other.to_string(),
+        })
+    })
+    .await
+}
+
+/// The error a stopped measurement returns, for the webview to stay quiet on.
+const LEVELS_CANCELLED: &str = "levels cancelled";
+
+/// Request cancellation of the loudness measurement in flight (if any). The running
+/// [`get_levels`] polls the flag while ffmpeg works, kills it and rejects with
+/// `"levels cancelled"`.
+#[tauri::command(async)]
+fn cancel_levels(state: State<'_, AppState>) {
+    state.levels_cancel.store(true, Ordering::SeqCst);
 }
 
 /// Set the frame the project is cut for, or clear it back to the source shape.
@@ -884,6 +972,74 @@ fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enabled: bool) 
     project.timeline().map_err(|e| e.to_string())
 }
 
+// ---- linked A/V ------------------------------------------------------------
+
+/// **Detach audio**: split a picture clip's own sound onto an audio track — a new
+/// audio clip with the same span and position, linked to the picture, whose own
+/// sound is muted. One revision.
+#[tauri::command(async)]
+fn detach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.detach_audio(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// **Detach audio** from several picture clips in **one** revision. A clip that
+/// cannot be detached is skipped and reported; an error only when none could be.
+#[tauri::command(async)]
+fn detach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<AudioDetached> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    let done = project.detach_audio_clips(&ids).map_err(|e| e.to_string())?;
+    Ok(AudioDetached {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        detached: done.detached.len(),
+        skipped: done.skipped,
+    })
+}
+
+/// **Reattach audio**: delete the linked audio clip(s) carrying a picture's sound and
+/// let the picture play its own again. Name either clip of the pair; refused when the
+/// picture's sound is already playing from another audio clip (it would double). One
+/// revision.
+#[tauri::command(async)]
+fn reattach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.reattach_audio(id).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// **Reattach audio** on several pictures in **one** revision, all or nothing: name
+/// either clip of each pair; a pair that cannot be reattached refuses the lot.
+#[tauri::command(async)]
+fn reattach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.reattach_audio_clips(&ids).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Link clips (at least two, on different tracks) so an edit to one is carried to
+/// the others. One revision.
+#[tauri::command(async)]
+fn link_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.link_clips(&ids).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Unlink clips; a group left with a single clip dissolves. One revision.
+#[tauri::command(async)]
+fn unlink_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
+    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let project = state.project();
+    project.unlink_clips(&ids).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// One clipboard entry: the clip's data plus the track it should land on.
 #[derive(serde::Deserialize)]
 struct Placement {
@@ -912,23 +1068,30 @@ fn duplicate_clips(state: State<'_, AppState>, clip_ids: Vec<String>, at: f64) -
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Remove a clip — and its linked partners, unless `link` is `false`.
 #[tauri::command(async)]
-fn remove_clip(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
+fn remove_clip(state: State<'_, AppState>, clip_id: String, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.remove(id).map_err(|e| e.to_string())?;
+    project.with_links(link, |p| p.remove(id)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 /// Remove several clips in **one** revision. `ripple` forces ripple on or off
 /// for the call; omitted, the project's ripple mode decides — so a multi-select
-/// *ripple* delete is this with `ripple: true`.
+/// *ripple* delete is this with `ripple: true`. Linked partners of the named clips
+/// go too, unless `link` is `false`.
 #[tauri::command(async)]
-fn remove_clips(state: State<'_, AppState>, clip_ids: Vec<String>, ripple: Option<bool>) -> CmdResult<Timeline> {
+fn remove_clips(
+    state: State<'_, AppState>,
+    clip_ids: Vec<String>,
+    ripple: Option<bool>,
+    link: Option<bool>,
+) -> CmdResult<Timeline> {
     let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
     let project = state.project();
     project
-        .with_ripple(ripple, |p| p.remove_clips(&ids))
+        .with_links(link, |p| p.with_ripple(ripple, |p| p.remove_clips(&ids)))
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
@@ -949,11 +1112,15 @@ fn set_fade(state: State<'_, AppState>, clip_id: String, fade_in: Option<f64>, f
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Retime a clip; its linked partners are retimed by the same ratio unless `link`
+/// is `false`.
 #[tauri::command(async)]
-fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64) -> CmdResult<Timeline> {
+fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64, link: Option<bool>) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
-    project.set_speed(id, speed).map_err(|e| e.to_string())?;
+    project
+        .with_links(link, |p| p.set_speed(id, speed))
+        .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1376,11 +1543,41 @@ fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// What detaching sound from several clips did: the refreshed timeline, how many
+/// clips were detached, and the ones left alone with the reason (a locked track,
+/// an asset without audio, a sound already detached).
+#[derive(serde::Serialize)]
+struct AudioDetached {
+    timeline: Timeline,
+    detached: usize,
+    skipped: Vec<kerf_core::SkippedDetach>,
+}
+
+/// Give an asset's sound its own clip on an audio track, for every use of the asset
+/// on a video track that still plays it: each has its sound **detached** (the picture
+/// muted, an audio clip with the same span linked to it) so nothing sounds twice — one
+/// revision. A clip on a locked track is skipped and reported; with nothing to detach
+/// it is an error (`add_asset_audio` is the explicit way to append the whole audio).
 #[tauri::command(async)]
-fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
+fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<AudioDetached> {
     let id = id(&asset_id)?;
     let project = state.project();
-    project.extract_audio(id).map_err(|e| e.to_string())?;
+    let done = project.extract_audio(id).map_err(|e| e.to_string())?;
+    Ok(AudioDetached {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        detached: done.detached.len(),
+        skipped: done.skipped,
+    })
+}
+
+/// Append an asset's whole audio to the first audio track as a clip of its own. It
+/// never touches a picture clip, so an asset that also plays its own sound from a
+/// video track is heard twice where they overlap — `extract_audio` is for that.
+#[tauri::command(async)]
+fn add_asset_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
+    let id = id(&asset_id)?;
+    let project = state.project();
+    project.add_asset_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2671,6 +2868,7 @@ pub fn run() {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            levels_cancel: Arc::new(AtomicBool::new(false)),
             voiceover_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
             launch: Mutex::new(LaunchSlot::new(launch.clone())),
@@ -2752,6 +2950,10 @@ pub fn run() {
             set_track_duck,
             set_track_volume,
             set_track_pan,
+            set_master_volume,
+            set_master_limiter,
+            get_levels,
+            cancel_levels,
             set_delivery_format,
             set_track_muted,
             set_track_solo,
@@ -2795,6 +2997,13 @@ pub fn run() {
             snap_to_beats,
             smart_crop,
             extract_audio,
+            add_asset_audio,
+            detach_audio,
+            detach_audio_clips,
+            reattach_audio,
+            reattach_audio_clips,
+            link_clips,
+            unlink_clips,
             concatenate,
             get_history,
             revision_diff,

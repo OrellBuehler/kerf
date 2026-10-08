@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks` (A1a-0..3 merged locally; A1b next) … | — | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107 (merged); A1b-1: OrellBuehler/kerf#111 | in-progress | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (cursor) next. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -14,7 +14,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B3b Filmstrips + track heights + minimap | `feat/filmstrips` | — | merged (local) | Per-asset filmstrip (proxy preferred, keyframe sampling for long originals, capped + niced even at 100%), `get_filmstrip` (no MCP tool: `skim_asset` covers agents), height presets (UI-only), minimap. |
 | B6 On-canvas transform handles | — | — | todo | |
 | A4 Playback | — | — | todo | |
-| B4 Mixer | — | — | todo | |
+| B4 Mixer | `feat/mixer` | OrellBuehler/kerf#110 | merged | Engine + surface done: `Timeline.master {volume, limiter, ceiling_db}` before `loudnorm` (omitted at neutral), `set_master_volume` / `set_master_limiter`, `get_levels` (one metered ffmpeg pass: per-track + master LUFS / sample + true peak / short-term max), golden family appended as cases 4000..4799. Mixer panel: one strip per audible track + master (shared dB taper with the header slider, one edit per gesture, keyboard nudges), measured Web Audio meters through per-track buses and a master limiter approximation, Measure → `get_levels` (range-aware), harness sample audio. |
 | B5 Keyframes v2 | `feat/keyframe-easing` (B5a) | — | in-progress | B5a done locally: per-key `Easing` (linear / hold / CSS eases / unit-square bezier), an eased segment is a 12-piece polyline shared by `transform_at` and the export (sweep at every output frame, mutation-checked), exact head trims / slices, `set_keyframe_easing` (core, Tauri, MCP), TS mirror pinned bit for bit, Inspector picker. Next: per-property channels, dope sheet. |
 | A5 Effect parity | — | — | todo | |
 | B7 Colour grade + scopes | — | — | todo | |
@@ -22,7 +22,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Open: linked A/V + detach audio (verify `extract_audio` doubling), blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -44,6 +44,21 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   stands in for `main` (each finished WP merged into it with `--no-ff`), so
   later WPs build on earlier ones. When access returns, the branches are pushed
   and PRs opened in merge order.
+- **2026-10-07 — push access restored; stacked PRs.** The finished branches were
+  pushed in merge order. At most three PRs are open at once, each based on the
+  branch before it, so every diff shows one work package and CI runs on the
+  combined tree. When the lowest one merges, the next is retargeted to `main` and
+  `main` is merged up the stack. `local/main` is retired.
+- **2026-10-07 — FFmpeg repin.** BtbN pruned `autobuild-2026-09-22-13-18`, so every
+  pinned engine job 404'd, on `main` too. The pin moved to `autobuild-2026-10-07-13-07`
+  (same 9.0 branch, n9.0.2-22), on the first PR of the stack. `--repin` needs the
+  GitHub API, which the sandbox blocks for BtbN, so the tag was read via `git
+  ls-remote`, the build name via `git describe` of FFmpeg's `release/9.0`, and the
+  digests from the downloads. Parity and the pick tests pass on it.
+- **2026-10-07 — subagent limit.** The weekly subagent quota ran out mid-session
+  (it resets 2026-10-12). The three stopped packages (linked A/V, mixer, A1b-1 fixes)
+  were finished directly, with the same verification and no second independent
+  review. They get one before merge, once agents are available.
 - **2026-10-06 — main did not type-check.** The hand-off merge (#89) left
   duplicated imports/script blocks (21 svelte-check errors, dev server 500).
   Fixed on its own branch `fix/hand-off-duplicates` (to merge first); B1 merges
@@ -132,6 +147,69 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   GPU.
 - **2026-10-07 — edit modes act per track.** Roll/slip/slide don't move a
   linked partner (no sync lock until linked A/V lands).
+  **Superseded 2026-10-07 (`feat/linked-av`):** with links in force they act on the
+  group — roll rolls each partner pair sharing the cut, slip and slide move every
+  partner, and the whole edit clamps to the tightest member.
+- **2026-10-07 — linked A/V (core + surfaces).** `Clip.link_id` (identity, at most one
+  clip per track) and `Clip.source_audio` (omitted at `true`; only `false` reaches the
+  graph, as a drop from the audio mix, so the golden oracle did not move). Links are on
+  by default and per call `link: false` (`Project::with_links`) is the escape hatch —
+  no project-wide switch. A linked edit is a group edit: all or nothing, a locked
+  partner refuses it. Ripple scope changed: tracks stay independent **except** that a
+  clip the ripple pushed drags its linked partners by the same amount (clips only,
+  never the lane). `reorder`, property edits and captions are deliberately not
+  link-aware. Imports / `cut_clip` / `add_clip` still do not auto-link an A/V asset's
+  sound (follow-up option).
+- **2026-10-07 — range-based sync lock (review of the first linked-A/V cut).** The
+  per-track ripple plus "partners follow a pushed clip" only handled mirrored pairs; a
+  J- or L-cut pair (sound leading or trailing its picture) was refused 10-65% of the
+  time for ripple delete / speed / ripple remove / ripple trims / cut range, with an
+  error steering to `link: false`, which desyncs. Replaced by `Timeline::conform_links`:
+  in step = equal content offsets; after every edit each group is re-aligned to its
+  *authority* (the named clip, else its track, else the first member that moved) by
+  shifting the others, linked followers win against linked material (trimmed back) and
+  refuse only for a locked track, an unlinked clip in the way, or a linked clip they
+  would cover entirely. Unlinked clips on a partner's track never move for it (a
+  behaviour change: ripple delete used to close the partner's whole lane). The guard
+  stays as the net and no longer advises `link: false`. Split / cut re-link **by side**
+  (an unsplit partner after the cut belongs to the right half), orphaned groups dissolve
+  in the same edit, a muted picture pasted without its sound is unmuted, `reattach` is
+  never rippled and refuses to double the sound, `detach` folds the picture track's fader
+  into the new clip (pan / duck / mute are the destination's, documented), `extract_audio`
+  no longer falls through to appending (that is `add_asset_audio`) and reports skipped
+  clips, `detach_audio_clips` is the one-revision batch. The browser harness is replayed
+  against a corpus kerf-core writes (`links-corpus.json`).
+- **2026-10-07 — linked A/V, second review.** (1) *Both partners named.* Trim to the
+  playhead names a picture and its sound; the per-lane ripple then pulled each track by its
+  own length and the lock read that as "moved apart" (refused 90/101, "unlink them first").
+  "Moved apart" is now judged on the timeline **as the edit left it** (before
+  `ripple_lanes`; `left` in `run_edit`); if the named members agree there the first in track
+  order is the authority and the other named ones are shifted too. `move_clips` with
+  partners at different deltas stays refused. (2) *Cut range:* a partner's leftover is a
+  linked clip when making room (`settle_linked`), and what a partner keeps after the cut is
+  moved to the cut explicitly (`closing`), so a lone leftover still resumes there. (3)
+  *Detach under a compressor or gate* no longer folds the fader (the gain would sit ahead of
+  a level-dependent effect): the clip goes to a lane at the picture track's fader, else a
+  new track at it (no skip path — a lane can always be made); the doc claim is narrowed to
+  linear chains. (4) The corpus fixture is `eol=lf` in `.gitattributes` and the freshness
+  test normalizes `\r\n`. (5) `first_sync_break` names the lowest track pair (TS too).
+  *Victims* — decided: a picture is **never** cut to make room or pushed before 0 (refused,
+  naming the lane, Alt offered); a linked **sound** may be trimmed back or lose its head and
+  the revision label says so (`… (trimmed sound on A2)`, live and staged); the floor is
+  `MIN_EDIT_CLIP` (0.05 s) — a victim that would fall under it is refused, not stubbed. A
+  J-cut lead lost at 0 is trimmed and reported rather than refused: the lead is a sound's,
+  the picture is untouched, and refusing would block deleting the first shot of any J-cut
+  edit. Cost, measured on the J/L fuzz: 13% of moving edits are blocked (was ~5%) — 2.8% of
+  those naming a picture, 23% of those naming a sound under ripple, which pulls the next
+  shot's picture onto the one before; before, that silently cut the previous shot. The UI
+  preview (`linkedTrimPreview`) runs the same rules, refusals included, and names a trimmed
+  sound. Corpus 80 → 93 cases.
+- **2026-10-07 — `extract_audio` doubled the sound, measured.** The export mixes every
+  clip whose asset has audio, video tracks included, so appending the asset's audio
+  with its picture still on V1 was +6.02 dB over the clip alone (real render, ffmpeg
+  6.1). `extract_audio(asset)` now detaches the asset's cut picture clips and only
+  appends when none is on the timeline; the per-clip form is `detach_audio`. The
+  sample project seeded the doubled shape; it now seeds the detached-then-unlinked one.
 
 - **2026-10-07 — Still refusals are exact.** A Still frame is refused only
   while a fade step is live, a layer travels, or an outgoing clip's tail window
@@ -139,6 +217,52 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   the `fades`/`transitions` caps apply to Motion plans only. Parity-tested
   around dissolves, slides, pushes and dips.
 
+- **2026-10-07 — D8: per-track buses later, and only for tracks that need one.**
+  The fader and pan ride each clip after its own chain (a linear op, so the same
+  signal as a bus fader); a *bus* only buys something for a **nonlinear or
+  per-track insert** (track EQ / compressor / automation acting on the summed
+  track). Moving every export to submixes would re-shape the audio graph of every
+  project: all of the golden digests with sound re-blessed, the byte-identical
+  guarantee gone, for no change in what anyone hears. Per-clip effects already
+  exist and B5's per-property channels give clip-level volume automation, which
+  covers the use cases that exist today. So: **no buses now.** When track inserts
+  arrive, build the bus topology *only for tracks that carry one* (neutral
+  omitted, every other track stays flat and byte-identical). The cost of that is
+  already small and proven: the metered levels build (`build_filter_complex_metered`)
+  sums each track into a submix before the final sum, and equals the flat graph in
+  what it measures (an ignored test renders the export and reads it back).
+- **2026-10-07 — B4 preview: ducking export-only, limiter approximated.** Web
+  Audio has no sidechain compressor without an AudioWorklet, and a worklet would be
+  a second DSP implementation to keep in step with `sidechaincompress`. So the
+  preview plays a ducked track at its fader, and the Duck toggle's tooltip says so.
+  The master limiter previews as a hard-knee `DynamicsCompressorNode` at the ceiling,
+  with its makeup gain trimmed out. It is labelled an approximation, and Measure
+  reads the real export graph.
+- **2026-10-07 — master bus placement and limiter.** After the final sum / duck
+  bus and before `loudnorm`. The limiter is `alimiter` with `level=0` (its
+  default auto-level scales the output back up to full scale, turning a ceiling
+  into makeup gain) and `latency=1` (otherwise the lookahead delays the mix by
+  its attack and drops its tail, out of step with the picture); both verified by
+  ignored tests that fail without them, on FFmpeg 6.1.1 and 9.0.2. Ceiling is a
+  *sample*-peak ceiling (no oversampling); `get_levels` reports the true peak.
+- **2026-10-07 — levels are one pass.** The alternative to taps is one render per
+  track. A metered build of the export's own audio graph taps each track's strip
+  and the finished mix, each with sample + true peak (measured ~0.01x real time
+  per meter; true peak is about half of that, sample-only would have saved
+  half the cost on a long cut but left a track's true peak unanswered), so the
+  master reading is the file's (tested against a rendered file). A track reads *before* the duck bus and the master. Short-term
+  max comes from the frame log (None under 3 s). Gated by `cpu::lease`, a
+  120 s stall watchdog and the MCP cancel token.
+- **2026-10-07 — golden family appended, not interleaved.** The 800 master-bus
+  cases are cases 4000..4799, so the first 4000 per-case digests are identical
+  before and after (`KERF_GOLDEN_CASES` diff, checked on the whole file) and the
+  three digest files only gained block lines (`git diff`: 24 insertions, 0
+  deletions). Interleaving them would have moved every block.
+- **2026-10-07 — toolchain noise.** rustc/clippy 1.99.0 flags four
+  `redundant_clone` sites in code this WP does not touch (`planner.rs:997`,
+  `keyed_zoom.rs:1385`, two in `cli.rs` tests); present on the base commit too, so
+  left alone here. FFmpeg 9.0.2 also mis-probes some float-PCM `.wav` fixtures as
+  MPEG-TS (the byte pattern of a pure tone), so the level tests use FLAC.
 - **2026-10-07 — the frame pick is FFmpeg's arithmetic.** `fps_pick`
   replays `setpts` tick truncation, the "stream ends where the next frame
   would land" EOF rule (using the last frame's own duration), reverse
@@ -146,6 +270,52 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   mp4/mkv/ts/avi/nut time bases, VFR, speeds and reverse on both FFmpegs.
   Proxies carry a `StreamInfo` sidecar so the interactive path never
   ffprobes; `Handover` pins the canvas for A4's stream restarts.
+- **2026-10-07 — A1b-2: parity with the still beats the true frame.** On a long-GOP
+  transport stream `-ss t` lands on the next keyframe and the decode does not recover
+  (finding 5), in the one-shot decode and the FFmpeg still alike. A run restarted
+  earlier would return the frame really at `t` — right by the timestamps, wrong by the
+  contract (the GPU frame must be the frame FFmpeg would draw). So a file whose first
+  run lands more than two frame intervals late is marked `late_seek` and decoded
+  one-shot from then on; speed is lost only on such files. Also: parity asserts equal
+  decoded planes, not equal composites — a one-off RGBA mismatch on 9.0.2
+  (`pip/odd-361x203-in-722x640 @ 0.5`) never recurred in nine suites and a
+  six-thread stress test, and rendering one plan twice never differed.
+- **2026-10-08 — B4 review fixes (PR #110).** (1) `alimiter` has no `latency` on
+  FFmpeg 4.4 (Ubuntu 22.04's system ffmpeg), which refused every limiter-on export
+  and `get_levels`; the option is now probed once per process
+  (`alimiter_latency_available`, `ffmpeg -h filter=alimiter`) with a `cfg(test)` pin,
+  and without it the limiter is emitted without `latency` (the mix then trails the
+  picture by the 5 ms attack; not compensated). The golden oracle builds a
+  limiter case's export both ways: the first 40 blocks and `still.txt` /
+  `preview.txt` did not move, only `export.txt` blocks 40..47. The levels tests pass
+  on 4.4.2 and 9.0.2. (2) The limiter is a sample-peak limiter: on 9.0.2 at a
+  -1 dBFS ceiling an 11 kHz tone read -0.2 dBTP and 15 kHz +0.1, so "turn on the
+  limiter" looped an agent that had already done it. `Levels::new` now takes the
+  master bus; with the limiter on and the true peak over -1 dBTP the note says to
+  lower the ceiling by the overshoot + 0.5 dB, and the default ceiling is -1.5 dBFS
+  (`loudnorm`'s TP). A track over 0 dBFS is no longer said to "clip the sum" (the
+  graph is float). (3) A GUI Measure held the process-wide `cpu::lease` with no way
+  out; `cancel_levels` (the `cancel_analysis` shape) and a Stop on the Measure
+  button, still gated since it is a whole-mix decode. (4) The mixer's strip rule
+  anticipates linked A/V's `Clip.source_audio` (PR #109) rather than
+  mirroring a `clip_sounds` this base does not have.
+
+- **2026-10-08 — linked A/V, PR review fixes.** (1) *A carried partner was never lane-checked.* `trim`
+  (and the beat snap, through `carry_links_since`) wrote a partner's new span with no overlap check, so a
+  move by trim or a tail extension put a detached sound on an unlinked voice-over where `move_clip` refuses.
+  The check cannot sit inside `carry_extent_edit`: ripple legitimately makes room (a tail extension pushes
+  the clip behind the sound), so it runs in `run_edit` **after** the per-lane ripple and the sync lock
+  (`Timeline::check_carried_lanes` on the partners recorded in `Project::edit_carried`), refusing with the
+  lane named when a carried partner now overlaps a clip outside its group that it did not overlap before
+  (the `settle_followers` wording, shared). The named clip's own lane is still unchecked, as a trim always
+  was. Under ripple a move by trim is still refused: no length changed, so nothing ripples. TS mirror
+  (`checkCarriedLanes`, `runEdit`'s third argument, the trim preview) and five corpus cases; corpus 93 →
+  102. (2) *Multi-select Reattach was N revisions and partial on error.* `reattach_audio_clips` (core,
+  Tauri, MCP, harness) is one `Reattach audio (N clips)` revision, **all or nothing** (unlike the detach
+  batch, which skips and reports: half a reattach is a half-undone selection), a pair named by both its
+  clips counted once; `reattachSelection` has one Undo. (3) `set_volume` / `set_fade` / `set_clip_enabled`
+  say a detached picture carries no sound. (4) A clippy `nonminimal_bool` in `with_linked_cuts` rewritten
+  with its short-circuit kept; a duplicated phrase in `CLAUDE.md` fixed.
 
 - **2026-10-08 — B5a: an eased segment is a polyline.** The plan said to realize easing
   in `keyframe_expr` by sampling 8–12 linear pieces. Doing that only in the graph would
@@ -160,4 +330,5 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
+- B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

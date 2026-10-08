@@ -117,7 +117,8 @@ so the feature is **only** activated through these forwards — which is what ma
   failure, and one such failure disables HW encode for the process). Background
   decodes (proxy, stitch, scene detection, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
-  software fallback shared with the preview path; the GUI defaults export
+  software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
+  decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
@@ -192,6 +193,65 @@ so the feature is **only** activated through these forwards — which is what ma
   on the final mix, and `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
+  **The master bus** (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`,
+  defaulted and not written while `is_default`) is the last stage of the mix:
+  after the final `amix` / duck sum and **before** `loudnorm`, `master_filters`
+  (pure + unit-tested) appends `volume=` and `alimiter=limit=…:attack=5:release=100:
+  level=0:latency=1`, each omitted while `is_neutral` (unity and no limiter — a
+  stored ceiling alone changes nothing), so every earlier graph is byte-identical.
+  Two `alimiter` options are load-bearing: its default **auto-levels** (scales the
+  output back up so the peak sits at full scale — the ceiling would become makeup
+  gain), and without `latency=1` its lookahead delays the whole mix by the attack
+  and drops its tail (sound out of step with the picture); an ignored test fails
+  without either. **`latency` is probed, not assumed**: FFmpeg 4.4 (Ubuntu 22.04's
+  system ffmpeg) has no such option and refuses the whole graph with `Option
+  'latency' not found` — every limiter-on export and every `get_levels` —, so
+  `alimiter_latency_available()` (once per process, like `zscale_available` /
+  `graph_script_flag`: `ffmpeg -h filter=alimiter` lists a `latency` line, pure
+  `help_lists_latency`; a binary that will not run reads as having it) decides
+  whether `master_filters` spells `:latency=1`. Without it the limiter is emitted
+  as `…:level=0` and the mix trails the picture by the 5 ms attack and loses its
+  last 5 ms (under a frame at any rate; nothing compensates it). A `cfg(test)`
+  thread-local (`with_alimiter_latency`) pins the answer for the unit tests and the
+  golden oracle; an ignored test checks the probe against a real `alimiter=…:latency=1`
+  run, and the levels tests run on 4.4 as well as 6.1 and 9.0 (their delay check is
+  skipped where the option is absent). The ceiling is a **sample**-peak ceiling (no
+  oversampling), rounded to six decimals so the text never rides on a libm `pow`'s
+  last digit; `get_levels` reports the true peak, which runs *above* the sample
+  ceiling (measured on 9.0.2 at a -1 dBFS ceiling: an 11 kHz tone read -0.2 dBTP,
+  15 kHz +0.1) — which is why the default ceiling (`MASTER_DEFAULT_CEILING_DB`) is
+  **-1.5 dBFS**, `loudnorm`'s own TP target, and not the -1 dBTP that platforms ask
+  for. `for_render` / `for_delivery` / `slice` carry
+  it (range export and variants keep the mix; the playback stream has no sound),
+  `safe_volume` / `safe_ceiling_db` re-clamp in the builder (a `.kerf` never passes
+  the clamping ops), and `DiffKind::MasterChanged` stops a master-only agent
+  proposal diffing as empty and being discarded by `apply_staged`.
+  **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,
+  `engine/cli/levels.rs`; lock-free split again): one ffmpeg pass over the export's own
+  audio graph. `build_filter_complex_metered` is `build_filter_complex` plus taps
+  (byte-identical with metering off): each track's clips are summed into a submix,
+  `asplit` into an `ebur128@t<i>` meter, and the finished mix — after the master and
+  the optional `loudnorm` — is tapped last, so the master reading is what the file
+  contains (an ignored test renders the file and reads it back). A track's reading is
+  its strip output, before the duck bus and the master; every tap reads sample + **true**
+  peak (`peak=sample+true`: the oversampling roughly doubles a meter's cost — measured
+  about 5 ms of work per second of audio per tap — and which track is hot is the
+  question). `MeterParser` reads stderr line by
+  line — frame lines carry the short-term maximum (`-120.7` until the first 3 s
+  window closes is `None`), the `Summary:` block is one log call so only its first
+  line is prefixed — and `-inf` / the -70 LUFS gate floor read as `None`. Whole-file,
+  so `cpu::lease` + thread caps; a stall watchdog (120 s with no stderr line; a meter
+  logs ten a second) and `cancel` kill the child. `Levels.notes` is the advice
+  against -14 LUFS / -1 dBTP, and it takes the **master bus** the mix went through
+  (`Levels::new(.., &timeline.master)`, `level_notes`): over -1 dBTP with the limiter
+  off says turn it on, but with it **already on** says lower its ceiling by the
+  overshoot plus 0.5 dB (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at
+  the floor, lower the master instead) — the old advice looped an agent that followed
+  it, because the limiter holds the sample peak and the overshoot is between samples.
+  A track over 0 dBFS before the master is told so without claiming a clip: the graph
+  is float, so nothing clips until the mix is written and the master can still bring
+  it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
+  languages' tests pins that).
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*
@@ -885,8 +945,10 @@ no editing logic in the adapter.
   over the footage the other half gave up, and they cancel); **moves never ripple**
   (a clip that merely changed its start or track is not "footage ahead");
   **clips the edit itself moved are not followers**, so an op that already closes
-  the gap is not shifted twice; tracks are **independent** (no sync lock — a V1
-  ripple leaves A1 where it is, which is why linked A/V is its own backlog item),
+  the gap is not shifted twice; tracks are **independent — except for linked
+  clips**: a clip the ripple moved takes its *linked partners* along by the same
+  amount (the sync lock, `conform_links`; only clips follow, never the rest of the
+  partner's lane — see Linked A/V below),
   a **locked track never moves**, and overlays / markers do not move. It **never
   produces an overlap**: if shifting would leave a touched clip overlapping
   another or before 0 (an add that lands *inside* a clip would need a split), that
@@ -939,6 +1001,164 @@ no editing logic in the adapter.
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Linked A/V** (`model/links.rs`, pure + unit-tested; a child module of `model`) is a
+  picture and its sound as one piece of material. **`Clip.link_id`** joins clips into a
+  group (at most one clip per track; omitted when `None`); **`Clip.source_audio`**
+  (default `true`, omitted) is whether the clip plays the audio of its *own* asset. Only
+  `source_audio: false` reaches the graph — `clip_sounds` (`engine/cli.rs`) drops the clip
+  from the audio mix, in the export gating, `validate_export` and `cut_summary` — so
+  every existing graph is byte-identical and the golden oracle did not move.
+  **The `extract_audio` doubling was verified, then fixed.** The export mixes the audio
+  of every clip whose asset has an audio stream, video tracks included, so appending the
+  asset's audio to A1 with its picture still on V1 summed the sound with itself: graph
+  level (`amix=inputs=2`, two identical `atrim` chains) and on a real render (**+6.02 dB**
+  over the clip alone; fixed, +0.00 dB; an A1 fader at 0.5 then reads -6.02 dB —
+  `engine/cli/linked_audio.rs`). **`extract_audio(asset)`** now only **detaches**: each
+  picture clip of the asset on a video track still playing its own sound (a clip on a
+  locked track is *skipped and reported*, not a reason to fail the rest; nothing to
+  detach is an error that says so — it never falls through to appending, which a second
+  call used to do), in one revision, answering `DetachedMany {detached, skipped}`.
+  Putting an asset's whole audio on an audio track is its own op, **`add_asset_audio`**
+  (the bin's action for an asset that is not playing its own sound, music). **`detach_audio(clip)`**:
+  an audio clip with the same source span, speed and position on the audio track at the
+  picture's own position (V1 → A1) when it has room, else the first that does, else a new
+  `A{n}`; linked to the picture, whose `source_audio` goes false; **`detach_audio_clips(ids)`**
+  is the batch (one `Detach audio (N clips)` revision, skip-and-report, errors only when
+  nothing detached). **What detaching keeps is the level, not the whole strip:** a video
+  track's fader rides its clips' own sound and the audio track has one of its own, so the
+  new clip's volume is `volume × picture fader ÷ audio fader` (a lane whose fader is at
+  zero is never chosen, and the render check measures +0.00 dB through a V1 fader of 0.5
+  into an A1 fader of 2.0) — **exact only while the clip's chain is linear**: folding the
+  fader into the volume moves the gain *ahead of* a compressor or gate
+  (`AudioEffect::is_dynamic`), which then reacts to a different level. So a clip with one
+  goes to a lane whose fader **equals** the picture track's — an existing one with room,
+  else a **new audio track at that fader**, there is no skip path — and its volume is left
+  alone; filters and EQ commute with gain and still fold; the destination's **pan, duck flag and mute/solo** now decide
+  the mix, and that difference is documented rather than hidden. The audio clip also carries audio
+  effects, fades and the transition (the `audio_clip_chain` strings are pinned equal
+  before / after at neutral faders); the picture keeps inert copies so **`reattach_audio`**
+  (name either clip; `edit_timeline_exact`, never rippled) restores it — and **refuses when
+  unmuting would double the sound**: a picture whose audio clip is gone, with some other
+  audio clip already playing the same footage in step over the same time.
+  **`reattach_audio_clips(ids)`** is the multi-select reattach (`Timeline::reattach_audio_many`, one
+  `Reattach audio (N clips)` revision): **all or nothing**, unlike the detach batch, because skipping
+  a pair would leave the selection half undone — each id names a picture or its sound (a pair named
+  by both counts once), every reattach is judged against the cut the earlier ones left (so it runs on
+  a copy that replaces the timeline only when all went through) and the first refusal is the error,
+  naming its clip when there are several. Imports /
+  `cut_clip` / `add_clip` do **not** auto-link an A/V asset's sound (a possible follow-up).
+  **Edits carry their change to the partners**, and a partner on a locked track refuses
+  the whole edit (a linked edit is a group edit, so it also checks the named clip's own
+  lock, which the single-clip ops still do not): *move* by the same Δt on each partner's
+  own track (a track change is the named clip's alone); *trim* (`carry_extent_edit`) moves
+  the edge **a partner shares within 1 ms**, clamped to its footage, and then lane-checked
+  **after the ripple** (`Timeline::check_carried_lanes`, run by `run_edit` between the sync lock and
+  the guard on the partners `Project::trim` / `snap_to_beats` recorded in `edit_carried`): a partner
+  that now overlaps a clip outside its group, where the two did not overlap before, refuses the edit
+  naming the lane — the rule `move_clips` holds a moved partner to. It cannot be checked inside
+  `carry_extent_edit`, because ripple legitimately makes room (a sound extended with its picture's tail
+  pushes the voice-over behind it; a move by trim changes no length, so nothing ripples and the sound
+  lands on it). The named clip's own lane is still not checked, as a trim never has; a sound carried before 0 loses its head (the lead
+  is reported, below), a **picture** is never trimmed to fit and refuses, as does any clip
+  left under `MIN_EDIT_CLIP` (0.05 s — refused, not stubbed) and one a trim would take
+  entirely; *split* cuts every partner the time is inside and then
+  re-forms the group **by side** (`relink_sides`): the left halves and any partner wholly
+  before the cut keep the group, the right halves and any partner wholly after it get a new
+  one — an unsplit partner lying after the cut used to stay linked to the *left* half and
+  desync silently when the right half moved (17 of 1418 fuzz splits); *remove* / *ripple
+  delete* take the partners; *cut a source range* takes the same stretch of **timeline**
+  out of each overlapping partner (a partner whose head was inside the stretch resumes at
+  the cut, one spanning it is cut in two) and relinks by side; what a partner keeps *after*
+  the stretch is moved to the cut **explicitly** (`closing`), not left to the lock, because
+  once the named clip keeps nothing after the cut the piece has no second group member to
+  follow (V1 `X[0..10]` / A1 `S[9..15]`, cut X 8..10: S's remainder starts at 8, not 9), and
+  a partner's leftover is a *linked* clip for the purpose of making room (`settle_linked`:
+  linked now ∪ linked before, through `origin`), not an unlinked obstacle; *speed* applies the same
+  **ratio**; *split-and-remove* cuts partners the time is inside; *roll* rolls each
+  partner pair sharing the cut, *slip* the same timeline moment of footage (scaled by the
+  speed ratio, stills skipped), *slide* each partner with its own neighbours — all clamped
+  to the **intersection of the members' ranges**; the beat snap re-syncs afterwards
+  (`carry_links_since`).
+  **The sync lock is range-based (`Timeline::conform_links`)** — *what in step means* is
+  equal **content offsets** (`content_offset`: the timeline time at which source time 0
+  would play), so a sound that leads or trails its picture (a J- or L-cut) is in step and
+  stays so. The per-lane ripple (`ripple_lanes`) and the ops above move clips nobody
+  named — the next shot after a delete, its sound on another track — so after every
+  edit each link group is put back in the relationship it had: every member's offset
+  moved is measured against its own before (a clip an op *created*, the tail of a cut,
+  is measured against the clip it was cut from, `origin`), the group's **authority** is
+  the member the edit **named** (`anchors`, from `edit_named*`; the first in track order
+  when it named several), else the member on a named clip's track, else the first member
+  that moved, and the others — *every* other member, other named ones included — are
+  *shifted* by the difference. Whether named members "moved apart" is judged on the
+  timeline **as the edit left it**, before the per-lane ripple (`left`, taken in `run_edit`
+  when ripple and a link both apply): a trim to the playhead names a picture *and* its
+  sound (clicking selects partners) and cuts both at the same moment, so they agree there
+  and only the ripple, which pulls each track by its own length, sets them apart — which
+  the lock puts right (this used to refuse the edit 90 times in 101, steering to "unlink
+  them first"). `move_clips` with partners at different deltas still moves them apart
+  itself and stays refused. A shift keeps a clip's length, so a ripple's removed or inserted
+  span reaches every linked track without ever cutting a partner (only a cut range,
+  an explicit removal, cuts one). **Only clips in a group follow**; an unlinked clip on
+  a partner's track stays where it was. **A picture is never silently cut.** A follower
+  that lands on linked material wins against it only when the clip it ran into is a
+  **sound** (`Track::settle_followers`: trimmed back, at least `MIN_EDIT_CLIP` left) and a
+  sound stops at 0 by losing its head; **every sound so trimmed is reported** — the
+  track's name goes to `Project::edit_notes` (a side channel, since the closures return
+  their own types) and the revision label ends `(trimmed sound on A2)`, live and staged
+  alike. It refuses — with a reason naming the lane — for a locked track, an **unlinked**
+  clip in its way, a **picture** in its way or pushed before 0, or a clip it would leave
+  under 0.05 s. The refusal rate is the price: on the J/L fuzz 13% of the moving edits are
+  blocked (was ~5% when a picture could be cut) — 2.8% of those that name a picture, 23% of
+  those that name a sound, where ripple pulls the *next shot's picture* up onto the one
+  before; the message says so and offers Alt. A J-cut's lead lost at 0 is *trimmed and
+  reported* (the picture is untouched and the lead is a sound's), not refused. `ripple_delete`
+  closes the named clip's track by *its* length and leaves partner tracks to the lock (a
+  J-cut pair closes by the picture removed); `reorder` carries partners the same way. Two
+  *named* members moved apart by hand are left for **the sync guard**
+  (`first_sync_break`, last in `run_edit`): it refuses with `out of step … unlink them
+  first if they are meant to part` — it no longer steers anyone to `link: false`, which
+  desyncs — and names the **lowest pair of tracks** (it used to take whichever group a
+  `HashMap` met first, so the same refusal read differently run to run; the TS mirror picks
+  the same pair). Measured on a J/L-cut fuzz (250 seeds × 10 edits, ripple on and off): none
+  of ripple delete / remove / trim / speed / cut range / split-remove (one or both partners
+  named) is refused for an unstated reason, and the blocks that remain name themselves — an
+  unlinked clip or a picture in the way, a linked clip a follower would cover, a clip left
+  under 0.05 s, a partner a trim would take entirely (the old per-track ripple refused
+  these 10-65%). **`run_edit`** (`edit_timeline` / `edit_timeline_exact` /
+  `edit_named*`): scratch snapshot only if ripple or links apply, then `f`, `ripple_lanes`,
+  `conform_links`, the carried-lane check, the guard, and finally **`dissolve_all_orphans`** — a link left with
+  one clip (its partner cut, deleted, or on a removed track) is cleared in the same edit.
+  `edit_named*` take the named clip ids and a **label computed from the result** (a group
+  edit counts the partners it carried; `trimmed_suffix` appends the reported sounds), so unlinked projects never reload the timeline
+  for a label; `working_has_links` answers "does this timeline link anything" with one
+  `instr` over the stored JSON, which is what keeps `trim` from loading every asset on a
+  project that links nothing. `LinkIndex` (one pass) replaces `link_partners` per clip in
+  the multi-clip paths and `linked_clip_ids` feeds `timeline_summary`. Pairs already apart,
+  different assets, `link: false` and a project that links nothing (no snapshot taken) are
+  exempt from the lock and the guard. Property edits (volume / fades / effects / colour /
+  transitions), `set_clip_enabled` and captions are not carried (offsets do not change).
+  **Paste / duplicate** give copies of a pasted group a fresh shared link id, and a muted
+  picture pasted *without* an audio partner carrying the same footage gets its own sound
+  back (it would be silent for good). **`Project::with_links(Option<bool>, ..)`** is
+  `with_ripple`'s sibling — no project switch, links are on unless a call says `false`;
+  `run_edit` hands it to the ripple pass and the lock. `link_clips` / `unlink_clips`
+  (unlinking either half of a pair unlinks it; a group left with one clip dissolves),
+  `detach_audio`, `reattach_audio` are one revision each; `Timeline::diff` reports `linked` /
+  `unlinked` / `own sound off|on`. `Project::sample()` seeds its interview sound
+  detached-then-*unlinked*.
+  **The browser harness is held to all of it by a differential corpus**: `project/linked_corpus.rs`
+  writes 102 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
+  rule above — both partners named, a cut's leftover and its lone resumed piece, a picture
+  victim, the 0.05 s floor, a lead lost at 0) with the answer `Project` gave — canonical timeline (no ids: clips an edit
+  creates have random ones), revision label, report or the exact refusal — to
+  `frontend/src/lib/fixtures/links-corpus.json`; `links-corpus.test.ts` replays each through
+  `link-ops.ts` (the pure mirror of `Project`'s ops and of `run_edit`, which `api.ts` now
+  composes) and demands the same. A freshness test fails a stale file; regenerate with
+  `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- links_corpus`.
+  The fixture is pinned `eol=lf` in `.gitattributes` (like the golden argv files) *and* the
+  freshness test compares with `\r\n` normalized, so a Windows checkout with `autocrlf`
+  cannot fail it for a line ending.
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
   length limits) plus a pure, unit-tested `check` over a `CutSummary`. It keeps
@@ -1062,7 +1282,14 @@ no editing logic in the adapter.
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
   frame of lookahead and the first frame past the window's end (or the last frame's duration at
-  the end of the file); reverse needs every pts of the window; a non-all-intra transport stream
+  the end of the file) — **`Pick::progress(&read, eof)`** (A1b-1, pure, property-tested
+  against `fps_pick` over the whole file) is that cursor's rule: fed the frames a run has
+  produced so far it says `NeedMore`, `NeedEarlier` (a `Before` whose answer is ahead of
+  the first frame read: nothing there if the run began at the file's start, else restart
+  earlier — only the cursor knows which) or `Ready { shown, keep_from }`, answers exactly as the
+  whole file would, and answers as early as it can (one frame past the shown one, or at the
+  window's end); `FpsPick::seek()` is where the run must begin; reverse needs every pts of
+  the window; a non-all-intra transport stream
   may not deliver the picked frame after an `-ss` (**both** builds — the design note's "6.1
   only" was wrong; an all-intra one is exact). **A fade on a layer with an alpha plane goes to
   luma 0, not 16** (`fade` on `yuva420p`; white is 235 either way): `FadeStep` /
@@ -1079,8 +1306,10 @@ no editing logic in the adapter.
   from the originals** (`render_geometry`). `PlanLayer.source: PlanSource { proxy }` says
   which. Resolve off the project lock, once per `Planner`. `SourceMedia::decoded` carries the
   original's spherical projection onto the proxy's stream (the proxy file has none of its own;
-  it is the same picture, smaller). `SourceMedia` has no `identity` yet (A1b-1's
-  `source_identity`).
+  it is the same picture, smaller). `SourceMedia` carries no `identity`: the frame cache's
+  file key is `kerf_core::source_identity(path)` (`fnv1a` of `source_key`: path, size and
+  modified time — one `stat`), taken on the *decoded* path when a frame is asked for, so a
+  replaced file or a new proxy is a new identity at the moment it matters (A1b-1).
   **Spans and the hand-over.** `Planner::span(a, b, size, caps)` evaluates every grid frame
   of `[a, b)` and run-length-encodes `reasons(..).is_empty()` (`SpanPlan::runs`); the lazy
   `Planner::first_unsupported(a, limit, size, caps)` stops at the first frame a compositor
@@ -1220,9 +1449,11 @@ no editing logic in the adapter.
   reaches the private builders). 4000 seeded timelines (every transition kind with / without
   a source handle / across a gap, fades, speed, reverse, stills, keyframes, masks, effects,
   chroma, reframe, HDR, overlays, delivery format and fit, the audio mix, and **every
-  `ExportOptions` field** with the one-, two- and no-pass encoder spellings) have their
+  `ExportOptions` field** with the one-, two- and no-pass encoder spellings), plus **800
+  appended** with a master bus (`master_for`, no dice of its own, so the first 4000 never
+  moved — a new family appends blocks, it does not re-bless old ones), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 40 block digests each in
+  FNV-1a digests, committed as 48 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -1231,9 +1462,14 @@ no editing logic in the adapter.
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in four places and each is pinned — the preview's
+  builders read the machine in five places and each is pinned — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
-  thread-local override; every HDR case is built both ways), `drawtext`'s resolved font path
+  thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
+  (the same kind of override, `with_alimiter_latency`; every case is built with the option,
+  and a case with the master limiter on has its **export** argv appended once more without
+  it — the still and the preview carry no sound, so those two files do not see it, and the
+  limiter families `master-limiter-no-latency[-loudnorm]` fail the test if they stop being
+  covered), `drawtext`'s resolved font path
   (no overlay names a font) and **libm** (`db_to_linear` is `powf`, whose last digits differ
   between glibc with and without FMA, macOS, Windows and arm, so `round_libm` keeps the
   compressor / gate numbers to 10 significant digits; the generator seeds dB values known to
@@ -1421,7 +1657,136 @@ refused if anything is transparent. A child is killed after 30 s or when it writ
 and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still draws
 nothing for that layer, and so does the compositor. The layers of a frame decode in
 parallel, each given `budget / layers` threads even at a full CPU budget
-(`limit_ffmpeg_args(args, share)`). No cache, no proxy: that is A1.
+(`limit_ffmpeg_args(args, share)`). That is the one-shot path; `FrameSource` (below) is the
+long-lived one.
+
+**A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
+of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:
+
+- `frame_cache::FrameCache` — `Arc<YuvFrame>`s keyed `(SourceId { file: source_identity,
+  format }, pts in ticks)`, byte-capped (`DEFAULT_CAP_BYTES` 256 MiB), least recently used out
+  first by an O(n) scan, **pinning** (`pin` hands out an RAII `PinGuard` and dropping it
+  unpins; a pinned frame is never evicted, the cap is soft for them and `CacheStats` says so; a
+  purge or `clear` detaches live guards — `PinGuard::is_live` goes false; the frame just
+  inserted is never its own victim), `Arc`s outlive eviction. `insert_cold` is for frames a
+  run only *passes* on the way to its target: it takes free space or a cold slot, and never
+  pushes out a frame that was asked for. `covers_from - 1` is a `checked_sub`. Each frame states **`covers_from`**: "no frame of this file has a
+  pts in `covers_from..pts`", so `at_or_after(source, t)` is one `BTreeMap` range query that
+  hits only when the frame *proves* it is the first at or after `t` (exact on VFR; a hole left
+  by an eviction is a miss, never the next frame held), `before(source, t)` is the frame at
+  `covers_from - 1`, and `mark_end` makes every later time `Lookup::PastEnd` (FFmpeg draws
+  nothing there). A frame decoded after another covers from the tick after it; a run's first
+  covers from its seek tick, which **the caller clamps to one frame interval before it**
+  (mpegts seeks a GOP late and must not claim the frames it skipped). A file has one picture
+  per pts, so inserting under a held key keeps the first frame and a debug build asserts the
+  second is the same picture.
+- `y4m::Y4mReader` — streams frames straight into the plane `Vec`s (`take().read_to_end()`
+  into spare capacity: no whole-stream buffer, no copy, no zero-fill; the header and `FRAME`
+  marker are read unbuffered, a few bytes, so nothing swallows the planes). The header's size
+  is compared with the probe's **before any plane is allocated** (`Y4mError::Size` →
+  `GpuError::Unsupported`), only `C420` / `420jpeg` / `420mpeg2` / `420paldv` / no tag is
+  accepted (`420p10` also starts with "420"), no bytes or a header alone is "no frame", a
+  stream ending between frames is finished and one ending inside a header or plane is
+  `Truncated`; after any error the reader stays failed (every later call repeats it, never a
+  clean `None`). FFmpeg 6.1 writes `C420mpeg2`, 9.0 `C420jpeg`, same pictures (fixtures).
+- `showinfo::ShowinfoParser` — the timestamps of a run, read off stderr as it is written
+  (flags: `-hide_banner -nostats -nostdin -loglevel info ... -vf showinfo=checksum=0,... `
+  and `-fps_mode passthrough`, which the spawn must spell with the engine's `fps_mode_flag()`
+  (`-vsync` before FFmpeg 5.1); plain `showinfo` checksums every frame: +65 % decode on 6.1,
+  +40 % on 9.0). A frame is a line
+  holding `[Parsed_showinfo_N @ 0x…] n:<n> pts:<pts>` and nothing else is read. The
+  prefix is required, including for `config in time_base`, so a file name or a container
+  title containing `] n:1 pts:0` cannot poison it. ANSI colour is stripped first, and the
+  spawn calls `plain_log_env`, which removes `AV_LOG_FORCE_COLOR` and sets
+  `AV_LOG_FORCE_NOCOLOR=1`. Coloured and poisoned-title fixtures from both builds are in
+  `tests/fixtures/showinfo/`. Beyond that, `n` must count 0, 1, 2, ... (a rebuilt
+  graph renumbers: an error), a run's **pts must be strictly ascending** (an out-of-order or
+  repeated pts is `ShowinfoError::OutOfOrder`, and that file falls back to FFmpeg: the cache
+  keys a frame by its pts and covers ticks up to it, so a repeat would be served for another
+  picture and a step back, a decoder still learning its reorder depth after a mid-GOP seek,
+  would let a frame claim ticks that are not its own), `config in time_base: a/b` is re-read
+  on every occurrence (a frame before the first, a bad ratio or a *change* is an error),
+  `pts:NOPTS` or a pts that is not a plain integer (`0x21`) is an error, and
+  `duration:` is kept (the last frame's is `SourceFrames::last_duration`). `line_lossy` takes
+  bytes, since stderr carries non-UTF-8 file names. **The real stderr of both FFmpegs is in
+  `tests/fixtures/showinfo/`** (mp4 1/12288, matroska 1/1000, mpegts 1/90000 with a container
+  start, with and without `-ss`; the SEI `User Data=` hex lines, the `Output #0` block printed
+  *between* the first frames and the closing statistics included) and the two builds report
+  identical frames; `tests/fixtures/y4m/` holds a real y4m of each (`.gitattributes` pins
+  them binary / LF).
+- `router::route(&[RunState], &Request) -> Route` and `ThrashGuard` — which run serves a
+  request. **Reuse** an idle run of the file behind the target by at most `effective_window`
+  frames (`REUSE_WINDOW_PROXY` 24, `REUSE_WINDOW_ORIGINAL` 96, held to half of what the cache
+  holds at the frame's size — a 96-frame read-forward at 1080p would otherwise flush the
+  other layers; nearest wins), else **start** (free slot: at most
+  3 runs a file, 6 in all) or **replace** the least recently used *idle* run (the file's when
+  it is at its cap, the process's otherwise); a request behind every run of its file starts
+  `BACKWARD_LEAD` (15) frames early; **`Exact` never evicts** (reuse or `OneShot`, a decode of
+  its own that registers nothing), **`Prefetch` only takes a spare slot**, a busy run is
+  neither reused nor evicted (`Route::Busy`). The guard counts only routes that **destroy a
+  run somebody may want back** (`Route::is_thrash`: a restart, or a start that evicts a run
+  that is not stale — not filling a free slot, a six-layer frame starts six runs at once) and
+  only for `Forward`. `check(intent, route, now)` hands back a `#[must_use]` `Ticket` that goes
+  to `finished(ticket, now, outcome)` once the run delivers its first frame or fails. It is
+  **time-weighted**: once restarts have cost ≥ `THRASH_BUSY_SECS` (0.75 s) of the last second,
+  the next is `Err(Busy)`. A run that fails or dies empty still counts (a failed start into a
+  free slot is charged `FAILED_RUN_COST` too), so a crashing decoder cannot slip past by freeing
+  its slot. Evicting a stale idle run of another file does not count, so a montage across more
+  than six files is not thrash, and a start still open after a full window (its ticket never
+  came back) is closed there and ages out instead of refusing every later start. A refusal (`GpuError::Busy` via `From`) renders that frame through FFmpeg's stream instead.
+  Refusals are not counted so it recovers when the caller stops. Time is passed in, so the
+  tests need no clock.
+- kerf-core: `Pick::progress` / `FpsPick::seek` (above), `source_identity`,
+  `disable_decode_hwaccel`.
+
+**`FrameSource`** (A1b-2, `frame_source.rs`) puts those pieces to work: frames for a plan's
+layers from **long-lived `ffmpeg` runs** and the frame cache instead of a spawn per frame.
+`FrameSource::new(FrameSourceConfig)` → `Arc`, one per process, every call blocking (blocking
+pool, never under the project lock); `frames(&layers, Hint)` decodes the layers side by side and
+**layers asking for the same frame of one file share one decode**; `Compositor::render_plan_with`
+is `render_plan` over it (`composite_shared` takes the `Arc` frames). A run is
+`run_args`: `-hide_banner -nostats -nostdin -loglevel info [-hwaccel h] -copyts -start_at_zero -ss
+T -i path -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv -fps_mode passthrough
+-f yuv4mpegpipe -pix_fmt yuv420p pipe:1`, spawned under `plain_log_env` with the CPU cap divided
+among the runs alive; a reader thread pairs each y4m frame with its `showinfo` line **by number**
+and files it under `(identity captured at spawn, pts)`. Only `Pick::AtOrAfter` is served (a still's
+pick, keyed by **`kerf_core::seek_ticks(t, tb)`**, the tick the still's `-ss {:.6}` becomes);
+`Before` / `Fps` are a cursor's (A1b-3) and come back `Unsupported`; a still image is one one-shot
+decode, cached. What it guarantees: **a frame from a run is the one-shot decode's, byte for byte**
+— the parity harness decodes every compared case both ways and asserts equal planes (FFmpeg 6.1.1
+and 9.0.2), and `tests/frame_source.rs` does it for 80 times each on a 29.97 mp4, a VFR matroska
+and a transport stream with a container start, plus six threads at once. The rules it holds to:
+- A run's first frame covers from its seek tick (at most one frame interval back); a run **from
+  0** covers everything before its first frame (a late-starting picture). A clean end calls
+  `mark_end` (a time past it is `Ok(None)`, no decode); a clean run with **no** frame is a seek
+  past the end (`mark_end(seek_tick - 1)`); a non-zero exit with no frame is a **failed start**,
+  never an end, and its error carries ffmpeg's stderr tail.
+- **A seek that lands late** (the first frame more than two intervals after a seek above 0: a
+  long-GOP transport stream seeks to the next keyframe and does not recover, finding 5) marks
+  the file `late_seek`, and its frames come from `decode_layer` from then on: what `-ss t`
+  returns there is not a function of the timestamps, and the FFmpeg still returns that late
+  keyframe too (measured on 6.1.1: `-ss 1.184` on a GOP-30 `.ts` gives the frame at 2.002 s
+  on both paths; the byte-for-byte test passes on 9.0.2 too). A run that reads past its target without the cache proving the frame is given up on
+  and the request routed again; after two starts it decodes one-shot (`SourceStats::fallbacks`).
+- **Nothing waits forever**: a reaper thread (it holds a `Weak`) kills a run that is wanted
+  and silent for `first_frame_timeout` (30 s) / `frame_timeout` (15 s) and one idle for
+  `idle_kill` (20 s), and drops a finished run's record after 5 s; a `Scrub` / `Forward`
+  request gives up after `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run
+  blocks once it is past what was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most
+  24), so the pipe fills and ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill
+  every child. One-shots are capped (`max_oneshots`, 2).
+- **The path can be off**: the first use runs **`self_test`** (an `mpeg4` clip at 30000/1001
+  made by ffmpeg's own encoder, decoded from frame 5 with the production flags, every pts
+  expected exactly, all inside 10 s), and if it fails (FFmpeg < 5.1 has no `-fps_mode` or
+  `showinfo=checksum`) the process decodes with `decode_layer`, as does
+  `KERF_FRAME_SOURCE=oneshot` and any asset that never recorded its pixel format.
+- Hardware decode is `kerf_core::decode_hwaccel()` (now public); a run that dies before its
+  first frame with it is retried once in software, and success calls `disable_decode_hwaccel`.
+- `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
+  holds a run that hangs and one that dies to a prompt `GpuError::Decode`.
+  `bench_frame_source_decode_vs_one_shot` (`KERF_BENCH=1`) times both paths: here, release, software
+  decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
+  one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
@@ -1640,7 +2005,17 @@ the overlap.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
 `reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
-pins against the generated schemas. **Edit modes over MCP**: `roll_edit` (`clip_a`
+pins against the generated schemas. **Linked A/V over MCP**: `detach_audio` / `reattach_audio` (`clip_id`; detach answers
+`{clip, track_id, created_track}`), `detach_audio_clips` (`clip_ids`; one revision, answers
+`{detached, skipped}` with a reason per skipped clip), `reattach_audio_clips` (`clip_ids`; one revision, all or
+nothing, answers the pictures), and `set_volume` / `set_fade` / `set_clip_enabled` say a picture whose sound was
+detached (`source_audio: false`) carries none — its linked audio clip is the one to edit, `extract_audio` (answers the same;
+**no longer appends** an asset that is not on a video track — that is `add_asset_audio`),
+`link_clips` / `unlink_clips` (`clip_ids`), and an optional
+`link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
+pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
+track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Edit modes over MCP**: `roll_edit` (`clip_a`
 the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
 seconds, positive = later in its own footage) and `slide_clip` answer the
 `EditOutcome` JSON (`applied` / `clamped` say how far a clamp let it go; a clamp to
@@ -1713,6 +2088,13 @@ through an unbounded channel to a spawned forwarder because the render itself is
 on the blocking pool and `notify_progress` is async; the forwarder drains the
 channel even with no token, so a client that asked for no progress doesn't leave
 ticks piling up.
+`set_master_volume` / `set_master_limiter` are staged edits like any other;
+`get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
+`context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
+test can pin them — send a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with
+the master tools or `loudnorm`). `set_master_limiter` names the ceiling the engine really
+defaults to (a test ties its text to `MASTER_DEFAULT_CEILING_DB`) and says that a true peak still
+over -1 dBTP with the limiter on is fixed by lowering the ceiling, not by switching it on again.
 `platform_check` tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
@@ -1743,7 +2125,10 @@ modes, never ripple), `split_remove { clipId, at, side }` (`"left"` | `"right"`;
 ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, one revision),
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
-`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_delivery_format` (the project's delivery frame; omit
+`set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
+`set_master_limiter` (the master bus; each returns the `Timeline`), `get_levels` (`range?`,
+`loudnorm?` → `Levels`; whole-file, so lock-free; `cancel_levels` stops it, rejecting with
+`levels cancelled`), `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
@@ -1759,8 +2144,13 @@ time), `import_captions` / `import_captions_text` (a subtitle file by path / by 
 the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
-`extract_audio`, `concatenate` — each returns the
-refreshed `Timeline`), media (`get_frame` → base64 PNG data URL, `get_waveform`,
+`extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
+(an asset's whole audio as a clip) / `detach_audio_clips`,
+`detach_audio` / `reattach_audio` / `reattach_audio_clips` / `link_clips` / `unlink_clips`, `concatenate` — each
+returns the refreshed `Timeline`; every edit that carries linked clips takes an optional
+`link` (`false` edits the named clips alone: `trim_clip`, `move_clip(s)`, `split_clip`,
+`remove_clip(s)`, `ripple_delete`, `cut_clip_range`, `set_speed`, `roll_edit`, `slip_clip`,
+`slide_clip`, `split_remove(_clips)`, via `with_links`)), media (`get_frame` → base64 PNG data URL, `get_waveform`,
 `get_waveform_range` → a source-seconds window as min/max peaks per channel,
 `get_filmstrip` → an asset's thumbnail strip, the `Filmstrip` JSON with each sheet's
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
@@ -1784,7 +2174,10 @@ from one round-trip; `get_staged_timeline` for previewing it; `apply_staged_edit
 `discard_staged_edit`) and `revision_diff`, `export_timeline` (emits
 `export-progress` events) / `cancel_export`, `cancel_analysis` (the same shape,
 for the analysis pass — importing ten clips must not be an unbreakable
-commitment to ten transcriptions), app preferences (`get_settings` /
+commitment to ten transcriptions), `cancel_levels` (the same again, for the Mixer's
+measurement: a flag on `AppState` reset when `get_levels` starts and polled as its cancel
+callback — the pass holds the process-wide `cpu::lease`, so it cannot be left
+unstoppable), app preferences (`get_settings` /
 `set_settings` → a `SettingsView`: the *effective* CPU budget read back out of
 the engine, the cores it works out to, and the machine it is a share of —
 `settings.rs` persists them as JSON in the platform config dir, since how much
@@ -2005,8 +2398,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting six panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel` — each a Svelte component
+it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the toolbar's **Panels** menu reopens one (the library left of the
@@ -2220,14 +2613,16 @@ project flag — read in `load()` (so launch, New and Open) and again on the
 `ripple-mode-changed` event an agent's `set_ripple_mode` emits (with a toast, since it is
 the user's own toolbar setting that moved); the toolbar's **Ripple** toggle (`R`,
 `aria-pressed`) is lit while on, with a second cue in the ruler corner and an accented
-ruler underline, and its tooltip says each track ripples on its own (no sync lock yet).
+ruler underline, and its tooltip says each track ripples on its own but a moved clip takes its linked partners along.
 All the rippling is the backend's, but the GUI shows it: with ripple on, an edge drag is
 no longer stopped by its neighbours (it pushes them — only the source's footage, the
 0.05 s minimum and 0 stop it; `ripple-trim.ts`'s `trimBounds`), and its ghost is the
-*outcome* (`rippleTrimPreview`: the trim applied to a scratch copy of the track, then
-`ripple.ts`'s `rippleFrom`), because a left-edge trim keeps the clip's start rather than
-holding the right edge — one ghost per clip it moves, the moved clips dimmed, red and
-inert if the backend would decline the ripple. The bounds are asked again at every move
+*outcome* (`linked-trim.ts`'s `linkedTrimPreview`, the generalisation of
+`ripple-trim.ts`'s single-lane `rippleTrimPreview` — a bun test holds the two equal with
+links off: the trim applied to a scratch copy of the lanes, then `ripple.ts`'s `rippleFrom`,
+sync lock included — see Linked A/V below), because a left-edge trim keeps the clip's start
+rather than holding the right edge — one ghost per clip it moves, on whichever track, the
+moved clips dimmed, red and inert if the backend would decline the ripple. The bounds are asked again at every move
 and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
 load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
 changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
@@ -2308,6 +2703,39 @@ clips are selected. The TS mirrors print numbers as the backend does: `format-fi
 `toFixedEven` rounds an exact binary tie to the even digit like Rust's `{:.N}` (JS's
 `toFixed` takes the larger: 4.25 → `4.3` vs `4.2`), used by `formatTime` and the
 refusals' `0.12s`.
+**Linked A/V in the timeline** (`link-ui.ts`, `linked-trim.ts`, `multi-move.ts`, bun-tested; the chrome
+is `Timeline.svelte`): a linked clip wears a **badge** — a chain, plus a muted speaker on a picture whose
+sound was detached (`linkBadges`; the tooltip names the partners and says what Alt does) — and hovering
+a clip outlines its partners. A **click selects the clip and its partners** (`clickSelectLinked`; Ctrl
+toggles the pair, Shift brings in partners, a marquee sweeps them with the primary staying a clip it
+touched); **Alt-click selects just the one**. **Alt is the escape hatch from links**, read live from the
+pointer and the key (a "links off" chip lights in the toolbar): `link: false` on a drag, an edge trim, the
+razor, roll / slip / slide, and the menu's *Remove only this clip*. A drag's plan is a `$derived` of the
+pointer, the cut and Alt (`planMove` with `{links}`): dragged clips take the lane offset, their partners
+are **carried by the same Δt on their own track** (`withLinkedMoves`' rule; the grabbed clip's own
+partners are never lane-shifted even when selected) and checked with the group — a locked partner or
+one that would land on a clip / before 0 turns the drop red with that said — and drawn as `carried`
+ghosts; `moves` names only the clips dragged (the backend adds the rest; a property test replays random
+linked drags against the mirror). An edge trim's bounds are the clip's narrowed by each sharing partner's
+neighbours (`linkedTrimBounds`; a partner's footage is no limit — it is trimmed less); its ghost
+(`linkedTrimPreview`) is `trim_clip` + `carry_extent_edit` + the per-lane ripple + `conformLinks` (the trimmed
+clip its anchor, the trim itself the timeline "moved apart" is judged on) + the carried-lane check + the sync guard on a scratch copy, so a
+clip ripple pushes shows the partner it drags along on its own lane (a J/L-cut offset kept), and a refusal — a
+locked partner, a clip outside its group or a picture in the way, a linked clip it would cover, a clip left under 0.05 s —
+is red with its reason; a sound it cuts back to make room is drawn too and named (`trimmed`, an amber hint — the
+revision's label says it afterwards) (`api-links.test.ts` holds it equal to the harness commit).
+Roll / slip / slide run `previewEdit(…, links)` over the `*Linked` edits and `*RangeLinked` clamps:
+partners are `partner`-role ghosts with a `trackId`, the readout says `· with A1`. `gestureReason` adds
+"or hold Alt to edit this clip on its own" to a refusal about linked clips. The clip menu and keymap share
+`linkPlans` (`ops.ts`): **Detach audio** (⇧D; **one revision for the whole selection** via `detach_audio_clips`,
+the toast's Undo takes it back and names a skipped clip), **Reattach audio** (⇧⌘D; shown only where something is
+detached, greyed with the reason when unmuting would double the sound; **one revision for the whole
+selection** via `reattach_audio_clips`, so one Undo), **Link** (⌘L) / **Unlink** (⇧⌘L), each
+disabled with the backend's reason under its label (`MenuItem.reason`; `planLink` / `planUnlink` are the
+validation halves of `linkClips` / `unlinkClips`). A detached picture plays none of its sound: no volume
+line, no mixer strip when a video track's clips are all detached, and the Inspector's Volume / Audio
+effects give way to a note saying where it plays (its fades stay — they are the picture's). Picture clips
+never drew a waveform, so there is none to hide.
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -2419,7 +2847,42 @@ neutral, tooltips in dB and L/R); a silent track gets none. `src/lib/mixer.ts` i
 the *faithful* mirror of `Track::pan_gains`, because preview playback renders the
 pan as the same balance the export does — a `StereoPannerNode`'s constant-power
 law would quietly disagree with the file, and `get_audio` hands back mono, so the
-two gain legs into a merger *are* the stereo pair. The old
+two gain legs into a merger *are* the stereo pair. `src/lib/levels.ts` holds the master
+bus's limits (the Rust constants), `levelNotes` (the *faithful* mirror of the advice
+`Levels::new` writes) and `estimateLevels`, the browser harness's stand-in for `get_levels`
+(an *approximation* from the sample analysis through faders, pan, master and limiter,
+flagged `estimated`). The **Mixer panel** (`Mixer.svelte`, in the panel registry and the
+Audio workspace preset, reachable from the Panels menu) is one vertical `MixerStrip` per
+audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts`'s
+`trackHasSound`, which the track header uses too. It mirrors the export graph's
+`clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
+was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader,
+pan, M / S / Duck and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
+at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
+`slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
+nudges written once it goes quiet (or on Enter / blur). Escape abandons a gesture,
+double-click resets, and Ctrl+Z during an unwritten run takes the run back rather than
+undoing the edit before it.
+
+The meters are **measured**. `audio.ts` routes each track through a bus gain and its
+pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
+limiter, which is a `DynamicsCompressorNode` approximation (`limiterParams` in
+`audio-mix.ts` trims its automatic makeup gain; the tooltip says it is an
+approximation of the export's `alimiter`), then a master analyser. The fader moved
+from the clip envelope (`clipGainAt`) onto the bus, which is the same product, so what
+plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
+and a held peak. The meters animate only while playing. Ducking is **export-only**:
+Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
+the preview plays the track at its fader. **Measure** on the master strip calls
+`get_levels` over the whole cut, or over in → out when both marks are set, and
+`levels-view.ts` phrases the result. It is a whole-mix decode under the heavy-job lease
+(minutes on a long cut), so while it runs the button is a **Stop** (`ui.stopMeasure()` →
+`cancel_levels`, then `Stopping…` until the backend gives up): the pass rejects with
+`levels cancelled` (`isLevelsCancelled`), which is quiet — no toast, the last result
+stays. In the browser harness, `sample-audio.ts`
+synthesizes a voice-like signal per asset at its analysed loudness, so playback,
+meters and faders are drivable under `bun run dev`. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused). The toolbar carries a **delivery frame picker** (Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
@@ -2625,7 +3088,8 @@ stored spelling is ⌘ on macOS and Ctrl elsewhere, and a chord means *exactly* 
 modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl everywhere;
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
-bare keys added since (`ADDED`: N / Y / U / Q / W).
+bare keys added since (`ADDED`: N / Y / U / Q / W) and the modified chords added for linked A/V
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink).
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -2717,7 +3181,23 @@ checks, same messages), and `src/lib/edit-modes.ts` for the edit modes
 (`rollEdit` / `slipClip` / `slideClip` / `splitRemove` plus their `*Range`
 functions — the clamp a drag holds the pointer to — replaying the Rust tests, messages
 included; `api.ts` runs them in the harness, `editor.roll` / `slip` / `slide` /
-`splitRemove` / `splitRemoveClips` are the thin actions over them). `api.ts` keeps the project's ripple flag in the harness state
+`splitRemove` / `splitRemoveClips` are the thin actions over them). **Linked A/V is the same
+arrangement**: `link-groups.ts` + `links.ts` mirror `model/links.rs`, the `*Linked` modes live
+in `edit-modes.ts`, `conformLinks` (the sync lock) in `ripple.ts`, and `links.test.ts` replays
+the Rust cases name for name; **`link-ops.ts` is the pure mirror of `Project`'s link-aware ops
+and of `run_edit`** (`runEdit`: scratch copy, per-lane ripple, sync lock with the named clips as
+anchors, guard, orphan dissolve), which `api.ts` composes through `devRun` (a scratch copy, so a
+locked partner leaves the harness untouched, like the backend), every edit taking an optional
+trailing `link` (`false` = the named clip alone), plus `detachAudio` / `detachAudioClips` /
+`extractAudio` (answers `AudioDetached {timeline, detached, skipped}`) / `addAssetAudio` /
+`reattachAudio` / `reattachAudioClips` / `linkClips` / `unlinkClips`; `links-corpus.test.ts` replays kerf-core's own answers
+(see Linked A/V above) through it. `audio.ts` schedules no clip with
+`source_audio === false` — scheduling both a picture and its detached sound *is* the
+doubling; the editor chrome for it is the Linked A/V paragraph above. **The harness cut starts
+detached-and-linked** (V1 `c1` silent with `link_id`, A1 `c3` its sound for the same span — heard once;
+`Project::sample` detaches the same way but then unlinks, because the kerf-core tests built on it
+edit one clip at a time), so `bun run dev` shows the feature; tests that want the old shape start
+from `reattachAudio('c1')` or `unlinkClips`. `api.ts` keeps the project's ripple flag in the harness state
 (`getRippleMode` / `setRippleMode`; not an edit, no revision) and runs every local edit
 that can change how much footage sits ahead of a clip — add, split, trim, speed, remove,
 voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapshot, edit,
@@ -2744,8 +3224,11 @@ clips already use it / analyzed. Its **context menu leads with the facts** — t
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
 import date, then what analysis found (loudness, tempo, silence, shots,
 transcript, or "not analyzed") — above the actions that need them: add at the
-playhead / append, extract audio, remove silences (greyed out until silence has
-been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
+playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
+playing its own sound, `add_asset_audio`)
+(`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
+their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
+track), remove silences (greyed out until silence has been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
 in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
 row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
 it, which the shared `ContextMenu` renders non-interactively.

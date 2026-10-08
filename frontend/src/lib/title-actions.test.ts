@@ -7,7 +7,7 @@ import type { CaptionImportResult } from './types';
 // lane menu run it: pick a file, ask before replacing captions, import, say what
 // happened. It runs here over the browser harness's backend (the same cut as
 // `state-selection.test.ts`: V1 `c1 [0, 12.5)` `c2 [12.5, 20.5)` over A1 `c3
-// [0, 120)`, `c2` showing broll from its start), with the picker, the question and
+// [0, 12.5)`, c1's detached sound, `c2` showing broll from its start), with the picker, the question and
 // the toasts standing in for what only a window can do.
 
 const real = { ...(await import('./api')) };
