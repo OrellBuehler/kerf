@@ -374,6 +374,17 @@ class PopoutState {
 
 	#failed(e: PopoutWindowFailure): void {
 		console.warn('a detached window did not open', e);
+		// The backend hands out its labels in the order `window.open` is answered, and gives
+		// one up even when the window did not come of it: the label this one was announced
+		// with is spent, and the next window that opens must not be given it. (dockview
+		// refusing the URL never reached the backend, so that one is still waiting.)
+		if (e.reason !== 'url-refused') {
+			const label = this.#labels.claim();
+			if (label) {
+				this.#wanted.delete(label);
+				void popoutCancel(label).catch(() => {});
+			}
+		}
 		toast.error(describeFailure(e.reason), { description: e.error?.message });
 	}
 

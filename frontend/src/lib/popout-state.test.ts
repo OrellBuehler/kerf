@@ -359,6 +359,46 @@ describe('restoring a layout', () => {
 		]);
 	});
 
+	test('a window that failed to open gives up its label, so the next one is not given it', async () => {
+		const { popout, dock } = await boot();
+		announce = (n) => ({ label: `popout-${n}`, position: [100 * (n + 1), 100] });
+		await popout.announce([
+			{ left: 100, top: 100, width: 400, height: 300 },
+			{ left: 200, top: 100, width: 400, height: 300 },
+			{ left: 300, top: 100, width: 400, height: 300 }
+		]);
+		// The first was refused after the backend took its label (the script was blocked).
+		dock.subs.fail.forEach((h) => h({ reason: 'blocked', error: new Error('blocked') }));
+		dock.openWith = () => fakeWindow(200, 100);
+		await dock.addPopoutGroup(dock.panels[1]);
+		dock.openWith = () => fakeWindow(300, 100);
+		await dock.addPopoutGroup(dock.panels[2]);
+		// What is left to cancel is nothing: every announcement was taken or spent.
+		popout.settle();
+		expect(calls.filter((c) => c[0] === 'cancel').map((c) => c[1])).toEqual(['popout-0']);
+		// The two that opened close under their own labels.
+		popout.dockBack('preview');
+		popout.dockBack('timeline');
+		expect(calls.filter((c) => c[0] === 'close')).toEqual([
+			['close', 'popout-1'],
+			['close', 'popout-2']
+		]);
+		// And the refused one's position is not applied to a window that has nothing to do with it.
+		jest.advanceTimersByTime(400);
+		expect(calls.filter((c) => c[0] === 'move')).toEqual([]);
+	});
+
+	test('a URL dockview refused never reached the backend, so its announcement still waits', async () => {
+		const { popout, dock } = await boot();
+		announce = (n) => ({ label: `popout-${n}`, position: null });
+		await popout.announce([null, null]);
+		dock.subs.fail.forEach((h) => h({ reason: 'url-refused' }));
+		dock.openWith = () => fakeWindow();
+		await dock.addPopoutGroup(dock.panels[0]);
+		popout.dockBack('library');
+		expect(calls.filter((c) => c[0] === 'close')).toEqual([['close', 'popout-0']]);
+	});
+
 	test('a window that opened where it was asked is left, and one the platform put a title bar off is moved by the error', async () => {
 		const { popout, dock } = await boot();
 		announce = (n) => ({ label: `popout-${n}`, position: [166, 811] });
