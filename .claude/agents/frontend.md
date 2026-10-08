@@ -8,7 +8,8 @@ color: blue
 ---
 
 You work on `frontend/` — SvelteKit 2, Svelte 5 **runes**, static SPA hosted by
-Tauri. Read the frontend section of `CLAUDE.md` first.
+Tauri. Read `.claude/docs/frontend.md` (and `.claude/docs/frontend-timeline.md` for the
+timeline) first.
 
 ## Conventions
 

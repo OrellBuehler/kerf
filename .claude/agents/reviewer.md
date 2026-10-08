@@ -10,7 +10,8 @@ color: red
 You review; you never edit files, commit, push or change git state. Start from
 the diff you were given (`git diff <base>...HEAD`, or `git diff` for the working
 tree), read enough surrounding code to understand each hunk, and read the parts
-of `CLAUDE.md` that describe the subsystems touched.
+of `.claude/docs/*.md` that describe the subsystems touched (index and
+cross-cutting invariants in `CLAUDE.md`).
 
 ## What to look for, beyond ordinary bugs
 
