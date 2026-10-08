@@ -2378,6 +2378,24 @@ impl Project {
         })
     }
 
+    /// Choose how ducked tracks dip: `None` for the sidechain compressor (the default),
+    /// `Some(depth_db)` for the speech gate that lowers them by exactly that much while
+    /// the other tracks speak (clamped to `-40..=-1` dB). One revision.
+    pub fn set_master_duck(&self, depth_db: Option<f64>) -> Result<MasterBus> {
+        if depth_db.is_some_and(|d| !d.is_finite()) {
+            return Err(Error::InvalidArgument("duck depth must be a number".to_string()));
+        }
+        let depth_db = depth_db.map(|d| d.clamp(crate::model::DUCK_MIN_DEPTH_DB, -1.0));
+        let label = match depth_db {
+            Some(d) => format!("Duck by {d:.0} dB under speech"),
+            None => "Duck with the compressor".to_string(),
+        };
+        self.edit_timeline(&label, |timeline| {
+            timeline.master.duck_depth_db = depth_db;
+            Ok(timeline.master)
+        })
+    }
+
     /// Set (or clear) the frame this project is cut for.
     ///
     /// The delivery frame decides the shape of every rendered picture — the
@@ -3728,6 +3746,7 @@ impl Project {
             }),
             onsets: vec![0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
             tempo: Some(crate::model::Tempo {
+                downbeats: Vec::new(),
                 bpm: 120.0,
                 beats: vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
                 confidence: 0.62,
@@ -5240,6 +5259,7 @@ mod tests {
             .set_analysis(&AssetAnalysis {
                 asset_id: music.id,
                 tempo: Some(crate::model::Tempo {
+                    downbeats: Vec::new(),
                     bpm: 120.0,
                     beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
                     confidence: 0.8,
@@ -5331,6 +5351,28 @@ mod tests {
 
         let err = project.fit_music(report.clips[0], Some(-1.0), false).unwrap_err().to_string();
         assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn an_agents_duck_mode_stages_and_applies() {
+        let mut project = Project::open_in_memory().unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        let master = project.set_master_duck(Some(-90.0)).unwrap();
+        assert_eq!(master.duck_depth_db, Some(crate::model::DUCK_MIN_DEPTH_DB));
+        let staged = project.staged().unwrap().expect("a proposal");
+        assert_eq!(
+            staged.diff.entries.len(),
+            1,
+            "the review lists the duck change: {:?}",
+            staged.diff
+        );
+        let applied = project.apply_staged(false).unwrap();
+        assert_eq!(applied.master.duck_depth_db, Some(crate::model::DUCK_MIN_DEPTH_DB));
+        assert!(project.set_master_duck(Some(f64::NAN)).is_err());
+        project.begin_staging(None, None).unwrap();
+        project.set_master_duck(None).unwrap();
+        assert_eq!(project.apply_staged(false).unwrap().master.duck_depth_db, None);
     }
 
     #[test]
@@ -8267,6 +8309,7 @@ mod tests {
                 .set_analysis(&AssetAnalysis {
                     asset_id: music.id,
                     tempo: Some(crate::model::Tempo {
+                        downbeats: Vec::new(),
                         bpm: 120.0,
                         beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
                         confidence: 0.8,

@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import type { Container, ExportOptions, Fit, RateControl } from './types';
+import type { Container, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
 export interface ContainerInfo {
@@ -179,6 +179,31 @@ export const FITS: { id: Fit; label: string; hint: string }[] = [
 	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
 	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' }
 ];
+
+/** The loudness targets an export can normalize to — `kerf_core::LoudnessPreset`, in the order the
+ *  select lists them. `off` is no normalization; every other id is the value of
+ *  `ExportOptions.loudness`. */
+export type LoudnessChoice = LoudnessPreset | 'off';
+
+export const LOUDNESS_TARGETS: { id: LoudnessChoice; label: string; lufs: number | null; hint: string }[] = [
+	{ id: 'off', label: 'Off', lufs: null, hint: 'The mix is exported at the level it was mixed.' },
+	{ id: 'youtube', label: 'YouTube · −14 LUFS', lufs: -14, hint: 'Evens out the level to −14 LUFS, true peak under −1 dBTP — what YouTube plays at.' },
+	{ id: 'spotify', label: 'Spotify · −14 LUFS', lufs: -14, hint: 'Evens out the level to −14 LUFS, true peak under −1 dBTP — what Spotify plays at.' },
+	{ id: 'apple', label: 'Apple · −16 LUFS', lufs: -16, hint: 'Evens out the level to −16 LUFS, true peak under −1 dBTP — Apple Music and Podcasts.' },
+	{ id: 'broadcast', label: 'Broadcast (EBU R128) · −23 LUFS', lufs: -23, hint: 'Evens out the level to −23 LUFS, true peak under −1 dBTP — television and radio.' }
+];
+
+/** The target an export will normalize to: `loudness` wins over the older `loudnorm` flag, which
+ *  is the YouTube target (`-14 LUFS`), exactly as the engine reads them. */
+export function loudnessChoice(opts: Pick<ExportOptions, 'loudness' | 'loudnorm'>): LoudnessChoice {
+	return opts.loudness ?? (opts.loudnorm ? 'youtube' : 'off');
+}
+
+/** `opts` normalized to `choice`. The old `loudnorm` flag is cleared in the same move: left on, it
+ *  would turn `Off` back into YouTube the next time the options are read. */
+export function withLoudness(opts: ExportOptions, choice: LoudnessChoice): ExportOptions {
+	return { ...opts, loudness: choice === 'off' ? null : choice, loudnorm: false };
+}
 
 export const SCALERS = ['bicubic', 'bilinear', 'lanczos', 'neighbor', 'spline'];
 export const GIF_DITHERS = ['bayer', 'sierra2', 'none'];
@@ -402,6 +427,8 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 	} else if (!wantAudio && hasAudio && !info.videoOnly) {
 		parts.push('no audio');
 	}
+	const lufs = wantAudio ? LOUDNESS_TARGETS.find((t) => t.id === loudnessChoice(opts))?.lufs : null;
+	if (lufs != null) parts.push(`${lufs} LUFS`);
 	if (opts.faststart && info.faststart) parts.push('faststart');
 	return parts.join(' · ');
 }

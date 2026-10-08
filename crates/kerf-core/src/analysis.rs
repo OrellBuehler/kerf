@@ -1035,6 +1035,7 @@ mod tests {
                 tempo: Some(Tempo {
                     bpm: 120.0,
                     beats: vec![0.0, 0.5],
+                    downbeats: Vec::new(),
                     confidence: 0.9,
                 }),
                 audio_class: Some(AudioClassification {

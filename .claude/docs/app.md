@@ -35,7 +35,9 @@ ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, o
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
-`set_master_limiter` (the master bus; each returns the `Timeline`), `get_levels` (`range?`,
+`set_master_limiter` / `set_master_duck` (`depthDb?`; the master bus; each returns the
+`Timeline`), `plan_music_fit` (`clipId`, `target?` → `MusicFit`), `fit_music` (`clipId`,
+`target?`, `fadeOut` → `{timeline, report}`), `get_levels` (`range?`,
 `loudnorm?` → `Levels`; whole-file, so lock-free; `cancel_levels` stops it, rejecting with
 `levels cancelled`), `set_delivery_format` (the project's delivery frame; omit
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`

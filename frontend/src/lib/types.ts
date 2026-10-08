@@ -82,6 +82,9 @@ export interface Tempo {
 	bpm: number;
 	beats: number[];
 	confidence: number;
+	/** Bar starts in source seconds; empty when no bar grid could be fitted (the beats are then
+	 *  a plain estimate). With a grid, `beats` are its beats. */
+	downbeats: number[];
 }
 
 export interface BeatGrid {
@@ -102,6 +105,36 @@ export interface MusicAnalysis {
 	duration: number;
 	bar_chroma: number[][];
 	phrases: PhraseMatch[];
+}
+
+/** One piece of the source, placed at `output_start` seconds into the fitted music
+ *  (`kerf_core::MusicSegment`). */
+export interface MusicSegment {
+	source_start: number;
+	source_end: number;
+	output_start: number;
+}
+
+/** A planned "fit music to length" (`kerf_core::MusicFit`): the segments in output order, how
+ *  long they last and how far that is from the target. `remainder = target - duration`:
+ *  positive is short of it, negative runs over and wants a fade-out. */
+export interface MusicFit {
+	segments: MusicSegment[];
+	target: number;
+	duration: number;
+	remainder: number;
+	/** Whole bars played between the intro and the ending. */
+	bars: number;
+	splices: number;
+}
+
+/** What fitting did (`kerf_core::MusicFitReport`): the clips it placed (in order), the plan they
+ *  came from, whether an overrun was cut and faded, and how long the music now lasts. */
+export interface MusicFitReport {
+	clips: string[];
+	fit: MusicFit;
+	faded: boolean;
+	duration: number;
 }
 
 export type AudioClass = 'speech' | 'music' | 'mixed' | 'unknown';
@@ -609,6 +642,11 @@ export interface MasterBus {
 	limiter: boolean;
 	/** Limiter ceiling in dBFS, -24..0 (-1.5 by default). A sample-peak ceiling. */
 	ceiling_db: number;
+	/** How tracks flagged `duck` dip. Absent / `null` is the sidechain compressor, which
+	 *  dips by how loud the rest of the mix is; a number is the **speech gate**: the ducked
+	 *  bus drops by exactly that many dB (negative, clamped to -40..-1) while the rest speaks.
+	 *  The backend omits it when unset. */
+	duck_depth_db?: number | null;
 }
 
 export interface Timeline {
@@ -840,9 +878,15 @@ export interface ExportOptions {
 	metadata_title?: string | null;
 	/** Render only this timeline span (e.g. the in/out marks); omit for all. */
 	range?: TimeRange | null;
-	/** Normalize the final mix to -14 LUFS before encoding. */
+	/** Normalize the final mix to -14 LUFS before encoding. The same as `loudness: 'youtube'`. */
 	loudnorm?: boolean;
+	/** Normalize the final mix to a platform's loudness target. Wins over `loudnorm`. */
+	loudness?: LoudnessPreset | null;
 }
+
+/** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,
+ *  Apple -16, EBU R128 broadcast -23, all with a -1 dBTP true-peak ceiling. */
+export type LoudnessPreset = 'youtube' | 'spotify' | 'apple' | 'broadcast';
 
 /** How a clip's picture is fitted to an output frame of a different shape. */
 export type Fit = 'contain' | 'cover';
@@ -1153,4 +1197,11 @@ export interface PreviewFrameResult {
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];
 	timings: GpuTimings | null;
+}
+
+/** The answer of `fit_music` (`MusicFitted` in `crates/kerf-app/src/lib.rs`): the refreshed
+ *  timeline and the report. */
+export interface MusicFitted {
+	timeline: Timeline;
+	report: MusicFitReport;
 }

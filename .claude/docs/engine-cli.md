@@ -224,7 +224,19 @@ so the feature is **only** activated through these forwards — which is what ma
   dropped entirely on a mono delivery. A clip's `adelay` is whole milliseconds when its start is one, else an exact sample count (`adelay=NS`, `audio_delay`) — ms rounding put a bar-aligned splice up to 0.5 ms off its neighbour. Tracks flagged `Track.duck` are mixed
   into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
-  dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
+  dialogue); With `MasterBus.duck_depth_db` set the duck is a **speech gate** instead
+  (`duck_gate_chains`): a constant 1.0 through a `sidechaingate` keyed by the rest makes a
+  0/1 "speech" curve (300 ms release = hangover), smoothed by a fast (7 Hz) and a slow
+  (1.2 Hz) one-pole and maxed (rises in ~50 ms, falls over ~300 ms), and the ducked bus is
+  `amultiply`'d by `1 - (1 - depth) * curve` — exactly `depth` dB under speech, verified
+  rendered (±0.5 dB). Traps: a sidechain filter **ends with the shorter input** (the gate key
+  is padded with `apad`; the compressor path still cuts a bed off when the dialogue ends first — a
+  pre-existing bug, left alone because fixing it moves every ducking graph), a digitally
+  silent key holds `sidechaingate` **open** (1e-6 floor), and `amix` silently drops a
+  negative weight. `ExportOptions.loudness` (`LoudnessPreset`: youtube / spotify -14, apple
+  -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
+  youtube is byte-identical to `loudnorm: true`.
+  `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
   on the final mix, and `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).

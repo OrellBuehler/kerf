@@ -19,22 +19,38 @@ export function sourceToTimeline(c: Clip, source: number): number {
 	return c.timeline_start + (speed < 0 ? c.source_out - source : source - c.source_in) / mag;
 }
 
-/** Beat times of the audio tracks in timeline seconds, ascending and de-duplicated. */
-export function beatGrid(timeline: Timeline, tempoFor: (assetId: string) => Tempo | null | undefined): number[] {
+/** The marks of the audio tracks (`marksOf` picks which list of an asset's tempo) in timeline
+ *  seconds, ascending and de-duplicated. */
+function trackGrid(
+	timeline: Timeline,
+	tempoFor: (assetId: string) => Tempo | null | undefined,
+	marksOf: (tempo: Tempo) => readonly number[]
+): number[] {
 	const times: number[] = [];
 	for (const track of timeline.tracks) {
 		if (track.kind !== 'audio') continue;
 		for (const clip of track.clips) {
 			const tempo = tempoFor(clip.asset_id);
 			if (!tempo || tempo.confidence < BEAT_MIN_CONFIDENCE || tempo.bpm <= 0) continue;
-			for (const beat of tempo.beats) {
-				if (beat >= clip.source_in && beat <= clip.source_out) times.push(sourceToTimeline(clip, beat));
+			for (const mark of marksOf(tempo)) {
+				if (mark >= clip.source_in && mark <= clip.source_out) times.push(sourceToTimeline(clip, mark));
 			}
 		}
 	}
 	times.sort((a, b) => a - b);
-	// Overlapping clips of one asset repeat the same beats; drop the copies.
+	// Overlapping clips of one asset repeat the same marks; drop the copies.
 	return times.filter((b, i) => i === 0 || b - times[i - 1] > 0.005);
+}
+
+/** Beat times of the audio tracks in timeline seconds, ascending and de-duplicated. */
+export function beatGrid(timeline: Timeline, tempoFor: (assetId: string) => Tempo | null | undefined): number[] {
+	return trackGrid(timeline, tempoFor, (t) => t.beats);
+}
+
+/** Bar starts of the audio tracks in timeline seconds: `beatGrid` over the tempos' `downbeats`
+ *  (`Timeline::bar_grid`). Empty when no music has a fitted bar grid. */
+export function barGrid(timeline: Timeline, tempoFor: (assetId: string) => Tempo | null | undefined): number[] {
+	return trackGrid(timeline, tempoFor, (t) => t.downbeats ?? []);
 }
 
 /** The beat nearest `time` within `tolerance`, or null. */
@@ -46,6 +62,38 @@ export function nearestBeat(beats: number[], time: number, tolerance: number): n
 		if (d <= tolerance && (best === null || d < Math.abs(best - time))) best = b;
 	}
 	return best;
+}
+
+/**
+ * What the beat grid pulls a gesture towards. `edges` are the offsets from `time` of the points that
+ * should land on the grid — `[0]` for a cut or a trimmed edge, `[0, length]` for a span whose head
+ * and tail may both be set on it — and the answer is the value of `time` that puts one of them on
+ * a grid mark (the candidates for a snap to choose the nearest from).
+ *
+ * Bars win over beats: when any edge has a bar within `tolerance`, only the bars are offered — a
+ * beat that happens to be nearer does not pull the clip off the downbeat — and otherwise the
+ * beats within reach are. A bar is also a beat (they come from one grid), so with a single edge
+ * this only changes the answer where the grid is sparse enough, or the tolerance wide enough,
+ * for a beat to sit nearer than the bar. Marks exactly `tolerance` away do not count, like
+ * `nearestWithin`'s.
+ */
+export function gridMagnets(
+	time: number,
+	edges: readonly number[],
+	beats: readonly number[],
+	bars: readonly number[],
+	tolerance: number
+): number[] {
+	if (!(tolerance > 0)) return [];
+	const within = (marks: readonly number[]) => {
+		const out: number[] = [];
+		for (const offset of edges) {
+			for (const m of marks) if (Math.abs(m - (time + offset)) < tolerance) out.push(m - offset);
+		}
+		return out;
+	};
+	const onBars = within(bars);
+	return onBars.length > 0 ? onBars : within(beats);
 }
 
 /** Half the median beat interval — every cut then moves to the beat it is nearest. */

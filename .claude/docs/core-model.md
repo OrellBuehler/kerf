@@ -230,6 +230,9 @@
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
+  `Timeline::bar_grid` is the same over `Tempo.downbeats` (bar starts; the rhythm pass
+  replaces an asset's autocorrelated `Tempo` with `Tempo::from_grid` when a bar grid is
+  fitted, so the ruler, snapping and cut-to-the-beat all use the fitted grid).
   `Timeline::beat_grid` maps the audio tracks' cached `Tempo` onto timeline time
   (confidence-gated by `BEAT_MIN_CONFIDENCE`, mirroring the ruler's ticks) and
   `Track::align_cuts_to_beats` ripples a track's cuts onto that grid — each clip

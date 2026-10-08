@@ -28,11 +28,15 @@
 		applyPreset,
 		containerInfo,
 		isHwCodec,
+		LOUDNESS_TARGETS,
+		loudnessChoice,
 		reconcileContainer,
 		videoCodecDefaults,
 		validateExport,
 		buildSummary,
-		buildCommandPreview
+		buildCommandPreview,
+		withLoudness,
+		type LoudnessChoice
 	} from '$lib/export-presets';
 
 	let { onClose }: { onClose: () => void } = $props();
@@ -120,6 +124,8 @@
 		? String(opts.crf ?? vc?.crf?.[2]) : 'custom');
 
 	const ac = $derived(opts.audio_codec ? AUDIO_CODECS[opts.audio_codec] : undefined);
+	const loudness = $derived(loudnessChoice(opts));
+	const loudnessHint = $derived(LOUDNESS_TARGETS.find((t) => t.id === loudness)?.hint ?? '');
 	const issues = $derived(validateExport(opts, hasVideo, hasAudio));
 	const summary = $derived(buildSummary(opts, hasVideo, hasAudio));
 	const command = $derived(buildCommandPreview(opts, hasVideo, hasAudio, outputPath || undefined));
@@ -443,8 +449,13 @@
 				{@render secHead('Sound')}
 				{@render toggleRow('Include audio', !!opts.include_audio, (v) => patch({ include_audio: v }))}
 				{#if opts.include_audio}
-					{@render toggleRow('Normalize loudness (−14 LUFS)', !!opts.loudnorm, (v) => patch({ loudnorm: v }))}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Evens out the level so it matches what platforms play at.</p>
+					{@render selectRow(
+						'Normalize loudness',
+						loudness,
+						LOUDNESS_TARGETS.map((t) => ({ value: t.id, label: t.label })),
+						(v) => patch(withLoudness(opts, v as LoudnessChoice))
+					)}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">{loudnessHint}</p>
 				{/if}
 			{/if}
 			<!-- one cut, every platform -->

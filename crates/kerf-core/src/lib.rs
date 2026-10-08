@@ -49,8 +49,8 @@ pub use engine::{
     render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
     source_seek_points_are_keyframes, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export,
     voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, Container,
-    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, PreviewFrame,
-    RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
+    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, LoudnessPreset,
+    PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
     WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED,
     MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
 };

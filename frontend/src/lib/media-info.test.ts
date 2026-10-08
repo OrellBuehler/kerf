@@ -111,7 +111,7 @@ describe('analysisFacts', () => {
 		],
 		loudness: { integrated_lufs: -18.34, loudness_range: 6, true_peak_dbtp: -1.02, threshold_lufs: -28 },
 		onsets: [],
-		tempo: { bpm: 120.4, beats: [], confidence: 0.82 },
+		tempo: { bpm: 120.4, beats: [], confidence: 0.82, downbeats: [] },
 		audio_class: { class: 'speech', confidence: 0.91 },
 		music: null
 	};

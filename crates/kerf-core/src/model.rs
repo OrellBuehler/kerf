@@ -686,6 +686,24 @@ pub struct Tempo {
     pub beats: Vec<f64>,
     /// How periodic the audio is, 0.0–1.0 (the normalized autocorrelation peak).
     pub confidence: f64,
+    /// Bar starts in seconds, when a fixed bar grid could be fitted (see
+    /// [`MusicAnalysis`]); empty otherwise. With a grid, `beats` are its beats too.
+    #[serde(default)]
+    pub downbeats: Vec<f64>,
+}
+
+impl Tempo {
+    /// The tempo read off a fitted bar grid: its beats and downbeats across `duration`
+    /// (the few ms a first beat may sit before 0 dropped), and at least
+    /// [`BEAT_MIN_CONFIDENCE`] — the fit already refused anything without a steady pulse.
+    pub fn from_grid(grid: &BeatGrid, duration: f64, confidence: f64) -> Self {
+        Self {
+            bpm: grid.bpm(),
+            beats: grid.beats(duration).into_iter().filter(|t| *t >= 0.0).collect(),
+            confidence: confidence.max(BEAT_MIN_CONFIDENCE),
+            downbeats: grid.downbeats(duration).into_iter().filter(|t| *t >= 0.0).collect(),
+        }
+    }
 }
 
 /// A fixed beat grid fitted to a piece of music: beat `k` is at `phase_s + k * period_s`,
@@ -3687,7 +3705,19 @@ pub struct MasterBus {
     /// ([`Project::levels`](crate::Project::levels) measures it).
     #[serde(default = "default_master_ceiling")]
     pub ceiling_db: f64,
+    /// How tracks flagged `duck` dip under the rest of the mix. `None` (the default) is
+    /// the sidechain compressor, which dips by how loud the rest is; `Some(depth)` is a
+    /// **speech gate**: the ducked bus drops by exactly `depth` dB (negative, clamped to
+    /// [`DUCK_MIN_DEPTH_DB`]`..=-1`) while the rest is above the gate's threshold, ramping
+    /// down in ~50 ms and back up ~300 ms after it falls quiet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duck_depth_db: Option<f64>,
 }
+
+/// The speech gate's depth when it is switched on without one.
+pub const DUCK_DEFAULT_DEPTH_DB: f64 = -12.0;
+/// The deepest the speech gate ducks: a bed 40 dB down is as good as gone.
+pub const DUCK_MIN_DEPTH_DB: f64 = -40.0;
 
 /// The top of the master fader: +12 dB, as far as a fader has any business going
 /// (the track faders stop at the same place).
@@ -3715,6 +3745,7 @@ impl Default for MasterBus {
             volume: 1.0,
             limiter: false,
             ceiling_db: MASTER_DEFAULT_CEILING_DB,
+            duck_depth_db: None,
         }
     }
 }
@@ -3733,6 +3764,18 @@ impl MasterBus {
     /// by this).
     pub fn is_neutral(&self) -> bool {
         !self.limiter && (self.safe_volume() - 1.0).abs() <= f64::EPSILON
+    }
+
+    /// The speech gate's depth as the graph will use it (finite, within
+    /// [`DUCK_MIN_DEPTH_DB`]`..=-1`), or `None` for the compressor.
+    pub fn safe_duck_depth_db(&self) -> Option<f64> {
+        self.duck_depth_db.map(|d| {
+            if d.is_finite() {
+                d.clamp(DUCK_MIN_DEPTH_DB, -1.0)
+            } else {
+                DUCK_DEFAULT_DEPTH_DB
+            }
+        })
     }
 
     /// The fader as the graph will use it: finite, within `0..=`
@@ -3856,6 +3899,24 @@ impl Timeline {
         // Overlapping clips of one asset repeat the same beats; drop the copies.
         times.dedup_by(|a, b| (*a - *b).abs() <= 0.005);
         times
+    }
+
+    /// Bar starts of the audio tracks in timeline seconds: [`Self::beat_grid`] over the
+    /// tempos' `downbeats`. Empty when no music has a fitted bar grid.
+    pub fn bar_grid(&self, tempos: &HashMap<Uuid, Tempo>) -> Vec<f64> {
+        let bars: HashMap<Uuid, Tempo> = tempos
+            .iter()
+            .map(|(id, t)| {
+                (
+                    *id,
+                    Tempo {
+                        beats: t.downbeats.clone(),
+                        ..t.clone()
+                    },
+                )
+            })
+            .collect();
+        self.beat_grid(&bars)
     }
 
     /// Find a clip by id, returning `(track_index, clip_index)`.
@@ -5656,6 +5717,18 @@ fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
             before.ceiling_db, after.ceiling_db
         ));
     }
+    let duck = |d: Option<f64>| match d {
+        Some(db) => format!("speech gate {db:.0} dB"),
+        None => "compressor".to_string(),
+    };
+    let (was, now) = (before.safe_duck_depth_db(), after.safe_duck_depth_db());
+    let moved = match (was, now) {
+        (Some(a), Some(b)) => (a - b).abs() > DIFF_EPS,
+        (a, b) => a.is_some() != b.is_some(),
+    };
+    if moved {
+        parts.push(format!("duck {} → {}", duck(was), duck(now)));
+    }
     joined(parts)
 }
 
@@ -6230,6 +6303,7 @@ mod tests {
         let tempos = HashMap::from([(
             asset,
             Tempo {
+                downbeats: Vec::new(),
                 bpm: 120.0,
                 beats: vec![0.0, 1.0, 3.0, 5.0, 8.0],
                 confidence: 0.5,
@@ -6248,6 +6322,7 @@ mod tests {
         let tempos = HashMap::from([(
             asset,
             Tempo {
+                downbeats: Vec::new(),
                 bpm: 120.0,
                 beats: vec![0.5, 1.0],
                 confidence: BEAT_MIN_CONFIDENCE - 0.01,
@@ -7351,6 +7426,7 @@ mod tests {
     fn a_master_round_trips_and_a_partial_one_fills_from_the_defaults() {
         let mut tl = Timeline::new();
         tl.master = MasterBus {
+            duck_depth_db: None,
             volume: 0.7,
             limiter: true,
             ceiling_db: -3.0,
@@ -7361,6 +7437,7 @@ mod tests {
         assert_eq!(
             partial.master,
             MasterBus {
+                duck_depth_db: None,
                 volume: 1.0,
                 limiter: true,
                 ceiling_db: -1.5
@@ -7389,6 +7466,7 @@ mod tests {
     #[test]
     fn a_master_from_a_hand_edited_file_is_made_safe_for_the_graph() {
         let m = MasterBus {
+            duck_depth_db: None,
             volume: f64::NAN,
             limiter: true,
             ceiling_db: f64::INFINITY,
@@ -7396,6 +7474,7 @@ mod tests {
         assert_eq!(m.safe_volume(), 1.0);
         assert_eq!(m.safe_ceiling_db(), MASTER_DEFAULT_CEILING_DB);
         let m = MasterBus {
+            duck_depth_db: None,
             volume: 99.0,
             limiter: true,
             ceiling_db: -90.0,
@@ -7413,6 +7492,7 @@ mod tests {
     #[test]
     fn the_master_follows_the_cut_into_every_render_of_it() {
         let master = MasterBus {
+            duck_depth_db: None,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -7459,6 +7539,18 @@ mod tests {
         assert_eq!(
             limited.diff(&moved).entries[0].detail.as_deref(),
             Some("limiter ceiling -1.5 → -3.0 dB")
+        );
+        let mut gated = tl.clone();
+        gated.master.duck_depth_db = Some(-12.0);
+        assert_eq!(
+            tl.diff(&gated).entries[0].detail.as_deref(),
+            Some("duck compressor → speech gate -12 dB")
+        );
+        let mut deeper = gated.clone();
+        deeper.master.duck_depth_db = Some(-18.0);
+        assert_eq!(
+            gated.diff(&deeper).entries[0].detail.as_deref(),
+            Some("duck speech gate -12 dB → speech gate -18 dB")
         );
         let mut parked = tl.clone();
         parked.master.ceiling_db = -3.0;

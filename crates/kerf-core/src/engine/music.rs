@@ -608,6 +608,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_fitted_grid_becomes_the_tempo_and_its_bars_land_on_the_timeline() {
+        use crate::model::{Clip, Tempo, BEAT_MIN_CONFIDENCE};
+        let g = BeatGrid {
+            period_s: 0.5,
+            phase_s: -0.004,
+            downbeat_offset: 1,
+            beats_per_bar: 4,
+        };
+        let t = Tempo::from_grid(&g, 5.0, 0.1);
+        assert_eq!(t.bpm, 120.0);
+        assert_eq!(t.confidence, BEAT_MIN_CONFIDENCE);
+        assert_eq!(t.beats.len(), 10, "the beat a hair before 0 is dropped: {:?}", t.beats);
+        assert_eq!(t.downbeats, vec![0.496, 2.496, 4.496]);
+        let asset = uuid::Uuid::new_v4();
+        let mut tl = crate::engine::test_support::timeline_of(vec![crate::engine::test_support::audio_track(vec![Clip::new(
+            asset, 1.0, 5.0, 10.0,
+        )])]);
+        tl.tracks[0].clips[0].speed = 1.0;
+        let tempos = std::collections::HashMap::from([(asset, t)]);
+        let bars = tl.bar_grid(&tempos);
+        assert_eq!(bars.len(), 2);
+        assert!((bars[0] - 11.496).abs() < 1e-9 && (bars[1] - 13.496).abs() < 1e-9, "{bars:?}");
+    }
+
+    #[test]
     fn beat_grid_lists_beats_bars_and_whole_bars() {
         let g = BeatGrid {
             period_s: 0.5,
@@ -733,12 +758,7 @@ pub(crate) mod tests {
         assert!((cut * 1000.0).fract().abs() > 1e-6);
         let a = Clip::new(asset.id, 0.0, cut, 0.0);
         let b = Clip::new(asset.id, cut, asset.duration, cut);
-        let hard = render(
-            &dir,
-            "hard.wav",
-            &timeline_of(vec![audio_track(vec![a, b])]),
-            &asset,
-        );
+        let hard = render(&dir, "hard.wav", &timeline_of(vec![audio_track(vec![a, b])]), &asset);
         // The same join crossfaded the way a fit splices: the window centred on the cut.
         let fit = crate::model::MusicFit {
             segments: vec![

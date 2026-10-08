@@ -162,6 +162,13 @@ through an unbounded channel to a spawned forwarder because the render itself is
 on the blocking pool and `notify_progress` is async; the forwarder drains the
 channel even with no token, so a client that asked for no progress doesn't leave
 ticks piling up.
+**Music**: `get_music_structure { asset_id }` (compact: bpm, grid, bar starts, intro end,
+phrases — no chroma; errors until analyzed, `music: null` without a pulse),
+`plan_music_fit { clip_id, target? }` (read-only `MusicFit`) and `fit_music { clip_id,
+target?, fade_out? }` (default `fade_out` true; answers `{fit: MusicFitReport, timeline}`;
+decides its own layout, so it takes no `ripple`), `set_master_duck { depth_db? }` (the
+speech gate; omitted = compressor), and `export`'s `options.loudness` preset. The server
+`instructions` route music under a cut through analyze → fit_music → duck.
 `set_master_volume` / `set_master_limiter` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
 `context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a

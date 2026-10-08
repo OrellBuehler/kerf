@@ -6,6 +6,10 @@
 	//
 	// The preview's limiter is an approximation — a compressor with a hard knee at the
 	// ceiling — and the toggle's tooltip says so; Measure reads the real thing.
+	//
+	// The Duck pair picks how the tracks flagged Duck dip: under the sidechain compressor
+	// (the default; it dips by how loud the rest is) or the speech gate (exactly the depth set
+	// here while the rest speaks). Export only, like the Duck toggle itself.
 	import MixSlider from './MixSlider.svelte';
 	import FaderMeter from './FaderMeter.svelte';
 	import Badge from './Badge.svelte';
@@ -17,10 +21,16 @@
 		CEILING_STEP,
 		ceilingLabel,
 		ceilingToPos,
+		DUCK_DEFAULT_DEPTH_DB,
+		DUCK_STEP,
+		duckLabel,
+		duckToPos,
 		MASTER_DEFAULT_CEILING_DB,
 		MASTER_MAX_VOLUME,
 		nudgeCeiling,
-		posToCeiling
+		nudgeDuck,
+		posToCeiling,
+		posToDuck
 	} from '$lib/levels';
 	import type { StereoMeter } from '$lib/meter';
 	import type { SliderKey } from '$lib/slider-gesture';
@@ -52,10 +62,20 @@
 
 	let faderPreview = $state<number | null>(null);
 	let ceilingPreview = $state<number | null>(null);
+	let duckPreview = $state<number | null>(null);
+	/** The depth the gate had when it was last on, so Compressor → Speech gate returns to it. */
+	let lastDepth = $state(DUCK_DEFAULT_DEPTH_DB);
 
 	const volume = $derived(faderPreview ?? master.volume);
 	const ceiling = $derived(ceilingPreview ?? master.ceiling_db);
 	const read = $derived(result ? readingText(result.levels.master) : null);
+	/** The speech gate is on while the master carries a depth; no depth is the compressor. */
+	const gate = $derived(master.duck_depth_db != null);
+	const depth = $derived(duckPreview ?? master.duck_depth_db ?? lastDepth);
+	const anyDucked = $derived(editor.timeline.tracks.some((t) => t.duck));
+	$effect(() => {
+		if (master.duck_depth_db != null) lastDepth = master.duck_depth_db;
+	});
 
 	function err(e: unknown) {
 		toast.error(e instanceof Error ? e.message : String(e));
@@ -118,6 +138,37 @@
 		if (master.ceiling_db !== MASTER_DEFAULT_CEILING_DB) void ceilingCommit(MASTER_DEFAULT_CEILING_DB);
 		else audio.restoreMix(editor.timeline);
 	}
+
+	// ---- the duck mode ----------------------------------------------------------
+	const DUCK_NOTE =
+		'Ducking is applied on export: the preview plays a ducked track at its fader. Turn Duck on for the tracks that should dip (the music bed) in the track header or the strip.';
+	/** The mode the select asks for. The select shows what the master holds, so a refusal puts it back. */
+	async function chooseMode(select: HTMLSelectElement) {
+		const wantsGate = select.value === 'gate';
+		if (wantsGate === gate) return;
+		try {
+			await editor.setMasterDuck(wantsGate ? lastDepth : null);
+		} catch (e) {
+			err(e);
+			select.value = gate ? 'gate' : 'compressor';
+		}
+	}
+	const duckStep = (v: number, key: SliderKey) =>
+		key.kind === 'edge' ? (key.to === 0 ? -40 : -1) : nudgeDuck(v, key.dir, key.size);
+	async function duckCommit(v: number) {
+		duckPreview = v;
+		try {
+			await editor.setMasterDuck(v);
+		} catch (e) {
+			err(e);
+		} finally {
+			duckPreview = null;
+		}
+	}
+	function duckReset() {
+		duckPreview = null;
+		if (master.duck_depth_db !== DUCK_DEFAULT_DEPTH_DB) void duckCommit(DUCK_DEFAULT_DEPTH_DB);
+	}
 </script>
 
 <section class="strip" aria-label="Master channel strip">
@@ -156,6 +207,47 @@
 			/>
 		</div>
 		<span class="ceil-val">{ceilingLabel(ceiling)}</span>
+	</div>
+
+	<div class="duck">
+		<div class="duck-head">
+			<span class="cap">Duck</span>
+			{#if gate}<span class="ceil-val">{duckLabel(depth)}</span>{/if}
+		</div>
+		<select
+			class="mode"
+			aria-label="Duck mode"
+			value={gate ? 'gate' : 'compressor'}
+			title="How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). {DUCK_NOTE}"
+			onchange={(e) => void chooseMode(e.currentTarget)}
+		>
+			<option value="compressor">Compressor</option>
+			<option value="gate">Speech gate</option>
+		</select>
+		<div class="depth" class:dim={!gate}>
+			<MixSlider
+				orientation="horizontal"
+				value={depth}
+				toPos={duckToPos}
+				fromPos={posToDuck}
+				step={duckStep}
+				label="Speech gate depth"
+				valueText={duckLabel}
+				disabled={!gate}
+				tip={gate
+					? `Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (Shift ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`
+					: 'Choose Speech gate to set how far a ducked track drops.'}
+				detent={duckToPos(DUCK_DEFAULT_DEPTH_DB)}
+				accent="var(--text-muted)"
+				onpreview={(v) => (duckPreview = v)}
+				oncommit={duckCommit}
+				oncancel={() => (duckPreview = null)}
+				onreset={duckReset}
+			/>
+		</div>
+		{#if !anyDucked}
+			<span class="hint">No track set to Duck</span>
+		{/if}
 	</div>
 
 	<FaderMeter
@@ -297,6 +389,45 @@
 		grid-area: row;
 		display: flex;
 		margin: 0 -4px;
+	}
+	.duck {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.duck-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 4px;
+	}
+	.mode {
+		height: 24px;
+		min-width: 0;
+		padding: 0 4px;
+		cursor: pointer;
+		font-family: var(--font-sans);
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--text-secondary);
+		background: var(--surface-inset);
+		border: var(--line-width) solid var(--border-strong);
+		border-radius: var(--radius-xs);
+	}
+	.mode:hover {
+		color: var(--text-primary);
+	}
+	.depth {
+		display: flex;
+		margin: 0 -4px;
+	}
+	.depth.dim {
+		opacity: 0.6;
+	}
+	.hint {
+		font-size: 10px;
+		line-height: 1.3;
+		color: var(--text-muted);
 	}
 	.scope {
 		display: flex;

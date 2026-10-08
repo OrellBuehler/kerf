@@ -74,7 +74,8 @@ import {
 	ArrowLeftRight,
 	Link2,
 	Unlink2,
-	Menu
+	Menu,
+	Music2
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -156,7 +157,9 @@ export const icons: Record<string, LucideIcon> = {
 	// Linked A/V: the chain on a linked clip, and the broken one for taking it apart.
 	'link': Link2,
 	'unlink': Unlink2,
-	'menu': Menu
+	'menu': Menu,
+	// Music: the song a clip is fitted from.
+	'music': Music2
 };
 
 export type IconName = keyof typeof icons;

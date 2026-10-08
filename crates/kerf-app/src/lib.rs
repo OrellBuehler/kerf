@@ -1033,6 +1033,15 @@ fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Opt
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Choose how ducked tracks dip: `depth_db` (negative dB) for the speech gate, omitted
+/// for the sidechain compressor.
+#[tauri::command(async)]
+fn set_master_duck(state: State<'_, AppState>, depth_db: Option<f64>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_duck(depth_db).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Measure how loud the cut is — the finished mix and each track — in one pass
 /// over the audio the export would render. Whole-file work, so it resolves its
 /// inputs under the project lock and runs ffmpeg with it released. `range` is a
@@ -1736,6 +1745,32 @@ fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance
     let project = state.project();
     project.snap_to_beats(track, tolerance).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Plan "fit music to length" for a music clip without changing anything. `target`
+/// defaults to the picture's length from the clip's start.
+#[tauri::command(async)]
+fn plan_music_fit(state: State<'_, AppState>, clip_id: String, target: Option<f64>) -> CmdResult<kerf_core::model::MusicFit> {
+    let clip = id(&clip_id)?;
+    state.project().plan_music_fit(clip, target).map_err(|e| e.to_string())
+}
+
+/// What fitting music did: the refreshed timeline and the report.
+#[derive(serde::Serialize)]
+struct MusicFitted {
+    timeline: Timeline,
+    report: kerf_core::model::MusicFitReport,
+}
+
+/// Fit a music clip to `target` (default: the picture's length from its start) with
+/// bar-aligned phrase splices, fading out an overrun when `fade_out`.
+#[tauri::command(async)]
+fn fit_music(state: State<'_, AppState>, clip_id: String, target: Option<f64>, fade_out: bool) -> CmdResult<MusicFitted> {
+    let clip = id(&clip_id)?;
+    let project = state.project();
+    let report = project.fit_music(clip, target, fade_out).map_err(|e| e.to_string())?;
+    let timeline = project.timeline().map_err(|e| e.to_string())?;
+    Ok(MusicFitted { timeline, report })
 }
 
 /// What detaching sound from several clips did: the refreshed timeline, how many
@@ -3260,6 +3295,9 @@ pub fn run() {
             set_track_pan,
             set_master_volume,
             set_master_limiter,
+            set_master_duck,
+            plan_music_fit,
+            fit_music,
             get_levels,
             cancel_levels,
             set_delivery_format,

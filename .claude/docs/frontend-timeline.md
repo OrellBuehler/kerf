@@ -6,7 +6,10 @@ px/sec + playhead), with scene markers / silence regions / **beat ticks** (the t
 of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
 snapping and the browser harness's alignment all share, unit-tested with `bun test`)
-mapped from `AssetAnalysis` and
+and **bar ticks** (`barGrid`, the mirror of `Timeline::bar_grid`: the same grid over the
+tempos' `downbeats`, which music with a fitted bar grid carries and speech does not; drawn
+taller and heavier than a beat, in the same `--beat-marker` token, and kept when the beats
+have folded away on zoom-out — a bar is ~4× sparser) mapped from `AssetAnalysis` and
 real audio waveforms (below); the razor tool splits, Delete removes, Shift+Delete
 ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
@@ -20,8 +23,11 @@ rate — `editor.fps`, i.e. `timelineFps`, the first video clip's rate else 30, 
 `export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
 `k / fps` from an integer `k`, so equal frames are equal doubles and nothing drifts over
 a long run of edits), the ghost and the commit use that one value, and a trim derives
-every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / beats
-/ clip edges) still wins, unrounded; frames are *not* a magnet and apply with snapping
+every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / bars and beats
+/ clip edges) still wins, unrounded — and of the grid's marks a **bar wins over a nearer beat**
+(`beats.ts` `gridMagnets`: for each edge of the gesture, the bars in reach, else the beats; a
+span puts either end on it; nearest of the result and the other magnets then wins, so a
+nearer clip edge still beats a bar); frames are *not* a magnet and apply with snapping
 off too. A landing within 1 µs of a neighbour's edge *is* that edge (`welds`):
 `move_clip`'s overlap test is a strict float compare, and an edge computed as
 `start + length / speed` can sit an ULP past its frame — so a tail butted against a
@@ -300,7 +306,17 @@ from the clip envelope (`clipGainAt`) onto the bus, which is the same product, s
 plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
 and a held peak. The meters animate only while playing. Ducking is **export-only**:
 Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
-the preview plays the track at its fader. **Measure** on the master strip calls
+the preview plays the track at its fader. The master strip's **Duck** pair chooses *how*
+tracks flagged Duck dip on export (`MasterBus.duck_depth_db`, `set_master_duck`): a select
+of **Compressor** (the sidechain compressor, no depth) or **Speech gate** (the ducked bus
+drops by exactly the depth while the rest of the mix speaks), and a depth slider
+(`levels.ts` `duckToPos` / `posToDuck` / `nudgeDuck`: -40 on the left to -1 on the right, whole
+dB, double-click for -12; disabled and dimmed under Compressor). Choosing Speech gate returns
+to the last depth the strip held (-12 until one is set); the depth slider commits one edit per
+gesture like the ceiling, and nothing previews (export-only). The harness keeps the key absent
+for the compressor so the master goes back to absent too, like the saved file. A line says
+"No track set to Duck" while no track is flagged, since the mode then changes nothing.
+**Measure** on the master strip calls
 `get_levels` over the whole cut, or over in → out when both marks are set, and
 `levels-view.ts` phrases the result. It is a whole-mix decode under the heavy-job lease
 (minutes on a long cut), so while it runs the button is a **Stop** (`ui.stopMeasure()` →
@@ -311,3 +327,24 @@ synthesizes a voice-like signal per asset at its analysed loudness, so playback,
 meters and faders are drivable under `bun run dev`. The old
 `@xyflow/svelte` `TimelineCanvas`/`clip-node` scaffold was removed (the
 dep is still in `package.json`, now unused).
+
+**Fit to video** (music with a bar grid). `AssetAnalysis.music` (the engine's `MusicAnalysis`: a
+fitted `BeatGrid`, one chroma per bar, repeating 4 / 8-bar phrases) makes a clip on an audio track
+*music*: `music-ui.ts` `fitOffer` is the one gate the clip menu (**Fit to video…**), the Inspector's
+**Music** section (summary `120 BPM · 4/4 · 29 bars`) and the dialog share — shown only with the
+analysis, greyed with the backend's own refusal (locked track, still linked to a picture, not at
+normal speed). Analyses are only loaded for assets something selected or analyzed, so Timeline asks
+`editor.ensureAnalyses` for every asset on an audio track (once each; `load()` forgets) — without it a
+reopened project has no beat / bar ticks and no menu entry until the music is clicked. The dialog
+(`FitMusicDialog`, `ui.fitMusicDialog`, a modal like the voiceover's) calls `planMusicFit` on open and
+whenever its question changes (newest answer wins) and shows target against fitted length, the splices,
+the bars between intro and ending and the remainder in words (`describeRemainder`: exact, short, or over
+— "cut at the target and faded out"); **To the picture** (the engine default: the clip's start to the
+end of the last video clip) or **Custom** seconds; **Fade out at the end** (default on, enabled only when
+the plan runs over). A refusal is shown in the card *and* noticed once; Apply is `editor.fitMusic` — one
+`Fit music to length` revision, the clips that replace the music selected, a toast with Undo. Under
+`bun run dev` the planner is `music-fit.ts`, the faithful mirror of `model/music_fit.rs` (plan walk,
+`music_fit_clips`, and the checks / messages of `Project::fit_music`), replayed by `music-fit.test.ts`;
+`sample-music.ts` is the harness's song (`music.mp3` in the library: 120 BPM, 29 bars, a loop and a
+bridge, so a 20.5 s picture fits exactly), and **`?music=1`** lays it on a track A2 of its own so the
+bar ticks and the menu entry are there at once.

@@ -102,9 +102,15 @@ pub fn analyze_rhythm(path: &Path, sensitivity: f64) -> Result<Rhythm> {
         music::store(path, &fresh);
         fresh
     });
+    // A fitted bar grid is the steadier beat: it replaces the autocorrelation's.
+    let mut tempo = estimate_tempo(&env, frame_rate);
+    if let Some(m) = &music {
+        let confidence = tempo.as_ref().map_or(0.0, |t| t.confidence);
+        tempo = Some(Tempo::from_grid(&m.grid, m.duration, confidence));
+    }
     Ok(Rhythm {
         onsets: pick_onsets(&env, frame_rate, sensitivity),
-        tempo: estimate_tempo(&env, frame_rate),
+        tempo,
         audio_class: classify_samples(&samples),
         music,
     })
@@ -213,7 +219,12 @@ fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
         beats.push(t / frame_rate);
         t += period;
     }
-    Some(Tempo { bpm, beats, confidence })
+    Some(Tempo {
+        bpm,
+        beats,
+        confidence,
+        downbeats: Vec::new(),
+    })
 }
 
 // ---- speech vs. music classification ---------------------------------------

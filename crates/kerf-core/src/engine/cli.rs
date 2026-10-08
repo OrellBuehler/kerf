@@ -3201,8 +3201,46 @@ pub struct ExportOptions {
     /// the output starts at `range.start`. `None` renders the whole timeline.
     pub range: Option<crate::model::TimeRange>,
     /// Normalize the final mix to -14 LUFS (single-pass `loudnorm`, the
-    /// streaming-platform target) before encoding.
+    /// streaming-platform target) before encoding. The same as
+    /// `loudness: Some(LoudnessPreset::Youtube)`.
     pub loudnorm: bool,
+    /// Normalize the final mix to a platform's loudness target. Wins over `loudnorm`.
+    pub loudness: Option<LoudnessPreset>,
+}
+
+/// A delivery's loudness target: integrated loudness and the true-peak ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoudnessPreset {
+    /// YouTube: -14 LUFS, -1 dBTP.
+    Youtube,
+    /// Spotify: -14 LUFS, -1 dBTP.
+    Spotify,
+    /// Apple Music / Podcasts: -16 LUFS, -1 dBTP.
+    Apple,
+    /// EBU R128 broadcast: -23 LUFS, -1 dBTP.
+    Broadcast,
+}
+
+impl LoudnessPreset {
+    pub fn lufs(self) -> f64 {
+        match self {
+            Self::Youtube | Self::Spotify => -14.0,
+            Self::Apple => -16.0,
+            Self::Broadcast => -23.0,
+        }
+    }
+
+    pub fn true_peak_db(self) -> f64 {
+        -1.0
+    }
+
+    /// The `loudnorm` filter that meets this target. Its `TP` is half a decibel under
+    /// the ceiling: single-pass `loudnorm` overshoots its own true-peak target by about
+    /// that much (the reason the plain `loudnorm` option asks for -1.5).
+    fn filter(self) -> String {
+        format!("loudnorm=I={}:TP={}:LRA=11", self.lufs(), self.true_peak_db() - 0.5)
+    }
 }
 
 impl Default for ExportOptions {
@@ -3238,6 +3276,7 @@ impl Default for ExportOptions {
             metadata_title: None,
             range: None,
             loudnorm: false,
+            loudness: None,
         }
     }
 }
@@ -5391,10 +5430,12 @@ fn build_filter_complex_metered(
         // order; loudnorm upsamples to 192 kHz internally, so resample back to
         // the output rate. A neutral master adds nothing, so a graph from before
         // the master existed is unchanged.
-        let mix_tail = if opts.loudnorm {
+        let loudness = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube));
+        let mix_tail = if let Some(target) = loudness {
             format!(
-                "{master},loudnorm=I=-14:TP=-1.5:LRA=11,aresample={sr}",
+                "{master},{norm},aresample={sr}",
                 master = master_filters(&timeline.master),
+                norm = target.filter(),
                 sr = fmt.sample_rate
             )
         } else {
@@ -5427,7 +5468,11 @@ fn build_filter_complex_metered(
                 n = ducked.len(),
             ));
             chains.push("[akey]asplit=2[akmix][akside]".to_string());
-            chains.push("[aduck][akside]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string());
+            match timeline.master.safe_duck_depth_db() {
+                None => chains
+                    .push("[aduck][akside]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[aducked]".to_string()),
+                Some(depth) => chains.extend(duck_gate_chains(depth, layout)),
+            }
             chains.push(format!(
                 "[akmix][aducked]amix=inputs=2:normalize=0:dropout_transition=0{mix_tail}[outa]"
             ));
@@ -7020,6 +7065,37 @@ fn audio_delay(start: f64, sample_rate: u32) -> String {
     } else {
         format!("{}S", (start * sample_rate as f64).round().max(0.0) as i64)
     }
+}
+
+/// The speech-gate duck: `[aduck]` (the ducked bus) times a gain that sits at `depth`
+/// dB while `[akside]` (the rest of the mix) speaks and at unity otherwise, into
+/// `[aducked]`. Pure.
+///
+/// The gain is *made* as a signal: a constant 1.0 run through a `sidechaingate` keyed by
+/// the rest is 1 while it speaks and 0 while it does not (the gate's 300 ms release is
+/// the hangover between words). A gate run on the music itself switches within ~10 ms,
+/// which clicks; so the 0/1 curve is smoothed twice — a fast one-pole (~50 ms rise) and a
+/// slow one (~300 ms) — and the larger of the two taken, which rises with the fast one
+/// and falls with the slow one. Three ffmpeg traps: a sidechain filter **ends with the
+/// shorter input**, so a key that stops before the bed would cut the music off (the key
+/// is padded with `apad`; the compressor path above still has this); a key of digital silence
+/// holds the gate **open** (so the key gets a 1e-6 floor); and `amix` drops a negative
+/// weight (so the gain is `1 - (1 - g) * curve` in one `aeval`, and the bus is
+/// `amultiply`'d by it).
+fn duck_gate_chains(depth_db: f64, layout: &str) -> Vec<String> {
+    let cut = 1.0 - 10f64.powf(depth_db / 20.0);
+    let upmix = if layout == "mono" { "" } else { ",pan=stereo|c0=c0|c1=c0" };
+    vec![
+        "[akside]apad,aformat=channel_layouts=mono,aeval=val(0)+0.000001:c=same[akfloor]".to_string(),
+        "[aduck]asplit=2[aduckdry][aduckdc]".to_string(),
+        "[aduckdc]aeval=1:c=mono[adc]".to_string(),
+        "[adc][akfloor]sidechaingate=threshold=0.03:range=0:ratio=9000:knee=1:attack=10:release=300,asplit=2[agfastin][agslowin]"
+            .to_string(),
+        "[agfastin]lowpass=f=7:p=1,aformat=sample_fmts=fltp:channel_layouts=mono[agfast]".to_string(),
+        "[agslowin]lowpass=f=1.2:p=1,aformat=sample_fmts=fltp:channel_layouts=mono[agslow]".to_string(),
+        format!("[agfast][agslow]amerge=inputs=2,aeval='1-{cut:.6}*max(val(0),val(1))':c=mono{upmix}[again]"),
+        "[aduckdry][again]amultiply[aducked]".to_string(),
+    ]
 }
 
 /// Decompose a tempo change into `atempo` steps each within ffmpeg's supported
@@ -10494,6 +10570,121 @@ mod tests {
     }
 
     #[test]
+    fn a_duck_depth_gates_the_bus_by_exactly_that_much() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let voice = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let music = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut music_track = audio_track(vec![music]);
+        music_track.duck = true;
+        let mut tl = timeline_of(vec![video_track(vec![voice]), music_track]);
+        tl.master.duck_depth_db = Some(-12.0);
+        let g = graph_of(&tl, std::slice::from_ref(&asset));
+        assert!(!g.contains("sidechaincompress"), "{g}");
+        assert!(
+            g.contains("[adc][akfloor]sidechaingate=threshold=0.03:range=0:ratio=9000"),
+            "{g}"
+        );
+        assert!(
+            g.contains("aeval='1-0.748811*max(val(0),val(1))':c=mono,pan=stereo|c0=c0|c1=c0[again]"),
+            "{g}"
+        );
+        assert!(g.contains("[aduckdry][again]amultiply[aducked]"), "{g}");
+        assert!(g.contains("[akmix][aducked]amix=inputs=2"), "{g}");
+        let mono = ExportOptions {
+            audio_channels: Some(1),
+            ..Default::default()
+        };
+        let args = build_export_args(&tl, &[asset], "out.mp4", &mono).unwrap();
+        assert!(args.join(" ").contains(":c=mono[again]"), "a mono delivery needs no upmix");
+    }
+
+    #[test]
+    fn the_duck_depth_is_clamped_and_absent_by_default() {
+        let mut m = crate::model::MasterBus::default();
+        assert_eq!(m.safe_duck_depth_db(), None);
+        assert!(m.is_default());
+        m.duck_depth_db = Some(-90.0);
+        assert_eq!(m.safe_duck_depth_db(), Some(crate::model::DUCK_MIN_DEPTH_DB));
+        m.duck_depth_db = Some(3.0);
+        assert_eq!(m.safe_duck_depth_db(), Some(-1.0));
+        m.duck_depth_db = Some(f64::NAN);
+        assert_eq!(m.safe_duck_depth_db(), Some(crate::model::DUCK_DEFAULT_DEPTH_DB));
+    }
+
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn the_speech_gate_ducks_by_its_depth_and_recovers() {
+        use crate::engine::{decode_audio, write_wav, AudioBuffer};
+        let dir = std::env::temp_dir().join(format!("kerf-duck-gate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sr = 48_000u32;
+        let tone = |hz: f64, secs: f64| -> Vec<f32> {
+            (0..(secs * sr as f64) as usize)
+                .map(|n| (0.2 * (2.0 * std::f64::consts::PI * hz * n as f64 / sr as f64).sin()) as f32)
+                .collect()
+        };
+        let wav = |name: &str, samples: Vec<f32>| {
+            let path = dir.join(name);
+            write_wav(&path, &AudioBuffer::new(sr, 1, samples)).unwrap();
+            let mut a = test_asset(vec![audio_stream(sr, 1)]);
+            a.path = path.to_string_lossy().into_owned();
+            a.duration = 6.0;
+            a
+        };
+        let music = wav("music.wav", tone(220.0, 6.0));
+        let mut voice = wav("voice.wav", tone(1000.0, 2.0));
+        voice.duration = 2.0;
+        let mut bed = audio_track(vec![make_clip(music.id, 0.0, 6.0, 0.0)]);
+        bed.duck = true;
+        let mut tl = timeline_of(vec![audio_track(vec![make_clip(voice.id, 0.0, 2.0, 2.0)]), bed]);
+        tl.master.duck_depth_db = Some(-12.0);
+
+        for channels in [1u16, 2] {
+            let out = dir.join(format!("mix-{channels}.wav"));
+            let opts = ExportOptions {
+                container: Container::Wav,
+                video_codec: None,
+                audio_codec: Some("pcm_s16le".into()),
+                audio_sample_rate: Some(sr),
+                audio_channels: Some(channels),
+                ..Default::default()
+            };
+            render_with(&tl, &[voice.clone(), music.clone()], &out, &opts).unwrap();
+            // Probe the written channel count by decoding as stereo only when it is.
+            let mix = decode_audio(&out, sr, channels).unwrap();
+            assert_eq!(mix.frames(), 6 * sr as usize, "{channels} ch: the bed plays to its end");
+            for ch in 0..channels as usize {
+                let samples: Vec<f32> = mix.samples.iter().skip(ch).step_by(channels as usize).copied().collect();
+                // The 220 Hz bed's amplitude over a window, by correlating with it.
+                let level = |from: f64, to: f64| -> f64 {
+                    let (a, b) = ((from * sr as f64) as usize, (to * sr as f64) as usize);
+                    let (mut re, mut im) = (0.0, 0.0);
+                    for n in a..b {
+                        let w = 2.0 * std::f64::consts::PI * 220.0 * n as f64 / sr as f64;
+                        re += samples[n] as f64 * w.cos();
+                        im += samples[n] as f64 * w.sin();
+                    }
+                    2.0 * (re * re + im * im).sqrt() / (b - a) as f64
+                };
+                let db = |x: f64| 20.0 * x.log10();
+                let (before, during, after) = (level(0.5, 1.5), level(2.5, 3.5), level(5.0, 5.9));
+                assert!(
+                    (db(during / before) - -12.0).abs() < 0.5,
+                    "{channels} ch, ch {ch}: ducked by {} dB",
+                    db(during / before)
+                );
+                assert!(
+                    db(after / before).abs() < 0.5,
+                    "{channels} ch, ch {ch}: recovered to {} dB",
+                    db(after / before)
+                );
+                assert!(before > 0.1, "{channels} ch, ch {ch}: the bed is there ({before})");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn duck_flag_without_other_audio_keeps_the_flat_mix() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let music = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -10502,6 +10693,22 @@ mod tests {
         let g = graph_of(&timeline_of(vec![t]), &[asset]);
         assert!(!g.contains("sidechaincompress"), "{g}");
         assert!(g.contains("amix=inputs=1"), "{g}");
+    }
+
+    #[test]
+    fn a_loudness_preset_sets_the_target_and_youtube_is_the_old_loudnorm() {
+        let args = |loudnorm, loudness| {
+            let opts = ExportOptions {
+                loudnorm,
+                loudness,
+                ..Default::default()
+            };
+            args_of(&opts).join(" ")
+        };
+        assert_eq!(args(false, Some(LoudnessPreset::Youtube)), args(true, None));
+        assert!(args(false, Some(LoudnessPreset::Apple)).contains("loudnorm=I=-16:TP=-1.5:LRA=11,aresample="));
+        assert!(args(true, Some(LoudnessPreset::Broadcast)).contains("loudnorm=I=-23:TP=-1.5:LRA=11"));
+        assert!(!args(false, None).contains("loudnorm"));
     }
 
     #[test]
@@ -10647,6 +10854,7 @@ mod tests {
     #[test]
     fn the_master_runs_after_the_sum_and_before_loudnorm() {
         let (tl, assets) = master_cut(MasterBus {
+            duck_depth_db: None,
             volume: 0.8,
             limiter: true,
             ceiling_db: -3.0,
@@ -10696,6 +10904,7 @@ mod tests {
         // `render_variants` builds every file from `for_delivery`: the same mix at
         // every frame, only the picture changes.
         let (tl, assets) = master_cut(MasterBus {
+            duck_depth_db: None,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -10708,6 +10917,7 @@ mod tests {
     #[test]
     fn the_playback_stream_has_no_sound_for_the_master_to_touch() {
         let (tl, assets) = master_cut(MasterBus {
+            duck_depth_db: None,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -10721,6 +10931,7 @@ mod tests {
     #[test]
     fn master_filters_are_safe_for_a_file_that_never_went_through_the_op() {
         let bus = |volume, ceiling_db| MasterBus {
+            duck_depth_db: None,
             volume,
             limiter: true,
             ceiling_db,
