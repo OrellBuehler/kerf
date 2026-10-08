@@ -264,6 +264,17 @@
 		);
 	}
 
+	/** Window › Reset all workspaces throws away every arrangement made, so it asks first
+	 *  — unless there is none to lose, when it only rebuilds the one on screen. */
+	async function resetAllWorkspaces() {
+		const w = settings.workspaces;
+		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
+		if (stored && !(await confirmAction('Reset every workspace to its default arrangement? The arrangements you made are lost.', 'Reset all workspaces'))) {
+			return;
+		}
+		workspace.resetAll();
+	}
+
 	function onAbout() {
 		toast.info(`Kerf ${updater.version || ''}`.trim(), {
 			description: 'Non-destructive, AI-assisted video editing. PolyForm Noncommercial 1.0.0 — github.com/OrellBuehler/kerf'
@@ -478,7 +489,7 @@
 		'workspace.motion': () => workspace.switchTo('motion'),
 		'workspace.deliver': () => workspace.switchTo('deliver'),
 		'window.resetWorkspace': () => workspace.reset(),
-		'window.resetAllWorkspaces': () => workspace.resetAll(),
+		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
 
 		'app.keyboard': () => settings.openSection('keyboard'),
 		'app.checkUpdate': () => updater.open(),

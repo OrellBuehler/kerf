@@ -1,4 +1,4 @@
-// The menu bar's content: File, Edit, View, Window and Help, as data.
+// The menu bar's content: File, Edit, View, Playback, Window and Help, as data.
 //
 // Every entry is one of three things. An *action* names an id in the keymap
 // registry (`keymap.ts`) — the same id the page's key handler runs — so the menu
@@ -15,7 +15,7 @@ import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
 import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
 
-export type MenuId = 'file' | 'edit' | 'view' | 'window' | 'help' | 'menu';
+export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' | 'menu';
 
 /** What a menu choice that is not a registry action does. */
 export type MenuCommand =
@@ -63,6 +63,8 @@ export interface MenuState {
 	/** The project is cut for a delivery frame (the safe-area guides need one). */
 	hasFrame: boolean;
 	tool: string;
+	/** The cut is playing (the transport's play / pause button shows the other). */
+	playing: boolean;
 	/** The id of the delivery preset the project is cut for. */
 	delivery: string;
 	/** The height every track shares, or null when they differ. */
@@ -215,6 +217,37 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		]
 	};
 
+	// The transport lives in the preview panel, and a panel can be closed: the menu
+	// keeps all of it — and the marks and markers its keys set — reachable.
+	const playback: MenuDef = {
+		id: 'playback',
+		label: 'Playback',
+		items: [
+			act('playback.toggle', { icon: s.playing ? 'pause' : 'play', ...clips }),
+			sep,
+			act('playback.toStart', { icon: 'skip-back' }),
+			act('playback.toEnd', { icon: 'skip-forward' }),
+			sep,
+			act('playback.stepBack'),
+			act('playback.stepForward'),
+			act('playback.jumpBack'),
+			act('playback.jumpForward'),
+			sep,
+			act('playback.shuttleBack', { ...clips }),
+			act('playback.pause'),
+			act('playback.shuttleForward', { ...clips }),
+			sep,
+			act('range.markIn'),
+			act('range.markOut'),
+			act('range.clearIn'),
+			act('range.clearOut'),
+			sep,
+			act('marker.add', { icon: 'bookmark' }),
+			act('marker.prev'),
+			act('marker.next')
+		]
+	};
+
 	const label = workspaceSpec(s.workspace).label;
 	const win: MenuDef = {
 		id: 'window',
@@ -249,7 +282,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		]
 	};
 
-	return [file, edit, view, win, help];
+	return [file, edit, view, playback, win, help];
 }
 
 /** The text of an action entry: its own label or the registry's. */
@@ -263,7 +296,7 @@ export function flatten(items: readonly MenuEntry[]): MenuEntry[] {
 	return items.flatMap((e) => (e.kind === 'submenu' ? [e, ...flatten(e.items)] : [e]));
 }
 
-/** What a menu bar too narrow for five menus shows instead: one "Menu" whose
+/** What a menu bar too narrow for its menus shows instead: one "Menu" whose
  *  entries are the menus themselves, each a submenu. */
 export function collapseMenus(menus: readonly MenuDef[]): MenuDef[] {
 	return [{ id: 'menu', label: 'Menu', items: menus.map((m): MenuEntry => ({ kind: 'submenu', label: m.label, items: m.items })) }];

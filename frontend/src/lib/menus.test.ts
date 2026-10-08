@@ -19,6 +19,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	safeAreas: false,
 	hasFrame: true,
 	tool: 'pointer',
+	playing: false,
 	delivery: 'source',
 	allHeight: 'medium',
 	workspace: 'edit',
@@ -34,10 +35,10 @@ const find = (items: readonly MenuEntry[], label: string) =>
 	flatten(items).find((e) => e.kind !== 'separator' && entryLabel(e) === label) as Exclude<MenuEntry, { kind: 'separator' }>;
 
 describe('the menu bar', () => {
-	test('is File, Edit, View, Window, Help — in that order, each with its own name', () => {
+	test('is File, Edit, View, Playback, Window, Help — in that order, each with its own name', () => {
 		const menus = buildMenus(state());
-		expect(menus.map((m) => m.label)).toEqual(['File', 'Edit', 'View', 'Window', 'Help']);
-		expect(new Set(menus.map((m) => m.id)).size).toBe(5);
+		expect(menus.map((m) => m.label)).toEqual(['File', 'Edit', 'View', 'Playback', 'Window', 'Help']);
+		expect(new Set(menus.map((m) => m.id)).size).toBe(6);
 	});
 
 	test('every action a menu runs is in the keymap registry, so its key is the user’s', () => {
@@ -208,6 +209,48 @@ describe('View', () => {
 	});
 });
 
+describe('Playback', () => {
+	const ids = (over: Partial<MenuState> = {}) =>
+		flatten(menu('playback', over).items).flatMap((e) => (e.kind === 'action' ? [e.id] : []));
+
+	test('keeps the whole transport reachable when the preview panel is closed', () => {
+		// Play / pause, to start / end, frame and second steps, J / K / L, marks, markers.
+		expect(ids()).toEqual([
+			'playback.toggle',
+			'playback.toStart',
+			'playback.toEnd',
+			'playback.stepBack',
+			'playback.stepForward',
+			'playback.jumpBack',
+			'playback.jumpForward',
+			'playback.shuttleBack',
+			'playback.pause',
+			'playback.shuttleForward',
+			'range.markIn',
+			'range.markOut',
+			'range.clearIn',
+			'range.clearOut',
+			'marker.add',
+			'marker.prev',
+			'marker.next'
+		]);
+	});
+
+	test('every playback, range and marker action in the registry has an entry', () => {
+		const have = new Set(ids());
+		for (const a of ACTIONS.filter((a) => /^(playback|range|marker)\./.test(a.id))) expect(have.has(a.id as never), a.id).toBe(true);
+	});
+
+	test('play shows the icon of what it will do, and needs a cut', () => {
+		const icon = (playing: boolean) => (find(menu('playback', { playing }).items, 'Play / pause') as { icon?: string }).icon;
+		expect(icon(false)).toBe('play');
+		expect(icon(true)).toBe('pause');
+		const empty = find(menu('playback', { hasClips: false }).items, 'Play / pause');
+		expect('disabled' in empty && empty.disabled).toBe(true);
+		expect('reason' in empty && empty.reason).toBeTruthy();
+	});
+});
+
 describe('Window', () => {
 	test('every panel is a tick that follows whether it is open', () => {
 		const m = menu('window', { openPanels: ['preview', 'timeline', 'mixer'] });
@@ -237,13 +280,13 @@ describe('Help', () => {
 	});
 });
 
-describe('a bar too narrow for five titles', () => {
-	test('collapses to one "Menu" whose entries are the five menus', () => {
+describe('a bar too narrow for its titles', () => {
+	test('collapses to one "Menu" whose entries are the menus', () => {
 		const full = buildMenus(state());
 		const compact = collapseMenus(full);
 		expect(compact).toHaveLength(1);
 		expect(compact[0].label).toBe('Menu');
-		expect(labels(compact[0].items)).toEqual(['File', 'Edit', 'View', 'Window', 'Help']);
+		expect(labels(compact[0].items)).toEqual(['File', 'Edit', 'View', 'Playback', 'Window', 'Help']);
 		const subs = compact[0].items as Extract<MenuEntry, { kind: 'submenu' }>[];
 		expect(subs.map((s) => s.items)).toEqual(full.map((m) => m.items));
 	});
@@ -268,7 +311,7 @@ describe('where the old toolbar went', () => {
 		expect(timeline).toContain('pickDelivery');
 	});
 
-	test('and each of them is also a menu entry, bar the transport that the keys and the preview carry', () => {
+	test('and each of them is also a menu entry', () => {
 		const ids = new Set(
 			buildMenus(state()).flatMap((m) => flatten(m.items).flatMap((e) => (e.kind === 'action' ? [e.id] : [])))
 		);
@@ -286,7 +329,10 @@ describe('where the old toolbar went', () => {
 			'tool.slide',
 			'tool.rippleMode',
 			'tool.snap',
-			'window.resetWorkspace'
+			'window.resetWorkspace',
+			'playback.toggle',
+			'playback.toStart',
+			'playback.toEnd'
 		]) {
 			expect(ids.has(id as never), id).toBe(true);
 		}

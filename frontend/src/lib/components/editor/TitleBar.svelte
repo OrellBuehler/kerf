@@ -13,9 +13,10 @@
 
 	let { onAction, onCommand }: { onAction: (id: ActionId) => void; onCommand: (command: MenuCommand) => void } = $props();
 
-	// The five titles need about this much beside the logo; narrower, they become one
-	// "Menu" button (see `MenuBar`).
-	const MENU_FULL_PX = 250;
+	// The six titles need about this much of the left cell beside the logo; narrower,
+	// they become one "Menu" button (see `MenuBar`). It is the width of that cell, which
+	// the workspace tabs and the right cluster take their share around — not the window.
+	const MENU_FULL_PX = 320;
 	let leftWidth = $state(0);
 	const compact = $derived(leftWidth > 0 && leftWidth < MENU_FULL_PX);
 

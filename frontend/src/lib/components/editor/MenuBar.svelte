@@ -11,8 +11,8 @@
 	//     → opens a submenu, ← closes it, Enter / Space run, Esc closes one level,
 	//     a letter jumps to the next entry that starts with it;
 	//   - Alt pressed and released on its own, or F10, focuses the bar (not when F10
-	//     is bound to something, not while a field is being typed in, and not when
-	//     the Alt was part of an Alt-drag).
+	//     is bound to something, not while a field is being typed in, and never for
+	//     an Alt that was part of a drag, a click or a window switch: `alt-tap.ts`).
 	//
 	// An entry runs the action it names (`onAction`) — the page's own key table, so
 	// a menu and its shortcut are one piece of code — or a command (`onCommand`).
@@ -40,6 +40,7 @@
 		type MenuState
 	} from '$lib/menus';
 	import type { ActionId } from '$lib/keymap';
+	import { createAltTap } from '$lib/alt-tap';
 
 	let {
 		compact = false,
@@ -63,6 +64,7 @@
 		safeAreas: settings.safeAreas,
 		hasFrame: !!editor.timeline.format,
 		tool: ui.tool,
+		playing: ui.playing,
 		delivery: presetFor(editor.timeline.format).id,
 		allHeight: uniformPreset(
 			ui.heights,
@@ -120,8 +122,7 @@
 	}
 
 	function closeAll(restore = false) {
-		if (hoverTimer) clearTimeout(hoverTimer);
-		hoverTimer = null;
+		clearHover();
 		hoverOpened = null;
 		const was = open.length > 0 || bar?.contains(document.activeElement);
 		open = [];
@@ -143,7 +144,14 @@
 		else if (!bar?.contains(a)) returnTo = null;
 	}
 
+	function clearHover() {
+		if (hoverTimer) clearTimeout(hoverTimer);
+		hoverTimer = null;
+	}
+
 	function openTop(i: number, focusFirst = false) {
+		// A hover timer still counting would reopen a submenu of the menu left behind.
+		clearHover();
 		open = [i];
 		active = i;
 		if (focusFirst) {
@@ -174,10 +182,16 @@
 			return;
 		}
 		if (isOpen([i]) && open.length === 1) closeAll(true);
-		else openTop(i);
+		else {
+			openTop(i);
+			// Some webviews (WKWebView) do not focus a button a click lands on; the bar's
+			// keys, Esc among them, need focus to be in it.
+			el([i])?.focus();
+		}
 	}
 
 	function topEnter(i: number) {
+		clearHover();
 		hot = key([i]);
 		// Once one menu is open the others follow the pointer; until then a title is
 		// only a title.
@@ -189,7 +203,7 @@
 
 	function entryEnter(path: number[], e: MenuEntry) {
 		hot = key(path);
-		if (hoverTimer) clearTimeout(hoverTimer);
+		clearHover();
 		const parent = path.slice(0, -1);
 		const sub = e.kind === 'submenu';
 		// Land on an entry: its own submenu opens, anything deeper than its menu
@@ -208,6 +222,7 @@
 	}
 
 	function onWindowPointerDown(ev: PointerEvent) {
+		altTap.pointerDown();
 		if (!bar || !(ev.target instanceof Node)) return;
 		if (bar.contains(ev.target)) {
 			noteReturn();
@@ -232,9 +247,10 @@
 	const typeahead = (path: readonly number[], at: number, ch: string) => typeaheadIn(entriesAt(path), at, ch);
 
 	function onBarKey(e: KeyboardEvent) {
-		// A chord is not the menu's: close it and let the page have the key.
+		// A chord is not the menu's: close it, give focus back to where it was (not to
+		// the page's body), and let the page have the key.
 		if (e.ctrlKey || e.metaKey || e.altKey) {
-			if (e.key !== 'Alt') closeAll();
+			if (e.key !== 'Alt') closeAll(true);
 			return;
 		}
 		const path = pathOf(e.target);
@@ -339,7 +355,7 @@
 
 	// ---- reaching the bar from anywhere -------------------------------------------
 
-	let altArmed = false;
+	const altTap = createAltTap();
 
 	/** Alt / F10: the bar's first title takes focus, as in every menu bar. */
 	function focusBar() {
@@ -353,11 +369,14 @@
 	}
 
 	function onWindowKeyDown(e: KeyboardEvent) {
-		if (e.key === 'Alt') {
-			altArmed = !e.repeat && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.getModifierState?.('AltGraph');
-			return;
-		}
-		altArmed = false;
+		altTap.press({
+			key: e.key,
+			repeat: e.repeat,
+			ctrlKey: e.ctrlKey,
+			metaKey: e.metaKey,
+			shiftKey: e.shiftKey,
+			altGraph: !!e.getModifierState?.('AltGraph')
+		});
 		if (e.key === 'F10' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && !e.defaultPrevented) {
 			// Not if the user has put F10 to work.
 			if (settings.actionFor(e) !== null || editable(e.target)) return;
@@ -367,17 +386,9 @@
 	}
 
 	function onWindowKeyUp(e: KeyboardEvent) {
-		if (e.key !== 'Alt') return;
-		const armed = altArmed;
-		altArmed = false;
-		if (!armed || editable(e.target) || e.defaultPrevented) return;
+		if (!altTap.release(e.key) || editable(e.target) || e.defaultPrevented) return;
 		e.preventDefault();
 		focusBar();
-	}
-
-	// An Alt-drag, an Alt-click or an Alt-scroll is not "Alt on its own".
-	function disarmAlt() {
-		altArmed = false;
 	}
 
 	// ---- housekeeping --------------------------------------------------------------
@@ -438,11 +449,16 @@
 
 <svelte:window
 	onpointerdowncapture={onWindowPointerDown}
+	onpointerupcapture={() => altTap.pointerUp()}
+	onpointercancelcapture={() => altTap.pointerUp()}
+	onpointermovecapture={(e) => altTap.pointerMove(e.buttons)}
 	onkeydown={onWindowKeyDown}
 	onkeyup={onWindowKeyUp}
-	onpointerdown={disarmAlt}
-	onwheel={disarmAlt}
-	onblur={() => closeAll()}
+	onwheel={() => altTap.wheel()}
+	onblur={() => {
+		altTap.blur();
+		closeAll();
+	}}
 	onresize={() => closeAll()}
 />
 
