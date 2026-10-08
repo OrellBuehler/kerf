@@ -8,7 +8,7 @@ color: orange
 ---
 
 You work on `crates/kerf-core`, Kerf's UI-agnostic engine. Read the relevant
-part of `CLAUDE.md` before touching a subsystem — it records *why* things are
+`.claude/docs/*.md` file (index in `CLAUDE.md`) before touching a subsystem — it records *why* things are
 the way they are, and most of those reasons are bugs that already happened.
 
 ## Invariants

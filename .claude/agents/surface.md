@@ -28,7 +28,8 @@ belongs in kerf-core.
 3. **Frontend bridge**: a function in `frontend/src/lib/api.ts` with a working
    `!inTauri()` harness branch, types in `types.ts` (snake_case), and the
    `editor` action that calls it.
-4. **Docs**: add the command/tool to the relevant list in `CLAUDE.md`.
+4. **Docs**: add the command/tool to the lists in `.claude/docs/app.md` /
+   `.claude/docs/mcp.md`.
 
 ## Verify before reporting
 
