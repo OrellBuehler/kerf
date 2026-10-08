@@ -114,16 +114,19 @@ struct Clip {
     probed: Probed,
 }
 
+/// 120 frames at 30 fps, each carrying its own number (see [`number`]).
+fn numbered_source() -> String {
+    format!("nullsrc=s={W}x{H}:r=30:d=4,format=yuv420p,geq=lum='if(mod(floor(N/pow(2,floor(X/8))),2),235,16)':cb=128:cr=128")
+}
+
 /// Lossless (FFV1 in matroska) numbered frames, 120 of them: `cfr` at 30 fps, `vfr` with every
-/// third gap three frames long, and `repeated-pts` with two pairs of frames sharing a timestamp.
+/// third gap three frames long, and `repeated-pts` with frames sharing a timestamp.
 fn clips() -> &'static [(&'static str, Clip)] {
     static C: OnceLock<Vec<(&'static str, Clip)>> = OnceLock::new();
     C.get_or_init(|| {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cursor-media");
         std::fs::create_dir_all(&dir).unwrap();
-        let numbered = format!(
-            "nullsrc=s={W}x{H}:r=30:d=4,format=yuv420p,geq=lum='if(mod(floor(N/pow(2,floor(X/8))),2),235,16)':cb=128:cr=128"
-        );
+        let numbered = numbered_source();
         let make = |name: &'static str, extra: &[&str]| -> (&'static str, Clip) {
             let path = dir.join(format!("{name}.mkv"));
             let mut args = vec!["-f", "lavfi", "-i", numbered.as_str()];
@@ -138,7 +141,12 @@ fn clips() -> &'static [(&'static str, Clip)] {
             // Every third gap three frames long, on the 1/30 grid.
             make(
                 "vfr",
-                &["-vf", "setpts='(N+2*floor(N/3))/(30*TB)'", "-fps_mode", "passthrough"],
+                &[
+                    "-vf",
+                    "setpts='(N+2*floor(N/3))/(30*TB)'",
+                    kerf_core::fps_mode_flag(),
+                    "passthrough",
+                ],
             ),
             // The same spacing in milliseconds, which the encoder's 1/30 time base rounds into
             // repeated timestamps (frames 31 and 32 both at 1667): a file the pick takes as it is.
@@ -147,11 +155,51 @@ fn clips() -> &'static [(&'static str, Clip)] {
                 &[
                     "-vf",
                     "settb=1/1000,setpts='(N+2*floor(N/3))*33/TB/1000'",
-                    "-fps_mode",
+                    kerf_core::fps_mode_flag(),
                     "passthrough",
                 ],
             ),
         ]
+    })
+}
+
+/// The numbered frames in an mp4 on a one-**microsecond** time base whose timestamps are the
+/// instants truncated (`floor(N * 10^6 / 30)`: frame 2 at 66666, where 2/30 s is 66666.67 us), so
+/// a seek spelled to the nearest microsecond (66667) lands a frame after the one FFmpeg
+/// reads `-ss 0.06666666666666667` (truncated to 66666) on.
+fn microsecond_clip() -> &'static Clip {
+    static C: OnceLock<Clip> = OnceLock::new();
+    C.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cursor-media");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("microseconds.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            numbered_source().as_str(),
+            "-vf",
+            "settb=1/1000000,setpts='floor(N*1000000/30)'",
+            kerf_core::fps_mode_flag(),
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-g",
+            "1",
+            "-bf",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-enc_time_base",
+            "1/1000000",
+            "-video_track_timescale",
+            "1000000",
+            path.to_str().unwrap(),
+        ]);
+        let probed = probe(&path);
+        Clip { path, probed }
     })
 }
 
@@ -186,6 +234,9 @@ fn a_cursor_shows_the_frame_the_export_picks_at_every_output_frame() {
     for (name, clip) in clips() {
         let all = clip.probed.frames();
         assert_eq!(all.pts.len(), 120, "{name}: the numbered source");
+        // The premise of the clip: it does repeat a timestamp, and the others do not.
+        let repeats = all.pts.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(repeats > 0, *name == "repeated-pts", "{name}: {repeats} repeated timestamps");
         for &speed in &[0.5, 1.0, 1.5, 2.0, 4.0] {
             for reverse in [false, true] {
                 // A window off the grid, one from the start, one to the end of the file.
@@ -202,12 +253,10 @@ fn a_cursor_shows_the_frame_the_export_picks_at_every_output_frame() {
                         drop_first: false,
                         image: None,
                     };
-                    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), pick.seek().unwrap(), config())
+                    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(pick), config())
                         .unwrap_or_else(|e| panic!("{name}: open: {e}"));
                     let ks = output_frames(window, start, speed, fps);
-                    let got = picks_through(&mut cursor, pick, ks.clone())
-                        .unwrap_or_else(|e| panic!("{name} speed {speed} reverse {reverse} {window:?}: {e}"));
-                    for (k, frame) in ks.zip(got) {
+                    picks_through(&mut cursor, pick, ks, |k, frame| {
                         let expected = Pick::Fps(FpsPick { frame: k, ..pick }).select(&all);
                         let shown = frame.as_deref().map(number);
                         assert_eq!(
@@ -218,7 +267,8 @@ fn a_cursor_shows_the_frame_the_export_picks_at_every_output_frame() {
                             fps.den
                         );
                         frames_checked += 1;
-                    }
+                    })
+                    .unwrap_or_else(|e| panic!("{name} speed {speed} reverse {reverse} {window:?}: {e}"));
                     // A forward clip never holds more than a frame or two.
                     if !reverse {
                         assert!(cursor.frames_held() <= 2, "{name}: {} frames held", cursor.frames_held());
@@ -237,15 +287,15 @@ fn a_still_pick_through_a_cursor_is_the_seeked_frame_and_before_at_the_start_is_
     let (_, clip) = &clips()[0];
     let all = clip.probed.frames();
     for t in [0.0, 0.5, 1.0 + 1.0 / 60.0, 3.98] {
-        let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), t, config()).expect("open");
+        let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::AtOrAfter(t), config()).expect("open");
         let got = cursor.pick(&Pick::AtOrAfter(t)).expect("a pick").as_deref().map(number);
         assert_eq!(got, Pick::AtOrAfter(t).select(&all).map(|i| i as u32), "t = {t}");
     }
     // Before the first frame of a run from the start: nothing, as over the whole file.
-    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), 0.0, config()).expect("open");
+    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Before(0.0), config()).expect("open");
     assert_eq!(cursor.pick(&Pick::Before(0.0)).expect("a pick"), None);
     // Before the first frame of a run that began later: only an earlier run has it.
-    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), 1.0, config()).expect("open");
+    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Before(1.0), config()).expect("open");
     assert!(cursor.pick(&Pick::Before(1.0)).is_err());
 }
 
@@ -268,13 +318,13 @@ fn a_reversed_window_over_the_cap_is_refused_and_picks_go_forward_only() {
         window_cap_bytes: 10 * (W * H * 3 / 2) as usize,
         ..config()
     };
-    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), 0.0, small).expect("open");
+    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(pick), small).expect("open");
     let err = cursor.pick(&Pick::Fps(pick)).expect_err("over the cap");
     assert!(matches!(err, kerf_gpu::GpuError::Unsupported(_)), "{err}");
 
     // Forward: frame 40 then frame 10 — the second's pixels were dropped.
     let fwd = FpsPick { reverse: false, ..pick };
-    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), 0.0, config()).expect("open");
+    let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(fwd), config()).expect("open");
     assert_eq!(
         cursor
             .pick(&Pick::Fps(FpsPick { frame: 40, ..fwd }))
@@ -293,4 +343,59 @@ fn a_reversed_window_over_the_cap_is_refused_and_picks_go_forward_only() {
             .map(number),
         Some(40)
     );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe"]
+fn a_window_starting_between_two_microseconds_is_seeked_as_the_export_seeks() {
+    let clip = microsecond_clip();
+    let all = clip.probed.frames();
+    assert_eq!(
+        all.time_base,
+        Rational::new(1, 1_000_000).unwrap(),
+        "the premise: a microsecond time base"
+    );
+    assert_eq!(all.pts.len(), 120);
+    assert_eq!(
+        &all.pts[1..4],
+        &[33_333, 66_666, 100_000],
+        "the premise: truncated timestamps"
+    );
+    let fps = Rational::new(30, 1).unwrap();
+    let mut rounded_up_past_a_frame = 0;
+    let mut frames_checked = 0;
+    for k in 1..60usize {
+        let start = k as f64 / 30.0;
+        // The still's spelling would start the run after the frame the export keeps.
+        if (start * 1e6).round() as i64 > all.pts[k] {
+            rounded_up_past_a_frame += 1;
+        }
+        let pick = FpsPick {
+            speed: 1.0,
+            reverse: false,
+            window: (start, start + 1.0),
+            start: 0.0,
+            frame: 0,
+            fps,
+            drop_first: false,
+            image: None,
+        };
+        let mut cursor = FrameCursor::open(clip.path.to_str().unwrap(), (W, H), &Pick::Fps(pick), config())
+            .unwrap_or_else(|e| panic!("open at {start}: {e}"));
+        picks_through(&mut cursor, pick, 0..33, |frame, shown| {
+            let expected = Pick::Fps(FpsPick { frame, ..pick }).select(&all);
+            assert_eq!(
+                shown.as_deref().map(number),
+                expected.map(|i| i as u32),
+                "window start {k}/30 s, output frame {frame}"
+            );
+            frames_checked += 1;
+        })
+        .unwrap_or_else(|e| panic!("window start {k}/30 s: {e}"));
+    }
+    assert!(
+        rounded_up_past_a_frame > 10,
+        "only {rounded_up_past_a_frame} starts distinguish the spellings"
+    );
+    eprintln!("{frames_checked} output frames, {rounded_up_past_a_frame} starts the nearest-microsecond spelling gets wrong");
 }

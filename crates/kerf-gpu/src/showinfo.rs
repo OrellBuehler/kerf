@@ -34,7 +34,10 @@
 //! * a run's pts must be **strictly ascending**: a repeated or earlier pts is an error. The frame
 //!   cache keys a frame by its pts and gives it coverage up to it, so a duplicate would be served
 //!   for a different picture, and a decoder still learning its reorder depth after a mid-GOP
-//!   seek (frames out of order) would let a frame claim ticks it does not own;
+//!   seek (frames out of order) would let a frame claim ticks it does not own. A parser made with
+//!   [`ShowinfoParser::allowing_repeats`] (a `FrameCursor`'s, which has no cache: `Pick::select`
+//!   takes a file's repeated timestamps as they come) accepts an **equal** pts and still rejects
+//!   an earlier one;
 //! * `duration:` is read too. Its last value is the **last frame's own duration**, which
 //!   `SourceFrames::last_duration` needs to know where a window to the end of the file ends
 //!   (`0`, or absent, is unknown). Under `-copyts -start_at_zero` the pts are already relative to
@@ -73,7 +76,8 @@ pub enum ShowinfoError {
     TimeBaseChanged { from: Rational, to: Rational },
     /// Frames are numbered consecutively from 0; this one is not the next.
     OutOfSequence { expected: u64, got: u64 },
-    /// A run's timestamps strictly ascend; this one is not above the one before.
+    /// A run's timestamps strictly ascend (or, for a parser that allows repeats, do not
+    /// descend); this one is not above (or below) the one before.
     OutOfOrder { prev: i64, got: i64 },
     /// A frame line whose numbers do not fit.
     Unreadable(String),
@@ -93,6 +97,7 @@ impl std::fmt::Display for ShowinfoError {
                 )
             }
             Self::OutOfSequence { expected, got } => write!(f, "expected frame {expected}, got {got}"),
+            Self::OutOfOrder { prev, got } if got < prev => write!(f, "timestamp {got} comes before {prev}"),
             Self::OutOfOrder { prev, got } => write!(f, "timestamp {got} does not come after {prev}"),
             Self::Unreadable(line) => write!(f, "unreadable frame line {line:?}"),
         }
@@ -107,11 +112,23 @@ pub struct ShowinfoParser {
     time_base: Option<Rational>,
     next: u64,
     last_pts: Option<i64>,
+    repeats: bool,
 }
 
 impl ShowinfoParser {
+    /// The strict parser: timestamps must strictly ascend (the frame cache's).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A parser that accepts a pts equal to the one before (a file whose time base rounds two
+    /// frames onto one tick) and still rejects an earlier one. For a reader that keeps no
+    /// pts-keyed cache.
+    pub fn allowing_repeats() -> Self {
+        Self {
+            repeats: true,
+            ..Self::default()
+        }
     }
 
     /// The time base in force, once a `config in time_base` line has been seen.
@@ -163,7 +180,7 @@ impl ShowinfoParser {
                 got: n,
             });
         }
-        if let Some(prev) = self.last_pts.filter(|&prev| pts <= prev) {
+        if let Some(prev) = self.last_pts.filter(|&prev| pts < prev || (pts == prev && !self.repeats)) {
             return Err(ShowinfoError::OutOfOrder { prev, got: pts });
         }
         self.last_pts = Some(pts);
@@ -458,7 +475,10 @@ mod tests {
     }
 
     fn config_and_frames(pts: &[i64]) -> Vec<Result<Option<ShowFrame>, ShowinfoError>> {
-        let mut p = ShowinfoParser::new();
+        config_and_frames_with(ShowinfoParser::new(), pts)
+    }
+
+    fn config_and_frames_with(mut p: ShowinfoParser, pts: &[i64]) -> Vec<Result<Option<ShowFrame>, ShowinfoError>> {
         p.line("[Parsed_showinfo_0 @ 0x1] config in time_base: 1/12288, frame_rate: 24/1")
             .unwrap();
         pts.iter()
@@ -501,6 +521,32 @@ mod tests {
         assert_eq!(p.frames_seen(), 2);
         let e = ShowinfoError::OutOfOrder { prev: 7, got: 3 };
         assert!(e.to_string().contains('7') && e.to_string().contains('3'));
+    }
+
+    #[test]
+    fn a_parser_that_allows_repeats_takes_an_equal_timestamp_and_still_refuses_an_earlier_one() {
+        // A cursor keeps no pts-keyed cache and `Pick::select` takes a file's repeated timestamps
+        // as they come (a 1/30 encoder grid rounding two frames onto one millisecond).
+        let repeating = config_and_frames_with(ShowinfoParser::allowing_repeats(), &[1633, 1667, 1667, 1700, 1700, 1700]);
+        assert!(repeating.iter().all(|r| matches!(r, Ok(Some(_)))), "{repeating:?}");
+        let pts: Vec<_> = repeating.iter().map(|r| r.clone().unwrap().unwrap().pts).collect();
+        assert_eq!(pts, [1633, 1667, 1667, 1700, 1700, 1700]);
+        assert_eq!(
+            config_and_frames_with(ShowinfoParser::allowing_repeats(), &[0, 2048, 1024])[2],
+            Err(ShowinfoError::OutOfOrder { prev: 2048, got: 1024 })
+        );
+        assert_eq!(
+            config_and_frames_with(ShowinfoParser::allowing_repeats(), &[100, 100, 99])[2],
+            Err(ShowinfoError::OutOfOrder { prev: 100, got: 99 })
+        );
+        // The strict parser, which the frame cache's runs use, still refuses the same repeat.
+        assert_eq!(
+            config_and_frames(&[1667, 1667])[1],
+            Err(ShowinfoError::OutOfOrder { prev: 1667, got: 1667 })
+        );
+        assert!(ShowinfoError::OutOfOrder { prev: 100, got: 99 }
+            .to_string()
+            .contains("before"));
     }
 
     #[test]

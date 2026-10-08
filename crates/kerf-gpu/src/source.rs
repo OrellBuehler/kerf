@@ -483,7 +483,7 @@ mod tests {
             )
             .args(["-c:v", "libx264", "-qp", "0", "-g", "1", "-bf", "0", "-pix_fmt", "yuv420p"])
             .args([
-                "-fps_mode",
+                kerf_core::fps_mode_flag(),
                 "passthrough",
                 "-enc_time_base",
                 "1/10000",

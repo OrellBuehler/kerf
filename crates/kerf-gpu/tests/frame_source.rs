@@ -75,7 +75,7 @@ fn media() -> &'static Media {
             &[
                 "-vf",
                 "settb=1/1000,setpts='(N+2*floor(N/3))*33/TB/1000'",
-                "-fps_mode",
+                kerf_core::fps_mode_flag(),
                 "passthrough",
             ],
         );

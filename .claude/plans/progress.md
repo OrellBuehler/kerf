@@ -6,7 +6,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 |---|---|---|---|---|
 | A0 GPU feasibility spike | `feat/gpu-a0` | — | merged (local) | **Gate: PASS** on lavapipe (FFmpeg 6.1.1 and 9.0.2): 77 renders after review fixes (letterbox matte, opacity RGB round trip emulated, swscale scaler port, transposed decodes/alpha refused, wgpu error scopes); flat max ≤ 8/255, PSNR ≥ 40 dB, busy-source cases ≥ 45.8 dB. Composite in YUV like `overlay`, swscale-bicubic scaler, vf_eq tables, BT.601 output (what the FFmpeg still does). Bench (lavapipe, 1080p/1/3/6 layers): ffmpeg 119/242/414 ms vs gpu 132/249/509 ms — decode-bound; real GPU unmeasured. +5 MB binary (Linux). |
 | B1 Workspaces + library rail | `feat/workspaces` | — | merged (local) | Two review rounds; awaits push. |
-| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112 (all merged); A1b-3: this PR | review | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on both FFmpegs) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete pending review of A1b-3. |
+| A1 Frame source + render plan | `feat/gpu-a1a-oracle`, `-timing`, `-planner`, `-picks`, `feat/gpu-a1b-pieces`, `feat/gpu-a1b-source`, `feat/gpu-a1b-cursor` | A1a: OrellBuehler/kerf#105, OrellBuehler/kerf#107; A1b-1: OrellBuehler/kerf#111; A1b-2: OrellBuehler/kerf#112 (all merged); A1b-3: this PR | review | Design `.claude/plans/a1-design.md` (critiqued, revised). Seven slices: A1a-0 golden argv oracle, A1a-1 `{:.6}` + `clip_timing.rs`, A1a-2 Planner, A1a-3 picks + SourceMedia + span, A1b-1..3 FrameSource. A1b-2 (`FrameSource`: runs, self-test, reaper, `render_plan_with`, parity through it on both FFmpegs, fake-ffmpeg and stress tests, bench) done locally, stacked on A1b-1; A1b-3 (`FrameCursor`: exclusive run per clip, forward-only, reversed window capped, 4290 output frames checked against `select` on 9.0.2 here; CI's parity job runs the same ignored suite on the distro FFmpeg too) done locally, stacked on A1b-2. A1b-1 second review (2026-10-08): pts must strictly ascend in a run (`OutOfOrder`), unreadable pts is an error, a failed y4m reader stays failed, a lost thrash ticket ages out. A1 complete pending review of A1b-3. |
 | A2 Native preview surface | — | — | todo | |
 | A3 Scrub + live drags on GPU | — | — | todo | |
 | B2 Waveforms + clip overlays + frame snapping | `feat/waveforms` | — | merged (local) | Waveform pyramid (48 kHz, 4 levels, cached) + `get_waveform_range`; tile-cached canvases, volume/fade overlays, frame quantization. |
@@ -251,6 +251,28 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   clips counted once; `reattachSelection` has one Undo. (3) `set_volume` / `set_fade` / `set_clip_enabled`
   say a detached picture carries no sound. (4) A clippy `nonminimal_bool` in `with_linked_cuts` rewritten
   with its short-circuit kept; a duplicated phrase in `CLAUDE.md` fixed.
+
+- **2026-10-08 — A1b-3 `FrameCursor`, review fixes.** (1) *Repeated timestamps split the parser, not the
+  contract.* `ShowinfoParser` is strict (`new()`: pts strictly ascending) because the frame cache keys a
+  frame by pts, and a repeat would be one key for two pictures. The cursor has no cache and `Pick::select`
+  takes a file's repeated timestamps as they come, so it reads with `ShowinfoParser::allowing_repeats()`:
+  an equal pts passes, an earlier one is still `OutOfOrder`. The router's runs stay strict. Until then the
+  `repeated-pts` clip of `tests/cursor.rs` failed on main's strict parser; it now passes and is asserted to
+  repeat (4290 output frames on 9.0.2; the distro FFmpeg is CI's parity job). (2) *The run's `-ss` is the
+  export's spelling for an `Fps` pick*: `kerf_core::export_seek_arg` (`format!("{seek}")`, truncated by
+  FFmpeg to whole microseconds), shared by `push_inputs` and the pick's own model of the seek, and none at
+  the head of the file; the still's `{:.6}` rounds, and a window start between two microseconds on a
+  one-microsecond time base started the run a frame late (an ignored µs-mp4 test; mutating only the
+  cursor's spelling fails it). (3) *Skipped output frames are read through*: a forward cursor keeps only
+  the newest frame while a pick is undecided (a reversed one its whole window), so skipping no longer
+  trips the reversed-window cap. (4) `picks_through` hands each frame to a callback. (5) A run that
+  closes stdout and never exits is killed after `frame_timeout` (bounded `try_wait`, the child lock never
+  held across a wait; the router's `run_reader` too, `EXIT_GRACE`); a wrong-sized picture is
+  `Unsupported`; `for_layer` refuses `Before` without spawning; a failed thread start kills the child;
+  `run_args` and the media-making tests spell `passthrough` with `fps_mode_flag()` (now public). (6) The
+  cursor's "answer is `select`'s" holds where `-ss` lands on the frame the timestamps say; a long-GOP
+  transport stream lands on a later keyframe as the export does, the same known limit as the still's.
+  `tests/cursor_fake.rs` (a shell script as `KERF_FFMPEG`) holds the parts that need no FFmpeg.
 
 ## Needs a real machine
 

@@ -3516,7 +3516,7 @@ fn push_inputs(
             let seek = clip_seek(start);
             if seek > 0.0 {
                 args.push("-ss".to_string());
-                args.push(format!("{seek}"));
+                args.push(export_seek_arg(seek));
             }
         }
         args.push("-i".to_string());
@@ -4551,8 +4551,9 @@ fn fps_mode_flag_for(knows_fps_mode: bool, knows_vsync: bool) -> &'static str {
     }
 }
 
-/// [`fps_mode_flag_for`] for this machine's ffmpeg, probed once per process.
-fn fps_mode_flag() -> &'static str {
+/// [`fps_mode_flag_for`] for this machine's ffmpeg, probed once per process: the spelling
+/// every spawn outside the engine that passes `passthrough` uses.
+pub fn fps_mode_flag() -> &'static str {
     static FLAG: OnceLock<&'static str> = OnceLock::new();
     FLAG.get_or_init(|| {
         let help = help_flags();
@@ -6135,6 +6136,15 @@ impl StillOutput {
 /// this, so the two cannot drift apart and show different frames.
 pub fn seek_arg(seconds: f64) -> String {
     format!("{seconds:.6}")
+}
+
+/// How the export spells a clip's input `-ss`: the shortest text of the `f64`, which FFmpeg
+/// reads and truncates to whole microseconds. [`seek_arg`] rounds to the nearest instead, so
+/// for a window start like 2/30 s on a one-microsecond time base the two land on frames a tick
+/// apart; whatever has to see the frames the export sees (`FpsPick::seek_arg`, the frame pick's
+/// model of the seek) takes this one.
+pub fn export_seek_arg(seconds: f64) -> String {
+    format!("{seconds}")
 }
 
 /// Pure arg builder for a composited still, parameterized by its sink (no I/O,

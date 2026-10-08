@@ -12,11 +12,22 @@
 //! What it answers is [`Pick::progress`]'s, over the timestamps it has read so far: it reads
 //! until the pick is decided and returns the shown frame, so a cursor's answer is
 //! [`Pick::select`]'s over the whole file — and `select` is held to the export's rendered frames
-//! by kerf-core's `picked.rs`. It keeps every **timestamp** it has read (indices are positions
-//! in the run) but only the **pixels** a later pick can still show (`keep_from`): a forward clip
-//! holds a frame or two, a **reversed** one its whole window (it is played backwards), which is
-//! bounded by [`CursorConfig::window_cap_bytes`] — past it the clip is `Unsupported` and goes to
-//! FFmpeg.
+//! by kerf-core's `picked.rs`. **That holds where `-ss` lands on the frame the timestamps say.**
+//! A long-GOP transport stream seeks to the *next* keyframe and the decode does not recover
+//! (finding 5 of the design note): the run starts late, as the export's own `-ss` does, and the
+//! cursor answers over the frames it was given — not `select`'s, and not proven against the
+//! export. [`FrameSource::cursor`](crate::FrameSource::cursor) refuses a file once a router run
+//! has learned it lands late (`late_seek`) and cannot know before: the same known limit as the
+//! still's. A repeated timestamp is a file's own (a time base that rounds two frames onto one
+//! tick) and is taken as it comes (the stderr is read by
+//! [`ShowinfoParser::allowing_repeats`]; the frame cache's runs keep the strict parser).
+//!
+//! It keeps every **timestamp** it has read (indices are positions in the run) but only the
+//! **pixels** a later pick can still show: after a decision, `keep_from`; while a forward pick is
+//! undecided, the newest frame (the frames of output frames the caller skips are not held). A
+//! forward clip holds a frame or two, a **reversed** one its whole window (it is played
+//! backwards), which is bounded by [`CursorConfig::window_cap_bytes`] — past it the clip is
+//! `Unsupported` and goes to FFmpeg.
 //!
 //! **Forward only.** Picks must come in output order (or repeat the last); a pick whose frame's
 //! pixels were already dropped is an error, not a decode (the caller opens a new cursor).
@@ -25,7 +36,8 @@
 //!
 //! **Nothing waits forever**: a watchdog kills the run when a read has waited
 //! [`CursorConfig::first_frame_timeout`] for the first frame or [`CursorConfig::frame_timeout`]
-//! for a later one; `Drop` kills it.
+//! for a later one, a run that closed its output and does not exit within `frame_timeout` is
+//! killed, and `Drop` kills it.
 
 use std::collections::VecDeque;
 use std::process::{Child, ChildStdout, Stdio};
@@ -36,11 +48,11 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{FpsPick, Pick, PickProgress, PlanLayer, Rational, SourceFrames};
 
-use crate::frame_source::{kill, read_stderr, run_args};
+use crate::frame_source::{kill, read_stderr, run_args, wait_until};
 use crate::gpu::GpuError;
-use crate::showinfo::{plain_log_env, ShowFrame};
+use crate::showinfo::{plain_log_env, ShowFrame, ShowinfoParser};
 use crate::source::{yuv420p_len, YuvFrame, MAX_SIDE};
-use crate::y4m::Y4mReader;
+use crate::y4m::{Y4mError, Y4mReader};
 
 /// Limits of one cursor.
 #[derive(Debug, Clone)]
@@ -100,26 +112,32 @@ pub struct FrameCursor {
 
 impl FrameCursor {
     /// A cursor over `layer`'s file from where its pick needs it: an `Fps` pick's clip seek
-    /// (a still image: the start), an `AtOrAfter` / `Before` pick's time (`Before` one frame of
-    /// the stream's rate earlier is the caller's to ask for, with [`FrameCursor::open`]).
+    /// (a still image: the start), an `AtOrAfter` pick's time. A `Before` pick is refused: it
+    /// needs the frame before the run's first, which only a run begun earlier has (open one
+    /// with [`FrameCursor::open`] at the time one frame of the stream's rate earlier).
     pub fn for_layer(layer: &PlanLayer, config: CursorConfig) -> Result<Self, GpuError> {
-        let seek = match layer.pick {
-            Pick::Fps(p) => p.seek().unwrap_or(0.0),
-            Pick::AtOrAfter(t) | Pick::Before(t) => t,
-        };
-        Self::open(&layer.path, (layer.stream.width, layer.stream.height), seek, config)
+        if matches!(layer.pick, Pick::Before(_)) {
+            return Err(GpuError::Unsupported(format!(
+                "{}: a `Before` pick needs the frame before a cursor's first",
+                layer.path
+            )));
+        }
+        Self::open(&layer.path, (layer.stream.width, layer.stream.height), &layer.pick, config)
     }
 
-    /// A cursor over the file at `path` (probed `size`) from `seek` seconds.
-    pub fn open(path: &str, size: (u32, u32), seek: f64, config: CursorConfig) -> Result<Self, GpuError> {
+    /// A cursor over the file at `path` (probed `size`) that begins where `first` needs it, with
+    /// the `-ss` spelled as `first`'s reference spells it (an `Fps` pick's as the export does,
+    /// none at the head of the file; the still's `{:.6}` for the others). Later picks may be any
+    /// in output order.
+    pub fn open(path: &str, size: (u32, u32), first: &Pick, config: CursorConfig) -> Result<Self, GpuError> {
         let (w, h) = size;
         if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
             return Err(GpuError::Unsupported(format!(
                 "{path}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
             )));
         }
-        let seek = seek.max(0.0);
-        let mut args = run_args(path, seek, config.hwaccel.as_deref());
+        let (seek, seek_text) = start_of(first);
+        let mut args = run_args(path, seek_text.as_deref(), config.hwaccel.as_deref());
         kerf_core::limit_ffmpeg_args(&mut args, 1);
         let mut cmd = kerf_core::ffmpeg_command();
         cmd.args(&args);
@@ -137,10 +155,14 @@ impl FrameCursor {
         let (tx, rx) = mpsc::channel();
         let tail = Arc::new(Mutex::new(String::new()));
         let err_tail = Arc::clone(&tail);
-        std::thread::Builder::new()
+        let reader = std::thread::Builder::new()
             .name("kerf-cursor-stderr".into())
-            .spawn(move || read_stderr(stderr, &tx, &err_tail))
-            .map_err(|e| GpuError::Decode(format!("could not start a reader: {e}")))?;
+            .spawn(move || read_stderr(stderr, &tx, &err_tail, ShowinfoParser::allowing_repeats()));
+        if let Err(e) = reader {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GpuError::Decode(format!("could not start a reader: {e}")));
+        }
         let watch = Arc::new(Watch {
             child: Mutex::new(child),
             reading: Mutex::new(None),
@@ -149,11 +171,14 @@ impl FrameCursor {
             killed: AtomicBool::new(false),
         });
         let watched = Arc::downgrade(&watch);
-        let (first, between) = (config.first_frame_timeout, config.frame_timeout);
-        std::thread::Builder::new()
+        let (first_frame, between) = (config.first_frame_timeout, config.frame_timeout);
+        let watchdog = std::thread::Builder::new()
             .name("kerf-cursor-watch".into())
-            .spawn(move || watchdog(&watched, first, between))
-            .map_err(|e| GpuError::Decode(format!("could not start a watchdog: {e}")))?;
+            .spawn(move || watchdog(&watched, first_frame, between));
+        if let Err(e) = watchdog {
+            kill(&watch.child);
+            return Err(GpuError::Decode(format!("could not start a watchdog: {e}")));
+        }
         Ok(Self {
             path: path.to_string(),
             seek,
@@ -219,7 +244,16 @@ impl FrameCursor {
                     // `progress` decides everything at the end of the file; this is a guard.
                     return Err(GpuError::Decode(format!("{}: the pick is undecided at the end", self.path)));
                 }
-                PickProgress::NeedMore => self.read_one()?,
+                PickProgress::NeedMore => {
+                    // A forward pick still undecided shows the newest frame read or a later one
+                    // (`Before`'s answer is the one before the first frame past its time: the
+                    // newest now), so nothing older is wanted. A reversed pick plays its window
+                    // backwards and needs all of it.
+                    if !matches!(pick, Pick::Fps(p) if p.reverse) {
+                        self.drop_before(self.pts.len().saturating_sub(1));
+                    }
+                    self.read_one()?;
+                }
             }
         }
     }
@@ -262,6 +296,10 @@ impl FrameCursor {
         let frame = match next {
             Ok(Some(f)) => f,
             Ok(None) => return self.finish(),
+            Err(e @ (Y4mError::Size { .. } | Y4mError::Format(_))) => {
+                self.stop();
+                return Err(e.into());
+            }
             Err(e) => return Err(self.failure(&e.to_string())),
         };
         self.watch.first_done.store(true, Ordering::Relaxed);
@@ -296,9 +334,10 @@ impl FrameCursor {
         Ok(())
     }
 
-    /// The stream ended: a clean exit is the end of the file, anything else a failure.
+    /// The stream ended: a clean exit is the end of the file, anything else a failure. A run that
+    /// closed its output and does not exit within `frame_timeout` is killed.
     fn finish(&mut self) -> Result<(), GpuError> {
-        let status = lock(&self.watch.child).wait();
+        let status = wait_until(&self.watch.child, Instant::now() + self.config.frame_timeout);
         self.watch.done.store(true, Ordering::Relaxed);
         if self.watch.killed.load(Ordering::Relaxed) {
             return Err(self.failure("no frame in time (killed)"));
@@ -309,13 +348,17 @@ impl FrameCursor {
                 Ok(())
             }
             Ok(s) => Err(self.failure(&format!("ffmpeg exited {s}"))),
-            Err(e) => Err(self.failure(&format!("waiting for ffmpeg: {e}"))),
+            Err(e) => Err(self.failure(&format!("after its last frame: {e}"))),
         }
     }
 
-    fn failure(&self, why: &str) -> GpuError {
+    fn stop(&self) {
         kill(&self.watch.child);
         self.watch.done.store(true, Ordering::Relaxed);
+    }
+
+    fn failure(&self, why: &str) -> GpuError {
+        self.stop();
         // Let the stderr reader finish so the error carries what ffmpeg said last.
         let until = Instant::now() + Duration::from_millis(500);
         while let Some(left) = until.checked_duration_since(Instant::now()) {
@@ -365,15 +408,31 @@ fn watchdog(watch: &std::sync::Weak<Watch>, first: Duration, between: Duration) 
     }
 }
 
+/// Where a run for `first` begins: the seek in seconds and the text of its `-ss` (`None`: no
+/// `-ss`).
+fn start_of(first: &Pick) -> (f64, Option<String>) {
+    match first {
+        Pick::Fps(p) => (p.seek().unwrap_or(0.0), p.seek_arg()),
+        Pick::AtOrAfter(t) | Pick::Before(t) => {
+            let t = t.max(0.0);
+            (t, Some(kerf_core::seek_arg(t)))
+        }
+    }
+}
+
 /// The export's pick of one clip at consecutive output frames, through one cursor: what an
-/// export (A7) does per clip. `frames` are the output frames, ascending.
+/// export (A7) does per clip. `frames` are the output frames, ascending; `each` takes every one
+/// with the frame shown (`None`: nothing is drawn) as it is decided, so a long clip is never
+/// held whole.
 pub fn picks_through(
     cursor: &mut FrameCursor,
     pick: FpsPick,
     frames: impl IntoIterator<Item = u64>,
-) -> Result<Vec<Option<Arc<YuvFrame>>>, GpuError> {
-    frames
-        .into_iter()
-        .map(|frame| cursor.pick(&Pick::Fps(FpsPick { frame, ..pick })))
-        .collect()
+    mut each: impl FnMut(u64, Option<Arc<YuvFrame>>),
+) -> Result<(), GpuError> {
+    for frame in frames {
+        let shown = cursor.pick(&Pick::Fps(FpsPick { frame, ..pick }))?;
+        each(frame, shown);
+    }
+    Ok(())
 }

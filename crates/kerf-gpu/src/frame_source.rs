@@ -35,10 +35,12 @@
 //!   (`disable_decode_hwaccel`).
 //! * **The path can be off.** The first use runs a **self-test** ([`self_test`]): a tiny file on
 //!   a fine time base made with `ffmpeg`'s own encoder, decoded with the production flags, every
-//!   pts expected exactly. If it fails (an FFmpeg older than 5.1 rejects `-fps_mode` and
-//!   `showinfo=checksum`, a build that prints `showinfo` differently) the whole process falls
-//!   back to [`decode_layer`] — one spawn per frame, A0's path — rather than trust timestamps it
-//!   cannot read. `KERF_FRAME_SOURCE=oneshot` does the same on purpose.
+//!   pts expected exactly. If it fails (a build whose `showinfo`, `-ss` or time base behave
+//!   otherwise than the two measured, 6.1.1 and 9.0.2; `passthrough` is spelled with the engine's
+//!   `fps_mode_flag()`, so an FFmpeg before 5.1 is judged on what it does, not on a flag it
+//!   lacks) the whole process falls back to [`decode_layer`] — one spawn per frame, A0's path —
+//!   rather than trust timestamps it cannot read. `KERF_FRAME_SOURCE=oneshot` does the same on
+//!   purpose.
 //! * **Errors are per frame**: `Unsupported`, `Decode`, a timeout or `Busy` (the thrash guard)
 //!   mean the caller renders *that* frame through FFmpeg; `Ok(None)` is "no frame".
 //!
@@ -229,17 +231,25 @@ pub struct FrameSource {
     shared: Arc<Shared>,
 }
 
-/// The `ffmpeg` argv of a run of `path` from `seek` seconds (before the CPU cap): the production
-/// flags the self-test checks.
-pub fn run_args(path: &str, seek: f64, hwaccel: Option<&str>) -> Vec<String> {
+/// The `ffmpeg` argv of a run of `path` (before the CPU cap): the production flags the self-test
+/// checks. `seek` is the text of the input `-ss` as the caller spells it (a still's
+/// `kerf_core::seek_arg`, the export's `FpsPick::seek_arg`), `None` for a run from the head with
+/// no `-ss`. `passthrough` is spelled with the engine's `fps_mode_flag()`.
+pub fn run_args(path: &str, seek: Option<&str>, hwaccel: Option<&str>) -> Vec<String> {
+    run_args_with(path, seek, hwaccel, kerf_core::fps_mode_flag())
+}
+
+fn run_args_with(path: &str, seek: Option<&str>, hwaccel: Option<&str>, fps_mode: &str) -> Vec<String> {
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "info"]
         .map(String::from)
         .into();
     if let Some(h) = hwaccel {
         args.extend(["-hwaccel".to_string(), h.to_string()]);
     }
-    args.extend(["-copyts", "-start_at_zero", "-ss"].map(String::from));
-    args.push(kerf_core::seek_arg(seek.max(0.0)));
+    args.extend(["-copyts", "-start_at_zero"].map(String::from));
+    if let Some(seek) = seek {
+        args.extend(["-ss".to_string(), seek.to_string()]);
+    }
     args.extend(["-i".to_string(), path.to_string()]);
     args.extend(
         [
@@ -250,7 +260,7 @@ pub fn run_args(path: &str, seek: f64, hwaccel: Option<&str>) -> Vec<String> {
             "0:v:0",
             "-vf",
             "showinfo=checksum=0,scale=out_range=tv",
-            "-fps_mode",
+            fps_mode,
             "passthrough",
             "-f",
             "yuv4mpegpipe",
@@ -323,7 +333,11 @@ pub fn self_test() -> Result<(), String> {
             return Err(format!("making the test clip: {status}"));
         }
         let mut cmd = kerf_core::ffmpeg_command();
-        cmd.args(run_args(&clip.to_string_lossy(), 5.0 * 1001.0 / 30000.0, None));
+        cmd.args(run_args(
+            &clip.to_string_lossy(),
+            Some(&kerf_core::seek_arg(5.0 * 1001.0 / 30000.0)),
+            None,
+        ));
         let mut child = plain_log_env(&mut cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -383,8 +397,9 @@ pub fn self_test() -> Result<(), String> {
 /// How long the self-test may take, both of its ffmpegs together.
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wait for `child` to exit, killing it at `deadline`.
-fn wait_until(child: &Mutex<Child>, deadline: Instant) -> Result<std::process::ExitStatus, String> {
+/// Wait for `child` to exit, killing it (and reaping it) at `deadline`. The lock is held only for
+/// each poll, so a watchdog's `kill` is never kept out by a wait.
+pub(crate) fn wait_until(child: &Mutex<Child>, deadline: Instant) -> Result<std::process::ExitStatus, String> {
     loop {
         let mut c = child.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match c.try_wait() {
@@ -392,7 +407,7 @@ fn wait_until(child: &Mutex<Child>, deadline: Instant) -> Result<std::process::E
             Ok(None) if Instant::now() >= deadline => {
                 let _ = c.kill();
                 let _ = c.wait();
-                return Err(format!("ffmpeg did not finish within {} s", SELF_TEST_TIMEOUT.as_secs()));
+                return Err("ffmpeg did not exit in time".into());
             }
             Ok(None) => {}
             Err(e) => return Err(format!("waiting for ffmpeg: {e}")),
@@ -703,7 +718,7 @@ impl FrameSource {
     ) -> Result<RunId, GpuError> {
         let seek = seek.max(0.0);
         let hwaccel = if hw { kerf_core::decode_hwaccel() } else { None };
-        let mut args = run_args(&layer.path, seek, hwaccel.as_deref());
+        let mut args = run_args(&layer.path, Some(&kerf_core::seek_arg(seek)), hwaccel.as_deref());
         let live = st.runs.iter().filter(|r| r.alive()).count();
         kerf_core::limit_ffmpeg_args(&mut args, live + 1);
         let mut cmd = kerf_core::ffmpeg_command();
@@ -755,7 +770,7 @@ impl FrameSource {
         let err_tail = Arc::clone(&tail);
         let _ = std::thread::Builder::new()
             .name("kerf-frame-stderr".into())
-            .spawn(move || read_stderr(stderr, &tx, &err_tail));
+            .spawn(move || read_stderr(stderr, &tx, &err_tail, ShowinfoParser::new()));
         let weak = Arc::downgrade(&self.shared);
         let expected = (layer.stream.width, layer.stream.height);
         let fps = layer.stream.fps;
@@ -938,14 +953,24 @@ pub(crate) fn kill(child: &Mutex<Child>) {
     let _ = c.wait();
 }
 
+/// How long ffmpeg may take to exit after it closed its stdout: past it the child is killed (a
+/// run's `wait` must never be unbounded, and under the child's lock it would keep the reaper's
+/// `kill` out too).
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
 /// How much of a run's stderr is kept for its error message.
 const STDERR_TAIL: usize = 4096;
 
 /// Parse a run's stderr into `showinfo` frames, keeping a tail of the rest for errors. A line
-/// the parser rejects ends the stream of frames with the error; the pipe is drained regardless,
-/// so `ffmpeg` never blocks on it.
-pub(crate) fn read_stderr(stderr: ChildStderr, tx: &Sender<Result<ShowFrame, String>>, tail: &Mutex<String>) {
-    let mut parser = ShowinfoParser::new();
+/// `parser` rejects ends the stream of frames with the error (the cache's runs read with the
+/// strict [`ShowinfoParser::new`], a cursor's with [`ShowinfoParser::allowing_repeats`]); the pipe
+/// is drained regardless, so `ffmpeg` never blocks on it.
+pub(crate) fn read_stderr(
+    stderr: ChildStderr,
+    tx: &Sender<Result<ShowFrame, String>>,
+    tail: &Mutex<String>,
+    mut parser: ShowinfoParser,
+) {
     let mut broken = false;
     for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
         if !broken {
@@ -1095,13 +1120,10 @@ fn run_reader(
         sh.changed.notify_all();
     };
     // The end: how the child exited decides what the run's last frame means.
-    let status = {
-        let mut c = child.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if outcome.is_err() {
-            let _ = c.kill();
-        }
-        c.wait()
-    };
+    if outcome.is_err() {
+        kill(child);
+    }
+    let status = wait_until(child, Instant::now() + EXIT_GRACE);
     // Let the stderr reader finish (it drops its sender at the end of the pipe), so the error
     // carries what ffmpeg said last.
     let until = Instant::now() + Duration::from_secs(1);
@@ -1136,7 +1158,7 @@ fn run_reader(
                 "ffmpeg exited {s}: {}",
                 tail.lock().map(|t| t.trim().to_string()).unwrap_or_default()
             ),
-            (Ok(()), Err(e)) => format!("waiting for ffmpeg: {e}"),
+            (Ok(()), Err(e)) => e.clone(),
         };
         st.runs[at].life = Life::Failed(why);
     }
@@ -1205,16 +1227,48 @@ mod tests {
 
     #[test]
     fn the_run_flags_are_the_designs() {
-        let args = run_args("/m/a.mp4", 1.5, Some("auto"));
+        let args = run_args_with("/m/a.mp4", Some("1.500000"), Some("auto"), "-fps_mode");
         assert_eq!(
             args.join(" "),
             "-hide_banner -nostats -nostdin -loglevel info -hwaccel auto -copyts -start_at_zero \
              -ss 1.500000 -i /m/a.mp4 -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv \
              -fps_mode passthrough -f yuv4mpegpipe -pix_fmt yuv420p pipe:1"
         );
-        // A negative seek (a lead before the start) is the start.
-        assert!(run_args("/m/a.mp4", -0.2, None).join(" ").contains("-ss 0.000000 -i"));
-        assert!(!run_args("/m/a.mp4", 0.0, None).iter().any(|a| a == "-hwaccel"));
+        // No seek is no `-ss` (the export passes none at the head of a file).
+        let head = run_args_with("/m/a.mp4", None, None, "-fps_mode");
+        assert!(!head.iter().any(|a| a == "-ss" || a == "-hwaccel"));
+        assert!(head.join(" ").contains("-start_at_zero -i /m/a.mp4"));
+        // An FFmpeg before 5.1 spells the same option `-vsync`.
+        let old = run_args_with("/m/a.mp4", None, None, "-vsync").join(" ");
+        assert!(old.contains("-vsync passthrough") && !old.contains("-fps_mode"), "{old}");
+        // The probed spelling is one of the two.
+        let probed = run_args("/m/a.mp4", None, None).join(" ");
+        assert!(probed.contains("-fps_mode passthrough") || probed.contains("-vsync passthrough"));
+    }
+
+    /// A child that does not exit is killed at the deadline (and reaped), one that exits is not.
+    #[cfg(unix)]
+    #[test]
+    fn waiting_for_a_child_is_bounded() {
+        let spawn = |prog: &str, arg: &str| {
+            Mutex::new(
+                std::process::Command::new(prog)
+                    .arg(arg)
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .expect("spawn"),
+            )
+        };
+        let quick = spawn("true", "");
+        let status = wait_until(&quick, Instant::now() + Duration::from_secs(10)).expect("exits");
+        assert!(status.success());
+        let hung = spawn("sleep", "600");
+        let t0 = Instant::now();
+        let err = wait_until(&hung, t0 + Duration::from_millis(150)).expect_err("killed at the deadline");
+        assert!(err.contains("did not exit"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        let killed = hung.lock().unwrap().try_wait().expect("reaped");
+        assert!(killed.is_some_and(|s| !s.success()), "the child is gone: {killed:?}");
     }
 
     #[test]

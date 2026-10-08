@@ -1623,7 +1623,11 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   repeated pts is `ShowinfoError::OutOfOrder`, and that file falls back to FFmpeg: the cache
   keys a frame by its pts and covers ticks up to it, so a repeat would be served for another
   picture and a step back, a decoder still learning its reorder depth after a mid-GOP seek,
-  would let a frame claim ticks that are not its own), `config in time_base: a/b` is re-read
+  would let a frame claim ticks that are not its own). That is `ShowinfoParser::new()`, the
+  `FrameSource` router's; a `FrameCursor` has no cache and reads with
+  `ShowinfoParser::allowing_repeats()`, which accepts an **equal** pts (a file whose time base
+  rounds two frames onto one tick, which `Pick::select` takes as it comes) and still rejects
+  an earlier one. `config in time_base: a/b` is re-read
   on every occurrence (a frame before the first, a bad ratio or a *change* is an error),
   `pts:NOPTS` or a pts that is not a plain integer (`0x21`) is an error, and
   `duration:` is kept (the last frame's is `SourceFrames::last_duration`). `line_lossy` takes
@@ -1666,7 +1670,8 @@ pool, never under the project lock); `frames(&layers, Hint)` decodes the layers 
 is `render_plan` over it (`composite_shared` takes the `Arc` frames). A run is
 `run_args`: `-hide_banner -nostats -nostdin -loglevel info [-hwaccel h] -copyts -start_at_zero -ss
 T -i path -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv -fps_mode passthrough
--f yuv4mpegpipe -pix_fmt yuv420p pipe:1`, spawned under `plain_log_env` with the CPU cap divided
+-f yuv4mpegpipe -pix_fmt yuv420p pipe:1` (`-fps_mode` spelled by `kerf_core::fps_mode_flag()`,
+which is `-vsync` before FFmpeg 5.1), spawned under `plain_log_env` with the CPU cap divided
 among the runs alive; a reader thread pairs each y4m frame with its `showinfo` line **by number**
 and files it under `(identity captured at spawn, pts)`. Only `Pick::AtOrAfter` is served (a still's
 pick, keyed by **`kerf_core::seek_ticks(t, tb)`**, the tick the still's `-ss {:.6}` becomes);
@@ -1696,8 +1701,9 @@ and a transport stream with a container start, plus six threads at once. The rul
   every child. One-shots are capped (`max_oneshots`, 2).
 - **The path can be off**: the first use runs **`self_test`** (an `mpeg4` clip at 30000/1001
   made by ffmpeg's own encoder, decoded from frame 5 with the production flags, every pts
-  expected exactly, all inside 10 s), and if it fails (FFmpeg < 5.1 has no `-fps_mode` or
-  `showinfo=checksum`) the process decodes with `decode_layer`, as does
+  expected exactly, all inside 10 s), and if it fails (a build whose `showinfo`, `-ss` or time
+  base behave otherwise than the two measured, 6.1.1 and 9.0.2) the process decodes with
+  `decode_layer`, as does
   `KERF_FRAME_SOURCE=oneshot` and any asset that never recorded its pixel format.
 - Hardware decode is `kerf_core::decode_hwaccel()` (now public); a run that dies before its
   first frame with it is retried once in software, and success calls `disable_decode_hwaccel`.
@@ -1708,24 +1714,44 @@ and a transport stream with a container start, plus six threads at once. The rul
   one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
 
 **`FrameCursor`** (A1b-3, `cursor.rs`) is the export's half: one clip's frames in output order
-from an **exclusive run** of its own (opened at the clip's `FpsPick::seek`, the export's `-ss`,
-with `run_args`; read on the caller's thread, registered with no router, cached nowhere).
-`cursor.pick(&Pick)` reads until `Pick::progress` decides and returns the shown frame, so its
-answer is `Pick::select`'s over the whole file — which `picked.rs` holds to the export's rendered
-frames. It keeps every timestamp read but only the pixels a later pick can show (`keep_from`): a
-forward clip holds a frame or two, a **reversed** one its whole window, capped by
+from an **exclusive run** of its own (opened at the clip's `FpsPick::seek`, with `run_args`; read
+on the caller's thread, registered with no router, cached nowhere). **The seek is spelled as the
+export spells it** — `FpsPick::seek_arg()`, the shortest text of the `f64` (`kerf_core::export_seek_arg`,
+shared with `push_inputs`, so the two cannot drift), which FFmpeg truncates to whole microseconds,
+and no `-ss` at the head of the file — not the still's `{:.6}`, which rounds: for a window start
+like 2/30 s on a one-microsecond time base (frame at 66666) the rounded text (66667) starts the run
+a frame after the one the export keeps and every pick is a frame late (20 of the 59 window starts
+in `tests/cursor.rs`'s microsecond mp4 differ between the two spellings; it holds the export's). `cursor.pick(&Pick)` reads until `Pick::progress`
+decides and returns the shown frame, so its answer is `Pick::select`'s over the whole file — which
+`picked.rs` holds to the export's rendered frames — **where `-ss` lands on the frame the timestamps
+say**: a long-GOP transport stream seeks to the next keyframe and the decode does not recover, the
+run starts late as the export's own `-ss` does, and the cursor answers over the frames it was given
+(not `select`'s, not proven against the export; `FrameSource::cursor` refuses a file once a router
+run has learned it lands late and cannot know before — the same known limit as the still's). It
+keeps every timestamp read but only the pixels a later pick can show: `keep_from` once decided and,
+while a forward pick is undecided, the newest frame (output frames the caller skips are read through,
+not held); a forward clip holds a frame or two, a **reversed** one its whole window, capped by
 `CursorConfig::window_cap_bytes` (512 MiB; past it `Unsupported`, FFmpeg renders the clip).
 **Forward only**: a pick whose frame was dropped is an error, the same frame again is fine;
-`Before` of a run's first frame is `None` from the file's start and `Unsupported` otherwise. A
-repeated timestamp is accepted (the pick takes the file as it is), one going back is an error; a
-watchdog kills a read waiting past `first_frame_timeout` / `frame_timeout`, `Drop` kills the run.
-`FrameSource::cursor(layer, config)` opens one where runs are trusted (refused: the self-test
-failed, an unrecorded or alpha pixel format, a `late_seek` file); `cursor::picks_through` is the
-per-clip loop an export makes. `tests/cursor.rs` (`#[ignore]`d, both FFmpegs) decodes lossless
+`Before` of a run's first frame is `None` from the file's start and `Unsupported` otherwise (and
+`for_layer` refuses a `Before` pick up front, spawning nothing). A repeated timestamp is accepted
+(`ShowinfoParser::allowing_repeats`, above), one going back is an error. **Nothing waits forever**:
+a watchdog kills a read waiting past `first_frame_timeout` / `frame_timeout`, a run that closed its
+stdout and does not exit within `frame_timeout` is killed (a bounded `try_wait`, never `wait()` under
+the child's lock; the router's `run_reader` the same, `EXIT_GRACE`), a size or layout the compositor
+does not draw is `Unsupported` (not a failed decode), a thread that cannot be started kills the child,
+and `Drop` kills the run. `FrameSource::cursor(layer, config)` opens one where runs are trusted
+(refused: the self-test failed, an unrecorded or alpha pixel format, a `late_seek` file);
+`cursor::picks_through(cursor, pick, frames, |frame, shown| ..)` is the per-clip loop an export
+makes, handing each frame to a callback as it is decided (a long clip is never held whole).
+`tests/cursor.rs` (`#[ignore]`d, both FFmpegs in CI's parity job; 9.0.2 run here) decodes lossless
 **self-numbering** sources (16 bits in luma blocks: a 30 fps CFR, a VFR on the 1/30 grid, and one
-with repeated timestamps) and checks the number on every output frame of 90 clips (speeds 0.5 to
-4, forward and reverse, windows off the grid / from the start / to the end of the file, 24 / 29.97
-/ 30 / 60 fps) against `select`: 4290 frames.
+with repeated timestamps, asserted to have them) and checks the number on every output frame of
+90 clips (speeds 0.5 to 4, forward and reverse, windows off the grid / from the start / to the end
+of the file, 24 / 29.97 / 30 / 60 fps) against `select`: 4290 frames on 9.0.2. `tests/cursor_fake.rs`
+(not `#[ignore]`d, unix: `KERF_FFMPEG` is a shell script writing a numbered y4m and `showinfo`
+lines) holds what needs no FFmpeg — skipped output frames are not held, a run that closes its output
+and never exits is killed, a wrong-sized picture is `Unsupported`, `Before` spawns nothing.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
