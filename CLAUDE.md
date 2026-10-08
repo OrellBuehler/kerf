@@ -117,7 +117,8 @@ so the feature is **only** activated through these forwards — which is what ma
   failure, and one such failure disables HW encode for the process). Background
   decodes (proxy, stitch, scene detection, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
-  software fallback shared with the preview path; the GUI defaults export
+  software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
+  decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
@@ -1106,7 +1107,14 @@ no editing logic in the adapter.
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
   frame of lookahead and the first frame past the window's end (or the last frame's duration at
-  the end of the file); reverse needs every pts of the window; a non-all-intra transport stream
+  the end of the file) — **`Pick::progress(&read, eof)`** (A1b-1, pure, property-tested
+  against `fps_pick` over the whole file) is that cursor's rule: fed the frames a run has
+  produced so far it says `NeedMore`, `NeedEarlier` (a `Before` whose answer is ahead of
+  the first frame read: nothing there if the run began at the file's start, else restart
+  earlier — only the cursor knows which) or `Ready { shown, keep_from }`, answers exactly as the
+  whole file would, and answers as early as it can (one frame past the shown one, or at the
+  window's end); `FpsPick::seek()` is where the run must begin; reverse needs every pts of
+  the window; a non-all-intra transport stream
   may not deliver the picked frame after an `-ss` (**both** builds — the design note's "6.1
   only" was wrong; an all-intra one is exact). **A fade on a layer with an alpha plane goes to
   luma 0, not 16** (`fade` on `yuva420p`; white is 235 either way): `FadeStep` /
@@ -1123,8 +1131,10 @@ no editing logic in the adapter.
   from the originals** (`render_geometry`). `PlanLayer.source: PlanSource { proxy }` says
   which. Resolve off the project lock, once per `Planner`. `SourceMedia::decoded` carries the
   original's spherical projection onto the proxy's stream (the proxy file has none of its own;
-  it is the same picture, smaller). `SourceMedia` has no `identity` yet (A1b-1's
-  `source_identity`).
+  it is the same picture, smaller). `SourceMedia` carries no `identity`: the frame cache's
+  file key is `kerf_core::source_identity(path)` (`fnv1a` of `source_key`: path, size and
+  modified time — one `stat`), taken on the *decoded* path when a frame is asked for, so a
+  replaced file or a new proxy is a new identity at the moment it matters (A1b-1).
   **Spans and the hand-over.** `Planner::span(a, b, size, caps)` evaluates every grid frame
   of `[a, b)` and run-length-encodes `reasons(..).is_empty()` (`SpanPlan::runs`); the lazy
   `Planner::first_unsupported(a, limit, size, caps)` stops at the first frame a compositor
@@ -1473,6 +1483,85 @@ and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still
 nothing for that layer, and so does the compositor. The layers of a frame decode in
 parallel, each given `budget / layers` threads even at a full CPU budget
 (`limit_ffmpeg_args(args, share)`). No cache, no proxy: that is A1.
+
+**A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
+of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:
+
+- `frame_cache::FrameCache` — `Arc<YuvFrame>`s keyed `(SourceId { file: source_identity,
+  format }, pts in ticks)`, byte-capped (`DEFAULT_CAP_BYTES` 256 MiB), least recently used out
+  first by an O(n) scan, **pinning** (`pin` hands out an RAII `PinGuard` and dropping it
+  unpins; a pinned frame is never evicted, the cap is soft for them and `CacheStats` says so; a
+  purge or `clear` detaches live guards — `PinGuard::is_live` goes false; the frame just
+  inserted is never its own victim), `Arc`s outlive eviction. `insert_cold` is for frames a
+  run only *passes* on the way to its target: it takes free space or a cold slot, and never
+  pushes out a frame that was asked for. `covers_from - 1` is a `checked_sub`. Each frame states **`covers_from`**: "no frame of this file has a
+  pts in `covers_from..pts`", so `at_or_after(source, t)` is one `BTreeMap` range query that
+  hits only when the frame *proves* it is the first at or after `t` (exact on VFR; a hole left
+  by an eviction is a miss, never the next frame held), `before(source, t)` is the frame at
+  `covers_from - 1`, and `mark_end` makes every later time `Lookup::PastEnd` (FFmpeg draws
+  nothing there). A frame decoded after another covers from the tick after it; a run's first
+  covers from its seek tick, which **the caller clamps to one frame interval before it**
+  (mpegts seeks a GOP late and must not claim the frames it skipped). A file has one picture
+  per pts, so inserting under a held key keeps the first frame and a debug build asserts the
+  second is the same picture.
+- `y4m::Y4mReader` — streams frames straight into the plane `Vec`s (`take().read_to_end()`
+  into spare capacity: no whole-stream buffer, no copy, no zero-fill; the header and `FRAME`
+  marker are read unbuffered, a few bytes, so nothing swallows the planes). The header's size
+  is compared with the probe's **before any plane is allocated** (`Y4mError::Size` →
+  `GpuError::Unsupported`), only `C420` / `420jpeg` / `420mpeg2` / `420paldv` / no tag is
+  accepted (`420p10` also starts with "420"), no bytes or a header alone is "no frame", a
+  stream ending between frames is finished and one ending inside a header or plane is
+  `Truncated`; after any error the reader stays failed (every later call repeats it, never a
+  clean `None`). FFmpeg 6.1 writes `C420mpeg2`, 9.0 `C420jpeg`, same pictures (fixtures).
+- `showinfo::ShowinfoParser` — the timestamps of a run, read off stderr as it is written
+  (flags: `-hide_banner -nostats -nostdin -loglevel info ... -vf showinfo=checksum=0,... `
+  and `-fps_mode passthrough`, which the spawn must spell with the engine's `fps_mode_flag()`
+  (`-vsync` before FFmpeg 5.1); plain `showinfo` checksums every frame: +65 % decode on 6.1,
+  +40 % on 9.0). A frame is a line
+  holding `[Parsed_showinfo_N @ 0x…] n:<n> pts:<pts>` and nothing else is read. The
+  prefix is required, including for `config in time_base`, so a file name or a container
+  title containing `] n:1 pts:0` cannot poison it. ANSI colour is stripped first, and the
+  spawn calls `plain_log_env`, which removes `AV_LOG_FORCE_COLOR` and sets
+  `AV_LOG_FORCE_NOCOLOR=1`. Coloured and poisoned-title fixtures from both builds are in
+  `tests/fixtures/showinfo/`. Beyond that, `n` must count 0, 1, 2, ... (a rebuilt
+  graph renumbers: an error), a run's **pts must be strictly ascending** (an out-of-order or
+  repeated pts is `ShowinfoError::OutOfOrder`, and that file falls back to FFmpeg: the cache
+  keys a frame by its pts and covers ticks up to it, so a repeat would be served for another
+  picture and a step back, a decoder still learning its reorder depth after a mid-GOP seek,
+  would let a frame claim ticks that are not its own), `config in time_base: a/b` is re-read
+  on every occurrence (a frame before the first, a bad ratio or a *change* is an error),
+  `pts:NOPTS` or a pts that is not a plain integer (`0x21`) is an error, and
+  `duration:` is kept (the last frame's is `SourceFrames::last_duration`). `line_lossy` takes
+  bytes, since stderr carries non-UTF-8 file names. **The real stderr of both FFmpegs is in
+  `tests/fixtures/showinfo/`** (mp4 1/12288, matroska 1/1000, mpegts 1/90000 with a container
+  start, with and without `-ss`; the SEI `User Data=` hex lines, the `Output #0` block printed
+  *between* the first frames and the closing statistics included) and the two builds report
+  identical frames; `tests/fixtures/y4m/` holds a real y4m of each (`.gitattributes` pins
+  them binary / LF).
+- `router::route(&[RunState], &Request) -> Route` and `ThrashGuard` — which run serves a
+  request. **Reuse** an idle run of the file behind the target by at most `effective_window`
+  frames (`REUSE_WINDOW_PROXY` 24, `REUSE_WINDOW_ORIGINAL` 96, held to half of what the cache
+  holds at the frame's size — a 96-frame read-forward at 1080p would otherwise flush the
+  other layers; nearest wins), else **start** (free slot: at most
+  3 runs a file, 6 in all) or **replace** the least recently used *idle* run (the file's when
+  it is at its cap, the process's otherwise); a request behind every run of its file starts
+  `BACKWARD_LEAD` (15) frames early; **`Exact` never evicts** (reuse or `OneShot`, a decode of
+  its own that registers nothing), **`Prefetch` only takes a spare slot**, a busy run is
+  neither reused nor evicted (`Route::Busy`). The guard counts only routes that **destroy a
+  run somebody may want back** (`Route::is_thrash`: a restart, or a start that evicts a run
+  that is not stale — not filling a free slot, a six-layer frame starts six runs at once) and
+  only for `Forward`. `check(intent, route, now)` hands back a `#[must_use]` `Ticket` that goes
+  to `finished(ticket, now, outcome)` once the run delivers its first frame or fails. It is
+  **time-weighted**: once restarts have cost ≥ `THRASH_BUSY_SECS` (0.75 s) of the last second,
+  the next is `Err(Busy)`. A run that fails or dies empty still counts (a failed start into a
+  free slot is charged `FAILED_RUN_COST` too), so a crashing decoder cannot slip past by freeing
+  its slot. Evicting a stale idle run of another file does not count, so a montage across more
+  than six files is not thrash, and a start still open after a full window (its ticket never
+  came back) is closed there and ages out instead of refusing every later start. A refusal (`GpuError::Busy` via `From`) renders that frame through FFmpeg's stream instead.
+  Refusals are not counted so it recovers when the caller stops. Time is passed in, so the
+  tests need no clock.
+- kerf-core: `Pick::progress` / `FpsPick::seek` (above), `source_identity`,
+  `disable_decode_hwaccel`.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
