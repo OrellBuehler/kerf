@@ -4081,6 +4081,12 @@ pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANN
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
 
+mod music_fit;
+pub use music_fit::{
+    music_fit_clips, plan_music_fit, to_samples, MusicFit, MusicFitReport, MusicSegment, FIT_FADE_S, MAX_FIT_BARS,
+    SPLICE_CROSSFADE_S,
+};
+
 // ---- ripple ----------------------------------------------------------------
 
 impl Timeline {

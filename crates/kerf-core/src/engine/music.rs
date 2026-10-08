@@ -409,9 +409,7 @@ struct CacheEntry {
 /// Remember `analysis` for `src`, through a temp file and a rename. Failing is not fatal.
 pub(super) fn store(src: &Path, analysis: &Option<MusicAnalysis>) {
     let Some(file) = cache_path(src) else { return };
-    let Ok(json) = serde_json::to_vec(&CacheEntry {
-        music: analysis.clone(),
-    }) else {
+    let Ok(json) = serde_json::to_vec(&CacheEntry { music: analysis.clone() }) else {
         return;
     };
     let tmp = file.with_extension(format!("{}.part", std::process::id()));
@@ -433,11 +431,11 @@ pub(crate) mod tests {
     pub(crate) const SR: u32 = 22_050;
 
     /// A short decaying low thump (a kick) and a high click, mixed at `t`.
-    fn add_hit(out: &mut [f32], t: f64, kick: bool) {
-        let start = (t * SR as f64).round() as usize;
-        for n in 0..(SR as usize / 20) {
+    fn add_hit(out: &mut [f32], sr: u32, t: f64, kick: bool) {
+        let start = (t * sr as f64).round() as usize;
+        for n in 0..(sr as usize / 20) {
             let Some(s) = out.get_mut(start + n) else { break };
-            let tt = n as f32 / SR as f32;
+            let tt = n as f32 / sr as f32;
             let env = (-tt * 60.0).exp();
             *s += 0.3 * env * (2.0 * std::f32::consts::PI * 3000.0 * tt).sin();
             if kick {
@@ -449,7 +447,11 @@ pub(crate) mod tests {
     /// A click on every beat of a `bpm` grid starting at `phase`, with a kick on every
     /// beat `k` where `k % 4 == downbeat`.
     pub(crate) fn click_track(bpm: f64, phase: f64, downbeat: usize, seconds: f64) -> Vec<f32> {
-        let mut out = vec![0.0_f32; (seconds * SR as f64) as usize];
+        click_track_at(SR, bpm, phase, downbeat, seconds)
+    }
+
+    fn click_track_at(sr: u32, bpm: f64, phase: f64, downbeat: usize, seconds: f64) -> Vec<f32> {
+        let mut out = vec![0.0_f32; (seconds * sr as f64) as usize];
         let period = 60.0 / bpm;
         let mut k = 0;
         loop {
@@ -457,16 +459,20 @@ pub(crate) mod tests {
             if t >= seconds {
                 break;
             }
-            add_hit(&mut out, t, k % 4 == downbeat);
+            add_hit(&mut out, sr, t, k % 4 == downbeat);
             k += 1;
         }
         out
     }
 
     fn chord(freqs: &[f64], seconds: f64) -> Vec<f32> {
-        (0..(seconds * SR as f64) as usize)
+        chord_at(SR, freqs, seconds)
+    }
+
+    fn chord_at(sr: u32, freqs: &[f64], seconds: f64) -> Vec<f32> {
+        (0..(seconds * sr as f64).round() as usize)
             .map(|n| {
-                let t = n as f64 / SR as f64;
+                let t = n as f64 / sr as f64;
                 freqs.iter().map(|f| (2.0 * std::f64::consts::PI * f * t).sin()).sum::<f64>() as f32 * 0.2
             })
             .collect()
@@ -480,6 +486,10 @@ pub(crate) mod tests {
     /// An 8-bar loop at `bpm` (C Am F G | C Am F G with a different last two bars:
     /// Dm Em), clicked on every beat and kicked on the downbeat, repeated `times`.
     pub(crate) fn chord_loop(bpm: f64, times: usize) -> Vec<f32> {
+        chord_loop_at(SR, bpm, times)
+    }
+
+    fn chord_loop_at(sr: u32, bpm: f64, times: usize) -> Vec<f32> {
         const D_MINOR: [f64; 3] = [146.83, 174.61, 220.00];
         const E_MINOR: [f64; 3] = [164.81, 196.00, 246.94];
         let bars: [&[f64]; 8] = [&C_MAJOR, &A_MINOR, &F_MAJOR, &G_MAJOR, &C_MAJOR, &A_MINOR, &D_MINOR, &E_MINOR];
@@ -487,11 +497,11 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         for _ in 0..times {
             for b in bars {
-                out.extend(chord(b, bar_s));
+                out.extend(chord_at(sr, b, bar_s));
             }
         }
-        let seconds = out.len() as f64 / SR as f64;
-        for (i, s) in click_track(bpm, 0.0, 0, seconds).into_iter().enumerate() {
+        let seconds = out.len() as f64 / sr as f64;
+        for (i, s) in click_track_at(sr, bpm, 0.0, 0, seconds).into_iter().enumerate() {
             out[i] += s;
         }
         out
@@ -613,5 +623,154 @@ pub(crate) mod tests {
         assert_eq!(g.whole_bars(4.74), 1);
         assert_eq!(g.whole_bars(0.5), 0);
         assert_eq!(g.bpm(), 120.0);
+    }
+
+    // ---- rendered through the export graph --------------------------------------
+
+    use crate::engine::test_support::{audio_stream, audio_track, test_asset, timeline_of};
+    use crate::engine::{decode_audio, render_with, write_wav, AudioBuffer, Container, ExportOptions};
+    use crate::model::{music_fit_clips, plan_music_fit, Asset, Clip, Timeline};
+
+    const RENDER_SR: u32 = 48_000;
+
+    /// A 16-bar song at 90 BPM (the 8-bar loop twice) with half a second of silence ahead
+    /// and a second of the last chord ringing out after, on the 16-bit grid so a WAV
+    /// export can reproduce it exactly.
+    fn fixture(dir: &Path) -> (Asset, AudioBuffer) {
+        let mut samples = vec![0.0_f32; RENDER_SR as usize / 2];
+        samples.extend(chord_loop_at(RENDER_SR, 90.0, 2));
+        let ring = chord_at(RENDER_SR, &C_MAJOR, 1.0);
+        let n = ring.len() as f32;
+        samples.extend(ring.iter().enumerate().map(|(i, s)| s * (1.0 - i as f32 / n)));
+        for s in &mut samples {
+            *s = ((*s * 0.8).clamp(-1.0, 1.0) * 32768.0).round().min(32767.0) / 32768.0;
+        }
+        let buf = AudioBuffer::new(RENDER_SR, 1, samples);
+        let path = dir.join("song.wav");
+        write_wav(&path, &buf).unwrap();
+        let mut asset = test_asset(vec![audio_stream(RENDER_SR, 1)]);
+        asset.path = path.to_string_lossy().into_owned();
+        asset.duration = buf.duration();
+        (asset, buf)
+    }
+
+    fn render(dir: &Path, name: &str, timeline: &Timeline, asset: &Asset) -> AudioBuffer {
+        let out = dir.join(name);
+        let opts = ExportOptions {
+            container: Container::Wav,
+            video_codec: None,
+            audio_codec: Some("pcm_s16le".into()),
+            audio_sample_rate: Some(RENDER_SR),
+            audio_channels: Some(1),
+            ..Default::default()
+        };
+        render_with(timeline, std::slice::from_ref(asset), &out, &opts).unwrap();
+        decode_audio(&out, RENDER_SR, 1).unwrap()
+    }
+
+    fn samples(t: f64) -> usize {
+        (t * RENDER_SR as f64).round() as usize
+    }
+
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn a_fitted_loop_renders_to_length_without_new_peaks_and_with_untouched_runs() {
+        let dir = std::env::temp_dir().join(format!("kerf-music-fit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (asset, src) = fixture(&dir);
+        let analysed = decode_audio(Path::new(&asset.path), SR, 1).unwrap();
+        let m = analyze_music(&analysed.samples, SR).expect("a grid");
+        assert!((m.grid.bpm() - 90.0).abs() < 0.05, "{}", m.grid.bpm());
+        assert!(!m.phrases.is_empty());
+        let whole = Clip::new(asset.id, 0.0, asset.duration, 0.0);
+        for target in [60.0, 90.0, 150.0] {
+            let fit = plan_music_fit(&m, target, RENDER_SR);
+            assert!(fit.splices >= 1, "{target}: {fit:?}");
+            let clips = music_fit_clips(&whole, &fit, RENDER_SR, true);
+            let timeline = timeline_of(vec![audio_track(clips.clone())]);
+            let out = render(&dir, &format!("fit-{target}.wav"), &timeline, &asset);
+            let want = if fit.remainder < 0.0 { target } else { fit.duration };
+
+            assert!(
+                (out.duration() - want).abs() < 0.002,
+                "{target}: {} s vs {want} s",
+                out.duration()
+            );
+            assert!(
+                out.peak() <= src.peak() + 1e-6,
+                "{target}: peak {} over {}",
+                out.peak(),
+                src.peak()
+            );
+            // Away from the crossfades and the final fade, every segment is its source,
+            // sample for sample.
+            let guard = samples(0.005) + 2;
+            let fade_from = if fit.remainder < 0.0 {
+                samples(target - crate::model::FIT_FADE_S)
+            } else {
+                usize::MAX
+            };
+            for seg in &fit.segments {
+                let (o, s, n) = (samples(seg.output_start), samples(seg.source_start), samples(seg.len()));
+                let worst = (guard..n.saturating_sub(guard))
+                    .take_while(|k| o + k < fade_from.min(out.samples.len()))
+                    .map(|k| (out.samples[o + k] - src.samples[s + k]).abs())
+                    .fold(0.0_f32, f32::max);
+                assert_eq!(worst, 0.0, "{target}: segment {seg:?} differs from its source");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn a_splice_between_continuous_bars_is_sample_identical() {
+        let dir = std::env::temp_dir().join(format!("kerf-music-cont-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (asset, src) = fixture(&dir);
+        // Bar 8 on a grid that is not a whole millisecond (0.5 s + 8 bars of 8/3 s).
+        let cut = crate::model::to_samples(0.5 + 8.0 * 4.0 * 60.0 / 90.0, RENDER_SR);
+        assert!((cut * 1000.0).fract().abs() > 1e-6);
+        let a = Clip::new(asset.id, 0.0, cut, 0.0);
+        let b = Clip::new(asset.id, cut, asset.duration, cut);
+        let hard = render(
+            &dir,
+            "hard.wav",
+            &timeline_of(vec![audio_track(vec![a, b])]),
+            &asset,
+        );
+        // The same join crossfaded the way a fit splices: the window centred on the cut.
+        let fit = crate::model::MusicFit {
+            segments: vec![
+                crate::model::MusicSegment {
+                    source_start: 0.0,
+                    source_end: cut,
+                    output_start: 0.0,
+                },
+                crate::model::MusicSegment {
+                    source_start: cut,
+                    source_end: asset.duration,
+                    output_start: cut,
+                },
+            ],
+            target: asset.duration,
+            duration: asset.duration,
+            remainder: 0.0,
+            bars: 16,
+            splices: 1,
+        };
+        let faded = music_fit_clips(&Clip::new(asset.id, 0.0, asset.duration, 0.0), &fit, RENDER_SR, false);
+        let soft = render(&dir, "soft.wav", &timeline_of(vec![audio_track(faded)]), &asset);
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (name, out) in [("hard cut", hard), ("crossfade", soft)] {
+            assert_eq!(out.samples.len(), src.samples.len(), "{name}");
+            let worst = out
+                .samples
+                .iter()
+                .zip(&src.samples)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert_eq!(worst, 0.0, "{name}: max abs diff");
+        }
     }
 }

@@ -14,6 +14,7 @@ use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, M
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
+use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
     Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
@@ -3127,6 +3128,113 @@ impl Project {
         })
     }
 
+    /// What "fit music to length" would make of a music clip, without making it: the
+    /// segments, how long they last and how far that is from `target` (by default the
+    /// picture's length from the clip's start). See [`crate::model::plan_music_fit`].
+    pub fn plan_music_fit(&self, clip_id: Uuid, target: Option<f64>) -> Result<MusicFit> {
+        Ok(self.music_fit_inputs(clip_id, target)?.2)
+    }
+
+    fn music_fit_inputs(&self, clip_id: Uuid, target: Option<f64>) -> Result<(Clip, u32, MusicFit)> {
+        let timeline = self.working_timeline()?;
+        let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        if timeline.tracks[ti].kind != StreamKind::Audio {
+            return Err(Error::InvalidArgument(
+                "fit music to length works on a clip on an audio track".to_string(),
+            ));
+        }
+        let clip = timeline.tracks[ti].clips[ci].clone();
+        if (clip.speed - 1.0).abs() > 1e-9 {
+            return Err(Error::InvalidArgument(
+                "fit music to length needs the clip at normal speed".to_string(),
+            ));
+        }
+        let asset = self.require_asset(clip.asset_id)?;
+        let music = self.get_analysis(asset.id)?.and_then(|a| a.music).ok_or_else(|| {
+            Error::InvalidArgument("this music has no bar grid — analyze the asset first (it needs a steady beat)".to_string())
+        })?;
+        let target = match target {
+            Some(t) if t.is_finite() && t > 0.0 => t,
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "target must be a positive number of seconds".to_string(),
+                ))
+            }
+            None => {
+                let picture_end = timeline
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == StreamKind::Video)
+                    .map(Track::end)
+                    .fold(0.0, f64::max);
+                let t = picture_end - clip.timeline_start;
+                if t <= 0.0 {
+                    return Err(Error::InvalidArgument(
+                        "there is no picture after this clip's start to fit it to".to_string(),
+                    ));
+                }
+                t
+            }
+        };
+        if target / music.grid.bar_s() > MAX_FIT_BARS as f64 {
+            return Err(Error::InvalidArgument("that target is too long to fit music to".to_string()));
+        }
+        let rate = asset
+            .streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Audio)
+            .and_then(|s| s.sample_rate)
+            .unwrap_or(48_000);
+        Ok((clip, rate, plan_music_fit(&music, target, rate)))
+    }
+
+    /// **Fit music to length**: replace a music clip with the bar-aligned edit list
+    /// [`Self::plan_music_fit`] plans — intro and ending kept, whole phrases repeated or
+    /// dropped, each splice crossfaded over a 10 ms window centred on it. Non-destructive:
+    /// the result is clips on the source, not rendered audio. With `fade_out`, a fit that
+    /// runs over its target is cut there and faded out. One revision; refused when the
+    /// result would run into the next clip on the track.
+    pub fn fit_music(&self, clip_id: Uuid, target: Option<f64>, fade_out: bool) -> Result<MusicFitReport> {
+        let (clip, rate, fit) = self.music_fit_inputs(clip_id, target)?;
+        if clip.link_id.is_some() {
+            return Err(Error::InvalidArgument(
+                "unlink the music from its picture before fitting it".to_string(),
+            ));
+        }
+        let clips = music_fit_clips(&clip, &fit, rate, fade_out);
+        self.edit_timeline_exact("Fit music to length", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let track = &mut timeline.tracks[ti];
+            if track.locked {
+                return Err(Error::InvalidArgument(format!("{} is locked", track.name)));
+            }
+            track.clips.remove(ci);
+            let start = clips.first().map_or(clip.timeline_start, |c| c.timeline_start);
+            let end = clips.last().map_or(start, Clip::timeline_end);
+            if track
+                .clips
+                .iter()
+                .any(|c| c.timeline_start < end - 1e-9 && c.timeline_end() > start + 1e-9)
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "the fitted music ({}) would run into the next clip on {} — make room first",
+                    fmt_time(end - start),
+                    track.name
+                )));
+            }
+            for (k, c) in clips.iter().enumerate() {
+                track.clips.insert(ci + k, c.clone());
+            }
+            let duration = end - start;
+            Ok(MusicFitReport {
+                clips: clips.iter().map(|c| c.id).collect(),
+                faded: fade_out && fit.remainder < 0.0,
+                duration,
+                fit,
+            })
+        })
+    }
+
     /// **Extract audio**: give an asset's sound its own clip on an audio track, for
     /// every use of the asset on the timeline that still plays it.
     ///
@@ -5158,6 +5266,91 @@ mod tests {
         // The music track is the grid, not a target — it keeps its full length.
         let audio = timeline.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap();
         assert_eq!(audio.clips[0].duration(), 10.0);
+    }
+
+    fn fit_music_project() -> (Project, Uuid) {
+        let project = Project::open_in_memory().unwrap();
+        let mut music = asset_with("/fit-music.wav", vec![aud_stream()]);
+        music.duration = 34.5;
+        let music = project.insert_or_get_asset(&music).unwrap();
+        let prog = [0, 9, 5, 7, 0, 9, 2, 4];
+        let bar_chroma: Vec<[f32; 12]> = (0..16)
+            .map(|k| {
+                let mut c = [0.0_f32; 12];
+                c[prog[k % 8]] = 1.0;
+                c
+            })
+            .collect();
+        let phrases = crate::engine::music::phrase_matches(&bar_chroma, crate::engine::music::SPLICE_SIMILARITY);
+        project
+            .set_analysis(&AssetAnalysis {
+                asset_id: music.id,
+                music: Some(crate::model::MusicAnalysis {
+                    grid: crate::model::BeatGrid {
+                        period_s: 0.5,
+                        phase_s: 0.0,
+                        downbeat_offset: 2,
+                        beats_per_bar: 4,
+                    },
+                    duration: 34.5,
+                    bar_chroma,
+                    phrases,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut long = asset_with("/fit-video.mp4", vec![vid_stream(false)]);
+        long.duration = 60.0;
+        let long = project.insert_or_get_asset(&long).unwrap();
+        project.cut_clip(long.id, 0.0, 50.0).unwrap();
+        project.add_asset_audio(music.id).unwrap();
+        let timeline = project.timeline().unwrap();
+        let clip = timeline.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap().clips[0].id;
+        (project, clip)
+    }
+
+    #[test]
+    fn fit_music_fills_the_picture_with_whole_phrases() {
+        let (project, clip) = fit_music_project();
+        let plan = project.plan_music_fit(clip, None).unwrap();
+        assert_eq!(plan.target, 50.0);
+        assert_eq!(plan.bars, 24, "{plan:?}");
+        assert!(plan.remainder < 0.0, "24 bars run half a second over");
+        assert!(project.timeline().unwrap().clip(clip).is_some(), "planning changes nothing");
+
+        let report = project.fit_music(clip, None, true).unwrap();
+        assert!(report.faded);
+        let timeline = project.timeline().unwrap();
+        let audio = timeline.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap();
+        assert_eq!(audio.clips.len(), report.clips.len());
+        assert_eq!(audio.clips.len(), 2);
+        assert!((audio.end() - 50.0).abs() < 1e-6, "{}", audio.end());
+        assert!(audio.clips[1].transition_in.is_some());
+        assert_eq!(audio.clips[1].fade_out, crate::model::FIT_FADE_S);
+        assert!(timeline.clip(clip).is_none(), "the original clip is replaced");
+
+        let err = project.fit_music(report.clips[0], Some(-1.0), false).unwrap_err().to_string();
+        assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn fit_music_needs_a_bar_grid() {
+        let project = Project::open_in_memory().unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/plain.wav", vec![aud_stream()]))
+            .unwrap();
+        project.add_asset_audio(music.id).unwrap();
+        let clip = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .find(|t| t.kind == StreamKind::Audio)
+            .unwrap()
+            .clips[0]
+            .id;
+        let err = project.fit_music(clip, Some(20.0), false).unwrap_err().to_string();
+        assert!(err.contains("no bar grid"), "{err}");
     }
 
     #[test]

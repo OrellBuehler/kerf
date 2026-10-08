@@ -161,6 +161,7 @@ still-file-jpeg image2 -vcodec mjpeg -y
 still-jpeg-pipe image2pipe
 still-rgb-pipe -pix_fmt rgb24
 ducking sidechaincompress
+audio-delay-samples S:all=1
 audio-pan pan=stereo|c0=
 audio-compressor acompressor=
 libm-canary-39 threshold=1.065368864e-2

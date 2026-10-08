@@ -221,7 +221,7 @@ so the feature is **only** activated through these forwards — which is what ma
   at unity and the other is attenuated away, because leaning a finished stereo
   track should not make it louder. Both are omitted from the graph at their
   neutral values, so every pre-existing mix is byte-identical, and the pan is
-  dropped entirely on a mono delivery. Tracks flagged `Track.duck` are mixed
+  dropped entirely on a mono delivery. A clip's `adelay` is whole milliseconds when its start is one, else an exact sample count (`adelay=NS`, `audio_delay`) — ms rounding put a bar-aligned splice up to 0.5 ms off its neighbour. Tracks flagged `Track.duck` are mixed
   into their own bus and
   `sidechaincompress`'d against the rest before the final sum (music dips under
   dialogue); `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS

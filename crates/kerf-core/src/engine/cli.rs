@@ -6944,7 +6944,7 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
     let seek = clip_seek(trim_start);
-    let delay_ms = (clip.timeline_start * 1000.0).round().max(0.0) as i64;
+    let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
     let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
     let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
 
@@ -7001,13 +7001,26 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
         // attenuated, so a stereo music bed leans without collapsing.
         p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
     }
-    p.push(format!("adelay={delay_ms}:all=1"));
+    p.push(format!("adelay={delay}:all=1"));
     p.join(",")
 }
 
 /// Samples in a frame the keyed volume is evaluated on (2.7 ms at 48 kHz): the gain steps by
 /// at most the curve's slope times that between two frames.
 const VOLUME_FRAME_SAMPLES: usize = 128;
+
+/// `adelay`'s delay for a clip starting at `start` seconds: whole milliseconds when the
+/// start is one (every graph that predates this stays byte-identical), otherwise an
+/// exact sample count at `sample_rate` (`…S`) — rounding a bar-aligned splice to the
+/// millisecond would put it up to half a millisecond off its neighbour. Pure.
+fn audio_delay(start: f64, sample_rate: u32) -> String {
+    let ms = start * 1000.0;
+    if (ms - ms.round()).abs() < 1e-6 || sample_rate == 0 {
+        format!("{}", ms.round().max(0.0) as i64)
+    } else {
+        format!("{}S", (start * sample_rate as f64).round().max(0.0) as i64)
+    }
+}
 
 /// Decompose a tempo change into `atempo` steps each within ffmpeg's supported
 /// `[0.5, 2.0]` range (e.g. 4× → `atempo=2.0,atempo=2.0`).
