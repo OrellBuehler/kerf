@@ -5370,12 +5370,24 @@ fn zoom_scale(factor: &str, keyed: bool, tiny: bool, even: bool, sf: &str) -> St
     }
 }
 
+/// Polyline points above which [`keyframe_expr`] writes a balanced tree instead of a chain.
+/// libavutil refuses an expression nested deeper than 100 levels (`Invalid argument`, from
+/// the filter that holds it), a chain is a level per point, and an eased key is 12 points: ten
+/// eased keys failed the export and the playback stream alike. Up to this many points the
+/// chain's depth is harmless and its text is the one every earlier graph carried.
+const KEYFRAME_TREE_POINTS: usize = 24;
+
 /// Build a piecewise-linear ffmpeg expression over **clip-local time** for a
 /// channel of keyframes. `points` are `(seconds_from_clip_start, value)` and are
 /// sorted here. `tvar` is the time variable the target filter exposes (`t` for
 /// overlay / scale / rotate, `T` for geq); `start` is the clip's `timeline_start`
 /// so the expression reads time relative to the clip. Values hold flat before the
 /// first and after the last keyframe.
+///
+/// Few points are nested `if(lt(..))`s walked from the first segment; many are a balanced
+/// binary tree over the segments (`if(lt(t,t_mid),left,right)`, [`KEYFRAME_TREE_POINTS`]),
+/// which is `log2(n)` levels deep and `log2(n)` comparisons per evaluation (a `geq` runs it per
+/// pixel). Both pick the one segment whose span holds the time, so they evaluate alike.
 fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
     let mut pts = points.to_vec();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -5386,39 +5398,67 @@ fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
         return fnum(pts[0].1);
     }
     let lt = format!("({tvar}-{})", fnum(start));
-    // Fold segments in from the end; `expr` starts as the value held after the
-    // last keyframe.
-    let mut expr = fnum(pts[pts.len() - 1].1);
-    for w in (0..pts.len() - 1).rev() {
-        let (t0, v0) = pts[w];
-        let (t1, v1) = pts[w + 1];
-        let seg = if (t1 - t0).abs() < 1e-9 {
-            fnum(v0)
-        } else {
-            format!(
-                "({v0}+({dv})*({lt}-{t0})/({dt}))",
-                v0 = fnum(v0),
-                dv = fnum(v1 - v0),
+    let last = pts[pts.len() - 1];
+    // The part between the first and the last key; the ends hold their values.
+    let inside = if pts.len() > KEYFRAME_TREE_POINTS {
+        let tree = keyframe_tree(&pts, 0, pts.len() - 1, &lt);
+        format!("if(lt({lt},{tl}),{tree},{vl})", tl = fnum(last.0), vl = fnum(last.1))
+    } else {
+        // Fold segments in from the end; `expr` starts as the value held after the
+        // last keyframe.
+        let mut expr = fnum(last.1);
+        for w in (0..pts.len() - 1).rev() {
+            expr = format!(
+                "if(lt({lt},{t1}),{seg},{expr})",
                 lt = lt,
-                t0 = fnum(t0),
-                dt = fnum(t1 - t0),
-            )
-        };
-        expr = format!(
-            "if(lt({lt},{t1}),{seg},{expr})",
-            lt = lt,
-            t1 = fnum(t1),
-            seg = seg,
-            expr = expr
-        );
-    }
+                t1 = fnum(pts[w + 1].0),
+                seg = keyframe_segment(&pts, w, &lt),
+                expr = expr
+            );
+        }
+        expr
+    };
     // Hold the first value before the first keyframe.
     format!(
-        "if(lt({lt},{t0}),{v0},{expr})",
+        "if(lt({lt},{t0}),{v0},{inside})",
         lt = lt,
         t0 = fnum(pts[0].0),
         v0 = fnum(pts[0].1),
-        expr = expr
+        inside = inside
+    )
+}
+
+/// The value inside segment `w` (`pts[w]` to `pts[w + 1]`): a straight line, or the first
+/// value for a step (equal times).
+fn keyframe_segment(pts: &[(f64, f64)], w: usize, lt: &str) -> String {
+    let (t0, v0) = pts[w];
+    let (t1, v1) = pts[w + 1];
+    if (t1 - t0).abs() < 1e-9 {
+        fnum(v0)
+    } else {
+        format!(
+            "({v0}+({dv})*({lt}-{t0})/({dt}))",
+            v0 = fnum(v0),
+            dv = fnum(v1 - v0),
+            lt = lt,
+            t0 = fnum(t0),
+            dt = fnum(t1 - t0),
+        )
+    }
+}
+
+/// Segments `lo..hi` of `pts` as a balanced tree, for a time known to lie in
+/// `[pts[lo].0, pts[hi].0)`. A step's empty span is never reached.
+fn keyframe_tree(pts: &[(f64, f64)], lo: usize, hi: usize, lt: &str) -> String {
+    if hi - lo == 1 {
+        return keyframe_segment(pts, lo, lt);
+    }
+    let mid = (lo + hi) / 2;
+    format!(
+        "if(lt({lt},{t}),{left},{right})",
+        t = fnum(pts[mid].0),
+        left = keyframe_tree(pts, lo, mid, lt),
+        right = keyframe_tree(pts, mid, hi, lt),
     )
 }
 
@@ -7803,6 +7843,110 @@ mod tests {
         assert!(e.contains("10+(10)*"), "linear segment v0 + dv*…: {e}");
         // A single keyframe degenerates to a constant.
         assert_eq!(keyframe_expr(&[(1.0, 0.5)], "t", 0.0), "0.5");
+    }
+
+    /// The deepest `if(` nesting of an expression, and its deepest nesting of any kind of
+    /// bracket: what libavutil counts (a level per `(`, a function call's included).
+    fn nesting(expr: &str) -> (usize, usize) {
+        let (mut brackets, mut ifs, mut open_ifs) = (0usize, 0usize, Vec::new());
+        let (mut deepest_brackets, mut deepest_ifs) = (0, 0);
+        let bytes = expr.as_bytes();
+        for (i, &c) in bytes.iter().enumerate() {
+            match c {
+                b'(' => {
+                    brackets += 1;
+                    let is_if = i >= 2 && &bytes[i - 2..i] == b"if" && (i == 2 || !bytes[i - 3].is_ascii_alphanumeric());
+                    open_ifs.push(is_if);
+                    if is_if {
+                        ifs += 1;
+                    }
+                }
+                b')' => {
+                    brackets -= 1;
+                    if open_ifs.pop() == Some(true) {
+                        ifs -= 1;
+                    }
+                }
+                _ => {}
+            }
+            deepest_brackets = deepest_brackets.max(brackets);
+            deepest_ifs = deepest_ifs.max(ifs);
+        }
+        (deepest_ifs, deepest_brackets)
+    }
+
+    /// `n` points on a line with time = value = index.
+    fn ramp(n: usize) -> Vec<(f64, f64)> {
+        (0..n).map(|i| (i as f64, i as f64)).collect()
+    }
+
+    #[test]
+    fn a_short_keyframe_expression_is_the_chain_it_always_was() {
+        assert_eq!(
+            keyframe_expr(&[(0.0, 0.0), (1.0, 10.0), (3.0, -2.0)], "t", 1.5),
+            "if(lt((t-1.5),0),0,if(lt((t-1.5),1),(0+(10)*((t-1.5)-0)/(1)),\
+             if(lt((t-1.5),3),(10+(-12)*((t-1.5)-1)/(2)),-2)))"
+        );
+        // Right up to the threshold every point is a level; one past it, the tree.
+        assert_eq!(
+            nesting(&keyframe_expr(&ramp(KEYFRAME_TREE_POINTS), "t", 0.0)).0,
+            KEYFRAME_TREE_POINTS
+        );
+        assert!(nesting(&keyframe_expr(&ramp(KEYFRAME_TREE_POINTS + 1), "t", 0.0)).0 < 8);
+    }
+
+    #[test]
+    fn a_long_keyframe_expression_is_a_balanced_tree_over_its_segments() {
+        // Five points, four segments: halve twice. A step (equal times) is a leaf like any other.
+        let pts = ramp(5);
+        assert_eq!(
+            keyframe_tree(&pts, 0, 4, "L"),
+            "if(lt(L,2),if(lt(L,1),(0+(1)*(L-0)/(1)),(1+(1)*(L-1)/(1))),\
+             if(lt(L,3),(2+(1)*(L-2)/(1)),(3+(1)*(L-3)/(1))))"
+        );
+        let step = [(0.0, 1.0), (2.0, 1.0), (2.0, 5.0), (4.0, 7.0)];
+        assert_eq!(
+            keyframe_tree(&step, 0, 3, "L"),
+            "if(lt(L,2),(1+(0)*(L-0)/(2)),if(lt(L,2),1,(5+(2)*(L-2)/(2))))"
+        );
+    }
+
+    #[test]
+    fn many_eased_keys_stay_far_inside_the_expression_nesting_limit() {
+        // libavutil refuses an expression nested past 100 levels. 40 keys eased into each other
+        // are 12 pieces a segment: the chain was a level per piece (ten eased keys already failed
+        // the export and the playback stream with `Invalid argument`).
+        let mut clip = make_clip(Uuid::nil(), 0.0, 40.0, 0.0);
+        use crate::model::Easing;
+        let easings = [Easing::EaseInOut, Easing::Hold, Easing::EaseOut, Easing::Linear];
+        clip.keyframes = (0..40)
+            .map(|i| crate::model::Keyframe {
+                time: f64::from(i),
+                scale: 1.0 + f64::from(i % 3) * 0.1,
+                pos_x: f64::from(i % 5) * 0.05,
+                pos_y: 0.0,
+                rotation: f64::from(i % 7),
+                opacity: 1.0 - f64::from(i % 4) * 0.1,
+                easing: easings[i as usize % easings.len()],
+            })
+            .collect();
+        for channel in [
+            clip.keyframe_channel(|k| k.scale),
+            clip.keyframe_channel(|k| k.pos_x),
+            clip.keyframe_channel(|k| k.rotation),
+            clip.keyframe_channel(|k| k.opacity),
+        ] {
+            assert!(channel.len() > 200, "{} points", channel.len());
+            let (ifs, brackets) = nesting(&keyframe_expr(&channel, "t", 0.0));
+            assert!(
+                ifs <= 12 && brackets <= 20,
+                "{} points nest {ifs} ifs / {brackets} brackets",
+                channel.len()
+            );
+        }
+        // ... and inside the filters that wrap it, which add a few levels of their own.
+        let graph = video_clip_chain(&clip, &ExportFormat::default(), &ClipFx::default(), false, "c0");
+        assert!(nesting(&graph).1 < 40, "{}", nesting(&graph).1);
     }
 
     #[test]

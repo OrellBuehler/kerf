@@ -26,7 +26,7 @@ use std::f64::consts::PI;
 use super::*;
 use crate::clip_timing::{ffmpeg_frame_time, Rational};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track};
-use crate::model::{Fit, Keyframe, TextKeyframe, Transition, TransitionKind};
+use crate::model::{Easing, Fit, Keyframe, TextKeyframe, Transition, TransitionKind};
 use crate::planner::{PlanRequest, Planner};
 
 /// FFmpeg's expression grammar as `keyframe_expr`, `motion_expr` and the overlay /
@@ -35,15 +35,22 @@ struct Eval<'a> {
     s: &'a [u8],
     i: usize,
     vars: &'a [(&'a str, f64)],
+    depth: usize,
 }
+
+/// How many expressions libavutil lets nest (`stack_index` in `av_expr_parse`: the whole text,
+/// each bracket and each function argument is one); the next is refused with `EMFILE`, which
+/// the filter reports as `Invalid argument`.
+const NESTING_LIMIT: usize = 100;
 
 fn eval(src: &str, vars: &[(&str, f64)]) -> f64 {
     let mut e = Eval {
         s: src.as_bytes(),
         i: 0,
         vars,
+        depth: 0,
     };
-    let v = e.sum();
+    let v = e.nested();
     assert_eq!(e.i, src.len(), "unparsed tail of `{src}`");
     v
 }
@@ -62,6 +69,17 @@ impl Eval<'_> {
             String::from_utf8_lossy(self.s)
         );
         self.i += 1;
+    }
+    fn nested(&mut self) -> f64 {
+        self.depth += 1;
+        assert!(
+            self.depth <= NESTING_LIMIT,
+            "libavutil refuses an expression nested {} deep",
+            self.depth
+        );
+        let v = self.sum();
+        self.depth -= 1;
+        v
     }
     fn sum(&mut self) -> f64 {
         let mut v = self.term();
@@ -107,7 +125,7 @@ impl Eval<'_> {
         let c = self.peek();
         if c == b'(' {
             self.i += 1;
-            let v = self.sum();
+            let v = self.nested();
             self.eat(b')');
             return v;
         }
@@ -131,10 +149,10 @@ impl Eval<'_> {
                 .1;
         }
         self.i += 1;
-        let mut args = vec![self.sum()];
+        let mut args = vec![self.nested()];
         while self.peek() == b',' {
             self.i += 1;
-            args.push(self.sum());
+            args.push(self.nested());
         }
         self.eat(b')');
         let flag = |b: bool| f64::from(u8::from(b));
@@ -270,25 +288,51 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
     eased.timeline_start = 0.4;
     eased.transition_in = None;
     let easings = [
-        crate::model::Easing::EaseInOut,
-        crate::model::Easing::Hold,
-        crate::model::Easing::Bezier {
+        Easing::EaseInOut,
+        Easing::Hold,
+        Easing::Bezier {
             x1: 0.2,
             y1: 0.9,
             x2: 0.3,
             y2: 0.1,
         },
-        crate::model::Easing::EaseOut,
+        Easing::EaseOut,
     ];
     for (k, e) in eased.keyframes.iter_mut().zip(easings) {
         k.easing = e;
     }
+    // A dozen and a half keys, eased into each other: ~200 points a channel, so the expressions
+    // are the balanced tree (a chain that long is past libavutil's nesting limit, which
+    // the evaluator enforces).
+    let mut many = eased.clone();
+    many.keyframes = (0..18)
+        .map(|i| {
+            let f = f64::from(i);
+            Keyframe {
+                easing: [
+                    Easing::EaseInOut,
+                    Easing::Hold,
+                    Easing::EaseOut,
+                    Easing::Linear,
+                    Easing::EaseIn,
+                ][i as usize % 5],
+                ..keyed(
+                    f * 0.27 + 0.013 * f64::from(i % 3),
+                    0.8 + 0.1 * f64::from(i % 5),
+                    (f64::from((i * 7) % 10 - 5) / 20.0, f64::from((i * 3) % 7 - 3) / 20.0),
+                    f64::from((i * 37) % 60 - 30),
+                    1.0 - 0.1 * f64::from(i % 4),
+                )
+            }
+        })
+        .collect();
     let mut cuts = vec![
         ("animated clip and title", animated),
         ("slide onto a static offset", pair(slid)),
         ("push onto an animated clip", pair(pushed)),
         ("slide onto an identity clip", pair(plain)),
         ("eased keys", timeline_of(vec![video_track(vec![eased])])),
+        ("many eased keys", timeline_of(vec![video_track(vec![many])])),
     ];
     for (_, tl) in &mut cuts {
         tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));
@@ -433,5 +477,62 @@ fn the_evaluator_reads_what_the_graph_writes() {
         (9.0, -2.0),
     ] {
         assert!((eval(&e, &[("t", t)]) - want).abs() < 1e-9, "{t}: {e}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "libavutil refuses")]
+fn the_evaluator_refuses_what_libavutil_refuses() {
+    let chain = (0..NESTING_LIMIT).fold("1".to_string(), |e, i| format!("if(lt(t,{i}),{i},{e})"));
+    eval(&chain, &[("t", 0.0)]);
+}
+
+#[test]
+fn a_long_keyframe_expression_is_the_polyline_it_was_written_from_at_every_time() {
+    let easings = [
+        Easing::EaseInOut,
+        Easing::Hold,
+        Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 0.1,
+        },
+        Easing::Linear,
+        Easing::EaseOut,
+        Easing::EaseIn,
+    ];
+    // Off-grid times, a key that goes nowhere (equal times) and values that go both ways.
+    let keys: Vec<(f64, f64, Easing)> = (0..16)
+        .map(|i| {
+            let time = f64::from(i) * 0.37 + 0.011 * f64::from(i % 4);
+            (time, f64::from((i * 5) % 9) - 4.0, easings[i as usize % easings.len()])
+        })
+        .chain([
+            (5.9, 3.0, Easing::Hold),
+            (5.9, -2.0, Easing::Linear),
+            (7.0, 1.5, Easing::Linear),
+        ])
+        .collect();
+    let pts = crate::model::eased_points(&keys);
+    assert!(
+        pts.len() > crate::engine::cli::KEYFRAME_TREE_POINTS * 4,
+        "{} points",
+        pts.len()
+    );
+    let expr = crate::engine::cli::keyframe_expr(&pts, "t", 0.0);
+    // The time of every point, a hair either side of it, between each two, and past both ends.
+    let mut times = vec![-1.0, 0.0, 99.0];
+    for w in pts.windows(2) {
+        let (a, b) = (w[0].0, w[1].0);
+        times.extend([a - 1e-9, a, a + 1e-9, (a + b) / 2.0, b - 1e-9, b]);
+    }
+    for t in times {
+        let got = eval(&expr, &[("t", t)]);
+        let want = crate::model::interpolate(&pts, t).unwrap();
+        assert!(
+            (got - want).abs() < 1e-9,
+            "t = {t}: the expression says {got}, the polyline {want}"
+        );
     }
 }
