@@ -1,6 +1,6 @@
 /* The dockable workspace (Svelte 5 runes). `Workspace.svelte` owns the dockview
    instance and attaches it here; the title bar's workspace tabs and the
-   toolbar's Panels menu drive it.
+   Window menu drive it.
 
    A workspace is an arrangement of panels, nothing else. Switching swaps the
    dockview layout and leaves the project alone — the cut, the selection, the
@@ -15,7 +15,7 @@ import { layoutFor, shouldPersistLayout, workspaceSpec, type WorkspaceId } from 
 import { settings } from './settings.svelte';
 import { toast } from './notifications.svelte';
 
-/** Where a panel opens when it is brought back from the Panels menu: the
+/** Where a panel opens when it is brought back from the Window menu: the
  *  library on the preview's left and the deliver panel and the mixer on its
  *  right — that is where the presets put them — everything else beside whatever
  *  is active. */

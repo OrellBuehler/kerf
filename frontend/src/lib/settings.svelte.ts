@@ -78,8 +78,14 @@ export const CPU_PRESETS = [
 	}
 ] as const;
 
+/** The sections of the settings dialog (`SettingsDialog.svelte` lists them). */
+export type SettingsSection = 'performance' | 'speech' | 'preview' | 'appearance' | 'keyboard';
+
 class SettingsStore {
 	open = $state(false);
+	/** The section the dialog opens on, when something other than the first was
+	 *  asked for (Help › Keyboard shortcuts); the dialog takes it once. */
+	wantSection = $state<SettingsSection | null>(null);
 	loaded = $state(false);
 	saving = $state(false);
 
@@ -437,6 +443,12 @@ class SettingsStore {
 	toggle() {
 		this.open = !this.open;
 		if (this.open && !this.loaded) void this.load();
+	}
+
+	/** Open the dialog on `section`. */
+	openSection(section: SettingsSection) {
+		this.wantSection = section;
+		if (!this.open) this.toggle();
 	}
 
 	close() {
