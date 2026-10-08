@@ -1436,7 +1436,9 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   `covers_from - 1`, and `mark_end` makes every later time `Lookup::PastEnd` (FFmpeg draws
   nothing there). A frame decoded after another covers from the tick after it; a run's first
   covers from its seek tick, which **the caller clamps to one frame interval before it**
-  (mpegts seeks a GOP late and must not claim the frames it skipped).
+  (mpegts seeks a GOP late and must not claim the frames it skipped). A file has one picture
+  per pts, so inserting under a held key keeps the first frame and a debug build asserts the
+  second is the same picture.
 - `y4m::Y4mReader` — streams frames straight into the plane `Vec`s (`take().read_to_end()`
   into spare capacity: no whole-stream buffer, no copy, no zero-fill; the header and `FRAME`
   marker are read unbuffered, a few bytes, so nothing swallows the planes). The header's size
@@ -1444,18 +1446,26 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   `GpuError::Unsupported`), only `C420` / `420jpeg` / `420mpeg2` / `420paldv` / no tag is
   accepted (`420p10` also starts with "420"), no bytes or a header alone is "no frame", a
   stream ending between frames is finished and one ending inside a header or plane is
-  `Truncated`. FFmpeg 6.1 writes `C420mpeg2`, 9.0 `C420jpeg`, same pictures (fixtures).
+  `Truncated`; after any error the reader stays failed (every later call repeats it, never a
+  clean `None`). FFmpeg 6.1 writes `C420mpeg2`, 9.0 `C420jpeg`, same pictures (fixtures).
 - `showinfo::ShowinfoParser` — the timestamps of a run, read off stderr as it is written
-  (flags: `-hide_banner -nostats -nostdin -loglevel info ... -vf showinfo=checksum=0,... `;
-  plain `showinfo` checksums every frame: +65 % decode on 6.1, +40 % on 9.0). A frame is a line
+  (flags: `-hide_banner -nostats -nostdin -loglevel info ... -vf showinfo=checksum=0,... `
+  and `-fps_mode passthrough`, which the spawn must spell with the engine's `fps_mode_flag()`
+  (`-vsync` before FFmpeg 5.1); plain `showinfo` checksums every frame: +65 % decode on 6.1,
+  +40 % on 9.0). A frame is a line
   holding `[Parsed_showinfo_N @ 0x…] n:<n> pts:<pts>` and nothing else is read. The
   prefix is required, including for `config in time_base`, so a file name or a container
   title containing `] n:1 pts:0` cannot poison it. ANSI colour is stripped first, and the
   spawn calls `plain_log_env`, which removes `AV_LOG_FORCE_COLOR` and sets
   `AV_LOG_FORCE_NOCOLOR=1`. Coloured and poisoned-title fixtures from both builds are in
   `tests/fixtures/showinfo/`. Beyond that, `n` must count 0, 1, 2, ... (a rebuilt
-  graph renumbers: an error), `config in time_base: a/b` is re-read on every occurrence (a
-  frame before the first, a bad ratio or a *change* is an error), `pts:NOPTS` is an error, and
+  graph renumbers: an error), a run's **pts must be strictly ascending** (an out-of-order or
+  repeated pts is `ShowinfoError::OutOfOrder`, and that file falls back to FFmpeg: the cache
+  keys a frame by its pts and covers ticks up to it, so a repeat would be served for another
+  picture and a step back, a decoder still learning its reorder depth after a mid-GOP seek,
+  would let a frame claim ticks that are not its own), `config in time_base: a/b` is re-read
+  on every occurrence (a frame before the first, a bad ratio or a *change* is an error),
+  `pts:NOPTS` or a pts that is not a plain integer (`0x21`) is an error, and
   `duration:` is kept (the last frame's is `SourceFrames::last_duration`). `line_lossy` takes
   bytes, since stderr carries non-UTF-8 file names. **The real stderr of both FFmpegs is in
   `tests/fixtures/showinfo/`** (mp4 1/12288, matroska 1/1000, mpegts 1/90000 with a container
@@ -1473,12 +1483,16 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   `BACKWARD_LEAD` (15) frames early; **`Exact` never evicts** (reuse or `OneShot`, a decode of
   its own that registers nothing), **`Prefetch` only takes a spare slot**, a busy run is
   neither reused nor evicted (`Route::Busy`). The guard counts only routes that **destroy a
-  run** (`Route::replaces`: a restart or an evicting start, not filling a free slot — a
-  six-layer frame starts six runs at once) and only for `Forward`. It is **time-weighted**:
-  once restarts have cost ≥ `THRASH_BUSY_SECS` (0.75 s) of the last second, the next is
-  `Err(Busy)`. A run that fails or dies empty still counts, so a crashing decoder cannot slip
-  past by freeing its slot. Evicting a stale idle run of another file does not count, so a
-  montage across more than six files is not thrash. A refusal (`GpuError::Busy` via `From`) renders that frame through FFmpeg's stream instead.
+  run somebody may want back** (`Route::is_thrash`: a restart, or a start that evicts a run
+  that is not stale — not filling a free slot, a six-layer frame starts six runs at once) and
+  only for `Forward`. `check(intent, route, now)` hands back a `#[must_use]` `Ticket` that goes
+  to `finished(ticket, now, outcome)` once the run delivers its first frame or fails. It is
+  **time-weighted**: once restarts have cost ≥ `THRASH_BUSY_SECS` (0.75 s) of the last second,
+  the next is `Err(Busy)`. A run that fails or dies empty still counts (a failed start into a
+  free slot is charged `FAILED_RUN_COST` too), so a crashing decoder cannot slip past by freeing
+  its slot. Evicting a stale idle run of another file does not count, so a montage across more
+  than six files is not thrash, and a start still open after a full window (its ticket never
+  came back) is closed there and ages out instead of refusing every later start. A refusal (`GpuError::Busy` via `From`) renders that frame through FFmpeg's stream instead.
   Refusals are not counted so it recovers when the caller stops. Time is passed in, so the
   tests need no clock.
 - kerf-core: `Pick::progress` / `FpsPick::seek` (above), `source_identity`,

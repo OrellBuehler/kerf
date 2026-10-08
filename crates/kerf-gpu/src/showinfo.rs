@@ -3,11 +3,13 @@
 //!
 //! A y4m frame carries no timestamp, and a frame's identity is its **pts in the stream's own
 //! ticks** (the cache key; `pts_time` keeps six digits and is not enough), so a run is started
-//! with `-vf showinfo=checksum=0,scale=...` and `-hide_banner -nostats -nostdin -loglevel info`,
-//! and stderr is read as it is written. **Plain `showinfo` checksums every frame**, which costs
-//! 65 % more decode time on FFmpeg 6.1 and 40 % on 9.0; `checksum=0` is free. This is a log
-//! channel, not an API, so the parser is deliberately narrow and everything it cannot be sure of
-//! is an error (the run is killed and the frame goes through FFmpeg):
+//! with `-vf showinfo=checksum=0,scale=...` and `-hide_banner -nostats -nostdin -loglevel info`
+//! (and `-fps_mode passthrough`, which a spawn spells with the engine's `fps_mode_flag()`:
+//! `-vsync` before FFmpeg 5.1), and stderr is read as it is written. **Plain `showinfo`
+//! checksums every frame**, which costs 65 % more decode time on FFmpeg 6.1 and 40 % on 9.0;
+//! `checksum=0` is free. This is a log channel, not an API, so the parser is deliberately narrow
+//! and everything it cannot be sure of is an error (the run is killed and the frame goes
+//! through FFmpeg):
 //!
 //! * a line is read only if it **begins** with the filter's own log prefix,
 //!   `[Parsed_showinfo_<n> @ <ptr>] `, after any ANSI colour sequences are stripped, and then it is
@@ -28,7 +30,11 @@
 //!   without it, a frame before the first one is an error, and a time base that *changes* is too;
 //! * `pts:NOPTS` is an error: a frame with no timestamp has no identity (the decoder's
 //!   best-effort timestamps are what the filter graph sees and what is printed, so a container
-//!   with no frame pts — AVI — still has them);
+//!   with no frame pts — AVI — still has them), and so is a pts that is not a plain integer;
+//! * a run's pts must be **strictly ascending**: a repeated or earlier pts is an error. The frame
+//!   cache keys a frame by its pts and gives it coverage up to it, so a duplicate would be served
+//!   for a different picture, and a decoder still learning its reorder depth after a mid-GOP
+//!   seek (frames out of order) would let a frame claim ticks it does not own;
 //! * `duration:` is read too. Its last value is the **last frame's own duration**, which
 //!   `SourceFrames::last_duration` needs to know where a window to the end of the file ends
 //!   (`0`, or absent, is unknown). Under `-copyts -start_at_zero` the pts are already relative to
@@ -67,6 +73,8 @@ pub enum ShowinfoError {
     TimeBaseChanged { from: Rational, to: Rational },
     /// Frames are numbered consecutively from 0; this one is not the next.
     OutOfSequence { expected: u64, got: u64 },
+    /// A run's timestamps strictly ascend; this one is not above the one before.
+    OutOfOrder { prev: i64, got: i64 },
     /// A frame line whose numbers do not fit.
     Unreadable(String),
 }
@@ -85,6 +93,7 @@ impl std::fmt::Display for ShowinfoError {
                 )
             }
             Self::OutOfSequence { expected, got } => write!(f, "expected frame {expected}, got {got}"),
+            Self::OutOfOrder { prev, got } => write!(f, "timestamp {got} does not come after {prev}"),
             Self::Unreadable(line) => write!(f, "unreadable frame line {line:?}"),
         }
     }
@@ -97,6 +106,7 @@ impl std::error::Error for ShowinfoError {}
 pub struct ShowinfoParser {
     time_base: Option<Rational>,
     next: u64,
+    last_pts: Option<i64>,
 }
 
 impl ShowinfoParser {
@@ -138,7 +148,7 @@ impl ShowinfoParser {
             return Err(ShowinfoError::NoPts { n });
         }
         let Some((pts, rest)) = number(rest) else {
-            return Ok(None);
+            return Err(ShowinfoError::Unreadable(line.to_string()));
         };
         let pts: i64 = pts.parse().map_err(|_| ShowinfoError::Unreadable(line.to_string()))?;
         let duration = rest
@@ -153,6 +163,10 @@ impl ShowinfoParser {
                 got: n,
             });
         }
+        if let Some(prev) = self.last_pts.filter(|&prev| pts <= prev) {
+            return Err(ShowinfoError::OutOfOrder { prev, got: pts });
+        }
+        self.last_pts = Some(pts);
         self.next += 1;
         Ok(Some(ShowFrame {
             n,
@@ -225,11 +239,13 @@ fn showinfo_body(line: &str) -> Option<&str> {
     (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) && !pointer.is_empty()).then_some(body)
 }
 
-/// A leading integer (`-` allowed) and what follows it.
+/// A leading integer (`-` allowed) and what follows it, which must be whitespace or nothing: `0x21`
+/// is not the number 0.
 fn number(s: &str) -> Option<(&str, &str)> {
     let digits = s.strip_prefix('-').unwrap_or(s);
     let len = digits.bytes().take_while(u8::is_ascii_digit).count();
-    (len > 0).then(|| s.split_at(s.len() - digits.len() + len))
+    let (number, rest) = s.split_at(s.len() - digits.len() + len);
+    (len > 0 && rest.chars().next().is_none_or(char::is_whitespace)).then_some((number, rest))
 }
 
 #[cfg(test)]
@@ -265,14 +281,16 @@ mod tests {
     /// Real stderr of the production flag set (`-hide_banner -nostats -nostdin -loglevel info
     /// -copyts -start_at_zero -ss <T> -i clip -an -sn -dn -map 0:v:0 -vf
     /// showinfo=checksum=0,scale=out_range=tv -fps_mode passthrough -f yuv4mpegpipe -pix_fmt
-    /// yuv420p pipe:1`) of both FFmpegs, on short x264 all-intra clips. Both builds print the
-    /// same. (To regenerate: clips from `color=c=gray:s=16x16:r=<fps>:d=<s>,format=yuv420p,
-    /// geq=lum='16+8*N':cb=128:cr=128` through `-c:v libx264 -qp 0 -g 1 -bf 0` — mp4 24 fps
-    /// 0.25 s, matroska 30 fps 0.4 s, mpegts 25 fps 0.28 s with `-output_ts_offset 1.4 -muxdelay
-    /// 0 -muxpreload 0` — then the flags above on each FFmpeg, stderr to the file, its trailing
-    /// spaces stripped as the repo's hygiene hook does.) Both print: the banner, `Stream mapping`, the
-    /// `Output #0` block *between* the first frames, a `side data` line and a long hex `User Data=`
-    /// line per SEI, and the closing statistics.
+    /// yuv420p pipe:1`; `-fps_mode` is FFmpeg 5.1's spelling, so a spawn takes the engine's
+    /// `fps_mode_flag()`, which is `-vsync` before that) of both FFmpegs, on short x264
+    /// all-intra clips. Both builds print the same. (To regenerate: clips from
+    /// `color=c=gray:s=16x16:r=<fps>:d=<s>,format=yuv420p,geq=lum='16+8*N':cb=128:cr=128` through
+    /// `-c:v libx264 -qp 0 -g 1 -bf 0` — mp4 24 fps 0.25 s, matroska 30 fps 0.4 s, mpegts 25 fps
+    /// 0.28 s with `-output_ts_offset 1.4 -muxdelay 0 -muxpreload 0` — then the flags above on
+    /// each FFmpeg, stderr to the file, its trailing spaces stripped as the repo's hygiene hook
+    /// does.) Both print: the banner, `Stream mapping`, the `Output #0` block *between* the first
+    /// frames, a `side data` line and a long hex `User Data=` line per SEI, and the closing
+    /// statistics.
     #[test]
     fn the_real_stderr_of_both_ffmpegs_gives_the_same_frames() {
         let clips = [
@@ -369,19 +387,19 @@ mod tests {
             frame("[Parsed_showinfo_0 @ 0x1] n:   0 pts:     -1001 pts_time:-0.0333667 duration:   1001 duration_time:0.0333667 fmt:y"),
             Some((0, -1001, 1001))
         );
-        assert_eq!(
-            frame("[Parsed_showinfo_0 @ 0x1] n:1 pts:123456789012 pts_time:4115226 duration:0 duration_time:0 fmt:y"),
-            Some((1, 123_456_789_012, 0))
-        );
         // No duration (an FFmpeg that does not print it) is unknown, not an error.
         assert_eq!(
-            frame("[Parsed_showinfo_0 @ 0x1] n:   2 pts:   3003 pts_time:0.1001 fmt:y"),
-            Some((2, 3003, 0))
+            frame("[Parsed_showinfo_0 @ 0x1] n:   1 pts:   3003 pts_time:0.1001 fmt:y"),
+            Some((1, 3003, 0))
         );
         // `duration_time:` is not `duration:`.
         assert_eq!(
-            frame("[Parsed_showinfo_0 @ 0x1] n:   3 pts:   4004 duration_time:0.0333667 fmt:y"),
-            Some((3, 4004, 0))
+            frame("[Parsed_showinfo_0 @ 0x1] n:   2 pts:   4004 duration_time:0.0333667 fmt:y"),
+            Some((2, 4004, 0))
+        );
+        assert_eq!(
+            frame("[Parsed_showinfo_0 @ 0x1] n:3 pts:123456789012 pts_time:4115226 duration:0 duration_time:0 fmt:y"),
+            Some((3, 123_456_789_012, 0))
         );
     }
 
@@ -437,6 +455,76 @@ mod tests {
             p.line(&frame(0, "99999999999999999999")),
             Err(ShowinfoError::Unreadable(_))
         ));
+    }
+
+    fn config_and_frames(pts: &[i64]) -> Vec<Result<Option<ShowFrame>, ShowinfoError>> {
+        let mut p = ShowinfoParser::new();
+        p.line("[Parsed_showinfo_0 @ 0x1] config in time_base: 1/12288, frame_rate: 24/1")
+            .unwrap();
+        pts.iter()
+            .enumerate()
+            .map(|(n, pts)| {
+                p.line(&format!(
+                    "[Parsed_showinfo_0 @ 0x1] n:{n:4} pts:{pts:>7} pts_time:0 duration:    512"
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timestamps_must_strictly_ascend_a_repeat_or_an_earlier_one_is_an_error() {
+        // A repeated pts would be one cache key for two pictures, an earlier one a frame claiming
+        // ticks that belong to the frame before it (a decoder still learning its reorder depth
+        // after a mid-GOP seek): both end the run.
+        let ordered = config_and_frames(&[-1024, 0, 512, 2560]);
+        assert!(ordered.iter().all(|r| matches!(r, Ok(Some(_)))), "{ordered:?}");
+        assert_eq!(
+            config_and_frames(&[100, 100])[1],
+            Err(ShowinfoError::OutOfOrder { prev: 100, got: 100 })
+        );
+        assert_eq!(
+            config_and_frames(&[0, 2048, 1024])[2],
+            Err(ShowinfoError::OutOfOrder { prev: 2048, got: 1024 })
+        );
+        assert_eq!(
+            config_and_frames(&[0, 512, 1024, 512, 1536])[3],
+            Err(ShowinfoError::OutOfOrder { prev: 1024, got: 512 })
+        );
+        // Only a frame that is read moves the reference: the one refused is not remembered.
+        let mut p = ShowinfoParser::new();
+        p.line("[Parsed_showinfo_0 @ 0x1] config in time_base: 1/1000, frame_rate: 30/1")
+            .unwrap();
+        let mut feed = |n: u64, pts: i64| p.line(&format!("[Parsed_showinfo_0 @ 0x1] n:{n} pts:{pts} pts_time:0"));
+        assert!(feed(0, 50).unwrap().is_some());
+        assert!(feed(1, 40).is_err());
+        assert!(feed(1, 51).unwrap().is_some());
+        assert_eq!(p.frames_seen(), 2);
+        let e = ShowinfoError::OutOfOrder { prev: 7, got: 3 };
+        assert!(e.to_string().contains('7') && e.to_string().contains('3'));
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_a_plain_integer_is_unreadable_not_a_skipped_line() {
+        let mut p = ShowinfoParser::new();
+        p.line("[Parsed_showinfo_0 @ 0x1] config in time_base: 1/1000, frame_rate: 30/1")
+            .unwrap();
+        for bad in ["0x21", "abc", "-", "--5", "1.5", "5x", "5,"] {
+            let line = format!("[Parsed_showinfo_0 @ 0x1] n:   0 pts:{bad:>8} pts_time:0 duration:33");
+            assert!(matches!(p.line(&line), Err(ShowinfoError::Unreadable(_))), "{bad}");
+        }
+        assert_eq!(p.frames_seen(), 0, "none of them was a frame");
+        // A line whose `n:` is no number is not a frame line at all.
+        assert_eq!(p.line("[Parsed_showinfo_0 @ 0x1] n:x pts:5 pts_time:0"), Ok(None));
+        // A duration that is not a plain integer is unknown, not a prefix of itself.
+        let f = p
+            .line("[Parsed_showinfo_0 @ 0x1] n:0 pts:5 pts_time:0 duration:12abc")
+            .unwrap()
+            .unwrap();
+        assert_eq!((f.pts, f.duration), (5, 0));
+        assert_eq!(number("12 rest"), Some(("12", " rest")));
+        assert_eq!(number("-7"), Some(("-7", "")));
+        assert_eq!(number("0x21"), None);
+        assert_eq!(number("12\u{a0}x"), Some(("12", "\u{a0}x")), "any whitespace");
     }
 
     #[test]
