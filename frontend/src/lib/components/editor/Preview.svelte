@@ -8,7 +8,30 @@
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
-	import { exportCover, getTimelineFrame, inTauri, pickCoverPath, revealPath, startPlayback } from '$lib/api';
+	import {
+		exportCover,
+		getPreviewFrame,
+		getTimelineFrame,
+		inTauri,
+		pickCoverPath,
+		revealPath,
+		setPreviewBounds,
+		startPlayback
+	} from '$lib/api';
+	import { gpuPreview } from '$lib/gpu-preview.svelte';
+	import {
+		anyCovered,
+		boundsReport,
+		describeWhy,
+		holePolygon,
+		parseCssColor,
+		routePreview,
+		sameReport,
+		samplePoints,
+		surfaceShowing
+	} from '$lib/preview-bounds';
+	import { singleFlight } from '$lib/single-flight';
+	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
 	import { clipDuration } from '$lib/types';
@@ -63,6 +86,9 @@
 	}
 
 	let frameUrl = $state<string | null>(null);
+	/** The frame on show was drawn by the GPU in the native surface: the pane draws nothing
+	 *  over it (no picture, no backdrop) and the surface is what is seen. */
+	let gpuShown = $state(false);
 	let inFlight = false;
 	let queued: number | null = null; // latest wanted timeline time, or null to clear
 
@@ -76,13 +102,34 @@
 		queued = null;
 		inFlight = true;
 		try {
-			// The *composited* timeline still — every visible clip with its color,
-			// effects, transform and overlays applied, so Inspector edits show up
-			// live. (Desktop only — null in the browser.)
-			const url = await getTimelineFrame(t, 960);
-			// Playback may have taken over while this was decoding; a still landing
-			// on top of live frames would show as a stutter.
-			if (url && !streaming) frameUrl = url;
+			const via = route;
+			if (via.via === 'gpu') {
+				// The GPU preview is on: the backend draws the frame in the native surface when the
+				// plan allows it (and says so), else it hands back FFmpeg's JPEG for this frame.
+				const result = await getPreviewFrame(t, 960, via.overlays);
+				if (!streaming) {
+					gpuPreview.note(result);
+					if (result.renderer === 'gpu') {
+						gpuShown = true;
+						// The canvas the compositor drew has the delivery's shape.
+						if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
+					} else if (result.frame) {
+						gpuShown = false;
+						frameUrl = result.frame;
+					}
+				}
+			} else {
+				// The *composited* timeline still — every visible clip with its color,
+				// effects, transform and overlays applied, so Inspector edits show up
+				// live. (Desktop only — null in the browser.)
+				const url = await getTimelineFrame(t, 960);
+				// Playback may have taken over while this was decoding; a still landing
+				// on top of live frames would show as a stutter.
+				if (url && !streaming) {
+					frameUrl = url;
+					gpuShown = false;
+				}
+			}
 		} catch {
 			/* ignore decode errors — keep the last good frame */
 		}
@@ -154,6 +201,7 @@
 					// sound, so wait for one that still applies.
 					return;
 				case 'show':
+					gpuShown = false;
 					frameUrl = f.jpeg;
 			}
 		}, reportPlaybackError);
@@ -174,8 +222,14 @@
 		const t = ui.time;
 		void editor.timeline;
 		void ui.previewEpoch;
+		// A change of route (the GPU takes a frame over, or hands it back for a title box) and of
+		// where the surface is both want the frame drawn again.
+		void route.via;
+		void route.overlays;
+		void boundsEpoch;
 		if (!hasClips) {
 			frameUrl = null;
+			gpuShown = false;
 			queued = null;
 			return;
 		}
@@ -221,7 +275,7 @@
 
 	let imgAspect = $state<number | null>(null);
 	const layerBox = $derived.by(() => {
-		if (!frameUrl || !imgAspect) return 'inset:0';
+		if ((!frameUrl && !gpuShown) || !imgAspect) return 'inset:0';
 		const r = containRect(imgAspect, aspect);
 		return `left:${r.left}%;top:${r.top}%;width:${r.width}%;height:${r.height}%`;
 	});
@@ -230,6 +284,159 @@
 		if (ui.playing || empty) return [];
 		const here = editor.overlays.filter((o) => isVisibleAt(o, ui.time));
 		return here.sort((a, b) => Number(a.id === editor.selectedOverlayId) - Number(b.id === editor.selectedOverlayId));
+	});
+
+	// ---- the GPU preview: how the frame is produced, and where the surface is ------------
+	//
+	// With the setting off none of this runs: the route is the JPEG path, nothing is observed and
+	// no command is sent. With it on, the backend is asked for each frame and says which renderer
+	// made it; the surface it draws into sits behind (or, on X11, over) the frame below.
+
+	/** Something of the page is on top of the frame (a dialog, a menu): only the poll below can
+	 *  know, since the DOM does not say. Only a surface above the page is hurt by it. */
+	let covered = $state(false);
+	const route = $derived(
+		routePreview({
+			enabled: settings.gpuPreview,
+			supported: gpuPreview.status?.supported ?? false,
+			overlaysCapable: gpuPreview.status?.overlays ?? false,
+			streaming,
+			empty,
+			titlesShown: titlesHere.length > 0,
+			trimMonitor: !!ui.trimMonitor,
+			guides: showGuides,
+			covered
+		})
+	);
+	const technique = $derived(gpuPreview.status?.technique ?? null);
+	/** The native surface is what is on show in the frame. */
+	const onSurface = $derived(surfaceShowing(route, gpuPreview.renderer) && gpuShown);
+
+	let rootEl = $state<HTMLElement | null>(null);
+	let frameEl = $state<HTMLElement | null>(null);
+	let matteEl = $state<HTMLElement | null>(null);
+	let surroundEl = $state<HTMLElement | null>(null);
+	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
+	let boundsEpoch = $state(0);
+	let wantedBounds: PreviewBoundsReport | null = null;
+	let sentBounds: PreviewBoundsReport | null = null;
+	const sendBounds = singleFlight(async () => {
+		const next = wantedBounds;
+		if (!next || sameReport(sentBounds, next)) return;
+		await setPreviewBounds(next);
+		const moved = !sentBounds || next.x !== sentBounds.x || next.y !== sentBounds.y || next.width !== sentBounds.width || next.height !== sentBounds.height;
+		sentBounds = next;
+		if (next.visible && moved) boundsEpoch++;
+	});
+
+	/** The frame's content box (inside its border) in CSS pixels, or null when it is not laid out. */
+	function frameRect() {
+		const el = frameEl;
+		if (!el || !el.isConnected) return null;
+		const r = el.getBoundingClientRect();
+		const w = el.clientWidth;
+		const h = el.clientHeight;
+		return w > 0 && h > 0 ? { left: r.left + el.clientLeft, top: r.top + el.clientTop, width: w, height: h } : null;
+	}
+
+	/** Whether anything but the frame (and what it holds) is the topmost thing at the frame's points. */
+	function frameCovered(): boolean {
+		const el = frameEl;
+		const rect = frameRect();
+		if (!el || !rect) return false;
+		return anyCovered(samplePoints(rect), (x, y) => {
+			const hit = document.elementFromPoint(x, y);
+			return hit ? el.contains(hit) : null;
+		});
+	}
+
+	function measure(wantSurface: boolean): PreviewBoundsReport {
+		return boundsReport({
+			rect: frameRect(),
+			dpr: window.devicePixelRatio,
+			viewport: { width: window.innerWidth, height: window.innerHeight },
+			visible: wantSurface && document.visibilityState === 'visible',
+			matte: matteEl ? parseCssColor(getComputedStyle(matteEl).backgroundColor) : null
+		});
+	}
+
+	$effect(() => {
+		if (!settings.gpuPreview || !frameEl) return;
+		const wantSurface = route.via === 'gpu';
+		void settings.theme; // the matte follows the theme
+		const update = () => {
+			covered = frameCovered();
+			wantedBounds = measure(wantSurface && !covered);
+			sendBounds.request();
+		};
+		update();
+		// Size changes are observed; position changes (a dock move, a scrolled pane, a window move,
+		// a different monitor's ratio) are caught by the window events and a slow poll.
+		const observer = new ResizeObserver(update);
+		observer.observe(frameEl);
+		if (rootEl) observer.observe(rootEl);
+		observer.observe(document.documentElement);
+		window.addEventListener('resize', update);
+		window.addEventListener('scroll', update, true);
+		document.addEventListener('visibilitychange', update);
+		// A dialog or a menu opening is not an event the frame hears about: look often, and straight
+		// after a click, a right-click or a key.
+		const poll = setInterval(update, 150);
+		const soon = () => requestAnimationFrame(() => requestAnimationFrame(update));
+		for (const type of ['pointerup', 'contextmenu', 'keyup']) window.addEventListener(type, soon, true);
+		return () => {
+			observer.disconnect();
+			window.removeEventListener('resize', update);
+			window.removeEventListener('scroll', update, true);
+			document.removeEventListener('visibilitychange', update);
+			for (const type of ['pointerup', 'contextmenu', 'keyup']) window.removeEventListener(type, soon, true);
+			clearInterval(poll);
+			covered = false;
+			// The panel is gone (a workspace switch, the setting turned off): the surface must not
+			// stay over whatever is there now.
+			wantedBounds = boundsReport({ rect: null, dpr: 1, viewport: { width: 0, height: 0 }, visible: false, matte: null });
+			sendBounds.request();
+		};
+	});
+
+	// Turning the setting off forgets the renderer, so the status bar goes quiet; while it is on, a
+	// frame that is the JPEG by the page's own choice (playback, a dialog over the frame) says so.
+	$effect(() => {
+		if (!settings.gpuPreview) {
+			gpuShown = false;
+			gpuPreview.clear();
+		} else if (route.via === 'jpeg' && route.why) {
+			gpuPreview.noteJpeg(describeWhy(route.why));
+		}
+	});
+
+	// Under a transparent webview (technique `window`) the surface is seen through the page: every
+	// element that paints behind the frame is made transparent, and the pane's own surround is
+	// painted by a layer with a hole where the frame is. Nothing else on the page changes.
+	$effect(() => {
+		if (!onSurface || technique !== 'window' || !rootEl || !frameEl || !surroundEl) return;
+		const tagged: HTMLElement[] = [];
+		for (let el = rootEl.parentElement; el; el = el.parentElement) {
+			el.setAttribute('data-surface-hole', '');
+			tagged.push(el);
+		}
+		const surround = surroundEl;
+		const cut = () => {
+			const outer = surround.getBoundingClientRect();
+			const frame = frameRect();
+			surround.style.clipPath = frame
+				? holePolygon(outer, { x: frame.left - outer.left, y: frame.top - outer.top, width: frame.width, height: frame.height })
+				: '';
+		};
+		cut();
+		const observer = new ResizeObserver(cut);
+		observer.observe(surround);
+		observer.observe(frameEl);
+		return () => {
+			observer.disconnect();
+			for (const el of tagged) el.removeAttribute('data-surface-hole');
+			surround.style.clipPath = '';
+		};
 	});
 
 	type TitleDrag = {
@@ -435,7 +642,14 @@
 	onblur={cancelTitleDrag}
 />
 
-<div style="flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-void)">
+<div
+	bind:this={rootEl}
+	style="flex:1;min-height:0;display:flex;flex-direction:column;position:relative;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
+>
+	{#if onSurface && technique === 'window'}
+		<!-- The pane's surround, with a hole where the frame is: the surface shows through there. -->
+		<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
+	{/if}
 	<div
 		role="presentation"
 		oncontextmenu={onPreviewContextMenu}
@@ -447,9 +661,16 @@
 			</div>
 		{:else}
 			<div
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%);border:var(--line-width) solid var(--border-default);box-shadow:var(--shadow-md)"
+				bind:this={frameEl}
+				data-gpu-frame={onSurface ? 'surface' : undefined}
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
-				{#if frameUrl}
+				{#if settings.gpuPreview}
+					<div bind:this={matteEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--frame-matte)"></div>
+				{/if}
+				{#if gpuShown}
+					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->
+				{:else if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"
 						onload={(e) => {
 							const im = e.currentTarget as HTMLImageElement;
