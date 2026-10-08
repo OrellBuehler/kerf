@@ -63,6 +63,7 @@ JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
+detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback` / `stop_playback` — streamed composited frames over a
 `tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
 counter, because start and stop are separate async calls that can arrive out of
@@ -273,3 +274,56 @@ and never the abstract socket libxcb tries first, and waited out a TCP timeout o
 null one, so its handle is not used — only the toplevel's window id comes from the window handle —
 and one display is kept for the whole life of the process however often the backend is rebuilt.
 Every request on the child window is `check()`ed, so a server that refuses it falls back promptly.
+
+**Detached panels (`popout.rs`).** A panel moved into a window of its own is dockview's
+popout: `window.open`, then the panel's DOM is moved into the new window's document while
+its script keeps running in the editor window's JavaScript realm — so the `editor` / `ui`
+singletons, the transport clock, the Web Audio engine and every Tauri `Channel` are the same
+objects in every window and **nothing is synchronised**. The shell has three jobs.
+(1) **The main window is built in code** — `tauri.conf.json` says `"create": false` for it and
+`popout::create_main_window` builds it from that very entry (`WebviewWindowBuilder::from_config`,
+so `visible: false`, the backdrop and the reveal are exactly as before; a Rust test pins
+`create: false`), because only a builder can carry the `on_new_window` handler: a window declared
+in the config has none and `window.open` returns null from it. (2) **The handler answers only a
+window the page announced** (`popout_expect { rect?, size?, background? }` → `{label, position}`,
+a `PopoutQueue` of announcements taken in order, 15 s time-out, at most 32 waiting; pure and
+unit-tested) **and only for `/popout.html` on the editor webview's own scheme, host and port**
+(`is_popout_url(url, main)`, `main` read from the webview): anything else — a stray `window.open`, a
+`target="_blank"`, another origin's page of that name — is denied. The window is built `window_features(features)` (what makes it
+*related* to the opener: same web process on WebKitGTK, same environment on WebView2, same
+configuration on WKWebView — the thing that makes the returned `Window` scriptable), sized and
+placed by `place` (pure): a rectangle off every screen is moved onto one, a panel detached by hand
+goes to the centre of **another** monitor when there is one, WebKitGTK ignores the `window.open`
+features (`NewWindowFeatures` arrive as `None`), so the rectangle comes from the announcement.
+`popout_cancel` forgets one the page did not open, `popout_focus` raises one (`window.focus()`
+does not raise a native window), `popout_move` applies the one-shot correction below, and
+`close_popout` destroys one by label. (3) **Closing**, per platform, because wry differs: its
+WebKitGTK `close` signal destroys the webview widget only (a blank window stays — the Linux hook
+connects the widget's `destroy` to the window's), WebView2 destroys the window itself, and
+WKWebView has no `webViewDidClose:` so `window.close()` is a no-op there and the page asks
+`close_popout` from dockview's `onWillClosePopoutWindow`. The editor window going away destroys
+every popout (`on_window_event`), as does its page reloading (`on_page_load`: the panels in them
+are that page's); a popout going away emits `popout-closed`. Also Linux-only
+(`gtk`, `webkit2gtk`, the versions Tauri resolves): WebKitGTK defaults
+`javascript-can-open-windows-automatically` to **false** and blocks a `window.open` no gesture
+asked for — a restored layout opens windows at launch with none — so `with_webview` turns it on
+for the editor window (the handler still decides). No capability and no CSP change: the panels
+run in the editor's realm and use its IPC, and a popout is served by the same `tauri://` protocol,
+so the same CSP applies to it (measured: an inline script and a foreign image are blocked there).
+The popout page `frontend/static/popout.html` must be a real file — the static fallback would
+answer the path with `index.html` and start a second editor — and `+layout.svelte` refuses to
+boot when a window has an opener. **dockview ≥ 8.4.1** is required: 8.3.1 refuses any
+non-http(s) popout URL, which is every packaged Linux / macOS build (`tauri://localhost`), and
+only 8.4 polls the popout's `closed` flag, the one signal a shell that destroys a webview gives.
+Tauri's `window.screenX` is the outer position and `innerWidth` the inner size, but the position
+the platform *reads* is not always the one it was *set* to (WSLg: 32 px), and a layout saves the
+read one; `popout.svelte.ts` therefore moves a window that opened a little off by the error, once
+(`positionCorrection`, pure), so a restored window does not creep at every launch.
+Windows are positioned in logical pixels clamped against `available_monitors` (work areas).
+**Not verified outside Linux/WSLg**: WebView2's `NewWindowRequested` + `SetNewWindow` (the popup
+being scriptable, no deadlock building a window inside the handler), WKWebView's `close_popout`
+path and `window_features` placement, `screenX` against mixed-DPI monitors, `requestAnimationFrame`
+in a main window that is minimized, HTML5 tab drags between windows against Tauri's drag-drop
+handler on Windows (`dragDropEnabled` — Kerf keeps it on for file drops). The GPU preview
+(`gpu_preview.rs`) hard-codes the `main` window for its surface and its bounds, so a Preview in a
+popout takes the JPEG path (`routePreview`'s `detached` reason) and hides the surface.

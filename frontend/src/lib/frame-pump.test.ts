@@ -36,6 +36,7 @@ export function harness(env) {
 		routePreview({
 			enabled: env.enabled,
 			supported: status.supported,
+			detached: false,
 			overlaysCapable: status.overlays,
 			streaming,
 			empty: false,

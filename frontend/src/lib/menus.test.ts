@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ACTIONS, actionDef } from './keymap';
-import { PANEL_IDS } from './layout';
+import { PANEL_IDS, type PanelId } from './layout';
 import { WORKSPACE_IDS } from './workspaces';
 import { DELIVERY_PRESETS } from './delivery-formats';
 import { buildMenus, collapseMenus, entryLabel, flatten, focusable, stepFocus, typeahead, type MenuEntry, type MenuState } from './menus';
@@ -24,6 +24,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	allHeight: 'medium',
 	workspace: 'edit',
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
+	detachedPanels: [],
 	desktop: true,
 	...over
 });
@@ -258,6 +259,52 @@ describe('Window', () => {
 		expect(panels.map((p) => (p.command.type === 'panel' ? p.command.panel : null))).toEqual([...PANEL_IDS]);
 		expect(panels.every((p) => p.role === 'check')).toBe(true);
 		expect(panels.filter((p) => p.checked).map((p) => p.label)).toEqual(['Preview', 'Timeline', 'Mixer']);
+	});
+
+	test('panels can go to windows of their own: one entry each, ticked while it is in one', () => {
+		const m = menu('window', { openPanels: ['preview', 'timeline', 'inspector'], detachedPanels: ['inspector'] });
+		const sub = m.items.find((e) => e.kind === 'submenu' && e.label === 'Panel windows') as Extract<MenuEntry, { kind: 'submenu' }>;
+		expect(sub).toBeTruthy();
+		const entries = sub.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
+		expect(entries.map((e) => (e.command.type === 'detach' ? e.command.panel : null))).toEqual([...PANEL_IDS]);
+		expect(entries.every((e) => e.role === 'check')).toBe(true);
+		expect(entries.filter((e) => e.checked).map((e) => e.label)).toEqual(['Inspector']);
+		// A panel that is not open has nothing to move, and says so.
+		const closed = entries.find((e) => e.label === 'Mixer')!;
+		expect(closed.disabled).toBe(true);
+		expect(closed.reason).toBeTruthy();
+		expect(entries.find((e) => e.label === 'Timeline')!.disabled).toBeFalsy();
+	});
+
+	test('the last panel in the editor window cannot go, and the entry says why', () => {
+		const entries = (openPanels: PanelId[], detachedPanels: PanelId[]) => {
+			const sub = menu('window', { openPanels, detachedPanels }).items.find((e) => e.kind === 'submenu' && e.label === 'Panel windows') as Extract<MenuEntry, { kind: 'submenu' }>;
+			return sub.items.filter((e) => e.kind === 'command') as Extract<MenuEntry, { kind: 'command' }>[];
+		};
+		const named = (list: ReturnType<typeof entries>, title: string) => list.find((e) => e.label === title)!;
+		// Two in the editor window: either can go.
+		let list = entries(['preview', 'timeline'], []);
+		expect(named(list, 'Preview').disabled).toBeFalsy();
+		expect(named(list, 'Timeline').disabled).toBeFalsy();
+		// One has gone: the other is the last, and is greyed out with the reason.
+		list = entries(['preview', 'timeline'], ['preview']);
+		expect(named(list, 'Timeline').disabled).toBe(true);
+		expect(named(list, 'Timeline').reason).toBe('The editor window keeps at least one panel');
+		// The one in a window can always come back.
+		expect(named(list, 'Preview').disabled).toBeFalsy();
+		expect(named(list, 'Preview').checked).toBe(true);
+		// A closed panel says to open it.
+		expect(named(list, 'Mixer').reason).toContain('open it from the Window menu');
+	});
+
+	test('giving them all back is offered only while some are out', () => {
+		const dockAll = (detachedPanels: PanelId[]) => {
+			const sub = menu('window', { detachedPanels }).items.find((e) => e.kind === 'submenu') as Extract<MenuEntry, { kind: 'submenu' }>;
+			return sub.items.find((e) => e.kind === 'action' && e.id === 'window.dockAll') as Extract<MenuEntry, { kind: 'action' }>;
+		};
+		expect(dockAll([]).disabled).toBe(true);
+		expect(dockAll([]).reason).toBeTruthy();
+		expect(dockAll(['preview']).disabled).toBeFalsy();
 	});
 
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {

@@ -11,6 +11,8 @@
 	// and Escape drops whatever is in flight. Double-click resets. Only the thumb
 	// takes hold of a drag — a click elsewhere on the travel just focuses the slider —
 	// so a double-click to reset is never also a jump.
+	import { windowOf } from '$lib/realm';
+	import { windows } from '$lib/windows.svelte';
 	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '$lib/slider-gesture';
 
 	let {
@@ -205,9 +207,12 @@
 			}
 			cancelRun();
 		};
-		window.addEventListener('blur', away);
+		// The window the slider is in now: a mixer in a detached window loses focus there.
+		void windows.version;
+		const win = windowOf(root);
+		win.addEventListener('blur', away);
 		return () => {
-			window.removeEventListener('blur', away);
+			win.removeEventListener('blur', away);
 			if (run) clearTimeout(run.timer);
 		};
 	});

@@ -962,6 +962,7 @@ describe('keys that act once per press', () => {
 			'workspace.deliver',
 			'window.resetWorkspace',
 			'window.resetAllWorkspaces',
+			'window.dockAll',
 			'app.keyboard',
 			'app.checkUpdate',
 			'app.releases',

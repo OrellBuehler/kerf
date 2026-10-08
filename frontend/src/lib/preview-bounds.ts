@@ -133,6 +133,10 @@ export interface RouteInputs {
 	enabled: boolean;
 	/** The platform has a surface technique. */
 	supported: boolean;
+	/** The Preview panel is in a window of its own. The surface belongs to the editor window
+	 *  (the backend places it there, by the editor webview's coordinates), so a panel in
+	 *  another window cannot have one. */
+	detached: boolean;
 	/** The page can draw over the picture on this technique. */
 	overlaysCapable: boolean;
 	/** Forward 1x playback is streaming JPEGs into the pane. */
@@ -150,7 +154,7 @@ export interface RouteInputs {
 	covered: boolean;
 }
 
-export type RouteWhy = 'off' | 'unsupported' | 'streaming' | 'empty' | 'overlays' | 'covered';
+export type RouteWhy = 'off' | 'unsupported' | 'detached' | 'streaming' | 'empty' | 'overlays' | 'covered';
 
 export interface Route {
 	/** `gpu`: ask the backend, which may still answer with the JPEG for this frame. `jpeg`: the
@@ -164,7 +168,7 @@ export interface Route {
 
 /**
  * How the frame under the playhead is produced. The GPU is asked only when the setting is on,
- * the platform has a surface, the pane is not being fed a stream and the page does not have to
+ * the platform has a surface, the panel is in the editor window, the pane is not being fed a stream and the page does not have to
  * draw over a surface that covers it, nor has something of its own over the frame (a dialog, a
  * menu). Everything else is the JPEG path, unchanged.
  */
@@ -172,6 +176,7 @@ export function routePreview(i: RouteInputs): Route {
 	const overlays = i.titlesShown || i.trimMonitor || i.guides;
 	if (!i.enabled) return { via: 'jpeg', overlays, why: 'off' };
 	if (!i.supported) return { via: 'jpeg', overlays, why: 'unsupported' };
+	if (i.detached) return { via: 'jpeg', overlays, why: 'detached' };
 	if (i.empty) return { via: 'jpeg', overlays, why: 'empty' };
 	if (i.streaming) return { via: 'jpeg', overlays, why: 'streaming' };
 	if (overlays && !i.overlaysCapable) return { via: 'jpeg', overlays, why: 'overlays' };
@@ -186,6 +191,8 @@ export function describeWhy(why: RouteWhy): string {
 			return 'the GPU preview is off';
 		case 'unsupported':
 			return 'this platform has no preview surface';
+		case 'detached':
+			return 'the panel is in a window of its own, and the surface belongs to the editor window';
 		case 'streaming':
 			return 'playback streams through FFmpeg';
 		case 'empty':

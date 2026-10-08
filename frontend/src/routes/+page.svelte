@@ -18,6 +18,8 @@
 	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { popout } from '$lib/popout.svelte';
+	import { windows } from '$lib/windows.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import {
 		cutSelection,
@@ -62,6 +64,9 @@
 		untrack(() => void mediaStatus.refresh());
 	});
 
+	// A modal over the editor window puts what is in the detached windows out of reach too.
+	$effect(() => popout.setInert(modalOpen));
+
 	// Any timeline edit mid-playback re-anchors the audio so what's heard
 	// matches the new cut (volume/fade tweaks land live too).
 	$effect(() => {
@@ -89,6 +94,10 @@
 		// Ask GitHub whether a newer signed release exists (silently — offline is
 		// not worth an interruption) and offer it in the title bar / dialog.
 		const unlisteners: Array<() => void> = [];
+		// The shortcuts and the menu-suppressing handler listen to every window the editor
+		// is in: a key pressed in a detached panel's window is dispatched there and never
+		// reaches a listener on this one.
+		unlisteners.push(windows.listen('keydown', onKey), windows.listen('contextmenu', onContextMenu));
 		const stopUpdater = updater.init();
 		// A project that was never saved lives only in memory: closing the window
 		// would drop it without a word, so ask first.
@@ -508,6 +517,7 @@
 		'workspace.deliver': () => workspace.switchTo('deliver'),
 		'window.resetWorkspace': () => workspace.reset(),
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
+		'window.dockAll': () => popout.dockAll(),
 
 		'app.keyboard': () => settings.openSection('keyboard'),
 		'app.checkUpdate': () => updater.open(),
@@ -556,8 +566,6 @@
 		if (run[id]() !== false) e.preventDefault();
 	}
 </script>
-
-<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} />
 
 <div
 	inert={modalOpen}

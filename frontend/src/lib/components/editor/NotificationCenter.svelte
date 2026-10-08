@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import { windows } from '$lib/windows.svelte';
 	import { notifications, type Notice, type NoticeKind } from '$lib/notifications.svelte';
 
 	let el = $state<HTMLDivElement | null>(null);
@@ -38,6 +39,18 @@
 
 	const clock = (n: Notice) => new Date(n.at).toLocaleTimeString();
 
+	function onEscape(e: KeyboardEvent) {
+		if (notifications.open && e.key === 'Escape') {
+			e.preventDefault();
+			notifications.open = false;
+		}
+	}
+
+	$effect(() => {
+		const stops = [windows.listen('pointerdown', onWindowPointerDown), windows.listen('keydown', onEscape)];
+		return () => stops.forEach((stop) => stop());
+	});
+
 	function onWindowPointerDown(e: PointerEvent) {
 		if (!notifications.open) return;
 		if (e.target instanceof Node) {
@@ -49,16 +62,8 @@
 	}
 </script>
 
-<svelte:window
-	onpointerdown={onWindowPointerDown}
-	onkeydown={(e) => {
-		if (notifications.open && e.key === 'Escape') {
-			e.preventDefault();
-			notifications.open = false;
-		}
-	}}
-/>
-
+<!-- A press outside the panel, or Escape, closes it — in whichever window it happens: a
+     detached panel's window never reaches a listener on the editor's. -->
 {#if notifications.open}
 	<div
 		bind:this={el}

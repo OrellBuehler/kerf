@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
 	DEFAULT_LAYOUT,
 	LIBRARY_RAIL_WIDTH,
+	MAX_POPOUTS,
 	PANELS,
 	PANEL_IDS,
 	PRESET_LAYOUTS,
@@ -11,6 +12,7 @@ import {
 	insertPanel,
 	openPanelIds,
 	panelState,
+	popoutViews,
 	presetLayout,
 	presetPanelIds,
 	sameArrangement,
@@ -666,5 +668,195 @@ describe('insertPanel', () => {
 		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;
 		const ids = groupIds(back);
 		expect(new Set(ids).size).toBe(ids.length);
+	});
+});
+
+// ---- detached windows --------------------------------------------------------
+
+/** The Edit preset with its inspector group popped out into a window, as dockview
+ *  writes it: the group stays in the grid, empty and hidden, holding the place its
+ *  panels return to, and the window points back at it. */
+function withInspectorDetached(position: unknown = { left: 2200, top: 120, width: 600, height: 700 }): any {
+	const raw = clone(DEFAULT_LAYOUT);
+	const g = group(raw, 'inspector');
+	const views = g.views;
+	g.views = [];
+	delete g.activeView;
+	const visit = (node: any): any => {
+		if (node.type === 'leaf') return node.data.id === 'inspector' ? node : undefined;
+		return node.data.map(visit).find(Boolean);
+	};
+	visit(raw.grid.root).visible = false;
+	raw.popoutGroups = [
+		{ data: { id: 'win-1', views, activeView: views[0] }, gridReferenceGroup: 'inspector', position, url: '/popout.html' }
+	];
+	return raw;
+}
+
+describe('detached windows', () => {
+	test('a window is kept, with the group it returns to', () => {
+		const out = sanitizeLayout(withInspectorDetached())!;
+		expect(out.popoutGroups).toHaveLength(1);
+		expect(out.popoutGroups![0].data!.views).toEqual(['inspector', 'agent']);
+		expect(out.popoutGroups![0].gridReferenceGroup).toBe('inspector');
+		expect(out.popoutGroups![0].position).toEqual({ left: 2200, top: 120, width: 600, height: 700 });
+		const hidden = group(out, 'inspector');
+		expect(hidden.views).toEqual([]);
+		expect([...openPanelIds(out)].sort()).toEqual(Object.keys(PRESET_LAYOUTS.edit.panels).sort() as string[] as never);
+	});
+
+	test('what dockview wrote is what comes back, and again', () => {
+		const once = sanitizeLayout(withInspectorDetached())!;
+		expect(sanitizeLayout(clone(once))).toEqual(once);
+	});
+
+	test('the page is always the popout page, whatever was stored', () => {
+		const raw = withInspectorDetached();
+		raw.popoutGroups[0].url = 'https://example.com/';
+		expect(sanitizeLayout(raw)!.popoutGroups![0].url).toBe('/popout.html');
+		delete raw.popoutGroups[0].url;
+		expect(sanitizeLayout(raw)!.popoutGroups![0].url).toBe('/popout.html');
+	});
+
+	test('a window with no readable place opens where the platform puts it', () => {
+		for (const position of [null, undefined, 'x', {}, { left: 1, top: 1, width: 0, height: 5 }, { left: NaN, top: 1, width: 5, height: 5 }]) {
+			const raw = withInspectorDetached();
+			raw.popoutGroups[0].position = position;
+			expect(sanitizeLayout(raw)!.popoutGroups![0].position, String(position)).toBeNull();
+		}
+	});
+
+	test('an empty hidden group nothing points at is dropped, and its row closes up', () => {
+		const raw = withInspectorDetached();
+		delete raw.popoutGroups;
+		const out = sanitizeLayout(raw)!;
+		expect(groupIds(out)).not.toContain('inspector');
+		expect(out.popoutGroups).toBeUndefined();
+		// The same goes for a window that did not read, which cannot hold a place.
+		const bad = withInspectorDetached();
+		bad.popoutGroups[0].data.views = [];
+		expect(groupIds(sanitizeLayout(bad)!)).not.toContain('inspector');
+	});
+
+	test('a reference group the grid no longer has is not pointed at', () => {
+		const raw = withInspectorDetached();
+		raw.popoutGroups[0].gridReferenceGroup = 'gone';
+		const out = sanitizeLayout(raw)!;
+		expect('gridReferenceGroup' in out.popoutGroups![0]).toBe(false);
+	});
+
+	test('a panel the grid shows cannot also be in a window: that window is dropped, the layout is not', () => {
+		const raw = withInspectorDetached();
+		raw.popoutGroups[0].data.views = ['inspector', 'library'];
+		const out = sanitizeLayout(raw);
+		expect(out).not.toBeNull();
+		expect(out!.popoutGroups).toBeUndefined();
+		expect(viewsOf(out!)).toContain('library');
+	});
+
+	test('two windows cannot show one panel, nor share a group id', () => {
+		const raw = withInspectorDetached();
+		raw.popoutGroups.push({ data: { id: 'win-2', views: ['agent'] }, position: null });
+		raw.popoutGroups[0].data.views = ['inspector'];
+		raw.panels.agent = { id: 'agent', contentComponent: 'agent' };
+		const ok = sanitizeLayout(raw)!;
+		expect(ok.popoutGroups).toHaveLength(2);
+		raw.popoutGroups[1].data.views = ['inspector'];
+		expect(sanitizeLayout(raw)!.popoutGroups).toHaveLength(1);
+		raw.popoutGroups[1].data = { id: 'win-1', views: ['agent'] };
+		expect(sanitizeLayout(raw)!.popoutGroups).toHaveLength(1);
+		raw.popoutGroups[1].data = { id: 'preview', views: ['agent'] };
+		expect(sanitizeLayout(raw)!.popoutGroups).toHaveLength(1);
+	});
+
+	test('a window split into groups is read through the same walk', () => {
+		const raw = withInspectorDetached();
+		const nested = {
+			root: {
+				type: 'branch',
+				data: [
+					{ type: 'leaf', data: { id: 'win-a', views: ['inspector'], activeView: 'inspector' }, size: 300 },
+					{ type: 'leaf', data: { id: 'win-b', views: ['agent'], activeView: 'agent' }, size: 300 }
+				],
+				size: 600
+			},
+			width: 600,
+			height: 700,
+			orientation: 'VERTICAL'
+		};
+		delete raw.popoutGroups[0].data;
+		raw.popoutGroups[0].grid = nested;
+		const out = sanitizeLayout(raw)!;
+		expect(out.popoutGroups![0].data).toBeUndefined();
+		expect(popoutViews(out.popoutGroups![0])).toEqual(['inspector', 'agent']);
+		expect(sanitizeLayout(clone(out))).toEqual(out);
+	});
+
+	test('the editor window keeps a panel of its own', () => {
+		const raw = clone(DEFAULT_LAYOUT);
+		const all = viewsOf(raw);
+		const leafOf = (id: string) => group(raw, id);
+		const win: any[] = [];
+		for (const gid of groupIds(raw)) {
+			const g = leafOf(gid);
+			win.push({ data: { id: `w-${gid}`, views: g.views }, position: null });
+			g.views = [];
+		}
+		raw.popoutGroups = win;
+		expect(all.length).toBeGreaterThan(0);
+		expect(sanitizeLayout(raw)).toBeNull();
+	});
+
+	test('there is a limit to how many windows a stored layout may open', () => {
+		const raw = withInspectorDetached();
+		for (let i = 0; i < 30; i++) raw.popoutGroups.push({ data: { id: `x${i}`, views: ['agent'] }, position: null });
+		expect(sanitizeLayout(raw)!.popoutGroups!.length).toBeLessThanOrEqual(MAX_POPOUTS);
+	});
+
+	test('a layout with no window has no window list', () => {
+		expect(sanitizeLayout(clone(DEFAULT_LAYOUT))!.popoutGroups).toBeUndefined();
+		const raw = clone(DEFAULT_LAYOUT);
+		raw.popoutGroups = 'nope';
+		expect(sanitizeLayout(raw)!.popoutGroups).toBeUndefined();
+	});
+});
+
+describe('sameArrangement and detached windows', () => {
+	const base = () => sanitizeLayout(withInspectorDetached())!;
+
+	test('a window the platform nudged by a title bar is where it was', () => {
+		const a = base();
+		const b = clone(a);
+		b.popoutGroups[0].position.left += 8;
+		b.popoutGroups[0].position.top -= 9;
+		expect(sameArrangement(a, b)).toBe(true);
+	});
+
+	test('a window the user moved or resized is arranged differently', () => {
+		const a = base();
+		const moved = clone(a);
+		moved.popoutGroups[0].position.left += 200;
+		expect(sameArrangement(a, moved)).toBe(false);
+		const resized = clone(a);
+		resized.popoutGroups[0].position.width -= 100;
+		expect(sameArrangement(a, resized)).toBe(false);
+	});
+
+	test('a window opening or closing, or changing what it holds, is a different arrangement', () => {
+		const a = base();
+		expect(sameArrangement(a, sanitizeLayout(clone(DEFAULT_LAYOUT))!)).toBe(false);
+		const fewer = clone(a);
+		fewer.popoutGroups[0].data.views = ['inspector'];
+		expect(sameArrangement(a, fewer)).toBe(false);
+		const reordered = clone(a);
+		reordered.popoutGroups[0].data.views = ['agent', 'inspector'];
+		expect(sameArrangement(a, reordered)).toBe(false);
+	});
+
+	test('a layout with no window is the same as one with an empty list', () => {
+		const a = clone(DEFAULT_LAYOUT);
+		const b = clone(DEFAULT_LAYOUT);
+		b.popoutGroups = [];
+		expect(sameArrangement(a, b)).toBe(true);
 	});
 });

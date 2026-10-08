@@ -8,6 +8,9 @@
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
+	import { onWindow } from '$lib/window-events';
+	import { windows } from '$lib/windows.svelte';
+	import { resizeObserverFor, windowOf } from '$lib/realm';
 	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
@@ -27,6 +30,7 @@
 	} from '$lib/preview-bounds';
 	import { createFramePump } from '$lib/frame-pump.svelte';
 	import { singleFlight } from '$lib/single-flight';
+	import { measuredWidth, transportParts } from '$lib/transport-bar';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
@@ -35,8 +39,12 @@
 	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
-	/** The transport bar's own width: what it can show depends on it, not on the window. */
-	let barWidth = $state(0);
+	/** The transport bar's own width, or undefined until it has been measured (and while it
+	 *  reads 0: hidden, mid-rebuild). What the bar can show depends on it, not on the window;
+	 *  an unknown width shows all of it (`transportParts`). */
+	let barEl = $state<HTMLElement | null>(null);
+	let barWidth = $state<number | undefined>(undefined);
+	const parts = $derived(transportParts(barWidth));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	const empty = $derived(!hasClips);
 
@@ -204,6 +212,28 @@
 	// don't fight over the pane. What it depends on is what `run` reads, and nothing else.
 	$effect(() => frames.run());
 
+	// Read the bar's width when it mounts (again after the next frame, once layout has
+	// settled), when it resizes and when the window does. A read that finds no width
+	// (a hidden dock tab, a rebuild) leaves it unknown rather than zero.
+	$effect(() => {
+		const el = barEl;
+		if (!el) return;
+		// In whichever window the panel is: measured again when it moves to another.
+		void windows.version;
+		const win = windowOf(el);
+		const read = () => (barWidth = measuredWidth(el.clientWidth));
+		read();
+		const settled = win.requestAnimationFrame(read);
+		const observer = resizeObserverFor(el, read);
+		observer.observe(el);
+		win.addEventListener('resize', read);
+		return () => {
+			win.cancelAnimationFrame(settled);
+			observer.disconnect();
+			win.removeEventListener('resize', read);
+		};
+	});
+
 	function scrub(e: MouseEvent) {
 		const el = e.currentTarget as HTMLElement;
 		const x = e.clientX - el.getBoundingClientRect().left;
@@ -260,10 +290,18 @@
 	/** Something of the page is on top of the frame (a dialog, a menu): only the poll below can
 	 *  know, since the DOM does not say. Only a surface above the page is hurt by it. */
 	let covered = $state(false);
+	let rootEl = $state<HTMLElement | null>(null);
+	/** The panel is in a window of its own. The surface and the bounds it is told are the editor
+	 *  window's, so there the frame is the JPEG, as it is with the setting off. */
+	const detached = $derived.by(() => {
+		void windows.version;
+		return rootEl ? windowOf(rootEl) !== window : false;
+	});
 	const route = $derived(
 		routePreview({
 			enabled: settings.gpuPreview,
 			supported: gpuPreview.status?.supported ?? false,
+			detached,
 			overlaysCapable: gpuPreview.status?.overlays ?? false,
 			streaming,
 			empty,
@@ -283,7 +321,6 @@
 	/** The native surface is what is on show in the frame. */
 	const onSurface = $derived(routeVia === 'gpu' && surfaceShowing(route, gpuPreview.renderer) && gpuShown);
 
-	let rootEl = $state<HTMLElement | null>(null);
 	let frameEl = $state<HTMLElement | null>(null);
 	let matteEl = $state<HTMLElement | null>(null);
 	let backdropEl = $state<HTMLElement | null>(null);
@@ -336,14 +373,14 @@
 
 	/** The surface must not be on show (the GPU path failed outright): hide it now, whatever the route says. */
 	function hideSurface() {
-		if (!settings.gpuPreview || !frameEl) return;
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		wantedBounds = measure(false);
 		sendBounds.request();
 	}
 
 	/** Measure the frame and tell the backend (newest wins). */
 	function pushBounds() {
-		if (!settings.gpuPreview || !frameEl) return;
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		covered = frameCovered();
 		wantedBounds = measure(route.via === 'gpu');
 		sendBounds.request();
@@ -352,7 +389,9 @@
 	// The observers live as long as the frame does and the setting is on; what they report is read
 	// when they fire, so a change of route or theme does not tear them down.
 	$effect(() => {
-		if (!settings.gpuPreview || !frameEl) return;
+		// In a window of its own there is no surface to place; the run before this one, if there
+		// was one, reported the panel gone.
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		const el = frameEl;
 		const update = () => pushBounds();
 		// Size changes are observed; position changes (a dock move, a scrolled pane, a window move,
@@ -623,30 +662,33 @@
 	}
 </script>
 
-<svelte:window
-	onkeydowncapture={(e) => {
-		// Abandoning a drag is all Escape does then — not also "clear the selection".
-		if (e.key === 'Escape' && tdrag && !tdrag.committing) {
-			cancelTitleDrag();
-			e.stopPropagation();
-		}
-	}}
-	onblur={cancelTitleDrag}
-/>
-
 <div
 	bind:this={rootEl}
-	style="flex:1;min-height:0;display:flex;flex-direction:column;{onSurface && technique === 'window' ? 'position:relative;background:transparent' : 'background:var(--surface-void)'}"
+	{@attach onWindow({
+		// Abandoning a drag is all Escape does then — not also "clear the selection". These
+		// listen to the window the panel is in, which is a detached window's when it is in one.
+		keydowncapture: (e: KeyboardEvent) => {
+			if (e.key === 'Escape' && tdrag && !tdrag.committing) {
+				cancelTitleDrag();
+				e.stopPropagation();
+			}
+		},
+		blur: cancelTitleDrag
+	})}
+	style="flex:1;min-height:0;display:flex;flex-direction:column;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
 >
-	{#if onSurface && technique === 'window'}
-		<!-- The pane's surround, with a hole where the frame is: the surface shows through there. -->
-		<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
-	{/if}
 	<div
 		role="presentation"
 		oncontextmenu={onPreviewContextMenu}
 		style="flex:1;min-height:0;display:grid;place-items:center;padding:20px;position:relative;container-type:size"
 	>
+		{#if onSurface && technique === 'window'}
+			<!-- The pane's surround, with a hole where the frame is: the surface shows through
+			     there. It covers the pane and nothing else: a positioned layer paints above the
+			     unpositioned transport bar, so one spanning this whole root hid every control in
+			     the bar but the scrub dot. -->
+			<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
+		{/if}
 		{#if empty}
 			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-disabled)">
 				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>
@@ -757,11 +799,11 @@
 	</div>
 	<!-- Transport: go to start, play / pause, go to end, the timecode with the
 	     timeline's rate, and the scrub bar. J / K / L stay on the keyboard. It narrows
-	     gracefully: below ~380 px the duration and the rate go, then the skip buttons'
-	     gaps close — the controls themselves stay. -->
+	     gracefully: below ~380 px of a measured width the duration and the rate go and
+	     the gaps close — the controls themselves always stay (`transport-bar.ts`). -->
 	<div
-		bind:clientWidth={barWidth}
-		style="height:40px;flex:none;display:flex;align-items:center;gap:{barWidth < 380 ? 6 : 10}px;padding:0 {barWidth < 380 ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
+		bind:this={barEl}
+		style="height:40px;flex:none;display:flex;align-items:center;gap:{parts.tight ? 6 : 10}px;padding:0 {parts.tight ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
 			title={settings.withShortcut('Go to start', 'playback.toStart')}
@@ -805,8 +847,10 @@
 				style="position:absolute;left:{empty ? 0 : (ui.time / duration) * 100}%;top:50%;width:11px;height:11px;border-radius:50%;background:var(--kerf-400);transform:translate(-50%,-50%);box-shadow:0 0 0 3px var(--surface-app)"
 			></div>
 		</div>
-		{#if barWidth >= 380}
+		{#if parts.duration}
 			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);white-space:nowrap">{tc(duration)}</span>
+		{/if}
+		{#if parts.rate}
 			<span
 				title="Timeline frame rate; non-drop timecode"
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span

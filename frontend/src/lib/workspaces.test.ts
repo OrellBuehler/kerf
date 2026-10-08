@@ -598,3 +598,58 @@ describe('storing and forgetting layouts', () => {
 		expect(sameArrangement(layoutFor(state, 'color'), nudged('color'))).toBe(false);
 	});
 });
+
+describe('a workspace with panels in windows of their own', () => {
+	/** A nudged Audio layout whose mixer is in a window: the mixer is *in* the layout, just
+	 *  not in its grid. */
+	function audioWithDetachedMixer() {
+		const l = nudged('audio');
+		const visit = (n: any): any => (n.type === 'leaf' ? (n.data.views.includes('mixer') ? n : undefined) : n.data.map(visit).find(Boolean));
+		const leaf = visit(l.grid.root);
+		const views = leaf.data.views;
+		leaf.data.views = [];
+		delete leaf.data.activeView;
+		leaf.visible = false;
+		l.popoutGroups = [{ data: { id: 'win-m', views, activeView: views[0] }, gridReferenceGroup: leaf.data.id, position: { left: 2300, top: 60, width: 460, height: 500 } }];
+		return l;
+	}
+
+	test('survive being stored and read back, windows and all', () => {
+		const layout = audioWithDetachedMixer();
+		const stored = withLayout(defaultWorkspaces(), 'audio', layout);
+		const read = readWorkspaces(clone(stored));
+		expect(read.state.layouts.audio?.popoutGroups).toHaveLength(1);
+		expect(read.state.layouts.audio?.popoutGroups?.[0].position).toEqual({ left: 2300, top: 60, width: 460, height: 500 });
+		expect(read.changed).toBe(false);
+		expect(layoutFor(read.state, 'audio').popoutGroups).toHaveLength(1);
+	});
+
+	test('a panel that is in a window is not "new" to a layout and is not put in the grid as well', () => {
+		// Stored before the record of what was offered: the mixer is not in `UNSTAMPED_OFFERED`, so
+		// the layout would be given it — but it already has it, in a window.
+		const layout = audioWithDetachedMixer();
+		const r = adoptPanels('audio', sanitizeLayout(layout)!, null);
+		expect(r.added).toEqual([]);
+		const gridViews = (n: any): string[] => (n.type === 'leaf' ? n.data.views : n.data.flatMap(gridViews));
+		expect(gridViews(r.layout!.grid.root)).not.toContain('mixer');
+		expect(r.layout!.popoutGroups?.[0].data?.views).toEqual(['mixer']);
+	});
+
+	test('is a different arrangement from the preset, so it is not dropped as a copy of one', () => {
+		const layout = sanitizeLayout(audioWithDetachedMixer())!;
+		expect(sameArrangement(layout, PRESET_LAYOUTS.audio)).toBe(false);
+		const r = adoptPanels('audio', layout, null);
+		expect(r.layout).not.toBeNull();
+	});
+
+	test('a moved window is worth writing, one nudged by the platform is not', () => {
+		const reference = sanitizeLayout(audioWithDetachedMixer())!;
+		const nudgedBy = (dx: number) => {
+			const l = clone(reference);
+			l.popoutGroups[0].position.left += dx;
+			return l;
+		};
+		expect(shouldPersistLayout(nudgedBy(8), reference, presetLayout('audio'), true)).toBe(false);
+		expect(shouldPersistLayout(nudgedBy(300), reference, presetLayout('audio'), true)).toBe(true);
+	});
+});
