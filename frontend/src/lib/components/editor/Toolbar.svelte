@@ -72,7 +72,8 @@
 				label: `Reset ${workspaceSpec(workspace.active).label} workspace`,
 				icon: 'rotate-ccw',
 				action: () => workspace.reset()
-			}
+			},
+			{ label: 'Reset all workspaces', icon: 'rotate-ccw', action: () => workspace.resetAll() }
 		]);
 	}
 

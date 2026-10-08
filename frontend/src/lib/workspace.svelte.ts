@@ -9,10 +9,11 @@
    position starts over; anything that matters lives in those singletons.) */
 
 import type { DockviewApi } from 'dockview';
-import { LIBRARY_RAIL_WIDTH, PANELS, presetLayout, type PanelId } from './layout';
+import { LIBRARY_RAIL_WIDTH, PANELS, presetLayout, sameArrangement, type PanelId } from './layout';
 import type { SerializedDockview } from 'dockview';
-import { layoutFor, shouldPersistLayout, type WorkspaceId } from './workspaces';
+import { layoutFor, shouldPersistLayout, workspaceSpec, type WorkspaceId } from './workspaces';
 import { settings } from './settings.svelte';
+import { toast } from './notifications.svelte';
 
 /** Where a panel opens when it is brought back from the Panels menu: the
  *  library on the preview's left and the deliver panel and the mixer on its
@@ -145,7 +146,14 @@ class WorkspaceState {
 				api.fromJSON(layoutFor(settings.workspaces, id));
 			} catch (e) {
 				console.error('could not restore the layout', e);
-				api.fromJSON(presetLayout(id));
+				try {
+					api.fromJSON(presetLayout(id));
+				} catch (again) {
+					// Neither took: say so rather than leave a dock that looks as if
+					// nothing was asked of it.
+					console.error('could not build the preset either', again);
+					toast.error(`Could not arrange the ${workspaceSpec(id).label} workspace`, { description: String(again) });
+				}
 			}
 			// A layout is built at the size it was saved at; the dock only learns its
 			// real size a frame or two later, off a ResizeObserver. A panel that
@@ -269,17 +277,42 @@ class WorkspaceState {
 		else this.show(id);
 	}
 
-	/** Put the active workspace back to its preset, forgetting what was saved. */
+	/** Put the active workspace back to its preset, forgetting what was saved: the
+	 *  arrangement and the library tab picked in it. Says what it did — a workspace
+	 *  that was never rearranged looks the same afterwards, and a reset that shows
+	 *  nothing reads as one that did nothing. */
 	reset() {
-		if (!this.#api) return;
-		if (this.#timer) {
-			clearTimeout(this.#timer);
-			this.#timer = null;
-		}
+		const api = this.#api;
+		if (!api) return;
+		const id = this.active;
+		const stored = id in settings.workspaces.layouts || id in settings.workspaces.library.tabs;
+		// Nothing stored, and the dock is as restoring the preset left it.
+		const asDefault = !stored && this.#reference !== null && sameArrangement(api.toJSON(), this.#reference);
+		this.#abandonSave();
 		// No entry, and none written back: what settles is the preset, which is
 		// what the baseline will be.
-		settings.clearWorkspaceLayout(this.active);
+		settings.resetWorkspace(id);
+		this.#restore(id);
+		const label = workspaceSpec(id).label;
+		if (asDefault) toast.info(`${label} workspace is already in its default arrangement`);
+		else toast.success(`${label} workspace reset to its default arrangement`);
+	}
+
+	/** Every workspace back to its preset; the one on screen is rebuilt. */
+	resetAll() {
+		if (!this.#api) return;
+		this.#abandonSave();
+		settings.resetAllWorkspaces();
 		this.#restore(this.active);
+		toast.success('All workspaces reset to their default arrangements');
+	}
+
+	/** Drop a change still waiting on the debounce: what it would write is being
+	 *  thrown away. */
+	#abandonSave() {
+		if (!this.#timer) return;
+		clearTimeout(this.#timer);
+		this.#timer = null;
 	}
 }
 
