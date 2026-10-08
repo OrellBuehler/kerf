@@ -2,7 +2,6 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import { toast, notifications } from '$lib/notifications.svelte';
 	import TitleBar from '$lib/components/editor/TitleBar.svelte';
-	import Toolbar from '$lib/components/editor/Toolbar.svelte';
 	import Workspace from '$lib/components/editor/Workspace.svelte';
 	import StatusBar from '$lib/components/editor/StatusBar.svelte';
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
@@ -29,7 +28,20 @@
 		unlinkSelection
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
-	import { inTauri, isMediaPath, confirmAction, onWindowCloseRequested, showMainWindow, takeLaunchProject } from '$lib/api';
+	import { runMenuCommand } from '$lib/menu-commands';
+	import { saveCoverFrame } from '$lib/file-actions';
+	import { importCaptionFile } from '$lib/title-actions';
+	import {
+		inTauri,
+		isMediaPath,
+		confirmAction,
+		onWindowCloseRequested,
+		openReleases,
+		quitApp,
+		revealLogs,
+		showMainWindow,
+		takeLaunchProject
+	} from '$lib/api';
 	import { afterPaint, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
@@ -224,10 +236,6 @@
 		}
 	}
 
-	function onOpen() {
-		void openProjectAt();
-	}
-
 	async function onSave() {
 		if (!inTauri()) {
 			toast.info('Saving a project file is available in the desktop app.');
@@ -242,6 +250,35 @@
 
 	function onExport() {
 		ui.openExport();
+	}
+
+	/** File › Quit. The window's close button asks about unsaved work; so does this. */
+	async function onQuit() {
+		if (!inTauri()) {
+			toast.info('Quitting is available in the desktop app.');
+			return;
+		}
+		await quitApp(
+			() => editor.hasUnsavedWork,
+			() => confirmAction('This project has never been saved. Quit Kerf and lose it?', 'Quit Kerf')
+		);
+	}
+
+	/** Window › Reset all workspaces throws away every arrangement made, so it asks first
+	 *  — unless there is none to lose, when it only rebuilds the one on screen. */
+	async function resetAllWorkspaces() {
+		const w = settings.workspaces;
+		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
+		if (stored && !(await confirmAction('Reset every workspace to its default arrangement? The arrangements you made are lost.', 'Reset all workspaces'))) {
+			return;
+		}
+		workspace.resetAll();
+	}
+
+	function onAbout() {
+		toast.info(`Kerf ${updater.version || ''}`.trim(), {
+			description: 'Non-destructive, AI-assisted video editing. PolyForm Noncommercial 1.0.0 — github.com/OrellBuehler/kerf'
+		});
 	}
 
 	async function onImport() {
@@ -332,13 +369,16 @@
 	 *  (the registry in `keymap.ts`, with the user's changes on top); the type makes
 	 *  an action without a handler a compile error. A handler returns `false` when
 	 *  it did not take the key, so the browser still gets it. */
-	const run: Record<ActionId, (e: KeyboardEvent) => void | false> = {
+	const run: Record<ActionId, () => void | false> = {
 		'file.new': () => void onNew(),
 		'file.open': () => void openProjectAt(),
 		'file.save': () => void onSave(),
 		'file.import': () => void onImport(),
 		'file.export': () => onExport(),
+		'file.importCaptions': () => void importCaptionFile(),
+		'file.saveCover': () => void saveCoverFrame(),
 		'app.settings': () => settings.toggle(),
+		'app.quit': () => void onQuit(),
 
 		'edit.undo': () => {
 			if (editor.canUndo) void editor.undo();
@@ -398,6 +438,9 @@
 		'tool.slide': () => {
 			ui.tool = 'slide';
 		},
+		'tool.snap': () => {
+			ui.snap = !ui.snap;
+		},
 		// A project setting: the registry marks it `repeat: false`, so a held key
 		// does not flip it back and forth.
 		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(clipErr),
@@ -436,8 +479,37 @@
 
 		'view.zoomIn': () => ui.zoomBy(1),
 		'view.zoomOut': () => ui.zoomBy(-1),
-		'view.zoomFit': () => ui.zoomToFit()
+		'view.zoomFit': () => ui.zoomToFit(),
+		'view.minimap': () => ui.toggleMinimap(),
+		'view.safeAreas': () => void settings.setSafeAreas(!settings.safeAreas),
+
+		'workspace.edit': () => workspace.switchTo('edit'),
+		'workspace.color': () => workspace.switchTo('color'),
+		'workspace.audio': () => workspace.switchTo('audio'),
+		'workspace.motion': () => workspace.switchTo('motion'),
+		'workspace.deliver': () => workspace.switchTo('deliver'),
+		'window.resetWorkspace': () => workspace.reset(),
+		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
+
+		'app.keyboard': () => settings.openSection('keyboard'),
+		'app.checkUpdate': () => updater.open(),
+		'app.releases': () =>
+			void openReleases().catch((e) => toast.error(`Couldn't open the release page — ${e instanceof Error ? e.message : String(e)}`)),
+		'app.logs': () => {
+			if (!inTauri()) {
+				toast.info('The log folder is available in the desktop app.');
+				return;
+			}
+			void revealLogs().catch(clipErr);
+		},
+		'app.about': () => onAbout()
 	};
+
+	/** A menu entry names an action; it runs what its key runs. Nothing is selected
+	 *  by it that a modal covers: the bar is inert behind one. */
+	function runAction(id: ActionId) {
+		void run[id]();
+	}
 
 	function onKey(e: KeyboardEvent) {
 		if (e.defaultPrevented || modalOpen) return;
@@ -448,6 +520,9 @@
 		const k = e.key.toLowerCase();
 		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
+		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
+		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
+		if (target?.closest('[role="menubar"], [role="menu"]') && !(e.ctrlKey || e.metaKey || e.altKey)) return;
 
 		// A key that is bound to nothing — or to a combination that is not exactly
 		// this one — does nothing, and in particular never falls through to a
@@ -460,7 +535,7 @@
 			e.preventDefault();
 			return;
 		}
-		if (run[id](e) !== false) e.preventDefault();
+		if (run[id]() !== false) e.preventDefault();
 	}
 </script>
 
@@ -470,8 +545,7 @@
 	inert={modalOpen}
 	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
-	<TitleBar />
-	<Toolbar {onNew} {onExport} {onOpen} {onSave} />
+	<TitleBar onAction={runAction} onCommand={runMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
 	     the project's yet; say so where it cannot be missed. -->
 	{#if editor.previewingStaged}

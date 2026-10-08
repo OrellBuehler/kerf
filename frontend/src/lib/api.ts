@@ -483,6 +483,27 @@ export async function onWindowCloseRequested(
 	});
 }
 
+/** Quit Kerf from a menu. The window's own close button is guarded by
+ *  `onWindowCloseRequested` (a project that was never saved is asked about first);
+ *  this is the same question put to the same window, then the same `destroy` that
+ *  guard ends with — the capability the app already has, so no new one.
+ *  A no-op in the browser harness, which has no window of its own to close. */
+export async function quitApp(needsConfirm: () => boolean, confirm: () => Promise<boolean>): Promise<void> {
+	if (!inTauri()) return;
+	if (needsConfirm()) {
+		let quit = false;
+		try {
+			quit = await confirm();
+		} catch {
+			// A dialog that fails to show must not make the app unquittable.
+			quit = true;
+		}
+		if (!quit) return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().destroy();
+}
+
 /** Show the main window. The desktop app creates it hidden (`visible: false`) so
  *  the webview's unthemed first frame is never seen; the page calls this once the
  *  theme is applied and the first frame has painted (`reveal.ts`). Rust shows the

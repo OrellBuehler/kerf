@@ -90,6 +90,13 @@
 				: 's'}
 		</span>
 	{/if}
+	<!-- Where the project lives; the title bar has its name. -->
+	<span style="width:1px;height:12px;background:var(--border-default)"></span>
+	<span
+		title={editor.currentPath ?? 'In-memory project — not yet saved'}
+		style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);max-width:min(320px,40vw);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+		>{editor.currentPath ?? 'local · in-memory'}</span
+	>
 	{#if showLogs}
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 		<button
