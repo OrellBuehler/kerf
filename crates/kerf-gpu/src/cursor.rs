@@ -13,12 +13,13 @@
 //! until the pick is decided and returns the shown frame, so a cursor's answer is
 //! [`Pick::select`]'s over the whole file — and `select` is held to the export's rendered frames
 //! by kerf-core's `picked.rs`. **That holds where `-ss` lands on the frame the timestamps say.**
-//! A long-GOP transport stream seeks to the *next* keyframe and the decode does not recover
-//! (finding 5 of the design note): the run starts late, as the export's own `-ss` does, and the
-//! cursor answers over the frames it was given — not `select`'s, and not proven against the
-//! export. [`FrameSource::cursor`](crate::FrameSource::cursor) refuses a file once a router run
-//! has learned it lands late (`late_seek`) and cannot know before: the same known limit as the
-//! still's. A repeated timestamp is a file's own (a time base that rounds two frames onto one
+//! A seek into the frames an open GOP's keyframe leads, and a long-GOP transport stream's, land on
+//! a *later* keyframe (finding 5 of the design note): the run starts late, as the export's own
+//! `-ss` does, and the cursor answers over the frames it was given — the export's, not `select`'s,
+//! and not proven against it. [`FrameSource::cursor`](crate::FrameSource::cursor) refuses the
+//! containers that are not MP4 / Matroska (a transport stream among them) and a file a router run
+//! has marked one-shot, and cannot know of an open-GOP mp4 before one has: the same known limit
+//! as the still's. A repeated timestamp is a file's own (a time base that rounds two frames onto one
 //! tick) and is taken as it comes (the stderr is read by
 //! [`ShowinfoParser::allowing_repeats`]; the frame cache's runs keep the strict parser).
 //!

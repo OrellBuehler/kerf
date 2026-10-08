@@ -339,6 +339,48 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   transport stream lands on a later keyframe as the export does, the same known limit as the still's.
   `tests/cursor_fake.rs` (a shell script as `KERF_FFMPEG`) holds the parts that need no FFmpeg.
 
+- **2026-10-08 — A1b-2 `FrameSource`, post-merge review fixes (PR #112's contract: "byte-identical to the
+  one-shot decode"; when in doubt, one-shot).** (1) *Cache history decided the answer.* What `-ss t` returns is
+  not "the frame at `t`": a seek into the frames an open GOP's keyframe leads returns the keyframe, a
+  long-GOP transport stream lands on the next one, and a run that read through from an earlier keyframe (or
+  from 0) has the frame the one-shot does not. Reproduced on 9.0.2 with an x264 `open-gop=1` mp4 (frame 49
+  against 50 at 1.96 s), an x265 mp4 (11 of 400 times) and a long-GOP `.ts` played from 0 (394 of 400 differ).
+  A run therefore answers only for what it can be proved equal on, and every other file is decoded one-shot
+  from the first thing that shows it (`State::distrusted`): the container is MP4 / MOV or Matroska / WebM
+  (`kerf_core::source_is_indexed_container`, a positive allow-list on `ffprobe`'s `format_name`; the cursor
+  refuses the rest too), no B frame (`showinfo`'s `type:`, which the self-test now requires: a closed-GOP file
+  with B frames pays too, because `showinfo` does not give the decode order that would tell it from an open
+  one), a first frame a whole interval or more after its seek (was two; the coverage claim from `pts - ft`
+  went, and a VFR gap now reads as a late seek: speed only), and a file that contradicts itself (time base,
+  unreadable or unpaired timestamps, another size, another picture at a cached pts). That last is also the
+  negative cache: a file whose runs always died was spawned and killed once a request. Fixtures that would
+  have caught it: open-GOP x264, x265 and long-GOP TS walked forward, backward and random through one source
+  each against the one-shot (`tests/frame_source.rs`; the old VFR and TS legs are one-shot by design and say
+  so), and a jittered-pts mp4 and the CFR mp4 for the files runs *do* answer. (2) *The reaper killed a parked
+  run the moment it was reused* (silence counted from the frame it parked after): `Run::want_to` starts the
+  clock when a run is wanted again. (3) *Nothing under the state lock waits on a process*: `run_reader`
+  held the child's lock across `wait()` (a run that closes stdout and never exits blocked `kill`, and with
+  it every request through `stop`); it is a bounded `try_wait` (`EXIT_GRACE`), `stop` kills on a short
+  thread, and `spawn` registers the run, releases the lock for `Command::spawn` and takes it again. Tested
+  with a wrapper that closes its output and sleeps, and mutation-checked. (4) *`FrameCache::put` panicked
+  in a debug build* when two runs of an AVI-like file put two pictures at one pts (release silently kept
+  the first): the cache refuses and counts it, the run fails and the file goes one-shot. (5) *A repeated
+  timestamp made `Non-monotonic DTS` warnings that mangled `showinfo` lines* (the muxer logs from another
+  thread between the calls that make one line: 5 runs in 200 lost a frame line, and the repeated-pts leg of the
+  cursor test failed once in five suites): the run's filter chain ends in `setpts=N/TB`, after `showinfo`, which silences the muxer
+  (0 in 200). (6) `render_plan_with` has an end-to-end test (five cases, both orders and hints, rendered
+  RGBA equal to `render_plan`'s, after checking the compositor is deterministic). (7) *A latent bug the
+  container probe's timing exposed*: a request made before a file's time base is known joins the run
+  another request has starting (it cannot tell where it is), and when that run ended with no frame —
+  because *its* seek (1.99 s) was past the end — the joiner was answered "no frame" for 0.5 s. The
+  parity suite hit it in one run of three once its 28 threads reached the frame source together (the
+  `ffprobe` they all wait for); a joiner now routes afresh (a fake `ffmpeg` that is slow and empty at
+  1.99 s reproduces it; mutation-checked). With the process started off the lock a fresh run is also
+  entered with its starter as a waiter (it is otherwise idle to the router and the first to be taken
+  while the lock is released), and the parity harness asks again on `Busy` (28 threads for one file is
+  more than its three runs: an app renders that frame with FFmpeg). Not done: the 6.1 leg (CI's parity
+  job runs it).
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.

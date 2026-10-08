@@ -36,10 +36,22 @@ fn ffmpeg(args: &[&str]) {
 struct Media {
     /// 29.97 fps H.264 in mp4 (1/30000), a GOP of 30: seeks land inside GOPs.
     cfr: Asset,
-    /// The same picture with a variable frame rate, in matroska (1/1000).
+    /// The same picture with a variable frame rate, in matroska (1/1000): every third gap is three
+    /// frames long, so a seek into one reads as a landing a whole frame late.
     vfr: Asset,
+    /// The CFR picture with timestamps that wander by 100 ticks of 1/90000 (mp4): variable, but
+    /// no seek lands a frame late.
+    jitter: Asset,
     /// The CFR clip as a transport stream (1/90000, a container start of 1.4 s).
     ts: Asset,
+    /// 25 fps H.264 with B-frames and **open GOPs** (a keyframe every 50 frames whose leading
+    /// B-frames cannot be decoded from it): `-ss` into a keyframe's leading frames lands later.
+    open_gop: Asset,
+    /// 25 fps HEVC (x265 defaults: B-frames, open GOPs) in mp4.
+    hevc: Asset,
+    /// 25 fps H.264, one keyframe every 100 frames, as a transport stream: `-ss` lands on the
+    /// next keyframe.
+    long_gop_ts: Asset,
 }
 
 fn media() -> &'static Media {
@@ -80,11 +92,66 @@ fn media() -> &'static Media {
             ],
         );
         let ts = make("clip.ts", &[]);
+        let jitter = make(
+            "jitter.mp4",
+            &[
+                "-vf",
+                "settb=1/90000,setpts='N*3003+100*mod(N,3)'",
+                kerf_core::fps_mode_flag(),
+                "passthrough",
+                "-video_track_timescale",
+                "90000",
+            ],
+        );
+        // Fixtures the one-shot decode treats differently from "the frame at that time": a seek
+        // into leading frames or short of a keyframe lands later.
+        let make_25 = |name: &str, codec: &[&str]| -> PathBuf {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=8"];
+            args.extend_from_slice(codec);
+            args.extend(["-pix_fmt", "yuv420p"]);
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            p
+        };
+        let open_gop = make_25(
+            "open-gop.mp4",
+            &[
+                "-c:v",
+                "libx264",
+                "-x264-params",
+                "open-gop=1:keyint=50:min-keyint=50:bframes=3:scenecut=0",
+            ],
+        );
+        let hevc = make_25(
+            "hevc.mp4",
+            &[
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "keyint=50:min-keyint=50:scenecut=0:log-level=none",
+            ],
+        );
+        let long_gop_ts = make_25(
+            "long-gop.ts",
+            &[
+                "-c:v",
+                "libx264",
+                "-x264-params",
+                "keyint=100:min-keyint=100:bframes=0:scenecut=0",
+                "-output_ts_offset",
+                "1.4",
+            ],
+        );
         let probe = |p: &Path| Project::probe_asset(p).unwrap_or_else(|e| panic!("probe {}: {e}", p.display()));
         Media {
             cfr: probe(&cfr),
             vfr: probe(&vfr),
+            jitter: probe(&jitter),
             ts: probe(&ts),
+            open_gop: probe(&open_gop),
+            hevc: probe(&hevc),
+            long_gop_ts: probe(&long_gop_ts),
         }
     })
 }
@@ -153,6 +220,13 @@ fn the_self_test_passes_on_this_ffmpeg() {
     self_test().expect("the run self-test");
 }
 
+/// Random, forward and backward times over three files, each answered as the one-shot decode
+/// answers. What each leg tests (the stats it prints say which path answered): `cfr` is answered
+/// from runs; `vfr` falls back to one-shot at its first seek into a gap of a frame or more (79 of
+/// its 80 answers are one-shot, equal and no faster: the fallback is what it tests); `ts` is a
+/// container runs are not trusted for, so every answer is one-shot (and its container start of
+/// 1.4 s is read by the one-shot as it always was). `files_that_runs_are_trusted_for_answer_from_runs_in_every_order`
+/// is the leg for runs answering a variable-rate file.
 #[test]
 #[ignore = "needs ffmpeg"]
 fn frames_from_runs_are_the_one_shot_decodes_byte_for_byte() {
@@ -178,7 +252,16 @@ fn frames_from_runs_are_the_one_shot_decodes_byte_for_byte() {
                 "{name} @ {t}: the frame source and the one-shot decode differ"
             );
         }
-        eprintln!("{name}: {:?}", src.stats());
+        let stats = src.stats();
+        eprintln!("{name}: {stats:?}");
+        match name {
+            "cfr" => assert!(
+                stats.spawned > 0 && stats.cache.hits > 0 && stats.distrusted == 0,
+                "{stats:?}"
+            ),
+            "ts" => assert!(stats.spawned == 0 && stats.oneshots >= 70, "{stats:?}"),
+            _ => assert!(stats.oneshots > 0, "{stats:?}"),
+        }
     }
 }
 
@@ -301,4 +384,130 @@ fn concurrent_requests_for_one_file_get_the_frames_they_asked_for() {
         }
     });
     eprintln!("{:?}", src.stats());
+}
+
+/// The frame source against the one-shot decode over `times`, in order, through **one** source
+/// (so each answer depends on what the walk cached before it): the times at which they differ.
+fn disagreements(
+    a: &Asset,
+    src: &FrameSource,
+    reference: &mut std::collections::HashMap<u64, Option<kerf_gpu::YuvFrame>>,
+    times: &[f64],
+    hint: Hint,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    for &t in times {
+        let l = at(a, t);
+        let want = reference
+            .entry(t.to_bits())
+            .or_insert_with(|| decode_layer(&l).unwrap_or_else(|e| panic!("@ {t}: one-shot: {e}")));
+        let got = src.frame(&l, hint).unwrap_or_else(|e| panic!("@ {t}: frame source: {e}"));
+        if got.as_deref() != want.as_ref() {
+            bad.push(format!("{t:.4}"));
+        }
+    }
+    bad
+}
+
+/// `from..to` in steps of a fiftieth of a second: every frame time of a 25 fps clip and the
+/// instant between each.
+fn steps(from: f64, to: f64) -> Vec<f64> {
+    let (a, b) = ((from * 50.0).round() as i64, (to * 50.0).round() as i64);
+    (a..b).map(|k| k as f64 / 50.0).collect()
+}
+
+/// Files the one-shot decode treats differently from "the frame at that time", and a source
+/// that must still answer with the one-shot decode's frame for each, whatever it has read
+/// before: with B-frames and open GOPs a seek into the frames a keyframe leads (2.00 s is a
+/// keyframe, 1.96 s is the frame before it) returns the keyframe, where a run that read through
+/// from an earlier keyframe has the frame itself (49, where the one-shot returns 50); a
+/// transport stream lands on the next keyframe whatever is asked, and a run from 0 did not.
+/// Forward, backward and random order, one source each, every answer equal to the one-shot's.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn files_whose_seeks_do_not_land_on_the_frame_at_that_time_are_decoded_as_the_one_shot_does() {
+    let m = media();
+    // (name, file, the window around its keyframes to walk, runs are expected to start)
+    let cases = [
+        ("open-gop", &m.open_gop, true),
+        ("hevc", &m.hevc, true),
+        ("long-gop-ts", &m.long_gop_ts, false),
+    ];
+    for (name, a, starts_runs) in cases {
+        let mut forward = steps(1.5, 2.5);
+        forward.extend(steps(5.5, 6.5));
+        let mut backward = forward.clone();
+        backward.reverse();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let random: Vec<f64> = (0..30).map(|_| (rng.next() * duration(a) * 1e6).round() / 1e6).collect();
+        let mut reference = std::collections::HashMap::new();
+        for (order, times) in [("forward", &forward), ("backward", &backward), ("random", &random)] {
+            let src = source();
+            assert!(src.runs_enabled(), "the run path is off on this ffmpeg");
+            let bad = disagreements(a, &src, &mut reference, times, Hint::Scrub);
+            let stats = src.stats();
+            eprintln!("{name} {order}: {} of {} differ; {stats:?}", bad.len(), times.len());
+            assert!(bad.is_empty(), "{name} {order}: differs from the one-shot at {bad:?}");
+            if starts_runs {
+                // Not vacuous: a run was started and found out why it cannot be trusted.
+                assert!(stats.spawned > 0 && stats.distrusted == 1, "{name} {order}: {stats:?}");
+            } else {
+                assert_eq!(
+                    stats.spawned, 0,
+                    "{name} {order}: a transport stream starts no run: {stats:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same walks over a file a run can be proved equal for: runs are what answers, and they are
+/// still the one-shot's frames, in every order.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn files_that_runs_are_trusted_for_answer_from_runs_in_every_order() {
+    let m = media();
+    for (name, a) in [("cfr", &m.cfr), ("jitter", &m.jitter)] {
+        let dur = duration(a);
+        let forward: Vec<f64> = (0..60).map(|k| 0.7 + f64::from(k) / 29.97).collect();
+        let mut backward = forward.clone();
+        backward.reverse();
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let random: Vec<f64> = (0..30).map(|_| (rng.next() * dur * 1e6).round() / 1e6).collect();
+        let mut reference = std::collections::HashMap::new();
+        for (order, times) in [("forward", &forward), ("backward", &backward), ("random", &random)] {
+            let src = source();
+            let bad = disagreements(a, &src, &mut reference, times, Hint::Scrub);
+            let stats = src.stats();
+            eprintln!("{name} {order}: {} of {} differ; {stats:?}", bad.len(), times.len());
+            assert!(bad.is_empty(), "{name} {order}: differs from the one-shot at {bad:?}");
+            assert!(
+                stats.spawned > 0 && stats.cache.hits > 0 && stats.distrusted == 0,
+                "{name} {order}: runs answered nothing: {stats:?}"
+            );
+        }
+    }
+}
+
+/// A run parked at the frame it was asked for has made no progress for as long as it sat there;
+/// asking it for more starts its silence clock then. Before, the reaper killed it within a tick of
+/// the request: the silence it was judged by was the time it spent parked.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_parked_run_that_is_asked_again_is_not_killed_for_the_time_it_was_parked() {
+    let a = &media().cfr;
+    let src = FrameSource::new(FrameSourceConfig {
+        frame_timeout: std::time::Duration::from_millis(400),
+        ..FrameSourceConfig::default()
+    });
+    assert!(src.runs_enabled());
+    src.frame(&at(a, 0.5), Hint::Scrub).expect("the first frame");
+    assert_eq!(src.stats().spawned, 1);
+    // Parked past the silence the reaper allows a run that is wanted (several of its ticks).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let l = at(a, 0.9);
+    let got = src.frame(&l, Hint::Scrub).expect("the same run, read on");
+    assert_eq!(got.as_deref(), decode_layer(&l).unwrap().as_ref());
+    let stats = src.stats();
+    assert_eq!((stats.spawned, stats.reused), (1, 1), "{stats:?}");
 }

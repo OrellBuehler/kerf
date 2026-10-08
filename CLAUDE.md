@@ -1662,9 +1662,11 @@ of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all 
   `covers_from - 1`, and `mark_end` makes every later time `Lookup::PastEnd` (FFmpeg draws
   nothing there). A frame decoded after another covers from the tick after it; a run's first
   covers from its seek tick, which **the caller clamps to one frame interval before it**
-  (mpegts seeks a GOP late and must not claim the frames it skipped). A file has one picture
-  per pts, so inserting under a held key keeps the first frame and a debug build asserts the
-  second is the same picture.
+  (`FrameSource` marks the file instead when the first frame is a whole interval late, and then
+  claims nothing before that frame). A file has one picture per pts, so inserting under a held key
+  keeps the first frame; `conflicts_with` says beforehand whether the picture offered is a
+  different one (the run fails and the file goes one-shot) and `CacheStats::conflicts` counts a
+  refused one — no assertion, because a container that guesses its pts does that.
 - `y4m::Y4mReader` — streams frames straight into the plane `Vec`s (`take().read_to_end()`
   into spare capacity: no whole-stream buffer, no copy, no zero-fill; the header and `FRAME`
   marker are read unbuffered, a few bytes, so nothing swallows the planes). The header's size
@@ -1735,36 +1737,85 @@ pool, never under the project lock); `frames(&layers, Hint)` decodes the layers 
 **layers asking for the same frame of one file share one decode**; `Compositor::render_plan_with`
 is `render_plan` over it (`composite_shared` takes the `Arc` frames). A run is
 `run_args`: `-hide_banner -nostats -nostdin -loglevel info [-hwaccel h] -copyts -start_at_zero -ss
-T -i path -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv -fps_mode passthrough
--f yuv4mpegpipe -pix_fmt yuv420p pipe:1` (`-fps_mode` spelled by `kerf_core::fps_mode_flag()`,
-which is `-vsync` before FFmpeg 5.1), spawned under `plain_log_env` with the CPU cap divided
-among the runs alive; a reader thread pairs each y4m frame with its `showinfo` line **by number**
+T -i path -an -sn -dn -map 0:v:0 -vf showinfo=checksum=0,scale=out_range=tv,setpts=N/TB
+-fps_mode passthrough -f yuv4mpegpipe -pix_fmt yuv420p pipe:1` (`-fps_mode` spelled by
+`kerf_core::fps_mode_flag()`, which is `-vsync` before FFmpeg 5.1; the chain ends in `setpts=N/TB`,
+after `showinfo` has printed the file's own pts, because a repeated timestamp makes the y4m muxer log
+`Non-monotonic DTS` from another thread between the calls that make one `showinfo` line, which loses
+its prefix: 5 runs in 200 on a repeated-pts mkv, 0 with it), spawned under `plain_log_env` with the
+CPU cap divided among the runs alive; a reader thread pairs each y4m frame with its `showinfo` line **by number**
 and files it under `(identity captured at spawn, pts)`. Only `Pick::AtOrAfter` is served (a still's
 pick, keyed by **`kerf_core::seek_ticks(t, tb)`**, the tick the still's `-ss {:.6}` becomes);
 `Before` / `Fps` are a cursor's (A1b-3) and come back `Unsupported`; a still image is one one-shot
-decode, cached. What it guarantees: **a frame from a run is the one-shot decode's, byte for byte**
-— the parity harness decodes every compared case both ways and asserts equal planes (FFmpeg 6.1.1
-and 9.0.2), and `tests/frame_source.rs` does it for 80 times each on a 29.97 mp4, a VFR matroska
-and a transport stream with a container start, plus six threads at once. The rules it holds to:
-- A run's first frame covers from its seek tick (at most one frame interval back); a run **from
-  0** covers everything before its first frame (a late-starting picture). A clean end calls
+decode, cached. What it guarantees: **a frame it returns is the one-shot decode's, byte for byte —
+for the files it answers from runs, and those are the files it could not catch a run out on.** The
+one-shot (`decode_layer`, `-ss t`, the FFmpeg still's own seek) is the contract, and what `-ss t`
+returns is *not* "the frame at `t`" for every file: a seek into the frames a keyframe leads (B
+frames of an open GOP, 1.96 s before a keyframe at 2.00 s) returns the keyframe, where a run that
+read through from an earlier keyframe has the frame itself (49, against the one-shot's 50); a
+transport stream lands on the next keyframe whatever is asked, and a run from 0 did not. So runs
+answer only where they can be proved equal, and everything else is **one-shot, per file, from the
+first thing that shows it** (`State::distrusted`, `SourceStats::distrusted`; the cost is speed, never
+a frame):
+- **The container** is MP4 / MOV or Matroska / WebM (`kerf_core::source_is_indexed_container`, one
+  cached `ffprobe` a file, off the lock): a positive allow-list, so a transport stream, AVI (whose
+  pts are guessed, and guessed differently run to run: the same pts held two pictures and the
+  cache's `debug_assert!` panicked a run's thread under the lock), program and elementary streams
+  and a file the probe could not name go one-shot before any run. `FrameSource::cursor` refuses
+  them too.
+- **Only I and P pictures** (`ShowFrame::pict`, the `type:` of the `showinfo` line; the self-test
+  fails a build that does not print it): the first B frame a run reads ends the run and marks the
+  file. That is every open-GOP file (x264 `open-gop=1`, x265's default) and, deliberately, closed-GOP
+  files with B frames too — telling them apart needs the keyframes' decode order, which `showinfo`
+  does not give; all-intra proxies, the files the preview reads, are unaffected.
+- **A seek that lands late**: the first frame of a seeked run is the first at or after the seek tick,
+  less than one frame interval away; **one interval or more** marks the file (it was two intervals,
+  which let a landing one or two frames late through, and the frame's coverage was claimed from
+  `pts - ft`, so cache history decided the answer). A frame that landed late claims nothing before
+  itself. This also marks a variable-frame-rate file the first time a seek falls in a gap of a frame
+  or more (the `vfr` leg of `tests/frame_source.rs` is that case: 79 of 80 answers are one-shot, equal
+  to the one-shot decode and no faster).
+- **A file that contradicts itself**: a time base that changes between runs, timestamps that cannot
+  be read or paired with frames (`ShowinfoError`), a picture of another size or format than probed,
+  or a picture that differs from the one an earlier run cached at the same pts
+  (`FrameCache::conflicts_with`; the cache refuses and counts it, never a panic) ends the run and
+  marks the file, so a file whose runs always die is not spawned and killed once a request.
+
+The checks: the parity harness decodes every compared case both ways and asserts equal planes
+(FFmpeg 6.1.1 and 9.0.2) and `rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give`
+asserts the **rendered** RGBA of `render_plan_with` equals `render_plan`'s, bit for bit, on five
+cases in two orders and both hints; `tests/frame_source.rs` walks a 29.97 mp4 and a jittered-pts mp4
+(trusted: runs answer, in forward, backward and random order, every answer equal) and an open-GOP
+x264, an x265 and a long-GOP transport stream (the files above: forward, backward and random through
+one source each, every answer equal to the one-shot's, and the stats say which went one-shot), plus
+six threads at once. The rules it holds to:
+- A run's first frame covers from its seek tick (within a frame interval of it, see above); a run
+  **from 0** covers everything before its first frame (a late-starting picture). A clean end calls
   `mark_end` (a time past it is `Ok(None)`, no decode); a clean run with **no** frame is a seek
   past the end (`mark_end(seek_tick - 1)`); a non-zero exit with no frame is a **failed start**,
   never an end, and its error carries ffmpeg's stderr tail.
-- **A seek that lands late** (the first frame more than two intervals after a seek above 0: a
-  long-GOP transport stream seeks to the next keyframe and does not recover, finding 5) marks
-  the file `late_seek`, and its frames come from `decode_layer` from then on: what `-ss t`
-  returns there is not a function of the timestamps, and the FFmpeg still returns that late
-  keyframe too (measured on 6.1.1: `-ss 1.184` on a GOP-30 `.ts` gives the frame at 2.002 s
-  on both paths; the byte-for-byte test passes on 9.0.2 too). A run that reads past its target without the cache proving the frame is given up on
+- A run that reads past its target without the cache proving the frame is given up on
   and the request routed again; after two starts it decodes one-shot (`SourceStats::fallbacks`).
-- **Nothing waits forever**: a reaper thread (it holds a `Weak`) kills a run that is wanted
-  and silent for `first_frame_timeout` (30 s) / `frame_timeout` (15 s) and one idle for
-  `idle_kill` (20 s), and drops a finished run's record after 5 s; a `Scrub` / `Forward`
-  request gives up after `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run
-  blocks once it is past what was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most
-  24), so the pipe fills and ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill
-  every child. One-shots are capped (`max_oneshots`, 2).
+  A request made before the file's time base is known joins a run another request has starting
+  (`joined_blind`) and cannot tell where that run is, so that run ending (or failing) with no frame,
+  because *its* seek was past the end, is not an answer for the joiner: it routes afresh (it used to
+  return "no frame" for a time inside the file; `tests/frame_source_fake.rs`).
+- **Nothing waits forever, and nothing under the lock waits on a process**: a reaper thread (it
+  holds a `Weak`) kills a run that is wanted and silent for `first_frame_timeout` (30 s) /
+  `frame_timeout` (15 s) and one idle for `idle_kill` (20 s), and drops a finished run's record
+  after 5 s. **The silence it measures starts when the run is wanted** (`Run::want_to`): a run
+  parked at what it was asked for has made no progress for as long as it sat there, and was killed
+  within a tick of being asked again. A `Scrub` / `Forward` request gives up after
+  `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run blocks once it is past what
+  was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most 24), so the pipe fills and
+  ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. A run that closes
+  its stdout and does not exit is killed after `EXIT_GRACE` (5 s; `wait_until`, a `try_wait` loop
+  that holds the child's lock only for a poll — the reader used to `wait()` under it, so every
+  `kill` and, through `stop` under the state lock, every request waited too). **No process is
+  started or waited for with the state lock held**: `spawn` enters the run in the table with no
+  child, releases the lock for `Command::spawn` and takes it again to give the run its child (a
+  run stopped meanwhile has its fresh child killed), and `stop` hands the kill to a short thread
+  (`reap_later`). One-shots are capped (`max_oneshots`, 2).
 - **The path can be off**: the first use runs **`self_test`** (an `mpeg4` clip at 30000/1001
   made by ffmpeg's own encoder, decoded from frame 5 with the production flags, every pts
   expected exactly, all inside 10 s), and if it fails (a build whose `showinfo`, `-ss` or time
@@ -1774,7 +1825,9 @@ and a transport stream with a container start, plus six threads at once. The rul
 - Hardware decode is `kerf_core::decode_hwaccel()` (now public); a run that dies before its
   first frame with it is retried once in software, and success calls `disable_decode_hwaccel`.
 - `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
-  holds a run that hangs and one that dies to a prompt `GpuError::Decode`.
+  holds a run that hangs and one that dies to a prompt `GpuError::Decode`, a run that closes its
+  output and never exits (`release` must not wait on it) and a second run whose pictures differ
+  from the first's at the same pts (the file goes one-shot, no panic).
   `bench_frame_source_decode_vs_one_shot` (`KERF_BENCH=1`) times both paths: here, release, software
   decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
   one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
@@ -1790,10 +1843,12 @@ a frame after the one the export keeps and every pick is a frame late (20 of the
 in `tests/cursor.rs`'s microsecond mp4 differ between the two spellings; it holds the export's). `cursor.pick(&Pick)` reads until `Pick::progress`
 decides and returns the shown frame, so its answer is `Pick::select`'s over the whole file — which
 `picked.rs` holds to the export's rendered frames — **where `-ss` lands on the frame the timestamps
-say**: a long-GOP transport stream seeks to the next keyframe and the decode does not recover, the
-run starts late as the export's own `-ss` does, and the cursor answers over the frames it was given
-(not `select`'s, not proven against the export; `FrameSource::cursor` refuses a file once a router
-run has learned it lands late and cannot know before — the same known limit as the still's). It
+say**: a seek that lands on a later keyframe (a seek into the frames an open GOP's keyframe leads;
+a long-GOP transport stream, which `FrameSource::cursor` refuses up front along with the other
+containers that are not MP4 / Matroska) starts the run late, as the export's own `-ss` does, and the
+cursor answers over the frames it was given — the export's, not `select`'s over the whole file, and
+not proven against the export. `FrameSource::cursor` refuses a file a router run has already marked
+(it cannot know of an open-GOP mp4 before one has): the same known limit as the still's. It
 keeps every timestamp read but only the pixels a later pick can show: `keep_from` once decided and,
 while a forward pick is undecided, the newest frame (output frames the caller skips are read through,
 not held); a forward clip holds a frame or two, a **reversed** one its whole window, capped by
@@ -1807,7 +1862,8 @@ stdout and does not exit within `frame_timeout` is killed (a bounded `try_wait`,
 the child's lock; the router's `run_reader` the same, `EXIT_GRACE`), a size or layout the compositor
 does not draw is `Unsupported` (not a failed decode), a thread that cannot be started kills the child,
 and `Drop` kills the run. `FrameSource::cursor(layer, config)` opens one where runs are trusted
-(refused: the self-test failed, an unrecorded or alpha pixel format, a `late_seek` file);
+(refused: the self-test failed, an unrecorded or alpha pixel format, a container that is not
+MP4 / Matroska, a file a router run has marked one-shot);
 `cursor::picks_through(cursor, pick, frames, |frame, shown| ..)` is the per-clip loop an export
 makes, handing each frame to a callback as it is decided (a long clip is never held whole).
 `tests/cursor.rs` (`#[ignore]`d, both FFmpegs in CI's parity job; 9.0.2 run here) decodes lossless

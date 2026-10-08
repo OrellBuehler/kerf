@@ -1054,6 +1054,11 @@ pub(crate) struct SourceTraits {
     /// Seconds between the container's start and the video's first frame (see
     /// [`head_lead`]); `0.0` for an ordinary file.
     pub lead: f64,
+    /// The container is an MP4/MOV or Matroska/WebM file: a per-packet timestamp of its own
+    /// and a seek index. Transport streams, AVI, program streams and bare elementary streams
+    /// are not (their timestamps are measured or guessed and their seeks land on a later
+    /// keyframe), and neither is a file whose format the probe did not name.
+    pub indexed: bool,
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached
@@ -1131,7 +1136,19 @@ fn parse_source_traits(json: &str) -> SourceTraits {
             secs(format.and_then(|f| f.get("start_time"))),
         )
     };
-    SourceTraits { hdr, lead }
+    let indexed = format
+        .and_then(|f| f.get("format_name"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.split(',').any(|n| matches!(n, "mp4" | "matroska")));
+    SourceTraits { hdr, lead, indexed }
+}
+
+/// Whether the file at `path` is an MP4/MOV or Matroska/WebM file (see
+/// [`SourceTraits::indexed`]): the only containers whose frame timestamps and seeks the
+/// GPU frame source's decode runs are checked against. One cached `ffprobe` per file (it
+/// spawns a process: not under a lock); `false` when the probe fails.
+pub fn source_is_indexed_container(path: &Path) -> bool {
+    source_traits(path).is_some_and(|t| t.indexed)
 }
 
 /// The HDR transfer of the first video stream of the file at `path`, for the
@@ -7058,6 +7075,20 @@ mod tests {
         let mp4 =
             r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"1.4"}}"#;
         assert!((parse_source_traits(mp4).lead - 0.121333).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_mp4_and_matroska_are_indexed_containers() {
+        let indexed =
+            |name: &str| parse_source_traits(&format!(r#"{{"streams":[{{}}],"format":{{"format_name":"{name}"}}}}"#)).indexed;
+        assert!(indexed("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert!(indexed("matroska,webm"));
+        for other in ["mpegts", "avi", "mpeg", "mpegvideo", "h264", "flv", "asf", "mxf", "image2"] {
+            assert!(!indexed(other), "{other}");
+        }
+        // No format named (a failed or odd probe) is not indexed.
+        assert!(!parse_source_traits(r#"{"streams":[{}],"format":{}}"#).indexed);
+        assert!(!parse_source_traits("not json").indexed);
     }
 
     #[test]

@@ -787,6 +787,45 @@ fn report() -> &'static Mutex<BTreeMap<String, String>> {
     R.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// The layers' frames from the suite's one [`frame_source`]. The suite asks for a few files from
+/// every test thread at once, and "every decode run is in use" is a legitimate answer to that (an
+/// app renders that frame through FFmpeg), so the harness asks again.
+fn shared_frames(layers: &[kerf_core::PlanLayer]) -> Result<Vec<Option<Arc<kerf_gpu::YuvFrame>>>, kerf_gpu::GpuError> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match frame_source().frames(layers, kerf_gpu::Hint::Scrub) {
+            Err(kerf_gpu::GpuError::Busy(_)) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Where two decoded frames differ, for a failure message.
+fn describe_difference(a: Option<&kerf_gpu::YuvFrame>, b: Option<&kerf_gpu::YuvFrame>) -> String {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let first = |x: &[u8], y: &[u8]| x.iter().zip(y).position(|(p, q)| p != q);
+            format!(
+                "{}x{} against {}x{}, first luma difference at {:?}, first chroma at {:?} / {:?}",
+                a.width,
+                a.height,
+                b.width,
+                b.height,
+                first(&a.y, &b.y),
+                first(&a.u, &b.u),
+                first(&a.v, &b.v)
+            )
+        }
+        (a, b) => format!(
+            "{} against {}",
+            a.map_or("no frame", |_| "a frame"),
+            b.map_or("no frame", |_| "a frame")
+        ),
+    }
+}
+
 /// Render `tl` at each of `times` through both renderers and hold them to
 /// `limits`. Returns the failures (empty when every time passes) after printing
 /// a line per time.
@@ -834,14 +873,15 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         let (frame, timings) = compositor().render_plan(&plan, size).expect("GPU render");
         assert_eq!((frame.width as usize, frame.height as usize), (w, h));
         // The layers' frames from long-lived runs: identical to the one-shot decode's, not merely close.
-        let shared = frame_source()
-            .frames(&plan.layers, kerf_gpu::Hint::Scrub)
-            .unwrap_or_else(|e| panic!("{case} @ {t}: the frame source: {e}"));
+        let shared = shared_frames(&plan.layers).unwrap_or_else(|e| panic!("{case} @ {t}: the frame source: {e}"));
         let oneshot = kerf_gpu::decode_layers(&plan.layers).expect("decode");
         for (n, (a, b)) in shared.iter().zip(&oneshot).enumerate() {
             assert!(
                 a.as_deref() == b.as_ref(),
-                "{case} @ {t}: layer {n}: the frame source's frame is not the one-shot decode's"
+                "{case} @ {t}: layer {n} ({}, source time {}): the frame source's frame is not the one-shot decode's: {}",
+                plan.layers[n].path,
+                plan.layers[n].source_time,
+                describe_difference(a.as_deref(), b.as_ref())
             );
         }
         let gpu_rgb = rgba_to_rgb(&frame.data);
@@ -943,6 +983,100 @@ fn single_clip_at_the_footage_size() {
     check("single/smptehdbars", &tl, std::slice::from_ref(&m.bars), &[0.0, 1.0], STRICT);
     let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)]], None);
     check("single/gradient", &tl, std::slice::from_ref(&m.gradient), &[0.0, 1.0], STRICT);
+}
+
+/// `Compositor::render_plan_with` end to end: the picture composited from a `FrameSource`'s
+/// frames (runs, a cache, layers sharing a decode) is the picture composited from the one-shot
+/// decodes, bit for bit, and so on a second ask (served by the cache), on a `Forward` ask (a run
+/// read on) and with the times visited backwards. The suite's other cases compare the *frames*
+/// of the two paths; this is the render.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give() {
+    let m = media();
+    let mut over = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    over.transform = Transform {
+        scale: 0.7,
+        rotation: 17.0,
+        crop_left: 0.1,
+        pos_x: -0.1,
+        ..Transform::default()
+    };
+    let mut half = clip(&m.bars, 0.0, 2.0, 0.0);
+    half.transform.opacity = 0.5;
+    let mut fast = clip(&m.testsrc, 0.2, 2.0, 1.0);
+    fast.speed = 2.0;
+    let cases = [
+        (
+            "single",
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+            vec![m.testsrc.clone()],
+            vec![0.0, 0.5, 1.2345],
+        ),
+        (
+            "contain/9x16",
+            timeline(
+                vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+                Some(Delivery::new(360, 640, Fit::Contain)),
+            ),
+            vec![m.testsrc.clone()],
+            vec![0.5, 1.2],
+        ),
+        (
+            "transform over gradient",
+            timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![over]], None),
+            vec![m.gradient.clone(), m.testsrc.clone()],
+            vec![0.5, 1.5],
+        ),
+        (
+            "opacity",
+            timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![half]], None),
+            vec![m.testsrc.clone(), m.bars.clone()],
+            vec![0.0, 1.0],
+        ),
+        (
+            "speed 2x, and the layers of one shot",
+            timeline(vec![vec![fast], vec![clip(&m.testsrc, 0.2, 2.0, 1.0)]], None),
+            vec![m.testsrc.clone()],
+            vec![1.0, 1.4, 1.7],
+        ),
+    ];
+    let compositor = compositor();
+    let source = kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default());
+    assert!(source.runs_enabled(), "the run path is off on this ffmpeg");
+    for (name, tl, assets, times) in &cases {
+        let mut order: Vec<f64> = times.clone();
+        order.extend(times.iter().rev());
+        for (n, &t) in order.iter().enumerate() {
+            let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let (reference, _) = compositor.render_plan(&plan, size).expect("one-shot render");
+            let (again, _) = compositor.render_plan(&plan, size).expect("one-shot render");
+            assert_eq!(
+                reference.data, again.data,
+                "{name} @ {t}: the compositor is not deterministic, which this comparison needs"
+            );
+            let hint = if n % 2 == 0 {
+                kerf_gpu::Hint::Scrub
+            } else {
+                kerf_gpu::Hint::Forward { fps: 30.0 }
+            };
+            let (with, _) = compositor
+                .render_plan_with(&plan, size, &source, hint)
+                .unwrap_or_else(|e| panic!("{name} @ {t}: {e}"));
+            assert_eq!((with.width, with.height), (reference.width, reference.height));
+            assert!(
+                with.data == reference.data,
+                "{name} @ {t} ({hint:?}): render_plan_with is not the picture render_plan draws"
+            );
+        }
+    }
+    let stats = source.stats();
+    assert!(
+        stats.spawned > 0 && stats.cache.hits > 0,
+        "the source was not exercised: {stats:?}"
+    );
+    eprintln!("render_plan_with: {stats:?}");
 }
 
 #[test]
