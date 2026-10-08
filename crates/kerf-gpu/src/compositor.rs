@@ -58,6 +58,71 @@ pub struct RgbaFrame {
     pub data: Vec<u8>,
 }
 
+/// A rendered frame still on the GPU: the finished composite as an `Rgba8Unorm` texture of
+/// the device it was drawn on (encoded values, as [`RgbaFrame`] would hold them), for a
+/// [`crate::Presenter`] to draw to a window without a trip through the CPU. Dropping it
+/// frees the texture; submitted work that reads it keeps it alive until it is done.
+pub struct RenderedFrame {
+    pub(crate) texture: wgpu::Texture,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RenderedFrame {
+    /// Upload `frame` (RGBA, top row first) as a texture of `gpu`: a picture the compositor did not
+    /// draw (a placeholder, a screenshot) that a [`crate::Presenter`] can show all the same.
+    pub fn from_rgba(gpu: &Gpu, frame: &RgbaFrame) -> Result<RenderedFrame, GpuError> {
+        let (w, h) = (frame.width, frame.height);
+        if w == 0 || h == 0 || frame.data.len() != (w as usize) * (h as usize) * 4 {
+            return Err(GpuError::Unsupported(format!(
+                "{} bytes are not a {w}x{h} RGBA picture",
+                frame.data.len()
+            )));
+        }
+        let limit = gpu.device.limits().max_texture_dimension_2d;
+        if w > limit || h > limit {
+            return Err(GpuError::Unsupported(format!(
+                "a {w}x{h} picture is over this device's {limit}px texture limit"
+            )));
+        }
+        gpu.guarded("uploading a frame", || {
+            let texture = gpu.device.create_texture_with_data(
+                &gpu.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("uploaded frame"),
+                    size: extent(w, h),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: CANVAS_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &frame.data,
+            );
+            Ok(RenderedFrame {
+                texture,
+                width: w,
+                height: h,
+            })
+        })
+    }
+
+    /// The frame's pixels, copied back to the CPU (for a screenshot or a test; the app presents
+    /// it without this). `gpu` must be the device it was rendered on.
+    pub fn read_back(&self, gpu: &Gpu) -> Result<RgbaFrame, GpuError> {
+        gpu.guarded("reading a rendered frame back", || {
+            let enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("kerf read back"),
+            });
+            read_texture(gpu, enc, &self.texture, self.width, self.height)
+        })
+    }
+}
+
 /// Where the time of a [`Compositor::render_plan`] went. The decode is FFmpeg's
 /// (and v0 spawns one process per layer), the composite is the GPU's upload,
 /// passes and readback.
@@ -189,6 +254,23 @@ enum Output {
     Rgb,
     /// The canvas planes before that conversion.
     Yuv,
+    /// RGB, left on the GPU for a presenter.
+    Texture,
+}
+
+/// What a composite hands back, by [`Output`].
+enum Rendered {
+    Pixels(RgbaFrame),
+    Texture(RenderedFrame),
+}
+
+impl Rendered {
+    fn pixels(self) -> Result<RgbaFrame, GpuError> {
+        match self {
+            Rendered::Pixels(frame) => Ok(frame),
+            Rendered::Texture(_) => Err(GpuError::Gpu("a texture was rendered where pixels were asked for".into())),
+        }
+    }
 }
 
 /// A layer that has a picture and a place to draw it.
@@ -686,7 +768,7 @@ impl Compositor {
     /// size, so a caller that forgot to ask gets an error naming why instead of a
     /// wrong picture — or a wgpu panic.
     pub fn composite(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<RgbaFrame, GpuError> {
-        self.composite_as(plan, frames, size, Output::Rgb)
+        self.composite_as(plan, frames, size, Output::Rgb)?.pixels()
     }
 
     /// [`Compositor::composite`] over shared frames (a [`FrameSource`]'s are `Arc`s, which
@@ -697,7 +779,7 @@ impl Compositor {
         frames: &[Option<Arc<YuvFrame>>],
         size: (u32, u32),
     ) -> Result<RgbaFrame, GpuError> {
-        self.composite_as(plan, frames, size, Output::Rgb)
+        self.composite_as(plan, frames, size, Output::Rgb)?.pixels()
     }
 
     /// [`Compositor::composite`] stopping before the final YUV -> RGB conversion:
@@ -705,7 +787,7 @@ impl Compositor {
     /// chroma planes at half size). It exists so the scaler and the blend can be
     /// compared with FFmpeg's planes directly, without a conversion in between.
     pub fn composite_yuv(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<YuvFrame, GpuError> {
-        let canvas = self.composite_as(plan, frames, size, Output::Yuv)?;
+        let canvas = self.composite_as(plan, frames, size, Output::Yuv)?.pixels()?;
         let (w, h) = (canvas.width as usize, canvas.height as usize);
         let at = |x: usize, y: usize, c: usize| canvas.data[(y * w + x) * 4 + c];
         let chroma = |c: usize| -> Vec<u8> {
@@ -732,7 +814,7 @@ impl Compositor {
         frames: &[Option<F>],
         size: (u32, u32),
         output: Output,
-    ) -> Result<RgbaFrame, GpuError> {
+    ) -> Result<Rendered, GpuError> {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -819,7 +901,7 @@ impl Compositor {
     }
 
     /// Record, submit and read back the passes for the layers that are drawn.
-    fn draw(&self, plan: &RenderPlan, drawn: &[Drawn], size: (u32, u32), output: Output) -> Result<RgbaFrame, GpuError> {
+    fn draw(&self, plan: &RenderPlan, drawn: &[Drawn], size: (u32, u32), output: Output) -> Result<Rendered, GpuError> {
         let (ow, oh) = size;
         let device = &self.gpu.device;
         // The canvas holds Y, U, V (and alpha) in an RGBA8 texture: FFmpeg's
@@ -989,7 +1071,7 @@ impl Compositor {
         }
 
         if output == Output::Yuv {
-            return self.read_back(enc, &canvas);
+            return self.read_back(enc, &canvas).map(Rendered::Pixels);
         }
         // The single YUV -> RGB conversion of the finished composite.
         let rgb = self.plane(
@@ -1024,7 +1106,16 @@ impl Compositor {
         });
         self.pass(&mut enc, &self.convert, &rgb.view, &bind, Some(wgpu::Color::BLACK), None);
 
-        self.read_back(enc, &rgb)
+        if output == Output::Texture {
+            // No wait: whatever draws it next is on the same queue, behind this.
+            self.gpu.queue.submit(Some(enc.finish()));
+            return Ok(Rendered::Texture(RenderedFrame {
+                texture: rgb.texture,
+                width: ow,
+                height: oh,
+            }));
+        }
+        self.read_back(enc, &rgb).map(Rendered::Pixels)
     }
 
     fn compose_bind(&self, params: &ComposeParams, planes: [&wgpu::TextureView; 3]) -> wgpu::BindGroup {
@@ -1058,69 +1149,8 @@ impl Compositor {
         })
     }
 
-    fn read_back(&self, mut enc: wgpu::CommandEncoder, canvas: &Plane) -> Result<RgbaFrame, GpuError> {
-        let device = &self.gpu.device;
-        let (w, h) = (canvas.w, canvas.h);
-        // Rows in a texture-to-buffer copy are padded to 256 bytes.
-        let pitch = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(pitch) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &canvas.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(pitch),
-                    rows_per_image: Some(h),
-                },
-            },
-            extent(w, h),
-        );
-        self.gpu.queue.submit(Some(enc.finish()));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            // The receiver outlives the wait below unless that gave up, in which
-            // case nobody wants the result.
-            let _ = tx.send(r);
-        });
-        // A wait that cannot hang the caller: a GPU that stops answering is an
-        // error (the owner falls back to FFmpeg and may rebuild the device), not a
-        // thread stuck in `poll` forever.
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(READBACK_TIMEOUT),
-            })
-            .map_err(|e| GpuError::Readback(format!("the GPU did not finish within {} s: {e}", READBACK_TIMEOUT.as_secs())))?;
-        rx.recv_timeout(Duration::from_secs(1))
-            .map_err(|e| GpuError::Readback(e.to_string()))?
-            .map_err(|e| GpuError::Readback(e.to_string()))?;
-        let mapped = buffer
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| GpuError::Readback(e.to_string()))?;
-        let mut data = Vec::with_capacity((w * h * 4) as usize);
-        for row in mapped.chunks(pitch as usize).take(h as usize) {
-            data.extend_from_slice(&row[..(w * 4) as usize]);
-        }
-        drop(mapped);
-        buffer.unmap();
-        Ok(RgbaFrame {
-            width: w,
-            height: h,
-            data,
-        })
+    fn read_back(&self, enc: wgpu::CommandEncoder, canvas: &Plane) -> Result<RgbaFrame, GpuError> {
+        read_texture(&self.gpu, enc, &canvas.texture, canvas.w, canvas.h)
     }
 
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
@@ -1175,6 +1205,111 @@ impl Compositor {
             },
         ))
     }
+}
+
+impl Compositor {
+    /// [`Compositor::render_plan_with`] without the readback: the frame stays on the GPU as a
+    /// [`RenderedFrame`], for [`crate::Presenter::present`]. The composite time in the
+    /// returned timings is the recording and submission of the passes, not their completion
+    /// (nothing waits for the GPU here; the presenter's work queues behind it).
+    pub fn render_plan_texture_with(
+        &self,
+        plan: &RenderPlan,
+        size: (u32, u32),
+        source: &FrameSource,
+        hint: Hint,
+    ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        let reasons = plan.reasons(&self.caps(), size);
+        if !reasons.is_empty() {
+            return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        let t0 = Instant::now();
+        let frames = source.frames(&plan.layers, hint)?;
+        let decode = t0.elapsed();
+        let t1 = Instant::now();
+        let rendered = match self.composite_as(plan, &frames, size, Output::Texture)? {
+            Rendered::Texture(texture) => texture,
+            Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
+        };
+        Ok((
+            rendered,
+            RenderTimings {
+                decode,
+                composite: t1.elapsed(),
+            },
+        ))
+    }
+}
+
+/// Copy an `Rgba8Unorm` texture of `w` x `h` back to the CPU, after the work in `enc`.
+fn read_texture(
+    gpu: &Gpu,
+    mut enc: wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    w: u32,
+    h: u32,
+) -> Result<RgbaFrame, GpuError> {
+    let device = &gpu.device;
+    // Rows in a texture-to-buffer copy are padded to 256 bytes.
+    let pitch = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(pitch) * u64::from(h),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: Some(h),
+            },
+        },
+        extent(w, h),
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        // The receiver outlives the wait below unless that gave up, in which
+        // case nobody wants the result.
+        let _ = tx.send(r);
+    });
+    // A wait that cannot hang the caller: a GPU that stops answering is an
+    // error (the owner falls back to FFmpeg and may rebuild the device), not a
+    // thread stuck in `poll` forever.
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(READBACK_TIMEOUT),
+        })
+        .map_err(|e| GpuError::Readback(format!("the GPU did not finish within {} s: {e}", READBACK_TIMEOUT.as_secs())))?;
+    rx.recv_timeout(Duration::from_secs(1))
+        .map_err(|e| GpuError::Readback(e.to_string()))?
+        .map_err(|e| GpuError::Readback(e.to_string()))?;
+    let mapped = buffer
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| GpuError::Readback(e.to_string()))?;
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for row in mapped.chunks(pitch as usize).take(h as usize) {
+        data.extend_from_slice(&row[..(w * 4) as usize]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    Ok(RgbaFrame {
+        width: w,
+        height: h,
+        data,
+    })
 }
 
 fn join_reasons(reasons: &[kerf_core::Unsupported]) -> String {

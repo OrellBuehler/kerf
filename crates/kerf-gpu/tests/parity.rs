@@ -1069,6 +1069,16 @@ fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give()
                 with.data == reference.data,
                 "{name} @ {t} ({hint:?}): render_plan_with is not the picture render_plan draws"
             );
+            // The presenter's route: the frame left on the GPU, then read back, is the same picture.
+            let (texture, _) = compositor
+                .render_plan_texture_with(&plan, size, &source, hint)
+                .unwrap_or_else(|e| panic!("{name} @ {t}: {e}"));
+            assert_eq!((texture.width, texture.height), (reference.width, reference.height));
+            let on_gpu = texture.read_back(&gpu()).expect("read the texture back");
+            assert!(
+                on_gpu.data == reference.data,
+                "{name} @ {t} ({hint:?}): render_plan_texture_with is not the picture render_plan draws"
+            );
         }
     }
     let stats = source.stats();

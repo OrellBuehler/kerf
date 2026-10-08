@@ -35,6 +35,7 @@ uninlined_format_args = "warn"
 [workspace.dependencies]
 # Shared crates — ffmpeg is opt-in; consumers forward it via their own feature
 kerf-core = { path = "crates/kerf-core", default-features = false }
+kerf-gpu = { path = "crates/kerf-gpu", default-features = false }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -68,6 +69,11 @@ fontdb = "0.24"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
 pollster = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
+
+# A native child window for the GPU preview on X11 (pure Rust, no libxcb needed to build):
+# the one surface technique that works under WebKitGTK; see kerf-app's `gpu_preview`.
+x11rb = { version = "0.14", default-features = false, features = ["shape"] }
+raw-window-handle = "0.6"
 
 # Media — system FFmpeg (libav*) via pkg-config; compatible with FFmpeg >= 3.4
 ffmpeg-next = "9.0"

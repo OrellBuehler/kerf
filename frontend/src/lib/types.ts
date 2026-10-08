@@ -937,6 +937,11 @@ export interface AppSettings {
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;
+	/** Whether the Preview panel is drawn by the GPU compositor in a native
+	 *  surface for the frames it draws exactly, instead of FFmpeg's JPEG for
+	 *  every frame (experimental; off by default). Frames it cannot draw, and
+	 *  every failure, are the JPEG as ever. */
+	gpu_preview: boolean;
 	/** The single dock arrangement saved before there were workspaces (dockview's
 	 *  serialized layout). Read only to migrate it into the Edit workspace when
 	 *  `workspaces` is absent; nothing writes it any more. */
@@ -991,4 +996,70 @@ export interface AudioDetached {
 	timeline: Timeline;
 	detached: number;
 	skipped: { clip_id: string; reason: string }[];
+}
+
+// ---- GPU preview (A2) -------------------------------------------------------
+
+/** What the GPU preview is doing on this machine (`GpuPreviewStatus` in
+ *  `crates/kerf-app/src/gpu_preview.rs`). */
+export interface GpuPreviewStatus {
+	/** The setting. */
+	enabled: boolean;
+	/** The platform has a surface technique (it may still fail to build one). */
+	supported: boolean;
+	/** `window`: the main window's own surface under a transparent webview.
+	 *  `child`: a borderless child window over the panel (X11). */
+	technique: 'window' | 'child' | null;
+	/** A device and a surface are up. */
+	ready: boolean;
+	/** The page can draw over the picture (titles, guides, the trim monitor). */
+	overlays: boolean;
+	adapter: string | null;
+	/** The adapter is a CPU rasterizer (lavapipe, WARP). */
+	software: boolean;
+	/** Why the GPU preview is not in use: no technique here, or the last failure. */
+	reason: string | null;
+}
+
+/** Where the Preview frame is in the window, in device pixels relative to the
+ *  webview's top-left corner (`BoundsReport` in `gpu_preview.rs`). */
+export interface PreviewBoundsReport {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	/** The webview's own size in device pixels. */
+	viewport_width: number;
+	viewport_height: number;
+	/** Whether the native surface should be showing. */
+	visible: boolean;
+	/** The colour around the picture, `#rrggbb`. */
+	matte: string | null;
+	/** The colour of the rest of the surface, `#rrggbb` — what a transparent webview shows
+	 *  where no element of the page paints. */
+	backdrop: string | null;
+	/** Which report this is, counting up across every Preview the page has had; the
+	 *  backend ignores one older than the newest it has seen. */
+	seq: number;
+}
+
+/** What one GPU frame took (`GpuTimings`). */
+export interface GpuTimings {
+	width: number;
+	height: number;
+	decode_ms: number;
+	composite_ms: number;
+	present_ms: number;
+}
+
+/** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
+ *  frame, and the JPEG when it was FFmpeg. */
+export interface PreviewFrameResult {
+	/** `gpu`: drawn in the native surface (the webview shows it by showing nothing
+	 *  over it). `ffmpeg`: the `frame` data URL. */
+	renderer: 'gpu' | 'ffmpeg';
+	frame: string | null;
+	/** Why the GPU did not draw it (empty when it did). */
+	reasons: string[];
+	timings: GpuTimings | null;
 }
