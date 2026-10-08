@@ -1136,7 +1136,7 @@ mod tests {
             ]
         );
         // A transform number taken off the bundle keeps the bundle's keys and shapes, and splits.
-        let mut taken = c.clone();
+        let mut taken = c;
         taken.insert_property_key(Property::Scale, PropertyKey::new(1.0, 1.5));
         let keys: Vec<(f64, f64, Easing)> = taken
             .property_keys(Property::Scale)
