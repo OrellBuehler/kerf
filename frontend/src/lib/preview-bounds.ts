@@ -85,6 +85,7 @@ export function boundsReport(args: {
 	viewport: { width: number; height: number };
 	visible: boolean;
 	matte: string | null;
+	backdrop: string | null;
 }): PreviewBoundsReport {
 	const r = safeRatio(args.dpr);
 	const device = args.rect ? deviceRect(args.rect, r, args.viewport) : { x: 0, y: 0, width: 0, height: 0 };
@@ -93,7 +94,8 @@ export function boundsReport(args: {
 		viewport_width: Math.max(0, Math.round(args.viewport.width * r)),
 		viewport_height: Math.max(0, Math.round(args.viewport.height * r)),
 		visible: args.visible && device.width > 0 && device.height > 0,
-		matte: args.matte
+		matte: args.matte,
+		backdrop: args.backdrop
 	};
 }
 
@@ -108,7 +110,8 @@ export function sameReport(a: PreviewBoundsReport | null, b: PreviewBoundsReport
 		a.viewport_width === b.viewport_width &&
 		a.viewport_height === b.viewport_height &&
 		a.visible === b.visible &&
-		a.matte === b.matte
+		a.matte === b.matte &&
+		a.backdrop === b.backdrop
 	);
 }
 

@@ -315,6 +315,7 @@
 	let rootEl = $state<HTMLElement | null>(null);
 	let frameEl = $state<HTMLElement | null>(null);
 	let matteEl = $state<HTMLElement | null>(null);
+	let backdropEl = $state<HTMLElement | null>(null);
 	let surroundEl = $state<HTMLElement | null>(null);
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
@@ -356,7 +357,8 @@
 			dpr: window.devicePixelRatio,
 			viewport: { width: window.innerWidth, height: window.innerHeight },
 			visible: wantSurface && document.visibilityState === 'visible',
-			matte: matteEl ? parseCssColor(getComputedStyle(matteEl).backgroundColor) : null
+			matte: matteEl ? parseCssColor(getComputedStyle(matteEl).backgroundColor) : null,
+			backdrop: backdropEl ? parseCssColor(getComputedStyle(backdropEl).backgroundColor) : null
 		});
 	}
 
@@ -394,7 +396,14 @@
 			covered = false;
 			// The panel is gone (a workspace switch, the setting turned off): the surface must not
 			// stay over whatever is there now.
-			wantedBounds = boundsReport({ rect: null, dpr: 1, viewport: { width: 0, height: 0 }, visible: false, matte: null });
+			wantedBounds = boundsReport({
+				rect: null,
+				dpr: 1,
+				viewport: { width: 0, height: 0 },
+				visible: false,
+				matte: null,
+				backdrop: null
+			});
 			sendBounds.request();
 		};
 	});
@@ -666,7 +675,9 @@
 				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-default);box-shadow:var(--shadow-md)"
 			>
 				{#if settings.gpuPreview}
+					<!-- Colour probes: what the backend paints around the picture and behind the page. -->
 					<div bind:this={matteEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--frame-matte)"></div>
+					<div bind:this={backdropEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--surface-app)"></div>
 				{/if}
 				{#if gpuShown}
 					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->

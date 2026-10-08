@@ -2319,8 +2319,30 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
  * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
  */
 export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays = false): Promise<PreviewFrameResult> {
-	if (!inTauri()) return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
+	if (!inTauri()) {
+		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
+		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
+		// at under `bun run dev`. Otherwise there is no GPU here.
+		if (harnessSurface()) {
+			return {
+				renderer: 'gpu',
+				frame: null,
+				reasons: [],
+				timings: { width: 1920, height: 1080, decode_ms: 4, composite_ms: 9, present_ms: 1 }
+			};
+		}
+		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
+	}
 	return invoke<PreviewFrameResult>('get_preview_frame', { timeSecs, maxWidth, overlays });
+}
+
+/** The browser harness was opened with `?gpusurface=1`. */
+function harnessSurface(): boolean {
+	try {
+		return new URLSearchParams(location.search).get('gpusurface') === '1';
+	} catch {
+		return false;
+	}
 }
 
 /** Tell the backend where the Preview frame is (see {@link PreviewBoundsReport}). */
@@ -2332,6 +2354,18 @@ export async function setPreviewBounds(bounds: PreviewBoundsReport): Promise<voi
 /** What the GPU preview is doing on this machine. The browser harness has none. */
 export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
 	if (!inTauri()) {
+		if (harnessSurface()) {
+			return {
+				enabled: true,
+				supported: true,
+				technique: 'window',
+				ready: true,
+				overlays: true,
+				adapter: 'browser harness (pretend)',
+				software: false,
+				reason: null
+			};
+		}
 		return {
 			enabled: false,
 			supported: false,
@@ -2598,7 +2632,7 @@ export async function getSettings(): Promise<SettingsView> {
 			cpu_percent: readBrowserCpuPercent(),
 			transcribe: readBrowserTranscribe(),
 			safe_areas: readBrowserSafeAreas(),
-			gpu_preview: false,
+			gpu_preview: harnessSurface(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),

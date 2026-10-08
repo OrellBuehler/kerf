@@ -1002,6 +1002,9 @@ export interface PreviewBoundsReport {
 	visible: boolean;
 	/** The colour around the picture, `#rrggbb`. */
 	matte: string | null;
+	/** The colour of the rest of the surface, `#rrggbb` — what a transparent webview shows
+	 *  where no element of the page paints. */
+	backdrop: string | null;
 }
 
 /** What one GPU frame took (`GpuTimings`). */
