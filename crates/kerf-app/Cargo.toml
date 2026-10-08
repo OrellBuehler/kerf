@@ -65,7 +65,5 @@ tokio = { workspace = true, features = ["net"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb.workspace = true
 raw-window-handle.workspace = true
-
-# The X11 end-to-end test opens the app's Xlib display the way GTK does.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The process's own Xlib display (`gpu_preview::x11::display`), opened through libX11 at runtime.
 libloading = "0.8"

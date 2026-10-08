@@ -20,6 +20,10 @@
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
 //!   ([`Backoff`]) and a lost device is dropped and rebuilt on the next use, as `kerf-gpu`
 //!   documents — the owner builds a new `Gpu`, never the same one revived.
+//! * **Nothing may freeze it**: the build runs off the render lock with a deadline, a panic in the
+//!   GPU path is caught (the frame is FFmpeg's), the setting flips synchronously and is looked at
+//!   again before a build and before a picture is shown, and a hide that lands while a frame is
+//!   being drawn is not undone by it ([`GpuPreview::under_bounds`]).
 //! * **Two surface techniques**, picked per platform ([`resolve_technique`]):
 //!   [`Technique::Window`] draws to the main window's own surface *under* a transparent webview
 //!   (the preferred one: the page keeps drawing titles, guides and timecode over the picture) and
@@ -33,8 +37,12 @@
 #[cfg(target_os = "linux")]
 mod x11;
 
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -143,6 +151,11 @@ pub struct BoundsReport {
     /// transparent webview shows where no element of the page paints.
     #[serde(default)]
     pub backdrop: Option<String>,
+    /// Which report this is, counting up across every Preview the page has had: reports from a
+    /// panel that was just replaced (a workspace switch) can arrive after the new one's, and the
+    /// older one is ignored. `0` (no number) is always taken.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// [`BoundsReport`], sanitised: whole pixels, finite, clamped to a sane range.
@@ -326,16 +339,21 @@ pub fn layout_for(technique: Technique, bounds: &Bounds, window_size: (u32, u32)
     }
 }
 
-/// Retry timing for a backend that failed to build or was lost: 5 s, doubling to 5 min, reset
-/// by a frame that reached the screen. A device that is merely lost once is rebuilt at once.
+/// Retry timing for a backend that failed to build or was lost: 5 s, doubling to 5 min. It is
+/// forgiven only by a run of frames that reached the screen ([`Backoff::FORGIVEN_AFTER`]), not by
+/// one: a device that is lost after every present would otherwise be rebuilt every other frame
+/// with no wait at all. The first loss of a device that worked is rebuilt at once.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Backoff {
     strikes: u32,
+    streak: u32,
 }
 
 impl Backoff {
     const BASE: Duration = Duration::from_secs(5);
     const MAX: Duration = Duration::from_secs(300);
+    /// Consecutive frames shown before the strikes are wiped.
+    pub const FORGIVEN_AFTER: u32 = 20;
 
     /// How long to wait after the `n`th failure in a row (the first loss of a working device
     /// is free: `n == 0` after it was reset).
@@ -354,12 +372,16 @@ impl Backoff {
             Self::delay(self.strikes + 1)
         };
         self.strikes = self.strikes.saturating_add(1);
+        self.streak = 0;
         wait
     }
 
     /// A frame was shown.
     pub fn succeeded(&mut self) {
-        self.strikes = 0;
+        self.streak = self.streak.saturating_add(1);
+        if self.streak >= Self::FORGIVEN_AFTER {
+            self.strikes = 0;
+        }
     }
 
     #[cfg(test)]
@@ -390,27 +412,81 @@ pub fn react(error: &GpuError) -> Reaction {
     }
 }
 
+/// Puts something back when it is dropped: the webview's opaque background, whichever way the
+/// backend's build or life ends (an error after the webview was made transparent, a panic, the
+/// setting going off).
+struct RestoreOnDrop(Option<Box<dyn FnOnce() + Send>>);
+
+impl RestoreOnDrop {
+    fn new(restore: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(restore)))
+    }
+}
+
+impl Drop for RestoreOnDrop {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
+        }
+    }
+}
+
 /// The surface's host: whatever has to stay alive, be placed and be shown or hidden with it.
 enum Host {
-    /// The main window; its webview background is transparent while this lives.
-    Window(Box<tauri::WebviewWindow>),
+    /// The main window; its webview background is transparent from [`Host::make_transparent`]
+    /// until this is dropped.
+    Window {
+        window: Box<tauri::WebviewWindow>,
+        restore: Option<RestoreOnDrop>,
+    },
     #[cfg(target_os = "linux")]
     Child(Box<x11::Child>),
 }
 
 impl Host {
+    fn window(window: tauri::WebviewWindow) -> Self {
+        Host::Window {
+            window: Box::new(window),
+            restore: None,
+        }
+    }
+
     fn technique(&self) -> Technique {
         match self {
-            Host::Window(_) => Technique::Window,
+            Host::Window { .. } => Technique::Window,
             #[cfg(target_os = "linux")]
             Host::Child(_) => Technique::Child,
+        }
+    }
+
+    /// Make the webview show what is under it (the swapchain): its background alpha 0. Undone when
+    /// the host is dropped, by any path. The last step of a build, so no later failure leaves the
+    /// page transparent over nothing.
+    fn make_transparent(&mut self) -> Result<(), String> {
+        match self {
+            Host::Window { window, restore } => {
+                let [r, g, b] = DEFAULT_MATTE;
+                window
+                    .set_background_color(Some(tauri::window::Color(r, g, b, 0)))
+                    .map_err(|err| format!("making the webview transparent: {err}"))?;
+                let window = (**window).clone();
+                *restore = Some(RestoreOnDrop::new(move || {
+                    // The config's own `backgroundColor` (`#0f1318`), opaque again.
+                    if let Err(e) = window.set_background_color(Some(tauri::window::Color(r, g, b, 255))) {
+                        tracing::debug!(error = %e, "could not restore the webview background");
+                    }
+                }));
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Host::Child(_) => Ok(()),
         }
     }
 
     /// The size of the window a [`Technique::Window`] surface covers, in device pixels.
     fn window_size(&self) -> Option<(u32, u32)> {
         match self {
-            Host::Window(w) => w.inner_size().ok().map(|s| (s.width, s.height)),
+            Host::Window { window, .. } => window.inner_size().ok().map(|s| (s.width, s.height)),
             #[cfg(target_os = "linux")]
             Host::Child(_) => None,
         }
@@ -421,7 +497,7 @@ impl Host {
         // Only a child window has to be put anywhere.
         let _ = layout;
         match self {
-            Host::Window(_) => Ok(()),
+            Host::Window { .. } => Ok(()),
             #[cfg(target_os = "linux")]
             Host::Child(child) => {
                 let r = layout.window.ok_or("a child window layout has a rectangle")?;
@@ -430,10 +506,26 @@ impl Host {
         }
     }
 
+    /// The page's frame moved or resized: a child window that is on show follows it now.
+    fn follow(&mut self, layout: &Layout) {
+        let _ = layout;
+        match self {
+            Host::Window { .. } => {}
+            #[cfg(target_os = "linux")]
+            Host::Child(child) => {
+                if let Some(r) = layout.window {
+                    if let Err(e) = child.follow(r.x as i32, r.y as i32, r.width, r.height) {
+                        tracing::debug!(error = %e, "could not move the GPU preview window");
+                    }
+                }
+            }
+        }
+    }
+
     /// Stop showing the surface, so what the page draws there is what is seen.
     fn hide(&mut self) {
         match self {
-            Host::Window(_) => {}
+            Host::Window { .. } => {}
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -441,13 +533,8 @@ impl Host {
 
     fn release(&mut self) {
         match self {
-            Host::Window(window) => {
-                // The config's own `backgroundColor` (`#0f1318`), opaque again.
-                let [r, g, b] = DEFAULT_MATTE;
-                if let Err(e) = window.set_background_color(Some(tauri::window::Color(r, g, b, 255))) {
-                    tracing::debug!(error = %e, "could not restore the webview background");
-                }
-            }
+            // Dropping the guard restores the background.
+            Host::Window { restore, .. } => drop(restore.take()),
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -490,7 +577,8 @@ pub struct GpuPreviewStatus {
     pub overlays: bool,
     pub adapter: Option<String>,
     pub software: bool,
-    /// Why the GPU preview is not in use: no technique here, or the last failure.
+    /// Why the GPU preview is not in use: no technique here, the last failure, or that it was
+    /// turned off because the last run ended while it was starting.
     pub reason: Option<String>,
 }
 
@@ -508,11 +596,49 @@ struct RenderState {
     backend: Option<Backend>,
     backoff: Backoff,
     retry_at: Option<Instant>,
+    /// The backend has not yet put a frame on the screen: the crash marker is still down.
+    unproven: bool,
+}
+
+/// Where the page says its frame is, and which report that came from.
+#[derive(Default)]
+struct BoundsState {
+    current: Option<Bounds>,
+    seq: u64,
 }
 
 /// Builds a backend (the app's: a window, a device and a surface on it). Injected so the
 /// failure paths are testable without a window.
 type Factory = dyn Fn(Technique) -> Result<Backend, String> + Send + Sync;
+
+/// How long a backend may take to come up before the preview gives up on it for now and shows the
+/// JPEG. Device and surface creation is a few hundred milliseconds on a working machine; this is
+/// for the one where something stalls (a driver, an X server that does not answer).
+const BUILD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The file whose presence says the last run ended while the GPU preview was starting.
+const CRASH_MARKER: &str = "gpu-preview-attempt";
+
+/// What the status says after the marker was found.
+const CRASH_NOTE: &str = "turned off: the last run ended while the GPU preview was starting (a driver crash?); \
+     switching it on again tries once more";
+
+/// Whether the previous run left its marker (and remove it). Called once at launch, before the
+/// settings are read: the run that died during the first GPU frame must not repeat it on every launch.
+pub fn take_crash_marker(dir: &Path) -> bool {
+    let path = dir.join(CRASH_MARKER);
+    let found = path.exists();
+    if found {
+        let _ = std::fs::remove_file(&path);
+    }
+    found
+}
+
+/// [`take_crash_marker`] in the app's config directory.
+pub fn take_crash_marker_in(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager as _;
+    app.path().app_config_dir().is_ok_and(|dir| take_crash_marker(&dir))
+}
 
 /// What one GPU frame took.
 #[derive(Debug, Clone, Copy, Serialize, Default, PartialEq)]
@@ -562,61 +688,113 @@ enum Attempt {
     Fallback(Vec<String>),
 }
 
+/// Why a backend did not come up.
+enum BuildFailure {
+    /// It said no (or panicked): the marker is not needed.
+    Failed(String),
+    /// It did not answer in time: it may still be running, and the marker stays.
+    TimedOut(String),
+}
+
+/// The text of a panic payload.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".into())
+}
+
 /// The GPU preview: the setting, the surface's place, and the backend that draws into it.
+///
+/// **Locks**, outermost first (a thread holding one may take those after it, never before):
+/// `render` (a frame in flight; the backend) → `bounds` (where the page says the frame is; held
+/// while a picture is shown, so a hide cannot land in the middle) → `host` (the option) → the
+/// host's own mutex. `building` (one backend build at a time) is taken alone, never under `render`.
 pub struct GpuPreview {
     enabled: AtomicBool,
+    /// Turning it on is a retry: the next frame forgets the backoff.
+    reset_backoff: AtomicBool,
     technique: Resolution,
-    factory: Box<Factory>,
+    factory: Arc<Factory>,
     /// The FFmpeg's composite colour policy (a measured fact; a field so a test can pin it).
     policy: fn() -> CompositeColorPolicy,
-    bounds: Mutex<Option<Bounds>>,
+    build_deadline: Duration,
+    /// The crash marker's path (the app's config directory), when there is one.
+    marker: Option<PathBuf>,
+    bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
     render: Mutex<RenderState>,
+    building: Mutex<()>,
     info: Mutex<Info>,
 }
 
 impl GpuPreview {
-    /// The app's: `app`'s main window is the host.
-    pub fn for_app(app: tauri::AppHandle) -> Self {
+    /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
+    pub fn for_app(app: tauri::AppHandle, crashed: bool) -> Self {
+        use tauri::Manager as _;
+
         let choice = std::env::var("KERF_GPU_SURFACE").ok();
-        Self::with_factory(
+        let marker = app.path().app_config_dir().ok().map(|dir| dir.join(CRASH_MARKER));
+        let mut preview = Self::with_factory(
             resolve_technique(std::env::consts::OS, choice.as_deref()),
-            Box::new(move |technique| build_backend(&app, technique)),
-        )
+            Arc::new(move |technique| build_backend(&app, technique)),
+        );
+        preview.marker = marker;
+        if crashed {
+            lock(&preview.info).reason = Some(CRASH_NOTE.into());
+        }
+        preview
     }
 
-    fn with_factory(technique: Resolution, factory: Box<Factory>) -> Self {
+    fn with_factory(technique: Resolution, factory: Arc<Factory>) -> Self {
         Self {
             policy: composite_color_policy,
+            build_deadline: BUILD_DEADLINE,
+            marker: None,
             enabled: AtomicBool::new(false),
+            reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
                 reason: technique.note.clone(),
                 ..Info::default()
             }),
             technique,
             factory,
-            bounds: Mutex::new(None),
+            bounds: Mutex::new(BoundsState::default()),
             host: Mutex::new(None),
             render: Mutex::new(RenderState::default()),
+            building: Mutex::new(()),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.enabled.load(Ordering::SeqCst)
     }
 
-    /// The setting changed. Turning it off hides the surface at once and frees the device.
-    pub fn set_enabled(&self, on: bool) {
-        let was = self.enabled.swap(on, Ordering::Relaxed);
-        if was && !on {
-            self.hide();
-            self.teardown();
+    /// The setting changed. The flag flips **now**, so the very next frame (and a frame already in
+    /// flight, which looks again before it builds and before it shows anything) sees it; returns
+    /// whether the surface and the device are now to be torn down ([`GpuPreview::teardown_if_off`],
+    /// which may wait for that frame and so belongs off the caller's thread). Turning it on is a
+    /// retry: the backoff of an earlier failure is forgotten.
+    pub fn set_enabled(&self, on: bool) -> bool {
+        let was = self.enabled.swap(on, Ordering::SeqCst);
+        if on {
+            self.reset_backoff.store(true, Ordering::SeqCst);
+            if !was {
+                lock(&self.info).reason = self.technique.note.clone();
+            }
         }
-        if on && !was {
-            let mut info = lock(&self.info);
-            info.reason = self.technique.note.clone();
+        was && !on
+    }
+
+    /// Hide the surface and free the device, unless the setting came back on meanwhile.
+    pub fn teardown_if_off(&self) {
+        if self.is_enabled() {
+            return;
         }
+        self.hide();
+        self.teardown();
     }
 
     pub fn status(&self) -> GpuPreviewStatus {
@@ -633,18 +811,46 @@ impl GpuPreview {
         }
     }
 
-    /// The Preview frame moved (or stopped being shown). Cheap and never waits for a render: a
-    /// hidden frame hides the surface at once, a shown one is drawn at the next frame.
+    /// The Preview frame moved (or stopped being shown). Cheap, and it never waits for a *render*
+    /// (only for a picture being put on the screen, a frame at most): a hidden frame hides the
+    /// surface, a moved one moves it, and both are serialized with a frame in flight — a hide that
+    /// arrives while a picture is being shown is not undone by it. The report of an older panel
+    /// that arrives late is ignored.
     pub fn set_bounds(&self, report: &BoundsReport) -> Result<(), String> {
         let bounds = Bounds::from_report(report).ok_or("the preview bounds are not a rectangle on a screen")?;
-        let before = lock(&self.bounds).replace(bounds);
+        let mut state = lock(&self.bounds);
+        if report.seq != 0 && report.seq < state.seq {
+            tracing::debug!(
+                seq = report.seq,
+                newest = state.seq,
+                "a stale preview bounds report was ignored"
+            );
+            return Ok(());
+        }
+        state.seq = state.seq.max(report.seq);
+        let before = state.current.replace(bounds);
         if before.map(|b| b.visible) != Some(bounds.visible) {
             tracing::debug!(visible = bounds.visible, rect = ?bounds.rect, "preview surface visibility changed");
         }
-        if !bounds.visible {
+        if bounds.visible {
+            self.follow(&bounds);
+        } else {
             self.hide();
         }
         Ok(())
+    }
+
+    /// Run `show` against the bounds as they are **now**, with `set_bounds` held off until it is
+    /// done: `None` when the surface is no longer to be shown (hidden, or the setting went off), in
+    /// which case `show` did not run. This is what makes a hide that lands during a long render
+    /// stick, instead of being undone by the frame that was already on its way.
+    fn under_bounds<T>(&self, show: impl FnOnce(&Bounds) -> T) -> Option<T> {
+        let state = lock(&self.bounds);
+        let current = state.current.filter(|b| b.visible)?;
+        if !self.is_enabled() {
+            return None;
+        }
+        Some(show(&current))
     }
 
     fn hide(&self) {
@@ -654,21 +860,55 @@ impl GpuPreview {
         }
     }
 
+    /// A child window that is on show follows the frame the page just moved.
+    fn follow(&self, bounds: &Bounds) {
+        let Some(technique @ Technique::Child) = self.technique.technique else {
+            return;
+        };
+        let host = lock(&self.host).clone();
+        let Some(host) = host else {
+            return;
+        };
+        match layout_for(technique, bounds, (0, 0)) {
+            Some(layout) => lock(&host).follow(&layout),
+            None => lock(&host).hide(),
+        }
+    }
+
     /// Drop the backend (device, surface, decodes). The window host goes back to normal.
     fn teardown(&self) {
         *lock(&self.host) = None;
         let backend = lock(&self.render).backend.take();
-        drop(backend);
+        // A panic while dropping a broken backend must not take the caller with it.
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
+        self.clear_marker();
         let mut info = lock(&self.info);
         info.ready = false;
         info.adapter = None;
+    }
+
+    fn write_marker(&self) {
+        if let Some(path) = &self.marker {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, std::process::id().to_string());
+        }
+    }
+
+    fn clear_marker(&self) {
+        if let Some(path) = &self.marker {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// A frame for `t`: drawn by the GPU when the plan allows it and everything works, else
     /// FFmpeg's JPEG of `ffmpeg_width`. `overlays_needed` is the page saying it must draw over
     /// the picture (a title box, the trim monitor, safe-area guides).
     ///
-    /// The project lock is taken only inside `inputs`, and not held after it returns.
+    /// The project lock is taken only inside `inputs`, and not held after it returns. A panic in
+    /// the GPU path (wgpu, the X connection) is caught here: the backend is dropped and rebuilt
+    /// behind the backoff, the surface hidden, and the frame is FFmpeg's like any other fallback.
     pub fn frame(
         &self,
         inputs: impl FnOnce() -> Result<PlanInputs, String>,
@@ -677,8 +917,9 @@ impl GpuPreview {
         overlays_needed: bool,
     ) -> Result<PreviewFrameResult, String> {
         let inputs = inputs()?;
-        let reasons = match self.attempt(&inputs, t, overlays_needed, Instant::now()) {
-            Attempt::Presented(timings) => {
+        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(&inputs, t, overlays_needed, Instant::now())));
+        let reasons = match attempt {
+            Ok(Attempt::Presented(timings)) => {
                 return Ok(PreviewFrameResult {
                     renderer: "gpu",
                     frame: None,
@@ -686,7 +927,8 @@ impl GpuPreview {
                     timings: Some(timings),
                 })
             }
-            Attempt::Fallback(reasons) => reasons,
+            Ok(Attempt::Fallback(reasons)) => reasons,
+            Err(payload) => vec![self.after_panic(payload.as_ref())],
         };
         tracing::debug!(?reasons, t, "preview frame through FFmpeg");
         let jpeg = Project::composite_timeline_frame(&inputs.timeline, &inputs.preview_assets, t, ffmpeg_width, 4)
@@ -698,6 +940,37 @@ impl GpuPreview {
             reasons,
             timings: None,
         })
+    }
+
+    /// The GPU path panicked: say so, hide the surface and drop the backend (it may be in any
+    /// state), behind the backoff. Every step is itself guarded: this must not panic in turn.
+    fn after_panic(&self, payload: &(dyn Any + Send)) -> String {
+        let message = panic_text(payload);
+        tracing::error!(%message, "the GPU preview panicked; dropping it, this frame goes through FFmpeg");
+        let why = format!("the GPU preview panicked: {message}");
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            self.hide();
+            self.drop_backend(&why, false, Instant::now());
+        }));
+        why
+    }
+
+    /// Drop the backend, remember why, and wait before building another (`immediate`: a device that
+    /// worked and was lost is rebuilt at once, the first time).
+    fn drop_backend(&self, why: &str, immediate: bool, now: Instant) {
+        let backend = {
+            let mut state = lock(&self.render);
+            let wait = state.backoff.fail(immediate);
+            state.retry_at = Some(now + wait);
+            state.unproven = false;
+            state.backend.take()
+        };
+        *lock(&self.host) = None;
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
+        self.clear_marker();
+        let mut info = lock(&self.info);
+        info.ready = false;
+        info.reason = Some(why.to_string());
     }
 
     fn attempt(&self, inputs: &PlanInputs, t: f64, overlays_needed: bool, now: Instant) -> Attempt {
@@ -715,7 +988,7 @@ impl GpuPreview {
                 .clone()
                 .unwrap_or_else(|| "no preview surface here".into())]);
         };
-        let Some(bounds) = *lock(&self.bounds) else {
+        let Some(bounds) = lock(&self.bounds).current else {
             return Attempt::Fallback(vec!["the preview has not reported where it is".into()]);
         };
         if !bounds.visible {
@@ -738,10 +1011,16 @@ impl GpuPreview {
             Err(e) => return fallback(format!("no plan for this frame: {e}")),
         };
 
-        let mut state = lock(&self.render);
-        if let Err(why) = self.ensure_backend(&mut state, technique, now) {
-            drop(state);
+        // A backend is built off the render lock, with a deadline: a slow or stuck build is a frame
+        // that goes through FFmpeg, not a preview that waits for it.
+        if let Err(why) = self.ensure_backend(technique, now) {
             return fallback(why);
+        }
+        let mut state = lock(&self.render);
+        // Looked at again under the lock: the setting may have gone off while this frame was planned.
+        if !self.is_enabled() {
+            drop(state);
+            return fallback("the GPU preview was turned off".into());
         }
         let Some(backend) = state.backend.as_mut() else {
             drop(state);
@@ -762,7 +1041,8 @@ impl GpuPreview {
             drop(state);
             return fallback("the preview frame is outside the window".into());
         };
-        let (width, dest) = place_frame((plan.canvas.width, plan.canvas.height), layout.area, |w| plan.size(w));
+        let canvas = (plan.canvas.width, plan.canvas.height);
+        let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
         let size = plan.size(width);
         let reasons = plan.reasons(&backend.compositor.caps(), size);
         if !reasons.is_empty() {
@@ -771,37 +1051,60 @@ impl GpuPreview {
             return Attempt::Fallback(reasons.iter().map(ToString::to_string).collect());
         }
 
-        let outcome = (|| -> Result<GpuTimings, GpuError> {
+        // `None`: the surface was hidden (or the setting turned off) while the frame was drawn.
+        let outcome = (|| -> Result<Option<GpuTimings>, GpuError> {
             let (frame, timings) = backend
                 .compositor
                 .render_plan_texture_with(&plan, size, &backend.source, Hint::Scrub)?;
             let t0 = Instant::now();
-            backend.presenter.resize(layout.surface)?;
-            // The surface is placed after the frame is drawn, just before it is shown: a child
-            // window moved earlier would flash its previous contents.
-            lock(&host).apply(&layout).map_err(GpuError::Surface)?;
-            backend.presenter.present(
-                &frame,
-                dest,
-                Surround {
-                    area: layout.area,
-                    matte: bounds.matte,
-                    backdrop: bounds.backdrop,
-                },
-            )?;
-            Ok(GpuTimings {
-                width: frame.width,
-                height: frame.height,
-                decode_ms: timings.decode.as_secs_f64() * 1e3,
-                composite_ms: timings.composite.as_secs_f64() * 1e3,
-                present_ms: t0.elapsed().as_secs_f64() * 1e3,
+            // From here the page's frame is looked at again, and `set_bounds` waits: the layout is the
+            // one of the bounds as they are now (the frame may have moved during the render; the
+            // picture is scaled into where it is), and a hide that arrived is respected.
+            self.under_bounds(|now_bounds| -> Result<GpuTimings, GpuError> {
+                let window_size = match technique {
+                    Technique::Window => lock(&host).window_size(),
+                    Technique::Child => Some((0, 0)),
+                }
+                .ok_or_else(|| GpuError::Surface("the window has no size".into()))?;
+                let layout = layout_for(technique, now_bounds, window_size)
+                    .ok_or_else(|| GpuError::Surface("the preview frame is outside the window".into()))?;
+                let dest = fit_contain(canvas, layout.area);
+                backend.presenter.resize(layout.surface)?;
+                // The surface is placed after the frame is drawn, just before it is shown: a child
+                // window moved earlier would flash its previous contents.
+                lock(&host).apply(&layout).map_err(GpuError::Surface)?;
+                backend.presenter.present(
+                    &frame,
+                    dest,
+                    Surround {
+                        area: layout.area,
+                        matte: now_bounds.matte,
+                        backdrop: now_bounds.backdrop,
+                    },
+                )?;
+                Ok(GpuTimings {
+                    width: frame.width,
+                    height: frame.height,
+                    decode_ms: timings.decode.as_secs_f64() * 1e3,
+                    composite_ms: timings.composite.as_secs_f64() * 1e3,
+                    present_ms: t0.elapsed().as_secs_f64() * 1e3,
+                })
             })
+            .transpose()
         })();
         match outcome {
-            Ok(timings) => {
+            Ok(Some(timings)) => {
                 state.backoff.succeeded();
+                if std::mem::take(&mut state.unproven) {
+                    // A frame reached the screen: whatever the first start risked, it survived.
+                    self.clear_marker();
+                }
                 tracing::debug!(?timings, t, "GPU preview frame presented");
                 Attempt::Presented(timings)
+            }
+            Ok(None) => {
+                drop(state);
+                fallback("the preview surface was hidden while the frame was drawn".into())
             }
             Err(error) => {
                 let reaction = react(&error);
@@ -812,18 +1115,9 @@ impl GpuPreview {
                 } else {
                     tracing::warn!(%error, "GPU preview failed; rebuilding it, and this frame goes through FFmpeg");
                 }
+                drop(state);
                 if reaction == Reaction::Rebuild {
-                    let wait = state.backoff.fail(matches!(error, GpuError::DeviceLost(_)));
-                    state.retry_at = Some(now + wait);
-                    let backend = state.backend.take();
-                    drop(state);
-                    *lock(&self.host) = None;
-                    drop(backend);
-                    let mut info = lock(&self.info);
-                    info.ready = false;
-                    info.reason = Some(error.to_string());
-                } else {
-                    drop(state);
+                    self.drop_backend(&error.to_string(), matches!(error, GpuError::DeviceLost(_)), now);
                 }
                 self.hide();
                 Attempt::Fallback(vec![error.to_string()])
@@ -832,29 +1126,54 @@ impl GpuPreview {
     }
 
     /// Make sure a backend is up, building one if the backoff allows. A device that was lost is
-    /// dropped here and rebuilt.
-    fn ensure_backend(&self, state: &mut RenderState, technique: Technique, now: Instant) -> Result<(), String> {
-        if state.backend.as_ref().is_some_and(|b| b.gpu.lost().is_some()) {
-            let why = state.backend.as_ref().and_then(|b| b.gpu.lost()).unwrap_or_default();
-            tracing::warn!(%why, "the GPU preview's device was lost; rebuilding it");
-            let wait = state.backoff.fail(true);
-            state.retry_at = Some(now + wait);
-            *lock(&self.host) = None;
-            state.backend = None;
-            lock(&self.info).ready = false;
+    /// dropped here and rebuilt. The build runs **without the render lock** and with a deadline;
+    /// a frame that finds one under way does not wait for it.
+    fn ensure_backend(&self, technique: Technique, now: Instant) -> Result<(), String> {
+        {
+            let mut state = lock(&self.render);
+            if self.reset_backoff.swap(false, Ordering::SeqCst) {
+                state.backoff = Backoff::default();
+                state.retry_at = None;
+            }
+            if state.backend.as_ref().is_some_and(|b| b.gpu.lost().is_some()) {
+                let why = state.backend.as_ref().and_then(|b| b.gpu.lost()).unwrap_or_default();
+                tracing::warn!(%why, "the GPU preview's device was lost; rebuilding it");
+                let wait = state.backoff.fail(true);
+                state.retry_at = Some(now + wait);
+                *lock(&self.host) = None;
+                let lost = state.backend.take();
+                state.unproven = false;
+                lock(&self.info).ready = false;
+                let _ = catch_unwind(AssertUnwindSafe(move || drop(lost)));
+            }
+            if state.backend.is_some() {
+                return Ok(());
+            }
+            if let Some(at) = state.retry_at.filter(|at| *at > now) {
+                let reason = lock(&self.info)
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "the GPU preview failed".into());
+                return Err(format!("{reason} (trying again in {} s)", (at - now).as_secs() + 1));
+            }
         }
-        if state.backend.is_some() {
-            return Ok(());
-        }
-        if let Some(at) = state.retry_at.filter(|at| *at > now) {
-            let reason = lock(&self.info)
-                .reason
-                .clone()
-                .unwrap_or_else(|| "the GPU preview failed".into());
-            return Err(format!("{reason} (trying again in {} s)", (at - now).as_secs() + 1));
-        }
-        match (self.factory)(technique) {
+        let _building = match self.building.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err("the GPU preview is starting".into()),
+        };
+        self.write_marker();
+        let built = self.build_with_deadline(technique);
+        let mut state = lock(&self.render);
+        match built {
             Ok(backend) => {
+                // The setting may have gone off while it was built, or another build got there first.
+                if !self.is_enabled() || state.backend.is_some() {
+                    drop(state);
+                    let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
+                    self.clear_marker();
+                    return Err("the GPU preview was turned off".into());
+                }
                 tracing::info!(
                     adapter = %backend.gpu.adapter_info().name,
                     software = backend.gpu.is_software(),
@@ -869,10 +1188,19 @@ impl GpuPreview {
                 info.overlays = technique.overlays();
                 info.reason = None;
                 state.retry_at = None;
+                // The marker stays down until a frame has reached the screen.
+                state.unproven = true;
                 state.backend = Some(backend);
                 Ok(())
             }
-            Err(why) => {
+            Err(failure) => {
+                let (why, timed_out) = match failure {
+                    BuildFailure::Failed(why) => (why, false),
+                    BuildFailure::TimedOut(why) => (why, true),
+                };
+                if !timed_out {
+                    self.clear_marker();
+                }
                 let wait = state.backoff.fail(false);
                 state.retry_at = Some(now + wait);
                 tracing::warn!(%why, retry_in_s = wait.as_secs(), "the GPU preview could not start; the JPEG preview is used");
@@ -881,6 +1209,36 @@ impl GpuPreview {
                 info.reason = Some(why.clone());
                 Err(why)
             }
+        }
+    }
+
+    /// Run the factory on a thread of its own and wait for it at most [`GpuPreview::build_deadline`].
+    /// A build that outlives the deadline is left to finish (and is dropped, window and device
+    /// with it, when it does); a panic in it is an error like any other.
+    fn build_with_deadline(&self, technique: Technique) -> Result<Backend, BuildFailure> {
+        let (tx, rx) = mpsc::channel();
+        let factory = Arc::clone(&self.factory);
+        std::thread::Builder::new()
+            .name("kerf-gpu-build".into())
+            .spawn(move || {
+                let built = catch_unwind(AssertUnwindSafe(|| factory(technique)));
+                // A receiver that gave up drops the backend here, on this thread.
+                let _ = tx.send(built);
+            })
+            .map_err(|e| BuildFailure::Failed(format!("could not start the GPU preview's build thread: {e}")))?;
+        match rx.recv_timeout(self.build_deadline) {
+            Ok(Ok(built)) => built.map_err(BuildFailure::Failed),
+            Ok(Err(payload)) => Err(BuildFailure::Failed(format!(
+                "starting the GPU preview panicked: {}",
+                panic_text(payload.as_ref())
+            ))),
+            Err(RecvTimeoutError::Timeout) => Err(BuildFailure::TimedOut(format!(
+                "starting the GPU preview took longer than {} s",
+                self.build_deadline.as_secs_f64().ceil()
+            ))),
+            Err(RecvTimeoutError::Disconnected) => Err(BuildFailure::Failed(
+                "the GPU preview's build thread ended without an answer".into(),
+            )),
         }
     }
 }
@@ -898,18 +1256,13 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
         let what = what.to_string();
         move |err: GpuError| format!("{what}: {err}")
     };
-    let (gpu, presenter, host) = match technique {
+    let (gpu, presenter, mut host) = match technique {
         Technique::Window => {
             let (gpu, surface) = Gpu::new_for_surface(options, window.clone()).map_err(e("the window surface"))?;
             let size = window.inner_size().map_err(|err| err.to_string())?;
             let presenter =
                 Presenter::new(Arc::clone(&gpu), surface, (size.width, size.height)).map_err(e("the window surface"))?;
-            // The webview must show what is under it: the page's own transparent regions.
-            let [r, g, b] = DEFAULT_MATTE;
-            window
-                .set_background_color(Some(tauri::window::Color(r, g, b, 0)))
-                .map_err(|err| format!("making the webview transparent: {err}"))?;
-            (gpu, presenter, Host::Window(Box::new(window)))
+            (gpu, presenter, Host::window(window))
         }
         #[cfg(target_os = "linux")]
         Technique::Child => {
@@ -924,6 +1277,9 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
     debug_assert_eq!(host.technique(), technique);
     let compositor = Compositor::new(Arc::clone(&gpu)).map_err(e("the compositor"))?;
     let source = FrameSource::new(FrameSourceConfig::default());
+    // Last, so nothing above can fail with the webview already transparent; and if this fails, the
+    // host (and so the background) goes back to normal as it is dropped.
+    host.make_transparent()?;
     Ok(Backend {
         presenter,
         compositor,
@@ -953,6 +1309,7 @@ mod tests {
             visible: true,
             matte: Some("#102030".into()),
             backdrop: Some("#0a0b0c".into()),
+            seq: 0,
         }
     }
 
@@ -1150,10 +1507,36 @@ mod tests {
         // …the second in a row is not.
         assert_eq!(b.fail(true), Duration::from_secs(10));
         assert_eq!(b.fail(false), Duration::from_secs(20));
-        b.succeeded();
+        for _ in 0..Backoff::FORGIVEN_AFTER {
+            b.succeeded();
+        }
         assert_eq!(b.strikes(), 0);
         // A failed build waits from the start.
         assert_eq!(b.fail(false), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_device_that_dies_after_every_frame_is_not_forgiven_by_the_frames_it_shows() {
+        let mut b = Backoff::default();
+        assert_eq!(b.fail(true), Duration::ZERO, "the first loss is rebuilt at once");
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            // One frame reaches the screen, and then the device is lost again.
+            b.succeeded();
+            waits.push(b.fail(true));
+        }
+        assert_eq!(
+            waits,
+            [10, 20, 40, 80].map(Duration::from_secs),
+            "the waits grow instead of resetting"
+        );
+        // A run one short of the forgiving one changes nothing; the run itself does.
+        for _ in 0..Backoff::FORGIVEN_AFTER - 1 {
+            b.succeeded();
+        }
+        assert_eq!(b.strikes(), 5);
+        b.succeeded();
+        assert_eq!(b.strikes(), 0);
     }
 
     #[test]
@@ -1182,7 +1565,7 @@ mod tests {
     /// A preview whose backend never starts, with the colour policy pinned (the real probe
     /// would run an FFmpeg).
     fn with(technique: Resolution, factory: Box<Factory>) -> GpuPreview {
-        let mut preview = GpuPreview::with_factory(technique, factory);
+        let mut preview = GpuPreview::with_factory(technique, Arc::from(factory));
         preview.policy = || CompositeColorPolicy::FixedBt601;
         preview
     }
@@ -1371,6 +1754,290 @@ mod tests {
         let mut bad = report();
         bad.width = f64::NAN;
         assert!(preview.set_bounds(&bad).is_err());
-        assert_eq!(lock(&preview.bounds).unwrap().rect.width, 800);
+        assert_eq!(lock(&preview.bounds).current.unwrap().rect.width, 800);
+    }
+
+    #[test]
+    fn a_hide_that_arrives_while_a_picture_is_being_shown_waits_for_it_and_is_what_stays() {
+        let preview = Arc::new(failing(Arc::default(), "unused"));
+        preview.set_enabled(true);
+        visible(&preview);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let shower = Arc::clone(&preview);
+        let shown = std::thread::spawn(move || {
+            shower.under_bounds(|_| {
+                entered_tx.send(()).unwrap();
+                // A slow present: the surface is being put on the screen.
+                std::thread::sleep(Duration::from_millis(300));
+                Instant::now()
+            })
+        });
+        entered_rx.recv().unwrap();
+        let mut hidden = report();
+        hidden.visible = false;
+        hidden.seq = 2;
+        // The page hides the surface (playback started, a dialog opened) in the middle of it.
+        preview.set_bounds(&hidden).unwrap();
+        let hidden_at = Instant::now();
+        let shown_until = shown.join().unwrap().expect("it was visible when it started");
+        assert!(hidden_at >= shown_until, "the hide landed in the middle of the present");
+        // What stays is the hide: a frame that finishes drawing after it is dropped, not shown.
+        let mut ran = false;
+        assert!(preview
+            .under_bounds(|_| {
+                ran = true;
+            })
+            .is_none());
+        assert!(!ran);
+    }
+
+    #[test]
+    fn nothing_is_shown_to_a_surface_that_is_hidden_or_whose_setting_went_off() {
+        let preview = failing(Arc::default(), "unused");
+        preview.set_enabled(true);
+        // No report yet.
+        assert!(preview.under_bounds(|_| ()).is_none());
+        visible(&preview);
+        assert_eq!(preview.under_bounds(|b| b.rect.width), Some(800));
+        // The bounds it is given are the ones as they are now.
+        let mut moved = report();
+        moved.x = 100.0;
+        moved.seq = 3;
+        preview.set_bounds(&moved).unwrap();
+        assert_eq!(preview.under_bounds(|b| b.rect.x), Some(100));
+        // The setting went off in the meantime: nothing is shown after it.
+        assert!(preview.set_enabled(false));
+        assert!(preview.under_bounds(|_| ()).is_none());
+    }
+
+    #[test]
+    fn a_report_from_an_older_panel_that_arrives_late_is_ignored() {
+        let preview = failing(Arc::default(), "unused");
+        let mut newer = report();
+        newer.seq = 5;
+        preview.set_bounds(&newer).unwrap();
+        let mut older = report();
+        older.seq = 3;
+        older.visible = false;
+        preview.set_bounds(&older).unwrap();
+        assert!(
+            lock(&preview.bounds).current.unwrap().visible,
+            "the old panel's hide did not land"
+        );
+        assert_eq!(lock(&preview.bounds).seq, 5);
+        // The same number again is the same panel; no number at all is always taken.
+        let mut same = report();
+        same.seq = 5;
+        same.visible = false;
+        preview.set_bounds(&same).unwrap();
+        assert!(!lock(&preview.bounds).current.unwrap().visible);
+        let mut legacy = report();
+        legacy.seq = 0;
+        preview.set_bounds(&legacy).unwrap();
+        assert!(lock(&preview.bounds).current.unwrap().visible);
+        assert_eq!(lock(&preview.bounds).seq, 5, "it does not wind the counter back");
+    }
+
+    #[test]
+    fn turning_it_off_flips_at_once_and_only_the_teardown_is_left_for_later() {
+        let preview = failing(Arc::default(), "unused");
+        assert!(!preview.set_enabled(true), "nothing to tear down when it was not on");
+        assert!(preview.is_enabled());
+        assert!(preview.set_enabled(false), "going off asks for a teardown");
+        assert!(!preview.is_enabled(), "the flag is already down when it returns");
+        // A teardown that finds the setting back on does nothing.
+        preview.set_enabled(true);
+        preview.teardown_if_off();
+        assert!(preview.is_enabled());
+    }
+
+    #[test]
+    fn turning_it_on_again_is_a_retry_that_forgets_the_backoff() {
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let preview = failing(built.clone(), "no usable GPU adapter: nothing here");
+        preview.set_enabled(true);
+        visible(&preview);
+        let inputs = inputs();
+        let t0 = Instant::now();
+        let _ = preview.attempt(&inputs, 0.5, false, t0);
+        let _ = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_secs(1));
+        assert_eq!(built.load(Ordering::SeqCst), 1, "backing off");
+        // Off and on: the next frame builds again without waiting out the 5 seconds.
+        preview.set_enabled(false);
+        preview.set_enabled(true);
+        let _ = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_secs(2));
+        assert_eq!(built.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_build_that_stalls_is_a_jpeg_after_its_deadline_and_blocks_nobody_meanwhile() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = started.clone();
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // A connection that never answers: it waits until the test lets it go.
+                let _ = lock(&release_rx).recv_timeout(Duration::from_secs(20));
+                Err("finally gave up".to_string())
+            }),
+        );
+        preview.build_deadline = Duration::from_millis(600);
+        let preview = Arc::new(preview);
+        preview.set_enabled(true);
+        visible(&preview);
+        let inputs = Arc::new(inputs());
+
+        let slow = {
+            let (preview, inputs) = (Arc::clone(&preview), Arc::clone(&inputs));
+            std::thread::spawn(move || (Instant::now(), preview.attempt(&inputs, 0.5, false, Instant::now())))
+        };
+        // While it builds, the render lock is free and another frame does not wait for the build.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(preview.render.try_lock().is_ok(), "the build holds the render lock");
+        let t = Instant::now();
+        let Attempt::Fallback(reasons) = preview.attempt(&inputs, 0.6, false, Instant::now()) else {
+            panic!("drew a frame while the backend was building");
+        };
+        assert!(t.elapsed() < Duration::from_millis(300), "waited {:?}", t.elapsed());
+        assert!(reasons[0].contains("starting"), "{reasons:?}");
+
+        let (began, outcome) = slow.join().unwrap();
+        let Attempt::Fallback(reasons) = outcome else {
+            panic!("drew a frame with a stalled backend");
+        };
+        assert!(reasons[0].contains("took longer"), "{reasons:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the preview waited for the stalled build"
+        );
+        assert!(preview.status().reason.unwrap().contains("took longer"));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn a_build_that_panics_is_an_error_and_not_a_crash() {
+        let preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| panic!("x11rb blew up")),
+        );
+        preview.set_enabled(true);
+        visible(&preview);
+        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), 0.5, false, Instant::now()) else {
+            panic!("drew a frame");
+        };
+        assert!(
+            reasons[0].contains("panicked") && reasons[0].contains("x11rb blew up"),
+            "{reasons:?}"
+        );
+        assert!(!preview.status().ready);
+    }
+
+    #[test]
+    fn a_panic_in_the_gpu_path_is_caught_the_surface_hidden_and_the_frame_is_ffmpegs() {
+        let mut preview = failing(Arc::default(), "unused");
+        // The colour policy is read after the visibility checks, inside the guarded path.
+        preview.policy = || panic!("wgpu panicked");
+        preview.set_enabled(true);
+        visible(&preview);
+        let result = catch_unwind(AssertUnwindSafe(|| preview.frame(|| Ok(inputs()), 0.5, 320, false)));
+        let result = result.expect("the panic reached the caller");
+        // The FFmpeg half has nothing to read here, so it is its own error: what matters is that it was
+        // reached, instead of the command dying with the panic.
+        assert!(result.is_err() || result.as_ref().is_ok_and(|r| r.renderer == "ffmpeg"));
+        let status = preview.status();
+        assert!(!status.ready);
+        assert!(status.reason.unwrap().contains("panicked: wgpu panicked"));
+        assert_eq!(lock(&preview.render).backoff.strikes(), 1, "it is rebuilt behind the backoff");
+    }
+
+    #[test]
+    fn a_run_that_ended_while_the_gpu_preview_was_starting_turns_it_off_next_time() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!take_crash_marker(&dir), "no marker, no crash");
+        std::fs::write(dir.join(CRASH_MARKER), "123").unwrap();
+        assert!(take_crash_marker(&dir), "the marker says the last run died");
+        assert!(!dir.join(CRASH_MARKER).exists(), "and is taken, so it is not found twice");
+        assert!(!take_crash_marker(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_marker_is_down_while_a_backend_is_built_and_gone_when_the_build_fails() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-build-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join(CRASH_MARKER);
+        let seen = Arc::new(Mutex::new(None));
+        let (probe, path) = (seen.clone(), marker.clone());
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(move |_| {
+                *lock(&probe) = Some(path.exists());
+                Err("no adapter".to_string())
+            }),
+        );
+        preview.marker = Some(marker.clone());
+        preview.set_enabled(true);
+        visible(&preview);
+        let _ = preview.attempt(&inputs(), 0.5, false, Instant::now());
+        assert_eq!(*lock(&seen), Some(true), "the marker was down during the build");
+        assert!(!marker.exists(), "a build that failed cleanly is not a crash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_never_answers_leaves_the_marker_down() {
+        let dir = std::env::temp_dir().join(format!("kerf-gpu-stall-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join(CRASH_MARKER);
+        let mut preview = with(
+            Resolution {
+                technique: Some(Technique::Child),
+                note: None,
+            },
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(800));
+                Err("late".to_string())
+            }),
+        );
+        preview.marker = Some(marker.clone());
+        preview.build_deadline = Duration::from_millis(100);
+        preview.set_enabled(true);
+        visible(&preview);
+        let _ = preview.attempt(&inputs(), 0.5, false, Instant::now());
+        // If the app is killed now (a hung driver) the next launch starts with the preview off.
+        assert!(marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_webview_is_made_opaque_again_when_the_guard_goes_by_any_path() {
+        let restored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = restored.clone();
+        let guard = RestoreOnDrop::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(restored.load(Ordering::SeqCst), 0);
+        // A build that fails after the webview was made transparent drops the host, and with it this.
+        let failed_build = || -> Result<(), String> {
+            let _held = guard;
+            Err("the compositor could not be built".into())
+        };
+        assert!(failed_build().is_err());
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
     }
 }

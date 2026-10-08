@@ -2389,14 +2389,11 @@ fn set_settings(
 ) -> CmdResult<settings::SettingsView> {
     let stored = settings::update(&app, &patch)?;
     if patch.get("gpu_preview").is_some() {
-        if stored.gpu_preview {
-            // Turning it on is a flag: the next frame the page asks for must already see it.
-            gpu.set_enabled(true);
-        } else {
-            // Turning it off hides the surface and frees the device, which may wait for a frame
-            // in flight: not on this thread.
+        // The flag flips here, now: the page asks for its next frame as soon as this returns. Only
+        // the teardown of turning it off, which may wait for a frame in flight, is off this thread.
+        if gpu.set_enabled(stored.gpu_preview) {
             let gpu = gpu.inner().clone();
-            std::thread::spawn(move || gpu.set_enabled(false));
+            std::thread::spawn(move || gpu.teardown_if_off());
         }
     }
     Ok(settings::SettingsView::current(&stored))
@@ -2941,10 +2938,19 @@ pub fn run() {
             install_panic_hook();
             use_bundled_ffmpeg();
             // Before anything can spawn ffmpeg: how much of the machine it may take.
+            // The previous run died during the GPU preview's first frame (a driver crash): it must not
+            // do it again on every launch, so the setting goes off before it is read.
+            let crashed = gpu_preview::take_crash_marker_in(app.handle());
+            if crashed {
+                tracing::warn!("the last run ended while the GPU preview was starting; turning the setting off");
+                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview": false })) {
+                    tracing::warn!(error = %e, "could not turn the GPU preview setting off");
+                }
+            }
             let stored = settings::load(app.handle());
             settings::apply(&stored);
             // The GPU preview builds nothing until a frame wants it; this is only the setting.
-            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone()));
+            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed));
             gpu.set_enabled(stored.gpu_preview);
             app.manage(gpu);
             tracing::info!(
