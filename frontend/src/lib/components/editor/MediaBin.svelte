@@ -3,10 +3,17 @@
 	import Icon from './Icon.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
+	import MediaChips from './MediaChips.svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { settings } from '$lib/settings.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
+	import { analyzeMenuItems } from '$lib/analyze-menu';
+	import { doneCount, doneSummary, kindInfo } from '$lib/analysis-steps';
+	import { proxyActions, proxyFacts } from '$lib/proxy-info';
+	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { getFrame, inTauri, revealPath } from '$lib/api';
@@ -67,7 +74,10 @@
 				toast.success(
 					imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
 				);
-				await ui.analyzeQueue(imported.map((a) => a.id));
+				await ui.analyzeImported(
+					imported.map((a) => a.id),
+					settings.autoAnalysis
+				);
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
@@ -104,6 +114,7 @@
 		const analyzing = ui.analyzingId === asset.id;
 		const spherical = !!info.projection;
 		const facts = analysisFacts(analysis, asset.duration);
+		const status = mediaStatus.analysis(asset.id);
 		const imported = new Date(asset.imported_at);
 
 		const items: MenuItem[] = [{ type: 'header', label: asset.name, sub: shortPath(asset.path) }];
@@ -132,8 +143,24 @@
 			items.push({ type: 'info', label: 'Imported', value: imported.toLocaleDateString() });
 
 		items.push({ type: 'separator' });
-		if (facts.length) for (const f of facts) items.push({ type: 'info', label: f.label, value: f.value });
-		else items.push({ type: 'info', label: 'Analysis', value: analyzing ? 'running…' : 'not analyzed' });
+		items.push({
+			type: 'info',
+			label: 'Analyzed',
+			value: analyzing ? 'running…' : doneCount(status),
+			title: doneSummary(status)
+		});
+		for (const k of status?.kinds ?? []) {
+			if (k.state === 'failed')
+				items.push({ type: 'info', label: kindInfo(k.kind).label, value: 'failed', title: k.reason ?? undefined });
+		}
+		for (const f of facts) items.push({ type: 'info', label: f.label, value: f.value });
+
+		const proxy = mediaStatus.proxy(asset.id);
+		const proxyRows = proxyFacts(proxy);
+		if (proxyRows.length > 0) {
+			items.push({ type: 'separator' });
+			for (const f of proxyRows) items.push({ type: 'info', label: f.label, value: f.value, title: f.title });
+		}
 
 		items.push({ type: 'separator' });
 		items.push({
@@ -207,17 +234,7 @@
 				action: () => ui.openVoiceover({ text: vo.text, voice: vo.voice, speed: vo.speed })
 			});
 		}
-		items.push(
-			analyzing
-				? { label: 'Stop analysis', icon: 'x', action: () => ui.stopAnalysis() }
-				: {
-						label: analysis ? 'Re-analyze' : 'Analyze',
-						icon: 'scan-line',
-						// Its transcript is the script it was read from; whisper would only replace it.
-						disabled: !!asset.voiceover,
-						action: () => void ui.runAnalysis(asset.id).catch(err)
-					}
-		);
+		items.push(...analyzeMenuItems(asset));
 		if (info.kind === 'video')
 			items.push({
 				label: spherical ? 'Mark as flat footage' : 'Mark as 360 (equirect)',
@@ -228,6 +245,38 @@
 						.then(() => toast.success(spherical ? `${asset.name} is flat` : `${asset.name} is 360 footage`))
 						.catch(err)
 			});
+		if (info.kind === 'video') {
+			const act = proxyActions(proxy);
+			items.push({ type: 'separator' });
+			items.push({
+				label: act.rebuild.label,
+				icon: 'refresh-cw',
+				disabled: act.rebuild.disabled,
+				reason: act.rebuild.reason,
+				action: () =>
+					void rebuildProxy(asset.id)
+						.then((s) => {
+							mediaStatus.noteProxy(s);
+							toast.success(`Building the proxy of ${asset.name}`);
+						})
+						.catch(err)
+			});
+			items.push({
+				label: act.remove.label,
+				icon: 'trash',
+				danger: true,
+				disabled: act.remove.disabled,
+				reason: act.remove.reason,
+				action: () =>
+					void deleteProxy(asset.id)
+						.then((s) => {
+							mediaStatus.noteProxy(s);
+							ui.refreshPreview();
+							toast.success(`Deleted the proxy of ${asset.name}; previews use the original`);
+						})
+						.catch(err)
+			});
+		}
 
 		items.push({ type: 'separator' });
 		items.push({
@@ -289,7 +338,7 @@
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
 						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf transcribes & detects locally on import
+							Kerf analyzes it locally on import — you choose what in Settings
 						</div>
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
@@ -339,8 +388,9 @@
 						onclick={() => onSelect(a.asset.id)}
 						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
 						title="{a.asset.path}&#10;Drag onto a timeline track to add a clip · right-click for details"
-						style="display:flex;gap:9px;align-items:center;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
+						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
+						<div style="display:flex;gap:9px;align-items:center">
 						<div
 							style="width:56px;height:36px;border-radius:3px;flex:none;overflow:hidden;background:{a.info
 								.kind === 'audio'
@@ -391,13 +441,10 @@
 								{#if a.info.uses > 0}
 									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
 								{/if}
-								{#if ui.analyzingId === a.asset.id}
-									<Badge tone="agent" dot>analyzing</Badge>
-								{:else if editor.analysisFor(a.asset.id)}
-									<Badge tone="success" dot>analyzed</Badge>
-								{/if}
 							</div>
 						</div>
+						</div>
+						<MediaChips assetId={a.asset.id} />
 					</div>
 				{/each}
 			</div>

@@ -100,7 +100,69 @@ export interface AssetAnalysis {
 	onsets: number[];
 	tempo: Tempo | null;
 	audio_class: AudioClassification | null;
+	/** The kinds whose step ran to completion — what tells "ran and found nothing" from
+	 *  "never ran". Absent in an analysis cached before it was recorded (a kind then
+	 *  counts as done when it has data). */
+	ran?: AnalysisKind[];
 }
+
+/** One kind of analysis: each is a step of its own, run alone and cached independently. */
+export type AnalysisKind = 'silence' | 'scenes' | 'loudness' | 'rhythm' | 'transcript';
+
+/** Where one kind of an asset's analysis stands. `off`: not run and will not by itself
+ *  (switched off in Settings, or no speech backend). */
+export type AnalysisState = 'done' | 'not_run' | 'running' | 'failed' | 'off';
+
+export interface AnalysisKindStatus {
+	kind: AnalysisKind;
+	state: AnalysisState;
+	/** Why it failed or is off. */
+	reason?: string | null;
+}
+
+/** An asset's analysis kind by kind (`analysis_statuses`, the `analysis-status` event):
+ *  always one entry per kind, in pass order. */
+export interface AnalysisStatus {
+	asset_id: string;
+	kinds: AnalysisKindStatus[];
+}
+
+/** Which analyses run by themselves on import (Settings › Analysis). */
+export interface AutoAnalysis {
+	/** Analyze new media on import at all. */
+	enabled: boolean;
+	silence: boolean;
+	scenes: boolean;
+	loudness: boolean;
+	rhythm: boolean;
+	transcript: boolean;
+}
+
+/** Where an asset's preview proxy stands. */
+export type ProxyPhase = 'not_needed' | 'off' | 'missing' | 'queued' | 'building' | 'ready' | 'failed';
+
+/** An asset's preview proxy (`proxy_statuses`, the `proxy-progress` event). */
+export interface ProxyStatus {
+	asset_id: string;
+	state: ProxyPhase;
+	/** 0..1, while building. */
+	fraction?: number | null;
+	/** Why it is off, not needed or failed. */
+	reason?: string | null;
+	/** How wide the proxy is (or would be), pixels across. */
+	width?: number | null;
+	/** The proxy file's size on disk. */
+	bytes?: number | null;
+	elapsed_secs?: number | null;
+	eta_secs?: number | null;
+}
+
+/** How wide preview proxies are, pixels across; 0 = none are made. 1280 is the default. */
+export type ProxySize = 0 | 720 | 1080 | 1280;
+
+/** Which file the preview decodes: the proxy once it is ready, always the original, or
+ *  only the proxy (waiting for it). Export always reads the originals. */
+export type PreviewSource = 'auto' | 'original' | 'proxy_only';
 
 export interface Transform {
 	scale: number;
@@ -823,7 +885,8 @@ export interface ImportProgress extends ExportProgress {
  */
 export interface AnalysisProgress {
 	asset_id: string;
-	/** `silence` · `scenes` · `loudness` · `rhythm` · `download_model` · `transcribe` · `done` */
+	/** `waiting` (queued behind a preview proxy) · `silence` · `scenes` · `loudness` · `rhythm` ·
+	 *  `download_model` · `transcribe` · `done` */
 	stage: string;
 	fraction?: number | null;
 	/** A short note, e.g. `84 MB / 142 MB`. */
@@ -930,10 +993,14 @@ export interface AppSettings {
 	 *  stitch, export) may take. Kerf runs one such job at a time; this is how
 	 *  much of the computer that job gets. */
 	cpu_percent: number;
-	/** Whether the analysis pass transcribes speech. Off, importing media still
-	 *  detects silence / scenes / loudness / rhythm but never fetches a speech
-	 *  model or runs inference. */
-	transcribe: boolean;
+	/** Which analyses run by themselves when media is imported: a master switch and
+	 *  one per kind. (Replaces the old `transcribe` flag; the backend carries an
+	 *  older settings file forward.) */
+	auto_analysis: AutoAnalysis;
+	/** How wide preview proxies are — 720, 1080 or 1280 pixels across, or 0 for none. */
+	proxy_size: ProxySize;
+	/** Which file the preview decodes. Export always reads the originals. */
+	preview_source: PreviewSource;
 	/** Whether the preview shades the delivery safe areas — where a phone's
 	 *  own UI covers a vertical or square cut. */
 	safe_areas: boolean;

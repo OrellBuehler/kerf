@@ -15,7 +15,17 @@ import {
 } from './api';
 import { audio } from './audio';
 import { toast } from './notifications.svelte';
-import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, Levels, TranscriptionStatus } from './types';
+import type {
+	AnalysisKind,
+	AnalysisProgress,
+	AutoAnalysis,
+	CaptionStyle,
+	CaptionTimeBase,
+	Levels,
+	TranscriptionStatus
+} from './types';
+import { autoSteps, kindInfo, kindOfStage, missingSteps } from './analysis-steps';
+import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
@@ -268,21 +278,25 @@ class EditorUi {
 		this.analysisStage = p;
 	}
 
+	/** The kind of analysis the running pass is on, once it has said (the chips show it spinning). */
+	get analysisKind(): AnalysisKind | null {
+		return this.analyzing ? kindOfStage(this.analysisStage?.stage) : null;
+	}
+
 	/** A short label for the step analysis is on, or null when idle. */
 	get analysisLabel(): string | null {
 		if (!this.analyzing) return null;
 		const p = this.analysisStage;
 		if (!p) return 'analyzing';
+		const kind = kindOfStage(p.stage);
 		const name =
+			(kind ? kindInfo(kind).doing : undefined) ??
 			{
-				silence: 'detecting silence',
-				scenes: 'detecting scenes',
-				loudness: 'measuring loudness',
-				rhythm: 'finding the beat',
+				waiting: 'waiting for the preview proxy',
 				download_model: 'downloading speech model',
-				transcribe: 'transcribing',
 				done: 'analyzing'
-			}[p.stage] ?? p.stage;
+			}[p.stage] ??
+			p.stage;
 		const pct = p.fraction != null ? ` ${Math.round(p.fraction * 100)}%` : '';
 		return `${name}${pct}`;
 	}
@@ -313,13 +327,16 @@ class EditorUi {
 	}
 
 	/** Analyze an asset, flagging `analyzing` while kerf-core works and following
-	 *  the streamed step reports. Resolves false when the pass was stopped. */
-	async runAnalysis(assetId: string): Promise<boolean> {
+	 *  the streamed step reports. `steps` names the kinds to run (only those, merged into what
+	 *  is cached); without it the backend runs what Settings leaves switched on. Resolves
+	 *  false when the pass was stopped; a step that failed is reported here, once, and the
+	 *  others still landed. */
+	async runAnalysis(assetId: string, steps?: readonly AnalysisKind[]): Promise<boolean> {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
 		try {
-			await editor.analyze(assetId);
+			await editor.analyze(assetId, steps);
 			// Transcription may have downloaded a model on the way.
 			if (this.transcription && !this.transcription.model_ready) await this.loadTranscriptionStatus();
 			return true;
@@ -332,28 +349,63 @@ class EditorUi {
 			this.analyzingId = null;
 			this.analysisStage = null;
 			this.stoppingAnalysis = false;
+			await mediaStatus.refresh();
+			this.reportFailedSteps(assetId, steps);
 		}
+	}
+
+	/** Say which steps of a run failed (the backend carries on without them, so the run itself
+	 *  succeeded). Only the kinds this run asked for — an earlier failure is not news. */
+	private reportFailedSteps(assetId: string, steps?: readonly AnalysisKind[]) {
+		const failed = (mediaStatus.analysis(assetId)?.kinds ?? []).filter(
+			(k) => k.state === 'failed' && (!steps || steps.includes(k.kind))
+		);
+		if (failed.length === 0) return;
+		const name = editor.assets.find((a) => a.id === assetId)?.name ?? 'that clip';
+		for (const k of failed) {
+			toast.error(`Couldn't ${kindInfo(k.kind).action.toLowerCase()} for ${name} — ${k.reason ?? 'it failed'}`);
+		}
+	}
+
+	/** Make sure the `needed` kinds are done for an asset, running only the ones that are not —
+	 *  what a quick edit does before it reads the result. */
+	async ensureAnalysis(assetId: string, needed: readonly AnalysisKind[]): Promise<void> {
+		const missing = missingSteps(mediaStatus.analysis(assetId), needed);
+		if (missing.length > 0) await this.runAnalysis(assetId, missing);
 	}
 
 	/** Analyze a batch one at a time — each pass is ffmpeg-bound, so running
 	 *  them together would only make every one of them slower. Stopping drops
 	 *  the whole rest of the queue: importing ten clips must not be a
 	 *  commitment to ten transcriptions. */
-	async analyzeQueue(assetIds: string[]) {
-		for (let i = 0; i < assetIds.length; i++) {
-			this.analysisQueued = assetIds.length - i - 1;
+	async analyzeQueue(jobs: { id: string; steps?: readonly AnalysisKind[] }[]) {
+		for (let i = 0; i < jobs.length; i++) {
+			this.analysisQueued = jobs.length - i - 1;
 			try {
-				if (!(await this.runAnalysis(assetIds[i]))) break;
+				if (!(await this.runAnalysis(jobs[i].id, jobs[i].steps))) break;
 			} catch (e) {
 				// One unanalyzable file shouldn't abandon the rest of the import;
 				// its media is already in the bin either way. Say so, though —
 				// swallowed, a failed transcription reads as one that found no
 				// speech.
-				const name = editor.assets.find((a) => a.id === assetIds[i])?.name ?? 'that clip';
+				const name = editor.assets.find((a) => a.id === jobs[i].id)?.name ?? 'that clip';
 				toast.error(`Couldn't analyze ${name} — ${message(e)}`);
 			}
 		}
 		this.analysisQueued = 0;
+	}
+
+	/** Analyze what just arrived, by the user's own rules (Settings › Analysis): nothing when
+	 *  the master switch is off, otherwise only the kinds switched on that the asset has not
+	 *  already had — importing a file the project holds again redoes nothing. */
+	async analyzeImported(assetIds: string[], auto: AutoAnalysis) {
+		if (!auto.enabled) return;
+		await mediaStatus.refresh();
+		const available = this.transcription?.available ?? false;
+		const jobs = assetIds
+			.map((id) => ({ id, steps: autoSteps(auto, mediaStatus.analysis(id), available) }))
+			.filter((j) => j.steps.length > 0);
+		await this.analyzeQueue(jobs);
 	}
 
 	/** Ask the running analysis pass to give up. It stops between steps, and

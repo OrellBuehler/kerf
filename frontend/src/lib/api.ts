@@ -9,7 +9,13 @@ import type {
 	AudioDetached,
 	Asset,
 	AssetAnalysis,
+	AnalysisKind,
+	AnalysisStatus,
 	AssetMetadata,
+	AutoAnalysis,
+	PreviewSource,
+	ProxySize,
+	ProxyStatus,
 	AudioEffect,
 	CaptionFormat,
 	CaptionImportRequest,
@@ -97,6 +103,7 @@ import { clampCeiling, clampMasterVolume, DEFAULT_MASTER, estimateLevels, master
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
+import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
 import { sampleFrameUrl } from './sample-frame';
@@ -618,23 +625,200 @@ export async function exportThemeFile(contents: string, defaultName: string): Pr
 	return invoke<string>('write_text_file', { path, contents });
 }
 
-export async function analyzeAsset(assetId: string): Promise<AssetAnalysis> {
+/**
+ * Run analysis on an asset and cache what it finds. `steps` names the kinds to run (silence,
+ * scenes, loudness, rhythm, transcript); only those run and their results are merged into
+ * what is cached, the other kinds left alone. Omitted, it runs the kinds the user has
+ * switched on in Settings › Analysis. In the browser harness the steps are simulated.
+ */
+export async function analyzeAsset(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	if (!inTauri()) return devAnalyze(assetId, steps);
+	return invoke<AssetAnalysis>('analyze_asset', { assetId, steps: steps ? [...steps] : null });
+}
+
+/** The per-kind analysis status of every asset (done / not run / running / failed / off). */
+export async function getAnalysisStatuses(): Promise<AnalysisStatus[]> {
+	if (!inTauri()) return sampleAssets.map((a) => devAnalysisStatus(a.id));
+	return invoke<AnalysisStatus[]>('analysis_statuses');
+}
+
+/** Subscribe to `analysis-status` events: an asset's per-kind status after each step starts and
+ *  when a run ends — the GUI's own and an agent's. Returns an unlisten fn. */
+export async function onAnalysisStatus(cb: (s: AnalysisStatus) => void): Promise<() => void> {
 	if (!inTauri()) {
-		await new Promise((r) => setTimeout(r, 900));
-		return (
-			sampleAnalysis[assetId] ?? {
-				asset_id: assetId,
-				silence_segments: [],
-				scene_changes: [],
-				transcript: [],
-				loudness: null,
-				onsets: [],
-				tempo: null,
-				audio_class: null
-			}
-		);
+		devAnalysisListeners.add(cb);
+		return () => void devAnalysisListeners.delete(cb);
 	}
-	return invoke<AssetAnalysis>('analyze_asset', { assetId });
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<AnalysisStatus>('analysis-status', (e) => cb(e.payload));
+}
+
+// ---- preview proxies -------------------------------------------------------
+
+/** Every asset's preview proxy: queued, building (with a fraction), ready, failed (with why),
+ *  off or not needed. */
+export async function getProxyStatuses(): Promise<ProxyStatus[]> {
+	if (!inTauri()) return sampleAssets.map((a) => devProxy[a.id] ?? { asset_id: a.id, state: 'missing' });
+	return invoke<ProxyStatus[]>('proxy_statuses');
+}
+
+/** Build an asset's proxy again from the original (the current one is dropped first). */
+export async function rebuildProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devRebuildProxy(assetId);
+	return invoke<ProxyStatus>('rebuild_proxy', { assetId });
+}
+
+/** Delete an asset's proxy; previews decode the original until it is rebuilt. */
+export async function deleteProxy(assetId: string): Promise<ProxyStatus> {
+	if (!inTauri()) return devDeleteProxy(assetId);
+	return invoke<ProxyStatus>('delete_proxy', { assetId });
+}
+
+/** Subscribe to `proxy-progress` events: a proxy queued, each percent of a build, ready,
+ *  failed. Returns an unlisten fn. */
+export async function onProxyProgress(cb: (s: ProxyStatus) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devProxyListeners.add(cb);
+		return () => void devProxyListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<ProxyStatus>('proxy-progress', (e) => cb(e.payload));
+}
+
+// The browser harness's stand-ins. Real kerf-core does all of this; here it is just enough for the
+// bin's badges and chips, the menus and the settings to be explored under `bun run dev`.
+// `?proxy=failed` makes the second sample's proxy a failed one, `?proxy=queued` a queued one, so
+// every badge can be looked at.
+
+const devProxyListeners = new Set<(s: ProxyStatus) => void>();
+const devAnalysisListeners = new Set<(s: AnalysisStatus) => void>();
+
+function harnessProxyMode(): string | null {
+	try {
+		return new URLSearchParams(location.search).get('proxy');
+	} catch {
+		return null;
+	}
+}
+
+const devProxy: Record<string, ProxyStatus> = (() => {
+	const mode = harnessProxyMode();
+	const [a, b] = sampleAssets;
+	return {
+		[a.id]: { asset_id: a.id, state: 'building', fraction: 0.42, width: 1280, elapsed_secs: 31, eta_secs: 43 },
+		[b.id]:
+			mode === 'failed'
+				? {
+						asset_id: b.id,
+						state: 'failed',
+						width: 1280,
+						reason: 'could not generate preview proxy: Invalid data found when processing input'
+					}
+				: mode === 'queued'
+					? { asset_id: b.id, state: 'queued', width: 1280 }
+					: { asset_id: b.id, state: 'ready', width: 1280, bytes: 38_400_000 }
+	};
+})();
+
+function devNoteProxy(s: ProxyStatus) {
+	devProxy[s.asset_id] = s;
+	for (const cb of devProxyListeners) cb(structuredClone(s));
+}
+
+const devTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function devRebuildProxy(assetId: string): ProxyStatus {
+	const asset = assetById(assetId);
+	if (!asset) throw new Error('asset not found');
+	devAbandonProxy(assetId);
+	let fraction = 0;
+	const start: ProxyStatus = { asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: 0 };
+	devNoteProxy(start);
+	devTimers.set(
+		assetId,
+		setInterval(() => {
+			fraction = Math.min(1, fraction + 0.1);
+			if (fraction >= 1) {
+				devAbandonProxy(assetId);
+				devNoteProxy({ asset_id: assetId, state: 'ready', width: 1280, bytes: 24_000_000 });
+			} else {
+				devNoteProxy({ asset_id: assetId, state: 'building', fraction, width: 1280, elapsed_secs: fraction * 10, eta_secs: (1 - fraction) * 10 });
+			}
+		}, 400)
+	);
+	return start;
+}
+
+function devAbandonProxy(assetId: string) {
+	const timer = devTimers.get(assetId);
+	if (timer) clearInterval(timer);
+	devTimers.delete(assetId);
+}
+
+function devDeleteProxy(assetId: string): ProxyStatus {
+	devAbandonProxy(assetId);
+	const gone: ProxyStatus = {
+		asset_id: assetId,
+		state: 'off',
+		width: 1280,
+		reason: 'you deleted this proxy; rebuild it to bring it back'
+	};
+	devNoteProxy(gone);
+	return gone;
+}
+
+const devRan: Record<string, Set<AnalysisKind>> = {};
+let devRunning: { id: string; kind: AnalysisKind } | null = null;
+
+function devAutoAnalysis(): AutoAnalysis {
+	return readBrowserAutoAnalysis();
+}
+
+function devAnalysisStatus(assetId: string): AnalysisStatus {
+	const analysis = sampleAnalysis[assetId];
+	const auto = devAutoAnalysis();
+	return {
+		asset_id: assetId,
+		kinds: ALL_KINDS.map((kind) => {
+			if (devRunning?.id === assetId && devRunning.kind === kind) return { kind, state: 'running' as const };
+			if (devRan[assetId]?.has(kind) || analysisKindDone(analysis, kind)) return { kind, state: 'done' as const };
+			if (kind === 'transcript')
+				return { kind, state: 'off' as const, reason: 'no speech-to-text backend: transcription runs in the desktop app' };
+			if (!auto.enabled) return { kind, state: 'off' as const, reason: 'analysis on import is off in Settings' };
+			if (!auto[kind]) return { kind, state: 'off' as const, reason: 'switched off in Settings › Analysis' };
+			return { kind, state: 'not_run' as const };
+		})
+	};
+}
+
+function devNoteAnalysis(assetId: string) {
+	const s = devAnalysisStatus(assetId);
+	for (const cb of devAnalysisListeners) cb(structuredClone(s));
+}
+
+async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+	const auto = devAutoAnalysis();
+	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
+	const empty: AssetAnalysis = {
+		asset_id: assetId,
+		silence_segments: [],
+		scene_changes: [],
+		transcript: [],
+		loudness: null,
+		onsets: [],
+		tempo: null,
+		audio_class: null
+	};
+	sampleAnalysis[assetId] ??= empty;
+	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
+		devRunning = { id: assetId, kind };
+		devNoteAnalysis(assetId);
+		await new Promise((r) => setTimeout(r, 450));
+		(devRan[assetId] ??= new Set()).add(kind);
+	}
+	devRunning = null;
+	devNoteAnalysis(assetId);
+	return { ...sampleAnalysis[assetId], ran: ALL_KINDS.filter((k) => devRan[assetId]?.has(k) || analysisKindDone(sampleAnalysis[assetId], k)) };
 }
 
 // ---- playback --------------------------------------------------------------
@@ -729,7 +913,7 @@ export async function transcriptionStatus(): Promise<TranscriptionStatus> {
 		return {
 			backend: 'none',
 			available: false,
-			enabled: readBrowserTranscribe(),
+			enabled: readBrowserAutoAnalysis().transcript,
 			model: null,
 			model_path: null,
 			model_ready: false,
@@ -2740,7 +2924,9 @@ export async function getSettings(): Promise<SettingsView> {
 	if (!inTauri()) {
 		return browserSettings({
 			cpu_percent: readBrowserCpuPercent(),
-			transcribe: readBrowserTranscribe(),
+			auto_analysis: readBrowserAutoAnalysis(),
+			proxy_size: readBrowserProxySize(),
+			preview_source: readBrowserPreviewSource(),
 			safe_areas: readBrowserSafeAreas(),
 			gpu_preview: harnessSurface(),
 			layout: readBrowserJson(LAYOUT_KEY),
@@ -2764,7 +2950,9 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 				const percent = Math.round(Math.min(100, Math.max(MIN_CPU_PERCENT, patch.cpu_percent)));
 				localStorage.setItem(CPU_KEY, String(percent));
 			}
-			if (patch.transcribe !== undefined) localStorage.setItem(TRANSCRIBE_KEY, patch.transcribe ? '1' : '0');
+			if (patch.auto_analysis !== undefined) localStorage.setItem(AUTO_ANALYSIS_KEY, JSON.stringify(patch.auto_analysis));
+			if (patch.proxy_size !== undefined) localStorage.setItem(PROXY_SIZE_KEY, String(patch.proxy_size));
+			if (patch.preview_source !== undefined) localStorage.setItem(PREVIEW_SOURCE_KEY, patch.preview_source);
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
@@ -2779,7 +2967,10 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 }
 
 const CPU_KEY = 'kerf.settings.cpuPercent';
-const TRANSCRIBE_KEY = 'kerf.settings.transcribe';
+const AUTO_ANALYSIS_KEY = 'kerf.settings.autoAnalysis';
+const PROXY_SIZE_KEY = 'kerf.settings.proxySize';
+const PREVIEW_SOURCE_KEY = 'kerf.settings.previewSource';
+const LEGACY_TRANSCRIBE_KEY = 'kerf.settings.transcribe';
 const SAFE_AREAS_KEY = 'kerf.settings.safeAreas';
 const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
@@ -2798,12 +2989,40 @@ function readBrowserCpuPercent(): number {
 	return DEFAULT_CPU_PERCENT;
 }
 
-function readBrowserTranscribe(): boolean {
+/** The automatic-analysis set the harness remembers. A harness that stored the old on/off
+ *  transcription flag carries it forward, as the backend does for its settings file. */
+function readBrowserAutoAnalysis(): AutoAnalysis {
+	const all: AutoAnalysis = { enabled: true, silence: true, scenes: true, loudness: true, rhythm: true, transcript: true };
 	try {
-		return localStorage.getItem(TRANSCRIBE_KEY) !== '0';
+		const stored = localStorage.getItem(AUTO_ANALYSIS_KEY);
+		if (stored) return { ...all, ...JSON.parse(stored) };
+		if (localStorage.getItem(LEGACY_TRANSCRIBE_KEY) === '0') return { ...all, transcript: false };
 	} catch {
-		return true;
+		// Ignore — the defaults.
 	}
+	return all;
+}
+
+function readBrowserProxySize(): ProxySize {
+	try {
+		const n = Number(localStorage.getItem(PROXY_SIZE_KEY));
+		if (n === 0 || n === 720 || n === 1080 || n === 1280) {
+			if (localStorage.getItem(PROXY_SIZE_KEY) !== null) return n;
+		}
+	} catch {
+		// Ignore — the default.
+	}
+	return 1280;
+}
+
+function readBrowserPreviewSource(): PreviewSource {
+	try {
+		const v = localStorage.getItem(PREVIEW_SOURCE_KEY);
+		if (v === 'original' || v === 'proxy_only') return v;
+	} catch {
+		// Ignore — the default.
+	}
+	return 'auto';
 }
 
 function readBrowserSafeAreas(): boolean {

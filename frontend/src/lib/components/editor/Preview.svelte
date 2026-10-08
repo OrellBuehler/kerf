@@ -11,6 +11,8 @@
 	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
+	import { previewSourceNote } from '$lib/proxy-info';
 	import {
 		anyCovered,
 		boundsReport,
@@ -63,6 +65,20 @@
 	const previewAsset = $derived(
 		atPlayhead ? editor.assets.find((a) => a.id === atPlayhead.assetId) : undefined
 	);
+
+	// Under "Proxy only" a clip whose proxy is still building is not decoded from the original: the
+	// last good frame stays, and this says what the preview is waiting for.
+	const waitingOnProxy = $derived.by(() => {
+		const note = previewSourceNote(
+			editor.timeline,
+			editor.assets,
+			mediaStatus.proxies,
+			settings.previewSource,
+			settings.proxySize,
+			ui.time
+		);
+		return note?.tone === 'waiting' ? note : null;
+	});
 
 	// Once the project has a delivery frame, that is the shape on screen — showing
 	// the source's dimensions here would label the picture with a size it isn't.
@@ -721,6 +737,9 @@
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
+					{#if waitingOnProxy}<span title={waitingOnProxy.title}
+							><Badge tone="warning" dot>{waitingOnProxy.text.replace('preview: ', '')}</Badge></span
+						>{/if}
 					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
 				</div>
 				<div

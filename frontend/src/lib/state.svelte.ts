@@ -109,6 +109,7 @@ import type {
 	SplitSide,
 	ExportProgress,
 	Asset,
+	AnalysisKind,
 	AssetAnalysis,
 	AssetMetadata,
 	AudioEffect,
@@ -610,9 +611,10 @@ class EditorState {
 		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
 	}
 
-	/** Run analysis on an asset and merge the result into local caches. */
-	async analyze(assetId: string): Promise<AssetAnalysis> {
-		const analysis = await analyzeAsset(assetId);
+	/** Run analysis (the named `steps`, else what Settings leaves switched on) on an asset and
+	 *  merge the result into local caches. */
+	async analyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
+		const analysis = await analyzeAsset(assetId, steps);
 		this.analyses[assetId] = analysis;
 		if (assetId === this.selectedAssetId && this.selectedMetadata) {
 			this.selectedMetadata = { ...this.selectedMetadata, analysis };

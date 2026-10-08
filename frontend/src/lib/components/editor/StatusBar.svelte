@@ -4,6 +4,8 @@
 	import { editor } from '$lib/state.svelte';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
+	import { previewSourceNote } from '$lib/proxy-info';
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 
@@ -26,6 +28,18 @@
 		editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
 	);
 
+	/** Which file the frame under the playhead comes from — the proxy or the original, and why. */
+	const sourceNote = $derived(
+		previewSourceNote(
+			editor.timeline,
+			editor.assets,
+			mediaStatus.proxies,
+			settings.previewSource,
+			settings.proxySize,
+			ui.time
+		)
+	);
+
 	function tc(s: number): string {
 		const total = Math.max(0, s);
 		const h = Math.floor(total / 3600);
@@ -46,6 +60,22 @@
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
+	{#if sourceNote}
+		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->
+		<span
+			data-testid="preview-source"
+			data-source={sourceNote.tone}
+			title={sourceNote.title}
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:10px;color:{sourceNote.tone === 'proxy'
+				? 'var(--kerf-300)'
+				: sourceNote.tone === 'waiting'
+					? 'var(--orange-400)'
+					: 'var(--text-muted)'}"
+		>
+			{sourceNote.text}
+		</span>
+		<span style="width:1px;height:12px;background:var(--border-default)"></span>
+	{/if}
 	{#if settings.gpuPreview && gpuPreview.label}
 		<!-- Which renderer made the frame on screen (a dev aid; only with the GPU preview on). -->
 		<span
