@@ -12,6 +12,7 @@
 import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
+import { gpuPreview } from './gpu-preview.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
 import {
@@ -98,6 +99,10 @@ class SettingsStore {
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
 	 *  chrome to stay clear of. */
 	safeAreas = $state(false);
+	/** Draw the Preview with the GPU compositor in a native surface where the plan
+	 *  allows it (experimental; off by default). The JPEG path is the fallback for
+	 *  every frame it does not draw and for every failure. */
+	gpuPreview = $state(false);
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
@@ -147,6 +152,8 @@ class SettingsStore {
 		this.savedPercent = view.cpu_percent;
 		this.transcribe = view.transcribe;
 		this.safeAreas = view.safe_areas;
+		this.gpuPreview = view.gpu_preview ?? false;
+		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
 		this.cpuMinPercent = view.cpu_min_percent;
@@ -220,6 +227,23 @@ class SettingsStore {
 		if (on === this.safeAreas) return;
 		this.safeAreas = on;
 		await this.write({ safe_areas: on }, 'safe-area setting');
+	}
+
+	/** Turn the GPU preview on or off. Off is immediate (the page stops asking at once); **on waits
+	 *  for the write** — the page flips to asking the backend only when the backend has been told, or
+	 *  its first request would find the setting still off and the pane would keep a JPEG until
+	 *  something else nudged it. Then the frame under the playhead is asked for again. The backend
+	 *  builds nothing until a frame wants it and frees everything when it goes off; the status is
+	 *  re-read either way. */
+	async setGpuPreview(on: boolean) {
+		if (on === this.gpuPreview) return;
+		if (!on) {
+			this.gpuPreview = false;
+			gpuPreview.clear();
+		}
+		await this.write({ gpu_preview: on }, 'GPU preview setting');
+		await gpuPreview.refresh();
+		ui.refreshPreview();
 	}
 
 	/** The tab the library shows in the active workspace. Each workspace keeps

@@ -13,6 +13,7 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod gpu_preview;
 mod mcp;
 mod popout;
 mod settings;
@@ -1741,6 +1742,51 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
     .await
 }
 
+/// The frame under the playhead for the Preview panel, through the GPU compositor when that is
+/// on and draws it exactly, else FFmpeg's JPEG — the same one `get_timeline_frame` returns, in
+/// the same call, with the reasons the GPU did not draw it.
+///
+/// `overlays` is the page saying it has something to draw over the picture (a title box, the trim
+/// monitor, safe-area guides): a surface that sits above the page cannot show those, so such a
+/// frame is the JPEG. See [`gpu_preview`]; GUI-only, so there is no MCP tool.
+#[tauri::command]
+async fn get_preview_frame(
+    state: State<'_, AppState>,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    time_secs: f64,
+    max_width: Option<u32>,
+    overlays: Option<bool>,
+) -> CmdResult<gpu_preview::PreviewFrameResult> {
+    let shared = state.project.clone();
+    let gpu = gpu.inner().clone();
+    blocking(move || {
+        // The inputs are taken under the lock and the guard is gone before anything is
+        // planned from files, decoded, rendered or presented.
+        gpu.frame(
+            || gpu_preview::plan_inputs(&lock_user(&shared)),
+            time_secs,
+            max_width.unwrap_or(960),
+            overlays.unwrap_or(false),
+        )
+    })
+    .await
+}
+
+/// Where the Preview frame is in the window (device pixels, relative to the webview) and whether
+/// the native surface should be showing. Called on mount, resize, dock moves, workspace switches
+/// and window moves; cheap, and it never waits for a render.
+#[tauri::command(async)]
+fn set_preview_bounds(gpu: State<'_, Arc<gpu_preview::GpuPreview>>, bounds: gpu_preview::BoundsReport) -> CmdResult<()> {
+    gpu.set_bounds(&bounds)
+}
+
+/// What the GPU preview is doing on this machine: the setting, whether the platform has a surface
+/// technique, whether a device is up, and why not when it is not.
+#[tauri::command(async)]
+fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuPreviewStatus {
+    gpu.status()
+}
+
 /// One composited frame pushed to the webview during playback.
 #[derive(Serialize, Clone)]
 struct PlaybackFrame {
@@ -2382,8 +2428,20 @@ fn get_settings(app: AppHandle) -> settings::SettingsView {
 /// the dialog can show the clamped percentage and the cores it works out to
 /// without a second round-trip.
 #[tauri::command(async)]
-fn set_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<settings::SettingsView> {
+fn set_settings(
+    app: AppHandle,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    patch: serde_json::Value,
+) -> CmdResult<settings::SettingsView> {
     let stored = settings::update(&app, &patch)?;
+    if patch.get("gpu_preview").is_some() {
+        // The flag flips here, now: the page asks for its next frame as soon as this returns. Only
+        // the teardown of turning it off, which may wait for a frame in flight, is off this thread.
+        if gpu.set_enabled(stored.gpu_preview) {
+            let gpu = gpu.inner().clone();
+            std::thread::spawn(move || gpu.teardown_if_off());
+        }
+    }
     Ok(settings::SettingsView::current(&stored))
 }
 
@@ -2933,7 +2991,21 @@ pub fn run() {
             popout::create_main_window(app)?;
             use_bundled_ffmpeg();
             // Before anything can spawn ffmpeg: how much of the machine it may take.
-            settings::apply(&settings::load(app.handle()));
+            // The previous run died during the GPU preview's first frame (a driver crash): it must not
+            // do it again on every launch, so the setting goes off before it is read.
+            let crashed = gpu_preview::take_crash_marker_in(app.handle());
+            if crashed {
+                tracing::warn!("the last run ended while the GPU preview was starting; turning the setting off");
+                if let Err(e) = settings::update(app.handle(), &serde_json::json!({ "gpu_preview": false })) {
+                    tracing::warn!(error = %e, "could not turn the GPU preview setting off");
+                }
+            }
+            let stored = settings::load(app.handle());
+            settings::apply(&stored);
+            // The GPU preview builds nothing until a frame wants it; this is only the setting.
+            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed));
+            gpu.set_enabled(stored.gpu_preview);
+            app.manage(gpu);
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 os = std::env::consts::OS,
@@ -3071,6 +3143,9 @@ pub fn run() {
             revert_to,
             get_frame,
             get_timeline_frame,
+            get_preview_frame,
+            set_preview_bounds,
+            gpu_preview_status,
             start_playback,
             stop_playback,
             get_waveform,

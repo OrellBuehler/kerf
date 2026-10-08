@@ -26,6 +26,7 @@ import type {
 	ExportOptions,
 	ExportProgress,
 	Filmstrip,
+	GpuPreviewStatus,
 	ImportProgress,
 	Easing,
 	Keyframe,
@@ -33,6 +34,8 @@ import type {
 	PropertyKey,
 	LaunchRequest,
 	Levels,
+	PreviewBoundsReport,
+	PreviewFrameResult,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -2487,6 +2490,76 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
 	return invoke<string>('get_timeline_frame', { timeSecs, maxWidth });
 }
 
+/**
+ * The frame under the playhead for the Preview panel — drawn by the GPU compositor in the
+ * native surface when the GPU preview is on and draws it exactly, else FFmpeg's JPEG (the
+ * same one {@link getTimelineFrame} returns), in the same call, with the reasons. `overlays`
+ * says the page has something to draw over the picture (a title box, the trim monitor,
+ * safe-area guides), which a surface above the page cannot show. In the browser harness
+ * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
+ */
+export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays = false): Promise<PreviewFrameResult> {
+	if (!inTauri()) {
+		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
+		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
+		// at under `bun run dev`. Otherwise there is no GPU here.
+		if (harnessSurface()) {
+			return {
+				renderer: 'gpu',
+				frame: null,
+				reasons: [],
+				timings: { width: 1920, height: 1080, decode_ms: 4, composite_ms: 9, present_ms: 1 }
+			};
+		}
+		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
+	}
+	return invoke<PreviewFrameResult>('get_preview_frame', { timeSecs, maxWidth, overlays });
+}
+
+/** The browser harness was opened with `?gpusurface=1`. */
+function harnessSurface(): boolean {
+	try {
+		return new URLSearchParams(location.search).get('gpusurface') === '1';
+	} catch {
+		return false;
+	}
+}
+
+/** Tell the backend where the Preview frame is (see {@link PreviewBoundsReport}). */
+export async function setPreviewBounds(bounds: PreviewBoundsReport): Promise<void> {
+	if (!inTauri()) return;
+	await invoke<void>('set_preview_bounds', { bounds });
+}
+
+/** What the GPU preview is doing on this machine. The browser harness has none. */
+export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
+	if (!inTauri()) {
+		if (harnessSurface()) {
+			return {
+				enabled: true,
+				supported: true,
+				technique: 'window',
+				ready: true,
+				overlays: true,
+				adapter: 'browser harness (pretend)',
+				software: false,
+				reason: null
+			};
+		}
+		return {
+			enabled: false,
+			supported: false,
+			technique: null,
+			ready: false,
+			overlays: false,
+			adapter: null,
+			software: false,
+			reason: 'The GPU preview is part of the desktop app.'
+		};
+	}
+	return invoke<GpuPreviewStatus>('gpu_preview_status');
+}
+
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {
 	if (!inTauri()) {
 		// Synthetic but deterministic peaks so the browser demo shows a waveform.
@@ -2739,6 +2812,7 @@ export async function getSettings(): Promise<SettingsView> {
 			cpu_percent: readBrowserCpuPercent(),
 			transcribe: readBrowserTranscribe(),
 			safe_areas: readBrowserSafeAreas(),
+			gpu_preview: harnessSurface(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),

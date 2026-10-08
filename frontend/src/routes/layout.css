@@ -206,3 +206,11 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
 input[type='range']:focus-visible::-moz-range-thumb {
 	box-shadow: var(--focus-ring);
 }
+
+/* The GPU preview under a transparent webview: every element that paints behind the Preview frame
+   is tagged by `Preview.svelte` while the native surface is on show, and must not paint, so the
+   surface behind the page is what the frame shows. The pane's surround is repainted by a layer
+   with a hole in it; nothing beside the frame's own ancestors is touched. */
+[data-surface-hole] {
+	background: transparent !important;
+}
