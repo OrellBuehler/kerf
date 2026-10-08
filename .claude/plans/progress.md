@@ -491,7 +491,8 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   editor's JavaScript realm (A). B needs ~75 `$state` fields across six singletons synchronised,
   a leader for transport and audio, a high-rate playhead event, a `settings-changed` event and a
   copy of every cache per window, and cannot drag an asset between windows; A needs none of it.
-  **Measured under WSLg (WebKitGTK 2.50.4, Tauri 2.12, wry 0.57, packaged `tauri://`):** a window
+  **Measured by hand under WSLg (WebKitGTK 2.50.4, Tauri 2.12, wry 0.57, packaged `tauri://`) in one
+  session before GUI runs were ruled out here:** a window
   built from `on_new_window` with `window_features` is scriptable (`opener` is the editor, the
   panel's Svelte handlers and `$state` drive it, a real click in it increments the editor's
   state); a drag, a context menu, a shortcut key, playback with the playhead and meters, a theme
@@ -523,6 +524,19 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   WSLg also kills the web process when a second popup opens with GPU compositing
   (`SkiaGPUWorker` fault in swrast_dri.so; `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1` avoids it) — an
   environment fault, not a Kerf one.
+  **Repeatable evidence, no desktop:** bun tests for the layout reader (`popoutGroups`, hidden
+  reference groups, limits, `sameArrangement`), the window registry and realm helpers, the label
+  book and placement correction, the store against a stand-in dock, the workspace restore order
+  (announce, build, wait, baseline) and the menus; Rust tests for the announcement queue and the
+  placement function (`place`); and a headless-Chromium run against the browser harness
+  (`bun run dev`, Playwright, `window.open` popups that share the realm like the desktop's) that
+  opens a Timeline window and drags a clip in it, opens its context menu there and runs an item,
+  plays from a key pressed in it, switches theme, sees the sliders filled, goes inert behind a
+  modal, stores and restores the window across a reload, closes it and gets the panel back, and
+  uses the Window menu — 29 checks, all passing. (The script lives in the author's scratch space;
+  it needs only Playwright and the dev server.) Chromium also showed the observers differ by
+  engine — an editor-realm `IntersectionObserver` says *intersecting* for a detached element
+  there and *not* on WebKitGTK — which is why they are made in the element's own window.
 
 ## Needs a real machine
 
