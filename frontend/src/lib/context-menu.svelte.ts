@@ -10,6 +10,9 @@ export type MenuItem =
 			shortcut?: string;
 			danger?: boolean;
 			disabled?: boolean;
+			/** Why a disabled item is disabled, said under its label — an item that cannot be
+			 *  used and does not say why is a dead end. */
+			reason?: string;
 			action: () => void;
 	  }
 	| { type: 'separator' }

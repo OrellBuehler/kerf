@@ -21,8 +21,10 @@ import type { Timeline } from './types';
 // Under bun there is no Tauri, so these drive the browser harness's answer to the
 // ripple surface — which has to honour the same contract as the backend's, or the
 // editor would be built against behaviour the desktop app never shows. The
-// harness cut is V1 `c1 [0, 12.5)  c2 [12.5, 20.5)` over A1 `c3 [0, 120)`; each
-// test adds `c4` at 24 on V1, leaving a gap of 3.5s before it.
+// harness cut is V1 `c1 [0, 12.5)  c2 [12.5, 20.5)` over A1 `c3 [0, 12.5)` (the
+// interview's sound, linked to c1); each test adds `c4` at 24 on V1, leaving a gap of
+// 3.5s before it. The removals below pass `link: false` to count what they name — the
+// linked removal is `api-links.test.ts`.
 
 const starts = (t: Timeline, track: number) => t.tracks[track].clips.map((c) => c.timeline_start);
 
@@ -139,7 +141,7 @@ describe('remove_clips (browser harness)', () => {
 	test('off, it leaves the gaps, as one revision', async () => {
 		const c4 = await withFourthClip();
 		const revisions = (await getHistory()).length;
-		const t = await removeClips(['c1', c4]);
+		const t = await removeClips(['c1', c4], undefined, false);
 		expect(starts(t, 0)).toEqual([12.5]);
 		const history = await getHistory();
 		expect(history.length).toBe(revisions + 1);
@@ -148,7 +150,7 @@ describe('remove_clips (browser harness)', () => {
 
 	test('forced on, every track closes up behind what it lost', async () => {
 		const c4 = await withFourthClip();
-		const t = await removeClips(['c1', c4], true);
+		const t = await removeClips(['c1', c4], true, false);
 		expect(starts(t, 0)).toEqual([0]); // c2: 12.5 - 12.5
 		const history = await getHistory();
 		expect(history[history.length - 1].label).toBe('Ripple delete 2 clips');
@@ -165,7 +167,7 @@ describe('remove_clips (browser harness)', () => {
 	test('omitted, it follows the project mode', async () => {
 		await withFourthClip();
 		await setRippleMode(true);
-		const t = await removeClips(['c1']);
+		const t = await removeClips(['c1'], undefined, false);
 		expect(starts(t, 0)).toEqual([0, 11.5]);
 		const history = await getHistory();
 		expect(history[history.length - 1].label).toBe('Ripple delete');

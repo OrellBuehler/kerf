@@ -22,17 +22,24 @@ import {
 	ADJACENT_EPS,
 	MIN_EDIT_CLIP,
 	rollEdit,
+	rollEditLinked,
 	rollRange,
+	rollRangeLinked,
 	slideClip,
+	slideClipLinked,
 	slideRange,
+	slideRangeLinked,
 	slipClip,
+	slipClipLinked,
 	slipRange,
+	slipRangeLinked,
 	type DeltaRange,
 	type SourceLimits
 } from './edit-modes';
 import { toFixedEven } from './format-fixed';
 import { quantizeTime, snapToFrame, splitPoint } from './frames';
 import { DIFF_EPS } from './ripple';
+import { gestureReason } from './link-ui';
 import { formatTimecode } from './timecode';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -70,14 +77,15 @@ const reversed = (c: Pick<Clip, 'speed'>) => (c.speed ?? 1) < 0;
 /** A deep copy that reads through a reactive proxy. `structuredClone` refuses one, and
  *  the timeline the editor holds *is* `$state` — the edits write to what they are handed,
  *  so a preview has to work on a plain copy. (The data is JSON all the way down.) */
-function plainCopy<T>(v: T): T {
+export function plainCopy<T>(v: T): T {
 	if (Array.isArray(v)) return v.map(plainCopy) as T;
 	if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plainCopy(x)])) as T;
 	return v;
 }
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, '');
+const messageOf = (e: unknown) =>
+	gestureReason((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
 
 /** How far each asset's footage reaches — `Project::source_limits`: its duration,
  *  or `Infinity` for a still (it loops, so it never runs out). */
@@ -185,12 +193,16 @@ export function holdToRange(range: DeltaRange, requested: number): { applied: nu
 export interface GhostClip {
 	id: string;
 	/** Which part it plays: the cut's outgoing / incoming clip (roll), the slid or
-	 *  slipped clip, or the neighbour giving way either side of it. */
-	role: 'a' | 'b' | 'clip' | 'prev' | 'next';
+	 *  slipped clip, or the neighbour giving way either side of it — or, for a linked
+	 *  edit, `partner`: a clip on another track that the edit carries along. */
+	role: 'a' | 'b' | 'clip' | 'prev' | 'next' | 'partner';
 	start: number;
 	dur: number;
 	/** The clip as the edit leaves it (its source window included). */
 	clip: Clip;
+	/** The track it stands on, and that track's name. */
+	trackId: string;
+	track: string;
 }
 
 export interface EditPreview {
@@ -210,13 +222,26 @@ export interface EditPreview {
 	ghosts: GhostClip[];
 }
 
-function ghostsOf(edit: GestureEdit, clips: Clip[]): GhostClip[] {
-	const ghost = (c: Clip, role: GhostClip['role']): GhostClip => ({ id: c.id, role, start: c.timeline_start, dur: clipDuration(c), clip: c });
-	if (edit.tool === 'roll') return clips.map((c, i) => ghost(c, i === 0 ? 'a' : 'b'));
-	if (edit.tool === 'slip') return clips.map((c) => ghost(c, 'clip'));
+/** The clips an edit changed, as ghosts: those on the subject's own track (`own`) play the
+ *  roles the tool gives them, the rest — a linked edit's partners and what gives way beside
+ *  them — are `partner`. `where` says which track a clip is on after the edit. */
+function ghostsOf(
+	edit: GestureEdit,
+	clips: Clip[],
+	own: ReadonlySet<string>,
+	where: (clipId: string) => { id: string; name: string }
+): GhostClip[] {
+	const ghost = (c: Clip, role: GhostClip['role']): GhostClip => {
+		const t = where(c.id);
+		return { id: c.id, role, start: c.timeline_start, dur: clipDuration(c), clip: c, trackId: t.id, track: t.name };
+	};
+	const mine = clips.filter((c) => own.has(c.id));
+	const rest = clips.filter((c) => !own.has(c.id)).map((c) => ghost(c, 'partner'));
+	if (edit.tool === 'roll') return [...mine.map((c, i) => ghost(c, i === 0 ? 'a' : 'b')), ...rest];
+	if (edit.tool === 'slip') return [...mine.map((c) => ghost(c, 'clip')), ...rest];
 	// A slide answers [previous?, the clip, next?] in timeline order.
-	const at = clips.findIndex((c) => c.id === edit.clipId);
-	return clips.map((c, i) => ghost(c, i < at ? 'prev' : i > at ? 'next' : 'clip'));
+	const at = mine.findIndex((c) => c.id === edit.clipId);
+	return [...mine.map((c, i) => ghost(c, i < at ? 'prev' : i > at ? 'next' : 'clip')), ...rest];
 }
 
 /**
@@ -225,29 +250,43 @@ function ghostsOf(edit: GestureEdit, clips: Clip[]): GhostClip[] {
  * after holding the request to the range it clamps to. Never throws and never touches
  * `timeline` — a refusal comes back as `ok: false` with the backend's reason.
  */
-export function previewEdit(timeline: Timeline, edit: GestureEdit, requested: number, footage: SourceLimits): EditPreview {
+export function previewEdit(
+	timeline: Timeline,
+	edit: GestureEdit,
+	requested: number,
+	footage: SourceLimits,
+	links = false
+): EditPreview {
 	const subject = edit.tool === 'roll' ? edit.a : edit.clipId;
 	const base: EditPreview = { edit, requested, applied: 0, clamped: false, why: '', ok: true, ghosts: [] };
 	const track = timeline.tracks.find((t) => t.clips.some((c) => c.id === subject));
 	if (!track) return { ...base, ok: false, why: `clip not found: ${subject}` };
-	const sandbox: Timeline = { tracks: [plainCopy(track)] };
+	// With links the edit reaches the partners' lanes too, so the sandbox holds every track
+	// that has a linked clip (a partner's lane is one of them) beside the subject's own.
+	const lanes = links ? timeline.tracks.filter((t) => t === track || t.clips.some((c) => c.link_id)) : [track];
+	const sandbox: Timeline = { tracks: plainCopy(lanes) };
+	const own = new Set(track.clips.map((c) => c.id));
 	try {
 		const range =
 			edit.tool === 'roll'
-				? rollRange(sandbox, edit.a, edit.b, footage)
+				? (links ? rollRangeLinked : rollRange)(sandbox, edit.a, edit.b, footage)
 				: edit.tool === 'slip'
-					? slipRange(sandbox, edit.clipId, footage)
-					: slideRange(sandbox, edit.clipId, footage);
+					? (links ? slipRangeLinked : slipRange)(sandbox, edit.clipId, footage)
+					: (links ? slideRangeLinked : slideRange)(sandbox, edit.clipId, footage);
 		const held = holdToRange(range, requested);
 		const idle = { ...base, clamped: held.clamped, why: held.why };
 		if (Math.abs(held.applied) <= DIFF_EPS) return idle;
 		const out =
 			edit.tool === 'roll'
-				? rollEdit(sandbox, edit.a, edit.b, held.applied, footage)
+				? (links ? rollEditLinked : rollEdit)(sandbox, edit.a, edit.b, held.applied, footage)
 				: edit.tool === 'slip'
-					? slipClip(sandbox, edit.clipId, held.applied, footage)
-					: slideClip(sandbox, edit.clipId, held.applied, footage);
-		return { ...idle, applied: out.applied, ghosts: ghostsOf(edit, out.clips) };
+					? (links ? slipClipLinked : slipClip)(sandbox, edit.clipId, held.applied, footage)
+					: (links ? slideClipLinked : slideClip)(sandbox, edit.clipId, held.applied, footage);
+		const where = (id: string) => {
+			const t = sandbox.tracks.find((x) => x.clips.some((c) => c.id === id)) ?? sandbox.tracks[0];
+			return { id: t.id, name: t.name };
+		};
+		return { ...idle, applied: out.applied, ghosts: ghostsOf(edit, out.clips, own, where) };
 	} catch (e) {
 		return { ...base, ok: false, why: messageOf(e) };
 	}
@@ -294,17 +333,20 @@ export function readoutFor(p: EditPreview, fps: number): Readout {
 	const tone = p.clamped ? 'limit' : 'ok';
 	const tc = (s: number) => formatTimecode(s, fps);
 	const g = p.ghosts;
+	// A linked edit says whose lanes come along: `· with A1`.
+	const carried = [...new Set(g.filter((x) => x.role === 'partner').map((x) => x.track))];
+	const along = carried.length > 0 ? ` · with ${carried.join(', ')}` : '';
 	if (p.edit.tool === 'roll') {
 		const b = g.find((x) => x.role === 'b');
-		return { title: `${verb} ${deltaLabel(p.applied, fps)}${b ? ` · cut ${tc(b.start)}` : ''}`, detail, tone };
+		return { title: `${verb} ${deltaLabel(p.applied, fps)}${b ? ` · cut ${tc(b.start)}` : ''}${along}`, detail, tone };
 	}
 	const me = g.find((x) => x.role === 'clip');
 	if (p.edit.tool === 'slip') {
 		const mag = me ? speedMag(me.clip) : 1;
 		const span = me ? ` · in ${tc(me.clip.source_in)} → out ${tc(me.clip.source_out)}` : '';
-		return { title: `${verb} ${deltaLabel(p.applied / mag, fps)}${span}`, detail, tone };
+		return { title: `${verb} ${deltaLabel(p.applied / mag, fps)}${span}${along}`, detail, tone };
 	}
-	return { title: `${verb} ${deltaLabel(p.applied, fps)}${me ? ` · now at ${tc(me.start)}` : ''}`, detail, tone };
+	return { title: `${verb} ${deltaLabel(p.applied, fps)}${me ? ` · now at ${tc(me.start)}` : ''}${along}`, detail, tone };
 }
 
 /** What the toast says when the backend would turn the edit down (`track V1 is locked`). */

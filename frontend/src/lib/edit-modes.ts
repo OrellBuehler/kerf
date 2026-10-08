@@ -22,8 +22,8 @@
 // follows the project's ripple mode like any trim.
 
 import { formatTime } from './diff';
+import { invalid, locateIndex, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
-import { DIFF_EPS } from './ripple';
 import type {
 	Clip,
 	ClipCut,
@@ -58,7 +58,11 @@ export interface DeltaRange {
 	whyMax: string;
 }
 
-const invalid = (why: string) => new Error(`invalid argument: ${why}`);
+/** kerf-core's `DIFF_EPS`: timing closer than this is float noise from a JSON round-trip.
+ *  Defined here (and re-exported by `ripple.ts`, where it always lived) so the sync lock in
+ *  `ripple.ts` can use this module's clip helpers without an import cycle. */
+export const DIFF_EPS = 1e-6;
+
 const changed = (a: number, b: number) => Math.abs(a - b) > DIFF_EPS;
 const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);
 const reversed = (c: Clip) => (c.speed ?? 1) < 0;
@@ -96,7 +100,7 @@ function checkDelta(delta: number) {
 	if (Math.abs(delta) <= DIFF_EPS) throw invalid('delta is zero — there is nothing to move');
 }
 
-function footageOf(footage: SourceLimits, clip: Clip): number {
+export function footageOf(footage: SourceLimits, clip: Clip): number {
 	const limit = footage.get(clip.asset_id);
 	if (limit === undefined) throw new Error(`asset not found: ${clip.asset_id}`);
 	return limit;
@@ -114,7 +118,7 @@ const outcome = (requested: number, applied: number, clips: Clip[]): EditOutcome
 /** Unused footage either side of a clip's source window, in timeline seconds, as
  *  `[head, tail]`. A reversed clip plays the window backwards, so its start is the
  *  source's *out* side and the two swap; a still has no footage to run out of. */
-function handles(clip: Clip, limit: number): [number, number] {
+export function handles(clip: Clip, limit: number): [number, number] {
 	if (!Number.isFinite(limit)) return [Infinity, Infinity];
 	const mag = speedOf(clip);
 	const before = Math.max(clip.source_in, 0) / mag;
@@ -124,7 +128,7 @@ function handles(clip: Clip, limit: number): [number, number] {
 
 /** Move the clip's end by `by` timeline seconds (positive lengthens). `looping` (a
  *  still) writes only the out-point whichever way it plays, so a window never goes below 0. */
-function moveTail(clip: Clip, by: number, looping: boolean) {
+export function moveTail(clip: Clip, by: number, looping: boolean) {
 	const shift = by * speedOf(clip);
 	if (reversed(clip) && !looping) clip.source_in -= shift;
 	else clip.source_out += shift;
@@ -132,7 +136,7 @@ function moveTail(clip: Clip, by: number, looping: boolean) {
 
 /** Move the clip's start by `by` timeline seconds — positive shortens it from the
  *  front, negative pulls it earlier and longer — so its end stays where it was. */
-function moveHead(clip: Clip, by: number, looping: boolean) {
+export function moveHead(clip: Clip, by: number, looping: boolean) {
 	rebaseAnimation(clip, by);
 	const shift = by * speedOf(clip);
 	if (reversed(clip) || looping) clip.source_out -= shift;
@@ -141,7 +145,7 @@ function moveHead(clip: Clip, by: number, looping: boolean) {
 }
 
 /** Hold both fades inside the clip; only ever shortens one. */
-function clampFades(clip: Clip) {
+export function clampFades(clip: Clip) {
 	const d = clipDuration(clip);
 	clip.fade_in = Math.min(clip.fade_in, d);
 	clip.fade_out = Math.min(clip.fade_out, d);
@@ -655,4 +659,158 @@ export function splitRemoveClips(timeline: Timeline, cuts: readonly ClipCut[], s
 	const kept = cuts.map((cut) => splitRemove(scratch, cut.clip_id, cut.at, side));
 	timeline.tracks = scratch.tracks;
 	return kept;
+}
+
+// ---- linked edits ----------------------------------------------------------------
+// The group versions of roll, slip and slide — the port of `roll_edit_linked` /
+// `slip_clip_linked` / `slide_clip_linked` in kerf-core's `model/links.rs`. Each applies
+// the same edit to the linked partners and clamps the whole group to its tightest
+// member; a partner on a locked track refuses the lot. With no partners to carry they
+// are exactly the plain edit.
+
+/** The range both allow: the tighter bound each way, with the reason it came from. */
+function intersect(a: DeltaRange, b: DeltaRange): DeltaRange {
+	const out = { ...a };
+	if (b.min > out.min) {
+		out.min = b.min;
+		out.whyMin = b.whyMin;
+	}
+	if (b.max < out.max) {
+		out.max = b.max;
+		out.whyMax = b.whyMax;
+	}
+	return out;
+}
+
+/** The same range in units `k` times as large (`k > 0`). */
+function scaled(r: DeltaRange, k: number): DeltaRange {
+	return { ...r, min: r.min * k, max: r.max * k };
+}
+
+/** The reasons, prefixed with the track of the linked clip they belong to. */
+function onLinked(r: DeltaRange, track: string): DeltaRange {
+	const why = (w: string) => (w ? `linked clip on ${track}: ${w}` : w);
+	return { ...r, whyMin: why(r.whyMin), whyMax: why(r.whyMax) };
+}
+
+const trackNameOf = (timeline: Timeline, clipId: string): string => {
+	const at = locateIndex(timeline, clipId);
+	return at ? timeline.tracks[at[0]].name : '';
+};
+
+/** The pairs of partners a roll of the cut between `clipA` and `clipB` also rolls: a
+ *  partner of `clipA` and one of `clipB` that touch on one track with the first earlier. */
+function rollPartnerPairs(timeline: Timeline, clipA: string, clipB: string, footage: SourceLimits): [string, string][] {
+	const named = new Set([clipA, clipB]);
+	const pa = unlockedPartners(timeline, clipA, named);
+	const pb = unlockedPartners(timeline, clipB, named);
+	const pairs: [string, string][] = [];
+	for (const a of pa) {
+		for (const b of pb) {
+			if (a === b) continue;
+			try {
+				rollPlan(timeline, a, b, footage);
+				pairs.push([a, b]);
+			} catch {
+				// not a pair: no shared cut
+			}
+		}
+	}
+	return pairs;
+}
+
+/** `rollRange` for the group: the roll's range intersected with each partner pair's. */
+export function rollRangeLinked(timeline: Timeline, clipA: string, clipB: string, footage: SourceLimits): DeltaRange {
+	let range = rollRange(timeline, clipA, clipB, footage);
+	for (const [a, b] of rollPartnerPairs(timeline, clipA, clipB, footage))
+		range = intersect(range, onLinked(rollRange(timeline, a, b, footage), trackNameOf(timeline, a)));
+	return range;
+}
+
+/** **Roll** the cut and the cut of each linked partner pair sharing it, all by `delta`,
+ *  clamped to the tightest pair. Mutates `timeline`; all or nothing. */
+export function rollEditLinked(
+	timeline: Timeline,
+	clipA: string,
+	clipB: string,
+	delta: number,
+	footage: SourceLimits
+): EditOutcome {
+	checkDelta(delta);
+	const pairs = rollPartnerPairs(timeline, clipA, clipB, footage);
+	if (pairs.length === 0) return rollEdit(timeline, clipA, clipB, delta, footage);
+	const applied = resolve(rollRangeLinked(timeline, clipA, clipB, footage), delta, 'roll the cut');
+	const scratch: Timeline = structuredClone(timeline);
+	const clips = rollEdit(scratch, clipA, clipB, applied, footage).clips;
+	for (const [a, b] of pairs) clips.push(...rollEdit(scratch, a, b, applied, footage).clips);
+	timeline.tracks = scratch.tracks;
+	return outcome(delta, applied, clips);
+}
+
+/** Partners a slip also slips: every linked partner but a still (no footage to slip). */
+function slipPartners(timeline: Timeline, clipId: string, footage: SourceLimits): string[] {
+	const out: string[] = [];
+	for (const partner of unlockedPartners(timeline, clipId, new Set([clipId]))) {
+		const [ti, ci] = locateIndex(timeline, partner)!;
+		if (!Number.isFinite(footageOf(footage, timeline.tracks[ti].clips[ci]))) continue;
+		out.push(partner);
+	}
+	return out;
+}
+
+/** `slipRange` for the group, in the named clip's source seconds: a partner's range is
+ *  converted by the ratio of the two speeds, then intersected. */
+export function slipRangeLinked(timeline: Timeline, clipId: string, footage: SourceLimits): DeltaRange {
+	let range = slipRange(timeline, clipId, footage);
+	const mag = speedOf(clipAt(timeline, clipId));
+	for (const partner of slipPartners(timeline, clipId, footage)) {
+		const theirs = slipRange(timeline, partner, footage);
+		range = intersect(range, onLinked(scaled(theirs, mag / speedOf(clipAt(timeline, partner))), trackNameOf(timeline, partner)));
+	}
+	return range;
+}
+
+function clipAt(timeline: Timeline, clipId: string): Clip {
+	const [ti, ci] = locateIndex(timeline, clipId)!;
+	return timeline.tracks[ti].clips[ci];
+}
+
+/** **Slip** the clip and its linked partners by the same timeline shift of the footage,
+ *  clamped to the tightest member. `delta` is in the named clip's source seconds. */
+export function slipClipLinked(timeline: Timeline, clipId: string, delta: number, footage: SourceLimits): EditOutcome {
+	checkDelta(delta);
+	const partners = slipPartners(timeline, clipId, footage);
+	if (partners.length === 0) return slipClip(timeline, clipId, delta, footage);
+	const applied = resolve(slipRangeLinked(timeline, clipId, footage), delta, 'slip the footage');
+	const mag = speedOf(clipAt(timeline, clipId));
+	const scratch: Timeline = structuredClone(timeline);
+	const clips = slipClip(scratch, clipId, applied, footage).clips;
+	for (const partner of partners) {
+		const theirs = (applied * speedOf(clipAt(scratch, partner))) / mag;
+		if (Math.abs(theirs) > DIFF_EPS) clips.push(...slipClip(scratch, partner, theirs, footage).clips);
+	}
+	timeline.tracks = scratch.tracks;
+	return outcome(delta, applied, clips);
+}
+
+/** `slideRange` for the group: the slide's range intersected with each partner's. */
+export function slideRangeLinked(timeline: Timeline, clipId: string, footage: SourceLimits): DeltaRange {
+	let range = slideRange(timeline, clipId, footage);
+	for (const partner of unlockedPartners(timeline, clipId, new Set([clipId])))
+		range = intersect(range, onLinked(slideRange(timeline, partner, footage), trackNameOf(timeline, partner)));
+	return range;
+}
+
+/** **Slide** the clip and each linked partner by the same `delta`, every one's touching
+ *  neighbours giving way on its own track, clamped to the tightest. */
+export function slideClipLinked(timeline: Timeline, clipId: string, delta: number, footage: SourceLimits): EditOutcome {
+	checkDelta(delta);
+	const partners = unlockedPartners(timeline, clipId, new Set([clipId]));
+	if (partners.length === 0) return slideClip(timeline, clipId, delta, footage);
+	const applied = resolve(slideRangeLinked(timeline, clipId, footage), delta, 'slide the clip');
+	const scratch: Timeline = structuredClone(timeline);
+	const clips = slideClip(scratch, clipId, applied, footage).clips;
+	for (const partner of partners) clips.push(...slideClip(scratch, partner, applied, footage).clips);
+	timeline.tracks = scratch.tracks;
+	return outcome(delta, applied, clips);
 }

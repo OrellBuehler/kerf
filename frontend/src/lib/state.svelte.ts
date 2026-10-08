@@ -1,6 +1,6 @@
 // Central editor state (Svelte 5 runes).
 
-import type { Placement } from './api';
+import type { AudioDetached, Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
@@ -20,6 +20,9 @@ import {
 	cancelExport,
 	onExportProgress,
 	exportVariants,
+	addAssetAudio,
+	detachAudio,
+	detachAudioClips,
 	extractAudio,
 	getAssetMetadata,
 	getHistory,
@@ -64,6 +67,9 @@ import {
 	addMarker,
 	updateMarker,
 	removeMarker,
+	linkClips,
+	reattachAudio,
+	reattachAudioClips,
 	reorderClip,
 	rippleDelete,
 	cutClipRange,
@@ -72,6 +78,7 @@ import {
 	slideClip,
 	splitRemove,
 	splitRemoveClips,
+	unlinkClips,
 	revertTo as apiRevertTo,
 	revisionDiff as apiRevisionDiff,
 	applyStagedEdit,
@@ -130,7 +137,9 @@ import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { Generation } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
-import { clickSelect, normalize, pruneSelection, type PickMode } from './selection';
+import { normalize, pruneSelection, type PickMode } from './selection';
+import { clickSelectLinked } from './link-ui';
+import { locateIndex, withLinkPartners } from './link-groups';
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -245,13 +254,15 @@ class EditorState {
 	 * Select a clip. `replace` (a plain click) drops the rest, `toggle`
 	 * (ctrl/cmd-click) adds or removes it, and `range` (shift-click) extends the
 	 * selection with everything between the primary and this clip on the same
-	 * track (just the clip, when the primary is elsewhere).
+	 * track (just the clip, when the primary is elsewhere). A linked clip takes its
+	 * partners with it — pick the picture and its sound is picked too — unless
+	 * `alone` (an Alt-click): see `clickSelectLinked`.
 	 */
-	selectClip(clipId: string, mode: PickMode = 'replace') {
+	selectClip(clipId: string, mode: PickMode = 'replace', alone = false) {
 		this.selectedOverlayId = null;
 		const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
 		this.#setSelection(
-			clickSelect(this.#selection(), clipId, mode, track ? track.clips.map((c) => c.id) : null)
+			clickSelectLinked(this.timeline, this.#selection(), clipId, mode, track ? track.clips.map((c) => c.id) : null, alone)
 		);
 	}
 
@@ -304,6 +315,17 @@ class EditorState {
 		const ids = clips.filter((c) => !locked.has(c.id)).map((c) => c.id);
 		const skipped = clips.length - ids.length;
 		if (ids.length === 0) return { removed: 0, skipped };
+		// A linked clip takes its partners with it, and a partner on a locked track refuses the whole
+		// removal (a linked edit is a group edit) — said before anything is touched, not as a bare
+		// "track A1 is locked" from the backend, with the way round it.
+		for (const id of withLinkPartners(this.timeline, ids)) {
+			const at = locateIndex(this.timeline, id);
+			if (at && this.timeline.tracks[at[0]].locked && !ids.includes(id)) {
+				throw new Error(
+					`A linked clip is on locked track ${this.timeline.tracks[at[0]].name} — unlock it, or use “Remove only this clip” in the clip menu`
+				);
+			}
+		}
 		const kept = clips.filter((c) => locked.has(c.id)).map((c) => c.id);
 		this.selectClips(kept, kept.includes(this.selectedClipId ?? '') ? this.selectedClipId : null);
 		await this.#apply(removeClips(ids, ripple ? true : undefined));
@@ -615,34 +637,39 @@ class EditorState {
 	add(assetId: string, sourceIn: number, sourceOut: number, trackId?: string, timelineStart?: number) {
 		return this.#apply(addClip(assetId, sourceIn, sourceOut, trackId, timelineStart));
 	}
-	split(clipId: string, at: number) {
-		return this.#apply(splitClip(clipId, at));
+	/** Split a clip at `at`; its linked partners are cut at the same moment unless `link` is `false`. */
+	split(clipId: string, at: number, link?: boolean) {
+		return this.#apply(splitClip(clipId, at, link));
 	}
-	trim(clipId: string, sourceIn?: number, sourceOut?: number, timelineStart?: number) {
-		return this.#apply(trimClip(clipId, sourceIn, sourceOut, timelineStart));
+	/** Trim a clip; the partners that share the edge follow it unless `link` is `false`. */
+	trim(clipId: string, sourceIn?: number, sourceOut?: number, timelineStart?: number, link?: boolean) {
+		return this.#apply(trimClip(clipId, sourceIn, sourceOut, timelineStart, link));
 	}
 	reorder(trackId: string, clipId: string, newIndex: number) {
 		return this.#apply(reorderClip(trackId, clipId, newIndex));
 	}
-	move(clipId: string, timelineStart: number, trackId?: string) {
-		return this.#apply(moveClip(clipId, timelineStart, trackId));
+	move(clipId: string, timelineStart: number, trackId?: string, link?: boolean) {
+		return this.#apply(moveClip(clipId, timelineStart, trackId, link));
 	}
 	/** Move several clips as ONE edit — a dragged selection. All or nothing: the
-	 *  promise rejects, and nothing has moved, if the group does not fit. */
-	moveClips(moves: ClipMove[]) {
-		return this.#apply(moveClips(moves));
+	 *  promise rejects, and nothing has moved, if the group does not fit. The partners of
+	 *  the clips named move with them (the same Δt, each on its own track) unless `link`
+	 *  is `false`. */
+	moveClips(moves: ClipMove[], link?: boolean) {
+		return this.#apply(moveClips(moves, link));
 	}
-	/** Roll the cut between two adjacent clips by `delta` seconds (positive later). */
-	roll(clipA: string, clipB: string, delta: number) {
-		return this.#apply(rollEdit(clipA, clipB, delta));
+	/** Roll the cut between two adjacent clips by `delta` seconds (positive later);
+	 *  the partner pairs sharing the cut roll with it unless `link` is `false`. */
+	roll(clipA: string, clipB: string, delta: number, link?: boolean) {
+		return this.#apply(rollEdit(clipA, clipB, delta, link));
 	}
 	/** Slip a clip's footage by `delta` source seconds (positive = starts later in it). */
-	slip(clipId: string, delta: number) {
-		return this.#apply(slipClip(clipId, delta));
+	slip(clipId: string, delta: number, link?: boolean) {
+		return this.#apply(slipClip(clipId, delta, link));
 	}
 	/** Slide a clip along its track by `delta` timeline seconds; touching neighbours give way. */
-	slide(clipId: string, delta: number) {
-		return this.#apply(slideClip(clipId, delta));
+	slide(clipId: string, delta: number, link?: boolean) {
+		return this.#apply(slideClip(clipId, delta, link));
 	}
 	/** Split a clip at `at` and remove the `left` or `right` half; follows ripple mode. */
 	splitRemove(clipId: string, at: number, side: SplitSide) {
@@ -720,13 +747,15 @@ class EditorState {
 		return sel.length;
 	}
 
-	remove(clipId: string) {
+	/** Remove a clip — and its linked partners, unless `link` is `false` (delete the
+	 *  picture, keep its sound). */
+	remove(clipId: string, link?: boolean) {
 		this.#forget(clipId);
-		return this.#apply(removeClip(clipId));
+		return this.#apply(removeClip(clipId, link));
 	}
-	rippleDelete(clipId: string) {
+	rippleDelete(clipId: string, link?: boolean) {
 		this.#forget(clipId);
-		return this.#apply(rippleDelete(clipId));
+		return this.#apply(rippleDelete(clipId, link));
 	}
 
 	/** Drop a clip from the selection; the primary falls to what is left. */
@@ -957,8 +986,58 @@ class EditorState {
 	smartCrop(clipId?: string) {
 		return this.#apply(smartCrop(clipId));
 	}
-	extractAudio(assetId: string) {
-		return this.#apply(extractAudio(assetId));
+	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
+	 *  to what was detached and what was skipped (a locked track). */
+	async extractAudio(assetId: string): Promise<AudioDetached> {
+		let report!: AudioDetached;
+		await this.#apply(
+			extractAudio(assetId).then((r) => {
+				report = r;
+				return r.timeline;
+			})
+		);
+		return report;
+	}
+	/** Append an asset's whole audio to the first audio track as a clip of its own. */
+	addAssetAudio(assetId: string) {
+		return this.#apply(addAssetAudio(assetId));
+	}
+
+	// ---- linked A/V -------------------------------------------------------------
+
+	/** Give a picture clip its own sound as a linked clip on an audio track, and mute the
+	 *  picture (one `Detach audio` revision). */
+	detachAudio(clipId: string) {
+		return this.#apply(detachAudio(clipId));
+	}
+	/** Detach several pictures' own sound as **one** `Detach audio (N clips)` revision; a clip that
+	 *  cannot be is skipped and reported. */
+	async detachAudioClips(clipIds: string[]): Promise<AudioDetached> {
+		let report!: AudioDetached;
+		await this.#apply(
+			detachAudioClips(clipIds).then((r) => {
+				report = r;
+				return r.timeline;
+			})
+		);
+		return report;
+	}
+	/** The way back: delete the linked audio clip and let the picture play its own sound
+	 *  again. Name either clip of the pair. */
+	reattachAudio(clipId: string) {
+		return this.#apply(reattachAudio(clipId));
+	}
+	/** Reattach several pairs as **one** `Reattach audio (N clips)` revision, all or nothing. */
+	reattachAudioClips(clipIds: string[]) {
+		return this.#apply(reattachAudioClips(clipIds));
+	}
+	/** Link clips (two or more, one per track) so an edit to one is carried to the others. */
+	linkClips(clipIds: string[]) {
+		return this.#apply(linkClips(clipIds));
+	}
+	/** Take clips out of their link groups. */
+	unlinkClips(clipIds: string[]) {
+		return this.#apply(unlinkClips(clipIds));
 	}
 	concatenate(assetIds: string[]) {
 		return this.#apply(concatenate(assetIds));

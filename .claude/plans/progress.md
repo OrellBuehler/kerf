@@ -22,7 +22,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Open: linked A/V + detach audio (verify `extract_audio` doubling), blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -44,6 +44,21 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   stands in for `main` (each finished WP merged into it with `--no-ff`), so
   later WPs build on earlier ones. When access returns, the branches are pushed
   and PRs opened in merge order.
+- **2026-10-07 — push access restored; stacked PRs.** The finished branches were
+  pushed in merge order. At most three PRs are open at once, each based on the
+  branch before it, so every diff shows one work package and CI runs on the
+  combined tree. When the lowest one merges, the next is retargeted to `main` and
+  `main` is merged up the stack. `local/main` is retired.
+- **2026-10-07 — FFmpeg repin.** BtbN pruned `autobuild-2026-09-22-13-18`, so every
+  pinned engine job 404'd, on `main` too. The pin moved to `autobuild-2026-10-07-13-07`
+  (same 9.0 branch, n9.0.2-22), on the first PR of the stack. `--repin` needs the
+  GitHub API, which the sandbox blocks for BtbN, so the tag was read via `git
+  ls-remote`, the build name via `git describe` of FFmpeg's `release/9.0`, and the
+  digests from the downloads. Parity and the pick tests pass on it.
+- **2026-10-07 — subagent limit.** The weekly subagent quota ran out mid-session
+  (it resets 2026-10-12). The three stopped packages (linked A/V, mixer, A1b-1 fixes)
+  were finished directly, with the same verification and no second independent
+  review. They get one before merge, once agents are available.
 - **2026-10-06 — main did not type-check.** The hand-off merge (#89) left
   duplicated imports/script blocks (21 svelte-check errors, dev server 500).
   Fixed on its own branch `fix/hand-off-duplicates` (to merge first); B1 merges
@@ -132,6 +147,69 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   GPU.
 - **2026-10-07 — edit modes act per track.** Roll/slip/slide don't move a
   linked partner (no sync lock until linked A/V lands).
+  **Superseded 2026-10-07 (`feat/linked-av`):** with links in force they act on the
+  group — roll rolls each partner pair sharing the cut, slip and slide move every
+  partner, and the whole edit clamps to the tightest member.
+- **2026-10-07 — linked A/V (core + surfaces).** `Clip.link_id` (identity, at most one
+  clip per track) and `Clip.source_audio` (omitted at `true`; only `false` reaches the
+  graph, as a drop from the audio mix, so the golden oracle did not move). Links are on
+  by default and per call `link: false` (`Project::with_links`) is the escape hatch —
+  no project-wide switch. A linked edit is a group edit: all or nothing, a locked
+  partner refuses it. Ripple scope changed: tracks stay independent **except** that a
+  clip the ripple pushed drags its linked partners by the same amount (clips only,
+  never the lane). `reorder`, property edits and captions are deliberately not
+  link-aware. Imports / `cut_clip` / `add_clip` still do not auto-link an A/V asset's
+  sound (follow-up option).
+- **2026-10-07 — range-based sync lock (review of the first linked-A/V cut).** The
+  per-track ripple plus "partners follow a pushed clip" only handled mirrored pairs; a
+  J- or L-cut pair (sound leading or trailing its picture) was refused 10-65% of the
+  time for ripple delete / speed / ripple remove / ripple trims / cut range, with an
+  error steering to `link: false`, which desyncs. Replaced by `Timeline::conform_links`:
+  in step = equal content offsets; after every edit each group is re-aligned to its
+  *authority* (the named clip, else its track, else the first member that moved) by
+  shifting the others, linked followers win against linked material (trimmed back) and
+  refuse only for a locked track, an unlinked clip in the way, or a linked clip they
+  would cover entirely. Unlinked clips on a partner's track never move for it (a
+  behaviour change: ripple delete used to close the partner's whole lane). The guard
+  stays as the net and no longer advises `link: false`. Split / cut re-link **by side**
+  (an unsplit partner after the cut belongs to the right half), orphaned groups dissolve
+  in the same edit, a muted picture pasted without its sound is unmuted, `reattach` is
+  never rippled and refuses to double the sound, `detach` folds the picture track's fader
+  into the new clip (pan / duck / mute are the destination's, documented), `extract_audio`
+  no longer falls through to appending (that is `add_asset_audio`) and reports skipped
+  clips, `detach_audio_clips` is the one-revision batch. The browser harness is replayed
+  against a corpus kerf-core writes (`links-corpus.json`).
+- **2026-10-07 — linked A/V, second review.** (1) *Both partners named.* Trim to the
+  playhead names a picture and its sound; the per-lane ripple then pulled each track by its
+  own length and the lock read that as "moved apart" (refused 90/101, "unlink them first").
+  "Moved apart" is now judged on the timeline **as the edit left it** (before
+  `ripple_lanes`; `left` in `run_edit`); if the named members agree there the first in track
+  order is the authority and the other named ones are shifted too. `move_clips` with
+  partners at different deltas stays refused. (2) *Cut range:* a partner's leftover is a
+  linked clip when making room (`settle_linked`), and what a partner keeps after the cut is
+  moved to the cut explicitly (`closing`), so a lone leftover still resumes there. (3)
+  *Detach under a compressor or gate* no longer folds the fader (the gain would sit ahead of
+  a level-dependent effect): the clip goes to a lane at the picture track's fader, else a
+  new track at it (no skip path — a lane can always be made); the doc claim is narrowed to
+  linear chains. (4) The corpus fixture is `eol=lf` in `.gitattributes` and the freshness
+  test normalizes `\r\n`. (5) `first_sync_break` names the lowest track pair (TS too).
+  *Victims* — decided: a picture is **never** cut to make room or pushed before 0 (refused,
+  naming the lane, Alt offered); a linked **sound** may be trimmed back or lose its head and
+  the revision label says so (`… (trimmed sound on A2)`, live and staged); the floor is
+  `MIN_EDIT_CLIP` (0.05 s) — a victim that would fall under it is refused, not stubbed. A
+  J-cut lead lost at 0 is trimmed and reported rather than refused: the lead is a sound's,
+  the picture is untouched, and refusing would block deleting the first shot of any J-cut
+  edit. Cost, measured on the J/L fuzz: 13% of moving edits are blocked (was ~5%) — 2.8% of
+  those naming a picture, 23% of those naming a sound under ripple, which pulls the next
+  shot's picture onto the one before; before, that silently cut the previous shot. The UI
+  preview (`linkedTrimPreview`) runs the same rules, refusals included, and names a trimmed
+  sound. Corpus 80 → 93 cases.
+- **2026-10-07 — `extract_audio` doubled the sound, measured.** The export mixes every
+  clip whose asset has audio, video tracks included, so appending the asset's audio
+  with its picture still on V1 was +6.02 dB over the clip alone (real render, ffmpeg
+  6.1). `extract_audio(asset)` now detaches the asset's cut picture clips and only
+  appends when none is on the timeline; the per-clip form is `detach_audio`. The
+  sample project seeded the doubled shape; it now seeds the detached-then-unlinked one.
 
 - **2026-10-07 — Still refusals are exact.** A Still frame is refused only
   while a fade step is live, a layer travels, or an outgoing clip's tail window
@@ -156,6 +234,23 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   decoded planes, not equal composites — a one-off RGBA mismatch on 9.0.2
   (`pip/odd-361x203-in-722x640 @ 0.5`) never recurred in nine suites and a
   six-thread stress test, and rendering one plan twice never differed.
+
+- **2026-10-08 — linked A/V, PR review fixes.** (1) *A carried partner was never lane-checked.* `trim`
+  (and the beat snap, through `carry_links_since`) wrote a partner's new span with no overlap check, so a
+  move by trim or a tail extension put a detached sound on an unlinked voice-over where `move_clip` refuses.
+  The check cannot sit inside `carry_extent_edit`: ripple legitimately makes room (a tail extension pushes
+  the clip behind the sound), so it runs in `run_edit` **after** the per-lane ripple and the sync lock
+  (`Timeline::check_carried_lanes` on the partners recorded in `Project::edit_carried`), refusing with the
+  lane named when a carried partner now overlaps a clip outside its group that it did not overlap before
+  (the `settle_followers` wording, shared). The named clip's own lane is still unchecked, as a trim always
+  was. Under ripple a move by trim is still refused: no length changed, so nothing ripples. TS mirror
+  (`checkCarriedLanes`, `runEdit`'s third argument, the trim preview) and five corpus cases; corpus 93 →
+  102. (2) *Multi-select Reattach was N revisions and partial on error.* `reattach_audio_clips` (core,
+  Tauri, MCP, harness) is one `Reattach audio (N clips)` revision, **all or nothing** (unlike the detach
+  batch, which skips and reports: half a reattach is a half-undone selection), a pair named by both its
+  clips counted once; `reattachSelection` has one Undo. (3) `set_volume` / `set_fade` / `set_clip_enabled`
+  say a detached picture carries no sound. (4) A clippy `nonminimal_bool` in `with_linked_cuts` rewritten
+  with its short-circuit kept; a duplicated phrase in `CLAUDE.md` fixed.
 
 ## Needs a real machine
 
