@@ -24,12 +24,14 @@
 		boundsReport,
 		describeWhy,
 		holePolygon,
+		nextSeq,
 		parseCssColor,
 		routePreview,
 		sameReport,
 		samplePoints,
 		surfaceShowing
 	} from '$lib/preview-bounds';
+	import { createFramePump } from '$lib/frame-pump.svelte';
 	import { singleFlight } from '$lib/single-flight';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
@@ -85,57 +87,29 @@
 		return formatTimecode(s, editor.fps);
 	}
 
-	let frameUrl = $state<string | null>(null);
-	/** The frame on show was drawn by the GPU in the native surface: the pane draws nothing
-	 *  over it (no picture, no backdrop) and the surface is what is seen. */
-	let gpuShown = $state(false);
-	let inFlight = false;
-	let queued: number | null = null; // latest wanted timeline time, or null to clear
-
-	// Single-flight decode: only ever one composite in flight, and `queued` always
-	// holds the *latest* wanted timeline time. Scrubbing collapses to one render +
-	// one pending target instead of a backlog of stale frames that must all drain
-	// before the frame under the cursor appears (the cause of lag).
-	async function pump() {
-		if (inFlight || queued === null) return;
-		const t = queued;
-		queued = null;
-		inFlight = true;
-		try {
-			const via = route;
-			if (via.via === 'gpu') {
-				// The GPU preview is on: the backend draws the frame in the native surface when the
-				// plan allows it (and says so), else it hands back FFmpeg's JPEG for this frame.
-				const result = await getPreviewFrame(t, 960, via.overlays);
-				if (!streaming) {
-					gpuPreview.note(result);
-					if (result.renderer === 'gpu') {
-						gpuShown = true;
-						// The canvas the compositor drew has the delivery's shape.
-						if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
-					} else if (result.frame) {
-						gpuShown = false;
-						frameUrl = result.frame;
-					}
-				}
-			} else {
-				// The *composited* timeline still — every visible clip with its color,
-				// effects, transform and overlays applied, so Inspector edits show up
-				// live. (Desktop only — null in the browser.)
-				const url = await getTimelineFrame(t, 960);
-				// Playback may have taken over while this was decoding; a still landing
-				// on top of live frames would show as a stutter.
-				if (url && !streaming) {
-					frameUrl = url;
-					gpuShown = false;
-				}
-			}
-		} catch {
-			/* ignore decode errors — keep the last good frame */
+	// The frame under the playhead: fetched one at a time (frame-pump.svelte.ts), as FFmpeg's JPEG
+	// or — with the GPU preview on — drawn by the backend in the native surface, in which case
+	// `gpuShown` is true and the pane paints nothing over it.
+	const frames = createFramePump({
+		time: () => ui.time,
+		timeline: () => editor.timeline,
+		previewEpoch: () => ui.previewEpoch,
+		routeVia: () => routeVia,
+		routeOverlays: () => routeOverlays,
+		boundsEpoch: () => boundsEpoch,
+		hasClips: () => hasClips,
+		streaming: () => streaming,
+		timelineFrame: (t) => getTimelineFrame(t, 960),
+		previewFrame: (t, overlays) => getPreviewFrame(t, 960, overlays),
+		answered: (result) => gpuPreview.note(result),
+		gpuFailed: (error) => {
+			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
+			hideSurface();
 		}
-		inFlight = false;
-		if (queued !== null) pump(); // a newer target arrived mid-decode — go to it
-	}
+	});
+	const frameUrl = $derived(frames.frameUrl);
+	const gpuShown = $derived(frames.gpuShown);
+	const imgAspect = $derived(frames.imgAspect);
 
 	// ---- playback: a streamed frame source instead of per-frame decodes -------
 	//
@@ -201,8 +175,7 @@
 					// sound, so wait for one that still applies.
 					return;
 				case 'show':
-					gpuShown = false;
-					frameUrl = f.jpeg;
+					frames.showStreamed(f.jpeg);
 			}
 		}, reportPlaybackError);
 		stopStream = stop;
@@ -214,29 +187,12 @@
 		};
 	});
 
-	// Keep the preview in step with the playhead *and* the edit state: re-render on
-	// every playhead move, on every timeline change (an Inspector edit reassigns
-	// `editor.timeline`), and when a proxy becomes ready. Suspended while the
-	// stream is feeding frames, so the two don't fight over the pane.
-	$effect(() => {
-		const t = ui.time;
-		void editor.timeline;
-		void ui.previewEpoch;
-		// A change of route (the GPU takes a frame over, or hands it back for a title box) and of
-		// where the surface is both want the frame drawn again.
-		void routeVia;
-		void routeOverlays;
-		void boundsEpoch;
-		if (!hasClips) {
-			frameUrl = null;
-			gpuShown = false;
-			queued = null;
-			return;
-		}
-		if (streaming) return;
-		queued = t;
-		pump();
-	});
+	// Keep the preview in step with the playhead *and* the edit state: re-render on every playhead
+	// move, on every timeline change (an Inspector edit reassigns `editor.timeline`), when a proxy
+	// becomes ready, on a change of route (the GPU takes a frame over, or hands it back for a title
+	// box) and when the surface moved. Suspended while the stream is feeding frames, so the two
+	// don't fight over the pane. What it depends on is what `run` reads, and nothing else.
+	$effect(() => frames.run());
 
 	function scrub(e: MouseEvent) {
 		const el = e.currentTarget as HTMLElement;
@@ -273,7 +229,6 @@
 	// source that is not the frame's shape is letterboxed inside it and the
 	// fractions are of what is drawn.
 
-	let imgAspect = $state<number | null>(null);
 	const layerBox = $derived.by(() => {
 		if ((!frameUrl && !gpuShown) || !imgAspect) return 'inset:0';
 		const r = containRect(imgAspect, aspect);
@@ -364,8 +319,16 @@
 			viewport: { width: window.innerWidth, height: window.innerHeight },
 			visible: wantSurface && document.visibilityState === 'visible',
 			matte: matteEl ? parseCssColor(getComputedStyle(matteEl).backgroundColor) : null,
-			backdrop: backdropEl ? parseCssColor(getComputedStyle(backdropEl).backgroundColor) : null
+			backdrop: backdropEl ? parseCssColor(getComputedStyle(backdropEl).backgroundColor) : null,
+			seq: nextSeq()
 		});
+	}
+
+	/** The surface must not be on show (the GPU path failed outright): hide it now, whatever the route says. */
+	function hideSurface() {
+		if (!settings.gpuPreview || !frameEl) return;
+		wantedBounds = measure(false);
+		sendBounds.request();
 	}
 
 	/** Measure the frame and tell the backend (newest wins). */
@@ -389,7 +352,17 @@
 		if (rootEl) observer.observe(rootEl);
 		observer.observe(document.documentElement);
 		window.addEventListener('resize', update);
-		window.addEventListener('scroll', update, true);
+		// A scroll event fires per wheel tick in every scrollable ancestor (capture phase): measure at
+		// most once a frame.
+		let scrollFrame = 0;
+		const onScroll = () => {
+			if (scrollFrame) return;
+			scrollFrame = requestAnimationFrame(() => {
+				scrollFrame = 0;
+				update();
+			});
+		};
+		window.addEventListener('scroll', onScroll, true);
 		document.addEventListener('visibilitychange', update);
 		// A dialog or a menu opening is not an event the frame hears about: look often, and straight
 		// after a click, a right-click or a key.
@@ -400,7 +373,8 @@
 		return () => {
 			observer.disconnect();
 			window.removeEventListener('resize', update);
-			window.removeEventListener('scroll', update, true);
+			window.removeEventListener('scroll', onScroll, true);
+			if (scrollFrame) cancelAnimationFrame(scrollFrame);
 			document.removeEventListener('visibilitychange', update);
 			for (const type of ['pointerup', 'contextmenu', 'keyup']) window.removeEventListener(type, soon, true);
 			clearInterval(poll);
@@ -413,7 +387,8 @@
 				viewport: { width: 0, height: 0 },
 				visible: false,
 				matte: null,
-				backdrop: null
+				backdrop: null,
+				seq: nextSeq()
 			});
 			sendBounds.request();
 		};
@@ -431,7 +406,7 @@
 	// frame that is the JPEG by the page's own choice (playback, a dialog over the frame) says so.
 	$effect(() => {
 		if (!settings.gpuPreview) {
-			gpuShown = false;
+			frames.surfaceGone();
 			gpuPreview.clear();
 		} else if (routeVia === 'jpeg' && routeWhy) {
 			gpuPreview.noteJpeg(describeWhy(routeWhy));
@@ -672,7 +647,7 @@
 
 <div
 	bind:this={rootEl}
-	style="flex:1;min-height:0;display:flex;flex-direction:column;position:relative;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
+	style="flex:1;min-height:0;display:flex;flex-direction:column;{onSurface && technique === 'window' ? 'position:relative;background:transparent' : 'background:var(--surface-void)'}"
 >
 	{#if onSurface && technique === 'window'}
 		<!-- The pane's surround, with a hole where the frame is: the surface shows through there. -->
@@ -704,7 +679,7 @@
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"
 						onload={(e) => {
 							const im = e.currentTarget as HTMLImageElement;
-							if (im.naturalWidth && im.naturalHeight) imgAspect = im.naturalWidth / im.naturalHeight;
+							if (im.naturalWidth && im.naturalHeight) frames.pictureAspect(im.naturalWidth / im.naturalHeight);
 						}}
 					/>
 				{:else}

@@ -5,6 +5,7 @@ import {
 	deviceRect,
 	anyCovered,
 	holePolygon,
+	nextSeq,
 	parseCssColor,
 	routePreview,
 	safeRatio,
@@ -56,7 +57,7 @@ describe('boundsReport', () => {
 	const rect = { left: 10, top: 20, width: 800, height: 450 };
 
 	test('carries the rectangle, the webview size and the matte in device pixels', () => {
-		expect(boundsReport({ rect, dpr: 1.5, viewport: view, visible: true, matte: '#000000', backdrop: '#0f1318' })).toEqual({
+		expect(boundsReport({ rect, dpr: 1.5, viewport: view, visible: true, matte: '#000000', backdrop: '#0f1318', seq: 7 })).toEqual({
 			x: 15,
 			y: 30,
 			width: 1200,
@@ -65,18 +66,19 @@ describe('boundsReport', () => {
 			viewport_height: 1350,
 			visible: true,
 			matte: '#000000',
-			backdrop: '#0f1318'
+			backdrop: '#0f1318',
+			seq: 7
 		});
 	});
 
 	test('a frame that is not laid out, or empty, is a surface that is not showing', () => {
-		expect(boundsReport({ rect: null, dpr: 1, viewport: view, visible: true, matte: null, backdrop: null }).visible).toBe(false);
-		expect(boundsReport({ rect: { ...rect, width: 0 }, dpr: 1, viewport: view, visible: true, matte: null, backdrop: null }).visible).toBe(false);
-		expect(boundsReport({ rect, dpr: 1, viewport: view, visible: false, matte: null, backdrop: null }).visible).toBe(false);
+		expect(boundsReport({ rect: null, dpr: 1, viewport: view, visible: true, matte: null, backdrop: null, seq: 1 }).visible).toBe(false);
+		expect(boundsReport({ rect: { ...rect, width: 0 }, dpr: 1, viewport: view, visible: true, matte: null, backdrop: null, seq: 1 }).visible).toBe(false);
+		expect(boundsReport({ rect, dpr: 1, viewport: view, visible: false, matte: null, backdrop: null, seq: 1 }).visible).toBe(false);
 	});
 
 	test('an unchanged report is recognised, a changed one is not', () => {
-		const a = boundsReport({ rect, dpr: 1, viewport: view, visible: true, matte: '#000000', backdrop: '#0f1318' });
+		const a = boundsReport({ rect, dpr: 1, viewport: view, visible: true, matte: '#000000', backdrop: '#0f1318', seq: 1 });
 		expect(sameReport(null, a)).toBe(false);
 		expect(sameReport({ ...a }, a)).toBe(true);
 		for (const key of ['x', 'y', 'width', 'height', 'viewport_width', 'viewport_height'] as const) {
@@ -85,6 +87,8 @@ describe('boundsReport', () => {
 		expect(sameReport({ ...a, visible: false }, a)).toBe(false);
 		expect(sameReport({ ...a, matte: '#111111' }, a)).toBe(false);
 		expect(sameReport({ ...a, backdrop: '#111111' }, a)).toBe(false);
+		// Which report it is is not part of what it says.
+		expect(sameReport({ ...a, seq: 99 }, a)).toBe(true);
 	});
 });
 
@@ -209,5 +213,15 @@ describe('covering', () => {
 		expect(anyCovered(pts, () => null)).toBe(false);
 		// A dialog over the lower-right corner only.
 		expect(anyCovered(pts, (x, y) => !(x > 450 && y > 250))).toBe(true);
+	});
+});
+
+describe('nextSeq', () => {
+	test('counts up across every caller, so a replaced panel cannot send an older number', () => {
+		const a = nextSeq();
+		const b = nextSeq();
+		const c = nextSeq();
+		expect([a < b, b < c]).toEqual([true, true]);
+		expect(a).toBeGreaterThan(0);
 	});
 });

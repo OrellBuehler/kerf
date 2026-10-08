@@ -1005,6 +1005,9 @@ export interface PreviewBoundsReport {
 	/** The colour of the rest of the surface, `#rrggbb` — what a transparent webview shows
 	 *  where no element of the page paints. */
 	backdrop: string | null;
+	/** Which report this is, counting up across every Preview the page has had; the
+	 *  backend ignores one older than the newest it has seen. */
+	seq: number;
 }
 
 /** What one GPU frame took (`GpuTimings`). */

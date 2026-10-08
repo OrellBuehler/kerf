@@ -345,6 +345,8 @@
 									: ''}
 							{:else if settings.gpuPreview}
 								{gpuStatus.reason ?? 'Starts with the next frame.'}
+							{:else if gpuStatus.reason}
+								{gpuStatus.reason}
 							{:else}
 								Available: {gpuStatus.technique === 'child' ? 'a child window over the preview' : 'the window surface under the preview'}.
 							{/if}

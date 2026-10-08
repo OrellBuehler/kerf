@@ -77,6 +77,15 @@ export function parseCssColor(css: string): string | null {
 	return null;
 }
 
+let reportSeq = 0;
+
+/** The number of the next report. One counter for the whole page, not one per Preview: a panel
+ *  that is replaced (a workspace switch) can send its last report after the new one's first, and
+ *  the backend ignores a report older than the newest it has. */
+export function nextSeq(): number {
+	return ++reportSeq;
+}
+
 /** The report for the backend. `rect` is null when the frame is not laid out (the panel is
  *  closed or in a background tab); that is a surface that is not showing. */
 export function boundsReport(args: {
@@ -86,6 +95,7 @@ export function boundsReport(args: {
 	visible: boolean;
 	matte: string | null;
 	backdrop: string | null;
+	seq: number;
 }): PreviewBoundsReport {
 	const r = safeRatio(args.dpr);
 	const device = args.rect ? deviceRect(args.rect, r, args.viewport) : { x: 0, y: 0, width: 0, height: 0 };
@@ -95,11 +105,13 @@ export function boundsReport(args: {
 		viewport_height: Math.max(0, Math.round(args.viewport.height * r)),
 		visible: args.visible && device.width > 0 && device.height > 0,
 		matte: args.matte,
-		backdrop: args.backdrop
+		backdrop: args.backdrop,
+		seq: args.seq
 	};
 }
 
-/** Whether two reports say the same thing (so an unchanged one is not sent again). */
+/** Whether two reports say the same thing (so an unchanged one is not sent again): the number is
+ *  not part of what is said. */
 export function sameReport(a: PreviewBoundsReport | null, b: PreviewBoundsReport): boolean {
 	return (
 		!!a &&

@@ -213,14 +213,21 @@ class SettingsStore {
 		await this.write({ safe_areas: on }, 'safe-area setting');
 	}
 
-	/** Turn the GPU preview on or off. The backend builds nothing until a frame wants it and
-	 *  frees everything when it goes off; the status is re-read either way. */
+	/** Turn the GPU preview on or off. Off is immediate (the page stops asking at once); **on waits
+	 *  for the write** — the page flips to asking the backend only when the backend has been told, or
+	 *  its first request would find the setting still off and the pane would keep a JPEG until
+	 *  something else nudged it. Then the frame under the playhead is asked for again. The backend
+	 *  builds nothing until a frame wants it and frees everything when it goes off; the status is
+	 *  re-read either way. */
 	async setGpuPreview(on: boolean) {
 		if (on === this.gpuPreview) return;
-		this.gpuPreview = on;
-		if (!on) gpuPreview.clear();
+		if (!on) {
+			this.gpuPreview = false;
+			gpuPreview.clear();
+		}
 		await this.write({ gpu_preview: on }, 'GPU preview setting');
 		await gpuPreview.refresh();
+		ui.refreshPreview();
 	}
 
 	/** The tab the library shows in the active workspace. Each workspace keeps
