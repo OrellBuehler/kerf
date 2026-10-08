@@ -29,6 +29,7 @@ import {
 	MIN_EDIT_CLIP,
 	moveHead,
 	moveTail,
+	rebaseAnimation,
 	type SourceLimits
 } from './edit-modes';
 import {
@@ -161,6 +162,12 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 		link_id: group
 	};
 	if (clip.enabled === false) audio.enabled = false;
+	// A keyed volume *is* the gain, so it rides over with the sound, through the same fader ratio.
+	const volume = clip.channels?.find((c) => c.prop === 'volume' && c.keys.length > 0);
+	if (volume) {
+		const ratio = Math.abs(pictureFader - destFader) <= FADER_EPS ? 1 : pictureFader / destFader;
+		audio.channels = [{ prop: 'volume', keys: volume.keys.map((k) => ({ ...k, value: k.value * ratio })) }];
+	}
 	const lane = timeline.tracks[laneIx];
 	lane.clips.push(audio);
 	lane.clips.sort((a, b) => a.timeline_start - b.timeline_start);
@@ -515,6 +522,9 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
 	right.timeline_start = at;
 	right.transition_in = null; // the transition stays with the left (start) half
 	delete right.link_id;
+	// The animation is clip-local: the right half starts `at - start` into it, so it opens on
+	// the pose the whole clip had there and keeps the keys after it.
+	rebaseAnimation(right, at - clip.timeline_start);
 	if (reversed(clip)) {
 		const splitSrc = Math.min(Math.max(clip.source_out - offset, clip.source_in), clip.source_out);
 		right.source_out = splitSrc;

@@ -7,10 +7,11 @@
  *    (`limiterParams`), including the trim that cancels the node's automatic makeup
  *    gain. */
 
+import { propertyCurve, volumeAnimated, volumeAt } from './channels';
 import type { Clip } from './types';
 
 /** What decides a clip's gain: its volume, fades and a transition into it. */
-export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in'>;
+export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'>;
 
 /** A clip's fade-in length, seconds. A transition approximates as an extra fade-in
  *  (the export folds it in the same way). */
@@ -26,12 +27,31 @@ export const fadeOutOf = (clip: GainClip): number => clip.fade_out ?? 0;
  * is exactly what the same call with `level` used to give (the factors are one product).
  */
 export function clipGainAt(clip: GainClip, t: number, start: number, end: number, level = 1): number {
-	let v = (clip.volume ?? 1) * level;
+	// A keyed volume is the gain over the clip's own time (`volumeAt`), else its static one.
+	let v = volumeAt(clip, t - start) * level;
 	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
 	if (fi > 0 && t < start + fi) v *= Math.max(0, (t - start) / fi);
 	if (fo > 0 && t > end - fo) v *= Math.max(0, (end - t) / fo);
 	return v;
+}
+
+/**
+ * The timeline times the preview ramps a **keyed** clip's gain through, after `from`: every point
+ * of the volume curve (the polyline the export draws) and the fade edges, up to `end`. Between two
+ * of them the preview ramps linearly, which is the curve exactly where no fade overlaps it and
+ * its product with the fade's ramp (a little rounder) where one does. Empty for a clip whose
+ * volume is not keyed.
+ */
+export function gainBreakpoints(clip: GainClip, start: number, end: number, from: number): number[] {
+	if (!volumeAnimated(clip)) return [];
+	const times = new Set<number>(propertyCurve(clip, 'volume').map(([t]) => start + t));
+	const fi = fadeInOf(clip);
+	const fo = fadeOutOf(clip);
+	if (fi > 0) times.add(start + fi);
+	if (fo > 0) times.add(end - fo);
+	times.add(end);
+	return [...times].filter((t) => t > from && t <= end).sort((a, b) => a - b);
 }
 
 // ---- the master limiter ------------------------------------------------------

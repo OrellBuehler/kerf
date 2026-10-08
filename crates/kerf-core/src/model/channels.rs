@@ -1030,6 +1030,133 @@ mod tests {
         assert!(c.property_keys_shifted(&[Property::Gamma], 1.0)[0].keys.is_empty());
     }
 
+    /// The clip `frontend/src/lib/channels.test.ts` builds too.
+    fn mirrored() -> Clip {
+        let mut c = clip();
+        c.keyframes = vec![
+            bundle_key(0.0, 1.0, 1.0, Easing::EaseOut),
+            bundle_key(2.0, 2.0, 0.5, Easing::Linear),
+        ];
+        c.set_property_keys(
+            Property::Volume,
+            vec![
+                key(0.2, 0.2, Easing::EaseIn),
+                key(1.1, 1.8, Easing::Linear),
+                key(1.7, 0.4, Easing::Hold),
+                key(2.2013, 1.0, Easing::Linear),
+            ],
+        );
+        c.set_property_keys(
+            Property::Brightness,
+            vec![
+                key(0.0, -0.3, Easing::EaseInOut),
+                key(
+                    2.0,
+                    0.4,
+                    Easing::Bezier {
+                        x1: 0.2,
+                        y1: 0.9,
+                        x2: 0.3,
+                        y2: 1.0,
+                    },
+                ),
+                key(3.0, 0.0, Easing::Linear),
+            ],
+        );
+        c
+    }
+
+    /// The numbers `frontend/src/lib/channels.test.ts` pins too: the TS mirror is the harness's
+    /// whole idea of a channel, so a rule changed here has to change there.
+    #[test]
+    fn channels_match_the_frontend_mirror_bit_for_bit() {
+        let c = mirrored();
+        let volume = [
+            (0.0, 0.2),
+            (0.5, 0.449862273587892),
+            (1.1, 1.8),
+            (1.4, 1.1000000000000005),
+            (1.7, 0.4),
+            (1.9, 0.4),
+            (2.2013, 1.0),
+            (3.0, 1.0),
+        ];
+        for (t, want) in volume {
+            assert_eq!(c.volume_at(t), want, "volume at {t}");
+        }
+        let brightness = [
+            (0.25, -0.27559255044876013),
+            (0.9, -0.0092929134307706),
+            (1.6, 0.3402597151672505),
+            (2.5, 0.020021298908220964),
+        ];
+        for (t, want) in brightness {
+            assert_eq!(c.color_at(t).brightness, want, "brightness at {t}");
+        }
+        // The bundle still drives what has no track.
+        let at = c.transform_at(1.0);
+        assert_eq!((at.scale, at.opacity), (1.6846431874269898, 0.6576784062865051));
+        // A head cut inside an eased segment: the pose pinned, the rest baked into plain keys.
+        let rebased: Vec<(f64, f64, Easing)> = super::rebase_head(&c.property_keys(Property::Volume), 0.9)
+            .iter()
+            .map(|k| (k.time, k.value, k.easing))
+            .collect();
+        assert_eq!(
+            rebased,
+            [
+                (0.0, 1.2578044843619944, Easing::Linear),
+                (0.050000000000000155, 1.3834554717250953, Easing::Linear),
+                (0.1250000000000001, 1.5842902877063407, Easing::Linear),
+                (0.20000000000000007, 1.8, Easing::Linear),
+                (0.7999999999999999, 0.4, Easing::Hold),
+                (1.3013, 1.0, Easing::Linear),
+            ]
+        );
+        // A key put inside an eased segment splits it (de Casteljau, each half in its own unit square).
+        let mut split = c.clone();
+        split.insert_property_key(Property::Volume, PropertyKey::new(0.7, 0.55));
+        let keys: Vec<(f64, f64, Easing)> = split
+            .property_keys(Property::Volume)
+            .iter()
+            .map(|k| (k.time, k.value, k.easing))
+            .collect();
+        let bezier = |x1, y1, x2, y2| Easing::Bezier { x1, y1, x2, y2 };
+        assert_eq!(
+            keys,
+            [
+                (
+                    0.2,
+                    0.2,
+                    bezier(0.31544631633977743, 0.0, 0.681034420783558, 0.4617901153530115)
+                ),
+                (0.7, 0.55, bezier(0.5568358766841033, 0.4548965203318149, 1.0, 1.0)),
+                (1.1, 1.8, Easing::Linear),
+                (1.7, 0.4, Easing::Hold),
+                (2.2013, 1.0, Easing::Linear),
+            ]
+        );
+        // A transform number taken off the bundle keeps the bundle's keys and shapes, and splits.
+        let mut taken = c.clone();
+        taken.insert_property_key(Property::Scale, PropertyKey::new(1.0, 1.5));
+        let keys: Vec<(f64, f64, Easing)> = taken
+            .property_keys(Property::Scale)
+            .iter()
+            .map(|k| (k.time, k.value, k.easing))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (0.0, 1.0, bezier(0.0, 0.0, 0.4542081650096481, 0.5719165400747731)),
+                (
+                    1.0,
+                    1.5,
+                    bezier(0.3264332254175324, 0.5558502990076779, 0.6856271141503777, 1.0)
+                ),
+                (2.0, 2.0, Easing::Linear),
+            ]
+        );
+    }
+
     #[test]
     fn the_diff_names_the_property_that_moved() {
         let before = clip();

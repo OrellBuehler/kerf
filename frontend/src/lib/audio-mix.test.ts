@@ -1,5 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { clipGainAt, fadeInOf, fadeOutOf, gainAtFullScale, limitedFullScaleDb, limiterParams, LIMITER_RATIO } from './audio-mix';
+import {
+	clipGainAt,
+	fadeInOf,
+	fadeOutOf,
+	gainAtFullScale,
+	gainBreakpoints,
+	type GainClip,
+	limitedFullScaleDb,
+	limiterParams,
+	LIMITER_RATIO
+} from './audio-mix';
 import { panGains } from './mixer';
 
 /** The envelope as `audio.ts` computed it before the fader moved onto the track's bus:
@@ -115,5 +125,47 @@ describe('limiterParams', () => {
 		for (const c of [-1, -3, -12, -24]) expect(limitedFullScaleDb(c) - c).toBeLessThan(1.3);
 		// …and the gain at full scale is that level, as a linear number.
 		expect(20 * Math.log10(gainAtFullScale(-12))).toBeCloseTo(-11.4, 9);
+	});
+});
+
+describe('a keyed volume', () => {
+	const clip = (over: Partial<GainClip> = {}): GainClip => ({
+		volume: 0.77,
+		fade_in: 0,
+		fade_out: 0,
+		channels: [
+			{
+				prop: 'volume',
+				keys: [
+					{ time: 0.2, value: 0.2 },
+					{ time: 1.1, value: 1.8 },
+					{ time: 1.7, value: 0.4, easing: 'hold' },
+					{ time: 2.2, value: 1 }
+				]
+			}
+		],
+		...over
+	});
+
+	test('is the gain over the clip’s own time, instead of the static one', () => {
+		const c = clip();
+		expect(clipGainAt(c, 10.2, 10, 15)).toBeCloseTo(0.2, 12);
+		expect(clipGainAt(c, 11.1, 10, 15)).toBeCloseTo(1.8, 12);
+		expect(clipGainAt(c, 11.9, 10, 15)).toBeCloseTo(0.4, 12);
+		expect(clipGainAt(c, 12.5, 10, 15, 0.5)).toBeCloseTo(0.5, 12);
+		// A clip with no track keeps its static volume; the fades still shape a keyed one.
+		expect(clipGainAt({ ...c, channels: undefined }, 11, 10, 15)).toBe(0.77);
+		expect(clipGainAt(clip({ fade_out: 2 }), 14, 10, 15)).toBeCloseTo(0.5, 12);
+	});
+
+	test('is ramped through the curve’s points and the fade edges', () => {
+		const near = (got: number[], want: number[]) => {
+			expect(got.length).toBe(want.length);
+			got.forEach((t, i) => expect(t).toBeCloseTo(want[i], 9));
+		};
+		near(gainBreakpoints(clip(), 10, 15, 10), [10.2, 11.1, 11.7, 12.2, 15]);
+		near(gainBreakpoints(clip({ fade_in: 0.5, fade_out: 1 }), 10, 15, 11), [11.1, 11.7, 12.2, 14, 15]);
+		near(gainBreakpoints(clip(), 10, 15, 14), [15]);
+		expect(gainBreakpoints(clip({ channels: undefined }), 10, 15, 10)).toEqual([]);
 	});
 });
