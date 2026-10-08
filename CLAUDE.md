@@ -2713,8 +2713,12 @@ Duplicate, Delete / Ripple delete / Select all, **Tool** and **Clip** submenus �
 the five tools as radios, and trim / detach / link — Ripple mode and Snapping as ticks,
 Keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
-workspace, Reset all workspaces), *Help* (Keyboard shortcuts, Check for updates…,
-Release page, Open the log folder, About). **Every entry names a keymap action**
+workspace, Reset all workspaces — which asks first when any arrangement is stored),
+*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
+panel and a panel can be closed, so the whole of it is here as registry actions with
+their bindings), *Help* (Keyboard shortcuts, Check for updates…, Release page, Open the
+log folder, About). **Every entry names a keymap action**
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
 `view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
@@ -2732,16 +2736,27 @@ open menus, ↓ ↑ Home End move in a menu, → opens a submenu and ← closes 
 Space run, Esc closes one level and then leaves the bar, a letter jumps to the next
 entry that starts with it (`stepFocus` / `typeahead`, pure); **Alt on its own, or F10,
 focuses the bar** — F10 not when the user has bound it, neither while a field is being
-typed in, and Alt does not count when a pointer press or another key came between its
-down and up (an Alt-drag, which the timeline uses to leave links out). Menus are
+typed in. Alt counts only as a tap (`alt-tap.ts`, a pure state machine, bun-tested): it
+is never armed while a pointer button is held (the timeline reads Alt live as its
+"leave the links alone" override on a drag, a trim or a razor cut, and an Alt pressed or
+released mid-drag must not take focus — a stuck press whose release was missed is cleared by
+the next move with no button down), another key, a pointer press or a wheel turn between
+its down and up cancels it, and so does the window losing focus (Alt+Tab). A menu title
+takes focus on a click (WKWebView does not focus a button a click lands on, and Esc
+needs focus inside the bar), a pending hover timer is cleared when the pointer moves to
+another title, and a chord that closes a menu gives focus back to where it was before the
+bar took it. Menus are
 `menu` panels of `menuitem` / `menuitemcheckbox` / `menuitemradio` entries
 (`aria-checked`, `aria-haspopup`, `aria-expanded`, `aria-disabled` with the reason as the
 title); a disabled entry still takes focus. Panels are `fixed`, placed from the rect of what
 opened them and kept inside the window (a submenu flips to its parent's other side and,
 failing that, slides in over it; a menu taller than the room scrolls — nested submenus are
-not positioned inside a scrolling panel, which would clip them). Too narrow for five titles
-(under ~250 px of title bar) the bar becomes one "Menu" button whose entries are the five
-menus as submenus. A modal closes the menus and the bar is `inert` behind it like the rest
+not positioned inside a scrolling panel, which would clip them). Too narrow for its six
+titles the bar becomes one "Menu" button whose entries are the menus as submenus: the
+test is the width of the title bar's **left cell** (`MENU_FULL_PX`, 320 — the bar and the
+logo measure ~331 at their widest, and the workspace tabs and the right cluster take their
+share of the window first), not the window's width, so a ~1000 px window has them in full and
+the 960 px minimum collapses them. A modal closes the menus and the bar is `inert` behind it like the rest
 of the page; a letter or arrow typed in a menu never reaches the page's shortcuts (the page
 returns early for events from inside `[role=menubar]` / `[role=menu]`, and the bar
 `preventDefault`s what it takes); a chord closes the menus and goes on to the page. The
