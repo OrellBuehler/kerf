@@ -22,6 +22,7 @@ use crate::model::{
     Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
+use crate::model::{Property, PropertyKey};
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
 /// source window, and the shape it was shot in.
@@ -3544,8 +3545,12 @@ impl Project {
 
     // ---- transform keyframes (animation) ----------------------------------
 
-    /// Replace a clip's transform keyframes (re-sorted by time). An empty list
-    /// clears the animation, so the static transform is used again.
+    /// Replace a clip's whole-transform keyframes — the bundle that animates scale, position,
+    /// rotation and opacity together — re-sorted by time. An empty list clears **the bundle**:
+    /// a transform number that has keys of its own ([`Project::set_property_keyframes`]) keeps
+    /// them, so a clip animated that way is still animated afterwards. [`Project::clear_keyframes`]
+    /// makes the whole transform static. A track left empty only to hold a number static
+    /// against the bundle is dropped with the bundle (it has nothing left to hold it off).
     pub fn set_keyframes(&self, clip_id: Uuid, mut keyframes: Vec<Keyframe>) -> Result<Clip> {
         for k in &keyframes {
             validate_keyframe(k)?;
@@ -3553,8 +3558,10 @@ impl Project {
         keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
         self.edit_timeline("Set keyframes", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips[ci].keyframes = keyframes;
-            Ok(timeline.tracks[ti].clips[ci].clone())
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.keyframes = keyframes;
+            clip.prune_channels();
+            Ok(clip.clone())
         })
     }
 
@@ -3604,6 +3611,19 @@ impl Project {
                 kf.opacity = v;
             }
             clip.insert_keyframe(kf);
+            // A number with a track of its own ignores the bundle's key: what was asked for it
+            // goes into that track.
+            for (prop, value) in [
+                (Property::Scale, scale),
+                (Property::PosX, pos_x),
+                (Property::PosY, pos_y),
+                (Property::Rotation, rotation),
+                (Property::Opacity, opacity),
+            ] {
+                if let (Some(v), true) = (value, clip.channel(prop).is_some()) {
+                    clip.insert_property_key(prop, PropertyKey::new(time, v));
+                }
+            }
             Ok(clip.clone())
         })
     }
@@ -3616,23 +3636,133 @@ impl Project {
         self.edit_timeline("Set keyframe easing", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
-            let key = clip
+            let near = |k: &Keyframe| (k.time - time).abs() <= 1e-3;
+            let bundled = clip.keyframes.iter().any(near);
+            // The transform key at that moment: the bundle's, and the key of every transform
+            // number that has taken a track of its own off the bundle.
+            let tracked: Vec<Property> = Property::TRANSFORM
+                .into_iter()
+                .filter(|p| {
+                    clip.channel(*p)
+                        .is_some_and(|t| t.keys.iter().any(|k| (k.time - time).abs() <= 1e-3))
+                })
+                .collect();
+            if !bundled && tracked.is_empty() {
+                return Err(Error::InvalidArgument(format!("the clip has no keyframe at {time:.3} s")));
+            }
+            if let Some(key) = clip
                 .keyframes
                 .iter_mut()
-                .filter(|k| (k.time - time).abs() <= 1e-3)
+                .filter(|k| near(k))
                 .min_by(|a, b| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
-                .ok_or_else(|| Error::InvalidArgument(format!("the clip has no keyframe at {time:.3} s")))?;
-            key.easing = easing;
+            {
+                key.easing = easing;
+            }
+            for prop in tracked {
+                clip.set_property_easing(prop, time, easing);
+            }
             Ok(clip.clone())
         })
     }
 
-    /// Remove all transform keyframes from a clip (back to the static transform).
+    /// Remove all transform keyframes from a clip (back to the static transform): the bundle
+    /// and every transform number's own track. Colour and volume keys stay — clear those with
+    /// [`Project::set_property_keyframes`].
     pub fn clear_keyframes(&self, clip_id: Uuid) -> Result<Clip> {
         self.edit_timeline("Clear keyframes", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips[ci].keyframes.clear();
-            Ok(timeline.tracks[ti].clips[ci].clone())
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.clear_transform_animation();
+            Ok(clip.clone())
+        })
+    }
+
+    // ---- per-property keyframe channels -----------------------------------
+
+    /// Replace the keys of one animatable number of a clip — scale, position, rotation,
+    /// opacity, a colour number or the clip's volume — with `keys` (sorted by time), each a
+    /// time in seconds from the clip's start, a value and the easing of the segment leaving it.
+    /// No keys leaves the number static again.
+    ///
+    /// A transform number that the legacy whole-transform keyframes were driving is taken
+    /// over by its own track (the others keep the bundle). Values are held to the range the
+    /// static setters take (`opacity` 0..=1, `brightness` -1..=1, `volume` 0..=4, ...); a track
+    /// is at most [`MAX_CHANNEL_KEYS`] keys long.
+    pub fn set_property_keyframes(&self, clip_id: Uuid, prop: Property, keys: Vec<PropertyKey>) -> Result<Clip> {
+        validate_property_keys(prop, &keys)?;
+        self.edit_timeline(&format!("Set {} keyframes", prop.label()), move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.set_property_keys(prop, keys);
+            Ok(clip.clone())
+        })
+    }
+
+    /// Set the easing of the segment that leaves one number's key at `time` seconds from the
+    /// clip's start (the key nearest it within a millisecond). The number may be one the
+    /// whole-transform keyframes drive: it is taken over by its own track and the others keep
+    /// the bundle's easing.
+    pub fn set_property_easing(&self, clip_id: Uuid, prop: Property, time: f64, easing: Easing) -> Result<Clip> {
+        validate_easing(&easing)?;
+        self.edit_timeline(&format!("Set {} keyframe easing", prop.label()), move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            if !clip.set_property_easing(prop, time, easing) {
+                return Err(Error::InvalidArgument(format!(
+                    "the clip has no {} keyframe at {time:.3} s",
+                    prop.label()
+                )));
+            }
+            Ok(clip.clone())
+        })
+    }
+
+    /// Copy the animation of `props` (every keyed number when empty) from one clip to another,
+    /// shifted `offset` seconds later (earlier when negative: the head that falls before the
+    /// destination's start is cut off and the pose it opens on is pinned there). The
+    /// destination's own keys for those numbers are replaced; everything else of it is kept.
+    /// Returns the destination clip. Refuses a number the source has no keys for.
+    pub fn copy_keyframes(&self, from_clip: Uuid, to_clip: Uuid, props: &[Property], offset: f64) -> Result<Clip> {
+        if !offset.is_finite() || offset.abs() > MAX_KEY_OFFSET {
+            return Err(Error::InvalidArgument(format!(
+                "offset must be a number within ±{MAX_KEY_OFFSET} seconds"
+            )));
+        }
+        if from_clip == to_clip {
+            return Err(Error::InvalidArgument(
+                "copy keyframes from one clip to another: the two ids are the same clip".to_string(),
+            ));
+        }
+        let props = props.to_vec();
+        self.edit_timeline("Copy keyframes", move |timeline| {
+            let source = timeline.clip(from_clip).ok_or(Error::ClipNotFound(from_clip))?.clone();
+            if timeline.locate(to_clip).is_none() {
+                return Err(Error::ClipNotFound(to_clip));
+            }
+            for p in &props {
+                if !source.is_keyed(*p) {
+                    return Err(Error::InvalidArgument(format!(
+                        "the source clip has no {} keyframes",
+                        p.label()
+                    )));
+                }
+            }
+            let tracks = source.property_keys_shifted(&props, offset);
+            if tracks.is_empty() {
+                return Err(Error::InvalidArgument("the source clip has no keyframes to copy".to_string()));
+            }
+            let (ti, ci) = timeline.locate(to_clip).ok_or(Error::ClipNotFound(to_clip))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            for track in tracks {
+                if track.keys.len() > MAX_CHANNEL_KEYS {
+                    return Err(Error::InvalidArgument(format!(
+                        "{} would have more than {MAX_CHANNEL_KEYS} keyframes",
+                        track.prop.label()
+                    )));
+                }
+                clip.set_property_keys(track.prop, track.keys);
+            }
+            Ok(clip.clone())
         })
     }
 
@@ -4411,6 +4541,30 @@ fn validate_keyframe(k: &Keyframe) -> Result<()> {
         return Err(Error::InvalidArgument("keyframe values must be finite".to_string()));
     }
     validate_easing(&k.easing)
+}
+
+/// The longest track of keys a property may be given: an expression is written per segment
+/// (a dozen pieces each when eased), and an agent's list is not otherwise bounded.
+pub const MAX_CHANNEL_KEYS: usize = 1_000;
+
+/// The furthest [`Project::copy_keyframes`] may shift keys (seconds): 100 hours.
+const MAX_KEY_OFFSET: f64 = 360_000.0;
+
+fn validate_property_keys(prop: Property, keys: &[PropertyKey]) -> Result<()> {
+    if keys.len() > MAX_CHANNEL_KEYS {
+        return Err(Error::InvalidArgument(format!(
+            "at most {MAX_CHANNEL_KEYS} keyframes per property (got {})",
+            keys.len()
+        )));
+    }
+    for k in keys {
+        if !k.time.is_finite() || k.time < 0.0 {
+            return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
+        }
+        prop.check(k.value)?;
+        validate_easing(&k.easing)?;
+    }
+    Ok(())
 }
 
 /// A bezier easing keeps both control points in the unit square: no overshoot, so an eased
@@ -5339,6 +5493,261 @@ mod tests {
             let (a, b) = (split.transform_at(t).scale, eased.transform_at(t).scale);
             assert!((a - b).abs() < 0.01, "at {t}: now {a}, was {b}");
         }
+    }
+
+    fn channel_project() -> (Project, Clip) {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        (project, clip)
+    }
+
+    fn pk(time: f64, value: f64) -> PropertyKey {
+        PropertyKey::new(time, value)
+    }
+
+    #[test]
+    fn a_property_gets_keys_of_its_own_and_loses_them_by_setting_none() {
+        let (project, clip) = channel_project();
+        let edited = project
+            .set_property_keyframes(
+                clip.id,
+                Property::Brightness,
+                vec![
+                    pk(4.0, 0.5),
+                    PropertyKey {
+                        easing: Easing::Hold,
+                        ..pk(1.0, -0.5)
+                    },
+                ],
+            )
+            .unwrap();
+        // Sorted by time; the sample is the curve.
+        let keys = edited.property_keys(Property::Brightness);
+        assert_eq!((keys[0].time, keys[0].easing), (1.0, Easing::Hold));
+        assert_eq!(edited.color_at(2.0).brightness, -0.5);
+        assert!(edited.color_animated() && !edited.is_animated());
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Set brightness keyframes");
+        let off = project.set_property_keyframes(clip.id, Property::Brightness, vec![]).unwrap();
+        assert!(off.channels.is_empty() && !off.color_animated());
+
+        // One edit each, validated against the range the static setter takes.
+        let before = project.history().unwrap().len();
+        for (prop, key) in [
+            (Property::Opacity, pk(0.0, 1.5)),
+            (Property::Scale, pk(0.0, 0.0)),
+            (Property::Gamma, pk(0.0, 0.05)),
+            (Property::Volume, pk(0.0, -1.0)),
+            (Property::Volume, pk(0.0, 40.0)),
+            (Property::PosX, pk(0.0, f64::NAN)),
+            (Property::PosX, pk(-1.0, 0.0)),
+            (
+                Property::PosX,
+                PropertyKey {
+                    easing: Easing::Bezier {
+                        x1: 0.5,
+                        y1: 1.5,
+                        x2: 0.5,
+                        y2: 0.5,
+                    },
+                    ..pk(0.0, 0.0)
+                },
+            ),
+        ] {
+            assert!(
+                matches!(
+                    project.set_property_keyframes(clip.id, prop, vec![key]),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{prop:?} {key:?}"
+            );
+        }
+        let too_many: Vec<PropertyKey> = (0..=MAX_CHANNEL_KEYS).map(|i| pk(i as f64, 1.0)).collect();
+        assert!(project.set_property_keyframes(clip.id, Property::Volume, too_many).is_err());
+        assert!(matches!(
+            project.set_property_keyframes(Uuid::new_v4(), Property::Volume, vec![]),
+            Err(Error::ClipNotFound(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), before, "a refused edit records nothing");
+    }
+
+    /// A proposal that only holds a bundle-driven number static changes the render, so it is a
+    /// change: it used to diff as empty and `apply_staged` discarded it without a revision.
+    #[test]
+    fn an_agent_holding_a_bundle_driven_number_static_is_a_proposal_and_it_lands() {
+        let (mut project, clip) = channel_project();
+        project
+            .add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, Some(1.0))
+            .unwrap();
+        project
+            .add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, Some(0.0))
+            .unwrap();
+        let revisions = project.history().unwrap().len();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None).unwrap();
+        project.set_property_keyframes(clip.id, Property::Opacity, vec![]).unwrap();
+
+        let staged = project.staged().unwrap().expect("a proposal");
+        assert!(!staged.diff.is_empty(), "{:?}", staged.diff);
+        let text = staged
+            .diff
+            .entries
+            .iter()
+            .map(|e| format!("{} {}", e.summary, e.detail.as_deref().unwrap_or("")))
+            .collect::<String>();
+        assert!(text.contains("opacity keyframes 2 → 0"), "{text}");
+        // The user's cut has not moved; applying lands one agent revision and the opacity is static.
+        assert!(project.timeline().unwrap().tracks[0].clips[0].channels.is_empty());
+        let applied = project.apply_staged(false).unwrap();
+        let landed = &applied.tracks[0].clips[0];
+        assert_eq!(landed.transform_at(2.0).opacity, 1.0, "held at the static value");
+        assert!(
+            (landed.transform_at(2.0).scale - 1.5).abs() < 1e-12,
+            "the rest still animates"
+        );
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().source, EditSource::Agent);
+    }
+
+    #[test]
+    fn set_keyframes_clears_the_bundle_only_and_drops_a_track_that_was_only_holding_it_off() {
+        let (project, clip) = channel_project();
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Easing::Linear,
+        };
+        project.set_keyframes(clip.id, vec![key(0.0, 1.0), key(4.0, 2.0)]).unwrap();
+        // The opacity held static against the bundle; the scale taken over with keys of its own.
+        project.set_property_keyframes(clip.id, Property::Opacity, vec![]).unwrap();
+        project
+            .set_property_keyframes(clip.id, Property::Scale, vec![pk(0.0, 1.0), pk(4.0, 3.0)])
+            .unwrap();
+        assert_eq!(project.timeline().unwrap().tracks[0].clips[0].channels.len(), 2);
+        let c = project.set_keyframes(clip.id, vec![]).unwrap();
+        assert!(c.keyframes.is_empty());
+        // The scale's own keys survive an emptied bundle (the clip is still animated) ...
+        assert!(c.is_animated() && c.is_keyed(Property::Scale));
+        assert_eq!(c.transform_at(2.0).scale, 2.0);
+        // ... and the empty opacity track, which had nothing left to hold off, is gone.
+        assert_eq!(c.channels.len(), 1, "{:?}", c.channels);
+        assert_eq!(c.channels[0].prop, Property::Scale);
+        // `clear_keyframes` is the one that makes the whole transform static.
+        let c = project.clear_keyframes(clip.id).unwrap();
+        assert!(!c.is_animated() && c.channels.is_empty());
+    }
+
+    #[test]
+    fn keying_one_number_off_the_bundle_leaves_the_others_and_the_old_ops_keep_working() {
+        let (project, clip) = channel_project();
+        project
+            .add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, Some(1.0))
+            .unwrap();
+        project
+            .add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, Some(0.0))
+            .unwrap();
+        // Take the opacity off the bundle, with a key in the middle of its own.
+        let c = project
+            .set_property_keyframes(clip.id, Property::Opacity, vec![pk(0.0, 1.0), pk(2.0, 0.25), pk(4.0, 1.0)])
+            .unwrap();
+        assert_eq!(c.keyframes.len(), 2, "the bundle is as it was");
+        assert!((c.transform_at(2.0).opacity - 0.25).abs() < 1e-12 && (c.transform_at(2.0).scale - 1.5).abs() < 1e-12);
+        // `add_keyframe` puts an asked-for opacity into the track that drives it.
+        let c = project.add_keyframe(clip.id, 3.0, None, None, None, None, Some(0.9)).unwrap();
+        assert_eq!(c.keyframes.len(), 3);
+        assert!((c.transform_at(3.0).opacity - 0.9).abs() < 1e-12);
+        assert_eq!(c.channel(Property::Opacity).unwrap().keys.len(), 4);
+        // The easing of the transform key at 0 s reaches the bundle *and* the track.
+        let c = project.set_keyframe_easing(clip.id, 0.0, Easing::Hold).unwrap();
+        assert_eq!(c.keyframes[0].easing, Easing::Hold);
+        assert_eq!(c.property_keys(Property::Opacity)[0].easing, Easing::Hold);
+        assert_eq!(c.transform_at(1.9).opacity, 1.0);
+        // One number's segment alone.
+        let c = project
+            .set_property_easing(clip.id, Property::Scale, 0.0, Easing::EaseIn)
+            .unwrap();
+        assert_eq!(
+            c.keyframes[0].easing,
+            Easing::Hold,
+            "the bundle keeps its other numbers' shapes"
+        );
+        assert_eq!(c.property_keys(Property::Scale)[0].easing, Easing::EaseIn);
+        assert!(project
+            .set_property_easing(clip.id, Property::Volume, 0.0, Easing::Hold)
+            .is_err());
+        assert!(project.set_keyframe_easing(clip.id, 8.0, Easing::Hold).is_err());
+        // Clearing the transform animation takes the tracks of its numbers too, and only those.
+        project
+            .set_property_keyframes(clip.id, Property::Brightness, vec![pk(0.0, 0.1), pk(1.0, 0.2)])
+            .unwrap();
+        let c = project.clear_keyframes(clip.id).unwrap();
+        assert!(!c.is_animated() && c.keyframes.is_empty());
+        assert_eq!(c.channels.len(), 1);
+        assert_eq!(c.channels[0].prop, Property::Brightness);
+    }
+
+    #[test]
+    fn copying_keyframes_moves_an_animation_to_another_clip() {
+        let (project, from) = channel_project();
+        let to = project
+            .add_clip_to_timeline(from.asset_id, None, 0.0, 6.0, Some(20.0))
+            .unwrap();
+        project
+            .set_property_keyframes(from.id, Property::Volume, vec![pk(1.0, 0.0), pk(3.0, 2.0)])
+            .unwrap();
+        project.add_keyframe(from.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        project.add_keyframe(from.id, 2.0, Some(2.0), None, None, None, None).unwrap();
+        project
+            .set_property_keyframes(to.id, Property::Volume, vec![pk(0.0, 1.0), pk(5.0, 1.0)])
+            .unwrap();
+        project.set_volume(to.id, 0.5).unwrap();
+
+        // The volume only, half a second later: it replaces the destination's own.
+        let copied = project.copy_keyframes(from.id, to.id, &[Property::Volume], 0.5).unwrap();
+        let keys = copied.property_keys(Property::Volume);
+        assert_eq!(
+            keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>(),
+            [(1.5, 0.0), (3.5, 2.0)]
+        );
+        assert!(!copied.is_animated(), "only the volume was asked for");
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Copy keyframes");
+        // Every keyed number, the bundle's included (as the tracks of its numbers), earlier.
+        let all = project.copy_keyframes(from.id, to.id, &[], -1.0).unwrap();
+        assert!(all.is_animated() && all.is_keyed(Property::Scale) && all.is_keyed(Property::Volume));
+        assert_eq!(
+            all.property_keys(Property::Volume)[0].time,
+            0.0,
+            "the head before the destination's start is cut"
+        );
+        assert!(
+            (all.property_at(Property::Volume, 0.0) - 0.0).abs() < 1e-9
+                && (all.property_at(Property::Volume, 1.0) - 1.0).abs() < 1e-9
+        );
+        assert!((all.property_at(Property::Scale, 0.5) - from_clip_scale_at(&project, from.id, 1.5)).abs() < 1e-9);
+        // Refusals, none of which write.
+        let before = project.history().unwrap().len();
+        assert!(project.copy_keyframes(from.id, from.id, &[], 0.0).is_err());
+        assert!(project.copy_keyframes(from.id, to.id, &[Property::Gamma], 0.0).is_err());
+        assert!(project.copy_keyframes(to.id, from.id, &[Property::Temperature], 0.0).is_err());
+        assert!(project.copy_keyframes(from.id, to.id, &[], f64::NAN).is_err());
+        assert!(project.copy_keyframes(from.id, Uuid::new_v4(), &[], 0.0).is_err());
+        assert!(project.copy_keyframes(Uuid::new_v4(), to.id, &[], 0.0).is_err());
+        assert_eq!(project.history().unwrap().len(), before);
+        // Nothing keyed in the source is nothing to copy.
+        let bare = project
+            .add_clip_to_timeline(from.asset_id, None, 0.0, 2.0, Some(40.0))
+            .unwrap();
+        assert!(project.copy_keyframes(bare.id, to.id, &[], 0.0).is_err());
+    }
+
+    fn from_clip_scale_at(project: &Project, id: Uuid, local: f64) -> f64 {
+        project.timeline().unwrap().clip(id).unwrap().transform_at(local).scale
     }
 
     #[test]

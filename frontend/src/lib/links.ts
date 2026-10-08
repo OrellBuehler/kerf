@@ -29,6 +29,7 @@ import {
 	MIN_EDIT_CLIP,
 	moveHead,
 	moveTail,
+	rebaseAnimation,
 	type SourceLimits
 } from './edit-modes';
 import {
@@ -44,6 +45,7 @@ import {
 	STEP_EPS,
 	unlockedPartners
 } from './link-groups';
+import { isKeyed, MAX_CHANNEL_VOLUME, propertyKeys } from './channels';
 import { applyShifts, conformLinks, DIFF_EPS, runsIntoUnlinked, settleLinked, spansOverlap } from './ripple';
 import type { AudioEffect, Clip, ClipCut, ClipMove, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -59,6 +61,10 @@ const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
 const MIN_FADER = 1e-3;
 /** Two faders closer than this are the same fader (kerf-core's `FADER_EPS`). */
 const FADER_EPS = 1e-6;
+
+/** What a sound's gain is multiplied by to keep its level when it moves from the fader `from`
+ *  to the fader `to` (kerf-core's `fader_ratio`; 1 for faders that are the same). */
+const faderRatio = (from: number, to: number) => (Math.abs(from - to) <= FADER_EPS ? 1 : from / to);
 
 // ---- detach / reattach -----------------------------------------------------------
 
@@ -132,8 +138,20 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 	const span: [number, number] = [clip.timeline_start, endOf(clip)];
 	const pictureFader = timeline.tracks[vi].volume ?? 1;
 	// Something that reacts to level must meet the same fader it did.
-	const fader = (clip.audio ?? []).some(isDynamic) ? pictureFader : undefined;
+	let fader = (clip.audio ?? []).some(isDynamic) ? pictureFader : undefined;
 	let laneIx = audioLaneFor(timeline, vi, span, avoid, fader);
+	// A keyed volume is read held to 0..=MAX_CHANNEL_VOLUME and a static one is not, so folding the
+	// fader ratio into its keys could push one past the cap and quietly lower the sound. When it
+	// would, carry the keys as they are to a lane whose fader equals the picture track's (the choice
+	// a compressor makes), where the ratio is 1.
+	if (fader === undefined && isKeyed(clip, 'volume')) {
+		const peak = propertyKeys(clip, 'volume').reduce((most, k) => Math.max(most, k.value), 0);
+		const dest = laneIx === undefined ? 1 : (timeline.tracks[laneIx].volume ?? 1);
+		if (peak * faderRatio(pictureFader, dest) > MAX_CHANNEL_VOLUME) {
+			fader = pictureFader;
+			laneIx = audioLaneFor(timeline, vi, span, avoid, fader);
+		}
+	}
 	let createdTrack = false;
 	if (laneIx === undefined) {
 		const count = timeline.tracks.filter((t) => t.kind === 'audio').length;
@@ -161,6 +179,12 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 		link_id: group
 	};
 	if (clip.enabled === false) audio.enabled = false;
+	// A keyed volume *is* the gain, so it rides over with the sound, through the same fader ratio.
+	const volume = clip.channels?.find((c) => c.prop === 'volume' && c.keys.length > 0);
+	if (volume) {
+		const ratio = faderRatio(pictureFader, destFader);
+		audio.channels = [{ prop: 'volume', keys: volume.keys.map((k) => ({ ...k, value: k.value * ratio })) }];
+	}
 	const lane = timeline.tracks[laneIx];
 	lane.clips.push(audio);
 	lane.clips.sort((a, b) => a.timeline_start - b.timeline_start);
@@ -501,7 +525,9 @@ export function carryLinksSince(timeline: Timeline, before: Timeline, footage: S
 // ---- split -----------------------------------------------------------------------
 
 /** Split one clip at timeline time `at` into two adjacent halves; the right half is a new
- *  clip (new id, no transition, no link). `at` must lie strictly inside the clip. */
+ *  clip (new id, no transition, no link). Each fade stays with the half that holds its edge
+ *  (the left keeps the fade-in, the right the fade-out), clamped to it, and the right half
+ *  opens on the animation's pose at the cut. `at` must lie strictly inside the clip. */
 export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip, Clip] {
 	const found = locateIndex(timeline, clipId);
 	if (!found) throw clipNotFound(clipId);
@@ -515,6 +541,9 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
 	right.timeline_start = at;
 	right.transition_in = null; // the transition stays with the left (start) half
 	delete right.link_id;
+	// The animation is clip-local: the right half starts `at - start` into it, so it opens on
+	// the pose the whole clip had there and keeps the keys after it.
+	rebaseAnimation(right, at - clip.timeline_start);
 	if (reversed(clip)) {
 		const splitSrc = Math.min(Math.max(clip.source_out - offset, clip.source_in), clip.source_out);
 		right.source_out = splitSrc;
@@ -524,6 +553,11 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
 		right.source_in = splitSrc;
 		clip.source_out = splitSrc;
 	}
+	// Each fade stays with the half that holds its edge (the cut is not a fade edge), clamped to it.
+	clip.fade_out = 0;
+	right.fade_in = 0;
+	clampFades(clip);
+	clampFades(right);
 	timeline.tracks[ti].clips.splice(ci + 1, 0, right);
 	return [structuredClone(clip), structuredClone(right)];
 }
@@ -607,7 +641,8 @@ export function rippleDeleteLinked(timeline: Timeline, clipId: string, notes: st
  *  `[from, to]` with its source window and drop the middle. Returns the `[head, tail]` pieces
  *  that survive (in play order — a reversed clip plays the upper span first). A piece that is
  *  the sole survivor keeps the original id and both fades; otherwise the fades facing the
- *  removed middle are dropped and the tail is a new clip with no link. With `closeGap`, later
+ *  removed middle are dropped and the tail is a new clip with no link. A tail piece's animation
+ *  is re-timed to open on the pose the clip had where it starts. With `closeGap`, later
  *  clips on the track ripple left over the removed span; without, the lane is left for the
  *  caller to settle. */
 function cutRangePieces(
@@ -653,6 +688,9 @@ function cutRangePieces(
 		const p = structuredClone(clip);
 		[p.source_in, p.source_out] = tail;
 		p.timeline_start = cursor;
+		// The tail starts after the head and the removed middle: its animation opens on the pose
+		// the whole clip had there (a sole-surviving tail is a head trim).
+		rebaseAnimation(p, (head[1] - head[0] + (b - a)) / mag);
 		if (headOk) {
 			p.id = newId();
 			p.fade_in = 0;

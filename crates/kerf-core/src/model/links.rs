@@ -117,6 +117,16 @@ const MIN_FADER: f32 = 1e-3;
 /// Two faders closer than this are the same fader.
 const FADER_EPS: f32 = 1e-6;
 
+/// What a sound's gain is multiplied by to keep its level when it moves from the fader
+/// `from` to the fader `to` (1 for faders that are the same within [`FADER_EPS`]).
+fn fader_ratio(from: f32, to: f32) -> f64 {
+    if (from - to).abs() <= FADER_EPS {
+        1.0
+    } else {
+        f64::from(from) / f64::from(to)
+    }
+}
+
 /// The link groups of one timeline, built in a single pass so an edit that asks
 /// about many clips (a multi-select delete, the conform) does not scan every track
 /// per question. Clips are named by id — an index into a track goes stale the
@@ -787,7 +797,11 @@ impl Timeline {
     /// and it would react to a different level. So when the chain has one and the
     /// faders differ, the sound goes to a lane whose fader *equals* the picture
     /// track's — an existing one with room, else a **new audio track at that fader** —
-    /// and the volume is left alone. What *cannot* be carried is the rest of the
+    /// and the volume is left alone. A **keyed volume** rides over the same way (its keys
+    /// times the ratio) unless that would push a key past [`MAX_CHANNEL_VOLUME`], which a
+    /// keyed volume is read held to and a static one is not: the sound then takes the
+    /// equal-fader route too, with its keys as they are, rather than being quietly turned
+    /// down. What *cannot* be carried is the rest of the
     /// destination's strip: its **pan**, its **duck** flag and its **mute / solo** now
     /// decide how the sound is mixed, where the picture track's did before — a pan on
     /// V1 no longer leans the dialogue, and a muted or ducked A1 changes it.
@@ -825,8 +839,24 @@ impl Timeline {
         let span = (clip.timeline_start, clip.timeline_end());
         let picture_fader = self.tracks[vi].volume;
         // Something that reacts to level must meet the same fader it did.
-        let fader = clip.audio.iter().any(AudioEffect::is_dynamic).then_some(picture_fader);
-        let (lane_ix, created_track) = match self.audio_lane_for(vi, span, &avoid, fader) {
+        let mut fader = clip.audio.iter().any(AudioEffect::is_dynamic).then_some(picture_fader);
+        let mut lane = self.audio_lane_for(vi, span, &avoid, fader);
+        // A keyed volume is read held to 0..=MAX_CHANNEL_VOLUME and a static one is not, so
+        // folding the fader ratio into its keys could push one past the cap and quietly lower
+        // the sound. When it would, carry the keys as they are to a lane whose fader equals the
+        // picture track's (the same choice a compressor makes), where the ratio is 1.
+        if fader.is_none() && clip.is_keyed(Property::Volume) {
+            let peak = clip
+                .property_keys(Property::Volume)
+                .iter()
+                .fold(0.0_f64, |most, k| most.max(k.value));
+            let dest = lane.map_or(Track::new(StreamKind::Audio, "").volume, |i| self.tracks[i].volume);
+            if peak * fader_ratio(picture_fader, dest) > MAX_CHANNEL_VOLUME {
+                fader = Some(picture_fader);
+                lane = self.audio_lane_for(vi, span, &avoid, fader);
+            }
+        }
+        let (lane_ix, created_track) = match lane {
             Some(lane_ix) => (lane_ix, false),
             None => {
                 let count = self.tracks.iter().filter(|t| t.kind == StreamKind::Audio).count();
@@ -848,6 +878,23 @@ impl Timeline {
         } else {
             clip.volume * picture_fader / dest_fader
         };
+        // A keyed volume *is* the gain, so it rides over with the sound, through the same
+        // fader ratio the static one is (the lane was chosen above so that this cannot push a
+        // key past the cap it is read under).
+        if let Some(track) = clip.channel(Property::Volume).filter(|t| !t.keys.is_empty()) {
+            let ratio = fader_ratio(picture_fader, dest_fader);
+            audio.channels.push(PropertyTrack {
+                prop: Property::Volume,
+                keys: track
+                    .keys
+                    .iter()
+                    .map(|k| PropertyKey {
+                        value: k.value * ratio,
+                        ..*k
+                    })
+                    .collect(),
+            });
+        }
         audio.fade_in = clip.fade_in;
         audio.fade_out = clip.fade_out;
         audio.audio = clip.audio.clone();
@@ -1261,6 +1308,10 @@ impl Timeline {
     /// Split one clip at timeline time `at` into two adjacent halves; the right half
     /// is a new clip (new id, no transition — that stays with the left — and **no
     /// link**: [`Timeline::split_clip_linked`] links the new halves of a group).
+    /// Each fade stays with the half that holds its edge: the left keeps the fade-in
+    /// and the right the fade-out, and the fades at the cut are dropped — a fade-out on
+    /// the left half would dip the picture and the sound to black at the split. A fade
+    /// longer than the half it stays on is clamped to it, as for any clip that shrank.
     /// `at` must lie strictly inside the clip. Returns `(left, right)`.
     pub fn split_clip(&mut self, clip_id: Uuid, at: f64) -> Result<(Clip, Clip)> {
         let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
@@ -1279,6 +1330,10 @@ impl Timeline {
         right.timeline_start = at;
         right.transition_in = None; // the transition stays with the left (start) half
         right.link_id = None;
+        // The animation is clip-local: the right half starts `at - start` into it, so it
+        // opens on the pose the whole clip had there and keeps the keys after it (without
+        // this the right half played the animation again from its first key).
+        right.rebase_animation(at - left.timeline_start);
         if left.is_reversed() {
             let split_src = (left.source_out - offset).clamp(left.source_in, left.source_out);
             left.source_in = split_src;
@@ -1288,6 +1343,10 @@ impl Timeline {
             left.source_out = split_src;
             right.source_in = split_src;
         }
+        left.fade_out = 0.0;
+        right.fade_in = 0.0;
+        left.clamp_fades();
+        right.clamp_fades();
         self.tracks[ti].clips[ci] = left.clone();
         self.tracks[ti].clips.insert(ci + 1, right.clone());
         Ok((left, right))
@@ -1407,8 +1466,10 @@ impl Timeline {
     /// much **timeline** the cut removed. A piece that is the sole survivor keeps the
     /// original id and both fades (the cut is just a trim); otherwise the fades
     /// facing the removed middle are dropped and the tail is a new clip with no link.
-    /// With `close_gap`, later clips on the track ripple left over the removed span;
-    /// without, the lane is left for the caller to settle.
+    /// A tail piece starts after the head and the removed middle, so its animation is
+    /// re-timed to open on the pose the clip had there. With `close_gap`, later clips on the
+    /// track ripple left over the removed span; without, the lane is left for the caller to
+    /// settle.
     fn cut_range_pieces(
         &mut self,
         clip_id: Uuid,
@@ -1451,6 +1512,10 @@ impl Timeline {
             let mut p = clip.clone();
             (p.source_in, p.source_out) = tail;
             p.timeline_start = cursor;
+            // The animation is clip-local: the tail starts after the head and the removed
+            // middle, so it opens on the pose the whole clip had there (without this it
+            // replayed the animation from its first key; a sole-surviving tail is a head trim).
+            p.rebase_animation((head.1 - head.0 + (b - a)) / clip.speed_mag());
             if head_ok {
                 p.id = Uuid::new_v4();
                 p.fade_in = 0.0;
@@ -2278,6 +2343,46 @@ mod tests {
         assert!(right.link_id.is_some() && right.link_id != group, "a new pair");
         assert_eq!(t.link_partners(right.id), vec![a_right]);
         assert_eq!(t.link_partners(c), vec![a]);
+    }
+
+    #[test]
+    fn a_split_keeps_each_fade_on_the_half_that_holds_its_edge() {
+        let (mut t, c, a, _) = pair();
+        for id in [c, a] {
+            let clip = t.clip_mut(id).unwrap();
+            clip.fade_in = 1.0;
+            clip.fade_out = 2.0;
+        }
+        t.clip_mut(c).unwrap().transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        let (left, right) = t.split_clip_linked(c, 4.0).unwrap();
+        // The cut is not a fade edge: the left half does not fade out into it, nor the right in.
+        assert_eq!((left.fade_in, left.fade_out), (1.0, 0.0));
+        assert_eq!((right.fade_in, right.fade_out), (0.0, 2.0));
+        assert!(left.transition_in.is_some() && right.transition_in.is_none());
+        let a_right = t.tracks[1].clips.iter().find(|x| x.id != a).unwrap();
+        let a_left = get(&t, a);
+        assert_eq!((a_left.fade_in, a_left.fade_out), (1.0, 0.0));
+        assert_eq!((a_right.fade_in, a_right.fade_out), (0.0, 2.0));
+    }
+
+    #[test]
+    fn a_fade_longer_than_the_half_it_stays_on_is_clamped_to_it() {
+        let (mut t, c, _, _) = pair();
+        {
+            let clip = t.clip_mut(c).unwrap();
+            clip.fade_in = 5.0;
+            clip.fade_out = 6.0;
+        }
+        // The cut is 2 s in: the left half is 2 s long, the right 8 s.
+        let (left, right) = t.split_clip(c, 2.0).unwrap();
+        assert_eq!((left.fade_in, left.fade_out), (2.0, 0.0));
+        assert_eq!((right.fade_in, right.fade_out), (0.0, 6.0));
+        // Cut 9 s in, inside the fade-out: the right half is 1 s long and holds it to that.
+        let (_, tail) = t.split_clip(right.id, 9.0).unwrap();
+        assert_eq!((tail.fade_in, tail.fade_out), (0.0, 1.0));
     }
 
     #[test]

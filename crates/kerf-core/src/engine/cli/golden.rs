@@ -1,4 +1,5 @@
-//! The golden argv oracle: 4800 seeded timelines (4000, then 800 with a master bus) whose ffmpeg argv must not move.
+//! The golden argv oracle: 5600 seeded timelines (4000, then 800 with a master bus, then 800
+//! with per-property channels) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -14,6 +15,12 @@
 //! get a master bus ([`master_for`], no dice of its own). Adding the family therefore
 //! moved no existing case — `KERF_GOLDEN_CASES` on the commit before and after agrees
 //! on all of `0..CASES` — and only appended block lines to the three digest files.
+//! **The channel family is appended the same way**: the [`CHANNEL_CASES`] after those draw
+//! their timelines from the same generator and then get animation channels
+//! ([`channels_for`], on dice of its own seeded by the case and the clip, so the generator's
+//! are untouched): colour numbers, a volume, some transform numbers keyed beside the others,
+//! and a legacy bundle with one number taken off it. The first 4800 per-case digests are the
+//! ones the commit before channels existed gave.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -55,12 +62,14 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::*;
-use crate::model::{Keyframe, MasterBus, TextKeyframe, Track, Transition, TransitionKind};
+use crate::model::{Easing, Keyframe, MasterBus, Property, PropertyKey, TextKeyframe, Track, Transition, TransitionKind};
 
 const CASES: usize = 4000;
 /// The master-bus cases appended after the first [`CASES`] (see the module docs).
 const MASTER_CASES: usize = 800;
-const TOTAL: usize = CASES + MASTER_CASES;
+/// The channel cases appended after the master-bus ones (see the module docs).
+const CHANNEL_CASES: usize = 800;
+const TOTAL: usize = CASES + MASTER_CASES + CHANNEL_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -113,6 +122,13 @@ effect-vignette vignette
 chroma-key chromakey=
 colour eq=brightness=
 colour-temperature :gamma_r=
+colour-keyed-brightness eq=brightness='if(lt((t-
+colour-keyed-contrast :contrast='if(lt((t-
+colour-keyed-saturation :saturation='if(lt((t-
+colour-keyed-gamma :gamma='if(lt((t-
+colour-keyed-temperature :gamma_r='1+0.3*(
+volume-keyed volume='if(lt((t-
+volume-keyed-frames asetnsamples=n=128:p=0,volume=
 hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
@@ -431,6 +447,79 @@ fn retarget_tiny(tl: &mut Timeline, i: usize) {
     }
 }
 
+/// The animation channels of the `j`-th channel case: on dice of their own (seeded by the case
+/// and the clip's place in it), so the family never rolls the generator's and the cases before
+/// it cannot move. About half the clips get colour numbers keyed (each of the five with its own
+/// chance, so one, several and all are covered), a third a volume, a third some transform numbers
+/// beside the rest (an opacity ramp on a still pose, a zoom without a move, ...), and a clip
+/// that was animated through the legacy bundle sometimes has one number taken off it — keyed on
+/// its own, or held static by an empty track.
+fn channels_for(tl: &mut Timeline, j: usize) {
+    const EASINGS: [Easing; 6] = [
+        Easing::Linear,
+        Easing::Linear,
+        Easing::Hold,
+        Easing::EaseIn,
+        Easing::EaseInOut,
+        Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 1.0,
+        },
+    ];
+    let range = |p: Property| match p {
+        Property::Scale => (0.3, 2.2),
+        Property::PosX | Property::PosY => (-0.5, 0.5),
+        Property::Rotation => (-90.0, 90.0),
+        Property::Opacity => (0.0, 1.0),
+        Property::Brightness => (-0.5, 0.5),
+        Property::Contrast => (0.4, 2.5),
+        Property::Saturation => (0.0, 2.5),
+        Property::Gamma => (0.4, 2.5),
+        Property::Temperature => (-1.0, 1.0),
+        Property::Volume => (0.0, 2.0),
+    };
+    for (n, clip) in tl.tracks.iter_mut().flat_map(|t| &mut t.clips).enumerate() {
+        let mut r = Rng::new((1 << 40) + (j as u64) * 64 + n as u64);
+        let span = clip.duration() * 1.1 + 0.2;
+        let keys = |r: &mut Rng, p: Property| {
+            let (lo, hi) = range(p);
+            let mut keys: Vec<PropertyKey> = (0..1 + r.below(4))
+                .map(|_| PropertyKey {
+                    time: r.real(0.0, span),
+                    value: r.real(lo, hi),
+                    easing: r.pick(&EASINGS),
+                })
+                .collect();
+            keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            keys
+        };
+        if r.chance(0.5) {
+            for p in Property::COLOR {
+                if r.chance(0.45) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
+        }
+        if r.chance(0.35) {
+            clip.set_property_keys(Property::Volume, keys(&mut r, Property::Volume));
+        }
+        if r.chance(0.35) {
+            for p in Property::TRANSFORM {
+                if r.chance(0.4) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
+        }
+        if !clip.keyframes.is_empty() && r.chance(0.4) {
+            let p = r.pick(&Property::TRANSFORM);
+            let held = if r.chance(0.5) { Vec::new() } else { keys(&mut r, p) };
+            clip.set_property_keys(p, held);
+        }
+    }
+}
+
 /// The master bus of the `j`-th master-bus case: a function of `j` alone, so the
 /// family never rolls a die (and the cases before it cannot move). A cycle of
 /// fader only, limiter only, both and "both, from a file that never went through the
@@ -712,8 +801,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     retarget_alpha(&mut timeline, i, assets);
     retarget_hdr43(&mut timeline, i, assets);
     retarget_tiny(&mut timeline, i);
-    if i >= CASES {
+    if (CASES..CASES + MASTER_CASES).contains(&i) {
         timeline.master = master_for(i - CASES);
+    }
+    if i >= CASES + MASTER_CASES {
+        channels_for(&mut timeline, i - CASES - MASTER_CASES);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -869,7 +961,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 20] = [
+const STRUCTURAL: [&str; 25] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -890,6 +982,11 @@ const STRUCTURAL: [&str; 20] = [
     "alpha-kept",
     "preview-alpha-kept",
     "master-nonfinite",
+    "channel-partial-transform",
+    "channel-off-the-bundle",
+    "channel-held-static",
+    "channel-colour-only",
+    "channel-opacity-alone",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1033,6 +1130,26 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (clips().any(Clip::zoom_animated), "zoom-keyed"),
         (clips().any(|k| k.is_animated() && !k.zoom_animated()), "zoom-keyed-constant"),
         (still_zoom_last(&flat[1]), "still-zoom-last"),
+        // Per-property channels: a transform with some numbers keyed and the rest static, a
+        // number taken off the legacy bundle (keyed on its own, or held static), and a clip
+        // that is animated in colour alone (its picture is placed as a static one).
+        (
+            clips().any(|k| k.is_animated() && Property::TRANSFORM.iter().any(|p| !k.is_keyed(*p))),
+            "channel-partial-transform",
+        ),
+        (
+            clips().any(|k| !k.keyframes.is_empty() && k.channels.iter().any(|c| c.prop.is_transform() && !c.keys.is_empty())),
+            "channel-off-the-bundle",
+        ),
+        (
+            clips().any(|k| !k.keyframes.is_empty() && k.channels.iter().any(|c| c.prop.is_transform() && c.keys.is_empty())),
+            "channel-held-static",
+        ),
+        (clips().any(|k| k.color_animated() && !k.is_animated()), "channel-colour-only"),
+        (
+            clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
+            "channel-opacity-alone",
+        ),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
         (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
         (chain_tails(&flat[0]).1, "alpha-kept"),
