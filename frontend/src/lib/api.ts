@@ -530,6 +530,76 @@ export async function showMainWindow(): Promise<void> {
 	await invoke('show_main_window');
 }
 
+// ---- detached panels --------------------------------------------------------
+//
+// A panel moved into a window of its own is dockview's popout, opened with
+// `window.open`. The desktop app only answers that for a window the page announced
+// first (`popout.rs`): where it should open, how big, and the colour to paint it until
+// the panel is in it. A plain browser (`bun run dev`) opens popups itself and needs no
+// announcement, so every call here is a no-op there.
+
+/** A window's place in `screenX` / `innerWidth` pixels. */
+export interface PopoutRect {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+export interface PopoutRequest {
+	/** Where it should open — a layout being restored; absent for a panel detached by hand. */
+	rect?: PopoutRect | null;
+	/** How big, when there is no rectangle: the panel's own size. */
+	size?: { width: number; height: number } | null;
+	/** `#rrggbb`, the window's backdrop until the panel is in it. */
+	background?: string | null;
+}
+
+/** A window that was announced: its label, and where it will open (`null`: where the
+ *  platform puts it) — not always where it was asked to, when that was off every screen. */
+export interface PopoutAnnounced {
+	label: string;
+	position: [number, number] | null;
+}
+
+/** Announce a window that `window.open` is about to ask for; `null` in a browser. Rejects
+ *  when the backend will not have another. */
+export async function popoutExpect(request: PopoutRequest): Promise<PopoutAnnounced | null> {
+	if (!inTauri()) return null;
+	return invoke<PopoutAnnounced>('popout_expect', { request: { rect: null, size: null, background: null, ...request } });
+}
+
+/** Move a detached window (the correction after a restore, see `popout.svelte.ts`). */
+export async function popoutMove(label: string, x: number, y: number): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('popout_move', { label, x, y });
+}
+
+/** The announced window will not be opened after all. */
+export async function popoutCancel(label: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('popout_cancel', { label });
+}
+
+/** Destroy a detached panel's window (WKWebView cannot be closed by the page). */
+export async function closePopout(label: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('close_popout', { label });
+}
+
+/** Raise a detached panel's window. */
+export async function popoutFocus(label: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('popout_focus', { label });
+}
+
+/** A detached panel's window was destroyed, however: `cb` gets its label. */
+export async function onPopoutClosed(cb: (label: string) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<string>('popout-closed', (e) => cb(e.payload));
+}
+
 /** What this launch was started asking to open (`kerf path/to/cut.kerf`) — a
  *  `.kerf` that exists, or one that was named and is not there — handed over once;
  *  `null` when there was nothing or it was already taken. A second launch's request

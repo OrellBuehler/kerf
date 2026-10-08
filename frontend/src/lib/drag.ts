@@ -11,6 +11,8 @@
  * event of the same gesture is ignored. It returns a function that abandons it
  * from outside (the clip it belongs to was removed mid-drag). */
 
+import { windowOf } from './realm';
+
 export interface DragHandlers {
 	/** The pointer moved (only while the primary button is down). */
 	move(e: PointerEvent): void;
@@ -20,12 +22,13 @@ export interface DragHandlers {
 	abandon(): void;
 }
 
-/** What a drag listens on besides the captured element — injectable for tests. */
+/** What a drag listens on besides the captured element — injectable for tests. By
+ *  default the window the element is in: a drag in a detached window ends there. */
 export interface DragEnv {
 	window: Pick<Window, 'addEventListener' | 'removeEventListener'>;
 }
 
-export function beginDrag(e: PointerEvent, h: DragHandlers, env: DragEnv = { window }): () => void {
+export function beginDrag(e: PointerEvent, h: DragHandlers, env: DragEnv = { window: windowOf(e.currentTarget as Element) }): () => void {
 	const el = e.currentTarget as Element;
 	const id = e.pointerId;
 	let done = false;

@@ -5,6 +5,7 @@
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
 	import Btn from './Btn.svelte';
+	import { documentOf } from '$lib/realm';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { CAPTION_LOOKS, TEXT_STYLES } from '$lib/style-presets';
@@ -28,6 +29,8 @@
 	import { chip } from '$lib/chip';
 
 	const uid = $props.id();
+	/** The options row: where its window (the panel may be in a detached one) is read from. */
+	let importEl = $state<HTMLElement | null>(null);
 
 	// The list below is what is *shown* (a staged proposal while one is being
 	// reviewed); every button here acts on the live cut, and so does the count of
@@ -60,7 +63,7 @@
 	$effect(() => {
 		if (!importOpen) return;
 		void choice.base;
-		document.getElementById(`${uid}-import`)?.scrollIntoView({ block: 'nearest' });
+		importEl?.scrollIntoView({ block: 'nearest' });
 	});
 
 	async function chooseFile() {
@@ -68,8 +71,9 @@
 	}
 
 	function closeImport(refocus: boolean) {
+		const doc = documentOf(importEl);
 		importOpen = false;
-		if (refocus) document.getElementById(`${uid}-toggle`)?.focus();
+		if (refocus) doc.getElementById(`${uid}-toggle`)?.focus();
 	}
 
 	/** Escape folds the options away and hands focus back to the button that opened
@@ -152,6 +156,7 @@
 	     covers is a real button / select that Tab already reaches. -->
 	<div role="presentation" onkeydown={onImportKey}>
 		<div
+			bind:this={importEl}
 			id="{uid}-import"
 			role="group"
 			aria-label="Import captions"

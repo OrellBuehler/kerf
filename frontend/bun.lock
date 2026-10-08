@@ -11,7 +11,7 @@
         "@tauri-apps/plugin-process": "^2.4.0",
         "@tauri-apps/plugin-updater": "^2.13.0",
         "@xyflow/svelte": "^1.7.0",
-        "dockview": "8.3.1",
+        "dockview": "8.4.1",
       },
       "devDependencies": {
         "@fontsource-variable/inter": "^5.3.0",
@@ -225,9 +225,9 @@
 
     "devalue": ["devalue@5.9.3", "", {}, "sha512-xRumYOCUZN/EesqHEU3WOXanOZNvfZFZ/o1AHVFDX1yI0UAkZkOgDXt341CzKoBVIkgQba55/+DjGBKrIoKcHw=="],
 
-    "dockview": ["dockview@8.3.1", "", { "dependencies": { "dockview-core": "^8.3.1" } }, "sha512-2odBC9cDKcVCVx8Db86vq9s9JZKzbgvdkxDzcfsrD9nORLc5UqhLgLvVcJguorBv7CyEpKDzFO1JVLYWJCYrJA=="],
+    "dockview": ["dockview@8.4.1", "", { "dependencies": { "dockview-core": "^8.4.1" } }, "sha512-6CrXwfDkhTL0N8stgnur8E/WYFZqltAtHaAV96Ia9lA1JGWwWMw5MWZznWckIMocS2Il5rgaqP/i/l2ltYaTqw=="],
 
-    "dockview-core": ["dockview-core@8.3.1", "", {}, "sha512-6Loais9hlIRo25sTQSWGWlgbPr22ddoLBzpGDFaTnocawnC45twp5f2S2WxUz5/HPa/a65I4yxKUqZa8xrcc5Q=="],
+    "dockview-core": ["dockview-core@8.4.1", "", {}, "sha512-LcvhGwmK/Q1tFDEPkiBpkLIYctimmu8JJHgG5yhIXwyf9IvWQkJa3EG7/a1NKUS2Q8w82uoYZTL+c84/zpQUjg=="],
 
     "enhanced-resolve": ["enhanced-resolve@5.24.5", "", { "dependencies": { "graceful-fs": "^4.2.4", "tapable": "^2.3.3" } }, "sha512-L1l8TNvomm6UVW5B253AGxQagSQr+vGwhMlrrfRS2qmhx46AMpMVJKQYLvWYbysTMY8VoicOvzHzoHMbyzB+4A=="],
 

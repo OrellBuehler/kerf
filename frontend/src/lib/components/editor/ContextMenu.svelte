@@ -3,30 +3,54 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 
+	/** The window this instance draws in. One is mounted in the editor window and one in
+	 *  each detached window (`popout.svelte.ts`): a menu belongs to the window it was
+	 *  opened in, and draws there. */
+	let { win }: { win?: Window } = $props();
+	const own = $derived(win ?? window);
+	const here = $derived(contextMenu.visible && (contextMenu.win ?? window) === own);
+
 	let el = $state<HTMLDivElement | null>(null);
 	let pos = $state({ x: 0, y: 0 });
 
 	// Clamp the menu into the viewport once it's measured. Runs after the element
 	// mounts (so offsetWidth/Height are real) and whenever the open position moves.
 	$effect(() => {
-		if (!contextMenu.visible || !el) return;
+		if (!here || !el) return;
 		const margin = 6;
 		const w = el.offsetWidth;
 		const h = el.offsetHeight;
 		let x = contextMenu.x;
 		let y = contextMenu.y;
-		if (x + w + margin > window.innerWidth) x = window.innerWidth - w - margin;
-		if (y + h + margin > window.innerHeight) y = window.innerHeight - h - margin;
+		if (x + w + margin > own.innerWidth) x = own.innerWidth - w - margin;
+		if (y + h + margin > own.innerHeight) y = own.innerHeight - h - margin;
 		pos = { x: Math.max(margin, x), y: Math.max(margin, y) };
 	});
 
-	// Dismiss on a press outside the menu, on scroll (any scroller, hence capture),
-	// and on resize. Esc is handled below.
+	// Dismiss on a press outside the menu, on Esc, on scroll (any scroller, hence
+	// capture), on resize and when the window loses focus — in the window it is open in.
 	$effect(() => {
-		if (!contextMenu.visible) return;
-		const onScroll = () => contextMenu.close();
-		window.addEventListener('scroll', onScroll, true);
-		return () => window.removeEventListener('scroll', onScroll, true);
+		if (!here) return;
+		const w = own;
+		// The menu scrolls when it is taller than the window it is in; that is no reason to close it.
+		const onScroll = (e: Event) => {
+			if (el && e.target instanceof Node && el.contains(e.target)) return;
+			contextMenu.close();
+		};
+		const onResize = () => contextMenu.close();
+		const onBlur = () => contextMenu.close();
+		w.addEventListener('scroll', onScroll, true);
+		w.addEventListener('pointerdown', onWindowPointerDown);
+		w.addEventListener('keydown', onKey);
+		w.addEventListener('resize', onResize);
+		w.addEventListener('blur', onBlur);
+		return () => {
+			w.removeEventListener('scroll', onScroll, true);
+			w.removeEventListener('pointerdown', onWindowPointerDown);
+			w.removeEventListener('keydown', onKey);
+			w.removeEventListener('resize', onResize);
+			w.removeEventListener('blur', onBlur);
+		};
 	});
 
 	function onWindowPointerDown(e: PointerEvent) {
@@ -52,20 +76,13 @@
 	}
 </script>
 
-<svelte:window
-	onpointerdown={onWindowPointerDown}
-	onkeydown={onKey}
-	onresize={() => contextMenu.close()}
-	onblur={() => contextMenu.close()}
-/>
-
-{#if contextMenu.visible}
+{#if here}
 	<div
 		bind:this={el}
 		role="menu"
 		tabindex="-1"
 		oncontextmenu={(e) => e.preventDefault()}
-		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
+		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;max-height:{own.innerHeight - 12}px;overflow-y:auto;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
 	>
 		{#each contextMenu.items as item, i (i)}
 			{#if item.type === 'separator'}

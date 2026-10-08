@@ -13,6 +13,8 @@
 	// approximation — each says so where you switch it on. The Measure button reads
 	// the real mix.
 	import { untrack } from 'svelte';
+	import { intersectionObserverFor } from '$lib/realm';
+	import { windows, type FrameHandle } from '$lib/windows.svelte';
 	import MixerStrip from './MixerStrip.svelte';
 	import MasterStrip from './MasterStrip.svelte';
 	import Badge from './Badge.svelte';
@@ -41,7 +43,11 @@
 	let visible = true;
 	$effect(() => {
 		if (!root) return;
-		const io = new IntersectionObserver((entries) => (visible = entries.at(-1)?.isIntersecting ?? true));
+		// Re-run when the panel moves to another window, and observe from that window: an
+		// observer made by the editor window's constructor reports an element in a
+		// detached one as not intersecting, for good.
+		void windows.version;
+		const io = intersectionObserverFor(root, (entries) => (visible = entries.at(-1)?.isIntersecting ?? true));
 		io.observe(root);
 		return () => io.disconnect();
 	});
@@ -58,9 +64,12 @@
 		// A fresh run starts with the marks clear (a restart for an edit does not: the
 		// effect only re-runs when playback itself changes).
 		untrack(() => (meters = {}));
-		let raf = 0;
+		let raf: FrameHandle | null = null;
 		let last = performance.now();
-		const frame = (now: number) => {
+		// Frames come from whichever window is showing, whose timestamps count from its own
+		// start: the editor's own clock is read instead.
+		const frame = () => {
+			const now = performance.now();
 			const dt = now - last;
 			last = now;
 			const read = visible ? audio.meters() : null;
@@ -73,10 +82,10 @@
 				next.master = stepStereo(untrack(() => meterOf('master')), read.master.l, read.master.r, dt);
 				meters = next;
 			}
-			raf = requestAnimationFrame(frame);
+			raf = windows.requestFrame(frame);
 		};
-		raf = requestAnimationFrame(frame);
-		return () => cancelAnimationFrame(raf);
+		raf = windows.requestFrame(frame);
+		return () => windows.cancelFrame(raf);
 	});
 
 	const clear = (id: string) => (meters = { ...meters, [id]: clearStereo(meterOf(id)) });

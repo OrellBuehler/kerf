@@ -12,6 +12,7 @@
 import { actionDef, type ActionId } from './keymap';
 import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
+import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
 import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
 
@@ -21,7 +22,9 @@ export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' |
 export type MenuCommand =
 	| { type: 'delivery'; preset: string }
 	| { type: 'height'; preset: HeightPreset }
-	| { type: 'panel'; panel: PanelId };
+	| { type: 'panel'; panel: PanelId }
+	/** Move a panel into a window of its own, or give it back. */
+	| { type: 'detach'; panel: PanelId };
 
 /** How an entry is announced and drawn: a plain item, a tickable one, or one of a
  *  group of which exactly one is ticked. */
@@ -71,6 +74,8 @@ export interface MenuState {
 	allHeight: HeightPreset | null;
 	workspace: WorkspaceId;
 	openPanels: readonly PanelId[];
+	/** The panels that are in a window of their own. */
+	detachedPanels: readonly PanelId[];
 	/** The desktop app: some commands have nothing to act on in a browser. */
 	desktop: boolean;
 }
@@ -249,6 +254,9 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	};
 
 	const label = workspaceSpec(s.workspace).label;
+	// Where each open panel is, for the rule that the editor window keeps one.
+	const where: Partial<Record<PanelId, PanelLocation>> = {};
+	for (const id of s.openPanels) where[id] = s.detachedPanels.includes(id) ? 'popout' : 'grid';
 	const win: MenuDef = {
 		id: 'window',
 		label: 'Window',
@@ -262,6 +270,29 @@ export function buildMenus(s: MenuState): MenuDef[] {
 					checked: s.openPanels.includes(id)
 				})
 			),
+			sep,
+			{
+				kind: 'submenu',
+				label: 'Panel windows',
+				icon: 'external-link',
+				items: [
+					...PANEL_IDS.map((id): MenuEntry => {
+						const blocked = detachBlocked(id, where);
+						return {
+							kind: 'command',
+							command: { type: 'detach', panel: id },
+							label: PANELS[id].title,
+							role: 'check',
+							checked: s.detachedPanels.includes(id),
+							...(blocked ? { disabled: true, reason: blocked } : {})
+						};
+					}),
+					sep,
+					act('window.dockAll', {
+						...(s.detachedPanels.length === 0 ? { disabled: true, reason: 'No panel is in a window of its own' } : {})
+					})
+				]
+			},
 			sep,
 			act('window.resetWorkspace', { icon: 'rotate-ccw', label: `Reset ${label} workspace` }),
 			act('window.resetAllWorkspaces', { label: 'Reset all workspaces' })

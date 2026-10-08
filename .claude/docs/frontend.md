@@ -183,6 +183,55 @@ group's tab strip, and hands the width it frees or takes to the group beside it
 chevron by keyboard moves focus to the rail's active tab, since the chevron
 unmounts with the content. A library sharing a group with another panel cannot
 fold — it has no width of its own to give back.
+**Detached panels** (`popout.svelte.ts` over dockview's popout groups; the backend half is
+`popout.rs`, see kerf-app). Any panel can go into a window of its own for a second screen:
+**Window › Panel windows** (a tick per panel, in a window while ticked; *Return all panels to the
+editor window*, `window.dockAll`) or the tab's right-click menu (*Move to new window* / *Return to the
+editor window*, dockview's `getTabContextMenuItems`). The editor window keeps at least one panel
+(`detachBlocked`, pure; the menu entry is greyed out with its reason). A window that failed to open
+gives its label up (`#failed`), unless dockview refused the URL before the backend saw it. Every open goes through `PopoutState.#open`, which **announces** the window
+(`popoutExpect`) and hands the label it gets to the window that opens (`LabelBook`, a FIFO: `window.open`
+carries nothing to say which announcement it is for, so opens are serialised and the backend hands them
+out in order); closing a window is dockview's own (it re-docks the panels where they came from) and
+the *Return* entries just close the window. What it gives a window beyond dockview's: the live theme
+(`mirrorRoot` copies `<html>`'s class and inline custom properties from a MutationObserver, otherwise a
+window shows the stylesheet's defaults whatever the theme), a title (`Library — Kerf`), a slider-fill
+observer of its own, **`inert` while a modal is open**, and the shortcut handler (`windows.listen`).
+**The rule for panel code: `window` and `document` are the editor window's, and an event that happens in a
+detached window is dispatched there and never reaches a listener on this one.** So `windows.svelte.ts`
+(the registry; `version` moves when a window opens or closes or a panel moves) and `realm.ts` (pure:
+`windowOf(el)`, `documentOf(el)`, `resizeObserverFor` / `intersectionObserverFor` — an observer made by the
+editor window's constructor reports a detached window's element **not intersecting for good**) are how a
+panel asks which window it is in; `window-events.ts`'s `onWindow({ pointermove, … })` is
+`<svelte:window on…>` as an attachment that follows the element (a `capture` suffix is the capture phase);
+`windows.listen` is for what is the app's (shortcuts, the click that dismisses a menu), heard in every
+window. `beginDrag` listens on the window of its element. **Svelte registers delegated handlers
+(`click`, …) on its own mount root**, so anything drawn outside a panel's root in a detached window needs
+a root of its own there: the context menu is one `ContextMenu` per window (`contextMenu.win` is where
+it was opened; mounted by `Workspace.svelte`'s `window` hook). The transport clock draws frames from
+`windows.requestFrame` — the editor window's when it is showing, else a detached window that is (a
+hidden window pauses its frames) — and reads `performance.now()` itself because a frame's timestamp
+counts from its own window's start. **The choice is not final**: the registry owns the handle and a
+frame waiting in a window that then hides or closes is asked for again where one shows — on each
+window's `visibilitychange`, when a window is added or removed, and by one lazy 250 ms watchdog for a
+platform that says nothing (a frame that outlives two ticks) — so the clock and the meters do not
+freeze while the picture plays on the other screen. The library cannot fold while it has a window to itself. **Layouts
+keep their windows**: `sanitizeLayout` reads dockview's `popoutGroups` (a window of one group or a
+nested layout) through the same walk as the grid, so a panel is still shown once; the page is always
+the popout page; a place that is not numbers is the platform's choice; the group a popped-out group
+leaves behind in the grid — empty and hidden, holding the place its panels return to — is kept only while
+a window points at it; `sameArrangement` counts each window's panels and place (12 px of slack for the
+title bars a platform adds), so a window the user moved is written and one the platform nudged is not.
+Restoring a workspace with windows **announces them first** (`announce`, in order — dockview restores
+each from a timer) and then builds the dock; saving waits until `popoutRestorationPromise` (8 s at most)
+so the windows opening are not taken for a rearrangement, and `settle` forgets any announcement nobody
+took. Each workspace has its own windows: a switch closes one set and opens the other.
+**The Preview panel in a window of its own** measures from there: the transport bar's width
+(`transport-bar.ts`) is read with the panel's window (`windowOf`, its `requestAnimationFrame` and
+`resize`, an observer of its own realm, read again on `windows.version`). The GPU preview's surface and
+bounds belong to the editor window, so a Preview in a popout is routed to the JPEG (`routePreview`'s
+`detached` input, `describeWhy`: "the panel is in a window of its own"), the bounds observers stand down
+and the surface is hidden by the cleanup that reports the panel gone; docking it back resumes them.
 **The chrome is a title bar over the dock, and the menu bar is in it.** There is no
 toolbar row and no rule between the title bar and the dock: the dock starts where
 the bar ends. The window keeps its native decorations (`tauri.conf.json` sets none

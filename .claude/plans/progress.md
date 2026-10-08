@@ -22,7 +22,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Done: menu bar + chrome rework (`feat/menu-bar`: VS Code-style File / Edit / View / Playback / Window / Help in the title bar over the keymap registry, the toolbar row removed and its controls moved into the Preview (transport) and Timeline (tools, ripple, snap, undo / redo, delivery frame); stored workspace layouts recorded against the panels their preset offered and brought up to date, so the mixer reaches an Audio saved before it; Reset workspace says what it did, Reset all added). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Done: menu bar + chrome rework (`feat/menu-bar`: VS Code-style File / Edit / View / Playback / Window / Help in the title bar over the keymap registry, the toolbar row removed and its controls moved into the Preview (transport) and Timeline (tools, ripple, snap, undo / redo, delivery frame); stored workspace layouts recorded against the panels their preset offered and brought up to date, so the mixer reaches an Audio saved before it; Reset workspace says what it did, Reset all added). Done: detachable panels (`feat/detach-panels`: dockview popout groups opened through Tauri's `on_new_window` — a panel's DOM moves into a second OS window while its script keeps running in the editor window's realm, so nothing is synchronised; Window › Panel windows and the tab menu; per-workspace windows stored in the layout and restored with their place; panels ask which window they are in (`windows` / `realm` / `onWindow`); dockview 8.4.1). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -639,10 +639,74 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   carries all of it, with the marks and markers, as registry actions. The compact-bar test is
   the *left cell's* width (`MENU_FULL_PX`), not the window's.
 
+- **2026-10-08 — B9: detachable panels (Option A, dockview popouts through `on_new_window`).**
+  Question: separate Tauri `WebviewWindow`s per panel (B) or dockview popouts that share the
+  editor's JavaScript realm (A). B needs ~75 `$state` fields across six singletons synchronised,
+  a leader for transport and audio, a high-rate playhead event, a `settings-changed` event and a
+  copy of every cache per window, and cannot drag an asset between windows; A needs none of it.
+  **Measured by hand under WSLg (WebKitGTK 2.50.4, Tauri 2.12, wry 0.57, packaged `tauri://`) in one
+  session before GUI runs were ruled out here:** a window
+  built from `on_new_window` with `window_features` is scriptable (`opener` is the editor, the
+  panel's Svelte handlers and `$state` drive it, a real click in it increments the editor's
+  state); a drag, a context menu, a shortcut key, playback with the playhead and meters, a theme
+  switch and an HTML5 asset drag from a detached Library into the main Timeline all work across
+  windows; closing from the window manager re-docks the panel; quitting or reloading the editor
+  takes the windows with it; a relaunch restores the windows where they were. **Found and fixed:**
+  dockview 8.3.1 refuses `tauri://` (bumped to 8.4.1, which also polls `closed`); a window
+  declared in the config has no `window.open` handler (the main window is now built in code,
+  `create: false`); WebKitGTK blocks a `window.open` no gesture asked for
+  (`javascript-can-open-windows-automatically`, off by default — a restore at launch has none);
+  WebKitGTK ignores `window.open` features (the rectangle is announced to the backend first);
+  `window.close()` leaves a blank window (the widget's `destroy` now destroys the window); the
+  position the platform reads differs from the one it sets (32 px under WSLg: moved by the error
+  once after a restore); a popup shares the opener's content manager so an init-script label
+  does not reach it (the label is chosen by the page); a missing popout page falls back to
+  `index.html` and boots a second editor (real `popout.html` + a boot guard); a main-realm
+  `IntersectionObserver` reports a detached element not intersecting for good; `<svelte:window>`
+  listeners never hear a detached window (a drag stuck for want of `pointerup`); Svelte's delegated
+  handlers live on a mount root, so a menu drawn in a detached window needs its own. dockview
+  reports `PopoutGroup.window` as null once a window closed, so a closed window is found by
+  diffing against `getPopouts()`. **Decisions:** the editor window keeps at least one panel;
+  a hand-detached panel goes to another monitor when there is one; windows are per workspace and
+  stored in its layout (`popoutGroups`, at most seven, the page always the popout page); a
+  detached window has no menu bar (shortcuts are forwarded); toasts and the notification bell stay
+  in the editor window; file drops onto a detached window do nothing in v1; the GPU preview
+  (merged since) is routed to the JPEG for a Preview in a window (`routePreview`'s `detached`) —
+  its surface is bound to `main` — and the Preview measures its transport bar in its own window. Disturbing nothing: with no panel detached every path is the
+  one it was (the only change on the way is the main window being built from its config in code).
+  WSLg also kills the web process when a second popup opens with GPU compositing
+  (`SkiaGPUWorker` fault in swrast_dri.so; `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1` avoids it) — an
+  environment fault, not a Kerf one.
+  **Repeatable evidence, no desktop:** bun tests for the layout reader (`popoutGroups`, hidden
+  reference groups, limits, `sameArrangement`), the window registry and realm helpers, the label
+  book and placement correction, the store against a stand-in dock, the workspace restore order
+  (announce, build, wait, baseline) and the menus; Rust tests for the announcement queue and the
+  placement function (`place`); and a headless-Chromium run against the browser harness
+  (`bun run dev`, Playwright, `window.open` popups that share the realm like the desktop's) that
+  opens a Timeline window and drags a clip in it, opens its context menu there and runs an item,
+  plays from a key pressed in it, switches theme, sees the sliders filled, goes inert behind a
+  modal, stores and restores the window across a reload, closes it and gets the panel back, and
+  uses the Window menu — 29 checks, all passing. (The script lives in the author's scratch space;
+  it needs only Playwright and the dev server.) Chromium also showed the observers differ by
+  engine — an editor-realm `IntersectionObserver` says *intersecting* for a detached element
+  there and *not* on WebKitGTK — which is why they are made in the element's own window.
+
+- **2026-10-09 — B9 detached panels review fixes.** An independent review found no blockers and
+  these: (1) a frame pending in a window that then hid or closed never ran, so the transport clock
+  and the meters froze while the picture played on the other screen — `windows.requestFrame` now
+  hands out a handle the registry moves (`visibilitychange`, window added / removed, a 250 ms
+  watchdog), tested against stand-in windows that run frames only while they show; (2) `window.open`
+  was checked for the popout path only — it also has to be the editor webview's scheme, host and
+  port (`is_popout_url(url, main)`); (3) a refused open during a restore left its spent label at the
+  front of the book — `#failed` now claims it unless dockview refused the URL; (4) a bun test pins
+  `POPOUT_URL` to `POPOUT_PATH`; (5) the last editor-window panel is greyed out in *Panel windows*
+  with the rule's reason instead of refusing with a toast.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
 - B9 menu bar: on Windows (WebView2) the title-bar menus under the native caption bar, Alt / F10 focus, an Alt-drag in the timeline not stealing focus, and the new Reset workspace feedback against the stored layouts of the build that reported it.
+- B9 detached panels (WebKitGTK/WSLg only so far): **GPU preview on** — a Preview dragged into a window while the surface shows (the child X11 window must go at once and the picture come back as the JPEG, and return when it is docked); **WebView2** — `NewWindowRequested` + `SetNewWindow` giving a scriptable popup, building a window inside the handler without a deadlock, `window.close()` then `Destroyed`, whether features are honoured, `screenX` and the saved rectangle on mixed-DPI monitors, a main-realm `ResizeObserver` observing a popout, frames when the editor window is minimized (the follow-the-visible-window logic is unit-tested against stand-ins only), the editor webview's `url()` read from inside the `window.open` handler and matching the popout URL's origin (`http://tauri.localhost` here), HTML5 tab / asset drags between windows against Tauri's drag-drop handler (kept on for file drops); **WKWebView** — `window.close()` is a no-op so `close_popout` has to be the way (untested), `window_features` placement (flipped y), window-level key events, frames in an occluded window (and `visibilitychange` firing for a minimized or covered window), the origin check on `tauri://localhost`, `javaScriptCanOpenWindowsAutomatically` (true by default per the headers); **everywhere** — real X11 / Wayland (positions cannot be set on Wayland; the 32 px offset is WSLg's), the single-instance second launch with windows open, a native menu bar not being inherited by a detached window, the packaged CSP applying to the popout page.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
 - B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.

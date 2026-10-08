@@ -1,5 +1,6 @@
 // What the menu choices that are not registry actions do (`menus.ts`
-// `MenuCommand`): pick a delivery frame, a track height, show or hide a panel.
+// `MenuCommand`): pick a delivery frame, a track height, show or hide a panel, move
+// a panel into a window of its own.
 // Shared with the timeline's own delivery picker, so a frame chosen from either
 // is chosen the same way.
 
@@ -7,6 +8,7 @@ import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { workspace } from './workspace.svelte';
+import { popout } from './popout.svelte';
 import { toast } from './notifications.svelte';
 import type { MenuCommand } from './menus';
 
@@ -35,6 +37,9 @@ export function runMenuCommand(c: MenuCommand): void {
 			break;
 		case 'panel':
 			workspace.toggle(c.panel);
+			break;
+		case 'detach':
+			popout.toggle(c.panel);
 			break;
 	}
 }

@@ -5,11 +5,18 @@
 	import { onMount } from 'svelte';
 	import { installSliderFill } from '$lib/slider-fill';
 	import { installErrorLogging } from '$lib/log';
+	import { isEmbeddedPopout } from '$lib/popout-boot';
 
 	let { children } = $props();
 
-	installErrorLogging();
-	onMount(() => installSliderFill());
+	// A page opened by another window is a detached panel's window that was answered
+	// with the app by mistake: it stays blank instead of starting a second editor.
+	const embedded = typeof window !== 'undefined' && isEmbeddedPopout(window);
+
+	if (!embedded) installErrorLogging();
+	onMount(() => {
+		if (!embedded) installSliderFill();
+	});
 </script>
 
 <svelte:head>
@@ -17,5 +24,7 @@
 	<title>Kerf</title>
 </svelte:head>
 
-{@render children()}
-<Toaster />
+{#if !embedded}
+	{@render children()}
+	<Toaster />
+{/if}

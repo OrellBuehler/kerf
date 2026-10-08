@@ -8,6 +8,9 @@
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
+	import { onWindow } from '$lib/window-events';
+	import { windows } from '$lib/windows.svelte';
+	import { resizeObserverFor, windowOf } from '$lib/realm';
 	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
@@ -199,16 +202,19 @@
 	$effect(() => {
 		const el = barEl;
 		if (!el) return;
+		// In whichever window the panel is: measured again when it moves to another.
+		void windows.version;
+		const win = windowOf(el);
 		const read = () => (barWidth = measuredWidth(el.clientWidth));
 		read();
-		const settled = requestAnimationFrame(read);
-		const observer = new ResizeObserver(read);
+		const settled = win.requestAnimationFrame(read);
+		const observer = resizeObserverFor(el, read);
 		observer.observe(el);
-		window.addEventListener('resize', read);
+		win.addEventListener('resize', read);
 		return () => {
-			cancelAnimationFrame(settled);
+			win.cancelAnimationFrame(settled);
 			observer.disconnect();
-			window.removeEventListener('resize', read);
+			win.removeEventListener('resize', read);
 		};
 	});
 
@@ -268,10 +274,18 @@
 	/** Something of the page is on top of the frame (a dialog, a menu): only the poll below can
 	 *  know, since the DOM does not say. Only a surface above the page is hurt by it. */
 	let covered = $state(false);
+	let rootEl = $state<HTMLElement | null>(null);
+	/** The panel is in a window of its own. The surface and the bounds it is told are the editor
+	 *  window's, so there the frame is the JPEG, as it is with the setting off. */
+	const detached = $derived.by(() => {
+		void windows.version;
+		return rootEl ? windowOf(rootEl) !== window : false;
+	});
 	const route = $derived(
 		routePreview({
 			enabled: settings.gpuPreview,
 			supported: gpuPreview.status?.supported ?? false,
+			detached,
 			overlaysCapable: gpuPreview.status?.overlays ?? false,
 			streaming,
 			empty,
@@ -291,7 +305,6 @@
 	/** The native surface is what is on show in the frame. */
 	const onSurface = $derived(routeVia === 'gpu' && surfaceShowing(route, gpuPreview.renderer) && gpuShown);
 
-	let rootEl = $state<HTMLElement | null>(null);
 	let frameEl = $state<HTMLElement | null>(null);
 	let matteEl = $state<HTMLElement | null>(null);
 	let backdropEl = $state<HTMLElement | null>(null);
@@ -344,14 +357,14 @@
 
 	/** The surface must not be on show (the GPU path failed outright): hide it now, whatever the route says. */
 	function hideSurface() {
-		if (!settings.gpuPreview || !frameEl) return;
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		wantedBounds = measure(false);
 		sendBounds.request();
 	}
 
 	/** Measure the frame and tell the backend (newest wins). */
 	function pushBounds() {
-		if (!settings.gpuPreview || !frameEl) return;
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		covered = frameCovered();
 		wantedBounds = measure(route.via === 'gpu');
 		sendBounds.request();
@@ -360,7 +373,9 @@
 	// The observers live as long as the frame does and the setting is on; what they report is read
 	// when they fire, so a change of route or theme does not tear them down.
 	$effect(() => {
-		if (!settings.gpuPreview || !frameEl) return;
+		// In a window of its own there is no surface to place; the run before this one, if there
+		// was one, reported the panel gone.
+		if (!settings.gpuPreview || !frameEl || detached) return;
 		const el = frameEl;
 		const update = () => pushBounds();
 		// Size changes are observed; position changes (a dock move, a scrolled pane, a window move,
@@ -631,19 +646,19 @@
 	}
 </script>
 
-<svelte:window
-	onkeydowncapture={(e) => {
-		// Abandoning a drag is all Escape does then — not also "clear the selection".
-		if (e.key === 'Escape' && tdrag && !tdrag.committing) {
-			cancelTitleDrag();
-			e.stopPropagation();
-		}
-	}}
-	onblur={cancelTitleDrag}
-/>
-
 <div
 	bind:this={rootEl}
+	{@attach onWindow({
+		// Abandoning a drag is all Escape does then — not also "clear the selection". These
+		// listen to the window the panel is in, which is a detached window's when it is in one.
+		keydowncapture: (e: KeyboardEvent) => {
+			if (e.key === 'Escape' && tdrag && !tdrag.committing) {
+				cancelTitleDrag();
+				e.stopPropagation();
+			}
+		},
+		blur: cancelTitleDrag
+	})}
 	style="flex:1;min-height:0;display:flex;flex-direction:column;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
 >
 	<div

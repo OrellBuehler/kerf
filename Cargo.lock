@@ -2359,6 +2359,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "gtk",
  "kerf-core",
  "kerf-gpu",
  "libloading 0.8.9",
@@ -2379,6 +2380,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "webkit2gtk",
  "x11rb",
 ]
 

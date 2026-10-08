@@ -27,6 +27,8 @@ const registered = new Set(
 	block
 		.split(',')
 		.map((s) => s.trim().replace(/^\/\/.*$/gm, '').trim())
+		// A command in its own module (`popout::popout_expect`) is registered by its name.
+		.map((s) => s.replace(/^(?:\w+::)+/, ''))
 		.filter(Boolean)
 );
 

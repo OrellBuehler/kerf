@@ -15,6 +15,7 @@
 
 mod gpu_preview;
 mod mcp;
+mod popout;
 mod settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2976,11 +2977,18 @@ pub fn run() {
             main_window_shown: main_window_shown.clone(),
             launch: Mutex::new(LaunchSlot::new(launch.clone())),
         })
+        .manage(popout::PopoutState::default())
+        .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
+            // The editor window is built here, not by Tauri from the config (`create:
+            // false` there): only a builder can carry the handler that lets a panel
+            // be detached into a window of its own. Otherwise exactly what the config
+            // says — hidden until the page has themed itself, see `show_main_window`.
+            popout::create_main_window(app)?;
             use_bundled_ffmpeg();
             // Before anything can spawn ffmpeg: how much of the machine it may take.
             // The previous run died during the GPU preview's first frame (a driver crash): it must not
@@ -3168,7 +3176,12 @@ pub fn run() {
             reveal_logs,
             log_frontend,
             show_main_window,
-            take_launch_project
+            take_launch_project,
+            popout::popout_expect,
+            popout::popout_cancel,
+            popout::close_popout,
+            popout::popout_focus,
+            popout::popout_move
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerf")
@@ -3558,6 +3571,12 @@ mod tests {
         let windows = conf["app"]["windows"].as_array().unwrap();
         let main = windows.iter().find(|w| w["label"] == "main").expect("a main window");
         assert_eq!(main["visible"], false, "the main window must be created hidden");
+        // …by `popout::create_main_window`, from this very entry: Tauri must not also create
+        // it, and a second window labelled `main` would be refused.
+        assert_eq!(
+            main["create"], false,
+            "the main window is built in code (popout.rs) so it can answer window.open"
+        );
         // Hidden shows the window's own backdrop in the moment before the page paints.
         assert!(main["backgroundColor"].as_str().is_some_and(|c| c.starts_with('#')));
 

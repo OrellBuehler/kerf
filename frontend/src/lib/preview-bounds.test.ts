@@ -116,6 +116,7 @@ describe('routePreview', () => {
 	const on: RouteInputs = {
 		enabled: true,
 		supported: true,
+		detached: false,
 		overlaysCapable: false,
 		streaming: false,
 		empty: false,
@@ -134,6 +135,17 @@ describe('routePreview', () => {
 
 	test('a platform without a surface technique is the JPEG', () => {
 		expect(routePreview({ ...on, supported: false })).toMatchObject({ via: 'jpeg', why: 'unsupported' });
+	});
+
+	test('a Preview in a window of its own is the JPEG: the surface is the editor window\'s', () => {
+		expect(routePreview({ ...on, detached: true })).toMatchObject({ via: 'jpeg', why: 'detached' });
+		// Even where the page could draw over a surface, and whatever else is true.
+		expect(routePreview({ ...on, detached: true, overlaysCapable: true }).via).toBe('jpeg');
+		// The setting and the platform are the more basic reasons.
+		expect(routePreview({ ...on, detached: true, enabled: false }).why).toBe('off');
+		expect(routePreview({ ...on, detached: true, supported: false }).why).toBe('unsupported');
+		// Docked again, it is a plain frame.
+		expect(routePreview({ ...on, detached: false })).toEqual({ via: 'gpu', overlays: false });
 	});
 
 	test('a plain frame goes to the GPU', () => {
@@ -159,7 +171,7 @@ describe('routePreview', () => {
 	});
 
 	test('every reason the route is the JPEG has a sentence for the status bar', () => {
-		for (const why of ['off', 'unsupported', 'streaming', 'empty', 'overlays', 'covered'] as const) {
+		for (const why of ['off', 'unsupported', 'detached', 'streaming', 'empty', 'overlays', 'covered'] as const) {
 			expect(describeWhy(why).length).toBeGreaterThan(10);
 		}
 	});

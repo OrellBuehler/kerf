@@ -24,6 +24,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { popout } from '$lib/popout.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { inTauri } from '$lib/api';
 	import { presetFor } from '$lib/delivery-formats';
@@ -72,6 +73,7 @@
 		),
 		workspace: workspace.shown,
 		openPanels: workspace.open,
+		detachedPanels: popout.detached,
 		desktop: inTauri()
 	});
 	const full = $derived(buildMenus(menuState));

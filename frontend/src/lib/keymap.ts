@@ -531,6 +531,15 @@ const ACTION_LIST = [
 		hint: 'Puts the panels of the workspace on screen back where its default has them, and its library tab.'
 	},
 	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces', group: 'window', context: 'global', defaults: [] },
+	{
+		id: 'window.dockAll',
+		repeat: false,
+		label: 'Return all panels to the editor window',
+		group: 'window',
+		context: 'global',
+		defaults: [],
+		hint: 'Closes every window a panel was moved into and puts the panels back where they came from.'
+	},
 
 	{
 		id: 'app.keyboard',

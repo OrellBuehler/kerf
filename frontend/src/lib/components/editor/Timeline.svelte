@@ -12,6 +12,9 @@
 	import { editor } from '$lib/state.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
+	import { documentOf, resizeObserverFor, windowOf } from '$lib/realm';
+	import { onWindow } from '$lib/window-events';
+	import { windows } from '$lib/windows.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import {
 		deleteSelection,
@@ -210,14 +213,19 @@
 		if (!v) return;
 		scrollX = v.el.scrollLeft;
 		viewW = v.viewW;
-		dpr = window.devicePixelRatio || 1;
+		// The pixel ratio of the window the timeline is in: a detached window may be on
+		// another screen.
+		dpr = windowOf(v.el).devicePixelRatio || 1;
 	}
 
 	$effect(() => {
 		const el = scroller;
 		if (!el) return;
+		// Re-run when the panel moves into a detached window (or back): the observer has
+		// to be that window's own, and the pixel ratio is read afresh.
+		void windows.version;
 		syncView();
-		const ro = new ResizeObserver(syncView);
+		const ro = resizeObserverFor(el, syncView);
 		ro.observe(el);
 		return () => ro.disconnect();
 	});
@@ -283,7 +291,7 @@
 	 *  click has no coordinates). */
 	function openHeightMenu(e: MouseEvent, t: Track) {
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), heightItems(t));
+		contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), heightItems(t), e.currentTarget as Node);
 	}
 
 	/** The height choices for one track, the current one ticked. */
@@ -442,7 +450,7 @@
 
 	function onTrimMove(e: PointerEvent) {
 		if (!trimDrag) return;
-		const lane = document.querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
+		const lane = documentOf(scroller).querySelector(`[data-lane][data-track-id="${trimDrag.trackId}"]`) as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		// Where the pointer says the edge is (it keeps the offset it grabbed it at),
 		// rounded once: that is the ghost, and the commit.
@@ -551,7 +559,8 @@
 				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
 				icon: p.id === delivery.id ? 'check' : undefined,
 				action: () => void setDeliveryPreset(p.id)
-			}))
+			})),
+			e.currentTarget as Node
 		);
 	}
 
@@ -637,7 +646,7 @@
 	}
 
 	function laneUnder(clientX: number, clientY: number): HTMLElement | null {
-		for (const el of document.elementsFromPoint(clientX, clientY)) {
+		for (const el of documentOf(scroller).elementsFromPoint(clientX, clientY)) {
 			if (el instanceof HTMLElement && el.dataset.lane !== undefined) return el;
 		}
 		return null;
@@ -769,7 +778,7 @@
 			trackId = lane.dataset.trackId!;
 			laneLeft = lane.getBoundingClientRect().left;
 		} else {
-			const cur = document.querySelector(`[data-lane][data-track-id="${trackId}"]`) as HTMLElement | null;
+			const cur = documentOf(scroller).querySelector(`[data-lane][data-track-id="${trackId}"]`) as HTMLElement | null;
 			laneLeft = cur?.getBoundingClientRect().left ?? 0;
 		}
 		// The grabbed clip is snapped and frame-quantized exactly as a lone clip is
@@ -981,7 +990,7 @@
 			tg = { ...g, moved };
 			return;
 		}
-		const lane = document.querySelector(`[data-lane][data-track-id="${g.trackId}"]`) as HTMLElement | null;
+		const lane = documentOf(scroller).querySelector(`[data-lane][data-track-id="${g.trackId}"]`) as HTMLElement | null;
 		const here = laneTime(e.clientX, lane?.getBoundingClientRect().left ?? 0);
 		// One rounding, from where the pointer is — never from the last frame's. A magnet
 		// within reach (the playhead, a beat, an edge not part of the edit) still wins.
@@ -1835,26 +1844,7 @@
 	}
 </script>
 
-<svelte:window
-	onpointermove={onPointerMove}
-	onpointerup={onPointerUp}
-	onpointercancel={onPointerCancel}
-	onblur={onWindowBlur}
-	onresize={syncView}
-	onkeyup={(e) => {
-		if (e.key === 'Alt') alt = false;
-	}}
-	onkeydowncapture={(e) => {
-		if (e.key === 'Alt') alt = true;
-		// Escape gives a clip, edge, title or marquee drag up without writing
-		// anything — and that is all it does: the page's Escape (clear the
-		// selection) must not also fire.
-		if (e.key === 'Escape' && (drag || trimDrag || titleDrag || marquee)) {
-			resetDragState();
-			e.stopPropagation();
-		}
-	}}
-/>
+
 
 {#snippet toolBtn(title: string, label: string, icon: string, on: boolean | null, click: () => void, off = false)}
 	<button
@@ -1874,6 +1864,29 @@
 {/snippet}
 
 <div
+	{@attach onWindow({
+		// The window the timeline is in, which is a detached window's when it is in one: a
+		// pointer move or release that ends a drag happens in *that* window and is never
+		// heard by a listener on the editor's.
+		pointermove: onPointerMove,
+		pointerup: onPointerUp,
+		pointercancel: onPointerCancel,
+		blur: onWindowBlur,
+		resize: syncView,
+		keyup: (e: KeyboardEvent) => {
+			if (e.key === 'Alt') alt = false;
+		},
+		keydowncapture: (e: KeyboardEvent) => {
+			if (e.key === 'Alt') alt = true;
+			// Escape gives a clip, edge, title or marquee drag up without writing
+			// anything — and that is all it does: the page's Escape (clear the
+			// selection) must not also fire.
+			if (e.key === 'Escape' && (drag || trimDrag || titleDrag || marquee)) {
+				resetDragState();
+				e.stopPropagation();
+			}
+		}
+	})}
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
 

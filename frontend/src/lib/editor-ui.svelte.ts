@@ -14,6 +14,7 @@ import {
 	transcriptionStatus
 } from './api';
 import { audio } from './audio';
+import { windows, type FrameHandle } from './windows.svelte';
 import { toast } from './notifications.svelte';
 import type { AnalysisProgress, CaptionStyle, CaptionTimeBase, Levels, TranscriptionStatus } from './types';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
@@ -146,7 +147,7 @@ class EditorUi {
 	/** System font family names available for the text overlay font picker. */
 	availableFonts = $state<string[]>([]);
 
-	#raf: number | null = null;
+	#raf: FrameHandle | null = null;
 
 	/** Measure the cut's loudness — the whole of it, or the in / out range when both
 	 *  marks are set (the export dialog's rule). A no-op while one is already running. */
@@ -410,15 +411,19 @@ class EditorUi {
 	play(rate = 1) {
 		if (this.playing && rate === this.rate) return;
 		if (rate < 0 && this.time <= 0) return; // nothing to shuttle back into
-		if (this.#raf) cancelAnimationFrame(this.#raf);
+		windows.cancelFrame(this.#raf);
 		if (rate > 0 && this.time >= editor.duration) this.time = 0;
 		this.playing = true;
 		this.rate = rate;
 		this.seekEpoch++;
 		this.#startAudio();
 		let last = performance.now();
-		const step = (now: number) => {
+		// Frames come from whichever window is showing (a detached preview may be the
+		// only one that is), whose timestamps count from its own start — so the clock
+		// read is this window's, always.
+		const step = () => {
 			if (!this.playing) return;
+			const now = performance.now();
 			// Follow the audio clock when it runs, so picture chases sound rather
 			// than the other way around; wall-clock otherwise (reverse shuttle,
 			// browser demo).
@@ -435,16 +440,16 @@ class EditorUi {
 				this.pause();
 				return;
 			}
-			this.#raf = requestAnimationFrame(step);
+			this.#raf = windows.requestFrame(step);
 		};
-		this.#raf = requestAnimationFrame(step);
+		this.#raf = windows.requestFrame(step);
 	}
 
 	pause() {
 		this.playing = false;
 		this.rate = 1;
 		audio.stop();
-		if (this.#raf) cancelAnimationFrame(this.#raf);
+		windows.cancelFrame(this.#raf);
 		this.#raf = null;
 	}
 

@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- The page a detached panel's window opens at (dockview's `popoutUrl`). Blank on
+     purpose: the panel is moved into it from the editor window, which keeps running
+     every line of script, so nothing is loaded here. It has to exist as a real file:
+     the app's static fallback would otherwise answer this path with `index.html` and a
+     second copy of the editor would start in the popout. Paints Kerf Dark like
+     `src/app.html`; the editor mirrors the live theme over it once the window is up. -->
+<html lang="en" class="dark" style="background: #0f1318; color-scheme: dark">
+	<head>
+		<meta charset="utf-8" />
+		<title>Kerf</title>
+	</head>
+	<body></body>
+</html>
