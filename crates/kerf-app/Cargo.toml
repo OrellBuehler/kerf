@@ -23,7 +23,7 @@ workspace = true
 [features]
 default = ["ffmpeg"]
 # Forward in-process FFmpeg support to kerf-core (probe / export).
-ffmpeg = ["kerf-core/ffmpeg"]
+ffmpeg = ["kerf-core/ffmpeg", "kerf-gpu/ffmpeg"]
 # Forward in-process speech-to-text (whisper.cpp) to kerf-core. Off by default:
 # it needs cmake, a C++ compiler and libclang at build time, whereas the
 # always-compiled fallback (FFmpeg's own `whisper` filter) needs nothing —
@@ -43,6 +43,7 @@ tauri-plugin-single-instance.workspace = true
 tauri-plugin-updater.workspace = true
 tauri-plugin-process.workspace = true
 kerf-core = { workspace = true }
+kerf-gpu = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -57,3 +58,10 @@ schemars.workspace = true
 axum.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["net"] }
+
+# The Linux GPU preview puts a child X11 window over the Preview panel (WebKitGTK cannot
+# show a surface under a transparent webview); x11rb makes the window, raw-window-handle
+# hands wgpu its handles.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+raw-window-handle.workspace = true
