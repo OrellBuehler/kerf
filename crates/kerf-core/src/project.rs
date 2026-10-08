@@ -194,6 +194,21 @@ fn trimmed_suffix(notes: &[String]) -> String {
     }
 }
 
+/// The project-meta key holding the ids of assets whose proxy the user deleted.
+const PROXY_DECLINED_KEY: &str = "proxy_declined";
+
+/// The file a preview decodes for `asset` under `mode` (pure apart from `ready`, which
+/// is only asked for when a proxy could be used): the ready proxy of an asset that has
+/// a picture, unless the mode is the original.
+fn resolve_preview_source(asset: &Asset, mode: crate::proxy::PreviewSource, ready: impl FnOnce() -> Option<PathBuf>) -> PathBuf {
+    if mode != crate::proxy::PreviewSource::Original && crate::proxy::needs_proxy(asset) {
+        if let Some(proxy) = ready() {
+            return proxy;
+        }
+    }
+    PathBuf::from(&asset.path)
+}
+
 impl Project {
     /// Create (or overwrite the schema of) a `.kerf` file on disk.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
@@ -704,13 +719,104 @@ impl Project {
     /// original. Falls back to the original whenever no proxy exists yet, so a
     /// preview never blocks waiting on generation.
     pub(crate) fn preview_source(asset: &Asset) -> PathBuf {
-        let has_video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
-        if has_video && !asset.is_image() {
-            if let Some(proxy) = engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection())) {
-                return proxy;
+        resolve_preview_source(asset, crate::proxy::effective_preview_source(), || {
+            engine::ready_proxy(Path::new(&asset.path), engine::proxy_width(asset.projection()))
+        })
+    }
+
+    // ---- proxies ------------------------------------------------------------
+
+    /// Whether the user deleted `asset_id`'s proxy on purpose (so it is not built
+    /// again by itself until they rebuild it). Kept in the project, a list of ids.
+    pub fn proxy_declined(&self, asset_id: Uuid) -> Result<bool> {
+        Ok(self.proxy_declined_ids()?.contains(&asset_id))
+    }
+
+    fn proxy_declined_ids(&self) -> Result<std::collections::HashSet<Uuid>> {
+        let stored = self.meta(PROXY_DECLINED_KEY)?.unwrap_or_default();
+        let ids: Vec<Uuid> = serde_json::from_str(&stored).unwrap_or_default();
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Record that the user does (or no longer does) want `asset_id` to go without a
+    /// proxy. Not an edit: no revision, and nothing in the cut moves.
+    pub fn set_proxy_declined(&self, asset_id: Uuid, declined: bool) -> Result<()> {
+        let mut ids = self.proxy_declined_ids()?;
+        if declined == ids.contains(&asset_id) {
+            return Ok(());
+        }
+        if declined {
+            ids.insert(asset_id);
+        } else {
+            ids.remove(&asset_id);
+        }
+        let mut ids: Vec<Uuid> = ids.into_iter().collect();
+        ids.sort();
+        self.set_meta(PROXY_DECLINED_KEY, &serde_json::to_string(&ids)?)
+    }
+
+    /// What every asset's proxy status is worked out from — resolved under the
+    /// project lock, then handed to [`crate::proxy::statuses`] with it released (the
+    /// status touches the disk and may run the cached `ffprobe`).
+    pub fn proxy_inputs(&self) -> Result<Vec<crate::proxy::ProxyInput>> {
+        let declined = self.proxy_declined_ids()?;
+        Ok(self
+            .list_assets()?
+            .into_iter()
+            .map(|asset| crate::proxy::ProxyInput {
+                declined: declined.contains(&asset.id),
+                asset,
+            })
+            .collect())
+    }
+
+    /// [`Project::proxy_inputs`] for one asset.
+    pub fn proxy_input(&self, asset_id: Uuid) -> Result<crate::proxy::ProxyInput> {
+        Ok(crate::proxy::ProxyInput {
+            asset: self.require_asset(asset_id)?,
+            declined: self.proxy_declined(asset_id)?,
+        })
+    }
+
+    /// The clips of the cut in `from..to` (to the end when `to` is `None`) that a
+    /// preview could not be made of yet, because the preview source is **Proxy only** and
+    /// their proxy is not ready. Empty under any other source. The GUI's preview
+    /// commands refuse to decode the original for these; an agent's reads do not ask.
+    pub fn proxy_waits(&self, from: f64, to: Option<f64>) -> Result<Vec<crate::proxy::ProxyWait>> {
+        self.proxy_waits_under(crate::proxy::effective_preview_source(), from, to)
+    }
+
+    fn proxy_waits_under(
+        &self,
+        source: crate::proxy::PreviewSource,
+        from: f64,
+        to: Option<f64>,
+    ) -> Result<Vec<crate::proxy::ProxyWait>> {
+        if source != crate::proxy::PreviewSource::ProxyOnly {
+            return Ok(Vec::new());
+        }
+        let timeline = self.working_timeline()?;
+        let mut wanted: Vec<Uuid> = Vec::new();
+        for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video) {
+            for clip in &track.clips {
+                let reaches = clip.timeline_end() > from && to.is_none_or(|to| clip.timeline_start <= to);
+                if reaches && !wanted.contains(&clip.asset_id) {
+                    wanted.push(clip.asset_id);
+                }
             }
         }
-        PathBuf::from(&asset.path)
+        let mut waits = Vec::new();
+        for id in wanted {
+            let input = self.proxy_input(id)?;
+            if crate::proxy::needs_proxy(&input.asset) && Self::preview_source(&input.asset) == Path::new(&input.asset.path) {
+                waits.push(crate::proxy::ProxyWait {
+                    asset_id: id,
+                    name: input.asset.name.clone(),
+                    status: crate::proxy::status(&input),
+                });
+            }
+        }
+        Ok(waits)
     }
 
     /// Build a `columns`×`rows` contact sheet of an asset — frames sampled evenly
@@ -5028,6 +5134,89 @@ mod tests {
         // preview never breaks or blocks on a proxy that hasn't landed yet.
         let asset = asset_with("/no-such-kerf-source.mp4", vec![vid_stream(false)]);
         assert_eq!(Project::preview_source(&asset), PathBuf::from(&asset.path));
+    }
+
+    #[test]
+    fn the_preview_source_setting_decides_whether_a_ready_proxy_is_used() {
+        use crate::proxy::PreviewSource;
+        let asset = asset_with("/kerf-source-setting.mp4", vec![vid_stream(false)]);
+        let ready = || Some(PathBuf::from("/cache/proxy.mp4"));
+        let original = PathBuf::from(&asset.path);
+        // Auto and Proxy only both decode a ready proxy; Original never asks for one.
+        assert_eq!(
+            resolve_preview_source(&asset, PreviewSource::Auto, ready),
+            PathBuf::from("/cache/proxy.mp4")
+        );
+        assert_eq!(
+            resolve_preview_source(&asset, PreviewSource::ProxyOnly, ready),
+            PathBuf::from("/cache/proxy.mp4")
+        );
+        assert_eq!(
+            resolve_preview_source(&asset, PreviewSource::Original, || panic!("a proxy was looked up")),
+            original
+        );
+        // No proxy yet: the original, which is what Proxy only then refuses (`proxy_waits`).
+        assert_eq!(resolve_preview_source(&asset, PreviewSource::Auto, || None), original);
+        // A still never has one.
+        let still = asset_with("/kerf-source-setting.png", vec![vid_stream(true)]);
+        assert_eq!(
+            resolve_preview_source(&still, PreviewSource::Auto, || panic!("a still has no proxy")),
+            PathBuf::from(&still.path)
+        );
+    }
+
+    #[test]
+    fn a_deleted_proxy_is_remembered_by_the_project_and_forgiven_by_a_rebuild() {
+        let project = Project::open_in_memory().unwrap();
+        let a = project
+            .insert_or_get_asset(&asset_with("/kerf-declined-a.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let b = project
+            .insert_or_get_asset(&asset_with("/kerf-declined-b.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        assert!(!project.proxy_declined(a.id).unwrap());
+        project.set_proxy_declined(a.id, true).unwrap();
+        project.set_proxy_declined(a.id, true).unwrap();
+        assert!(project.proxy_declined(a.id).unwrap());
+        assert!(!project.proxy_declined(b.id).unwrap(), "only the asset that was deleted");
+        let inputs = project.proxy_inputs().unwrap();
+        assert_eq!(inputs.iter().filter(|i| i.declined).count(), 1);
+        assert!(inputs.iter().any(|i| i.asset.id == a.id && i.declined));
+        project.set_proxy_declined(a.id, false).unwrap();
+        assert!(!project.proxy_declined(a.id).unwrap());
+        assert!(project.proxy_inputs().unwrap().iter().all(|i| !i.declined));
+    }
+
+    #[test]
+    fn proxy_only_waits_on_the_clips_in_range_that_have_no_proxy_and_nothing_else() {
+        use crate::proxy::{PreviewSource, ProxyPhase};
+        let project = Project::open_in_memory().unwrap();
+        let early = project
+            .insert_or_get_asset(&asset_with("/kerf-wait-early.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let mut late = asset_with("/kerf-wait-late.mp4", vec![vid_stream(false)]);
+        late.name = "late.mp4".into();
+        let late = project.insert_or_get_asset(&late).unwrap();
+        project.cut_clip(early.id, 0.0, 2.0).unwrap();
+        project.cut_clip(late.id, 0.0, 2.0).unwrap();
+        // Auto and Original never wait: they fall back to the original.
+        for source in [PreviewSource::Auto, PreviewSource::Original] {
+            assert!(project.proxy_waits_under(source, 0.0, None).unwrap().is_empty());
+        }
+        // Proxy only waits on every clip in the range whose proxy is not there.
+        let all = project.proxy_waits_under(PreviewSource::ProxyOnly, 0.0, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|w| w.status.state == ProxyPhase::Missing));
+        // A frame at 3 s is the second clip only (the first ends at 2 s).
+        let at = project.proxy_waits_under(PreviewSource::ProxyOnly, 3.0, Some(3.0)).unwrap();
+        assert_eq!(at.len(), 1);
+        assert_eq!(at[0].asset_id, late.id);
+        assert!(at[0].message().contains("late.mp4"), "{}", at[0].message());
+        // Nothing under the playhead, nothing to wait for.
+        assert!(project
+            .proxy_waits_under(PreviewSource::ProxyOnly, 9.0, Some(9.0))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

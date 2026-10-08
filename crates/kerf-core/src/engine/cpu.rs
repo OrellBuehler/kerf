@@ -13,7 +13,12 @@
 //! * **One heavy job at a time.** Every pass that reads a whole file (analysis,
 //!   transcription, proxy, stitch, export) takes [`lease`] first and waits its
 //!   turn. Interactive work — a scrubbed frame, a preview stream, a clip's audio
-//!   — never queues, so the UI stays live behind a running render.
+//!   — never queues, so the UI stays live behind a running render. The queue has
+//!   two lanes ([`Priority`]): a preview proxy jumps ahead of everything waiting
+//!   (and is registered the moment it is queued, [`reserve`], so analysis that
+//!   starts a heartbeat later still finds it in front), because a proxy is what
+//!   the preview is waiting for while analysis is only wanted eventually. A job
+//!   already running is never interrupted; the proxy goes next.
 //! * **A share of the cores for that job**, from [`cpu_percent`]: the thread caps
 //!   [`limit_args`] writes into the ffmpeg command line, plus below-normal
 //!   scheduling priority ([`background`]) so the rest of the desktop always
@@ -73,9 +78,7 @@ pub fn set_cpu_percent(percent: u8) -> u8 {
     let percent = clamp_percent(percent);
     PERCENT.store(percent, Ordering::Relaxed);
     // Wake anything queued so a raised budget is picked up promptly.
-    let gate = gate();
-    let _held = gate.busy.lock();
-    gate.free.notify_all();
+    gate().free.notify_all();
     percent
 }
 
@@ -102,17 +105,50 @@ fn limited() -> bool {
 
 // ---- the one-heavy-job-at-a-time gate --------------------------------------
 
+/// Which lane of the queue a heavy job waits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Analysis, transcription, stitching, export: wanted eventually, in order.
+    Normal,
+    /// A preview proxy: the preview is decoding the original until it lands, so it
+    /// goes before every `Normal` job that is waiting or arrives meanwhile.
+    High,
+}
+
+struct GateState {
+    busy: bool,
+    /// `High` jobs that have asked for the slot or [reserved](reserve) one and not
+    /// got it yet. While any exist, no `Normal` job takes the slot.
+    high: usize,
+    /// Tickets of the `Normal` jobs waiting, in arrival order: they take the slot
+    /// first-come first-served, so a long queue of analyses runs in the order it
+    /// was asked for rather than whichever thread the scheduler wakes.
+    normal: std::collections::VecDeque<u64>,
+    next_ticket: u64,
+}
+
 struct Gate {
-    busy: Mutex<bool>,
+    state: Mutex<GateState>,
     free: Condvar,
 }
 
 fn gate() -> &'static Gate {
     static GATE: OnceLock<Gate> = OnceLock::new();
     GATE.get_or_init(|| Gate {
-        busy: Mutex::new(false),
+        state: Mutex::new(GateState {
+            busy: false,
+            high: 0,
+            normal: std::collections::VecDeque::new(),
+            next_ticket: 0,
+        }),
         free: Condvar::new(),
     })
+}
+
+/// The gate's state, whether or not a panicking job poisoned it: a poisoned gate
+/// must not wedge every later job for the rest of the session.
+fn state(gate: &Gate) -> std::sync::MutexGuard<'_, GateState> {
+    gate.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 thread_local! {
@@ -143,11 +179,56 @@ impl Drop for Lease {
             return;
         }
         let gate = gate();
-        if let Ok(mut busy) = gate.busy.lock() {
-            *busy = false;
-            gate.free.notify_one();
+        state(gate).busy = false;
+        // Everyone re-checks: which waiter is next depends on the lanes, and a
+        // single wake-up could land on one that has to keep waiting.
+        gate.free.notify_all();
+    }
+}
+
+/// A queued `High` job's place in front of the `Normal` lane, held from the moment
+/// it is queued until it takes the slot (or is dropped, which gives the place up).
+///
+/// Without it a proxy would only outrank analysis once its worker thread had got
+/// as far as asking for the slot — after an ffprobe — by which time the analysis
+/// of the very file it was queued for had taken the slot first.
+#[must_use = "a dropped reservation gives its place up"]
+pub struct Reservation {
+    held: bool,
+}
+
+/// Put a `High` job in front of the `Normal` lane now, and take the slot with
+/// [`Reservation::lease`] when it is its turn.
+pub fn reserve() -> Reservation {
+    state(gate()).high += 1;
+    Reservation { held: true }
+}
+
+impl Reservation {
+    /// Wait for the slot and take it, ahead of every `Normal` job.
+    pub fn lease(mut self) -> Lease {
+        self.held = false;
+        lease_high(true)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.held {
+            let gate = gate();
+            let mut s = state(gate);
+            s.high = s.high.saturating_sub(1);
+            drop(s);
+            gate.free.notify_all();
         }
     }
+}
+
+/// Whether a `High` job is queued or waiting — what a `Normal` job that is about to
+/// ask for the slot would be made to wait behind. For saying so ("waiting for the
+/// preview proxy"); the gate itself never needs it.
+pub fn high_pending() -> bool {
+    state(gate()).high > 0
 }
 
 /// Wait for the heavy-job slot and take it.
@@ -157,30 +238,70 @@ impl Drop for Lease {
 /// decodes. Callers must not hold the project lock across this — the wait is
 /// unbounded by design (a queued job waits out the render ahead of it).
 pub fn lease() -> Lease {
+    lease_priority(Priority::Normal)
+}
+
+/// [`lease`] in the given lane.
+pub fn lease_priority(priority: Priority) -> Lease {
+    match priority {
+        Priority::Normal => lease_normal(),
+        Priority::High => lease_high(false),
+    }
+}
+
+/// A lease for a thread that already holds one: owns no slot, so it cannot wait.
+fn nested_lease() -> Option<Lease> {
     let depth = HELD.with(|h| h.get());
     HELD.with(|h| h.set(depth + 1));
-    if depth > 0 {
-        return Lease {
-            threads: budget_threads(),
-            nested: true,
-        };
+    (depth > 0).then(|| Lease {
+        threads: budget_threads(),
+        nested: true,
+    })
+}
+
+fn lease_normal() -> Lease {
+    if let Some(nested) = nested_lease() {
+        return nested;
     }
     let gate = gate();
-    match gate.busy.lock() {
-        Ok(mut busy) => {
-            while *busy {
-                busy = match gate.free.wait(busy) {
-                    Ok(g) => g,
-                    // A panicking job poisoned the gate; take the slot rather
-                    // than wedging every later job for the rest of the session.
-                    Err(e) => e.into_inner(),
-                };
-            }
-            *busy = true;
-        }
-        // Same: a poisoned mutex must not stop the engine working.
-        Err(e) => *e.into_inner() = true,
+    let mut s = state(gate);
+    let ticket = s.next_ticket;
+    s.next_ticket += 1;
+    s.normal.push_back(ticket);
+    while s.busy || s.high > 0 || s.normal.front() != Some(&ticket) {
+        s = gate.free.wait(s).unwrap_or_else(|e| e.into_inner());
     }
+    s.normal.pop_front();
+    s.busy = true;
+    drop(s);
+    Lease {
+        threads: budget_threads(),
+        nested: false,
+    }
+}
+
+/// `reserved`: the caller already counts in `high` (a [`Reservation`]).
+fn lease_high(reserved: bool) -> Lease {
+    let gate = gate();
+    if let Some(nested) = nested_lease() {
+        if reserved {
+            let mut s = state(gate);
+            s.high = s.high.saturating_sub(1);
+            drop(s);
+            gate.free.notify_all();
+        }
+        return nested;
+    }
+    let mut s = state(gate);
+    if !reserved {
+        s.high += 1;
+    }
+    while s.busy {
+        s = gate.free.wait(s).unwrap_or_else(|e| e.into_inner());
+    }
+    s.high = s.high.saturating_sub(1);
+    s.busy = true;
+    drop(s);
     Lease {
         threads: budget_threads(),
         nested: false,
@@ -456,6 +577,120 @@ mod tests {
         drop(inner);
         drop(outer);
         // The slot is free again once the outermost lease is dropped.
+        let _next = lease();
+    }
+
+    /// Run `f` on a thread, reporting `label` on `order` once it holds the lease and
+    /// releasing it straight away.
+    fn waiter(
+        label: &'static str,
+        priority: Priority,
+        order: &std::sync::Arc<Mutex<Vec<&'static str>>>,
+    ) -> std::thread::JoinHandle<()> {
+        let order = order.clone();
+        std::thread::spawn(move || {
+            let _lease = lease_priority(priority);
+            order.lock().unwrap().push(label);
+        })
+    }
+
+    /// How many `Normal` jobs are waiting for the slot.
+    fn queued_normal() -> usize {
+        state(gate()).normal.len()
+    }
+
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !ready() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_high_job_goes_before_normal_jobs_that_were_already_waiting() {
+        let _serial = exclusive();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let held = lease();
+        let a = waiter("analysis-1", Priority::Normal, &order);
+        wait_until("the first analysis to queue", || queued_normal() == 1);
+        let b = waiter("analysis-2", Priority::Normal, &order);
+        wait_until("the second analysis to queue", || queued_normal() == 2);
+        let proxy = waiter("proxy", Priority::High, &order);
+        wait_until("the proxy to queue", high_pending);
+        drop(held);
+        for t in [a, b, proxy] {
+            t.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), ["proxy", "analysis-1", "analysis-2"]);
+    }
+
+    #[test]
+    fn normal_jobs_take_the_slot_in_the_order_they_asked() {
+        let _serial = exclusive();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let held = lease();
+        let mut threads = Vec::new();
+        for (i, label) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            threads.push(waiter(label, Priority::Normal, &order));
+            wait_until("the waiter to queue", || queued_normal() == i + 1);
+        }
+        drop(held);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_reservation_keeps_normal_jobs_out_before_its_thread_has_asked() {
+        let _serial = exclusive();
+        // The slot is free, but a proxy is queued: an analysis that starts now must
+        // not slip in ahead of it just because the proxy's worker is still probing.
+        let reservation = reserve();
+        assert!(high_pending());
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let analysis = waiter("analysis", Priority::Normal, &order);
+        wait_until("the analysis to queue", || queued_normal() == 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(order.lock().unwrap().is_empty(), "the analysis ran ahead of a queued proxy");
+        let proxy = reservation.lease();
+        order.lock().unwrap().push("proxy");
+        // …and it does not run beside the proxy either: one heavy job at a time.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(*order.lock().unwrap(), ["proxy"]);
+        drop(proxy);
+        analysis.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["proxy", "analysis"]);
+        assert!(!high_pending());
+    }
+
+    #[test]
+    fn a_dropped_reservation_lets_the_queue_move() {
+        let _serial = exclusive();
+        let reservation = reserve();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let analysis = waiter("analysis", Priority::Normal, &order);
+        wait_until("the analysis to queue", || queued_normal() == 1);
+        drop(reservation);
+        analysis.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["analysis"]);
+        assert!(!high_pending());
+    }
+
+    #[test]
+    fn a_high_lease_inside_a_lease_does_not_wait_for_itself() {
+        let _serial = exclusive();
+        let outer = lease();
+        // A proxy made inside a leased job (an import that stitches, then proxies).
+        let inner = reserve().lease();
+        assert_eq!(inner.threads(), outer.threads());
+        assert!(!high_pending(), "the reservation was spent");
+        drop(inner);
+        drop(outer);
         let _next = lease();
     }
 }

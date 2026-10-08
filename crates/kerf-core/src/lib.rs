@@ -18,6 +18,7 @@ pub mod plan_caps;
 pub mod planner;
 pub mod platform;
 pub mod project;
+pub mod proxy;
 pub mod render_plan;
 
 mod engine;
@@ -37,7 +38,8 @@ pub use captions_import::{
 };
 pub use clip_timing::{FadeEdge, FadeStep, FadeTint, MotionKeys, Rational};
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
+    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, high_pending as proxy_jobs_pending, set_cpu_percent,
+    DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
     composite_color_policy, contact_sheet_times, decode_hwaccel, disable_decode_hwaccel, download_speech_model, export_seek_arg,
@@ -71,6 +73,7 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
     PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
