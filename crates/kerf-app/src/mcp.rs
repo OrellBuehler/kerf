@@ -18,7 +18,7 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
     EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, ReframeKeyframe, Region, SplitSide,
-    StreamKind, TextKeyframe, Transition, TransitionKind, VideoEffect,
+    StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -560,6 +560,34 @@ struct SetTrackPanParams {
     track_id: String,
     #[schemars(description = "Stereo placement: -1 hard left, 0 centre, 1 hard right")]
     pan: f32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMasterVolumeParams {
+    #[schemars(
+        description = "Master fader as a linear gain on the finished mix: 1.0 is unity, 0.5 is -6 dB, 0 is silent. Clamped to 0..4 (+12 dB)"
+    )]
+    volume: f64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMasterLimiterParams {
+    #[schemars(description = "true switches the limiter on, false switches it off")]
+    enabled: bool,
+    #[schemars(
+        description = "Where the limiter stops the signal, in dBFS: -1.5 keeps the mix a decibel and a half under full scale. Clamped to -24..0. Omit to keep the current ceiling (-1.5 until one is chosen)"
+    )]
+    ceiling_db: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetLevelsParams {
+    #[schemars(description = "Measure only this span of the cut, {start, end} in timeline seconds. Omit for the whole cut")]
+    range: Option<TimeRange>,
+    #[schemars(
+        description = "Measure the mix as an export with loudnorm=true would write it (default false: the mix as it stands, which is what tells you whether to turn loudnorm on)"
+    )]
+    loudnorm: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1711,6 +1739,38 @@ impl KerfMcp {
         self.edit(|project| {
             let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
             json(&track)
+        })
+    }
+
+    #[tool(
+        description = "Set the master fader — one linear gain on the finished mix, after every track and the duck \
+                       bus and before loudnorm. Use it to bring the whole cut down (or up) without touching a \
+                       track: when get_levels says the mix is hot, this and set_master_limiter are the fixes, and \
+                       a quiet cut is raised here or by exporting with loudnorm. Clamped to 0..4 (+12 dB). \
+                       Returns the master bus."
+    )]
+    fn set_master_volume(&self, Parameters(p): Parameters<SetMasterVolumeParams>) -> Result<String, McpError> {
+        self.edit(|project| {
+            let master = project.set_master_volume(p.volume).map_err(core_err)?;
+            json(&master)
+        })
+    }
+
+    #[tool(
+        description = "Switch the master limiter on or off, optionally moving its ceiling (dBFS, default -1.5). A \
+                       lookahead limiter on the finished mix that holds the loudest peaks under the ceiling \
+                       instead of letting them clip — turn it on for a cut destined for a platform, which asks for \
+                       a true peak under -1 dBTP. It is a sample-peak ceiling: the true peak between samples can \
+                       read above it (up to about 1 dB on a pure high tone), which is why the default sits half a \
+                       decibel under that line. Confirm the true peak with get_levels, and if it is still over \
+                       -1 dBTP with the limiter on, lower the ceiling by the overshoot plus half a decibel (the \
+                       notes say to what) instead of switching it on again. A limiter has nothing to do on a mix \
+                       already under its ceiling and leaves it alone. Returns the master bus."
+    )]
+    fn set_master_limiter(&self, Parameters(p): Parameters<SetMasterLimiterParams>) -> Result<String, McpError> {
+        self.edit(|project| {
+            let master = project.set_master_limiter(p.enabled, p.ceiling_db).map_err(core_err)?;
+            json(&master)
         })
     }
 
@@ -3043,6 +3103,40 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Measure how loud the cut is: the integrated loudness (LUFS), loudness range (LU), \
+                       short-term maximum (LUFS), sample peak (dBFS) and true peak (dBTP), for the mix and \
+                       for each track that feeds it, in one pass over the audio the \
+                       export would render (so the master reading includes the master fader and limiter, and \
+                       loudnorm when asked for). A track's reading is its strip: after its fader and pan, before \
+                       the duck bus and the master. Platforms play social video at about -14 LUFS and ask for a \
+                       true peak under -1 dBTP; `notes` says in words what is off and which tool fixes it \
+                       (set_master_volume, set_master_limiter, set_track_volume, or exporting with loudnorm). \
+                       Run it before you report a cut finished. A muted track is `heard: false` with no level, \
+                       and a value of null means there was nothing to measure (silence; a short-term maximum \
+                       needs a span of 3 seconds). It reads the whole span, so it takes a few seconds for a long \
+                       cut; cancel the request to stop it. Reads the cut you are proposing, staged edits included."
+    )]
+    async fn get_levels(
+        &self,
+        Parameters(p): Parameters<GetLevelsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let levels = blocking(move || {
+            // Resolve under the lock, run ffmpeg over the whole span with it
+            // released — a long cut takes seconds and must not stall the GUI.
+            let (timeline, assets) = lock_agent(&project).levels_inputs().map_err(core_err)?;
+            Project::measure_levels(&timeline, &assets, p.range, p.loudnorm.unwrap_or(false), &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(core_err)
+        })
+        .await?;
+        json(&levels)
+    }
+
+    #[tool(
         description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
     )]
     async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
@@ -3314,33 +3408,9 @@ fn server_identity() -> Implementation {
     Implementation::new("kerf", env!("CARGO_PKG_VERSION"))
 }
 
-#[tool_handler(router = router())]
-impl ServerHandler for KerfMcp {
-    /// The `#[tool_handler]` default, plus the one place every failing tool
-    /// call — whichever helper built the error — reaches the logfile.
-    async fn call_tool(
-        &self,
-        request: rmcp::model::CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResponse, McpError> {
-        let tool = request.name.to_string();
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = router().call(tcc).await;
-        if let Err(e) = &result {
-            log_tool_error(&tool, e);
-        }
-        result
-    }
-
-    fn get_info(&self) -> ServerConfig {
-        // `initialize` is the one moment we know an agent is on the other end
-        // of the socket, so it counts as being seen even before it calls a tool.
-        note_agent_activity();
-        let mut info = ServerConfig::default();
-        info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(
-            "Kerf MCP server. The user queues editing tasks in the desktop app; \
+/// What the server tells a client about itself and how to work (the MCP
+/// `instructions`): the workflow an agent cannot infer from the tool list.
+const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in the desktop app; \
              call claim_next_task to take the oldest one (or list_tasks to see \
              the whole queue). To work a task, inspect loaded media with \
              list_assets / get_asset_metadata / get_timeline_state (import_asset \
@@ -3467,13 +3537,42 @@ impl ServerHandler for KerfMcp {
              platform_check: it says whether the length and frame shape suit \
              where it is going, including the reach limits a platform enforces \
              silently (a Reel over 3 minutes uploads fine and then reaches only \
-             existing followers). Call export to render, and export_cover to \
+             existing followers). For a cut going to social, also run get_levels: \
+             platforms play at about -14 LUFS and want a true peak under -1 dBTP, \
+             so check it, then fix a hot mix with set_master_volume / \
+             set_master_limiter or export with loudnorm (which normalises to \
+             -14 LUFS). Call export to render, and export_cover to \
              write the thumbnail the platform shows before anyone presses play. \
              export / export_srt / export_cover / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
-             already there unless you pass overwrite=true."
-                .to_string(),
-        );
+             already there unless you pass overwrite=true.";
+
+#[tool_handler(router = router())]
+impl ServerHandler for KerfMcp {
+    /// The `#[tool_handler]` default, plus the one place every failing tool
+    /// call — whichever helper built the error — reaches the logfile.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = router().call(tcc).await;
+        if let Err(e) = &result {
+            log_tool_error(&tool, e);
+        }
+        result
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        // `initialize` is the one moment we know an agent is on the other end
+        // of the socket, so it counts as being seen even before it calls a tool.
+        note_agent_activity();
+        let mut info = ServerConfig::default();
+        info.server_info = server_identity();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.instructions = Some(INSTRUCTIONS.to_string());
         info
     }
 }
@@ -4370,6 +4469,73 @@ mod tests {
             .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         assert_eq!(required, ["output_path"], "options and overwrite are optional");
+    }
+
+    /// The mixer's three tools: the master fader and limiter are staged edits like
+    /// any other, and `get_levels` is a read that takes a `RequestContext` (so a
+    /// long measurement can be cancelled) which must stay out of its schema.
+    #[test]
+    fn the_master_and_levels_tools_are_on_the_surface() {
+        let tools = router().list_all();
+        let schema = |name: &str| {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let mut properties: Vec<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default();
+            properties.sort();
+            let required: Vec<String> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            (properties, required)
+        };
+        assert_eq!(
+            schema("set_master_volume"),
+            (vec!["volume".to_string()], vec!["volume".to_string()])
+        );
+        assert_eq!(
+            schema("set_master_limiter"),
+            (
+                vec!["ceiling_db".to_string(), "enabled".to_string()],
+                vec!["enabled".to_string()]
+            )
+        );
+        // Both optional, and no request context leaking into the schema.
+        assert_eq!(
+            schema("get_levels"),
+            (vec!["loudnorm".to_string(), "range".to_string()], Vec::<String>::new())
+        );
+    }
+
+    /// The words an agent reads have to name the ceiling the engine actually defaults to
+    /// (it moved from -1 to -1.5 dBFS once the limiter was measured to overshoot).
+    #[test]
+    fn the_limiter_tool_names_the_default_ceiling_it_really_has() {
+        let default = format!("{}", kerf_core::MASTER_DEFAULT_CEILING_DB);
+        let tools = router().list_all();
+        let limiter = tools.iter().find(|t| t.name == "set_master_limiter").expect("registered");
+        let text = limiter.description.as_deref().unwrap_or_default();
+        assert!(text.contains(&format!("default {default}")), "{text}");
+        let param = limiter.input_schema["properties"]["ceiling_db"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(param.contains(&format!("({default} until")), "{param}");
+    }
+
+    #[test]
+    fn the_server_instructions_send_a_social_cut_through_get_levels() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.contains("get_levels"), "{text}");
+        assert!(text.contains("-14 LUFS") && text.contains("loudnorm"), "{text}");
+        assert!(text.contains("set_master_limiter"), "{text}");
     }
 
     /// An agent with no way to load media can only rearrange what it was handed.

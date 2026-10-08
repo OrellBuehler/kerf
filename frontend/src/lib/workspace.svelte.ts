@@ -15,9 +15,10 @@ import { layoutFor, shouldPersistLayout, type WorkspaceId } from './workspaces';
 import { settings } from './settings.svelte';
 
 /** Where a panel opens when it is brought back from the Panels menu: the
- *  library on the preview's left and the deliver panel on its right — that is
- *  where the presets put them — everything else beside whatever is active. */
-const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'left', deliver: 'right' };
+ *  library on the preview's left and the deliver panel and the mixer on its
+ *  right — that is where the presets put them — everything else beside whatever
+ *  is active. */
+const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'left', deliver: 'right', mixer: 'right' };
 
 /** How long after the last layout change the arrangement is written. */
 const SAVE_DELAY_MS = 500;

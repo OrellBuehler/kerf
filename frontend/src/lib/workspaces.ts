@@ -71,7 +71,7 @@ export interface WorkspaceSpec {
 export const WORKSPACE_SPECS: WorkspaceSpec[] = [
 	{ id: 'edit', label: 'Edit', hint: 'Cut and arrange — library, preview, inspector and a full-width timeline', libraryTab: 'media' },
 	{ id: 'color', label: 'Color', hint: 'Grade the picture — the preview as large as it gets, controls beside it', libraryTab: 'effects' },
-	{ id: 'audio', label: 'Audio', hint: 'Work on sound — a tall timeline for the waveforms', libraryTab: 'audio' },
+	{ id: 'audio', label: 'Audio', hint: 'Work on sound — the mixer beside the picture, the timeline under it for the waveforms', libraryTab: 'audio' },
 	{ id: 'motion', label: 'Motion', hint: 'Titles, transitions and keyframes — preview, a wide inspector and the timeline', libraryTab: 'transitions' },
 	{ id: 'deliver', label: 'Deliver', hint: 'Check where the cut is going and export it', libraryTab: 'media' }
 ];

@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Mask,
-    Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, Timeline,
-    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
+    Mask, Project, Projection, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task, TextKeyframe, TimeRange,
+    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -40,6 +40,9 @@ struct AppState {
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
     analysis_cancel: Arc<AtomicBool>,
+    /// Same, for the Mixer's loudness measurement. It holds the heavy-job lease for
+    /// a whole-mix decode (minutes on a long cut), so it has to be stoppable.
+    levels_cancel: Arc<AtomicBool>,
     /// Same, for a voiceover being synthesized (or its model downloading).
     voiceover_cancel: Arc<AtomicBool>,
     /// Whether the main window has been shown. It is created hidden (`visible:
@@ -864,6 +867,60 @@ fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdR
     let project = state.project();
     project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Set the master fader — the linear gain on the finished mix, after every
+/// track and the duck bus and before loudness normalisation.
+#[tauri::command(async)]
+fn set_master_volume(state: State<'_, AppState>, volume: f64) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_volume(volume).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Switch the master limiter on or off, optionally moving its ceiling (dBFS).
+/// Omitting `ceiling_db` keeps the one it had.
+#[tauri::command(async)]
+fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Option<f64>) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_limiter(enabled, ceiling_db).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Measure how loud the cut is — the finished mix and each track — in one pass
+/// over the audio the export would render. Whole-file work, so it resolves its
+/// inputs under the project lock and runs ffmpeg with it released. `range` is a
+/// `{start, end}` span of the cut (default all of it); `loudnorm` measures the
+/// mix as an export with normalisation on would write it. `cancel_levels` stops
+/// the pass, which then rejects with `"levels cancelled"`.
+#[tauri::command]
+async fn get_levels(state: State<'_, AppState>, range: Option<TimeRange>, loudnorm: Option<bool>) -> CmdResult<Levels> {
+    let shared = state.project.clone();
+    // Fresh cancel flag for this pass; `cancel_levels` flips it from the UI.
+    let cancel = state.levels_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).levels_inputs().map_err(|e| e.to_string())?;
+        Project::measure_levels(&timeline, &assets, range, loudnorm.unwrap_or(false), &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map_err(|e| match e {
+            kerf_core::Error::Cancelled => LEVELS_CANCELLED.to_string(),
+            other => other.to_string(),
+        })
+    })
+    .await
+}
+
+/// The error a stopped measurement returns, for the webview to stay quiet on.
+const LEVELS_CANCELLED: &str = "levels cancelled";
+
+/// Request cancellation of the loudness measurement in flight (if any). The running
+/// [`get_levels`] polls the flag while ffmpeg works, kills it and rejects with
+/// `"levels cancelled"`.
+#[tauri::command(async)]
+fn cancel_levels(state: State<'_, AppState>) {
+    state.levels_cancel.store(true, Ordering::SeqCst);
 }
 
 /// Set the frame the project is cut for, or clear it back to the source shape.
@@ -2803,6 +2860,7 @@ pub fn run() {
             project: project.clone(),
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            levels_cancel: Arc::new(AtomicBool::new(false)),
             voiceover_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
             launch: Mutex::new(LaunchSlot::new(launch.clone())),
@@ -2884,6 +2942,10 @@ pub fn run() {
             set_track_duck,
             set_track_volume,
             set_track_pan,
+            set_master_volume,
+            set_master_limiter,
+            get_levels,
+            cancel_levels,
             set_delivery_format,
             set_track_muted,
             set_track_solo,

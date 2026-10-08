@@ -61,6 +61,7 @@ fn timeline_of(clips: Vec<Clip>) -> Timeline {
         overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
+        master: Default::default(),
     }
 }
 

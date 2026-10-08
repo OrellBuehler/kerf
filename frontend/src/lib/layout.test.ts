@@ -58,7 +58,7 @@ describe('presets', () => {
 		expect(root.data[0].type).toBe('branch');
 	});
 
-	test('every panel but the deliver one is reachable in Edit, the agent beside the inspector', () => {
+	test('every panel but the deliver and mixer ones is open in Edit, the agent beside the inspector', () => {
 		expect(openPanelIds(PRESET_LAYOUTS.edit).sort()).toEqual(['agent', 'inspector', 'library', 'preview', 'timeline']);
 		expect(group(PRESET_LAYOUTS.edit, 'inspector').views).toEqual(['inspector', 'agent']);
 	});
@@ -66,6 +66,14 @@ describe('presets', () => {
 	test('Deliver docks the deliver panel beside the preview', () => {
 		expect(openPanelIds(PRESET_LAYOUTS.deliver).sort()).toEqual(['agent', 'deliver', 'preview', 'timeline']);
 		expect(group(PRESET_LAYOUTS.deliver, 'deliver').views).toEqual(['deliver', 'agent']);
+	});
+
+	test('Audio docks the mixer between the preview and the inspector, and no other workspace opens it', () => {
+		expect(openPanelIds(PRESET_LAYOUTS.audio).sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'timeline']);
+		expect(group(PRESET_LAYOUTS.audio, 'mixer').views).toEqual(['mixer']);
+		const row = (PRESET_LAYOUTS.audio.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'mixer', 'inspector']);
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(viewsOf(PRESET_LAYOUTS[id])).not.toContain('mixer');
 	});
 
 	test('the agent is one tab away in every workspace', () => {
@@ -84,6 +92,13 @@ describe('the registry', () => {
 		for (const id of PANEL_IDS) expect(PANELS[id].title.length).toBeGreaterThan(0);
 		expect(PANELS.library.minimumWidth).toBe(LIBRARY_RAIL_WIDTH);
 		expect(PANELS.deliver.minimumWidth).toBeGreaterThan(0);
+	});
+
+	test('the mixer has a title and a minimum a strip and the master fit in', () => {
+		expect(PANELS.mixer.title).toBe('Mixer');
+		expect(PANELS.mixer.minimumWidth).toBeGreaterThanOrEqual(340);
+		expect(PANELS.mixer.minimumHeight).toBeGreaterThanOrEqual(200);
+		expect(PANELS.mixer.defaultWidth).toBeGreaterThan(PANELS.mixer.minimumWidth!);
 	});
 
 	test('the retired media and transcript panels are gone', () => {

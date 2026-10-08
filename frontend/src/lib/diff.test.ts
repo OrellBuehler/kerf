@@ -68,6 +68,7 @@ describe('polarity', () => {
 		expect(polarity('track_removed')).toBe('removed');
 		expect(polarity('clip_retrimmed')).toBe('changed');
 		expect(polarity('format_changed')).toBe('changed');
+		expect(polarity('master_changed')).toBe('changed');
 	});
 });
 
@@ -76,5 +77,10 @@ describe('groupEntries', () => {
 		const groups = groupEntries([entry('clip_added'), entry('overlay_added'), entry('clip_moved')]);
 		expect(groups.map((g) => g.label)).toEqual(['Clips', 'Text']);
 		expect(groups[0].entries).toHaveLength(2);
+	});
+
+	test('a master-bus change is the mix, not the delivery frame', () => {
+		const groups = groupEntries([entry('format_changed'), entry('master_changed'), entry('track_changed')]);
+		expect(groups.map((g) => g.label)).toEqual(['Tracks', 'Mix', 'Delivery']);
 	});
 });

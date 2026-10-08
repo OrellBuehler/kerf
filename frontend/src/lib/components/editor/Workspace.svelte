@@ -12,6 +12,7 @@
 	import Inspector from './Inspector.svelte';
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
+	import Mixer from './Mixer.svelte';
 	import type { PanelId } from '$lib/layout';
 	import { workspace } from '$lib/workspace.svelte';
 
@@ -21,7 +22,8 @@
 		timeline: Timeline,
 		inspector: Inspector,
 		agent: AgentPanel,
-		deliver: DeliverPanel
+		deliver: DeliverPanel,
+		mixer: Mixer
 	};
 
 	let el = $state<HTMLDivElement | null>(null);
