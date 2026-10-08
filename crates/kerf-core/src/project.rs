@@ -628,17 +628,53 @@ impl Project {
         }
     }
 
-    /// Run silence + scene detection (and, with the `whisper` feature and a
-    /// `KERF_WHISPER_MODEL` model, transcription) against an asset's media file,
-    /// cache the result, and return it.
+    /// Fold the results of some analysis steps — an [`crate::analysis::StepsRun::patch`]
+    /// — into what is cached for the asset, leaving every other kind as it was, and
+    /// return the merged analysis. A patch that ran nothing changes nothing.
+    pub fn merge_analysis(&self, patch: &AssetAnalysis) -> Result<AssetAnalysis> {
+        let mut analysis = self.get_analysis(patch.asset_id)?.unwrap_or_else(|| AssetAnalysis {
+            asset_id: patch.asset_id,
+            ..AssetAnalysis::default()
+        });
+        if !patch.ran.is_empty() {
+            analysis.merge(patch);
+            self.set_analysis(&analysis)?;
+        }
+        Ok(analysis)
+    }
+
+    /// Which analyses have run for an asset, which are running, failed or are switched off.
+    pub fn analysis_status(&self, asset_id: Uuid) -> Result<crate::analysis::AnalysisStatus> {
+        Ok(crate::analysis::analysis_status(
+            asset_id,
+            self.get_analysis(asset_id)?.as_ref(),
+        ))
+    }
+
+    /// [`Project::analysis_status`] of every asset.
+    pub fn analysis_statuses(&self) -> Result<Vec<crate::analysis::AnalysisStatus>> {
+        self.list_assets()?.iter().map(|a| self.analysis_status(a.id)).collect()
+    }
+
+    /// Run the default analysis steps against an asset's media file, cache the result
+    /// (merged into what is already there) and return it.
     pub fn analyze_asset(&self, asset_id: Uuid) -> Result<AssetAnalysis> {
         let asset = self.require_asset(asset_id)?;
-        // The heavy ffmpeg work lives in `analysis::analyze_asset_media`, a free
+        // The heavy ffmpeg work lives in `analysis::analyze_asset_steps`, a free
         // function — so the GUI/MCP adapters can run it without holding the
-        // shared Project lock and then re-lock only for the quick `set_analysis`.
-        let analysis = crate::analysis::analyze_asset_media(&asset)?;
-        self.set_analysis(&analysis)?;
-        Ok(analysis)
+        // shared Project lock and then re-lock only for the quick `merge_analysis`.
+        let run = crate::analysis::analyze_asset_steps(&asset, None, &mut |_| {}, crate::analysis::NEVER_CANCEL);
+        let cancelled = run.cancelled;
+        self.merge_analysis(&run.patch)?;
+        if cancelled {
+            return Err(Error::Cancelled);
+        }
+        let failure = run.failure_summary();
+        let analysis = self.get_analysis(asset_id)?.unwrap_or_default();
+        match failure {
+            Some(why) if run.patch.ran.is_empty() => Err(Error::Engine(why)),
+            _ => Ok(analysis),
+        }
     }
 
     // ---- media extraction (preview frames, waveforms) ---------------------
@@ -3592,6 +3628,7 @@ impl Project {
                 class: crate::model::AudioClass::Speech,
                 confidence: 0.71,
             }),
+            ran: crate::model::AnalysisKind::ALL.to_vec(),
         })?;
 
         // A small starter timeline: an interview cut followed by some b-roll.
@@ -4464,7 +4501,12 @@ impl Project {
                 asset_id: asset.id,
                 ..AssetAnalysis::default()
             });
-            analysis.transcript = voiceover.segments.clone();
+            analysis.merge(&AssetAnalysis {
+                asset_id: asset.id,
+                transcript: voiceover.segments.clone(),
+                ran: vec![crate::model::AnalysisKind::Transcript],
+                ..AssetAnalysis::default()
+            });
             self.set_analysis(&analysis)?;
         }
         let clip = self.edit_timeline("Add voiceover", |timeline| {
@@ -5134,6 +5176,45 @@ mod tests {
         // preview never breaks or blocks on a proxy that hasn't landed yet.
         let asset = asset_with("/no-such-kerf-source.mp4", vec![vid_stream(false)]);
         assert_eq!(Project::preview_source(&asset), PathBuf::from(&asset.path));
+    }
+
+    #[test]
+    fn merging_an_analysis_patch_keeps_the_kinds_it_did_not_run() {
+        use crate::model::AnalysisKind;
+        let project = Project::open_in_memory().unwrap();
+        let asset = project
+            .insert_or_get_asset(&asset_with("/kerf-merge-analysis.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        // Nothing cached yet: a patch that ran nothing caches nothing.
+        let empty = AssetAnalysis {
+            asset_id: asset.id,
+            ..AssetAnalysis::default()
+        };
+        project.merge_analysis(&empty).unwrap();
+        assert!(project.get_analysis(asset.id).unwrap().is_none());
+
+        let silence = AssetAnalysis {
+            asset_id: asset.id,
+            silence_segments: vec![TimeRange { start: 1.0, end: 2.0 }],
+            ran: vec![AnalysisKind::Silence],
+            ..AssetAnalysis::default()
+        };
+        project.merge_analysis(&silence).unwrap();
+        let scenes = AssetAnalysis {
+            asset_id: asset.id,
+            scene_changes: vec![4.0],
+            ran: vec![AnalysisKind::Scenes],
+            ..AssetAnalysis::default()
+        };
+        let merged = project.merge_analysis(&scenes).unwrap();
+        assert_eq!(merged.done_kinds(), [AnalysisKind::Silence, AnalysisKind::Scenes]);
+        let stored = project.get_analysis(asset.id).unwrap().unwrap();
+        assert_eq!(stored.silence_segments.len(), 1, "the first patch survived the second");
+        assert_eq!(stored.scene_changes, [4.0]);
+        let status = project.analysis_status(asset.id).unwrap();
+        assert_eq!(status.kinds.len(), 5);
+        assert_eq!(status.kinds[0].state, crate::analysis::AnalysisState::Done);
+        assert_eq!(project.analysis_statuses().unwrap().len(), 1);
     }
 
     #[test]

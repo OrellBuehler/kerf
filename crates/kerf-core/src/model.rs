@@ -699,6 +699,83 @@ pub struct Rhythm {
     pub audio_class: Option<AudioClassification>,
 }
 
+/// One kind of analysis an asset can have: each is a step of its own, can be run alone
+/// and is cached independently (see [`AssetAnalysis::ran`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisKind {
+    /// Silent spans (`silence_segments`).
+    Silence,
+    /// Scene changes (`scene_changes`).
+    Scenes,
+    /// EBU R128 loudness (`loudness`).
+    Loudness,
+    /// Onsets, tempo and the speech/music class (`onsets`, `tempo`, `audio_class`).
+    Rhythm,
+    /// Speech-to-text (`transcript`).
+    #[serde(alias = "transcription", alias = "transcribe")]
+    Transcript,
+}
+
+impl AnalysisKind {
+    /// Every kind, in the order a pass runs them: the cheap ones the timeline draws
+    /// first, transcription — by far the slowest — last.
+    pub const ALL: [AnalysisKind; 5] = [
+        AnalysisKind::Silence,
+        AnalysisKind::Scenes,
+        AnalysisKind::Loudness,
+        AnalysisKind::Rhythm,
+        AnalysisKind::Transcript,
+    ];
+
+    /// The wire name (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`).
+    pub fn name(self) -> &'static str {
+        match self {
+            AnalysisKind::Silence => "silence",
+            AnalysisKind::Scenes => "scenes",
+            AnalysisKind::Loudness => "loudness",
+            AnalysisKind::Rhythm => "rhythm",
+            AnalysisKind::Transcript => "transcript",
+        }
+    }
+
+    /// The kind a name (or an alias an agent is likely to try) means.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "silence" | "silences" => Some(AnalysisKind::Silence),
+            "scenes" | "scene" | "scene_changes" => Some(AnalysisKind::Scenes),
+            "loudness" | "lufs" => Some(AnalysisKind::Loudness),
+            "rhythm" | "tempo" | "beat" | "beats" | "onsets" => Some(AnalysisKind::Rhythm),
+            "transcript" | "transcription" | "transcribe" | "speech" => Some(AnalysisKind::Transcript),
+            _ => None,
+        }
+    }
+
+    /// A list of names (`all` meaning every kind) as kinds, in pass order and without
+    /// repeats. An empty list is an error: asking for no steps is a mistake, not a no-op.
+    pub fn parse_list<S: AsRef<str>>(names: &[S]) -> Result<Vec<AnalysisKind>> {
+        let mut wanted = std::collections::HashSet::new();
+        for name in names {
+            let name = name.as_ref();
+            if name.trim().eq_ignore_ascii_case("all") {
+                wanted.extend(AnalysisKind::ALL);
+            } else {
+                wanted.insert(AnalysisKind::parse(name).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "unknown analysis step `{name}`; expected any of silence, scenes, loudness, rhythm, transcript, or all"
+                    ))
+                })?);
+            }
+        }
+        if wanted.is_empty() {
+            return Err(Error::InvalidArgument(
+                "no analysis steps were named; pass some of silence, scenes, loudness, rhythm, transcript, or all".to_string(),
+            ));
+        }
+        Ok(AnalysisKind::ALL.into_iter().filter(|k| wanted.contains(k)).collect())
+    }
+}
+
 /// Cached, pluggable analysis results for an asset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetAnalysis {
@@ -725,6 +802,64 @@ pub struct AssetAnalysis {
     /// video-only assets. Route ducking/leveling decisions off this.
     #[serde(default)]
     pub audio_class: Option<AudioClassification>,
+    /// The kinds whose step has run to completion — the only way to tell "ran and
+    /// found nothing" (no silence, no speech) from "never ran", both of which leave the
+    /// data empty. Absent in an analysis cached before kinds were recorded: for those
+    /// a kind counts as done when it has data ([`AssetAnalysis::done`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ran: Vec<AnalysisKind>,
+}
+
+impl AssetAnalysis {
+    /// Whether `kind` has data in this analysis, whatever recorded it.
+    fn has_data(&self, kind: AnalysisKind) -> bool {
+        match kind {
+            AnalysisKind::Silence => !self.silence_segments.is_empty(),
+            AnalysisKind::Scenes => !self.scene_changes.is_empty(),
+            AnalysisKind::Loudness => self.loudness.is_some(),
+            AnalysisKind::Rhythm => !self.onsets.is_empty() || self.tempo.is_some() || self.audio_class.is_some(),
+            AnalysisKind::Transcript => !self.transcript.is_empty(),
+        }
+    }
+
+    /// Whether `kind` is done: its step ran (recorded in [`AssetAnalysis::ran`]), or —
+    /// for an analysis from before that was recorded — it holds data of that kind.
+    pub fn done(&self, kind: AnalysisKind) -> bool {
+        self.ran.contains(&kind) || self.has_data(kind)
+    }
+
+    /// The kinds that are done, in pass order.
+    pub fn done_kinds(&self) -> Vec<AnalysisKind> {
+        AnalysisKind::ALL.into_iter().filter(|k| self.done(*k)).collect()
+    }
+
+    /// Fold `patch` — the results of the steps just run, with those steps in its
+    /// `ran` — into this analysis, replacing the data of those kinds and leaving every
+    /// other kind exactly as it was.
+    pub fn merge(&mut self, patch: &AssetAnalysis) {
+        for kind in AnalysisKind::ALL {
+            if !patch.ran.contains(&kind) {
+                continue;
+            }
+            match kind {
+                AnalysisKind::Silence => self.silence_segments = patch.silence_segments.clone(),
+                AnalysisKind::Scenes => self.scene_changes = patch.scene_changes.clone(),
+                AnalysisKind::Loudness => self.loudness = patch.loudness,
+                AnalysisKind::Rhythm => {
+                    self.onsets = patch.onsets.clone();
+                    self.tempo = patch.tempo.clone();
+                    self.audio_class = patch.audio_class;
+                }
+                AnalysisKind::Transcript => self.transcript = patch.transcript.clone(),
+            }
+            // The legacy kinds an old analysis counted by their data are recorded now,
+            // so a step that finds nothing this time does not make it look unrun.
+            if !self.ran.contains(&kind) {
+                self.ran.push(kind);
+            }
+        }
+        self.ran.sort();
+    }
 }
 
 fn one() -> f64 {
