@@ -69,7 +69,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
 | **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
 | **Transitions & masks** | Eleven transitions — crossfade, dip to black / white, **slide** and **push** in four directions — that borrow the outgoing clip's handle and degrade to a hard cut when there is none. **Masks** cut a clip to a feathered rectangle or ellipse so a lower track shows through: a blurred face is a duplicated shot above, blurred and masked. |
-| **Keyframe animation** | Animated zoom, position, rotation and opacity via piecewise-linear keyframes — the Transform panel auto-keyframes at the playhead. |
+| **Keyframe animation** | Animated zoom, position, rotation and opacity via keyframes — linear, hold, ease in / out or a custom curve per key — the Transform panel auto-keyframes at the playhead. |
 | **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. An **Insta360 lens pair imports as one 360 asset** — Kerf stitches the two capture files into an equirect sphere once and caches it. Spherical sources are detected on import; anything unflagged can be marked by hand. |
 | **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, and SRT export. **Captions follow the cut**: the transcript is projected through the clips that actually show its footage (trim / speed / reverse honored), so words you cut out get no caption — in a subtitle **Lines** style or the social **Word punch** style, one large word on the beat of the speech, fitted to the delivery frame. |
 | **Edit by transcript** | The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and `×` cuts that sentence out of the timeline and ripples the gap closed. |
@@ -163,7 +163,7 @@ frame at full source detail.
 
 `set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
 `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
-`set_keyframes` · `add_keyframe` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
+`set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·

@@ -55,7 +55,7 @@ pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFr
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, EditOutcome,
+    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome,
     EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus, Projection, Reframe,
     ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SkippedDetach, SourceLimits, SplitSide, StagedEdit,
     StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track,

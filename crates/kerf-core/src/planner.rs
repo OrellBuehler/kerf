@@ -767,6 +767,7 @@ mod tests {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            easing: Default::default(),
         }
     }
 

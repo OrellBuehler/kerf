@@ -16,10 +16,10 @@ use crate::error::{Error, Result};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
-    Delivery, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe, ReframeKeyframe,
-    Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo, TextKeyframe, TextOverlay,
-    TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect, Voiceover,
-    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
+    Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
+    ReframeKeyframe, Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect,
+    Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
 
@@ -3559,9 +3559,11 @@ impl Project {
     }
 
     /// Add a keyframe at `time` seconds from the clip's start (replacing any
-    /// keyframe already at that time). Each `None` channel captures the clip's
-    /// current sampled transform there, so a lone keyframe "pins" the present
-    /// pose. Realized as animation at export when ≥1 keyframe exists.
+    /// keyframe already at that time, and keeping how that one leaves). Each `None`
+    /// channel captures the clip's current sampled transform there, so a lone keyframe
+    /// "pins" the present pose. A key that lands inside an eased segment splits it
+    /// ([`Clip::insert_keyframe`]): a hold stays held, a curve stays the same curve.
+    /// Realized as animation at export when ≥1 keyframe exists.
     #[allow(clippy::too_many_arguments)]
     pub fn add_keyframe(
         &self,
@@ -3601,9 +3603,26 @@ impl Project {
             if let Some(v) = opacity {
                 kf.opacity = v;
             }
-            clip.keyframes.retain(|k| (k.time - time).abs() > 1e-6);
-            clip.keyframes.push(kf);
-            clip.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+            clip.insert_keyframe(kf);
+            Ok(clip.clone())
+        })
+    }
+
+    /// Set the easing of the segment that leaves the keyframe at `time` seconds from the
+    /// clip's start (the key nearest it within a millisecond): how the clip travels from that
+    /// pose to the next. The last key's easing has nothing to shape until a key follows it.
+    pub fn set_keyframe_easing(&self, clip_id: Uuid, time: f64, easing: Easing) -> Result<Clip> {
+        validate_easing(&easing)?;
+        self.edit_timeline("Set keyframe easing", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            let key = clip
+                .keyframes
+                .iter_mut()
+                .filter(|k| (k.time - time).abs() <= 1e-3)
+                .min_by(|a, b| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
+                .ok_or_else(|| Error::InvalidArgument(format!("the clip has no keyframe at {time:.3} s")))?;
+            key.easing = easing;
             Ok(clip.clone())
         })
     }
@@ -4390,6 +4409,20 @@ fn validate_keyframe(k: &Keyframe) -> Result<()> {
     }
     if ![k.pos_x, k.pos_y, k.rotation].iter().all(|v| v.is_finite()) {
         return Err(Error::InvalidArgument("keyframe values must be finite".to_string()));
+    }
+    validate_easing(&k.easing)
+}
+
+/// A bezier easing keeps both control points in the unit square: no overshoot, so an eased
+/// value stays between its two keys (the engine clamps what it reads, but a stored value
+/// outside would silently not be the curve it says).
+fn validate_easing(easing: &Easing) -> Result<()> {
+    if let Easing::Bezier { x1, y1, x2, y2 } = *easing {
+        if [x1, y1, x2, y2].iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
+            return Err(Error::InvalidArgument(
+                "bezier control points must be within 0.0..=1.0 (no overshoot)".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5240,6 +5273,121 @@ mod tests {
         let replaced = project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
         assert_eq!(replaced.keyframes.len(), 2);
         assert!(!project.clear_keyframes(clip.id).unwrap().is_animated());
+    }
+
+    #[test]
+    fn a_keys_easing_is_set_by_time_kept_when_the_key_is_rekeyed_and_checked() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        project.add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, None).unwrap();
+        // Found within a millisecond of its time.
+        let eased = project.set_keyframe_easing(clip.id, 0.0004, Easing::EaseInOut).unwrap();
+        assert_eq!(eased.keyframes[0].easing, Easing::EaseInOut);
+        assert!(
+            (eased.transform_at(1.0).scale - 1.25).abs() > 0.05,
+            "the curve is not the line"
+        );
+        // Moving the pose at that moment keeps how it leaves.
+        let rekeyed = project.add_keyframe(clip.id, 0.0, Some(1.1), None, None, None, None).unwrap();
+        assert_eq!(rekeyed.keyframes[0].easing, Easing::EaseInOut);
+        // No key there, a control point out of range: refused, nothing written.
+        let before = project.history().unwrap().len();
+        assert!(matches!(
+            project.set_keyframe_easing(clip.id, 2.0, Easing::Hold),
+            Err(Error::InvalidArgument(_))
+        ));
+        let wild = Easing::Bezier {
+            x1: 0.2,
+            y1: 1.4,
+            x2: 0.8,
+            y2: 0.5,
+        };
+        assert!(matches!(
+            project.set_keyframe_easing(clip.id, 0.0, wild),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_key_added_inside_a_hold_keeps_holding_and_inside_a_curve_keeps_the_curve() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        project.add_keyframe(clip.id, 4.0, Some(3.0), None, None, None, None).unwrap();
+        project.set_keyframe_easing(clip.id, 0.0, Easing::Hold).unwrap();
+        // Pinning the present pose in the middle of the hold changes nothing about it.
+        let held = project.add_keyframe(clip.id, 2.0, None, None, None, None, None).unwrap();
+        assert_eq!(held.keyframes.len(), 3);
+        assert_eq!(held.keyframes[1].easing, Easing::Hold);
+        assert_eq!(held.transform_at(3.9).scale, 1.0);
+        assert_eq!(held.transform_at(4.0).scale, 3.0);
+        // The same in a curve: the motion stays where it was (to the polyline's resolution).
+        project.clear_keyframes(clip.id).unwrap();
+        project.add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, None).unwrap();
+        project.add_keyframe(clip.id, 4.0, Some(3.0), None, None, None, None).unwrap();
+        let eased = project.set_keyframe_easing(clip.id, 0.0, Easing::EaseInOut).unwrap();
+        let split = project.add_keyframe(clip.id, 1.0, None, None, None, None, None).unwrap();
+        assert!(matches!(split.keyframes[0].easing, Easing::Bezier { .. }));
+        for i in 0..40 {
+            let t = (f64::from(i) + 0.5) * 0.1;
+            let (a, b) = (split.transform_at(t).scale, eased.transform_at(t).scale);
+            assert!((a - b).abs() < 0.01, "at {t}: now {a}, was {b}");
+        }
+    }
+
+    #[test]
+    fn set_keyframes_refuses_a_bezier_that_overshoots_like_set_keyframe_easing_does() {
+        let project = Project::open_in_memory().unwrap();
+        let asset = asset_with("/x.mp4", vec![vid_stream(false)]);
+        project.insert_asset(&asset).unwrap();
+        let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
+        let key = |time: f64, easing: Easing| Keyframe {
+            easing,
+            ..Keyframe::from_transform(time, &Default::default())
+        };
+        let fine = Easing::Bezier {
+            x1: 0.2,
+            y1: 0.9,
+            x2: 0.3,
+            y2: 1.0,
+        };
+        assert!(project
+            .set_keyframes(clip.id, vec![key(0.0, fine), key(2.0, Easing::Linear)])
+            .is_ok());
+        let before = project.history().unwrap().len();
+        for wild in [
+            Easing::Bezier {
+                x1: 0.2,
+                y1: 1.4,
+                x2: 0.8,
+                y2: 0.5,
+            },
+            Easing::Bezier {
+                x1: -0.1,
+                y1: 0.0,
+                x2: 0.5,
+                y2: 1.0,
+            },
+            Easing::Bezier {
+                x1: 0.2,
+                y1: 0.0,
+                x2: f64::NAN,
+                y2: 1.0,
+            },
+        ] {
+            assert!(matches!(
+                project.set_keyframes(clip.id, vec![key(0.0, wild), key(2.0, Easing::Linear)]),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(project.history().unwrap().len(), before);
+        assert_eq!(project.timeline().unwrap().tracks[0].clips[0].keyframes[0].easing, fine);
     }
 
     #[test]

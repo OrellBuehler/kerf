@@ -897,6 +897,21 @@ struct AddKeyframeParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetKeyframeEasingParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Time of the keyframe, in seconds from the clip's start (within a millisecond)")]
+    time: f64,
+    #[schemars(
+        description = "How the clip travels from this keyframe's pose to the next: \"linear\" (default), \"hold\" \
+                       (stay, then jump at the next key), \"ease_in\", \"ease_out\", \"ease_in_out\", or \
+                       {\"bezier\": {\"x1\", \"y1\", \"x2\", \"y2\"}} with every control point in 0..=1 (CSS cubic-bezier, \
+                       no overshoot)"
+    )]
+    easing: kerf_core::Easing,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AddOverlayParams {
     #[schemars(description = "The text to display")]
     text: String,
@@ -2106,7 +2121,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses."
+        description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses. A key added inside an eased segment splits it (a hold stays held, a curve stays the same curve); re-keying a moment keeps how it leaves."
     )]
     fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
         let clip_id = parse_id(&p.clip_id)?;
@@ -2114,6 +2129,19 @@ impl KerfMcp {
             let out = project
                 .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
                 .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Set the easing of the segment leaving one transform keyframe: how the clip moves from that pose \
+                       to the next (ease in / out / in-out, a hold, or a custom cubic bezier). Keys are linear until set. \
+                       Returns the clip."
+    )]
+    fn set_keyframe_easing(&self, Parameters(p): Parameters<SetKeyframeEasingParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let out = project.set_keyframe_easing(clip_id, p.time, p.easing).map_err(core_err)?;
             json(&out)
         })
     }
@@ -3482,7 +3510,9 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              further under dialogue and set_track_pan to place it. Animate a clip \
              with set_keyframes / \
              add_keyframe (scale / position / rotation / opacity over time — a Ken \
-             Burns zoom, a moving picture-in-picture). 360 footage (Insta360 \
+             Burns zoom, a moving picture-in-picture); keys move linearly until \
+             set_keyframe_easing gives a segment an ease or a hold, which is what \
+             makes motion read as deliberate rather than mechanical. 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
              are reframed to an ordinary rectilinear shot automatically: aim the \
              virtual camera with set_reframe (yaw / pitch / roll / field of view) \

@@ -21,6 +21,7 @@
 // three ripples (the caller must not run `rippleFrom` over them); split-and-remove
 // follows the project's ripple mode like any trim.
 
+import { curve, EASE_STEPS, keyframeChannel } from './easing';
 import { formatTime } from './diff';
 import { invalid, locateIndex, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
@@ -218,7 +219,36 @@ function rebaseAnimation(clip: Clip, by: number) {
 				rotation: pose.rotation,
 				opacity: pose.opacity
 			};
-			clip.keyframes = [pinned, ...clip.keyframes.filter((k) => k.time > by).map((k) => ({ ...k, time: k.time - by }))];
+			const kfs: Keyframe[] = [pinned];
+			// Cut inside an eased segment: a hold keeps holding, a curve's remaining pieces
+			// become plain keys (the curve is those pieces).
+			const sorted = [...clip.keyframes].sort(byTime);
+			for (let i = 0; i + 1 < sorted.length; i++) {
+				const [a, b] = [sorted[i], sorted[i + 1]];
+				if (!(a.time <= by && by < b.time && b.time - a.time >= 1e-9)) continue;
+				const easing = a.easing ?? 'linear';
+				if (easing === 'hold') pinned.easing = 'hold';
+				else if (easing !== 'linear') {
+					for (let j = 1; j < EASE_STEPS; j++) {
+						const u = j / EASE_STEPS;
+						const at = a.time + (b.time - a.time) * u;
+						if (at <= by) continue;
+						const p = curve(easing, u);
+						const mix = (x: number, y: number) => x + (y - x) * p;
+						kfs.push({
+							time: at - by,
+							scale: mix(a.scale, b.scale),
+							pos_x: mix(a.pos_x, b.pos_x),
+							pos_y: mix(a.pos_y, b.pos_y),
+							rotation: mix(a.rotation, b.rotation),
+							opacity: mix(a.opacity, b.opacity)
+						});
+					}
+				}
+				break;
+			}
+			kfs.push(...sorted.filter((k) => k.time > by).map((k) => ({ ...k, time: k.time - by })));
+			clip.keyframes = kfs;
 		}
 		const rf = clip.reframe;
 		if (rf?.keyframes?.length) {
@@ -273,13 +303,9 @@ function interpolateAngle(points: [number, number][], at: number): number | unde
 /** The clip's static transform with its animatable channels sampled at `local` seconds. */
 function transformAt(clip: Clip, local: number): Transform {
 	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
-	const ks = [...(clip.keyframes ?? [])].sort(byTime);
+	const ks = clip.keyframes ?? [];
 	if (ks.length === 0) return t;
-	const chan = (get: (k: Keyframe) => number) =>
-		interpolate(
-			ks.map((k) => [k.time, get(k)]),
-			local
-		);
+	const chan = (get: (k: Keyframe) => number) => interpolate(keyframeChannel(ks, get), local);
 	t.scale = chan((k) => k.scale) ?? t.scale;
 	t.pos_x = chan((k) => k.pos_x) ?? t.pos_x;
 	t.pos_y = chan((k) => k.pos_y) ?? t.pos_y;

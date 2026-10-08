@@ -1245,6 +1245,14 @@ fn add_keyframe(
 }
 
 #[tauri::command(async)]
+fn set_keyframe_easing(state: State<'_, AppState>, clip_id: String, time: f64, easing: kerf_core::Easing) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let project = state.project();
+    project.set_keyframe_easing(id, time, easing).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id)?;
     let project = state.project();
@@ -2966,6 +2974,7 @@ pub fn run() {
             set_audio_effects,
             set_keyframes,
             add_keyframe,
+            set_keyframe_easing,
             clear_keyframes,
             set_reframe,
             set_asset_projection,
