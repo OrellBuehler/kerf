@@ -118,6 +118,11 @@ describe('color literals', () => {
 		expect(html).toMatch(new RegExp(`<html[^>]*style="[^"]*background:\\s*${dark}\\b`, 'i'));
 		expect(html).toMatch(/<html[^>]*style="[^"]*color-scheme:\s*dark/i);
 
+		// A detached panel's window paints the same until the live theme is mirrored in.
+		const popout = readFileSync(join(SRC, '..', 'static', 'popout.html'), 'utf8');
+		expect(popout).toMatch(new RegExp(`<html[^>]*style="[^"]*background:\\s*${dark}\\b`, 'i'));
+		expect(popout).toMatch(/<html[^>]*style="[^"]*color-scheme:\s*dark/i);
+
 		const conf = JSON.parse(readFileSync(join(REPO, 'crates/kerf-app/tauri.conf.json'), 'utf8'));
 		const main = conf.app.windows.find((w: { label: string }) => w.label === 'main');
 		expect(main.visible, 'the main window starts hidden; the page shows it once themed').toBe(false);
