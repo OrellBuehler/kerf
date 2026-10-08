@@ -32,7 +32,11 @@
 	$effect(() => {
 		if (!here) return;
 		const w = own;
-		const onScroll = () => contextMenu.close();
+		// The menu scrolls when it is taller than the window it is in; that is no reason to close it.
+		const onScroll = (e: Event) => {
+			if (el && e.target instanceof Node && el.contains(e.target)) return;
+			contextMenu.close();
+		};
 		const onResize = () => contextMenu.close();
 		const onBlur = () => contextMenu.close();
 		w.addEventListener('scroll', onScroll, true);
@@ -78,7 +82,7 @@
 		role="menu"
 		tabindex="-1"
 		oncontextmenu={(e) => e.preventDefault()}
-		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
+		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;max-height:{own.innerHeight - 12}px;overflow-y:auto;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
 	>
 		{#each contextMenu.items as item, i (i)}
 			{#if item.type === 'separator'}
