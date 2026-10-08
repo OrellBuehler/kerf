@@ -9,10 +9,8 @@
  * track made only of those has no strip: its sound rides the audio track it was
  * detached to, and that track's fader is the one that moves it.
  *
- * This anticipates linked A/V (the unmerged feat/linked-av PR), whose
- * `Clip.source_audio` — written only when false — marks a detached picture. Until it
- * lands no clip carries the field and every clip with an audio stream sounds; the
- * export graph's own rule arrives with it, and this one is to match it. */
+ * It mirrors `clip_sounds` in the export graph: `Clip.source_audio`, written only
+ * when false, marks a detached picture. */
 
 import { trackRenders } from './levels';
 import type { StreamKind, Timeline, Track } from './types';

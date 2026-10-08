@@ -4,6 +4,15 @@
 
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
+import { withLinkPartners } from './link-groups';
+import {
+	detachedNotice,
+	linkPlans,
+	linkedNotice,
+	reattachedNotice,
+	unlinkedNotice,
+	type LinkPlans
+} from './link-ui';
 import { toast } from './notifications.svelte';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
@@ -82,4 +91,88 @@ export async function trimSelection(side: SplitSide): Promise<void> {
 	// Some were cut and some could not be (a locked track, a clip too short): the
 	// edit that happened is visible, the one that did not needs a sentence.
 	if (plan.problems.length > 0) toast.warning(trimNotice({ ...plan, trims: [] }, selected.length, side));
+}
+
+// ---- linked A/V: detach, reattach, link, unlink --------------------------------------
+// The clip menu and the keymap both run these, over `linkPlans` — one place that knows what
+// is possible for the selection and why not, so a key and a menu line never disagree.
+
+/** What the selection can be Detached / Reattached / Linked / Unlinked, and why not. */
+export function selectionLinkPlans(): LinkPlans {
+	const audible = new Set(editor.assets.filter((a) => a.streams.some((s) => s.kind === 'audio')).map((a) => a.id));
+	return linkPlans(editor.timeline, (id) => audible.has(id), editor.selectedClipIds);
+}
+
+/** **Detach audio** (⇧D, the clip menu): each selected picture clip still playing its own
+ *  sound hands it to a linked clip on an audio track and goes quiet, so it is heard once.
+ *  One revision for the lot (`detach_audio_clips`); the toast's Undo takes it back. A clip the
+ *  backend skips (a locked track) is named in the toast rather than failing the rest. */
+export async function detachSelection(): Promise<void> {
+	const plan = selectionLinkPlans().detach;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	let report;
+	try {
+		report = await editor.detachAudioClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	// The sound that was just made is part of the pictures' link group: select it with them.
+	editor.selectClips(withLinkPartners(editor.timeline, [...plan.ids]), editor.selectedClipId);
+	const note = report.skipped.length > 0 ? `${detachedNotice(report.detached)} — ${report.skipped.length} skipped (${report.skipped[0].reason})` : detachedNotice(report.detached);
+	toast(note, { action: { label: 'Undo', onClick: () => void editor.undo() } });
+}
+
+/** **Reattach audio** (⇧⌘D, the clip menu): the linked audio clip goes and the picture
+ *  plays its own sound again. One revision for the whole selection (`reattach_audio_clips`),
+ *  all or nothing — a refusal changes nothing — and the toast's Undo takes it back. */
+export async function reattachSelection(): Promise<void> {
+	const plan = selectionLinkPlans().reattach;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	try {
+		await editor.reattachAudioClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(reattachedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+}
+
+/** **Link** the selected clips (⌘L, the clip menu): one clip per track, a move / trim / split
+ *  / delete of one carried to the others. */
+export async function linkSelection(): Promise<void> {
+	const plan = selectionLinkPlans().link;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	try {
+		await editor.linkClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(linkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+}
+
+/** **Unlink** the selected clips (⇧⌘L, the clip menu): each leaves its group. */
+export async function unlinkSelection(): Promise<void> {
+	const plan = selectionLinkPlans().unlink;
+	if (plan.reason !== null) {
+		toast.info(plan.reason);
+		return;
+	}
+	try {
+		await editor.unlinkClips(plan.ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(unlinkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }

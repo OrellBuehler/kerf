@@ -162,8 +162,8 @@ export class AudioEngine {
 			if (!trackRenders(timeline, track)) continue;
 			const playing = track.clips.filter((clip) => {
 				if (clip.enabled === false) return false;
-				// A picture whose sound was detached is silent — its audio clip plays it,
-				// as linked A/V's `source_audio` will say: scheduling both is the doubling.
+				// A picture whose sound was detached is silent — its audio clip plays it
+				// (`clip_sounds` in the export graph): scheduling both is the doubling.
 				if (!clipSounds(clip, audioAssets)) return false;
 				return clip.timeline_start + (clip.source_out - clip.source_in) / speedMag(clip) > t;
 			});

@@ -3561,12 +3561,11 @@ fn build_export_args_phase(
         .tracks
         .iter()
         .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
-    let timeline_has_audio = timeline.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
-        assets
-            .iter()
-            .find(|a| a.id == c.asset_id)
-            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
-    });
+    let timeline_has_audio = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .any(|c| clip_sounds(c, assets));
     let c = opts.container;
     let want_video = timeline_has_video && !c.is_audio_only();
     let want_audio = timeline_has_audio && !c.is_video_only() && opts.include_audio && pass != PassPhase::First;
@@ -4375,12 +4374,11 @@ fn render_attempt(
         .tracks
         .iter()
         .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
-    let has_audio = timeline.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| {
-        assets
-            .iter()
-            .find(|a| a.id == c.asset_id)
-            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
-    });
+    let has_audio = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .any(|c| clip_sounds(c, assets));
     let issues = validate_export(opts, has_video, has_audio);
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
@@ -4748,6 +4746,22 @@ fn run_ffmpeg_progress(
     Ok(RenderStatus::Completed)
 }
 
+/// Whether `clip` puts sound in the mix: its asset carries an audio stream **and**
+/// the clip still plays it. A picture clip whose sound was detached
+/// (`Clip::source_audio` false, see `Project::detach_audio`) is silent — its sound
+/// is the linked audio clip's — and the export otherwise mixes the audio of *every*
+/// clip with an audio stream, video tracks included, which is what made an asset
+/// extracted onto an audio track while still on V1 sound twice. `source_audio`
+/// defaults to true, so a clip that never heard of the flag is gated exactly as it
+/// was.
+fn clip_sounds(clip: &Clip, assets: &[Asset]) -> bool {
+    clip.source_audio
+        && assets
+            .iter()
+            .find(|a| a.id == clip.asset_id)
+            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
+}
+
 /// The result of [`build_filter_complex`]: the `-filter_complex` string plus
 /// which output pads it produced, so the caller knows which `-map`s to add.
 struct FilterGraph {
@@ -4834,12 +4848,7 @@ fn build_filter_complex_metered(
     plan: &InputPlan,
     meter: bool,
 ) -> FilterGraph {
-    let has_audio = |clip: &crate::model::Clip| {
-        assets
-            .iter()
-            .find(|a| a.id == clip.asset_id)
-            .is_some_and(|a| a.streams.iter().any(|s| s.kind == StreamKind::Audio))
-    };
+    let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
     let layout = fmt.channel_layout();
 
@@ -6650,6 +6659,14 @@ mod golden;
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
+
+/// The sound of detached / linked clips: that `extract_audio` used to double, that a
+/// detached clip's *own* chain is the chain it had, and that its **level** survives
+/// the move between a picture track's fader and an audio track's (graph level, and
+/// measured on a render under `#[ignore]`). Pan, duck and mute are the destination
+/// track's afterwards — see `Timeline::detach_audio`.
+#[cfg(test)]
+mod linked_audio;
 
 /// The export plan against the *evaluated* export graph, on a grid of frames.
 #[cfg(test)]

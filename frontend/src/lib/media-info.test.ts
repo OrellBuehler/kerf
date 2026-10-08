@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { analysisFacts, fmtAspect, fmtDuration, fmtFps, mediaInfo, shortPath, specLine, thumbTime } from './media-info';
+import { analysisFacts, audioExtraction, fmtAspect, fmtDuration, fmtFps, mediaInfo, shortPath, specLine, thumbTime } from './media-info';
 import type { Asset, AssetAnalysis } from './types';
 
 const video: Asset = {
@@ -140,5 +140,45 @@ describe('shortPath / thumbTime', () => {
 	test('samples 10% in, except for very short media', () => {
 		expect(thumbTime(100)).toBe(10);
 		expect(thumbTime(1)).toBe(0);
+	});
+});
+
+describe('audioExtraction — what the bin’s audio action will do', () => {
+	const tracks = (v: object[], a: object[]) =>
+		({ tracks: [{ kind: 'video', name: 'V1', clips: v }, { kind: 'audio', name: 'A1', clips: a }] }) as never;
+
+	test('an asset with no sound has nothing to extract', () => {
+		expect(audioExtraction({ id: 'x', streams: [{ index: 0, kind: 'video', codec: 'h264' }] }, tracks([], []))).toBeNull();
+	});
+
+	test('an asset only in the bin is added to the first audio track', () => {
+		const x = audioExtraction(video, tracks([], []))!;
+		expect(x.mode).toBe('append');
+		expect(x.label).toBe('Add audio to A1');
+	});
+
+	test('an asset cut onto a video track has its sound detached from each clip still playing it', () => {
+		const t = tracks([{ asset_id: 'a' }, { asset_id: 'a' }, { asset_id: 'a', source_audio: false }], []);
+		const x = audioExtraction(video, t)!;
+		expect(x).toMatchObject({ mode: 'detach', clips: 2, label: 'Detach audio from 2 clips' });
+		expect(audioExtraction(video, tracks([{ asset_id: 'a' }], []))!.label).toBe('Detach audio from 1 clip');
+	});
+
+	test('once every clip is detached the action is an append again — and says it duplicates', () => {
+		const t = tracks([{ asset_id: 'a', source_audio: false }], [{ asset_id: 'a' }]);
+		const x = audioExtraction(video, t)!;
+		expect(x.mode).toBe('append');
+		expect(x.label).toBe('Add audio to A1 again');
+		expect(x.detail).toContain('another copy');
+	});
+
+	test('a cut with no audio track says one will be made', () => {
+		const t = { tracks: [{ kind: 'video', name: 'V1', clips: [] }] } as never;
+		expect(audioExtraction(video, t)!.label).toBe('Add audio on a new track A1');
+	});
+
+	test('the first audio track is named, whichever it is', () => {
+		const t = { tracks: [{ kind: 'audio', name: 'VO', clips: [] }, { kind: 'audio', name: 'A2', clips: [] }] } as never;
+		expect(audioExtraction(video, t)!.label).toBe('Add audio to VO');
 	});
 });

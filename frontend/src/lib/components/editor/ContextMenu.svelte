@@ -102,6 +102,7 @@
 				<button
 					role="menuitem"
 					disabled={item.disabled}
+					title={item.disabled ? item.reason : undefined}
 					onclick={() => run(item)}
 					style="display:flex;align-items:center;gap:9px;width:100%;padding:6px 8px;border:none;border-radius:var(--radius-sm);background:none;cursor:{item.disabled
 						? 'default'
@@ -118,7 +119,17 @@
 					<span style="width:15px;display:grid;place-items:center;flex:none;color:inherit">
 						{#if item.icon}<Icon n={item.icon} s={14} color="currentColor" />{/if}
 					</span>
-					<span style="flex:1">{item.label}</span>
+					<span style="flex:1;min-width:0">
+						{item.label}
+						{#if item.disabled && item.reason}
+							<!-- A disabled line says why, in the words the backend would have refused with. -->
+							<span
+								data-menu-reason
+								style="display:block;max-width:250px;margin-top:1px;font-size:10.5px;line-height:1.3;font-weight:400;color:var(--text-muted)"
+								>{item.reason}</span
+							>
+						{/if}
+					</span>
 					{#if item.shortcut}
 						<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none"
 							>{item.shortcut}</span

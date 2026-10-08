@@ -21,11 +21,20 @@
 	import type { Mask, Projection, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { linkBadge } from '$lib/link-ui';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
+	/** A picture whose sound was detached plays none of its own: the audio clip linked to it
+	 *  does, and that is where the level, the fades of the *sound* and the effects belong. */
+	const soundDetached = $derived(clip?.source_audio === false);
+	const soundLivesOn = $derived(
+		clip && soundDetached
+			? (linkBadge(editor.timeline, clip, (id) => editor.assetName(id))?.partners.filter((p) => p.kind === 'audio').map((p) => p.track) ?? [])
+			: []
+	);
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
@@ -623,7 +632,19 @@
 			)}
 			</InspectorSection>
 
-			{#if hasAudio}
+			{#if hasAudio && soundDetached}
+				<InspectorSection title="Volume" summary="Sound detached" open>
+					<p data-sound-detached-note style="font-size:12px;line-height:1.45;color:var(--text-muted);margin:2px 0 0">
+						{#if soundLivesOn.length > 0}
+							This picture's sound plays from its linked audio clip on {soundLivesOn.join(', ')} — set the level, the
+							sound's own effects and the track fader there. The picture's fades below apply to the picture only.
+						{:else}
+							This picture's sound was detached and its audio clip is gone, so it plays silent. Reattach audio from the
+							clip menu to hear it again.
+						{/if}
+					</p>
+				</InspectorSection>
+			{:else if hasAudio}
 				<InspectorSection title="Volume" summary={`${Math.round(clip.volume * 100)}%`} open>
 				<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
 					<input
@@ -949,7 +970,7 @@
 			{/if}
 			</InspectorSection>
 
-			{#if hasAudio}
+			{#if hasAudio && !soundDetached}
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
 				{/if}
 
