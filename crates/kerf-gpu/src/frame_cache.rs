@@ -203,8 +203,10 @@ impl FrameCache {
     }
 
     /// Keep `frame` under `key`, covering `covers_from..=key.pts` (see the [module](self)), and
-    /// return the frame the cache now holds. A frame already there stays (it is the same
-    /// picture) and only widens its coverage: two true statements about the same file add up.
+    /// return the frame the cache now holds. A frame already there stays and only widens its
+    /// coverage: two true statements about the same file add up. A file has one picture at a
+    /// pts (a run whose pts repeat or go back is refused by the `showinfo` parser), so the frame
+    /// offered for a held key must be that picture; a debug build checks it.
     /// Older unpinned frames go until the cap is met (cold ones first); the one inserted never does.
     pub fn insert(&mut self, key: FrameKey, frame: Arc<YuvFrame>, covers_from: i64) -> Arc<YuvFrame> {
         let held = self.put(key, frame, covers_from, false);
@@ -239,6 +241,10 @@ impl FrameCache {
         let used = self.clock;
         match self.frames.get_mut(&key) {
             Some(e) => {
+                debug_assert!(
+                    Arc::ptr_eq(&e.frame, &frame) || e.frame == frame,
+                    "a different picture offered for {key:?}, which is already cached"
+                );
                 e.covers_from = e.covers_from.min(covers_from);
                 if !cold {
                     (e.used, e.cold) = (used, false);
@@ -463,7 +469,7 @@ mod tests {
     fn a_frame_is_held_once_and_a_second_insert_returns_the_first() {
         let mut c = FrameCache::new(1 << 20);
         let first = c.insert(key(A, 10), frame(1), 5);
-        let again = c.insert(key(A, 10), frame(2), 8);
+        let again = c.insert(key(A, 10), frame(1), 8);
         assert!(Arc::ptr_eq(&first, &again), "the same picture is not stored twice");
         assert_eq!(c.stats().entries, 1);
         assert_eq!(c.stats().bytes, 12);
@@ -472,6 +478,26 @@ mod tests {
         // The wider of two true coverages wins.
         assert_eq!(tag(c.at_or_after(A, 5)), Some(1));
         assert_eq!(c.stats().inserts, 1);
+    }
+
+    /// Two pictures under one key would be served as the first for a time that belongs to the
+    /// second: a debug build refuses to let that pass silently.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a different picture offered")]
+    fn a_different_picture_under_a_held_key_is_not_silently_dropped() {
+        let mut c = FrameCache::new(1 << 20);
+        c.insert(key(A, 10), frame(1), 5);
+        c.insert(key(A, 10), frame(2), 5);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a different picture offered")]
+    fn a_different_picture_offered_cold_under_a_held_key_is_not_silently_dropped() {
+        let mut c = FrameCache::new(1 << 20);
+        c.insert(key(A, 10), frame(1), 5);
+        c.insert_cold(key(A, 10), frame(2), 5);
     }
 
     #[test]
@@ -607,7 +633,7 @@ mod tests {
         assert!([2, 4, 5].iter().all(|&p| c.get(key(A, p)).is_some()));
         // A cold insert of a frame already held leaves it as warm as it was and keeps one `Arc`.
         let held = c.get(key(A, 4)).unwrap();
-        assert!(Arc::ptr_eq(&c.insert_cold(key(A, 4), frame(9), 3), &held));
+        assert!(Arc::ptr_eq(&c.insert_cold(key(A, 4), frame(4), 3), &held));
         assert_eq!(c.stats().cold, 0);
     }
 

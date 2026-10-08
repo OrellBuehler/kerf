@@ -270,7 +270,8 @@ impl LayerGeometry {
         if iw == 0 || ih == 0 || ow == 0 || oh == 0 {
             return Err(GeometryError("an empty picture or canvas".into()));
         }
-        if !(tf.scale.is_finite() && tf.scale > 0.0)
+        if !tf.scale.is_finite()
+            || tf.scale <= 0.0
             || ![tf.pos_x, tf.pos_y, tf.rotation, tf.opacity, mx, my]
                 .iter()
                 .all(|v| v.is_finite())

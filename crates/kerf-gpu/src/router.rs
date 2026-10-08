@@ -277,6 +277,7 @@ pub enum StartOutcome {
 
 /// A start the guard let through: hand it back to [`ThrashGuard::finished`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[must_use = "a start that is never reported to `ThrashGuard::finished` stays open until the guard gives up on it"]
 pub struct Ticket {
     start: f64,
     /// The interval in the guard, when the start is one it counts.
@@ -299,8 +300,11 @@ struct Interval {
 /// its slot, so the next request fills it again, for free, forever). The cost is the restart
 /// time inside the last [`THRASH_WINDOW`] — an interval still open counts up to now — and a
 /// start is refused ([`Busy`]) when it reaches [`THRASH_BUSY_SECS`]. A refusal is not recorded,
-/// so a caller that stops asking recovers within the window. Only `Forward` is guarded (a scrub
-/// restarts as fast as the hand moves, and an `Exact` frame starts nothing registered).
+/// so a caller that stops asking recovers within the window. A start still open after a full
+/// window is taken for lost (its [`Ticket`] never came back) and closed there: nothing is charged
+/// for longer than the window, so a lost ticket cannot refuse every later start. Only `Forward` is
+/// guarded (a scrub restarts as fast as the hand moves, and an `Exact` frame starts nothing
+/// registered).
 #[derive(Default)]
 pub struct ThrashGuard {
     intervals: VecDeque<Interval>,
@@ -330,6 +334,9 @@ impl ThrashGuard {
             return Ok(None);
         }
         let from = now - THRASH_WINDOW;
+        for i in self.intervals.iter_mut().filter(|i| i.end.is_none() && i.start < from) {
+            i.end = Some(i.start + THRASH_WINDOW);
+        }
         self.intervals.retain(|i| i.end.is_none_or(|e| e > from));
         if self.cost(now) >= THRASH_BUSY_SECS {
             return Err(Busy);
@@ -720,6 +727,31 @@ mod tests {
         assert_eq!(go(&mut g, &RESTART, 12.0, 0.0625, Frame), Ok(()));
         assert_eq!(g.cost(12.0625), 0.0625);
         assert_eq!(g.cost(14.0), 0.0);
+    }
+
+    #[test]
+    fn a_ticket_that_never_comes_back_is_closed_after_a_window_and_ages_out() {
+        let mut g = ThrashGuard::new();
+        let lost = g.check(Intent::Forward, &RESTART, 10.0).unwrap();
+        assert!(lost.is_some());
+        // Under way it counts, as a slow start does: open for a full window is a full window.
+        assert_eq!(g.check(Intent::Forward, &RESTART, 10.75), Err(Busy));
+        assert_eq!(g.check(Intent::Forward, &RESTART, 11.0), Err(Busy));
+        // Past the window it is taken for lost and closed where the window ended: what is left of
+        // it in the last second shrinks as that second moves on...
+        assert_eq!(g.check(Intent::Forward, &RESTART, 11.0625), Err(Busy));
+        assert_eq!(g.cost(11.0625), 0.9375);
+        assert_eq!(go(&mut g, &RESTART, 11.5, 0.0625, Frame), Ok(()), "no longer wedged");
+        assert_eq!(g.cost(11.5625), 0.4375 + 0.0625);
+        // ...and it is dropped, whatever the caller does or does not report.
+        assert_eq!(go(&mut g, &start(None, 0), 13.0, 0.0, Frame), Ok(()));
+        assert!(g.intervals.is_empty(), "{}", g.intervals.len());
+        assert_eq!(g.cost(13.0), 0.0);
+        // A lost ticket that does turn up late still says how long the start really took.
+        let late = g.check(Intent::Forward, &RESTART, 20.0).unwrap();
+        assert_eq!(go(&mut g, &RESTART, 21.5, 0.0, Frame), Ok(()));
+        g.finished(late, 21.5, Frame);
+        assert_eq!(g.cost(21.5), 1.0);
     }
 
     #[test]

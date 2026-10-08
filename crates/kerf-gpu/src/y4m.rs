@@ -15,9 +15,10 @@
 //!
 //! The end of the stream is a state, not an error: no bytes at all (a seek past the last
 //! frame) or a header with no frame after it is "no frame", and a stream that ends *between*
-//! frames is finished; one that ends inside a header or a frame is [`Y4mError::Truncated`].
-//! Partial reads are `Read`'s business (`read_to_end` over a `take` loops, and retries
-//! `Interrupted`); a pipe hands over a few KiB at a time.
+//! frames is finished; one that ends inside a header or a frame is [`Y4mError::Truncated`], and
+//! after any error the reader stays failed: every later call repeats it, so a stream that broke
+//! never reads as one that ended. Partial reads are `Read`'s business (`read_to_end` over a
+//! `take` loops, and retries `Interrupted`); a pipe hands over a few KiB at a time.
 
 use std::io::{ErrorKind, Read};
 
@@ -76,6 +77,7 @@ pub struct Y4mReader<R> {
     expected: (u32, u32),
     started: bool,
     frames: u64,
+    failed: Option<Y4mError>,
 }
 
 impl<R: Read> Y4mReader<R> {
@@ -86,6 +88,7 @@ impl<R: Read> Y4mReader<R> {
             expected,
             started: false,
             frames: 0,
+            failed: None,
         }
     }
 
@@ -94,8 +97,20 @@ impl<R: Read> Y4mReader<R> {
         self.frames
     }
 
-    /// The next frame, or `None` at the end of the stream (see the [module](self)).
+    /// The next frame, or `None` at the end of the stream (see the [module](self)). Once it has
+    /// failed it fails the same way every time.
     pub fn next_frame(&mut self) -> Result<Option<YuvFrame>, Y4mError> {
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        let next = self.read_frame();
+        if let Err(e) = &next {
+            self.failed = Some(e.clone());
+        }
+        next
+    }
+
+    fn read_frame(&mut self) -> Result<Option<YuvFrame>, Y4mError> {
         if !self.started {
             let Some(header) = read_line(&mut self.from, MAX_HEADER)? else {
                 return Ok(None);
@@ -297,6 +312,36 @@ mod tests {
         for cut in [5, 16 + 2, 16 + 6, 16 + 6 + 3, bytes.len() - 1] {
             let r = read_all(&bytes[..cut], (4, 2));
             assert!(matches!(r, Err(Y4mError::Truncated(_))), "cut at {cut}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_reader_that_failed_keeps_failing_and_never_looks_like_the_end_of_the_stream() {
+        let good = stream("YUV4MPEG2 W4 H2", &[planes(4, 2, (1, 1, 1)), planes(4, 2, (2, 2, 2))]);
+        let truncated_plane = good[..good.len() - 1].to_vec();
+        let mut bad_marker = stream("YUV4MPEG2 W4 H2", &[planes(4, 2, (1, 1, 1))]);
+        bad_marker.extend_from_slice(b"NOPE\n");
+        let wrong_size = stream("YUV4MPEG2 W2 H4", &[planes(2, 4, (1, 1, 1))]);
+        for (name, bytes) in [
+            ("a plane cut short", truncated_plane),
+            ("a header cut short", good[..5].to_vec()),
+            ("a line that is no FRAME", bad_marker),
+            ("a picture of another size", wrong_size),
+            ("a stream that is not y4m", b"nonsense\n".to_vec()),
+        ] {
+            let mut r = Y4mReader::new(&bytes[..], (4, 2));
+            let first = loop {
+                match r.next_frame() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("{name}: ended instead of failing"),
+                    Err(e) => break e,
+                }
+            };
+            let read = r.frames_read();
+            for _ in 0..3 {
+                assert_eq!(r.next_frame().unwrap_err(), first, "{name}");
+            }
+            assert_eq!(r.frames_read(), read, "{name}: no frame came out of a failed reader");
         }
     }
 
