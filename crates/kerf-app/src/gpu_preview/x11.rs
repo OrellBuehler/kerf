@@ -421,7 +421,13 @@ mod tests {
             width: 64,
             height: 48,
             // The server's pixels are BGRX.
-            data: image.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]).collect(),
+            data: image
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[2], p[1], p[0], 255])
+                .collect(),
         };
         for (x, y) in [(5, 5), (60, 5), (5, 40), (60, 40), (31, 23), (32, 24)] {
             assert_eq!(pixel(&got, x, y), pixel(&sent, x, y), "pixel ({x}, {y}) of the child window");

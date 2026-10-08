@@ -148,10 +148,12 @@ impl Gpu {
         target: Option<wgpu::SurfaceTarget<'static>>,
     ) -> Result<(Arc<Gpu>, Option<wgpu::Surface<'static>>), GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // A backend asserts on a handle it cannot use (DX12 on a non-Windows display
+        // handle) instead of returning an error, so a refusal can be a panic too.
         let surface = match target {
             Some(target) => Some(
-                instance
-                    .create_surface(target)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| instance.create_surface(target)))
+                    .map_err(|_| GpuError::Surface("the surface could not be created for this window".into()))?
                     .map_err(|e| GpuError::Surface(e.to_string()))?,
             ),
             None => None,
