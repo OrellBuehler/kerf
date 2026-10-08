@@ -285,6 +285,8 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, di
     if std::env::var_os("KERF_ZOOM_KEEP").is_some() {
         std::fs::write(dir.join(format!("{tag}.args")), args.join(" ")).unwrap();
     }
+    // Windows caps a whole command line at 32767 characters, as the export does.
+    let _script = externalize_filter_complex(&mut args, tag).unwrap();
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
         run.status.success(),
