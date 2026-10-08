@@ -714,9 +714,12 @@ impl RenderPlan {
             // Below full opacity FFmpeg takes the layer through RGB and back (see
             // `kerf-gpu`'s `roundtrip`), out of YCbCr with the picture's own matrix,
             // which has to be known for the arithmetic to be reproduced. A keyframed
-            // clip's opacity is a `geq` alpha instead, refused below.
+            // clip's opacity is a `geq` alpha instead, refused below. Only a **keyed opacity** is
+            // that: a clip with some other number keyed (a position, a zoom) and a static opacity
+            // below 1 still takes the round trip, so it still needs the matrix.
             let keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some());
-            if layer.transform.opacity < 1.0 && stream.matrix().is_none() && !keyed {
+            let alpha_keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some_and(|k| k.opacity));
+            if layer.transform.opacity < 1.0 && stream.matrix().is_none() && !alpha_keyed {
                 let detail = match (stream.pix_fmt.as_deref(), stream.color_space.as_deref()) {
                     (None, _) => "unknown (probed before the pixel format and tags were recorded)".to_string(),
                     (Some(_), Some(tag)) => format!("`{tag}`, which the compositor has no coefficients for"),

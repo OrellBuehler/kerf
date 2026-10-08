@@ -1404,6 +1404,57 @@ mod tests {
     }
 
     #[test]
+    fn only_a_keyed_opacity_skips_the_matrix_a_translucent_layer_needs() {
+        use crate::model::{Property, PropertyKey};
+        // The pixel format was never recorded, so the layer's matrix is unknown.
+        let mut a = asset();
+        a.streams[0].pix_fmt = None;
+        let assets = [a.clone()];
+        let caps = GpuCaps {
+            motion: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        let refused = |clip: crate::model::Clip| {
+            let plan = planner(&single(vec![clip]), &assets, PlanMode::Motion, &opts(30.0))
+                .at_frame(30)
+                .unwrap();
+            has(&plan.reasons(&caps, plan.size(u32::MAX)), |u| {
+                matches!(u, Unsupported::TranslucentMatrix(..))
+            })
+        };
+        let slide = || {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            c.transform.opacity = 0.5;
+            c
+        };
+        // Static opacity, nothing keyed: the RGB round trip, which needs the matrix.
+        assert!(refused(slide()));
+        // Static opacity with a *position* keyed: the graph still takes the round trip (the keyed
+        // position changes nothing about the alpha), so the matrix is still needed. It used to
+        // pass because "something is keyed" was read as "the opacity is a `geq`".
+        let mut moving = slide();
+        moving.set_property_keys(Property::PosX, vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(2.0, 0.2)]);
+        assert!(refused(moving));
+        let mut zooming = slide();
+        zooming.set_property_keys(Property::Scale, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 1.5)]);
+        assert!(refused(zooming));
+        // A keyed opacity is a `geq` alpha: no round trip, no matrix.
+        let mut fading = slide();
+        fading.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.9)],
+        );
+        assert!(!refused(fading));
+        // The legacy bundle keys every number, the opacity included.
+        let mut bundle = slide();
+        let half = |k: Keyframe| Keyframe { opacity: 0.5, ..k };
+        bundle.keyframes = vec![half(keyed(0.0, 1.0, 0.0)), half(keyed(4.0, 1.5, 0.0))];
+        assert!(!refused(bundle));
+    }
+
+    #[test]
     fn a_text_overlay_is_live_to_its_end_in_an_export_frame_and_not_in_a_still() {
         let a = asset();
         let mut title = TextOverlay::new("Fish:chips", 1.0, 2.0);
