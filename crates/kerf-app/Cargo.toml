@@ -57,3 +57,10 @@ schemars.workspace = true
 axum.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["net"] }
+
+# Detached panels need two things from WebKitGTK that wry does not do: let a script open a
+# window without a user gesture, and close the window when the page closes its webview.
+# Versions are the ones Tauri itself resolves (they must match for the types to).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+webkit2gtk = "2.0"
