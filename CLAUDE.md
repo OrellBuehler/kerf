@@ -1533,6 +1533,26 @@ and a transport stream with a container start, plus six threads at once. The rul
   decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
   one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
 
+**`FrameCursor`** (A1b-3, `cursor.rs`) is the export's half: one clip's frames in output order
+from an **exclusive run** of its own (opened at the clip's `FpsPick::seek`, the export's `-ss`,
+with `run_args`; read on the caller's thread, registered with no router, cached nowhere).
+`cursor.pick(&Pick)` reads until `Pick::progress` decides and returns the shown frame, so its
+answer is `Pick::select`'s over the whole file — which `picked.rs` holds to the export's rendered
+frames. It keeps every timestamp read but only the pixels a later pick can show (`keep_from`): a
+forward clip holds a frame or two, a **reversed** one its whole window, capped by
+`CursorConfig::window_cap_bytes` (512 MiB; past it `Unsupported`, FFmpeg renders the clip).
+**Forward only**: a pick whose frame was dropped is an error, the same frame again is fine;
+`Before` of a run's first frame is `None` from the file's start and `Unsupported` otherwise. A
+repeated timestamp is accepted (the pick takes the file as it is), one going back is an error; a
+watchdog kills a read waiting past `first_frame_timeout` / `frame_timeout`, `Drop` kills the run.
+`FrameSource::cursor(layer, config)` opens one where runs are trusted (refused: the self-test
+failed, an unrecorded or alpha pixel format, a `late_seek` file); `cursor::picks_through` is the
+per-clip loop an export makes. `tests/cursor.rs` (`#[ignore]`d, both FFmpegs) decodes lossless
+**self-numbering** sources (16 bits in luma blocks: a 30 fps CFR, a VFR on the 1/30 grid, and one
+with repeated timestamps) and checks the number on every output frame of 90 clips (speeds 0.5 to
+4, forward and reverse, windows off the grid / from the start / to the end of the file, 24 / 29.97
+/ 30 / 60 fps) against `select`: 4290 frames.
+
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
 - **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and

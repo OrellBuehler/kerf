@@ -272,7 +272,7 @@ fn frame_ticks(fps: Option<f64>, tb: Rational) -> i64 {
 
 /// Whether the path is on: `KERF_FRAME_SOURCE=oneshot` turns it off, and so does a failed
 /// [`self_test`] (once per process).
-fn path_enabled() -> bool {
+pub(crate) fn path_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         if std::env::var("KERF_FRAME_SOURCE").is_ok_and(|v| v.eq_ignore_ascii_case("oneshot")) {
@@ -802,6 +802,39 @@ impl FrameSource {
         Ok(decoded?.map(Arc::new))
     }
 
+    /// A [`FrameCursor`](crate::FrameCursor) for `layer`'s clip: an exclusive run from where its
+    /// pick needs it, for the export's picks (`Pick::Fps`) output frame after output frame. It is
+    /// not registered with the router and shares no cache: an export reads every frame once.
+    /// `Unsupported` where frames from runs are not trusted (the self-test failed, the pixel format
+    /// was never recorded or is not known to be opaque, the file's seeks land late).
+    pub fn cursor(&self, layer: &PlanLayer, config: crate::CursorConfig) -> Result<crate::FrameCursor, GpuError> {
+        if !path_enabled() {
+            return Err(GpuError::Unsupported(
+                "decode runs are off in this process (the self-test failed)".into(),
+            ));
+        }
+        match layer.stream.pix_fmt.as_deref() {
+            None => {
+                return Err(GpuError::Unsupported(format!(
+                    "{}: the pixel format was never recorded (it may carry alpha)",
+                    layer.path
+                )))
+            }
+            Some(fmt) if kerf_core::model::pix_fmt_layout(fmt).is_none() => {
+                return Err(GpuError::Unsupported(format!(
+                    "{}: the pixel format {fmt} is not one known to be opaque (it may carry alpha)",
+                    layer.path
+                )))
+            }
+            Some(_) => {}
+        }
+        let source = SourceId::of(Path::new(&layer.path));
+        if self.shared.lock().files.get(&source).is_some_and(|f| f.late_seek) {
+            return Err(GpuError::Unsupported(format!("{}: its seeks land late", layer.path)));
+        }
+        crate::FrameCursor::for_layer(layer, config)
+    }
+
     /// Stop every run of `source` and forget its frames.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
@@ -899,7 +932,7 @@ fn stop(st: &mut State, id: RunId) {
     }
 }
 
-fn kill(child: &Mutex<Child>) {
+pub(crate) fn kill(child: &Mutex<Child>) {
     let mut c = child.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = c.kill();
     let _ = c.wait();
@@ -911,7 +944,7 @@ const STDERR_TAIL: usize = 4096;
 /// Parse a run's stderr into `showinfo` frames, keeping a tail of the rest for errors. A line
 /// the parser rejects ends the stream of frames with the error; the pipe is drained regardless,
 /// so `ffmpeg` never blocks on it.
-fn read_stderr(stderr: ChildStderr, tx: &Sender<Result<ShowFrame, String>>, tail: &Mutex<String>) {
+pub(crate) fn read_stderr(stderr: ChildStderr, tx: &Sender<Result<ShowFrame, String>>, tail: &Mutex<String>) {
     let mut parser = ShowinfoParser::new();
     let mut broken = false;
     for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {

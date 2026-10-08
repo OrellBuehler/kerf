@@ -68,6 +68,11 @@ Phase 1 of A1 (`feat/gpu-a1`, off `f14e06d`), revised after critique. Design onl
   - **Self-test**: `mpeg4` at 30000/1001 in mp4 on 1/30000 (no libx264 needed), from frame 5, seven frames, pts `1001 k` exactly; bounded at 10 s with a watchdog that kills either ffmpeg. `KERF_FRAME_SOURCE=oneshot` turns the path off on purpose.
   - **Parity compares decoded planes, not composites**: the first version compared `render_plan` and `render_plan_with` RGBA and failed once on 9.0.2 (`pip/odd-361x203-in-722x640 @ 0.5`); the frames were identical on that case in every run after (seven full suites on 9.0.2, two on 6.1.1, and a six-thread stress test), and rendering the same plan twice never differed, so the one-off was not reproduced. What is asserted is what is claimed: equal planes.
   - **Deferred**: the `proxy/` parity family and `Prefetch` (A4 drives both), the `FrameCursor` and reverse window (A1b-3).
+- **As landed in A1b-3** (`cursor.rs`, `FrameSource::cursor`, `tests/cursor.rs`). Differences from the text above:
+  - **The cursor is its own process, not a router run**: an export reads each frame once, so a cursor shares no cache and is not counted against `MAX_RUNS`; `FrameSource::cursor` only decides whether runs are trusted for the layer. It runs at the full CPU budget for now (A7 niced it under the lease).
+  - **The reverse window is not a separate type**: `Pick::progress` already says a reversed pick needs every frame of its window (`keep_from` = the window's first), so the one cursor holds them, bounded by `window_cap_bytes`; chunked backward GOP decode stays out of A1.
+  - **Repeated timestamps are accepted**: a matroska file whose 1/30 encoder grid rounds two frames onto one millisecond is a real file; the cursor takes the frames as the pick does. (`FrameSource`'s cache would key both frames alike — the first wins — a known limit for still picks on such files.)
+  - **Real-clip pick tests compare with `select`, not with the export**: `picked.rs` already holds `select` to rendered export frames (speeds, reverse, phases, rates, VFR, TS); this suite checks that the streaming cursor delivers those picks with the right pixels, on self-numbering sources, and is mutation-sensitive through `Pick::progress`'s own tests.
 
 ## 2. RenderPlan, complete (kerf-core)
 

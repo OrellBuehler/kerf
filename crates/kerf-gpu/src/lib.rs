@@ -127,6 +127,7 @@
 //! (`Pick::progress`).
 
 pub mod compositor;
+pub mod cursor;
 pub mod eq;
 pub mod frame_cache;
 pub mod frame_source;
@@ -139,6 +140,7 @@ pub mod sws;
 pub mod y4m;
 
 pub use compositor::{Compositor, RenderTimings, RgbaFrame};
+pub use cursor::{CursorConfig, FrameCursor};
 pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
