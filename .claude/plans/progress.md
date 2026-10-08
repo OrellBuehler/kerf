@@ -22,7 +22,7 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
 | B8 Motion | — | — | todo | |
 | A7 Export through the compositor | — | — | todo | |
 | fix: keyframed zoom + graph bugs | `fix/keyed-zoom` | — | merged (local) | Moving zoom runs last at the output frame (export, preview stream and still alike); keyed rotation fills transparent; tiny-scale clamp; even HDR fit sizes; alpha sources keep their cut-out. Deliberate golden re-blesses, each proven equal to its family. |
-| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
+| B9 Backlog | — | — | in-progress | Done: hardening (`feat/hardening-2`: hidden-until-themed window + failsafe, synchronous log writer, colour-literal + WCAG guards with Kerf Light fixes and a stored-theme upgrade, first-launch `.kerf`). Done: SRT/ASS caption import (`feat/caption-import`: tolerant parsers run outside the project lock, cut- or source-timed placement through the transcript caption path, offset, keep-lines, caps). Done: customizable keybindings (`feat/keybindings`: action registry, strict modifiers, override-only storage, Settings › Keyboard). Done: edit modes (`feat/edit-modes`: roll/slip/slide tools with a trim monitor, group split-and-remove on Q/W, cut welding). Done: linked A/V + detach audio (`feat/linked-av`: `link_id` / `source_audio`, group edits, range-based sync lock for J/L-cuts, orphan dissolve, fader-folding detach (a fresh lane for dynamics), pictures never cut to make room and trimmed sound reported, `extract_audio` doubling verified +6.02 dB and fixed, Rust-to-TS differential corpus). Done: menu bar + chrome rework (`feat/menu-bar`: VS Code-style File / Edit / View / Window / Help in the title bar over the keymap registry, the toolbar row removed and its controls moved into the Preview (transport) and Timeline (tools, ripple, snap, undo / redo, delivery frame); stored workspace layouts recorded against the panels their preset offered and brought up to date, so the mixer reaches an Audio saved before it; Reset workspace says what it did, Reset all added). Open: blurred background,  marker notes, split-and-remove, preview limiter, virtualisation, graph editor, lock checks in single-clip core ops, CSP in packaged builds, **export A/V offset for late-start sources** (a head clip's video is rebased to the clip start, `lead` early against its audio). |
 | fix: proxy late video start | `fix/proxy-late-video-start` | — | merged (local) | Padded proxies (`<hash>.lead.mp4`: one clone of frame 0 at t=0, timestamps kept, software encode); head clips drop the clone; TS left as a documented limit. |
 
 ## Decisions
@@ -443,9 +443,41 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   lossy for the picker, exact for the picture, and now documented rather than changed (`Easing::split`
   could keep one eased key there; the picture is already right).
 
+- **2026-10-08 — B9: menu bar, no toolbar row; stored layouts carry what they were offered.**
+  Reported from the Windows build: *Reset Color workspace* "does nothing" and Audio looked
+  like Motion with no Mixer. The reset path was run end to end in the browser harness (a
+  rearranged layout, a tab dragged to another group, a closed panel, a stale entry from the
+  older build that wrote every visited workspace, five window sizes and device pixel ratios,
+  a folded library) and **always put the preset on the dock and cleared the entry** — so no
+  race with the single-flight write, the reference logic or the legacy `layout` was found
+  (the legacy layout only ever becomes Edit). What the report matches is state: the build
+  that wrote an entry for every workspace the user merely visited left a *copy of that day's
+  preset* behind for each, so Reset on Color put back a layout the same as the one it
+  replaced (nothing visible changed, and nothing said so), while Audio's copy predated the
+  Mixer and never would learn about it — a stored layout is a snapshot, and nothing recorded
+  what it was a snapshot of. Fixed there: each stored layout records the panels its preset
+  offered (`offered`); on read a copy of a preset is dropped, a panel the preset gained is put
+  where the preset has it (`insertPanel`: tab mates, else beside the nearest neighbour with
+  the preset's share, else a tab by the preview — never a reset to make room), a panel the
+  layout was offered and lacks stays closed; Reset forgets the library tab too, says what it
+  did (including "already default"), and a dock that takes neither layout nor preset is
+  reported. **Not found, so not claimed:** a case where the live dock ignores a reset. If the
+  Windows build still shows one, the new error toast and the log (`webview` target) will say
+  why. Chrome: the toolbar row and the rule under the title bar are gone, the dock starts under
+  the title bar; the menus are one widget over one data file, every entry a registry action
+  (so the key shown is the user's) or a typed command. **Decisions:** the version chip, the
+  gear and the bell stay at the right (the chip is the only thing that says an update is
+  waiting; Help also has *Check for updates…*); the project name and badge sit at the right
+  of the title bar and the path moved to the status bar (the left cell is the menus'); Save
+  is one entry that reads "as…" once there is a file, because `save_project_as` is the only
+  save; Quit reuses the close guard's `destroy` (no new capability); new actions are unbound
+  except `S` for snapping. The window keeps native decorations — custom ones (menus in the
+  caption bar) are a follow-up, not this change.
+
 ## Needs a real machine
 
 - B1–B3: every UI change was verified in the browser harness only; the Tauri desktop window (WebKitGTK / WebView2 / WKWebView canvas, events like `ripple-mode-changed`, real `get_waveform_range` / `get_filmstrip` against footage) needs a desktop run.
+- B9 menu bar: on Windows (WebView2) the title-bar menus under the native caption bar, Alt / F10 focus, an Alt-drag in the timeline not stealing focus, and the new Reset workspace feedback against the stored layouts of the build that reported it.
 - B9 hardening: first visible frame / no flash per OS, the 3 s failsafe, focus, second launch mid-boot, a mistyped `.kerf`, the CSP in packaged Windows/macOS builds.
 - B4: `get_levels` on a real long multi-track cut (here: synthetic tones, ~100x real time per true-peak meter) and the Mixer panel's meters against real playback.
 - A0: kerf-gpu on a real GPU (Vulkan/Metal/DX12) and WARP; macOS has no software adapter (`KERF_GPU_ADAPTER=hardware`). Real-GPU still timings.
