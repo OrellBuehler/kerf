@@ -2389,10 +2389,15 @@ fn set_settings(
 ) -> CmdResult<settings::SettingsView> {
     let stored = settings::update(&app, &patch)?;
     if patch.get("gpu_preview").is_some() {
-        // Turning it off hides the surface and frees the device, which may wait for a frame in
-        // flight: not on this thread.
-        let (gpu, on) = (gpu.inner().clone(), stored.gpu_preview);
-        std::thread::spawn(move || gpu.set_enabled(on));
+        if stored.gpu_preview {
+            // Turning it on is a flag: the next frame the page asks for must already see it.
+            gpu.set_enabled(true);
+        } else {
+            // Turning it off hides the surface and frees the device, which may wait for a frame
+            // in flight: not on this thread.
+            let gpu = gpu.inner().clone();
+            std::thread::spawn(move || gpu.set_enabled(false));
+        }
     }
     Ok(settings::SettingsView::current(&stored))
 }
