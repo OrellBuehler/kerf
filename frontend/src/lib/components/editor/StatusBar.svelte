@@ -97,7 +97,9 @@
 		     visible and stoppable. -->
 		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--kerf-300)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
-			Exporting {Math.round((editor.exportRun.progress?.fraction ?? 0) * 100)}%
+			{#if editor.exportRun.progress?.waiting}Export {editor.exportRun.progress.waiting}…{:else}Exporting {Math.round(
+					(editor.exportRun.progress?.fraction ?? 0) * 100
+				)}%{/if}
 		</span>
 		<button
 			type="button"

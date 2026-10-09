@@ -262,14 +262,13 @@
 					>
 						What to analyze
 					</div>
-					<div style="margin-top:8px;display:flex;flex-direction:column;gap:2px;opacity:{settings.autoAnalysis.enabled ? 1 : 0.55}">
+					<div style="margin-top:8px;display:flex;flex-direction:column;gap:2px">
 						{#each ANALYSIS_KINDS as k (k.kind)}
 							<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:5px 0">
 								<input
 									type="checkbox"
 									data-testid="auto-analysis-{k.kind}"
 									checked={settings.autoAnalysis[k.kind]}
-									disabled={!settings.autoAnalysis.enabled}
 									onchange={(e) => settings.setAutoKind(k.kind, e.currentTarget.checked)}
 									style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
 								/>
@@ -281,8 +280,8 @@
 						{/each}
 					</div>
 					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
-						These also decide what an agent's analyze_asset runs when it names no steps. A clip can always be
-						analyzed by hand, whatever is switched off here.
+						With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
+						runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
 					</p>
 				{:else if section === 'speech'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">

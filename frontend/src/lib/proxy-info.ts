@@ -2,6 +2,7 @@
 // menu, the settings' wording and the status bar's "which file is this frame from". Pure.
 
 import { fmtDuration } from './media-info';
+export { PROXY_WAIT_PREFIX, isProxyWaitMessage } from './proxy-wait';
 import type { Asset, PreviewSource, ProxySize, ProxyStatus, Timeline } from './types';
 
 export type BadgeTone = 'neutral' | 'kerf' | 'agent' | 'success' | 'warning' | 'danger';
@@ -166,7 +167,7 @@ export const PREVIEW_SOURCES: readonly { source: PreviewSource; label: string; h
 	{
 		source: 'proxy_only',
 		label: 'Proxy only',
-		hint: 'Never decode the original: a clip whose proxy is still building waits for it.'
+		hint: 'The Preview panel and playback never decode the original: a clip whose proxy is still building waits for it. Thumbnails, the source monitor, zoom and an agent’s frames can still read the original.'
 	}
 ];
 

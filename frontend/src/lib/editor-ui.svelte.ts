@@ -404,7 +404,14 @@ class EditorUi {
 		await mediaStatus.refresh();
 		const available = this.transcription?.available ?? false;
 		const jobs = assetIds
-			.map((id) => ({ id, steps: autoSteps(auto, mediaStatus.analysis(id), available) }))
+			.map((id) => {
+				const asset = editor.assets.find((a) => a.id === id);
+				const media = {
+					audio: asset?.streams.some((s) => s.kind === 'audio') ?? true,
+					image: asset?.streams.some((s) => s.image) ?? false
+				};
+				return { id, steps: autoSteps(auto, mediaStatus.analysis(id), available, media) };
+			})
 			.filter((j) => j.steps.length > 0);
 		await this.analyzeQueue(jobs);
 	}

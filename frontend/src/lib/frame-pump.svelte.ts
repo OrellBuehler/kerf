@@ -9,6 +9,7 @@
 // as its two primitives in `run` — the only parts of it that should bring a frame back — and handed
 // to `pump` as values.
 
+import { isProxyWaitMessage } from './proxy-wait';
 import type { PreviewFrameResult } from './types';
 
 export interface FramePumpDeps {
@@ -61,6 +62,14 @@ export function createFramePump(deps: FramePumpDeps) {
 				try {
 					result = await deps.previewFrame(want.time, want.overlays);
 				} catch (error) {
+					// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
+					// the preview waiting, not the GPU path failing: the picture on show (and the surface,
+					// if it is up) stays as it is until the proxy lands and the frame is asked for again.
+					if (isProxyWaitMessage(error)) {
+						inFlight = false;
+						if (queued !== null) void pump();
+						return;
+					}
 					// The command itself failed (a panic in the GPU path, an error building the inputs): this
 					// frame is the JPEG, and the surface must not stay over it.
 					deps.gpuFailed(error);

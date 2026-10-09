@@ -115,20 +115,39 @@ function stateOf(status: AnalysisStatus | null | undefined, kind: AnalysisKind):
 	return status?.kinds.find((k) => k.kind === kind)?.state ?? 'not_run';
 }
 
+/** What an asset is, for deciding what is worth running on it. */
+export interface MediaTraits {
+	/** Has an audio stream: without one there is no silence, loudness, rhythm or speech to find. */
+	audio: boolean;
+	/** A still image: nothing to analyze at all. */
+	image: boolean;
+}
+
+/** Whether a kind reads the audio (everything but scene detection — `AnalysisKind::needs_audio`). */
+export function needsAudio(kind: AnalysisKind): boolean {
+	return kind !== 'scenes';
+}
+
 /**
  * What an import runs on a new asset: the kinds the toggles allow that are not already done
  * (re-importing a file the project holds must not redo its transcription), without the
- * transcript when there is no speech backend. Empty when the master switch is off.
+ * transcript when there is no speech backend, and without anything that reads sound when the
+ * file has none (silent b-roll would otherwise get a failed transcript chip and an error toast
+ * on every import). A still has nothing to analyze. Empty when the master switch is off.
  */
 export function autoSteps(
 	auto: AutoAnalysis,
 	status: AnalysisStatus | null | undefined,
-	transcriptionAvailable: boolean
+	transcriptionAvailable: boolean,
+	media: MediaTraits = { audio: true, image: false }
 ): AnalysisKind[] {
-	if (!auto.enabled) return [];
+	if (!auto.enabled || media.image) return [];
 	return ALL_KINDS.filter(
 		(kind) =>
-			auto[kind] && stateOf(status, kind) !== 'done' && (kind !== 'transcript' || transcriptionAvailable)
+			auto[kind] &&
+			stateOf(status, kind) !== 'done' &&
+			(kind !== 'transcript' || transcriptionAvailable) &&
+			(media.audio || !needsAudio(kind))
 	);
 }
 
@@ -171,13 +190,14 @@ export interface AnalyzeChoice {
  */
 export function analyzeChoices(
 	status: AnalysisStatus | null | undefined,
-	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; transcriptionAvailable?: boolean } = {}
+	opts: { voiceover?: boolean; busy?: boolean; audio?: boolean; image?: boolean; transcriptionAvailable?: boolean } = {}
 ): AnalyzeChoice[] {
-	const { voiceover = false, busy = false, audio = true, transcriptionAvailable = true } = opts;
+	const { voiceover = false, busy = false, audio = true, image = false, transcriptionAvailable = true } = opts;
 	const why = (kind: AnalysisKind | 'all'): string | undefined => {
+		if (image) return 'a still image has nothing to analyze';
 		if (voiceover) return 'its transcript is the script it was read from';
 		if (busy) return 'an analysis is already running';
-		if (!audio && kind !== 'scenes' && kind !== 'all') return 'this file has no audio';
+		if (!audio && kind !== 'all' && needsAudio(kind)) return 'this file has no audio';
 		if (kind === 'transcript' && !transcriptionAvailable) return 'no speech-to-text backend is available';
 		return undefined;
 	};
@@ -194,7 +214,9 @@ export function analyzeChoices(
 			reason
 		};
 	});
-	const everything = ANALYSIS_KINDS.filter((k) => transcriptionAvailable || k.kind !== 'transcript').map((k) => k.kind);
+	const everything = ANALYSIS_KINDS.filter(
+		(k) => (transcriptionAvailable || k.kind !== 'transcript') && (audio || !needsAudio(k.kind))
+	).map((k) => k.kind);
 	const reason = why('all');
 	const allDone = everything.every((k) => stateOf(status, k) === 'done');
 	choices.push({

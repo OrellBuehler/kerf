@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { fmtBytes, previewSourceNote, proxyActions, proxyBadge, proxyFacts } from './proxy-info';
+import {
+	PREVIEW_SOURCES,
+	PROXY_WAIT_PREFIX,
+	fmtBytes,
+	isProxyWaitMessage,
+	previewSourceNote,
+	proxyActions,
+	proxyBadge,
+	proxyFacts
+} from './proxy-info';
 import type { Asset, ProxyStatus, Timeline } from './types';
 
 const st = (state: ProxyStatus['state'], extra: Partial<ProxyStatus> = {}): ProxyStatus => ({ asset_id: 'a', state, ...extra });
@@ -113,5 +122,24 @@ describe('the status bar line: which file is this frame from', () => {
 		expect(note({ g: st('ready') }, 'auto', 1280, 25)).toBeNull();
 		const onlyStill = { tracks: [{ kind: 'video', clips: [{ asset_id: 's', source_in: 0, source_out: 5, timeline_start: 0 }] }] } as unknown as Timeline;
 		expect(previewSourceNote(onlyStill, [still], {}, 'auto', 1280, 1)).toBeNull();
+	});
+});
+
+describe('the proxy-only refusal', () => {
+	test('is recognized by the prefix the backend writes, as an Error or a string, and nothing else is', () => {
+		const said = `${PROXY_WAIT_PREFIX} of GOPR0042.MP4 and 2 more — building it (42%)`;
+		expect(isProxyWaitMessage(new Error(said))).toBe(true);
+		expect(isProxyWaitMessage(said)).toBe(true);
+		expect(isProxyWaitMessage(new Error('the GPU path panicked'))).toBe(false);
+		expect(isProxyWaitMessage('Playback preview failed: ffmpeg died')).toBe(false);
+		expect(isProxyWaitMessage(null)).toBe(false);
+		expect(isProxyWaitMessage(undefined)).toBe(false);
+	});
+
+	test('the source hint says what Proxy only really governs', () => {
+		const hint = PREVIEW_SOURCES.find((p) => p.source === 'proxy_only')!.hint;
+		expect(hint).toMatch(/Preview panel and playback/);
+		expect(hint).toMatch(/Thumbnails|thumbnails/);
+		expect(hint).toMatch(/zoom/);
 	});
 });

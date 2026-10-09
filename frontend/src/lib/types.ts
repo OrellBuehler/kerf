@@ -866,6 +866,9 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
+	/** Set while the render has not started because the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`): a queued export is not hung at 0%. */
+	waiting?: string | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
 	variant?: number;
@@ -945,7 +948,7 @@ export interface VoiceoverStatus {
 
 /** Payload of the `voiceover-progress` event, from the GUI or an agent. */
 export interface VoiceoverProgress {
-	stage: 'download_runtime' | 'download_model' | 'download_voice' | 'synthesize';
+	stage: 'download_runtime' | 'download_model' | 'download_voice' | 'synthesize' | 'waiting';
 	fraction: number | null;
 	/** A short note, e.g. `42 MB / 88 MB` or `3 of 7 sentences`. */
 	detail: string | null;

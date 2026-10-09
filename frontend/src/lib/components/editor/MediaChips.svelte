@@ -36,7 +36,12 @@
 
 <div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center" data-testid="media-chips">
 	{#if proxy && badge}
-		<span title={badge.title} data-testid="proxy-badge" data-state={mediaStatus.proxy(assetId)?.state}>
+		<span
+			title={badge.title}
+			aria-label={badge.title}
+			data-testid="proxy-badge"
+			data-state={mediaStatus.proxy(assetId)?.state}
+		>
 			<Badge tone={badge.tone} dot={mediaStatus.proxy(assetId)?.state === 'building'}>{badge.text}</Badge>
 		</span>
 	{/if}
@@ -46,6 +51,7 @@
 				<span
 					role="listitem"
 					title={chip.title}
+					aria-label={chip.title}
 					data-testid="analysis-chip"
 					data-kind={chip.kind}
 					data-state={chip.state}

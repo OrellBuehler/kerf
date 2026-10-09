@@ -124,7 +124,8 @@ const STAGE_LABELS: Record<VoiceoverProgress['stage'], string> = {
 	download_runtime: 'Downloading voice runtime…',
 	download_model: 'Downloading voice model…',
 	download_voice: 'Downloading voice…',
-	synthesize: 'Reading the script…'
+	synthesize: 'Reading the script…',
+	waiting: 'Waiting for the machine…'
 };
 
 export function stageLabel(stage: VoiceoverProgress['stage']): string {

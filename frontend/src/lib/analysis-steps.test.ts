@@ -10,6 +10,7 @@ import {
 	doneSummary,
 	kindOfStage,
 	missingSteps,
+	needsAudio,
 	stateWord
 } from './analysis-steps';
 import type { AnalysisKind, AnalysisState, AnalysisStatus, AssetAnalysis, AutoAnalysis } from './types';
@@ -82,6 +83,34 @@ describe('what an import runs', () => {
 	test('the master switch off runs nothing, and transcription needs a backend', () => {
 		expect(autoSteps({ ...ALL_ON, enabled: false }, undefined, true)).toEqual([]);
 		expect(autoSteps(ALL_ON, undefined, false)).toEqual(['silence', 'scenes', 'loudness', 'rhythm']);
+	});
+});
+
+describe('silent footage and stills', () => {
+	const silent = { audio: false, image: false };
+
+	test('an import asks silent b-roll for scenes only: no failed transcript chip on every import', () => {
+		expect(autoSteps(ALL_ON, undefined, true, silent)).toEqual(['scenes']);
+		// …whatever the toggles, and once scenes is done there is nothing left to run.
+		expect(autoSteps(ALL_ON, status({ scenes: 'done' }), true, silent)).toEqual([]);
+		expect(autoSteps({ ...ALL_ON, scenes: false }, undefined, true, silent)).toEqual([]);
+		// A file with sound is unchanged.
+		expect(autoSteps(ALL_ON, undefined, true, { audio: true, image: false })).toEqual([...ALL_KINDS]);
+		expect(needsAudio('scenes')).toBe(false);
+		expect(ALL_KINDS.filter(needsAudio)).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+	});
+
+	test('a still image is analysed by nothing', () => {
+		expect(autoSteps(ALL_ON, undefined, true, { audio: false, image: true })).toEqual([]);
+		const choices = analyzeChoices(undefined, { image: true });
+		expect(choices.every((c) => c.disabled && /still image/.test(c.reason ?? ''))).toBe(true);
+	});
+
+	test('the menu leaves out what a silent file cannot run, even under "everything"', () => {
+		const choices = analyzeChoices(undefined, { audio: false });
+		expect(choices.find((c) => c.id === 'all')?.steps).toEqual(['scenes']);
+		expect(choices.find((c) => c.id === 'loudness')?.disabled).toBe(true);
+		expect(choices.find((c) => c.id === 'scenes')?.disabled).toBe(false);
 	});
 });
 
