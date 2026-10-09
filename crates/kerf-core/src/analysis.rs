@@ -48,6 +48,25 @@ impl AnalysisProgress {
 /// A progress sink for an analysis pass.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(AnalysisProgress);
 
+/// Told about the analysis found so far — the patch of everything finished — after each
+/// step that finishes, so a caller can cache it then rather than after the last.
+pub type StepFn<'a> = &'a mut dyn FnMut(&AssetAnalysis);
+
+/// What a step reports while it waits for the machine's heavy-job slot.
+fn waiting(wait: crate::engine::cpu::Wait) -> AnalysisProgress {
+    AnalysisProgress {
+        stage: "waiting".to_string(),
+        fraction: None,
+        detail: Some(wait.message().to_string()),
+    }
+}
+
+/// Wait for the heavy-job slot in the background lane, saying why through `progress`, and
+/// give up if `cancel` turns true while queued.
+fn wait_for_slot(progress: ProgressFn, cancel: CancelFn) -> Result<crate::engine::cpu::Lease> {
+    crate::engine::cpu::lease_waiting(&mut |w| progress(waiting(w)), cancel)
+}
+
 /// Polled while an analysis pass runs; once it returns true the pass gives up
 /// with [`Error::Cancelled`] instead of finishing.
 ///
@@ -204,6 +223,9 @@ pub struct WhisperFilterTranscriber {
 impl Transcriber for WhisperFilterTranscriber {
     fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
         let model = whisper::ensure_model(&mut model_progress(progress), cancel)?;
+        // After the download, which is not heavy work and must not hold the slot: the
+        // inference below nests inside this lease.
+        let _slot = wait_for_slot(progress, cancel)?;
         progress(AnalysisProgress::with_fraction("transcribe", 0.0));
         whisper::transcribe(
             std::path::Path::new(&asset.path),
@@ -230,6 +252,7 @@ pub struct WhisperTranscriber {
 impl Transcriber for WhisperTranscriber {
     fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
         let model = whisper::ensure_model(&mut model_progress(progress), cancel)?;
+        let _slot = wait_for_slot(progress, cancel)?;
         progress(AnalysisProgress::with_fraction("transcribe", 0.0));
         if cancel() {
             return Err(Error::Cancelled);
@@ -746,21 +769,66 @@ pub fn default_kinds() -> Vec<AnalysisKind> {
     kinds
 }
 
-/// Run `kinds` (all [`default_kinds`] when `None`) against an asset's media with the
-/// default providers: FFmpeg silence / scene / loudness / rhythm detection, and
+/// The steps a request for `requested` (the [`default_kinds`] when `None`) actually runs on
+/// `asset`: a file with no audio has none of silence, loudness, rhythm or speech to find, so
+/// those are left out rather than run to nothing or fail, and a still image has nothing to
+/// analyze at all. An empty answer is an error that says why — a caller that names no steps
+/// while everything is switched off, or one that asks a silent file for its speech, is told,
+/// not handed an empty result.
+pub fn resolve_steps(asset: &Asset, requested: Option<&[AnalysisKind]>) -> Result<Vec<AnalysisKind>> {
+    if asset.is_image() {
+        return Err(Error::InvalidArgument(format!(
+            "{} is a still image: there is nothing to analyze",
+            asset.name
+        )));
+    }
+    let wanted = requested.map(<[AnalysisKind]>::to_vec).unwrap_or_else(default_kinds);
+    let has_audio = asset.has_audio();
+    let kinds: Vec<AnalysisKind> = AnalysisKind::ALL
+        .into_iter()
+        .filter(|k| wanted.contains(k) && (has_audio || !k.needs_audio()))
+        .collect();
+    if !kinds.is_empty() {
+        return Ok(kinds);
+    }
+    Err(Error::InvalidArgument(if wanted.is_empty() {
+        "no analysis steps to run: every analysis is switched off in Settings › Analysis (name steps — silence, scenes, loudness, rhythm, transcript — to run them anyway)".to_string()
+    } else {
+        format!(
+            "{} has no audio, so {} cannot run on it; only scene detection applies",
+            asset.name,
+            AnalysisKind::ALL
+                .into_iter()
+                .filter(|k| wanted.contains(k))
+                .map(|k| k.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }))
+}
+
+/// Run `kinds` (the [`default_kinds`] when `None`, see [`resolve_steps`]) against an asset's
+/// media with the default providers: FFmpeg silence / scene / loudness / rhythm detection, and
 /// speech-to-text through whichever whisper backend this build has.
 ///
 /// This is the heavy, ffmpeg-bound part of analysis, a free function so a caller
 /// holding the shared `Project` lock can release it before running this and take it
 /// again only to cache the result ([`crate::project::Project::merge_analysis`]).
 ///
-/// Only the steps named run, in pass order; the result is a patch holding what they
-/// found, to merge into whatever is already cached. The check for `cancel` lands
-/// between steps *and* inside transcription, where the wait is: a model download and
-/// then inference for minutes.
-pub fn analyze_asset_steps(asset: &Asset, kinds: Option<&[AnalysisKind]>, progress: ProgressFn, cancel: CancelFn) -> StepsRun {
-    let default = default_kinds();
-    let kinds = kinds.unwrap_or(&default);
+/// Only the steps named run, in pass order, in the **background lane** of the heavy-job queue
+/// (behind exports and preview proxies, saying so while they wait); the result is a patch
+/// holding what they found, to merge into whatever is already cached. `on_step` hears the
+/// patch after each step that finishes. The check for `cancel` lands between steps, while
+/// queued, *and* inside transcription, where the wait is: a model download and then
+/// inference for minutes.
+pub fn analyze_asset_steps(
+    asset: &Asset,
+    kinds: Option<&[AnalysisKind]>,
+    progress: ProgressFn,
+    on_step: StepFn,
+    cancel: CancelFn,
+) -> Result<StepsRun> {
+    let kinds = resolve_steps(asset, kinds)?;
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
@@ -783,15 +851,27 @@ pub fn analyze_asset_steps(asset: &Asset, kinds: Option<&[AnalysisKind]>, progre
         loudness: &loudness,
         rhythm: &rhythm,
     };
-    analyze_steps(asset, kinds, &providers, progress, cancel)
+    Ok(analyze_steps(asset, &kinds, &providers, progress, on_step, cancel))
 }
 
-/// [`analyze_asset_steps`] over given providers.
+/// [`analyze_asset_steps`] over given providers (and the steps as given, unresolved).
 pub fn analyze_steps(
     asset: &Asset,
     kinds: &[AnalysisKind],
     providers: &AnalysisProviders,
     progress: ProgressFn,
+    on_step: StepFn,
+    cancel: CancelFn,
+) -> StepsRun {
+    crate::engine::cpu::in_background(|| run_steps(asset, kinds, providers, progress, on_step, cancel))
+}
+
+fn run_steps(
+    asset: &Asset,
+    kinds: &[AnalysisKind],
+    providers: &AnalysisProviders,
+    progress: ProgressFn,
+    on_step: StepFn,
     cancel: CancelFn,
 ) -> StepsRun {
     let mut run = StepsRun {
@@ -806,27 +886,27 @@ pub fn analyze_steps(
             run.cancelled = true;
             break;
         }
-        // Wait for the machine's one heavy-job slot here rather than inside the step, so
-        // the wait can be said out loud — "a preview proxy goes first" — instead of the
-        // step looking hung while it sits in the queue. The step's own lease then nests.
-        // Transcription is left to take its own: its model download is not heavy work
-        // and must not hold the slot while it fetches.
-        let _slot = (kind != AnalysisKind::Transcript).then(|| {
-            if let Some(wait) = crate::engine::cpu::normal_wait() {
-                progress(AnalysisProgress {
-                    stage: "waiting".to_string(),
-                    fraction: None,
-                    detail: Some(
-                        match wait {
-                            crate::engine::cpu::Wait::Proxy => "waiting for the preview proxy",
-                            crate::engine::cpu::Wait::Job => "waiting for another job to finish",
-                        }
-                        .to_string(),
-                    ),
-                });
+        // Wait for the machine's one heavy-job slot here rather than inside the step, so the
+        // wait can be said out loud — "a preview proxy goes first" — and Stop works while the
+        // step is still queued. The step's own lease then nests. Transcription takes its
+        // own, after its model download, which is not heavy work and must not hold the slot
+        // while it fetches.
+        let _slot = if kind == AnalysisKind::Transcript {
+            None
+        } else {
+            match wait_for_slot(progress, cancel) {
+                Ok(slot) => Some(slot),
+                Err(_) => {
+                    run.cancelled = true;
+                    break;
+                }
             }
-            crate::engine::cpu::lease()
-        });
+        };
+        // Stopped while queued: do not start a whole-file pass the user has just abandoned.
+        if cancel() {
+            run.cancelled = true;
+            break;
+        }
         progress(AnalysisProgress::stage(match kind {
             AnalysisKind::Transcript => "transcribe",
             other => other.name(),
@@ -855,6 +935,7 @@ pub fn analyze_steps(
             Ok(()) => {
                 note_result(asset.id, kind, None);
                 run.patch.ran.push(kind);
+                on_step(&run.patch);
             }
             Err(Error::Cancelled) => {
                 run.cancelled = true;
@@ -875,7 +956,7 @@ pub fn analyze_steps(
 /// Run the default steps and return what they found (the whole of a first analysis).
 /// Errors when the run was cancelled or no step finished.
 pub fn analyze_asset_media(asset: &Asset) -> Result<AssetAnalysis> {
-    analyze_asset_steps(asset, None, &mut |_| {}, NEVER_CANCEL).into_result()
+    analyze_asset_steps(asset, None, &mut |_| {}, &mut |_| {}, NEVER_CANCEL)?.into_result()
 }
 
 #[cfg(test)]
@@ -988,7 +1069,7 @@ mod tests {
             loudness: &lo,
             rhythm: &rh,
         };
-        analyze_steps(asset, kinds, &providers, &mut |_| {}, NEVER_CANCEL)
+        analyze_steps(asset, kinds, &providers, &mut |_| {}, &mut |_| {}, NEVER_CANCEL)
     }
 
     #[test]
@@ -1026,7 +1107,15 @@ mod tests {
         let null = NullAnalyzer;
         let mut providers = AnalysisProviders::null(&null);
         providers.silence = &Quiet;
-        let patch = analyze_steps(&a, &[AnalysisKind::Silence], &providers, &mut |_| {}, NEVER_CANCEL).patch;
+        let patch = analyze_steps(
+            &a,
+            &[AnalysisKind::Silence],
+            &providers,
+            &mut |_| {},
+            &mut |_| {},
+            NEVER_CANCEL,
+        )
+        .patch;
         cached.merge(&patch);
         assert!(cached.silence_segments.is_empty(), "the re-run replaced silence");
         assert_eq!(cached.scene_changes, [5.0, 9.0], "scenes kept");
@@ -1098,6 +1187,7 @@ mod tests {
                 &[AnalysisKind::Silence],
                 &providers,
                 &mut |p| seen.lock().unwrap().push((p.stage, p.detail)),
+                &mut |_| {},
                 NEVER_CANCEL,
             )
         });
@@ -1126,6 +1216,187 @@ mod tests {
         assert_eq!(run.patch.ran, [AnalysisKind::Silence]);
         let said: Vec<String> = stages.lock().unwrap().iter().map(|(s, _)| s.clone()).collect();
         assert_eq!(said, ["waiting", "silence", "done"]);
+    }
+
+    /// A step stopped while it is still queued behind another job never starts: not at the
+    /// start of the loop, not in the queue, and not in the instant the slot comes free.
+    #[test]
+    fn stop_works_while_a_step_is_queued_and_a_stopped_step_never_starts_its_pass() {
+        let _gate = crate::engine::cpu::test_lock();
+        let held = crate::engine::cpu::lease();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let fake = std::sync::Arc::new(Fake::new());
+        let worker = {
+            let (cancel, stages, fake) = (cancel.clone(), stages.clone(), fake.clone());
+            let a = asset();
+            std::thread::spawn(move || {
+                let (si, sc, lo, rh, tr) = (
+                    Probe(&fake, AnalysisKind::Silence),
+                    Probe(&fake, AnalysisKind::Scenes),
+                    Probe(&fake, AnalysisKind::Loudness),
+                    Probe(&fake, AnalysisKind::Rhythm),
+                    Probe(&fake, AnalysisKind::Transcript),
+                );
+                let providers = AnalysisProviders {
+                    silence: &si,
+                    scene: &sc,
+                    transcriber: &tr,
+                    loudness: &lo,
+                    rhythm: &rh,
+                };
+                analyze_steps(
+                    &a,
+                    &[AnalysisKind::Silence, AnalysisKind::Scenes],
+                    &providers,
+                    &mut |p| stages.lock().unwrap().push(p.stage),
+                    &mut |_| {},
+                    &|| cancel.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+        };
+        let start = std::time::Instant::now();
+        while stages.lock().unwrap().is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the queued step said nothing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(stages.lock().unwrap()[0], "waiting", "it says it is queued");
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let run = worker.join().unwrap();
+        drop(held);
+        assert!(run.cancelled && run.patch.ran.is_empty());
+        assert!(
+            fake.ran.lock().unwrap().is_empty(),
+            "no pass ran: {:?}",
+            fake.ran.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stop_that_lands_as_the_slot_comes_free_does_not_start_the_pass() {
+        let _gate = crate::engine::cpu::test_lock();
+        let fake = Fake::new();
+        // The slot is free, so the queue wait never polls the flag: the loop's check before the
+        // wait is the first call and the one right after the slot is taken the second. Stop on
+        // the second.
+        let calls = std::cell::Cell::new(0);
+        let (si, sc, lo, rh, tr) = (
+            Probe(&fake, AnalysisKind::Silence),
+            Probe(&fake, AnalysisKind::Scenes),
+            Probe(&fake, AnalysisKind::Loudness),
+            Probe(&fake, AnalysisKind::Rhythm),
+            Probe(&fake, AnalysisKind::Transcript),
+        );
+        let providers = AnalysisProviders {
+            silence: &si,
+            scene: &sc,
+            transcriber: &tr,
+            loudness: &lo,
+            rhythm: &rh,
+        };
+        let run = analyze_steps(
+            &asset(),
+            &[AnalysisKind::Silence],
+            &providers,
+            &mut |_| {},
+            &mut |_| {},
+            &|| {
+                calls.set(calls.get() + 1);
+                calls.get() >= 2
+            },
+        );
+        assert!(run.cancelled);
+        assert!(fake.ran.lock().unwrap().is_empty(), "the pass started after the stop");
+    }
+
+    #[test]
+    fn the_caller_hears_the_analysis_after_each_step_that_finishes() {
+        let _gate = crate::engine::cpu::test_lock();
+        let fake = Fake::new();
+        let (si, sc, lo, rh, tr) = (
+            Probe(&fake, AnalysisKind::Silence),
+            Probe(&fake, AnalysisKind::Scenes),
+            Probe(&fake, AnalysisKind::Loudness),
+            Probe(&fake, AnalysisKind::Rhythm),
+            Probe(&fake, AnalysisKind::Transcript),
+        );
+        let providers = AnalysisProviders {
+            silence: &si,
+            scene: &sc,
+            transcriber: &tr,
+            loudness: &lo,
+            rhythm: &rh,
+        };
+        let mut heard: Vec<Vec<AnalysisKind>> = Vec::new();
+        analyze_steps(
+            &asset(),
+            &[AnalysisKind::Silence, AnalysisKind::Scenes, AnalysisKind::Loudness],
+            &providers,
+            &mut |_| {},
+            &mut |so_far| heard.push(so_far.ran.clone()),
+            NEVER_CANCEL,
+        );
+        // Each call carries everything finished so far, so a cache written after each one holds
+        // the cheap results while the slow ones run.
+        assert_eq!(
+            heard,
+            [
+                vec![AnalysisKind::Silence],
+                vec![AnalysisKind::Silence, AnalysisKind::Scenes],
+                vec![AnalysisKind::Silence, AnalysisKind::Scenes, AnalysisKind::Loudness]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_audio_is_not_asked_for_sound_and_nothing_to_run_is_an_error() {
+        let _gate = crate::engine::cpu::test_lock();
+        use crate::engine::test_support::{img_asset, test_asset, video_stream};
+        let silent = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        // Named steps: the audio ones are left out, scene detection stays.
+        assert_eq!(
+            resolve_steps(&silent, Some(&AnalysisKind::ALL)).unwrap(),
+            [AnalysisKind::Scenes],
+            "silent b-roll gets no silence, loudness, rhythm or transcript to fail on"
+        );
+        // Only audio steps named: an error that says why, not an empty run.
+        let err = resolve_steps(&silent, Some(&[AnalysisKind::Transcript, AnalysisKind::Silence]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no audio") && err.contains("silence, transcript"), "{err}");
+        // A file with sound keeps everything named, in pass order.
+        let with_sound = asset();
+        assert_eq!(
+            resolve_steps(&with_sound, Some(&[AnalysisKind::Transcript, AnalysisKind::Rhythm])).unwrap(),
+            [AnalysisKind::Rhythm, AnalysisKind::Transcript]
+        );
+        // A still has nothing to analyze.
+        let still = img_asset(Uuid::new_v4());
+        assert!(resolve_steps(&still, Some(&AnalysisKind::ALL))
+            .unwrap_err()
+            .to_string()
+            .contains("still image"));
+        // Nothing named and nothing switched on: told so, with the way out.
+        let off = AutoAnalysis {
+            silence: false,
+            scenes: false,
+            loudness: false,
+            rhythm: false,
+            transcript: false,
+            ..AutoAnalysis::default()
+        };
+        let previous = auto_analysis();
+        set_auto_analysis(off);
+        let none = resolve_steps(&with_sound, None);
+        set_auto_analysis(previous);
+        let err = none.unwrap_err().to_string();
+        assert!(
+            err.contains("switched off in Settings") && err.contains("name steps"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1171,7 +1442,7 @@ mod tests {
             loudness: &lo,
             rhythm: &rh,
         };
-        let out = analyze_steps(&a, &AnalysisKind::ALL, &providers, &mut |_| {}, &|| true);
+        let out = analyze_steps(&a, &AnalysisKind::ALL, &providers, &mut |_| {}, &mut |_| {}, &|| true);
         assert!(out.cancelled && out.patch.ran.is_empty() && fake.ran.lock().unwrap().is_empty());
     }
 

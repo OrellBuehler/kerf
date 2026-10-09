@@ -663,7 +663,7 @@ impl Project {
         // The heavy ffmpeg work lives in `analysis::analyze_asset_steps`, a free
         // function — so the GUI/MCP adapters can run it without holding the
         // shared Project lock and then re-lock only for the quick `merge_analysis`.
-        let run = crate::analysis::analyze_asset_steps(&asset, None, &mut |_| {}, crate::analysis::NEVER_CANCEL);
+        let run = crate::analysis::analyze_asset_steps(&asset, None, &mut |_| {}, &mut |_| {}, crate::analysis::NEVER_CANCEL)?;
         let cancelled = run.cancelled;
         self.merge_analysis(&run.patch)?;
         if cancelled {

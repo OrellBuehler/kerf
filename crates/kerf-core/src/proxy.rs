@@ -111,16 +111,26 @@ pub fn proxy_size() -> ProxySize {
     ProxySize::ALL[PROXY_SIZE.load(Ordering::Relaxed) as usize % ProxySize::ALL.len()]
 }
 
-/// Set the proxy size. Turning proxies off abandons the queue; any other size takes
-/// effect for every later lookup (a proxy at the old size stays on disk, unused).
+/// Set the proxy size. A **change** abandons every proxy queued or building — they are at the
+/// old width, which nothing will use now — and the caller queues what is missing at the new
+/// one (a proxy already on disk at the old size stays there, unused). Off is a change like any
+/// other, and makes no new ones.
 pub fn set_proxy_size(size: ProxySize) {
+    let before = proxy_size();
     let index = ProxySize::ALL.iter().position(|s| *s == size).unwrap_or(3);
     PROXY_SIZE.store(index as u8, Ordering::Relaxed);
-    if size == ProxySize::Off {
+    if size_change_abandons_queue(before, size) {
         cancel_all();
-    } else {
+    }
+    if size != ProxySize::Off {
         engine::set_proxy_base_width(size.px());
     }
+}
+
+/// Whether moving the proxy size from `before` to `after` abandons what is queued or building
+/// (pure): any change does, because those jobs are at the old width.
+fn size_change_abandons_queue(before: ProxySize, after: ProxySize) -> bool {
+    before != after
 }
 
 pub fn preview_source_setting() -> PreviewSource {
@@ -295,6 +305,11 @@ fn live_of(key: &JobKey) -> Option<Live> {
 /// The status of an asset's proxy (touches the disk and, the first time per file, runs
 /// the cached `ffprobe` that keys the proxy — call it off the project lock).
 pub fn status(input: &ProxyInput) -> ProxyStatus {
+    status_under(input, proxy_size(), effective_preview_source())
+}
+
+/// [`status`] under given settings (`mode` already resolved against the size).
+fn status_under(input: &ProxyInput, size: ProxySize, mode: PreviewSource) -> ProxyStatus {
     let asset = &input.asset;
     if let Some(why) = proxy_exemption(asset) {
         return ProxyStatus::new(asset.id, ProxyPhase::NotNeeded).with_reason(why);
@@ -306,35 +321,39 @@ pub fn status(input: &ProxyInput) -> ProxyStatus {
     let mut out = ProxyStatus::new(asset.id, ProxyPhase::Missing).with_width(width);
     out.bytes = bytes;
 
-    let mode = effective_preview_source();
-    if proxy_size() == ProxySize::Off {
+    if size == ProxySize::Off {
         out.state = ProxyPhase::Off;
         out.reason = Some("proxies are off in Settings; previews decode the original".to_string());
         return out;
     }
-    if mode == PreviewSource::Original {
-        out.state = ProxyPhase::Off;
-        out.reason = Some("previews are set to always use the original".to_string());
-        return out;
-    }
-    match live_of(&(asset.path.clone(), width)) {
+    // A build the user asked for by hand is shown whatever the preview source says (Always
+    // original builds none by itself, but a Rebuild is a request, and its progress is news).
+    let live = live_of(&(asset.path.clone(), width));
+    match &live {
         Some(Live::Queued) => {
             out.state = ProxyPhase::Queued;
             return out;
         }
         Some(Live::Building { fraction, started }) => {
             out.state = ProxyPhase::Building;
-            out.fraction = Some(fraction);
+            out.fraction = Some(*fraction);
             out.elapsed_secs = Some(started.elapsed().as_secs_f64());
-            out.eta_secs = eta(fraction, started.elapsed());
+            out.eta_secs = eta(*fraction, started.elapsed());
             return out;
         }
-        Some(Live::Failed(reason)) if ready.is_none() => {
+        _ => {}
+    }
+    if mode == PreviewSource::Original {
+        out.state = ProxyPhase::Off;
+        out.reason = Some("previews are set to always use the original".to_string());
+        return out;
+    }
+    if let Some(Live::Failed(reason)) = live {
+        if ready.is_none() {
             out.state = ProxyPhase::Failed;
             out.reason = Some(reason);
             return out;
         }
-        _ => {}
     }
     if ready.is_some() {
         out.state = ProxyPhase::Ready;
@@ -365,10 +384,18 @@ pub struct ProxyWait {
     pub status: ProxyStatus,
 }
 
+/// What every error and message about a preview waiting for proxies starts with — the page
+/// tells such a refusal from a failure by it (`isProxyWaitMessage` in `proxy-info.ts`).
+pub const PROXY_WAIT_PREFIX: &str = "waiting for the preview proxy";
+
 impl ProxyWait {
     /// What the preview says (and an error carries) while it waits.
     pub fn message(&self) -> String {
-        let how = match self.status.state {
+        format!("{PROXY_WAIT_PREFIX} of {} — {}", self.name, self.how())
+    }
+
+    fn how(&self) -> String {
+        match self.status.state {
             ProxyPhase::Building => match self.status.fraction {
                 Some(f) => format!("building it ({}%)", (f * 100.0).round() as u32),
                 None => "building it".to_string(),
@@ -376,12 +403,23 @@ impl ProxyWait {
             ProxyPhase::Queued => "queued".to_string(),
             ProxyPhase::Failed => format!("it failed: {}", self.status.reason.as_deref().unwrap_or("unknown error")),
             _ => "not built yet".to_string(),
-        };
-        format!(
-            "waiting for the preview proxy of {} — {how} (Settings › Preview > Preview source is Proxy only)",
-            self.name
-        )
+        }
     }
+}
+
+/// One sentence for everything a preview is waiting on (`None` when it is waiting on nothing):
+/// the first clip by name and how far its proxy is, and how many more there are.
+pub fn waits_message(waits: &[ProxyWait]) -> Option<String> {
+    let first = waits.first()?;
+    let more = match waits.len() - 1 {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    Some(format!(
+        "{PROXY_WAIT_PREFIX} of {}{more} — {} (Settings › Preview › Preview source is Proxy only)",
+        first.name,
+        first.how()
+    ))
 }
 
 // ---- the queue ---------------------------------------------------------------
@@ -440,13 +478,55 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 const NOTIFY_FRACTION: f64 = 0.01;
 const NOTIFY_EVERY: Duration = Duration::from_secs(1);
 
+/// What a worker needs to settle a job whose body died.
+struct JobMeta {
+    key: JobKey,
+    gen: u64,
+    asset_id: Uuid,
+    width: u32,
+    notify: Notify,
+}
+
+/// Run `work` for the job `meta` describes; if it **panics**, that job is `Failed` with the
+/// panic's text and the worker lives to take the next one — a panic in one asset's encode
+/// (a decoder crate, an arithmetic overflow) must not leave the queue with no worker and every
+/// later proxy `queued` for the rest of the session.
+fn run_guarded(meta: JobMeta, work: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        let reason = format!("the proxy encode crashed: {what}");
+        tracing::error!(%reason, "preview proxy worker panicked");
+        finish(&meta.key, meta.gen, Some(reason.clone()));
+        let s = ProxyStatus::new(meta.asset_id, ProxyPhase::Failed)
+            .with_width(meta.width)
+            .with_reason(reason);
+        (meta.notify)(&s);
+    }
+}
+
 fn run(job: Queued) {
+    let meta = JobMeta {
+        key: (job.path.clone(), job.width),
+        gen: job.gen,
+        asset_id: job.asset_id,
+        width: job.width,
+        notify: job.notify.clone(),
+    };
+    run_guarded(meta, || build(job));
+}
+
+fn build(job: Queued) {
     let key: JobKey = (job.path.clone(), job.width);
     if job.cancel.load(Ordering::SeqCst) {
         return;
     }
+    // The job stays `Queued` until it holds the machine's slot: the encode's first report
+    // (0.0) comes when it does, so a proxy waiting behind an export is not shown at 0%.
     let started = Instant::now();
-    set_live(&key, job.gen, Live::Building { fraction: 0.0, started });
     let building = |fraction: f64| {
         let mut s = ProxyStatus::new(job.asset_id, ProxyPhase::Building).with_width(job.width);
         s.fraction = Some(fraction);
@@ -454,8 +534,7 @@ fn run(job: Queued) {
         s.eta_secs = eta(fraction, started.elapsed());
         s
     };
-    (job.notify)(&building(0.0));
-    let mut last = (0.0, Instant::now());
+    let mut last: Option<(f64, Instant)> = None;
     let cancel = job.cancel.clone();
     let result = engine::generate_proxy_with(
         Path::new(&job.path),
@@ -465,8 +544,9 @@ fn run(job: Queued) {
             duration: Some(job.duration),
             progress: &mut |fraction| {
                 set_live(&key, job.gen, Live::Building { fraction, started });
-                if fraction - last.0 >= NOTIFY_FRACTION || last.1.elapsed() >= NOTIFY_EVERY {
-                    last = (fraction, Instant::now());
+                let due = last.is_none_or(|(at, when)| fraction - at >= NOTIFY_FRACTION || when.elapsed() >= NOTIFY_EVERY);
+                if due {
+                    last = Some((fraction, Instant::now()));
                     (job.notify)(&building(fraction));
                 }
             },
@@ -844,5 +924,138 @@ mod tests {
             ..wait
         };
         assert!(failed.message().contains("it failed: ffmpeg exited with 1"));
+    }
+
+    #[test]
+    fn a_size_change_abandons_what_is_queued_at_the_old_width() {
+        for from in ProxySize::ALL {
+            for to in ProxySize::ALL {
+                assert_eq!(size_change_abandons_queue(from, to), from != to, "{from:?} -> {to:?}");
+            }
+        }
+        // Setting the size already in force is not a change: nothing is cancelled.
+        let video = asset(vec![stream(StreamKind::Video, false)], "same-size");
+        let key: JobKey = (video.path, engine::proxy_width(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        jobs().insert(
+            key.clone(),
+            Entry {
+                gen: 1,
+                cancel: cancel.clone(),
+                live: Live::Queued,
+            },
+        );
+        set_proxy_size(proxy_size());
+        assert!(!cancel.load(Ordering::SeqCst), "the same size cancels nothing");
+        jobs().remove(&key);
+    }
+
+    #[test]
+    fn a_build_the_user_asked_for_shows_under_always_original_and_a_queued_one_stays_queued() {
+        let video = input(asset(vec![stream(StreamKind::Video, false)], "manual-rebuild"));
+        let width = engine::proxy_width(None);
+        let key: JobKey = (video.asset.path.clone(), width);
+        // Nothing queued, always-original: off (no proxies are built by themselves).
+        let off = status_under(&video, ProxySize::W1280, PreviewSource::Original);
+        assert_eq!(off.state, ProxyPhase::Off);
+        assert!(off.reason.unwrap().contains("always use the original"));
+        // A Rebuild is queued: its progress is shown, not hidden behind the setting.
+        jobs().insert(
+            key.clone(),
+            Entry {
+                gen: 3,
+                cancel: Arc::new(AtomicBool::new(false)),
+                live: Live::Queued,
+            },
+        );
+        assert_eq!(
+            status_under(&video, ProxySize::W1280, PreviewSource::Original).state,
+            ProxyPhase::Queued
+        );
+        set_live(
+            &key,
+            3,
+            Live::Building {
+                fraction: 0.5,
+                started: Instant::now(),
+            },
+        );
+        let building = status_under(&video, ProxySize::W1280, PreviewSource::Original);
+        assert_eq!((building.state, building.fraction), (ProxyPhase::Building, Some(0.5)));
+        // Proxies off outranks everything: there is nothing to build.
+        assert_eq!(
+            status_under(&video, ProxySize::Off, PreviewSource::Original).state,
+            ProxyPhase::Off
+        );
+        jobs().remove(&key);
+    }
+
+    #[test]
+    fn a_panic_in_a_proxy_job_fails_that_job_and_not_the_worker() {
+        let video = asset(vec![stream(StreamKind::Video, false)], "panics");
+        let width = engine::proxy_width(None);
+        let key: JobKey = (video.path.clone(), width);
+        jobs().insert(
+            key.clone(),
+            Entry {
+                gen: 9,
+                cancel: Arc::new(AtomicBool::new(false)),
+                live: Live::Building {
+                    fraction: 0.3,
+                    started: Instant::now(),
+                },
+            },
+        );
+        let told: Arc<Mutex<Vec<ProxyStatus>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        let meta = JobMeta {
+            key: key.clone(),
+            gen: 9,
+            asset_id: video.id,
+            width,
+            notify: Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
+        };
+        // The call returns: the caller (the worker's loop) goes on to the next job.
+        run_guarded(meta, || panic!("decoder blew up"));
+        let told = told.lock().unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].state, ProxyPhase::Failed);
+        assert!(
+            told[0].reason.as_deref().unwrap().contains("decoder blew up"),
+            "{:?}",
+            told[0].reason
+        );
+        let input = input(video);
+        let s = status_under(&input, ProxySize::W1280, PreviewSource::Auto);
+        assert_eq!(s.state, ProxyPhase::Failed);
+        jobs().remove(&key);
+    }
+
+    #[test]
+    fn what_a_wait_says_carries_the_marker_the_page_recognizes_and_counts_the_rest() {
+        let id = Uuid::new_v4();
+        let wait = |name: &str, state: ProxyPhase, fraction: Option<f64>| {
+            let mut status = ProxyStatus::new(id, state);
+            status.fraction = fraction;
+            ProxyWait {
+                asset_id: id,
+                name: name.to_string(),
+                status,
+            }
+        };
+        let one = wait("a.mp4", ProxyPhase::Building, Some(0.5));
+        assert!(one.message().starts_with(PROXY_WAIT_PREFIX));
+        assert_eq!(waits_message(&[]), None);
+        let many = waits_message(&[
+            one,
+            wait("b.mp4", ProxyPhase::Queued, None),
+            wait("c.mp4", ProxyPhase::Queued, None),
+        ])
+        .unwrap();
+        assert!(many.starts_with(PROXY_WAIT_PREFIX), "{many}");
+        assert!(many.contains("a.mp4 and 2 more") && many.contains("50%"), "{many}");
+        // The setting is named with the same arrow as everywhere else.
+        assert!(many.contains("Settings › Preview › Preview source"), "{many}");
+        assert!(!many.contains("Preview >"), "{many}");
     }
 }

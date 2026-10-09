@@ -120,7 +120,9 @@ pub fn mix_levels(
     };
 
     let bin = ffmpeg_bin();
-    let lease = cpu::lease();
+    // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
+    // measurement as on a running one).
+    let lease = cpu::lease_waiting(&mut |_| {}, cancel)?;
     let mut args = run.args;
     cpu::limit_args(&mut args, lease.threads());
     let _script = externalize_filter_complex(&mut args, "lv")?;

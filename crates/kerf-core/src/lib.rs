@@ -26,10 +26,10 @@ mod engine;
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, set_auto_analysis,
-    transcription_backend, transcription_status, AnalysisKindStatus, AnalysisProgress, AnalysisProviders, AnalysisState,
-    AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer,
-    ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, StepsRun, Transcriber, TranscriptionStatus,
+    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, resolve_steps,
+    set_auto_analysis, transcription_backend, transcription_status, AnalysisKindStatus, AnalysisProgress, AnalysisProviders,
+    AnalysisState, AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector,
+    NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, StepsRun, Transcriber, TranscriptionStatus,
     WhisperFilterTranscriber,
 };
 pub use captions_import::{

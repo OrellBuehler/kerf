@@ -2339,7 +2339,9 @@ pub struct ProxyRun<'a> {
     /// The source's length in seconds — what the encoder's position is measured
     /// against to give `progress` a fraction. Without it nothing is reported.
     pub duration: Option<f64>,
-    /// Called with how far along the encode is, `0.0..1.0`, about twice a second.
+    /// Called with how far along the encode is, `0.0..1.0`: once with `0.0` when it holds the
+    /// slot and starts (so a proxy queued behind an export is not shown at 0%), then about twice
+    /// a second.
     pub progress: &'a mut dyn FnMut(f64),
     /// Polled while queued and while encoding; once true the encode is killed, its
     /// partial file removed and [`Error::Cancelled`] returned.
@@ -2348,10 +2350,11 @@ pub struct ProxyRun<'a> {
 
 /// [`generate_proxy`] that reports progress and can be abandoned.
 ///
-/// The encode is a whole-file job in the **high** lane of the heavy-job queue: a proxy
+/// The encode is a whole-file job in the **proxy** lane of the heavy-job queue: a proxy
 /// is what the preview is waiting for (it decodes the original until the proxy lands),
 /// where analysis is only wanted eventually, so it goes before every analysis that is
-/// waiting. A job already running is not interrupted.
+/// waiting — but after an export or anything else a user is waiting on. A job already
+/// running is not interrupted.
 ///
 /// It runs with `-progress` on a pipe (written here at spawn time, never in
 /// [`build_proxy_args`]) and is killed after [`EXPORT_STALL`] without a word, so a
@@ -2387,14 +2390,20 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
     let bin = ffmpeg_bin();
     // A full-file re-encode. Importing a folder queues them one behind the next
-    // rather than starting one per file at once; they wait in the high lane.
+    // rather than starting one per file at once; they wait in the proxy lane, behind
+    // anything a user is waiting on and ahead of analysis. A proxy that is deleted, rebuilt
+    // or switched off while it waits gives up its place without having started.
     let cpu = match reservation {
-        Some(reserved) => reserved.lease(),
-        None => cpu::lease_priority(cpu::Priority::High),
+        Some(reserved) => reserved.lease_waiting(&mut |_| {}, cancel)?,
+        None => cpu::lease_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel)?,
     };
-    // Queued behind a long job, the caller may have changed its mind by now.
+    // Cancelled in the instant it got the slot: do not start the encode.
     if cancel() {
         return Err(Error::Cancelled);
+    }
+    // The first report says the encode has begun (it held no slot until now).
+    if duration.is_some() {
+        progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
     // One cached probe answers both: whether to tone-map and whether the video
@@ -2414,7 +2423,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             head_pad,
         );
         cpu::limit_args(&mut args, threads);
-        run_ffmpeg_streamed(&bin, &args, duration, &mut *progress, cancel)
+        run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
     // GPU encode (and decode) when available — a background proxy transcode
     // then costs the CPU almost nothing. A failure falls back to the software
@@ -2432,9 +2441,22 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Cancelled);
     }
-    if !output.status.success() && output.outcome == StreamOutcome::Ended && (hw_enc.is_some() || hw_dec.is_some()) {
+    if retry_proxy_in_software(output.outcome, output.status.success(), hw_enc.is_some(), hw_dec.is_some()) {
         let _ = std::fs::remove_file(&tmp);
-        let err = output.stderr.trim().to_string();
+        let err = if output.outcome == StreamOutcome::Stalled {
+            // A hardware encoder or decoder that hangs is as broken as one that refuses, and
+            // costs five minutes a proxy to find out: turn it off for the process, like any
+            // other hardware failure, and go again in software.
+            if hw_enc.is_some() {
+                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if hw_dec.is_some() {
+                disable_decode_hwaccel();
+            }
+            format!("ffmpeg stopped reporting progress for {}s", EXPORT_STALL.as_secs())
+        } else {
+            output.stderr.trim().to_string()
+        };
         output = run("libx264", None)?;
         if output.outcome == StreamOutcome::Cancelled {
             let _ = std::fs::remove_file(&tmp);
@@ -2470,6 +2492,13 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     })
 }
 
+/// Whether a proxy encode that went through hardware is run again in software (pure,
+/// unit-tested): when it failed on its own **or stalled** — a cancelled one is not a failure,
+/// and an encode that was software already has nothing to fall back to.
+fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_encode: bool, hw_decode: bool) -> bool {
+    !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && (hw_encode || hw_decode)
+}
+
 /// How a streamed ffmpeg run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -2491,13 +2520,14 @@ struct Streamed {
 /// Run `ffmpeg` with `args`, reading its `-progress` stream: `progress` gets the
 /// encoder's position as a fraction of `duration` (when it is known), `cancel` is
 /// polled between reports and while ffmpeg is silent, and a run that says nothing
-/// for [`EXPORT_STALL`] is killed. A bounded cousin of `Command::output()` for the
+/// for `stall` ([`EXPORT_STALL`] in production) is killed. A bounded cousin of `Command::output()` for the
 /// whole-file jobs that outlive a glance — stderr is drained on a side thread so a
 /// warning flood cannot fill its pipe and wedge the child.
 fn run_ffmpeg_streamed(
     bin: &str,
     args: &[String],
     duration: Option<f64>,
+    stall: std::time::Duration,
     progress: &mut dyn FnMut(f64),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Streamed> {
@@ -2547,7 +2577,7 @@ fn run_ffmpeg_streamed(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if last_output.elapsed() > EXPORT_STALL {
+                if last_output.elapsed() > stall {
                     outcome = StreamOutcome::Stalled;
                     break;
                 }
@@ -4437,6 +4467,10 @@ pub struct ExportProgress {
     pub fraction: f64,
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
+    /// Set while the render has not started because the machine is busy with another heavy job
+    /// — `waiting for the preview proxy` — so a queued export does not look hung at 0%.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<&'static str>,
 }
 
 /// Whether an export ran to completion or was stopped by the cancel callback.
@@ -4855,8 +4889,24 @@ fn run_ffmpeg_progress(
 
     let bin = ffmpeg_bin();
     // The heaviest thing the engine does. The lease is reentrant, so an export's
-    // second pass and a stitch inside an import do not queue behind themselves.
-    let cpu = cpu::lease();
+    // second pass and a stitch inside an import do not queue behind themselves. It is the
+    // foreground lane — ahead of any proxy still queued — and a render that has to wait says
+    // so through `progress` and can be cancelled while it does.
+    let cpu = match cpu::lease_waiting(
+        &mut |wait| {
+            progress(ExportProgress {
+                fraction: bar.offset,
+                elapsed_secs: bar.start.elapsed().as_secs_f64(),
+                eta_secs: None,
+                waiting: Some(wait.message()),
+            });
+        },
+        cancel,
+    ) {
+        Ok(lease) => lease,
+        Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
+        Err(e) => return Err(e),
+    };
     let mut args = args.to_vec();
     cpu::limit_args(&mut args, cpu.threads());
     let args = &args[..];
@@ -4935,6 +4985,7 @@ fn run_ffmpeg_progress(
                 fraction,
                 elapsed_secs: elapsed,
                 eta_secs: eta,
+                waiting: None,
             });
         }
         if cancel() {
@@ -7915,6 +7966,124 @@ mod tests {
         ) {
             assert_ne!(a, b);
         }
+    }
+
+    #[test]
+    fn a_hardware_proxy_that_stalls_is_retried_in_software_like_one_that_fails() {
+        use StreamOutcome::*;
+        // Failed on its own or stalled, through hardware: go again in software.
+        assert!(retry_proxy_in_software(Ended, false, true, false));
+        assert!(retry_proxy_in_software(Ended, false, false, true));
+        assert!(
+            retry_proxy_in_software(Stalled, false, true, true),
+            "a hung hardware encoder is as broken as a refusing one"
+        );
+        // Not when it worked, when the user cancelled, or when it was software already.
+        assert!(!retry_proxy_in_software(Ended, true, true, true));
+        assert!(!retry_proxy_in_software(Cancelled, false, true, true));
+        assert!(!retry_proxy_in_software(Stalled, false, false, false));
+        assert!(!retry_proxy_in_software(Ended, false, false, false));
+    }
+
+    /// A child that says nothing is killed after the stall allowance, and a cancel kills one
+    /// that is still talking — neither waits for the process to finish by itself. (The child is
+    /// a script standing in for ffmpeg: it ignores the `-progress …` flags it is handed.)
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_encode_is_killed_after_the_stall_allowance_and_a_cancel_kills_a_talker() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("stall");
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let silent = script("silent.sh", "exec sleep 30");
+        let started = Instant::now();
+        let stalled = run_ffmpeg_streamed(
+            &silent,
+            &[],
+            None,
+            std::time::Duration::from_millis(700),
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(stalled.outcome, StreamOutcome::Stalled);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "it waited for the child to end by itself"
+        );
+        assert!(!stalled.status.success());
+
+        let talker = script(
+            "talker.sh",
+            "i=0; while [ $i -lt 100 ]; do echo out_time_us=$((i*100000)); i=$((i+1)); sleep 0.1; done",
+        );
+        let started = Instant::now();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let cancelled = run_ffmpeg_streamed(
+            &talker,
+            &[],
+            Some(10.0),
+            std::time::Duration::from_secs(60),
+            &mut |f| {
+                seen.push(f);
+                if seen.len() >= 3 {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            &|| flag.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .unwrap();
+        assert_eq!(cancelled.outcome, StreamOutcome::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|f| (0.0..1.0).contains(f)),
+            "{seen:?}"
+        );
+    }
+
+    /// An export that has to wait for another heavy job says so in its progress, and Stop works
+    /// on it before ffmpeg is ever started — no binary needed.
+    #[test]
+    fn a_queued_export_says_it_is_waiting_and_can_be_cancelled_before_it_starts() {
+        let _serial = cpu::test_lock();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // A proxy encode is running: it holds the slot.
+        let proxy = std::thread::spawn(move || {
+            let _lease = cpu::lease_priority(cpu::Priority::Proxy);
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut told: Vec<Option<&'static str>> = Vec::new();
+        let bar = Bar {
+            total: 10.0,
+            offset: 0.0,
+            width: 1.0,
+            start: Instant::now(),
+        };
+        let status = run_ffmpeg_progress(
+            &["-version".to_string()],
+            Path::new("/nonexistent/out.mp4"),
+            bar,
+            &mut |p| {
+                told.push(p.waiting);
+                assert_eq!(p.fraction, 0.0);
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            &|| cancel.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .unwrap();
+        assert_eq!(status, RenderStatus::Cancelled);
+        assert_eq!(told, [Some("waiting for the preview proxy")]);
+        release_tx.send(()).unwrap();
+        proxy.join().unwrap();
     }
 
     /// The streamed encode reports a rising fraction under 1 and can be abandoned: a cancel

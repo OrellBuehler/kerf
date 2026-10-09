@@ -728,6 +728,12 @@ impl AnalysisKind {
         AnalysisKind::Transcript,
     ];
 
+    /// Whether the step reads the audio: everything but scene detection. A picture with no
+    /// sound has none of it to find — and nothing to fail on.
+    pub fn needs_audio(self) -> bool {
+        self != AnalysisKind::Scenes
+    }
+
     /// The wire name (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`).
     pub fn name(self) -> &'static str {
         match self {
