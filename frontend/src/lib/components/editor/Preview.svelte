@@ -14,6 +14,8 @@
 	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
+	import { isProxyWaitMessage, previewSourceNote } from '$lib/proxy-info';
 	import {
 		anyCovered,
 		boundsReport,
@@ -72,6 +74,20 @@
 		atPlayhead ? editor.assets.find((a) => a.id === atPlayhead.assetId) : undefined
 	);
 
+	// Under "Proxy only" a clip whose proxy is still building is not decoded from the original: the
+	// last good frame stays, and this says what the preview is waiting for.
+	const waitingOnProxy = $derived.by(() => {
+		const note = previewSourceNote(
+			editor.timeline,
+			editor.assets,
+			mediaStatus.proxies,
+			settings.previewSource,
+			settings.proxySize,
+			ui.time
+		);
+		return note?.tone === 'waiting' ? note : null;
+	});
+
 	// Once the project has a delivery frame, that is the shape on screen — showing
 	// the source's dimensions here would label the picture with a size it isn't.
 	const resolution = $derived.by(() => {
@@ -128,7 +144,15 @@
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
 	let lastPlaybackError = { message: '', at: 0 };
+	/** Set while playback cannot start because "Proxy only" is waiting for a clip's proxy: the
+	 *  message the backend gave (naming the clip and how far its proxy is). Not an error — it
+	 *  clears when a proxy lands (the stream restarts then) and the picture on show stays. */
+	let playbackWaiting = $state<string | null>(null);
 	function reportPlaybackError(message: string) {
+		if (isProxyWaitMessage(message)) {
+			playbackWaiting = message;
+			return;
+		}
 		const now = Date.now();
 		if (message === lastPlaybackError.message && now - lastPlaybackError.at < 15_000) return;
 		lastPlaybackError = { message, at: now };
@@ -153,6 +177,7 @@
 		void editor.timeline;
 		void ui.previewEpoch;
 		const from = untrack(() => ui.time);
+		playbackWaiting = null;
 		if (!play || !hasClips) {
 			endStream();
 			return;
@@ -763,6 +788,12 @@
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
+					{#if playbackWaiting}<span title={playbackWaiting} data-testid="playback-waiting"
+							><Badge tone="warning" dot>playback waits for the proxy</Badge></span
+						>{/if}
+					{#if waitingOnProxy}<span title={waitingOnProxy.title}
+							><Badge tone="warning" dot>{waitingOnProxy.text.replace('preview: ', '')}</Badge></span
+						>{/if}
 					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
 				</div>
 				<div

@@ -18,6 +18,7 @@ pub mod plan_caps;
 pub mod planner;
 pub mod platform;
 pub mod project;
+pub mod proxy;
 pub mod render_plan;
 
 mod engine;
@@ -25,10 +26,11 @@ mod engine;
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analyze, analyze_asset_media, analyze_asset_media_cancellable, analyze_asset_media_with_progress, analyze_cancellable,
-    analyze_with_progress, set_transcription_enabled, transcription_enabled, transcription_status, AnalysisProgress,
-    AnalysisProviders, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn,
-    RhythmAnalyzer, SceneDetector, SilenceDetector, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
+    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, resolve_steps,
+    set_auto_analysis, transcription_backend, transcription_status, AnalysisKindStatus, AnalysisProgress, AnalysisProviders,
+    AnalysisState, AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector,
+    NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, StepsRun, Transcriber, TranscriptionStatus,
+    WhisperFilterTranscriber,
 };
 pub use captions_import::{
     decode_caption_bytes, parse_ass, parse_captions, parse_srt, read_caption_file, CaptionFile, CaptionFormat,
@@ -37,7 +39,8 @@ pub use captions_import::{
 };
 pub use clip_timing::{FadeEdge, FadeStep, FadeTint, MotionKeys, Rational};
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, set_cpu_percent, DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
+    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, high_pending as proxy_jobs_pending, set_cpu_percent,
+    DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
 };
 pub use engine::{
     composite_color_policy, contact_sheet_times, decode_hwaccel, disable_decode_hwaccel, download_speech_model, export_seek_arg,
@@ -55,14 +58,14 @@ pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome,
-    EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus, Projection, Property, PropertyKey,
-    PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, SkippedDetach, SourceLimits,
-    SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
-    TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover,
-    ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME,
-    MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
+    AnalysisKind, Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
+    CaptionTimeBase, Clip, ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry,
+    DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus,
+    Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
+    SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe,
+    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind,
+    VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
@@ -71,6 +74,7 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
     PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,

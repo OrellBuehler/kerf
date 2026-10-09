@@ -661,18 +661,20 @@ after every change: focus left on the page behind a modal stops Escape closing i
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Five
+panel, so the next preference is a row in a list rather than new chrome. Six
 sections: **Performance** — the CPU limit as three named budgets (Background /
 Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
 left for everything else", because the complaint this answers arrives in those
-terms and not in percentages — and **Speech**, one checkbox for whether the
-analysis pass transcribes at all (`Settings.transcribe` →
-`kerf_core::set_transcription_enabled`, a process-wide flag `analyze_asset_media_*`
-reads to swap in the null transcriber): every import analyzes, and someone who
-never wants a model fetched or minutes of inference spent needs the whole pass
-to survive that, not to fail on the download. `TranscriptionStatus.enabled`
-reports it, so the transcript tab's empty state can say "Speech-to-text is
-off" and open Settings rather than offer a download. And **Preview**, one checkbox
+terms and not in percentages — **Analysis**, a master "analyze new media when it is imported" and one
+toggle per kind (silence, scenes, loudness, rhythm, transcript; `Settings.auto_analysis`, which replaced
+the single `transcribe` checkbox and migrates it): a clip can always be analysed by hand whatever is off,
+and the same set decides what an agent's `analyze_asset` runs when it names no steps — so the per-kind
+toggles stay editable while the master is off. **Speech** keeps
+the voiceover model and points at Analysis; `TranscriptionStatus.enabled` is the transcript switch, so
+the transcript tab says "Speech-to-text is off for new imports" and offers Transcribe. And **Preview**:
+the **proxy size** (720 / 1080 / 1280 default / Off, `settings.proxySize`) and the **preview source**
+(Auto / Always original / Proxy only, `settings.previewSource`; disabled with size Off, which forces the
+original) — both written through, followed by a status refresh and a preview nudge — then one checkbox
 for the safe-area guides over a vertical or square cut, and the experimental GPU preview
 toggle with this machine's status line (technique, adapter, last failure). And **Appearance**: the
 three theme presets as chips, a name and a dark/light scheme, **Import… /
@@ -757,9 +759,15 @@ uses the real backend and starts empty. State is two runes singletons: `src/lib/
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
 call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelte.ts`
 (`export const ui` — chrome state, playhead/zoom/playback, and `analyzeQueue` /
-`runAnalysis` / `stopAnalysis`: a batch analyzes **one asset at a time** — each pass is
+`runAnalysis(id, steps?)` / `stopAnalysis`: a batch analyzes **one asset at a time** — each pass is
 ffmpeg-bound, so running them together only makes each slower — and stopping drops
-the whole rest of the queue). There is **no scripted demo phase machine**: the
+the whole rest of the queue. `analyzeImported(ids, auto)` is what an import calls: nothing when the
+master is off, else per asset only the kinds that are on and **not already done** (`autoSteps`; a
+re-imported file redoes nothing, a failed kind is retried, transcript needs a backend), and
+`ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
+cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
+`silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
+`runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
 duration (plus the analysis step, what is still queued behind it and a **Stop**), and
@@ -768,16 +776,30 @@ Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
 browser harness, which has no decoder), the spec line
 (`1920×1080 · 29.97 fps · h264 · stereo`), and badges for 360 / still / how many
-clips already use it / analyzed. Its **context menu leads with the facts** — the
+clips already use it, and **`MediaChips`** — the preview proxy's badge (`queued` / `proxy 42%` / `proxy` /
+`proxy failed`, tooltip carrying the reason; nothing for a still or audio file) and one chip per analysis
+kind (`SIL` `SCN` `LUFS` `BPM` `TXT`: done ✓ green, not run outlined, running spinning, failed `!` red,
+off dashed `–`; state is a mark and a border as well as a colour, the tooltip says why). The Inspector's
+clip header draws the same chips from the same store plus an **Analyze** button, and the timeline clip
+menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
+(`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
+assets changes and after a setting that moves what a status means. The **status bar** says which file
+the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
+`preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu leads with the facts** — the
 frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
-import date, then what analysis found (loudness, tempo, silence, shots,
-transcript, or "not analyzed") — above the actions that need them: add at the
+import date, then how much of the analysis has run, what it found (loudness, tempo, silence, shots,
+transcript) and the proxy's state — above the actions that need them: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
 playing its own sound, `add_asset_audio`)
 (`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
 their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
-track), remove silences (greyed out until silence has been detected), analyze or stop, mark the asset 360 or flat, copy the path, show
-in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
+track), remove silences (greyed out until silence has been detected), **Analyze** — one entry per kind
+("Detect silence", "Find scene changes", "Measure loudness", "Find the beat and tempo", "Transcribe
+speech", "Analyze everything"), each saying `done · run again` / `failed · retry`, disabled with the reason
+for a voiceover, a running pass, a file with no audio or no speech backend — and Stop analysis, **Rebuild /
+Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the asset 360 or flat, copy the
+path, show in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
 row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
 it, which the shared `ContextMenu` renders non-interactively.
 **Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
@@ -787,3 +809,16 @@ README — and runs the same `editor.importPaths` the picker resolves to), which
 what the bin's "Drop media to start" had been promising. `editor.error` renders as a
 dismissible banner under the title bar: it was recorded and never shown, so a `.kerf`
 that would not open opened as silence.
+
+The browser harness fakes all of it so the bin, menus and settings can be looked at under `bun run dev`
+(`api.ts` `devProxy` / `devAnalyze`): the interview's proxy is building at 42 %, the b-roll's ready;
+`?proxy=failed` / `?proxy=queued` make the b-roll's a failed / queued one; Rebuild runs a timed build,
+Analyze steps run in ~450 ms each and announce themselves through the same `analysis-status` path.
+The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
+
+**Proxy only in the preview.** The backend refuses a frame or playback whose clip has no proxy yet with a
+message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is
+compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
+stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
+a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
+`Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%.

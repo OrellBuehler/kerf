@@ -5,6 +5,8 @@
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import TitlesControls from './TitlesControls.svelte';
+	import MediaChips from './MediaChips.svelte';
+	import { analyzeMenuItems } from '$lib/analyze-menu';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -708,6 +710,22 @@
 					</div>
 				</div>
 			</div>
+			{#if asset}
+				<!-- Which analyses have run for this clip's media, and a way to run one: the same
+				     chips as the bin, and the same Analyze menu (the work is the asset's, not the clip's). -->
+				<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+					<MediaChips assetId={asset.id} />
+					<Btn
+						size="sm"
+						variant="secondary"
+						icon="scan-line"
+						onclick={(e: MouseEvent) => {
+							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+						}}>Analyze</Btn
+					>
+				</div>
+			{/if}
 
 			<InspectorSection title="Timing" summary={`${tc(clip.timeline_start)} · ${tc(clipDuration(clip))}`} open>
 			{@render readRow('Start', tc(clip.timeline_start))}

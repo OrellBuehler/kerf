@@ -16,6 +16,7 @@
 	import { agent } from '$lib/agent.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { popout } from '$lib/popout.svelte';
 	import { windows } from '$lib/windows.svelte';
@@ -37,6 +38,8 @@
 		inTauri,
 		isMediaPath,
 		confirmAction,
+		onAnalysisStatus,
+		onProxyProgress,
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
@@ -53,6 +56,13 @@
 	const modalOpen = $derived(ui.exportDialog || settings.open || updater.dialogOpen || ui.voiceoverDialog !== null);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
+
+	// Re-read the proxy and analysis statuses whenever the set of assets changes (an import, an
+	// agent's import or voiceover, a project opened): a new asset has no status until asked.
+	$effect(() => {
+		void editor.assets.map((a) => a.id).join(',');
+		untrack(() => void mediaStatus.refresh());
+	});
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.
 	$effect(() => popout.setInert(modalOpen));
@@ -95,6 +105,11 @@
 			() => editor.hasUnsavedWork,
 			() => confirmAction('This project has never been saved. Close Kerf and lose it?', 'Close Kerf')
 		).then((un) => unlisteners.push(un));
+
+		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
+		// (an agent's runs included) — the bin's badges and chips read them.
+		void onProxyProgress((s) => mediaStatus.noteProxy(s)).then((un) => unlisteners.push(un));
+		void onAnalysisStatus((s) => mediaStatus.noteAnalysis(s)).then((un) => unlisteners.push(un));
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -324,7 +339,10 @@
 			toast.success(
 				imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
 			);
-			await ui.analyzeQueue(imported.map((a) => a.id));
+			await ui.analyzeImported(
+				imported.map((a) => a.id),
+				settings.autoAnalysis
+			);
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}

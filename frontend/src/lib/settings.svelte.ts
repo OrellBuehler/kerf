@@ -2,7 +2,7 @@
 //
 // The settings that belong to the machine rather than to the cut: how much of
 // the computer Kerf's media engine may take (`kerf_core::engine::cpu` enforces
-// the budget), whether analysis transcribes, what the preview draws, how the
+// the budget), which analyses run on import, how the preview is made, how the
 // workspace is arranged, what colors it is drawn in and which keys do what.
 //
 // The persisted values live on the Rust side (the platform config directory),
@@ -12,6 +12,7 @@
 import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
+import { mediaStatus } from './media-status.svelte';
 import { gpuPreview } from './gpu-preview.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
@@ -54,7 +55,7 @@ import {
 	type ResetPlan,
 	type Resolution
 } from './keymap';
-import type { AppSettings, SettingsView } from './types';
+import type { AnalysisKind, AppSettings, AutoAnalysis, PreviewSource, ProxySize, SettingsView } from './types';
 
 /** The named budgets. The slider still offers everything in between; these are
  *  the three answers people actually have to "how much of my computer?". */
@@ -80,7 +81,7 @@ export const CPU_PRESETS = [
 ] as const;
 
 /** The sections of the settings dialog (`SettingsDialog.svelte` lists them). */
-export type SettingsSection = 'performance' | 'speech' | 'preview' | 'appearance' | 'keyboard';
+export type SettingsSection = 'performance' | 'analysis' | 'speech' | 'preview' | 'appearance' | 'keyboard';
 
 class SettingsStore {
 	open = $state(false);
@@ -94,7 +95,19 @@ class SettingsStore {
 	/** What the backend last confirmed. `cpuPercent` runs ahead of it while a
 	 *  slider is being dragged, so "nothing changed" is judged against this. */
 	private savedPercent = 75;
-	transcribe = $state(true);
+	/** Which analyses run by themselves when media is imported (a master and one per kind). */
+	autoAnalysis = $state<AutoAnalysis>({
+		enabled: true,
+		silence: true,
+		scenes: true,
+		loudness: true,
+		rhythm: true,
+		transcript: true
+	});
+	/** How wide preview proxies are, pixels across (0 = none are made). */
+	proxySize = $state<ProxySize>(1280);
+	/** Which file the preview decodes. Export always reads the originals. */
+	previewSource = $state<PreviewSource>('auto');
 	/** Shade the delivery safe areas over the preview. Only visible while the
 	 *  project is cut for a vertical or square frame; a 16:9 web export has no
 	 *  chrome to stay clear of. */
@@ -150,7 +163,9 @@ class SettingsStore {
 	private absorb(view: SettingsView) {
 		this.cpuPercent = view.cpu_percent;
 		this.savedPercent = view.cpu_percent;
-		this.transcribe = view.transcribe;
+		this.autoAnalysis = view.auto_analysis;
+		this.proxySize = view.proxy_size;
+		this.previewSource = view.preview_source;
 		this.safeAreas = view.safe_areas;
 		this.gpuPreview = view.gpu_preview ?? false;
 		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
@@ -215,11 +230,39 @@ class SettingsStore {
 		await this.write({ cpu_percent: want }, 'CPU limit');
 	}
 
-	/** Turn speech-to-text in the analysis pass on or off. */
-	async setTranscribe(on: boolean) {
-		if (on === this.transcribe) return;
-		this.transcribe = on;
-		if (await this.write({ transcribe: on }, 'transcription setting')) await ui.loadTranscriptionStatus();
+	/** Change which analyses run by themselves on import: the master (`enabled`) or one kind. A
+	 *  switch that touches transcription also refreshes what the transcript tab says about it. */
+	async setAutoAnalysis(change: Partial<AutoAnalysis>) {
+		const next = { ...this.autoAnalysis, ...change };
+		if (JSON.stringify(next) === JSON.stringify(this.autoAnalysis)) return;
+		this.autoAnalysis = next;
+		if (await this.write({ auto_analysis: next }, 'analysis setting')) {
+			await Promise.all([ui.loadTranscriptionStatus(), mediaStatus.refresh()]);
+		}
+	}
+
+	/** Turn one kind of automatic analysis on or off. */
+	setAutoKind(kind: AnalysisKind, on: boolean) {
+		return this.setAutoAnalysis({ [kind]: on });
+	}
+
+	/** How wide preview proxies are. The backend queues the missing ones at the new size, and
+	 *  the preview re-decodes from whichever file it should now. */
+	async setProxySize(size: ProxySize) {
+		if (size === this.proxySize) return;
+		this.proxySize = size;
+		await this.write({ proxy_size: size }, 'proxy size');
+		await mediaStatus.refresh();
+		ui.refreshPreview();
+	}
+
+	/** Which file the preview decodes (auto, always the original, only the proxy). */
+	async setPreviewSource(source: PreviewSource) {
+		if (source === this.previewSource) return;
+		this.previewSource = source;
+		await this.write({ preview_source: source }, 'preview source');
+		await mediaStatus.refresh();
+		ui.refreshPreview();
 	}
 
 	/** Show or hide the safe-area guides over the preview. */

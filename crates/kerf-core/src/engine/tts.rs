@@ -938,7 +938,12 @@ pub fn synthesize(text: &str, voice: &str, speed: f64, progress: ProgressFn, can
     let pack = std::fs::read(ensure_voice(voice, &mut |_| {}, cancel)?)
         .map_err(|e| Error::Engine(format!("could not read voice '{voice}': {e}")))?;
 
-    let lease = super::cpu::lease();
+    // Foreground — someone is waiting on the narration — and stoppable while it waits for the
+    // slot, saying why (`waiting`) rather than looking hung at the download's end.
+    let lease = super::cpu::lease_waiting(
+        &mut |wait| progress("waiting", None, Some(wait.message().to_string())),
+        cancel,
+    )?;
     progress("synthesize", Some(0.0), None);
     let g2p = g2p(is_british(voice));
     let mut samples: Vec<f32> = Vec::new();

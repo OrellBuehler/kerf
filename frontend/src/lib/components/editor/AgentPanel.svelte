@@ -11,6 +11,7 @@
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
 	import { CAPTION_CONFIRM_TITLE } from '$lib/caption-import-ui';
 	import { confirmReplaceCaptions } from '$lib/title-actions';
+	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
 
@@ -236,7 +237,8 @@
 			task = await agent.add(p);
 			// Some presets map to a local op we can run now; the rest wait for the agent.
 			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
-				if (!editor.analysisFor(assetId)) await ui.runAnalysis(assetId);
+				// Only the silent spans are read: not a transcript, not the beat.
+				await ui.ensureAnalysis(assetId, QUICK_EDIT_STEPS.silences);
 				await editor.removeSilence(assetId);
 				await agent.resolve(task.id);
 				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
@@ -248,7 +250,7 @@
 					)
 				];
 				if (music.length === 0) throw new Error('Put music on an audio track first');
-				for (const id of music) if (!editor.analysisFor(id)) await ui.runAnalysis(id);
+				for (const id of music) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.beat);
 				const before = cutSignature();
 				await editor.snapToBeats();
 				await agent.resolve(task.id);
@@ -261,7 +263,7 @@
 				// in the cut but has not been transcribed yet.
 				const sources = [...new Set(editor.timeline.tracks.flatMap((t) => t.clips.map((c) => c.asset_id)))];
 				if (sources.length === 0) throw new Error('Put a clip on the timeline first');
-				for (const id of sources) if (!editor.analysisFor(id)) await ui.runAnalysis(id);
+				for (const id of sources) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.captions);
 				await editor.generateCaptions();
 				await agent.resolve(task.id);
 				const n = (editor.timeline.overlays ?? []).filter((o) => o.generated).length;

@@ -99,6 +99,25 @@ so the feature is **only** activated through these forwards — which is what ma
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
+  **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
+  ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
+  latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
+  `-progress pipe:1 -stats_period 0.5` **at spawn time** (like the thread caps — `build_proxy_args`
+  and the golden oracle do not move), turns `out_time_us / duration` into a fraction held under 1
+  (the file is not in place until it is renamed), polls `cancel` between reports (kill, remove the
+  `.part`, `Error::Cancelled`) and kills ffmpeg after `EXPORT_STALL` (300 s) without a word — it
+  used to be a bare `.output()` that waited forever *while holding the machine's one heavy slot*.
+  The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
+  is not shown building. **A stalled hardware encode or decode is a hardware failure like a refusal**
+  (`retry_proxy_in_software`, pure): it turns hardware encode (and decode) off for the process and the
+  proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
+  encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
+  before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
+  = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
+  cache stays valid) or the 720 / 1080 Settings pick (`set_proxy_base_width`, driven by
+  `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (hardware
+  H.264 stops at 4096 across and one refusal turns every hardware encode off). The width is in the
+  key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
   encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
   each compiled-in candidate is verified with a one-frame test encode, because
@@ -121,7 +140,30 @@ so the feature is **only** activated through these forwards — which is what ma
   its PCM, so gigabytes too) and leave the desktop unusable for no wall-clock
   gain. Two moving parts: **one heavy job at a time** (`cpu::lease`, a reentrant
   gate — an export's second pass and a stitch inside an import must not queue
-  behind themselves) and **a share of the cores for that job** (`cpu_percent`,
+  behind themselves; **in three lanes** (`cpu::Priority`): **foreground** — an export (each
+  variant), a levels measurement, a voiceover, an Insta360 stitch at import, a smart crop: whatever
+  a user is actively waiting on, and the default lane of a plain `lease()` — goes before **proxy**,
+  which goes before **background** — analysis steps and transcription, which run inside
+  `cpu::in_background` so every whole-file decode they reach into queues there without knowing.
+  Within a lane the slot goes in arrival order (tickets, not whichever thread the scheduler
+  wakes). Foreground first because an export started on a freshly opened 80-clip project must not
+  sit at 0% behind every proxy build; proxy before background because the preview is decoding the
+  original until a proxy lands while analysis is only wanted eventually. **A proxy reserves its place
+  when it is queued** (`cpu::reserve()` → `Reservation::lease_waiting`), not when its worker thread
+  gets as far as asking: `spawn_proxy` runs in the import before the webview can start the analysis
+  of the very file, and without the reservation the analysis took the slot while the worker was
+  still in its ffprobe, then held it for a whole scene-detection pass over 5K HEVC. A reservation
+  blocks background work, never the foreground. A job already running is never interrupted — a
+  waiter waits for the step in flight, not for the queue. **A job that waits says why and can be
+  stopped while it does**: `lease_waiting(on_wait, cancel)` calls `on_wait(Wait::Proxy | Wait::Job)`
+  when it first has to wait (and again if the reason changes — never under the gate's lock) and
+  polls `cancel` four times a second, returning `Error::Cancelled` and leaving its queue. The export
+  says it through `ExportProgress.waiting` ("waiting for the preview proxy"; the dialog and status
+  bar show it instead of 0%), analysis through the `waiting` stage, a voiceover through its `waiting`
+  stage, a levels measurement only honours the Stop; a proxy waiting for its slot is cancelled by a
+  delete / rebuild / settings change without ever starting. **Still one job on the cores at a time at
+  any budget**: two at once would be two shares of the machine, which is what `cpu_percent` says one
+  job may take) and **a share of the cores for that job** (`cpu_percent`,
   seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
   a whole-file job whose *result* is wanted later and that nobody is looking at:
   silence / scene / loudness detection, the PCM decode behind rhythm and in-process

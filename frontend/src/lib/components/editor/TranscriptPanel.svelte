@@ -7,6 +7,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
 
@@ -48,11 +49,12 @@
 		if (st && !st.available) {
 			return { title: 'Transcription unavailable', body: st.reason ?? undefined };
 		}
-		if (st && !st.enabled) {
+		const transcribed = mediaStatus.done(editor.selectedAssetId, 'transcript');
+		if (st && !st.enabled && !transcribed) {
 			return {
-				title: 'Speech-to-text is off',
-				body: 'Analysis skips transcription while it is off. Turn it on in Settings, then analyze the clip.',
-				action: 'settings'
+				title: 'Speech-to-text is off for new imports',
+				body: 'Turn it on in Settings › Analysis, or transcribe this clip by hand.',
+				action: 'analyze'
 			};
 		}
 		if (st && !st.model_ready) {
@@ -62,8 +64,8 @@
 				action: 'download'
 			};
 		}
-		if (!editor.selectedMetadata?.analysis) {
-			return { title: 'Not analyzed yet', body: 'Analyze this clip to transcribe its speech.', action: 'analyze' };
+		if (!transcribed) {
+			return { title: 'Not transcribed yet', body: 'Transcribe this clip to read its speech.', action: 'analyze' };
 		}
 		return { title: 'No speech found', body: 'This media was analyzed but no speech was detected in it.' };
 	});
@@ -123,8 +125,8 @@
 			{:else if tx.action === 'analyze' && editor.selectedAssetId}
 				<Btn size="sm" onclick={() =>
 						void ui
-							.runAnalysis(editor.selectedAssetId!)
-							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Analyze &amp; transcribe</Btn>
+							.runAnalysis(editor.selectedAssetId!, ['transcript'])
+							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Transcribe</Btn>
 			{/if}
 		</div>
 	{:else}

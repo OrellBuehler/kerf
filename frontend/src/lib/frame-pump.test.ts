@@ -114,6 +114,7 @@ beforeAll(async () => {
 	rmSync(dir, { recursive: true, force: true });
 	mkdirSync(dir, { recursive: true });
 	emit('preview-bounds.js', readFileSync(join(import.meta.dir, 'preview-bounds.ts'), 'utf8'), false);
+	emit('proxy-wait.js', readFileSync(join(import.meta.dir, 'proxy-wait.ts'), 'utf8'), false);
 	emit('frame-pump.svelte.js', readFileSync(join(import.meta.dir, 'frame-pump.svelte.ts'), 'utf8'), true);
 	writeFileSync(join(dir, 'harness.svelte.js'), compileModule(HARNESS, { generate: 'client', filename: 'harness.svelte.js' }).js.code);
 	harness = (await import(join(dir, 'harness.svelte.js'))).harness;
@@ -278,6 +279,60 @@ describe('with the GPU preview on', () => {
 		expect(failures).toHaveLength(1);
 		expect(h.frames.frameUrl).toBe('data:jpeg-0');
 		expect(h.frames.gpuShown).toBe(false);
+		h.stop();
+	});
+});
+
+describe('under "Proxy only"', () => {
+	const waiting = () =>
+		new Error('waiting for the preview proxy of GOPR0042.MP4 — building it (42%) (Settings › Preview › Preview source is Proxy only)');
+
+	test('a refused frame is the preview waiting: not a GPU failure, no JPEG fallback, the picture stays', async () => {
+		const failures: unknown[] = [];
+		let refuse = false;
+		const r = recorder({
+			gpu: async (t) => {
+				if (refuse) throw waiting();
+				return { renderer: 'gpu' as const, frame: null, reasons: [], timings: { width: 1920, height: 1080, decode_ms: 1, composite_ms: 1, present_ms: 1 } };
+			}
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, ...r, gpuFailed: (e) => failures.push(e) });
+		await settle();
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		// The next frame is refused: the surface is not told to go, nothing falls back to the JPEG
+		// (which would be refused as well), and what is on show stays.
+		refuse = true;
+		h.time = 1;
+		await settle();
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'gpu@1']);
+		expect(failures).toEqual([]);
+		expect(h.frames.gpuShown).toBe(true);
+		// The proxy lands: the frame is asked for again and shown.
+		refuse = false;
+		h.previewEpoch = 1;
+		await settle();
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'gpu@1', 'gpu@1']);
+		h.stop();
+	});
+
+	test('a pump that was refused still takes the next frame it is asked for', async () => {
+		let refuse = true;
+		const r = recorder({
+			jpeg: async (t) => {
+				if (refuse) throw waiting();
+				return `data:jpeg-${t}`;
+			}
+		});
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		refuse = false;
+		h.time = 2;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@0', 'jpeg@2']);
+		expect(h.frames.frameUrl).toBe('data:jpeg-2');
 		h.stop();
 	});
 });

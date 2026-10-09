@@ -675,11 +675,13 @@
 							></div>
 						</div>
 						<span
+							data-testid="export-progress-text"
 							style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
 						>
+							{#if progress?.waiting}{progress.waiting}…{:else}
 							{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
 								(progress?.fraction ?? 0) * 100
-							)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}
+							)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
 						</span>
 					</div>
 					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>

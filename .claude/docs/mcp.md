@@ -178,3 +178,19 @@ the audience), and `export_cover` writes the thumbnail.
 `revision_diff` explains a past revision. The server `instructions` spell the flow
 out, since an agent that does not know its edits are held back would report a cut
 the user has not got.
+
+**Proxies and analysis steps.** `analyze_asset { asset_id, steps? }` runs only the named kinds
+(`silence`, `scenes`, `loudness`, `rhythm`, `transcript`, `all`; aliases such as `tempo` / `transcription`
+parse) and merges them into the cache; omitted, it runs what the user left on in Settings ›
+Analysis, so an agent cannot fetch a speech model for someone who turned transcription off — naming
+`transcript` overrides that. It shares `run_analysis` with the GUI command, so the bin's chips update
+live for an agent's run too; the result is the cached analysis plus `analysis_status` and, for a partial
+failure, `failed: [{step, reason}]` (a run where every step failed is an error; a step that fails does
+not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`. `proxy_status
+{ asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
+a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
+the machine.
+`analysis_status { asset_id? }` reads the per-kind state of one asset or all of them. The proxy and analysis
+tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
+`analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
+a file with no audio — is an invalid-params error, not an empty result.

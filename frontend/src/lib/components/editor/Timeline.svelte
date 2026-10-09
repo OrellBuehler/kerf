@@ -73,6 +73,9 @@
 	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
 	import { linkPartners } from '$lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
+	import { analyzeSubmenuItem } from '$lib/analyze-menu';
+	import { doneCount, doneSummary } from '$lib/analysis-steps';
+	import { mediaStatus } from '$lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
 	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
@@ -1323,6 +1326,22 @@
 		];
 	}
 
+	/** What has been analysed for the clip's media, and a way to run more (opens the Analyze menu
+	 *  where the pointer was — the menu is long enough already). */
+	function clipAnalysisItems(c: Clip, e: MouseEvent): MenuItem[] {
+		const asset = editor.assets.find((a) => a.id === c.asset_id);
+		if (!asset) return [];
+		return [
+			{
+				type: 'info',
+				label: 'Analyzed',
+				value: doneCount(mediaStatus.analysis(asset.id)),
+				title: doneSummary(mediaStatus.analysis(asset.id))
+			},
+			analyzeSubmenuItem(asset, { x: e.clientX, y: e.clientY })
+		];
+	}
+
 	function onClipContextMenu(e: MouseEvent, c: Clip, t: Track) {
 		// Right-clicking inside a multi-selection keeps it, so the menu can act on all.
 		if (!editor.isSelected(c.id)) editor.selectClip(c.id);
@@ -1418,6 +1437,8 @@
 				reason: lp.unlink.reason ?? undefined,
 				action: () => void unlinkSelection()
 			},
+			{ type: 'separator' },
+			...clipAnalysisItems(c, e),
 			{ type: 'separator' },
 			{
 				label: enabled ? 'Disable clip' : 'Enable clip',

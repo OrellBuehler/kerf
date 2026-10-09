@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Kerf's preferences: how much of the machine the media engine may take,
-	// whether an analysis pass transcribes speech, what the preview draws and
-	// what colors the editor is drawn in. A section list on the left, panels on
+	// which analyses run on import, how the preview is made and what it draws,
+	// and what colors the editor is drawn in. A section list on the left, panels on
 	// the right, so the next one is a row in a list.
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
@@ -13,6 +13,8 @@
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
+	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
 
@@ -21,6 +23,7 @@
 	// Sections are a list rather than markup so adding one is a data change.
 	const SECTIONS = [
 		{ id: 'performance', label: 'Performance', icon: 'sliders-horizontal' },
+		{ id: 'analysis', label: 'Analysis', icon: 'scan-line' },
 		{ id: 'speech', label: 'Speech', icon: 'mic' },
 		{ id: 'preview', label: 'Preview', icon: 'eye' },
 		{ id: 'appearance', label: 'Appearance', icon: 'palette' },
@@ -97,6 +100,15 @@
 		voCancelling = true;
 		await cancelVoiceover();
 	}
+
+	const KIND_HELP: Record<(typeof ANALYSIS_KINDS)[number]['kind'], string> = {
+		silence: 'Finds the silent spans, so Remove silences and the timeline markers have something to work from.',
+		scenes: 'Finds the shot changes, for markers and rough cuts.',
+		loudness: 'Measures EBU R128 loudness, so levels can be matched.',
+		rhythm: 'Finds onsets, the tempo and beat grid, and whether the audio is speech or music — for Cut to the beat.',
+		transcript:
+			'Speech to text, for the Transcript tab and captions. Downloads a speech model on first use and runs for minutes on long clips.'
+	};
 
 	const chip = (active: boolean) =>
 		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
@@ -224,28 +236,71 @@
 						A job already running keeps the cores it started with — FFmpeg cannot be told otherwise
 						mid-render. The next one picks this up.
 					</p>
-				{:else if section === 'speech'}
+				{:else if section === 'analysis'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						Speech-to-text
+						Analyze on import
 					</div>
 					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
 						<input
 							type="checkbox"
-							checked={settings.transcribe}
-							onchange={(e) => settings.setTranscribe(e.currentTarget.checked)}
+							data-testid="auto-analysis-master"
+							checked={settings.autoAnalysis.enabled}
+							onchange={(e) => settings.setAutoAnalysis({ enabled: e.currentTarget.checked })}
 							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
 						/>
 						<span style="display:flex;flex-direction:column;gap:3px">
-							<span style="font-size:12px;color:var(--text-primary)">Transcribe speech when analyzing media</span>
+							<span style="font-size:12px;color:var(--text-primary)">Analyze new media when it is imported</span>
 							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-								Every import runs an analysis pass. With this on, the pass also transcribes the speech — which
-								downloads a model on first use and then runs for a good fraction of each clip's length.
+								Each pass reads the whole file, one clip at a time, behind any preview proxy that is being built.
+								Off, nothing runs by itself — right-click a clip in the bin and pick what to analyze.
 							</span>
 						</span>
 					</label>
+
+					<div
+						style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
+						What to analyze
+					</div>
+					<div style="margin-top:8px;display:flex;flex-direction:column;gap:2px">
+						{#each ANALYSIS_KINDS as k (k.kind)}
+							<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:5px 0">
+								<input
+									type="checkbox"
+									data-testid="auto-analysis-{k.kind}"
+									checked={settings.autoAnalysis[k.kind]}
+									onchange={(e) => settings.setAutoKind(k.kind, e.currentTarget.checked)}
+									style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+								/>
+								<span style="display:flex;flex-direction:column;gap:2px">
+									<span style="font-size:12px;color:var(--text-primary)">{k.label}</span>
+									<span style="font-size:12px;line-height:1.5;color:var(--text-secondary)">{KIND_HELP[k.kind]}</span>
+								</span>
+							</label>
+						{/each}
+					</div>
 					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
-						Off, analysis still detects silence, scenes, loudness and the beat; the Transcript tab and captions
-						have nothing to work from until it is turned back on and the clip re-analyzed.
+						With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
+						runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
+					</p>
+				{:else if section === 'speech'}
+					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+						Speech-to-text
+					</div>
+					<p style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+						Transcription downloads a speech model on first use and then runs for a good fraction of each clip's
+						length. Whether it runs on import is decided under
+						<button
+							type="button"
+							onclick={() => (section = 'analysis')}
+							style="background:none;border:none;padding:0;cursor:pointer;color:var(--kerf-300);font:inherit;text-decoration:underline"
+							>Analysis</button
+						>.
+					</p>
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						{settings.autoAnalysis.transcript
+							? 'Transcription is on for new imports.'
+							: 'Transcription is off for new imports: the Transcript tab and captions have nothing to work from until you transcribe a clip by hand (right-click it in the bin, Analyze).'}
 					</p>
 
 					<div
@@ -291,6 +346,58 @@
 					</p>
 				{:else if section === 'preview'}
 					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+						Preview proxies
+					</div>
+					<p style="margin:6px 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+						Kerf builds a light, all-intra copy of each video so scrubbing decodes one frame instead of a long GOP of
+						4K or 5K footage. Export always reads the original. A proxy is built before any analysis that is waiting.
+					</p>
+					<div role="radiogroup" aria-label="Proxy size" style="display:flex;flex-wrap:wrap;gap:6px">
+						{#each PROXY_SIZES as p (p.size)}
+							<button
+								role="radio"
+								aria-checked={settings.proxySize === p.size}
+								data-testid="proxy-size-{p.size}"
+								title={p.hint}
+								onclick={() => settings.setProxySize(p.size)}
+								style={chip(settings.proxySize === p.size)}>{p.label}</button
+							>
+						{/each}
+					</div>
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						{PROXY_SIZES.find((p) => p.size === settings.proxySize)?.hint} Pixels across; 360 footage keeps its larger
+						ratio. A proxy made at another size stays on disk until you delete it from the bin.
+					</p>
+
+					<div
+						style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
+						Preview source
+					</div>
+					<div role="radiogroup" aria-label="Preview source" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+						{#each PREVIEW_SOURCES as p (p.source)}
+							<button
+								role="radio"
+								aria-checked={settings.previewSource === p.source}
+								data-testid="preview-source-{p.source}"
+								title={p.hint}
+								disabled={settings.proxySize === 0 && p.source !== 'original'}
+								onclick={() => settings.setPreviewSource(p.source)}
+								style="{chip(settings.previewSource === p.source)};{settings.proxySize === 0 && p.source !== 'original'
+									? 'opacity:.45;cursor:not-allowed'
+									: ''}">{p.label}</button
+							>
+						{/each}
+					</div>
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						{settings.proxySize === 0
+							? 'Proxies are off, so the preview decodes the original.'
+							: PREVIEW_SOURCES.find((p) => p.source === settings.previewSource)?.hint}
+					</p>
+
+					<div
+						style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+					>
 						Safe areas
 					</div>
 					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
