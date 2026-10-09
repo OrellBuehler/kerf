@@ -103,6 +103,7 @@ import {
 	splitClip,
 	trimClip,
 	generateVoiceover,
+	separateStems,
 	undo as apiUndo
 } from './api';
 import type {
@@ -135,6 +136,7 @@ import type {
 	ReframeKeyframe,
 	Revision,
 	StagedEdit,
+	StemsPlaced,
 	StreamKind,
 	TextKeyframe,
 	Marker,
@@ -998,6 +1000,42 @@ class EditorState {
 			await this.refreshHistory();
 			await this.select(asset.id);
 			return asset;
+		} finally {
+			this.#busyCount--;
+		}
+	}
+	/**
+	 * Split an asset's sound into drums / bass / other / vocals (Demucs). The four stems join the
+	 * library; with `clipId` they are also laid under that clip on four new tracks and its own
+	 * sound is switched off — one `Separate stems` revision, and the new clips are selected. Like
+	 * `generateVoiceover` it reports nothing through `error`: the dialog says what happened, and
+	 * a cancelled run is not an error at all.
+	 */
+	async separateStems(assetId: string, clipId?: string): Promise<StemsPlaced> {
+		this.#busyCount++;
+		if (clipId) {
+			// An edit to the live cut, so reviewing a proposal is over; into the library alone it is not.
+			this.previewingStaged = false;
+			this.#liveTimeline = null;
+		}
+		try {
+			const { placed, timeline } = await separateStems(assetId, clipId);
+			const known = new Set(this.assets.map((a) => a.id));
+			const fresh = placed.assets.filter((a) => !known.has(a.id));
+			if (fresh.length > 0) this.assets = [...this.assets, ...fresh];
+			if (clipId) {
+				this.#setTimeline(timeline);
+				await this.refreshHistory();
+				if (placed.clips.length > 0) this.selectClips(placed.clips.map((c) => c.id), placed.clips[0].id);
+			} else if (placed.assets.length > 0) {
+				await this.select(placed.assets[0].id);
+			}
+			return placed;
+		} catch (e) {
+			// The stems land in the library before the clip is laid down, so a refusal there
+			// leaves them in the project without the bin having heard of them.
+			await this.refreshAssets().catch(() => {});
+			throw e;
 		} finally {
 			this.#busyCount--;
 		}

@@ -70,6 +70,7 @@
 	import { clipDuration } from '$lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '$lib/beats';
 	import { fitOffer } from '$lib/music-ui';
+	import { stemsOffer } from '$lib/stems';
 	import { transitionLabel } from '$lib/transitions';
 	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
 	import { linkPartners } from '$lib/link-groups';
@@ -1376,6 +1377,12 @@
 		const linked = linkPartners(editor.timeline, c.id).length > 0;
 		// Music with a fitted bar grid can be made to last as long as the picture.
 		const fit = fitOffer(t, c, editor.analysisFor(c.asset_id));
+		// Footage or music with sound can be split into drums / bass / other / vocals under the clip.
+		const stems = stemsOffer(
+			t,
+			c,
+			editor.assets.find((a) => a.id === c.asset_id)
+		);
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
@@ -1472,10 +1479,21 @@
 							disabled: fit.reason !== null,
 							reason: fit.reason ?? undefined,
 							action: () => ui.openFitMusic(c.id)
-						} satisfies MenuItem,
-						{ type: 'separator' } satisfies MenuItem
+						} satisfies MenuItem
 					]
 				: []),
+			...(stems.show
+				? [
+						{
+							label: 'Separate stems under this clip…',
+							icon: 'layers',
+							disabled: stems.reason !== null,
+							reason: stems.reason ?? undefined,
+							action: () => ui.openStems(c.asset_id, c.id)
+						} satisfies MenuItem
+					]
+				: []),
+			...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
 			{
 				label: enabled ? 'Disable clip' : 'Enable clip',
 				icon: enabled ? 'eye-off' : 'eye',

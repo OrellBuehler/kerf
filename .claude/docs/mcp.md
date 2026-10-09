@@ -167,7 +167,9 @@ phrases — no chroma; errors until analyzed, `music: null` without a pulse),
 `plan_music_fit { clip_id, target? }` (read-only `MusicFit`) and `fit_music { clip_id,
 target?, fade_out? }` (default `fade_out` true; answers `{fit: MusicFitReport, timeline}`;
 decides its own layout, so it takes no `ripple`), `set_master_duck { depth_db? }` (the
-speech gate; omitted = compressor), and `export`'s `options.loudness` preset. The server
+speech gate; omitted = compressor), `stems_status` and `separate_stems { asset_id, clip_id? }`
+(async, progress through the token like `generate_voiceover`, cancel via `context.ct`, the
+GUI sees `stems-progress`; answers `StemsPlaced`), and `export`'s `options.loudness` preset. The server
 `instructions` route music under a cut through analyze → fit_music → duck.
 `set_master_volume` / `set_master_limiter` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes

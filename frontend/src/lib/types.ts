@@ -1037,6 +1037,37 @@ export interface VoiceoverResult {
 	timeline: Timeline;
 }
 
+/** What stem separation has on disk (`kerf_core::StemsStatus`): whether its first use still
+ *  downloads the ONNX runtime or the Demucs model, how big that model is and the stems it makes. */
+export interface StemsStatus {
+	runtime_ready: boolean;
+	model_ready: boolean;
+	model_bytes: number;
+	/** In order: `drums`, `bass`, `other`, `vocals`. */
+	stems: string[];
+}
+
+/** Payload of the `stems-progress` event, the same shape as `voiceover-progress`. */
+export interface StemsProgress {
+	stage: 'download_runtime' | 'download_model' | 'separate' | 'encode';
+	fraction: number | null;
+	/** A short note, e.g. `42 MB / 170 MB` or the stem being encoded. */
+	detail: string | null;
+}
+
+/** What `place_stems` did (`kerf_core::StemsPlaced`): the stem assets, in `stems` order, and the
+ *  clips laid under the separated clip (empty when only the library was asked for). */
+export interface StemsPlaced {
+	assets: Asset[];
+	clips: Clip[];
+}
+
+/** The `separate_stems` answer: what was placed and the refreshed timeline. */
+export interface StemsResult {
+	placed: StemsPlaced;
+	timeline: Timeline;
+}
+
 /** What the app was launched asking to open (kerf-app's `LaunchProject`, externally
  *  tagged): a `.kerf` that exists, or one named on the command line that is not
  *  there — never created, so the page says so instead. */

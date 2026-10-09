@@ -10659,10 +10659,10 @@ mod tests {
                 let level = |from: f64, to: f64| -> f64 {
                     let (a, b) = ((from * sr as f64) as usize, (to * sr as f64) as usize);
                     let (mut re, mut im) = (0.0, 0.0);
-                    for n in a..b {
+                    for (n, x) in samples.iter().enumerate().take(b).skip(a) {
                         let w = 2.0 * std::f64::consts::PI * 220.0 * n as f64 / sr as f64;
-                        re += samples[n] as f64 * w.cos();
-                        im += samples[n] as f64 * w.sin();
+                        re += *x as f64 * w.cos();
+                        im += *x as f64 * w.sin();
                     }
                     2.0 * (re * re + im * im).sqrt() / (b - a) as f64
                 };

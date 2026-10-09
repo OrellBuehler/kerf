@@ -284,14 +284,14 @@ fn runtime_path(spec: &RuntimeSpec) -> Option<PathBuf> {
 }
 
 /// The runtime library if it is already on disk.
-fn ready_runtime() -> Option<PathBuf> {
+pub(super) fn ready_runtime() -> Option<PathBuf> {
     if let Some(path) = runtime_override() {
         return path.is_file().then_some(path);
     }
     runtime_spec().and_then(|s| runtime_path(&s)).filter(|p| p.is_file())
 }
 
-fn ensure_runtime(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
+pub(super) fn ensure_runtime(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
     if let Some(path) = runtime_override() {
         return if path.is_file() {
             Ok(path)
@@ -346,7 +346,7 @@ fn unsupported_platform() -> Error {
     ))
 }
 
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+pub(super) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     let mut file = std::fs::File::open(path).map_err(|e| Error::Engine(format!("could not read download: {e}")))?;
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
@@ -425,7 +425,7 @@ fn ensure_model(progress: &mut dyn FnMut(DownloadProgress), cancel: &dyn Fn() ->
 /// An ONNX file is a protobuf `ModelProto` whose first field is `ir_version`
 /// (field 1, varint: tag byte `0x08`) — enough to tell a model from an error
 /// page saved under its name.
-fn verify_onnx(path: &Path) -> Result<()> {
+pub(super) fn verify_onnx(path: &Path) -> Result<()> {
     let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut head = [0u8; 1];
     let ok = len > MB && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head[0] == 0x08;
@@ -876,7 +876,10 @@ pub struct Synthesis {
     pub segments: Vec<TranscriptSegment>,
 }
 
-fn download_progress<'a, 'b: 'a>(stage: &'a str, progress: &'a mut Report<'b>) -> Box<dyn FnMut(DownloadProgress) + 'a> {
+pub(super) fn download_progress<'a, 'b: 'a>(
+    stage: &'a str,
+    progress: &'a mut Report<'b>,
+) -> Box<dyn FnMut(DownloadProgress) + 'a> {
     Box::new(move |p: DownloadProgress| {
         let mb = |b: u64| format!("{:.0} MB", b as f64 / MB as f64);
         let detail = match p.total {
@@ -1017,7 +1020,7 @@ fn session_slot() -> &'static Mutex<Option<Loaded>> {
 
 /// Load the runtime library into the process, once. A second call with a
 /// different path is ignored — a process can hold one ONNX Runtime.
-fn init_runtime(runtime: &Path) -> Result<()> {
+pub(super) fn init_runtime(runtime: &Path) -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
         ort::init_from(runtime)

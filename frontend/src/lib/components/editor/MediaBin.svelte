@@ -224,6 +224,13 @@
 					.then(() => toast.success(`Removed ${analysis?.silence_segments.length} silent gaps`))
 					.catch(err)
 		});
+		// Drums / bass / other / vocals into the library; the clip menu lays them under a clip instead.
+		if (info.audio)
+			items.push({
+				label: 'Separate stems…',
+				icon: 'layers',
+				action: () => ui.openStems(asset.id)
+			});
 
 		items.push({ type: 'separator' });
 		if (asset.voiceover) {

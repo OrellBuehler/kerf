@@ -53,6 +53,9 @@ import type {
 	SettingsView,
 	SplitSide,
 	StagedEdit,
+	StemsProgress,
+	StemsResult,
+	StemsStatus,
 	StreamKind,
 	Task,
 	TextKeyframe,
@@ -116,6 +119,7 @@ import { sampleFrameUrl } from './sample-frame';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
+import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -1203,6 +1207,108 @@ export async function onVoiceoverProgress(cb: (p: VoiceoverProgress) => void): P
 	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<VoiceoverProgress>('voiceover-progress', (e) => cb(e.payload));
+}
+
+// ---- stem separation (Demucs) -----------------------------------------------
+
+// The browser harness has no separator, so it fakes one: the same progress sequence the app
+// streams (a download on first use, then separate, then encode), four silent-in-fact stem assets
+// named like the real ones and, under a clip, `placeStems` — the faithful mirror of
+// `Project::place_stems`. Repeating a run finds the stems again by path and skips the work, as
+// the app's per-file cache does.
+const devStemsListeners = new Set<(p: StemsProgress) => void>();
+let devStemsReady = false;
+let devStemsCancelled = false;
+const DEV_STEMS_TICK_MS = 160;
+
+function devStemsStatus(): StemsStatus {
+	return { runtime_ready: devStemsReady, model_ready: devStemsReady, model_bytes: DEV_MODEL_BYTES, stems: [...STEM_NAMES] };
+}
+
+/** One stage's worth of synthetic ticks; stops with the real error on a cancel. */
+async function devStemsStage(stage: StemsProgress['stage'], steps: number, detail: (i: number) => string | null) {
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, DEV_STEMS_TICK_MS));
+		if (devStemsCancelled) throw new Error(STEMS_CANCELLED);
+		const p: StemsProgress = { stage, fraction: i / steps, detail: detail(i) };
+		for (const cb of devStemsListeners) cb(p);
+	}
+}
+
+async function devStemsRun() {
+	if (!devStemsReady) {
+		await devStemsStage('download_runtime', 3, (i) => `${Math.round((i / 3) * 12)} MB / 12 MB`);
+		await devStemsStage('download_model', 4, (i) => `${Math.round((i / 4) * 174)} MB / 174 MB`);
+		devStemsReady = true;
+	}
+	await devStemsStage('separate', 6, () => null);
+	await devStemsStage('encode', STEM_NAMES.length, (i) => (i < STEM_NAMES.length ? STEM_NAMES[i] : null));
+}
+
+/** Whether stem separation would still download its runtime or model first, how big the
+ *  model is, and the stems it makes. */
+export async function stemsStatus(): Promise<StemsStatus> {
+	if (!inTauri()) return devStemsStatus();
+	return invoke<StemsStatus>('stems_status');
+}
+
+/**
+ * Split an asset's sound into drums, bass, other and vocals, streaming `stems-progress`, and
+ * add the four stems to the library as `<name> · drums` … With `clipId` they are also laid under
+ * that clip on four new audio tracks (Drums / Bass / Other / Vocals) at its position and span, and
+ * the clip's own sound is switched off (an audio clip disabled, a picture's `source_audio` off) —
+ * one `Separate stems` revision. Rejects with `stems cancelled` if stopped; the app also refuses an
+ * asset without sound, a clip of another asset, a locked track and a picture whose sound is on a
+ * linked audio clip.
+ */
+export async function separateStems(assetId: string, clipId?: string): Promise<StemsResult> {
+	if (!inTauri()) {
+		devStemsCancelled = false;
+		const source = assetById(assetId);
+		if (!source) throw new Error(`asset not found: ${assetId}`);
+		if (!source.streams.some((s) => s.kind === 'audio')) throw new Error('invalid argument: this asset has no sound to separate');
+		const made = devStemAssets(source, uid, new Date().toISOString());
+		const known = made.map((m) => sampleAssets.find((a) => a.path === m.path));
+		// The app caches the stems per file: a second run answers at once, without a word of progress.
+		if (known.some((k) => !k)) await devStemsRun();
+		// `insert_or_get_asset`: stems already in the library (same path) are reused, and they stay
+		// there even if the placement is then refused — the assets land before the edit does.
+		const assets = made.map((fresh, i) => {
+			const had = known[i];
+			if (had) return had;
+			sampleAssets.push(fresh);
+			return fresh;
+		});
+		let clips: Clip[] = [];
+		if (clipId) {
+			// `edit_timeline_exact`: no ripple; a refusal leaves the timeline as it was.
+			const scratch = snapshot();
+			clips = placeStems(scratch, assetId, assets, clipId, uid);
+			devTimeline = scratch;
+			recordDev('Separate stems');
+		}
+		return { placed: structuredClone({ assets, clips }), timeline: snapshot() };
+	}
+	return invoke<StemsResult>('separate_stems', { assetId, clipId });
+}
+
+/** Stop the download or separation in flight; it then rejects with `stems cancelled`. */
+export async function cancelStems(): Promise<void> {
+	if (!inTauri()) {
+		devStemsCancelled = true;
+		return;
+	}
+	return invoke<void>('cancel_stems');
+}
+
+/** Subscribe to `stems-progress` events — the GUI's own and an agent's. Returns an unlisten fn. */
+export async function onStemsProgress(cb: (p: StemsProgress) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devStemsListeners.add(cb);
+		return () => void devStemsListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<StemsProgress>('stems-progress', (e) => cb(e.payload));
 }
 
 // ---- ripple mode -----------------------------------------------------------

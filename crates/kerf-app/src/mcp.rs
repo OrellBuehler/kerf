@@ -427,6 +427,16 @@ struct SnapToBeatsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SeparateStemsParams {
+    #[schemars(description = "UUID of the asset whose sound to separate (music, or footage with dialogue over a bed)")]
+    asset_id: String,
+    #[schemars(
+        description = "UUID of a clip of that asset to lay the stems under: each stem goes on its own new audio track at the clip's position and span, and the clip's own sound is switched off. Omit to only add the stems to the library"
+    )]
+    clip_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PlanMusicFitParams {
     #[schemars(description = "UUID of the music clip (on an audio track, at normal speed)")]
     clip_id: String,
@@ -2694,6 +2704,72 @@ impl KerfMcp {
         let (asset, clip, captions) = placed?;
         self.changed();
         json(&serde_json::json!({ "asset": asset, "clip": clip, "captions": captions }))
+    }
+
+    #[tool(
+        description = "Whether stem separation is ready on this machine: whether the ONNX runtime and the ~170 MB Demucs model still have to be downloaded, and the stems it makes."
+    )]
+    fn stems_status(&self) -> Result<String, McpError> {
+        json(&kerf_core::stems_status())
+    }
+
+    #[tool(
+        description = "Split an asset's sound into four stems — drums, bass, other, vocals — with the Demucs htdemucs model, \
+                       added to the library as FLAC assets (\"<name> · drums\" …). With clip_id they are also laid under \
+                       that clip on four new audio tracks with the clip's own sound switched off, so each part can be \
+                       mixed, muted or re-cut on its own: drums from one section under another, the vocals pulled down \
+                       under a voiceover, or dialogue separated from the background of a clip (its speech lands in \
+                       vocals). The first call downloads the runtime and model; separation takes a fraction of the audio's length on a \
+                       modern CPU (minutes on an old one) — send a `progressToken` for progress and cancel the request to \
+                       stop it. Cached per file. Returns the stem assets and the placed clips."
+    )]
+    async fn separate_stems(
+        &self,
+        Parameters(p): Parameters<SeparateStemsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let asset_id = parse_id(&p.asset_id)?;
+        let clip_id = p.clip_id.as_deref().map(parse_id).transpose()?;
+        let project = self.project.clone();
+        let app = self.app.clone();
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<f64>, String)>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            tauri::async_runtime::spawn(async move {
+                while let Some((fraction, message)) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let param = ProgressNotificationParam::new(token, fraction.unwrap_or(0.0)).with_total(1.0);
+                    let _ = peer.notify_progress(param.with_message(message)).await;
+                }
+            })
+        };
+        let placed = blocking(move || {
+            let asset = lock_agent(&project).require_asset(asset_id).map_err(core_err)?;
+            let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+                let message = match &detail {
+                    Some(d) => format!("{stage}: {d}"),
+                    None => stage.to_string(),
+                };
+                let _ = tx.send((fraction, message));
+                let _ = app.emit(
+                    "stems-progress",
+                    crate::VoiceoverProgressEvent {
+                        stage: stage.to_string(),
+                        fraction,
+                        detail,
+                    },
+                );
+            };
+            let stems = Project::separate_stems_media(&asset, &mut on_progress, &|| cancel.is_cancelled()).map_err(core_err)?;
+            lock_agent(&project).place_stems(asset_id, &stems, clip_id).map_err(core_err)
+        })
+        .await;
+        let _ = forward.await;
+        let placed = placed?;
+        self.changed();
+        json(&placed)
     }
 
     #[tool(
