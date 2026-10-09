@@ -668,7 +668,8 @@ left for everything else", because the complaint this answers arrives in those
 terms and not in percentages — **Analysis**, a master "analyze new media when it is imported" and one
 toggle per kind (silence, scenes, loudness, rhythm, transcript; `Settings.auto_analysis`, which replaced
 the single `transcribe` checkbox and migrates it): a clip can always be analysed by hand whatever is off,
-and the same set decides what an agent's `analyze_asset` runs when it names no steps. **Speech** keeps
+and the same set decides what an agent's `analyze_asset` runs when it names no steps — so the per-kind
+toggles stay editable while the master is off. **Speech** keeps
 the voiceover model and points at Analysis; `TranscriptionStatus.enabled` is the transcript switch, so
 the transcript tab says "Speech-to-text is off for new imports" and offers Transcribe. And **Preview**:
 the **proxy size** (720 / 1080 / 1280 default / Off, `settings.proxySize`) and the **preview source**
@@ -763,7 +764,8 @@ ffmpeg-bound, so running them together only makes each slower — and stopping d
 the whole rest of the queue. `analyzeImported(ids, auto)` is what an import calls: nothing when the
 master is off, else per asset only the kinds that are on and **not already done** (`autoSteps`; a
 re-imported file redoes nothing, a failed kind is retried, transcript needs a backend), and
-`ensureAnalysis(id, needed)` is what the Agent panel's quick edits call — Remove silences runs only
+`ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
+cannot give: silent b-roll gets scenes only, a still nothing) — — Remove silences runs only
 `silence`, Cut to the beat only `rhythm`, Caption the cut only `transcript` (`QUICK_EDIT_STEPS`).
 `runAnalysis` re-reads the statuses afterwards and toasts each requested step that failed, once). There is **no scripted demo phase machine**: the
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
@@ -813,3 +815,10 @@ The browser harness fakes all of it so the bin, menus and settings can be looked
 `?proxy=failed` / `?proxy=queued` make the b-roll's a failed / queued one; Rebuild runs a timed build,
 Analyze steps run in ~450 ms each and announce themselves through the same `analysis-status` path.
 The pure phrasing is `analysis-steps.ts` and `proxy-info.ts` (bun-tested).
+
+**Proxy only in the preview.** The backend refuses a frame or playback whose clip has no proxy yet with a
+message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free because the frame pump is
+compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
+stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
+a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
+`Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%.

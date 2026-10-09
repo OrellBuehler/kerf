@@ -113,16 +113,21 @@ accepts a *path*, for existing setups) → `base`. `KERF_WHISPER_LANGUAGE` sets 
 language hint, `KERF_WHISPER_MODEL_URL` an offline model mirror. `transcription_status()`
 reports which backend is live, the model, and whether it still has to be fetched — the
 transcript tab and an agent both read it to explain an empty transcript.
-`analyze_asset_media_with_progress` streams a per-step `AnalysisProgress`
-(`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
-transcription runs **last** so the markers land before minutes of inference.
-**A pass is abandonable** (`analyze_asset_media_cancellable` / `analyze_cancellable`,
-a `CancelFn` alongside the `ProgressFn`): the check lands between steps *and* inside
-transcription — the ffmpeg `whisper` run polls it about once a second off
-`-stats_period 1` and kills the child, and the model download polls it per chunk,
-keeping the `.part` file so the next attempt resumes rather than re-fetching 148 MB.
-A cancelled pass returns `Error::Cancelled` and caches **nothing**: a half-analyzed
-asset would read as analyzed, and its missing transcript as "no speech".
+`analyze_asset_steps` streams a per-step `AnalysisProgress`
+(`waiting`/`silence`/`scenes`/`loudness`/`rhythm`/`download_model`/`transcribe`/`done`), and
+transcription runs **last** so the cheap results are cached — each finished step is handed to the
+caller's `on_step` and merged at once (`AssetAnalysis::merge`), so markers and chips land before
+minutes of inference. **A pass is abandonable** (a `CancelFn` alongside the `ProgressFn`): the check
+lands between steps, **while a step is still queued for the machine's slot** (`cpu::lease_waiting`
+polls it four times a second, and the check is repeated the instant the slot is taken, so a Stop
+that arrives while queued never starts a whole-file pass) *and* inside transcription — the ffmpeg
+`whisper` run polls it about once a second off `-stats_period 1` and kills the child, and the model
+download polls it per chunk, keeping the `.part` file so the next attempt resumes rather than
+re-fetching 148 MB. A cancelled or failed *step* caches nothing (a half-analyzed kind would read as
+analyzed, a missing transcript as "no speech"); the steps that finished before it stay cached and
+show done. Analysis runs in the **background lane** of the heavy-job queue (`cpu::in_background`),
+behind exports and preview proxies; transcription takes its slot after its model download, which is
+not heavy work. Kinds that read sound are not run on a file with none (`resolve_steps`).
 
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
@@ -145,7 +150,7 @@ one at a clause) and makes the timings exact — sample counts, not a speech mod
 estimate. So a generated asset carries **`Asset.voiceover`** (`Voiceover`: script,
 voice, speed, per-sentence `segments`; a `voiceover` JSON column migrated like
 `source_paths`), `place_voiceover` writes those segments as its transcript, and
-`generate_captions` subtitles it with no new caption code; `analyze_asset_media_*`
+`generate_captions` subtitles it with no new caption code; `analyze_asset_steps`
 reads a voiceover's transcript from its script (`VoiceoverScript`) instead of
 running whisper over audio whose words are known. The WAV lands in the **data**
 dir (`<data>/kerf/voiceovers/voiceover-<hash>.wav` — the only copy, unlike a proxy)

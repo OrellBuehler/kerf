@@ -6,13 +6,18 @@ registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset(assetId, steps?)` (`steps`: any of `silence`,
 `scenes`, `loudness`, `rhythm`, `transcript`, `all` — only those run, merged into the cached analysis;
 omitted, the kinds Settings leaves on. `run_analysis` is the one path the command and the MCP tool
-share: it streams `analysis-progress` per step and `analysis-status` — the per-kind state — after
-each step starts and when the run ends, merges what finished with the lock released, and keeps
-a cancelled or failed step out of the cache), `analysis_statuses`, preview proxies
-(`proxy_statuses`, `rebuild_proxy`, `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
+share, taking the project through a `lock` closure (`lock_user` for the GUI, `lock_agent` for MCP,
+which stamps the agent's activity and actor): it streams `analysis-progress` per step and
+`analysis-status` — the per-kind state — after each step starts and finishes, **merges each
+finished step into the cache as it lands** (so its chip turns done and its markers appear while the
+slower steps run), with the lock released for the work, and keeps a cancelled or failed step out of
+the cache; nothing to run is an error before anything starts), `analysis_statuses`, preview proxies
+(`proxy_statuses`, `rebuild_proxy` (clears a deleted proxy's mark only once the rebuild was accepted), `delete_proxy` → a `ProxyStatus`; the `proxy-progress` event
 carries one on every change and `proxy-ready` still follows a landed proxy so the preview re-decodes.
 `spawn_proxy` queues through `kerf_core::proxy` and takes its place in front of analysis **before it
-returns** — call it from the blocking pool, it may run the cached ffprobe; the MCP import does it
+returns** — call it from the blocking pool, it may run the cached ffprobe (`set_asset_projection` and
+its MCP twin are `async` + `blocking` for that; `open_project` calls `respawn_proxies`, which does
+every probe on a thread of its own, so the open never waits for N ffprobes); the MCP import does it
 inside its `blocking` closure for that reason. `set_settings` re-queues the missing proxies after a
 `proxy_size` / `preview_source` change; `get_timeline_frame`, `get_preview_frame` and `start_playback`
 refuse under Proxy only while a clip's proxy is building, `get_frame` does not), speech-to-text (`transcription_status`,

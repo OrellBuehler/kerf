@@ -135,9 +135,17 @@
   per-kind toggles, minus transcript without a backend), a named list runs exactly that — so an
   agent cannot fetch a speech model for someone who turned transcription off, and a user can still
   transcribe one clip by hand. Transcribing with no backend is a failed step, not an empty
-  transcript. `Project::analyze_asset` is the convenience over all of it.
+  transcript. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
+  not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
+  chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
+  an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)
+  rather than an empty run. `analyze_asset_steps` runs in the background lane of the heavy-job queue
+  (`engine-cli.md`), announces `waiting`, can be stopped while queued, and hands the patch so far to
+  `on_step` after each finished step so the adapter merges it then. `Project::analyze_asset` is the
+  convenience over all of it.
 - `proxy.rs` — preview proxies as something the user can see and steer. Settings the engine reads
-  (`ProxySize`: 0 / 720 / 1080 / 1280, lenient on read; `PreviewSource`: `auto` / `original` /
+  (`ProxySize`: 0 / 720 / 1080 / 1280, lenient on read; **a change of size cancels every queued or
+  building proxy** — they are at the old width — and the adapter queues what is missing at the new one; `PreviewSource`: `auto` / `original` /
   `proxy_only`, unknown reads as `auto`; size 0 forces the original), `ProxyStatus` per asset
   (`not_needed` for a still or audio-only, `off` with a reason, `missing`, `queued`, `building`
   with a fraction and ETA, `ready` with bytes, `failed` with the reason), and the queue: `queue_auto`
@@ -147,7 +155,10 @@
   what `ready_proxy` and the preview themselves ask — so a status cannot claim a proxy the preview
   would not use. Each submission has a generation; a worker only touches its own entry, never the one
   a rebuild put in its place. The adapters pass a `Notify` that turns each change into the
-  `proxy-progress` event. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
+  `proxy-progress` event. A job stays `Queued` until it holds the machine's slot (its first report is
+  0.0), and a *manual* Rebuild's progress shows under Always original, which builds none by itself.
+  A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
+  and the worker takes the next one. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
   meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips
   in range with no ready proxy; the GUI preview commands refuse to decode the original for them, an

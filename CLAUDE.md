@@ -124,9 +124,10 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
   *string* are not enough: render it (`#[ignore]`d tests) when the shape changes.
 - **Machine budget.** Whole-file background jobs take `cpu::lease`; what the UI draws
   from or an agent looks at is ungated but thread-capped and niced. Thread flags are
-  added at spawn time (`cpu::limit_args`), never in the pure builders. A **proxy goes before
-  analysis**: it is the high lane and reserves its place when queued (`cpu::reserve`), and
-  analysis steps are the normal lane.
+  added at spawn time (`cpu::limit_args`), never in the pure builders. The queue has three lanes —
+  **foreground** (export, levels, voiceover, stitch: what a user waits on) before **proxy** before
+  **background** (analysis): a proxy goes before analysis and after foreground jobs, reserving its
+  place when queued (`cpu::reserve`). A job that waits for the slot says so and polls its cancel.
 - **Nothing waits on a child process forever** — every ffmpeg / ffprobe read has a
   timeout and a kill, and nothing is spawned or waited on under a lock.
 - **Export reads originals; preview reads proxies.** A proxy must answer `-ss T` with the

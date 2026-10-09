@@ -190,3 +190,7 @@ not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`. `
 { asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
 a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
 the machine.
+`analysis_status { asset_id? }` reads the per-kind state of one asset or all of them. The proxy and analysis
+tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
+`analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
+a file with no audio — is an invalid-params error, not an empty result.
