@@ -219,16 +219,15 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         let mut project = lock_user(&shared);
         *project = opened;
         let result = project.path().map(|p| p.display().to_string());
-        let assets = project.list_assets().unwrap_or_default();
         drop(project);
         // The speech model is remembered per project, so transcribing in the
         // reopened one uses the model it was cut with.
         restore_speech_model(&shared);
-        // Make sure every video asset in the reopened project has a preview proxy
-        // (a cached one is a cheap no-op; a missing one regenerates in the background).
-        for asset in &assets {
-            spawn_proxy(&app, asset);
-        }
+        // Make sure every video asset in the reopened project has a preview proxy (a cached one
+        // is skipped; a missing one is built in the background). One ffprobe per asset keys the
+        // proxy, so it is all off this thread: the open must not wait for N probes — a project
+        // of eighty clips on a network drive would otherwise sit there for seconds.
+        respawn_proxies(&app);
         Ok(result)
     })
     .await
@@ -398,27 +397,30 @@ async fn proxy_statuses(state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::
 }
 
 /// Build an asset's proxy again from the original: the one it has (and any being built) is
-/// dropped first, and a proxy the user had deleted is wanted again. Returns where the new
-/// build starts; `proxy-progress` follows it.
-pub(crate) fn rebuild_proxy_now(app: &AppHandle, shared: &Mutex<Project>, asset_id: Uuid) -> CmdResult<kerf_core::ProxyStatus> {
-    let asset = {
-        let project = lock_user(shared);
-        let asset = project.require_asset(asset_id).map_err(|e| e.to_string())?;
-        project.set_proxy_declined(asset_id, false).map_err(|e| e.to_string())?;
-        asset
-    };
-    kerf_core::proxy::rebuild(&asset, proxy_notifier(app)).map_err(|e| e.to_string())
+/// dropped first, and a proxy the user had deleted is wanted again — but only once the rebuild
+/// was accepted (proxies off, or a file that needs none, refuse it and change nothing).
+/// Returns where the new build starts; `proxy-progress` follows it. `lock` is how the caller
+/// takes the project (the GUI as the user, the MCP server as the agent).
+pub(crate) fn rebuild_proxy_now<'a>(
+    app: &AppHandle,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+) -> CmdResult<kerf_core::ProxyStatus> {
+    let asset = lock().require_asset(asset_id).map_err(|e| e.to_string())?;
+    let status = kerf_core::proxy::rebuild(&asset, proxy_notifier(app)).map_err(|e| e.to_string())?;
+    lock().set_proxy_declined(asset_id, false).map_err(|e| e.to_string())?;
+    Ok(status)
 }
 
 /// Delete an asset's proxy files at every size and stop any build of them; the proxy is not
 /// made again by itself until it is rebuilt. Returns the bytes freed and the new status.
-pub(crate) fn delete_proxy_now(
+pub(crate) fn delete_proxy_now<'a>(
     app: &AppHandle,
-    shared: &Mutex<Project>,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
 ) -> CmdResult<(u64, kerf_core::ProxyStatus)> {
     let input = {
-        let project = lock_user(shared);
+        let project = lock();
         project.set_proxy_declined(asset_id, true).map_err(|e| e.to_string())?;
         project.proxy_input(asset_id).map_err(|e| e.to_string())?
     };
@@ -438,14 +440,14 @@ pub(crate) fn delete_proxy_now(
 async fn rebuild_proxy(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<kerf_core::ProxyStatus> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
-    blocking(move || rebuild_proxy_now(&app, &shared, id)).await
+    blocking(move || rebuild_proxy_now(&app, &|| lock_user(&shared), id)).await
 }
 
 #[tauri::command]
 async fn delete_proxy(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<kerf_core::ProxyStatus> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
-    blocking(move || delete_proxy_now(&app, &shared, id).map(|(_, status)| status)).await
+    blocking(move || delete_proxy_now(&app, &|| lock_user(&shared), id).map(|(_, status)| status)).await
 }
 
 /// One step of an analysis pass, tagged with the asset it belongs to so the bin can badge
@@ -472,26 +474,34 @@ pub(crate) struct AnalysisOutcome {
 /// The one path the GUI command and the MCP tool share, so both stream `analysis-progress`
 /// (the step, with a fraction where it has one) and `analysis-status` (the per-kind state,
 /// which the bin's chips draw), and both follow the same rules: the heavy work runs with
-/// the project lock released; the steps that finish are merged into the cached analysis
-/// without touching the other kinds; a step that was cancelled or failed caches nothing.
-/// A run in which every step failed is an error; a partial failure is not (it is in the
-/// outcome and the status).
-pub(crate) fn run_analysis(
+/// the project lock released; **each step that finishes is merged into the cached analysis
+/// at once** (without touching the other kinds), so its chip turns done and its markers appear
+/// while the slower steps still run; a step that was cancelled or failed caches nothing.
+/// Steps wait their turn behind exports and preview proxies, say so (`waiting`), and can be
+/// stopped while queued. A run in which every step failed is an error; a partial failure is
+/// not (it is in the outcome and the status). `lock` is how the caller takes the project: the
+/// GUI as the user, the MCP server as the agent (which also stamps its activity).
+pub(crate) fn run_analysis<'a>(
     app: &AppHandle,
-    shared: &Mutex<Project>,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
     steps: Option<&[kerf_core::AnalysisKind]>,
     cancel: &dyn Fn() -> bool,
 ) -> CmdResult<AnalysisOutcome> {
     let (asset, stored) = {
-        let project = lock_user(shared);
+        let project = lock();
         (
             project.require_asset(asset_id).map_err(|e| e.to_string())?,
             project.get_analysis(asset_id).map_err(|e| e.to_string())?,
         )
     };
-    let emit_status = |stored: Option<&AssetAnalysis>| {
-        let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, stored));
+    // What is cached as of now: it grows with each finished step, and the status reads it.
+    let current = std::cell::RefCell::new(stored);
+    let emit_status = || {
+        let _ = app.emit(
+            "analysis-status",
+            kerf_core::analysis_status(asset_id, current.borrow().as_ref()),
+        );
     };
     let id_text = asset_id.to_string();
     // Analysis is no longer a short opaque wait: the first transcription downloads a speech
@@ -509,12 +519,21 @@ pub(crate) fn run_analysis(
         );
         // A step starting is the running chip; a model download is part of its step.
         if !matches!(p.stage.as_str(), "waiting" | "download_model" | "done") && p.fraction.is_none() {
-            emit_status(stored.as_ref());
+            emit_status();
         }
     };
-    let run = kerf_core::analyze_asset_steps(&asset, steps, &mut on_progress, cancel);
-    let merged = lock_user(shared).merge_analysis(&run.patch).map_err(|e| e.to_string())?;
-    emit_status(Some(&merged));
+    let mut on_step = |so_far: &AssetAnalysis| match lock().merge_analysis(so_far) {
+        Ok(merged) => {
+            *current.borrow_mut() = Some(merged);
+            emit_status();
+        }
+        // The final merge below tries again and reports it.
+        Err(e) => tracing::warn!(error = %e, "could not cache a finished analysis step"),
+    };
+    let run = kerf_core::analyze_asset_steps(&asset, steps, &mut on_progress, &mut on_step, cancel).map_err(|e| e.to_string())?;
+    let merged = lock().merge_analysis(&run.patch).map_err(|e| e.to_string())?;
+    *current.borrow_mut() = Some(merged.clone());
+    emit_status();
     if run.cancelled {
         // A cancel is the user's own doing, not a failure — the caller keys off this string to
         // stay quiet about it. What finished before it is cached; the step it stopped is not.
@@ -554,7 +573,10 @@ async fn analyze_asset(
     let cancel = state.analysis_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
     blocking(move || {
-        run_analysis(&app, &shared, id, steps.as_deref(), &|| cancel.load(Ordering::SeqCst)).map(|outcome| outcome.analysis)
+        run_analysis(&app, &|| lock_user(&shared), id, steps.as_deref(), &|| {
+            cancel.load(Ordering::SeqCst)
+        })
+        .map(|outcome| outcome.analysis)
     })
     .await
 }
@@ -1453,21 +1475,25 @@ fn set_reframe(
 /// Mark an asset as 360 footage (or clear the mark) for footage the probe could
 /// not identify. Unlike `set_reframe` this sticks to the asset, so every clip cut
 /// from it afterwards is reframed.
-#[tauri::command(async)]
-fn set_asset_projection(
+#[tauri::command]
+async fn set_asset_projection(
     app: AppHandle,
     state: State<'_, AppState>,
     asset_id: String,
     projection: Option<Projection>,
 ) -> CmdResult<Asset> {
     let id = id(&asset_id)?;
-    let asset = state
-        .project()
-        .set_asset_projection(id, projection)
-        .map_err(|e| e.to_string())?;
-    // 360 assets proxy at a different size, so the cached proxy no longer matches.
-    spawn_proxy(&app, &asset);
-    Ok(asset)
+    let shared = state.project.clone();
+    // On the blocking pool: queueing the proxy runs the cached ffprobe that keys it.
+    blocking(move || {
+        let asset = lock_user(&shared)
+            .set_asset_projection(id, projection)
+            .map_err(|e| e.to_string())?;
+        // 360 assets proxy at a different size, so the cached proxy no longer matches.
+        spawn_proxy(&app, &asset);
+        Ok(asset)
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -1822,8 +1848,9 @@ fn discard_staged_edit(state: State<'_, AppState>) -> CmdResult<Timeline> {
 /// Under any other source this is nothing. The page keeps the last good frame and says what the
 /// preview is waiting on from the proxy statuses it already holds.
 fn refuse_unless_proxied(project: &Project, from: f64, to: Option<f64>) -> CmdResult<()> {
-    match project.proxy_waits(from, to).map_err(|e| e.to_string())?.first() {
-        Some(wait) => Err(wait.message()),
+    let waits = project.proxy_waits(from, to).map_err(|e| e.to_string())?;
+    match kerf_core::proxy::waits_message(&waits) {
+        Some(message) => Err(message),
         None => Ok(()),
     }
 }

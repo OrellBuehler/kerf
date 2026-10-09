@@ -1449,6 +1449,24 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Which analyses have run for one asset (asset_id) or for every asset: per kind (silence, scenes, \
+                       loudness, rhythm, transcript) `state` is done, not_run, running, failed (with the `reason`) or \
+                       off (switched off in Settings › Analysis, or no speech-to-text backend). Use it to see what \
+                       analyze_asset still has to do before an edit that reads the result."
+    )]
+    fn analysis_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
+        let wanted = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let project = self.lock();
+        match wanted {
+            Some(id) => {
+                project.require_asset(id).map_err(core_err)?;
+                json(&vec![project.analysis_status(id).map_err(core_err)?])
+            }
+            None => json(&project.analysis_statuses().map_err(core_err)?),
+        }
+    }
+
+    #[tool(
         description = "Build an asset's preview proxy again from the original: the current one (and any build in \
                        progress) is dropped first, and a proxy the user had deleted is wanted again. Use it when \
                        previews of an asset look wrong or stale. Returns where the build starts; poll proxy_status \
@@ -1457,8 +1475,10 @@ impl KerfMcp {
     async fn rebuild_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let (project, app) = (self.project.clone(), self.app.clone());
-        let status =
-            blocking(move || crate::rebuild_proxy_now(&app, &project, id).map_err(|e| McpError::invalid_params(e, None))).await?;
+        let status = blocking(move || {
+            crate::rebuild_proxy_now(&app, &|| lock_agent(&project), id).map_err(|e| McpError::invalid_params(e, None))
+        })
+        .await?;
         json(&status)
     }
 
@@ -1470,8 +1490,10 @@ impl KerfMcp {
     async fn delete_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let (project, app) = (self.project.clone(), self.app.clone());
-        let (freed, status) =
-            blocking(move || crate::delete_proxy_now(&app, &project, id).map_err(|e| McpError::invalid_params(e, None))).await?;
+        let (freed, status) = blocking(move || {
+            crate::delete_proxy_now(&app, &|| lock_agent(&project), id).map_err(|e| McpError::invalid_params(e, None))
+        })
+        .await?;
         json(&serde_json::json!({ "bytes_freed": freed, "proxy": status }))
     }
 
@@ -1522,8 +1544,13 @@ impl KerfMcp {
         let outcome = blocking(move || {
             // Resolve under the lock, run the heavy ffmpeg analysis with the lock released, then
             // re-lock only to merge it into the cache (`run_analysis`) — so analysis doesn't
-            // freeze the GUI or stall other tools for its whole (multi-second) duration.
-            crate::run_analysis(&app, &project, id, steps.as_deref(), &|| false).map_err(|e| McpError::internal_error(e, None))
+            // freeze the GUI or stall other tools for its whole (multi-second) duration. Nothing
+            // to run (everything switched off, a silent file asked for its speech) is a bad
+            // request, said so before anything starts.
+            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+            kerf_core::resolve_steps(&asset, steps.as_deref()).map_err(core_err)?;
+            crate::run_analysis(&app, &|| lock_agent(&project), id, steps.as_deref(), &|| false)
+                .map_err(|e| McpError::internal_error(e, None))
         })
         .await?;
         self.changed();
@@ -2394,10 +2421,19 @@ impl KerfMcp {
                        equirect export that lost its metadata imports as flat video. Unlike set_reframe this is \
                        remembered on the asset, so every clip cut from it afterwards is reframed automatically."
     )]
-    fn set_asset_projection(&self, Parameters(p): Parameters<AssetProjectionParams>) -> Result<String, McpError> {
+    async fn set_asset_projection(&self, Parameters(p): Parameters<AssetProjectionParams>) -> Result<String, McpError> {
         let asset_id = parse_id(&p.asset_id)?;
-        let asset = self.lock().set_asset_projection(asset_id, p.projection).map_err(core_err)?;
-        crate::spawn_proxy(&self.app, &asset);
+        let (project, app) = (self.project.clone(), self.app.clone());
+        // On the blocking pool: queueing the proxy at the new size runs the cached ffprobe that
+        // keys it, which must not stall an async worker.
+        let asset = blocking(move || {
+            let asset = lock_agent(&project)
+                .set_asset_projection(asset_id, p.projection)
+                .map_err(core_err)?;
+            crate::spawn_proxy(&app, &asset);
+            Ok(asset)
+        })
+        .await?;
         self.changed();
         json(&asset)
     }
@@ -4262,7 +4298,7 @@ mod tests {
         for kind in ["silence", "scenes", "loudness", "rhythm", "transcript", "all"] {
             assert!(schema.contains(kind), "`steps` does not name `{kind}`: {schema}");
         }
-        for name in ["proxy_status", "rebuild_proxy", "delete_proxy"] {
+        for name in ["proxy_status", "rebuild_proxy", "delete_proxy", "analysis_status"] {
             let tool = tool(name);
             assert!(!tool.description.as_deref().unwrap_or_default().is_empty(), "{name}");
         }
