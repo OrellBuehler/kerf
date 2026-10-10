@@ -512,7 +512,7 @@
 							if (hot === k && !(item.kind === 'submenu' && isOpen(p))) hot = null;
 						}}
 						onfocus={() => (hot = k)}
-						style="display:grid;grid-template-columns:16px minmax(0,1fr) auto 12px;align-items:center;column-gap:8px;width:100%;height:26px;padding:0 6px 0 8px;border:none;border-radius:var(--radius-sm);text-align:left;font-size:12.5px;white-space:nowrap;cursor:{off
+						style="display:grid;grid-template-columns:16px minmax(0,1fr) auto 12px;align-items:center;column-gap:8px;width:100%;height:26px;padding:0 6px 0 8px;border:none;border-radius:var(--radius-sm);text-align:left;font-size:var(--text-sm);white-space:nowrap;cursor:{off
 							? 'default'
 							: 'pointer'};background:{hot === k || (item.kind === 'submenu' && isOpen(p))
 							? 'var(--surface-hover)'
@@ -527,7 +527,7 @@
 						</span>
 						<span style="overflow:hidden;text-overflow:ellipsis">{entryLabel(item)}</span>
 						<span
-							style="font-family:var(--font-mono);font-size:10.5px;padding-left:18px;color:{off
+							style="font-family:var(--font-mono);font-size:var(--text-xs);padding-left:18px;color:{off
 								? 'var(--text-disabled)'
 								: 'var(--text-muted)'}">{accel(item)}</span
 						>
@@ -584,7 +584,7 @@
 					active = i;
 					noteReturn();
 				}}
-				style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 {compact ? 7 : 9}px;border-radius:var(--radius-sm);cursor:pointer;font:var(--type-label);border:var(--line-width) solid {open[0] ===
+				style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 {compact ? 7 : 9}px;border-radius:var(--radius-sm);cursor:pointer;font:var(--type-ui);border:var(--line-width) solid {open[0] ===
 				i
 					? 'var(--border-strong)'
 					: 'transparent'};background:{open[0] === i
@@ -607,8 +607,8 @@
 	   stylesheet adds is the ring a keyboard user needs. */
 	.kerf-menu-top:focus-visible,
 	.kerf-menu-item:focus-visible {
-		outline: var(--line-emphasis) solid var(--kerf-400);
-		outline-offset: -1px;
+		outline: var(--focus-outline);
+		outline-offset: calc(var(--focus-offset) * -1);
 	}
 	.kerf-menu-item[aria-disabled='true']:hover {
 		background: transparent;

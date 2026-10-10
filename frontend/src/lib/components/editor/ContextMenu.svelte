@@ -97,7 +97,7 @@
 					</div>
 					{#if item.sub}
 						<div
-							style="font-size:10.5px;color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							style="font-size:var(--text-xs);color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 							title={item.sub}
 						>
 							{item.sub}
@@ -111,7 +111,7 @@
 				>
 					<span style="flex:none;color:var(--text-muted)">{item.label}</span>
 					<span
-						style="flex:1;min-width:0;text-align:right;font-family:var(--font-mono);font-size:10.5px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+						style="flex:1;min-width:0;text-align:right;font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>{item.value}</span
 					>
 				</div>
@@ -123,11 +123,11 @@
 					onclick={() => run(item)}
 					style="display:flex;align-items:center;gap:9px;width:100%;padding:6px 8px;border:none;border-radius:var(--radius-sm);background:none;cursor:{item.disabled
 						? 'default'
-						: 'pointer'};text-align:left;font-size:12.5px;color:{item.disabled
+						: 'pointer'};text-align:left;font-size:var(--text-sm);color:{item.disabled
 						? 'var(--text-disabled)'
 						: item.danger
 							? 'var(--red-400)'
-							: 'var(--text-primary)'};opacity:{item.disabled ? 0.55 : 1}"
+							: 'var(--text-primary)'};opacity:1"
 					onpointerenter={(e) => {
 						if (!item.disabled) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover)';
 					}}
@@ -142,13 +142,13 @@
 							<!-- A disabled line says why, in the words the backend would have refused with. -->
 							<span
 								data-menu-reason
-								style="display:block;max-width:250px;margin-top:1px;font-size:10.5px;line-height:1.3;font-weight:400;color:var(--text-muted)"
+								style="display:block;max-width:250px;margin-top:1px;font-size:var(--text-xs);line-height:1.3;font-weight:400;color:var(--text-muted)"
 								>{item.reason}</span
 							>
 						{/if}
 					</span>
 					{#if item.shortcut}
-						<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none"
+						<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:{item.disabled ? 'var(--text-disabled)' : 'var(--text-muted)'};flex:none"
 							>{item.shortcut}</span
 						>
 					{/if}

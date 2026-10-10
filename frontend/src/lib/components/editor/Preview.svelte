@@ -699,7 +699,7 @@
 			<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
 		{/if}
 		{#if empty}
-			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-disabled)">
+			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-muted)">
 				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>
 			</div>
 		{:else}

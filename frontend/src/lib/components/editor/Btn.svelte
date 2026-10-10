@@ -8,6 +8,7 @@
 		icon = undefined,
 		iconSize = undefined,
 		style = '',
+		class: klass = '',
 		children,
 		...rest
 	}: {
@@ -16,34 +17,15 @@
 		icon?: string;
 		iconSize?: number;
 		style?: string;
+		class?: string;
 		children?: Snippet;
 		[key: string]: unknown;
 	} = $props();
-
-	const sizes = {
-		sm: { h: 30, p: '0 10px', f: 12 },
-		md: { h: 34, p: '0 14px', f: 13 },
-		lg: { h: 38, p: '0 18px', f: 14 }
-	} as const;
-
-	const variants = {
-		primary: 'background:var(--kerf-500);color:var(--text-on-accent);border:var(--line-width) solid var(--kerf-500);',
-		agent: 'background:var(--agent-500);color:var(--agent-fg);border:var(--line-width) solid var(--agent-500);',
-		secondary:
-			'background:var(--surface-hover);color:var(--text-primary);border:var(--line-width) solid var(--border-strong);',
-		ghost: 'background:transparent;color:var(--text-secondary);border:var(--line-width) solid transparent;',
-		destructive: 'background:transparent;color:var(--red-400);border:var(--line-width) solid var(--red-600);'
-	} as const;
-
-	const sz = $derived(sizes[size]);
 </script>
 
-<button
-	style="display:inline-flex;align-items:center;justify-content:center;gap:7px;height:{sz.h}px;padding:{sz.p};font-family:var(--font-sans);font-size:{sz.f}px;font-weight:500;line-height:1;border-radius:var(--radius-sm);cursor:pointer;white-space:nowrap;transition:background var(--dur-fast) var(--ease-out);{variants[
-		variant
-	]}{style}"
-	{...rest}
->
+<!-- Colors, hover, pressed and disabled live in `styles/controls.css`: an inline background
+     could not be hovered. `style` is for layout only. -->
+<button class={['k-btn', klass]} data-variant={variant} data-size={size} style={style || undefined} {...rest}>
 	{#if icon}<Icon n={icon} s={iconSize ?? 14} />{/if}
 	{@render children?.()}
 </button>

@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { contrastRatio, mixSrgb } from './contrast';
-import { PRESET_IDS, PRESETS, type ColorToken } from './theme';
+import { posix, SRC, uiSources } from './test-sources';
+import { PRESET_IDS, PRESETS, SUPERSEDED_KERF_LIGHT, type ColorToken } from './theme';
 import { GENERATED_TITLE_FILL } from './titles';
 
 // Two guards that keep "every color is themable" and "every theme is readable"
@@ -13,7 +14,6 @@ import { GENERATED_TITLE_FILL } from './titles';
 //     how a logo that was fine on Kerf Dark came to be invisible on Kerf Light.
 //  2. Every preset meets WCAG contrast for the pairs the UI actually draws.
 
-const SRC = join(import.meta.dir, '..');
 const REPO = join(SRC, '..', '..');
 
 // ---- 1. color literals ------------------------------------------------------
@@ -50,16 +50,6 @@ function colorLiterals(text: string): { line: number; literal: string }[] {
 		literal: m[0]
 	}));
 }
-
-function uiSources(dir: string): string[] {
-	return readdirSync(dir).flatMap((name) => {
-		const path = join(dir, name);
-		if (statSync(path).isDirectory()) return uiSources(path);
-		return /\.(svelte|ts|css|html)$/.test(name) && !name.endsWith('.test.ts') ? [path] : [];
-	});
-}
-
-const posix = (path: string) => relative(SRC, path).split(sep).join('/');
 
 describe('color literals', () => {
 	test('the detector finds colors and leaves the rest alone', () => {
@@ -130,6 +120,49 @@ describe('color literals', () => {
 	});
 });
 
+// ---- 1b. the disabled color --------------------------------------------------
+
+/** The only files that draw in `text-disabled`, and what for. It is the color of what is *off*
+ *  — a greyed menu row, a disabled button — and it is dimmer than anything people are meant to
+ *  read: 3.3:1 on a panel. The status bar, every explanatory paragraph and the idle S / L / DUCK
+ *  toggles used it, which is how the Settings gear came to be the dimmest thing in the window.
+ *  Text people read is `text-muted` (4.5:1 or better) and a toggle that is live but idle is
+ *  `text-muted` too. Paths are relative to `src/`. */
+const DISABLED_INK_ALLOWED: Record<string, string> = {
+	'lib/styles/kerf-tokens.css': 'the token stylesheet',
+	'lib/styles/controls.css': 'the label of a disabled Btn / IconBtn',
+	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
+	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
+	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
+	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text',
+	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
+};
+
+describe('the disabled color', () => {
+	test('only what is off is drawn in it', () => {
+		const offenders: string[] = [];
+		for (const file of uiSources(SRC).map(posix)) {
+			if (file in DISABLED_INK_ALLOWED) continue;
+			const code = withoutComments(readFileSync(join(SRC, file), 'utf8'));
+			for (const m of code.matchAll(/--text-disabled/g)) {
+				offenders.push(`${file}:${code.slice(0, m.index).split('\n').length}  — text people read is text-muted`);
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	test('every exception is still needed', () => {
+		for (const file of Object.keys(DISABLED_INK_ALLOWED)) {
+			const path = join(SRC, file);
+			expect(existsSync(path), `${file} no longer exists — drop it from DISABLED_INK_ALLOWED`).toBe(true);
+			expect(
+				readFileSync(path, 'utf8').includes('--text-disabled'),
+				`${file} no longer uses it — drop it from DISABLED_INK_ALLOWED`
+			).toBe(true);
+		}
+	});
+});
+
 // ---- 2. contrast ------------------------------------------------------------
 //
 // WCAG 2.x contrast ratios between the opaque tokens of a preset, for the pairs
@@ -144,20 +177,23 @@ describe('color literals', () => {
 //   SECONDARY (3:1)  What is not body text: text-muted on the hover / active
 //     states, accent and status hues used as text or icon colour on the
 //     panels, the amber chips that carry text-on-accent (the S / L flags), the
-//     idle state of live toggles (text-disabled — see below), and the strokes and
+//     label of a disabled control (text-disabled — see below), and the strokes and
 //     marks that carry meaning — clip edges and the playhead / selection amber
 //     against the lane, the waveform against its clip, the drag ghost.
 //   COMPOSITES  Fills the stylesheet builds with color-mix, resolved per preset
 //     and held to READING under the label that sits on them (the generated-caption
-//     block in the titles lane).
+//     block in the titles lane), and the *tinted surfaces* — a badge, an analysis
+//     chip, an error block is its hue at 10–16 % over whatever it sits on, and the
+//     hue's own light shade is the text on it, which no pair of opaque tokens can
+//     say (see TINTED below).
 //
 // Not checked, on purpose:
 //   - text-disabled on a *disabled* control: inactive components are exempt from
-//     WCAG contrast. But the UI also draws the idle state of controls that are
-//     live — the DUCK / S / L toggles, the notification bell, 56 uses — in
-//     text-disabled, and an idle toggle is not disabled, so it is held to 3:1 on
-//     the resting surfaces (it is still required to read dimmer than text-muted,
-//     below).
+//     WCAG contrast. It is still held to 3:1 on the resting surfaces so a greyed
+//     label can be found, and required to read dimmer than text-muted (below).
+//     It is no longer the colour of anything live — the DUCK / S / L toggles, the
+//     bell and the status bar were drawn in it — and the scan in "the disabled
+//     color" keeps it that way.
 //   - Translucent hairlines (border-*, timeline grid, scrims): they are derived in
 //     the stylesheet by color-mix, so they are not a pair of opaque tokens; they
 //     separate rather than identify.
@@ -194,7 +230,8 @@ const PAIRS: Pair[] = [
 	...cross(['text-inverted'], ['text-primary'], READING, 'inverted label on a text-colored fill'),
 	// Secondary text, status hues and the marks that carry meaning.
 	...cross(['text-muted'], STATES, SECONDARY, 'muted text on a hover / active state'),
-	...cross(['text-disabled'], RESTING, SECONDARY, 'idle state of a live toggle (DUCK / S / L, the bell)'),
+	...cross(['kerf-300'], ['surface-hover'], READING, 'amber text on a hovered or selected row (the bin, the inspector)'),
+	...cross(['text-disabled'], RESTING, SECONDARY, 'a disabled control\'s label stays findable'),
 	...cross(
 		['kerf-300', 'kerf-400', 'agent-300', 'agent-400', 'green-400', 'red-400', 'orange-400', 'green-500', 'orange-500', 'red-500'],
 		PANELS,
@@ -202,6 +239,14 @@ const PAIRS: Pair[] = [
 		'accent / status hue as text or icon on a panel'
 	),
 	...cross(['text-on-accent'], ['kerf-300', 'kerf-400'], SECONDARY, 'label on the amber S / L flag chips'),
+	// What a filled button does under the pointer: the primary and agent fills step to their
+	// 600 shade on hover and 700 while pressed (`controls.css`), the label stays.
+	...cross(['text-on-accent'], ['kerf-600'], READING, 'label on the amber primary fill, hovered'),
+	...cross(['text-on-accent'], ['kerf-700'], SECONDARY, 'label on the amber primary fill, pressed'),
+	...cross(['agent-fg'], ['agent-600'], READING, 'label on the agent fill, hovered'),
+	...cross(['agent-fg'], ['agent-700'], SECONDARY, 'label on the agent fill, pressed'),
+	// The keyboard focus outline is drawn in kerf-400 on whatever the control sits on.
+	...cross(['kerf-400'], RESTING, SECONDARY, 'keyboard focus outline on a resting surface'),
 	...cross(
 		['track-video-edge', 'track-audio-edge', 'track-text-edge', 'kerf-500', 'kerf-400', 'drag-ghost'],
 		['track-bg'],
@@ -252,6 +297,118 @@ describe('contrast', () => {
 		];
 		expect(failures(PRESETS['high-contrast'].colors, enhanced)).toEqual([]);
 	});
+
+	// ---- tinted surfaces ------------------------------------------------------
+	//
+	// `--success-surface` and its siblings are `color-mix(in srgb, <hue> N%, transparent)`:
+	// over a panel they composite to a faint wash of the hue, and the Badge, the analysis
+	// chips and the error blocks put the hue's light shade (`green-400` …) on it as 10 px
+	// text. The guard above only held those hues against the opaque panel, which is how
+	// Kerf Light's "Saved" badge came to read at 3.2:1.
+
+	const TOKENS_CSS = readFileSync(join(SRC, 'lib/styles/kerf-tokens.css'), 'utf8');
+
+	/** A translucent token of the stylesheet — `color-mix(in srgb, var(--hue) N%, transparent)` — as its hue and weight. */
+	function tintOf(name: string): Tint {
+		const m = new RegExp(`--${name}:\\s*color-mix\\(in srgb,\\s*var\\(--([a-z0-9-]+)\\)\\s+([\\d.]+)%,\\s*transparent\\)`).exec(TOKENS_CSS);
+		if (!m) throw new Error(`--${name} is not a color-mix of one token over transparent in kerf-tokens.css`);
+		return { hue: m[1] as ColorToken, weight: Number(m[2]) / 100 };
+	}
+
+	interface Tint {
+		hue: ColorToken;
+		weight: number;
+	}
+
+	interface TintPair {
+		fg: ColorToken;
+		tint: Tint;
+		min: number;
+		what: string;
+		/** What it sits on; the three panels and the hover surface unless it says otherwise. */
+		on?: ColorToken[];
+	}
+
+	/** What a tint is once it sits on a surface. */
+	const SURFACES_UNDER_TINTS: ColorToken[] = [...PANELS, 'surface-hover'];
+
+	const TINTED: TintPair[] = [
+		{ fg: 'green-400', tint: tintOf('success-surface'), min: READING, what: 'success badge, finished analysis chip' },
+		{ fg: 'orange-400', tint: tintOf('warning-surface'), min: READING, what: 'warning badge, "links off" tag, update warning' },
+		{ fg: 'red-400', tint: tintOf('danger-surface'), min: READING, what: 'danger badge, failed analysis chip' },
+		{ fg: 'agent-300', tint: tintOf('agent-surface'), min: READING, what: 'agent badge, running analysis chip' },
+		{ fg: 'kerf-200', tint: tintOf('selection-fill'), min: READING, what: 'amber badge (360, voiceover, the preview\'s file name)' },
+		// The timeline toolbar's lit toggles (snap, ripple, fades, heights, overview, delivery frame) draw
+		// kerf-300 on the selection wash; the toolbar is a panel, so the hover surface is not under it.
+		{ fg: 'kerf-300', tint: tintOf('selection-fill'), min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },
+		// Written inline in the dialogs' error blocks: `color-mix(in srgb,var(--red-600) 14%,transparent)`.
+		{ fg: 'red-400', tint: { hue: 'red-600', weight: 0.14 }, min: READING, what: 'error block in a dialog' },
+		{ fg: 'text-primary', tint: tintOf('danger-surface'), min: READING, what: 'agent connection banner' },
+		{ fg: 'text-primary', tint: tintOf('warning-surface'), min: READING, what: 'keyboard conflict prompt' },
+		{ fg: 'text-secondary', tint: tintOf('diff-remove-surface'), min: READING, what: 'stale proposal note' },
+		{ fg: 'text-secondary', tint: tintOf('agent-surface'), min: READING, what: 'agent panel header and active chip' }
+	];
+
+	function tintFailures(colors: Record<ColorToken, string>, pairs: TintPair[]): string[] {
+		return pairs.flatMap((p) =>
+			(p.on ?? SURFACES_UNDER_TINTS).flatMap((surface) => {
+				const fill = mixSrgb(colors[p.tint.hue], colors[surface], p.tint.weight);
+				const ratio = contrastRatio(colors[p.fg], fill);
+				return ratio >= p.min
+					? []
+					: [
+							`${p.fg} ${colors[p.fg]} on ${p.tint.hue} ${Math.round(p.tint.weight * 100)}% over ${surface} (${fill}): ${ratio.toFixed(2)}:1, needs ${p.min}:1 (${p.what})`
+						];
+			})
+		);
+	}
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: text on a tinted surface is readable`, () => {
+			expect(tintFailures(PRESETS[id].colors, TINTED)).toEqual([]);
+		});
+	}
+
+	test('the tinted-surface check would have caught Kerf Light as it shipped', () => {
+		// As of v0.24.0 Light's `green-400` and `orange-400` read 3.2:1 and 3.1:1 on their own washes,
+		// and its `kerf-300` 3.8:1 on the selection wash the toolbar's lit toggles sit on.
+		const shipped = SUPERSEDED_KERF_LIGHT.find((o) => o['green-400'] === '#1f8f60' && o['text-disabled'] === '#76828f')!;
+		const out = tintFailures(shipped, TINTED);
+		for (const hue of ['green-400', 'orange-400', 'kerf-300']) expect(out.some((l) => l.startsWith(hue)), hue).toBe(true);
+		// …and kerf-300 alone is what the later set still failed.
+		const later = tintFailures(SUPERSEDED_KERF_LIGHT[SUPERSEDED_KERF_LIGHT.length - 1], TINTED);
+		expect(later.every((l) => l.startsWith('kerf-300'))).toBe(true);
+		expect(later.length).toBeGreaterThan(0);
+	});
+
+	// ---- component edges --------------------------------------------------------
+
+	/** An edge of `weight` (a theme's border alpha) over a surface, as the opaque color it draws. */
+	const edge = (colors: Record<ColorToken, string>, alpha: number, surface: ColorToken) =>
+		mixSrgb(colors['border-base'], colors[surface], alpha / 100);
+
+	test('High contrast outlines its components at 3:1 or better (WCAG 1.4.11)', () => {
+		const hc = PRESETS['high-contrast'];
+		const bad: string[] = [];
+		for (const surface of [...PANELS, 'surface-hover' as ColorToken]) {
+			for (const [token, min] of [
+				['border-alpha-default', 3],
+				['border-alpha-strong', 4.5]
+			] as const) {
+				const ratio = contrastRatio(edge(hc.colors, hc.shape[token], surface), hc.colors[surface]);
+				if (ratio < min) bad.push(`${token} ${hc.shape[token]}% on ${surface}: ${ratio.toFixed(2)}:1, needs ${min}:1`);
+			}
+		}
+		expect(bad).toEqual([]);
+	});
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: the three border weights step up`, () => {
+			const { shape } = PRESETS[id];
+			expect(shape['border-alpha-subtle']).toBeLessThan(shape['border-alpha-default']);
+			expect(shape['border-alpha-default']).toBeLessThan(shape['border-alpha-strong']);
+		});
+	}
 
 	/** `color-mix(in srgb,var(--a) P%,var(--b))` resolved against a preset's colors. */
 	function resolveMix(expr: string, colors: Record<ColorToken, string>): string {

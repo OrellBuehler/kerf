@@ -1,8 +1,11 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @import 'shadcn-svelte/tailwind.css';
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+@import '@fontsource-variable/space-grotesk';
 @import '$lib/styles/kerf-tokens.css';
+@import '$lib/styles/controls.css';
 @import 'dockview/dist/styles/dockview.css';
 @import '$lib/styles/dockview-kerf.css';
 
@@ -85,7 +88,7 @@ html:not(.dark) {
 
 @layer base {
 	* {
-		@apply border-border outline-ring/50;
+		@apply border-border;
 	}
 	html {
 		font-family: var(--font-sans);
@@ -139,12 +142,20 @@ html:not(.dark) {
 	}
 }
 
-/* Native editor controls share a clear keyboard focus and disabled state. */
-button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible {
-	outline: 2px solid var(--kerf-400);
-	outline-offset: 2px;
+/* One keyboard focus indicator for everything that can take focus (`--focus-outline`; sliders draw
+   the same color and width as a ring on the thumb, below). Zero specificity apart from the
+   state, so a control that needs its own placement — an inset ring in a dense strip — can say so.
+   dockview's tabs are role=tab too and draw theirs inset (`dockview-kerf.css`). */
+:where(button, summary, input, select, textarea, a[href], [role='button'], [role='tab']:not(.dv-tab)):focus-visible {
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
 }
-button:disabled { opacity: .5; cursor: not-allowed !important; }
+
+/* A dialog or a menu panel takes focus when it opens so the keyboard has somewhere to start; it is
+   not a control, and a ring around the whole window (a scrim is `inset:0`) says nothing. */
+:is(div, section, aside, nav, ul, ol, form, main)[tabindex='-1']:not([role='tab'], [role='button'], [role='menuitem'], [role='option']):focus-visible {
+	outline: none;
+}
 
 /* Every slider in the editor. Thickness, thumb size / style and the track's
    rounding are theme shape tokens (`lib/theme.ts`); `--slider-accent` is the
@@ -213,4 +224,41 @@ input[type='range']:focus-visible::-moz-range-thumb {
    with a hole in it; nothing beside the frame's own ancestors is touched. */
 [data-surface-hole] {
 	background: transparent !important;
+}
+
+/* Toasts in Kerf's theme (`ui/sonner`): the library's stylesheet is built for a light page, so its
+   shadow is invisible on Dark, its description grey is a literal, and its action is an inverse pill
+   that was the loudest thing on screen. These are the same tokens as a menu: raised surface, the
+   overlay shadow, a ghost action in the accent. */
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] {
+	box-shadow: var(--shadow-md);
+	font-family: var(--font-sans);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-description] {
+	color: var(--text-secondary);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button] {
+	background: transparent;
+	color: var(--kerf-400);
+	border: var(--line-width) solid var(--border-strong);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button]:hover {
+	background: var(--surface-hover);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button]:focus-visible {
+	box-shadow: none;
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='success'] [data-icon] {
+	color: var(--success);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='error'] [data-icon] {
+	color: var(--danger);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='warning'] [data-icon] {
+	color: var(--warning);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='info'] [data-icon] {
+	color: var(--info);
 }

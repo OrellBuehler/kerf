@@ -49,7 +49,7 @@
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
-	import { afterPaint, revealWindow } from '$lib/reveal';
+	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
@@ -85,13 +85,14 @@
 
 	// The desktop window is created hidden, so the unthemed first frame is never
 	// seen. Once the settings are in — which is when the theme is applied and the
-	// dock is built — wait for the frame that draws them and show the window. (If
+	// dock is built — wait for the interface's fonts and the frame that draws them, then show the
+	// window, so its first frame is not the system fallback re-flowing. (If
 	// this never runs, the backend shows it itself after a few seconds.)
 	let revealed = false;
 	$effect(() => {
 		if (!settings.loaded || revealed) return;
 		revealed = true;
-		void revealWindow({ settle: tick, paint: afterPaint, show: showMainWindow });
+		void revealWindow({ settle: tick, fonts: () => fontsReady(), paint: afterPaint, show: showMainWindow });
 	});
 
 	onMount(() => {

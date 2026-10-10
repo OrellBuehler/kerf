@@ -287,7 +287,7 @@
 				>{stale ? 'Out of date · ' : ''}{scopeLabel(result.range, result.levels.duration)}</span
 			>
 			{#if result.levels.estimated}
-				<Badge tone="warning" style="height:16px;padding:0 5px;font-size:9px;margin-top:2px"
+				<Badge tone="warning" style="height:16px;padding:0 5px;font-size:var(--text-2xs);margin-top:2px"
 					>estimated</Badge
 				>
 			{/if}

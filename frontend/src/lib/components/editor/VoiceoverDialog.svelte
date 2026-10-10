@@ -256,7 +256,7 @@
 						</button>
 					{/each}
 				{:else}
-					<span style="font-size:12px;color:var(--text-disabled)">No captions are added.</span>
+					<span style="font-size:12px;color:var(--text-muted)">No captions are added.</span>
 				{/if}
 			</div>
 		</fieldset>

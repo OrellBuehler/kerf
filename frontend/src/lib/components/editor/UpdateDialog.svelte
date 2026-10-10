@@ -83,7 +83,7 @@
 				</div>
 				{#if unsaved}
 					<div
-						style="font-size:12px;color:var(--warning);background:var(--warning-surface);border-radius:var(--radius-sm);padding:8px 10px"
+						style="font-size:12px;color:var(--orange-400);background:var(--warning-surface);border-radius:var(--radius-sm);padding:8px 10px"
 					>
 						⚠ This project has unsaved changes — save it before restarting.
 					</div>
