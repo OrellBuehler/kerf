@@ -322,7 +322,9 @@ stale), keeping the newest answer. Shapes are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
 (`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
-The `Inspector` is **mounted whether or not a clip is selected**:
+A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
+link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
+its track badge instead. The `Inspector` is **mounted whether or not a clip is selected**:
 its Text overlays section belongs to the timeline rather than to any one clip, so
 gating the panel on a selection made titles and captions unreachable until you
 clicked a clip. Its sections are `InspectorSection`s — native `<details>`
@@ -352,7 +354,7 @@ as the export's `if(lt(t,..))` does — but the timeline's volume line and
 waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
-shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
+shot already matches the frame or is 360), a **Mask** section (pictures only; None / Rectangle /
 Ellipse chips, then centre / size / feather / invert; picking a shape starts from
 a visible default rather than a collapsed one, and the caption carries the recipe
 the shape alone does not suggest — a lower track shows through, so a blurred face
@@ -434,7 +436,12 @@ YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TA
 target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), and
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
-Options are not persisted between openings. The **readiness panel** stays visible
+The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
+dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —
+a remembered 9:16 preset must not open on a 16:9 cut), and a click on the scrim does not close the
+dialog (Esc, Cancel and ✕ do). The frame-rate select is `frameRateOptions(fps)`: `FRAME_RATES`
+(15 / 12 / 10 are the GIF's) plus the current value when the list lacks it, never a blank select.
+The **readiness panel** stays visible
 (only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
 collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
@@ -560,7 +567,9 @@ it describes. **Preview** swaps the editor onto the proposed timeline behind a
 banner (`editor.previewingStaged`; any real edit or a fresh `load()` drops back to
 the live cut, and `refreshTimeline` parks an incoming live update rather than
 yanking the view) — so the proposal can be *watched*, not only read. Apply lands it
-as one revision (confirming first when it went `stale`), Discard drops it. The
+as one revision (confirming first when it went `stale`), Discard drops it. The queue card of the
+task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
+any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
 headline arithmetic is `src/lib/diff.ts`, the bun-tested TS mirror of
 `TimelineDiff::headline`; the entries themselves are phrased by kerf-core, which is
 why `revisionDiff` returns `null` in the browser instead of a second, divergent diff
@@ -592,12 +601,22 @@ Settings dialog's Preview section carries the toggle and the machine's status li
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
 `FitMusicDialog` / `StemsDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
-which focuses itself) `inert` and returns early from its global key handler while
+close; `VoiceoverDialog` too, with `initial: 'textarea'`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
-textarea / select / contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
+textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer
+swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks its footer actions
+`data-rescue`: when the button that had focus is replaced or disabled a `MutationObserver` moves it to
+the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
+not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is
+gone (the menu entry that opened the dialog) to the menu bar's tab stop (`data-focus-return`) **when
+keys were driving the bar** — a pointer user is left on `body`, since a focused menu title would take
+Space from play / pause. **A scrim click never loses typed input**: Export ignores it (its options
+come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
+script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
+regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
+**Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
@@ -704,7 +723,9 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
-**Restart now** — which warns first when the project has unsaved changes); the
+**Restart now** — which warns first when the project has unsaved changes; a failed *check* is titled
+"Couldn't check for updates", never "up to date", and the AppImage fallback note shows only for a failed
+install on Linux — `update-copy.ts`); the
 dialog auto-opens the first time a given version is seen (remembered under
 `kerf.update.seen` in localStorage) so declining doesn't nag every launch. The
 `Update` handle the plugin returns stays module-local in `api.ts`, which hands the

@@ -37,7 +37,8 @@ as not). Whether a press became a drag is judged on pointer travel (3 px), never
 quantized position (one pixel is under a frame at high zoom), and an edge keeps the
 offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
-split quantizes the playhead, and Escape / pointercancel / blur abandon a clip, edge or
+split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
+the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
 title drag.
 **Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
 a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
@@ -142,7 +143,11 @@ a clip outlines its partners. A **click selects the clip and its partners** (`cl
 toggles the pair, Shift brings in partners, a marquee sweeps them with the primary staying a clip it
 touched); **Alt-click selects just the one**. **Alt is the escape hatch from links**, read live from the
 pointer and the key (a "links off" chip lights in the toolbar): `link: false` on a drag, an edge trim, the
-razor, roll / slip / slide, and the menu's *Remove only this clip*. A drag's plan is a `$derived` of the
+razor, roll / slip / slide, and the menu's *Remove only this clip*. The context menus are lists built by
+hand on each right-click, so `menu-items.ts` (pure) keeps them honest: `tidyMenu` (run by `contextMenu.show`)
+collapses doubled and edge separators when an optional group is missing, `muteItem` is the track menu's
+eye-or-speaker row by track kind, `removeRows` the clip menu's delete rows (an icon each; the
+*only this clip* pair has none, under a rule of its own). A drag's plan is a `$derived` of the
 pointer, the cut and Alt (`planMove` with `{links}`): dragged clips take the lane offset, their partners
 are **carried by the same Δt on their own track** (`withLinkedMoves`' rule; the grabbed clip's own
 partners are never lane-shifted even when selected) and checked with the group — a locked partner or
