@@ -5,6 +5,7 @@
 	import { updater } from '$lib/updater.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { confirmAction } from '$lib/api';
+	import { installNote, onLinux, updateTitle } from '$lib/update-copy';
 
 	const u = updater;
 
@@ -26,17 +27,8 @@
 		await u.restart();
 	}
 
-	const title = $derived(
-		u.phase === 'downloading'
-			? 'Downloading update'
-			: u.phase === 'ready'
-				? 'Update installed'
-				: u.phase === 'checking'
-					? 'Checking for updates'
-					: u.update
-						? `Kerf ${u.update.version} is available`
-						: 'Kerf is up to date'
-	);
+	const title = $derived(updateTitle(u.phase, u.update));
+	const note = $derived(installNote(u.errorKind, onLinux()));
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -115,11 +107,9 @@
 				<div
 					style="font-size:12px;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:8px 10px"
 				>
-					⚠ {u.error}
-					{#if u.errorKind === 'install'}
-						<div style="color:var(--text-muted);margin-top:4px">
-							In-place updates need the AppImage build on Linux — install from the release page instead.
-						</div>
+					<span style="overflow-wrap:anywhere">⚠ {u.error}</span>
+					{#if note}
+						<div style="color:var(--text-muted);margin-top:4px">{note}</div>
 					{/if}
 				</div>
 			{/if}
