@@ -148,6 +148,20 @@ static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// background encode.
 static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Set only when a failure that read as the hardware's (`looks_like_hardware_decode_failure`) was
+/// cured by a software rerun of a proxy or an export, where [`HWACCEL_OK`] is cleared by *any*
+/// rescue of a still, a frame grab, the stream, an analysis or a filmstrip. What an export's `auto`
+/// is dropped on: one spurious preview rescue must not send every later export to software.
+static HWACCEL_PROVEN_BAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn hardware decode off for the process on a conviction that read as the hardware's: the
+/// preview paths' learned fallback ([`disable_decode_hwaccel`]) and the export's
+/// ([`HWACCEL_PROVEN_BAD`]).
+fn convict_hardware_decode() {
+    HWACCEL_PROVEN_BAD.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_decode_hwaccel();
+}
+
 /// The `-hwaccel` for the engine's own decodes (preview stills and streaming,
 /// proxy generation, stitching, scene detection): the configured accel unless
 /// an earlier fallback proved it broken on this machine. This is what is
@@ -2544,7 +2558,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
                 HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             if blame.decode {
-                disable_decode_hwaccel();
+                convict_hardware_decode();
             }
             tracing::warn!(error = %err, "hardware-accelerated proxy encode failed; using software");
         }
@@ -4648,7 +4662,9 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
 /// init, a named accelerator does not, and a decoder can fail mid-stream). A
 /// retry that completes after a failure that reads as the hardware's turns
 /// hardware decode off for the process, and from then on the symbolic `auto`
-/// is dropped from an export's options (a named accelerator never is).
+/// is dropped from an export's options, as it is under `KERF_HWACCEL=none` (a
+/// named accelerator never is; nor does a rescue of a preview, which is not
+/// classified, count).
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with_progress(
     timeline: &Timeline,
@@ -4659,13 +4675,17 @@ pub fn render_with_progress(
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
     let opts = &ExportOptions {
-        hwaccel: export_hwaccel_request(opts.hwaccel.as_deref(), decode_hwaccel().is_some()),
+        hwaccel: export_hwaccel_request(
+            opts.hwaccel.as_deref(),
+            hwaccel().is_some(),
+            HWACCEL_PROVEN_BAD.load(std::sync::atomic::Ordering::Relaxed),
+        ),
         ..opts.clone()
     };
     retry_export_in_software(
         opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
-        disable_decode_hwaccel,
+        convict_hardware_decode,
     )
 }
 
@@ -7662,6 +7682,17 @@ mod tests {
         assert_eq!(decode_hwaccel(), None);
     }
 
+    /// A rescue of a still, a frame grab or the stream is not classified, so it clears the learned
+    /// fallback the previews read but not what an export's `auto` is dropped on.
+    #[test]
+    fn an_unclassified_preview_conviction_leaves_the_exports_auto_alone() {
+        disable_decode_hwaccel();
+        assert_eq!(decode_hwaccel(), None);
+        let proven = HWACCEL_PROVEN_BAD.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(!proven, "only convict_hardware_decode sets it, and no test calls that");
+        assert_eq!(export_hwaccel_request(Some("auto"), true, proven).as_deref(), Some("auto"));
+    }
+
     #[test]
     fn source_traits_reads_hdr_and_lead_from_one_probe() {
         let json = r#"{"programs":[],"streams":[{"color_transfer":"arib-std-b67","start_time":"0.080013"}],
@@ -8319,9 +8350,10 @@ mod tests {
             "yuv420p",
             media.to_str().unwrap(),
         ]);
+        // At `info`, the level whose `auto` header the classifier must not mistake for a failure.
         let decode = |accel: &str| {
             command(&ffmpeg_bin())
-                .args(["-hide_banner", "-loglevel", "error", "-hwaccel", accel, "-i"])
+                .args(["-hide_banner", "-loglevel", "info", "-hwaccel", accel, "-i"])
                 .arg(&media)
                 .args(["-frames:v", "1", "-f", "null", "-"])
                 .output()
@@ -8339,6 +8371,19 @@ mod tests {
             assert!(looks_like_hardware_decode_failure(&text), "{accel}: {text}");
         }
         assert!(decode("auto").status.success(), "`auto` is expected to fall back quietly");
+        // The probing `auto` prints (`Device creation failed`, `Using auto hwaccel type ...`) is
+        // not a failure: a run that then dies on its output is not the hardware's.
+        let out = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "info", "-hwaccel", "auto", "-i"])
+            .arg(&media)
+            .args(["-frames:v", "1"])
+            .arg(dir.join("no-such-dir").join("out.mp4"))
+            .output()
+            .expect("run ffmpeg");
+        assert!(!out.status.success());
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains("Error opening output"), "{text}");
+        assert!(!looks_like_hardware_decode_failure(&text), "{text}");
         if failed == 0 {
             skip("skipped: every accelerator worked here");
         }

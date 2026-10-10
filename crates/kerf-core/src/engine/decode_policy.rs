@@ -192,35 +192,43 @@ pub(crate) fn facts_matter(os: HostOs, requested: &str, reading: Reading) -> boo
     requested.trim().eq_ignore_ascii_case("auto") && (os == HostOs::Windows || (reading == Reading::Frame && os != HostOs::MacOs))
 }
 
-/// Whether the text of a failed run (the tail of its stderr, which an error carries) reads as the
-/// hardware decoder's failure rather than the render's own: a named accelerator with no device
-/// behind it exits non-zero at start where `auto` fell back quietly. Used to decide whether a
-/// software rerun that works convicts the hardware (turns it off for the process); a stall, a
-/// locked output or a bad file does not. ffmpeg 9.0.2 prints, for a missing device,
-/// `Device creation failed: -12.`, `No device available for decoder: device type d3d11va needed
-/// for codec h264.` and `Hardware device setup failed for decoder: ...`.
+/// Whether the text of a failed run (the tail of its stderr, which an error carries) says the
+/// hardware decoder could not be had, rather than the render failing for its own reasons: a named
+/// accelerator with no device behind it exits non-zero at start where `auto` fell back quietly.
+/// Used to decide whether a software rerun that works convicts the hardware (turns it off for the
+/// process). Only phrases that are fatal on their own count: an `auto` run that goes on to succeed
+/// prints `Device creation failed` for each device it probed, `Using auto hwaccel type vulkan` and
+/// `Failed setup for format ...: hwaccel initialisation returned error`, so a run that then fails
+/// for another reason (an output directory that is not there, a full disk) carries all three and
+/// is not the hardware's. ffmpeg 9.0.2 ends a run with no device for a named accelerator with
+/// `No device available for decoder: device type d3d11va needed for codec h264.` and `Hardware
+/// device setup failed for decoder: ...`.
 pub(crate) fn looks_like_hardware_decode_failure(text: &str) -> bool {
-    const MARKS: [&str; 6] = [
-        "device creation failed",
+    const MARKS: [&str; 8] = [
         "no device available for decoder",
         "hardware device setup failed",
-        "failed setup for format",
-        "avhw",
-        "hwaccel",
+        "unrecognized hwaccel",
+        "unrecognized option 'hwaccel'",
+        "for option 'hwaccel'",
+        "invalid hwaccel device",
+        "requires hwaccel",
+        "doesn't support hardware accelerated",
     ];
     let text = text.to_ascii_lowercase();
     MARKS.iter().any(|m| text.contains(m))
 }
 
-/// The `-hwaccel` an export is asked for, given what the process has learned about hardware
-/// decode (`hardware_on`: `decode_hwaccel()` is not `None`, i.e. it was not switched off by
-/// `KERF_HWACCEL=none` or by an earlier failure that a software rerun cured). The symbolic `auto`
-/// — the GUI's default, which names no device — is dropped when hardware is off, so a machine
-/// whose decoder failed once does not launch and fail again for every export. A named accelerator
-/// is the caller's choice and is never touched.
-pub(crate) fn export_hwaccel_request(requested: Option<&str>, hardware_on: bool) -> Option<String> {
+/// The `-hwaccel` an export is asked for, given what the process knows about hardware decode:
+/// `env_allows` is false under `KERF_HWACCEL=none` (or empty), `proven_bad` once a failure that
+/// read as the hardware's (`looks_like_hardware_decode_failure`) was cured by a software rerun.
+/// Either way the symbolic `auto` — the GUI's default, which names no device — is dropped, so a
+/// machine whose decoder is broken does not launch and fail again for every export. A named
+/// accelerator is the caller's choice and is never touched. Deliberately **not** keyed on the
+/// preview paths' learned flag (`decode_hwaccel()`), which any rescue of a still or a stream
+/// turns off, whatever failed: one spurious preview rescue must not send every export to software.
+pub(crate) fn export_hwaccel_request(requested: Option<&str>, env_allows: bool, proven_bad: bool) -> Option<String> {
     match requested {
-        Some(r) if !hardware_on && r.trim().eq_ignore_ascii_case("auto") => None,
+        Some(r) if (!env_allows || proven_bad) && r.trim().eq_ignore_ascii_case("auto") => None,
         other => other.map(str::to_string),
     }
 }
@@ -421,24 +429,51 @@ mod tests {
         }
     }
 
+    /// ffmpeg 9.0.2 at `-loglevel info`, captured here (the `[vi..#0:0/h264 @ ..]` stream tag
+    /// trimmed): `-hwaccel auto` probes devices that are not there, picks one, and the run then
+    /// dies on an output directory that does not exist.
+    const AUTO_THEN_OUTPUT_FAILS: &str = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':\n\
+        [CUDA @ 0x55fafc43d500] Cannot load libcuda.so.1\n\
+        [CUDA @ 0x55fafc43d500] Could not dynamically load CUDA\n\
+        Device creation failed: -1.\n\
+        Device creation failed: -542398533.\n\
+        [dec:h264 @ 0x55fafc43dcc0] Using auto hwaccel type vulkan with new default device.\n\
+        [out#0/mp4 @ 0x55fafc44a840] Error opening output /nonexistent-dir/out.mp4: No such file or directory\n\
+        Error opening output file /nonexistent-dir/out.mp4.\n\
+        Error opening output files: No such file or directory";
+
+    /// The same, at `-loglevel info`, for `-hwaccel d3d11va` with no device behind it.
+    const NAMED_WITHOUT_A_DEVICE: &str = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':\n\
+        Device creation failed: -12.\n\
+        [dec:h264 @ 0x55de1abe1440] No device available for decoder: device type d3d11va needed for codec h264.\n\
+        [dec:h264 @ 0x55de1abe1440] Hardware device setup failed for decoder: Cannot allocate memory\n\
+        Error opening output file -.\n\
+        Error opening output files: Cannot allocate memory";
+
     #[test]
     fn a_missing_device_reads_as_the_hardwares_failure_and_nothing_else_does() {
-        // What ffmpeg 9.0.2 prints for a named accelerator with no device behind it.
         for text in [
+            NAMED_WITHOUT_A_DEVICE,
             "ffmpeg exited with exit status: 244: Device creation failed: -12.\n\
-             [dec:h264 @ 0x55] No device available for decoder: device type d3d11va needed for codec h264.\n\
-             [dec:h264 @ 0x55] Hardware device setup failed for decoder: Cannot allocate memory",
-            "[CUDA @ 0x55] Cannot load libcuda.so.1\nDevice creation failed: -1.",
-            "[h264 @ 0x55] Failed setup for format vulkan: hwaccel initialisation returned error.",
-            "[AVHWDeviceContext @ 0x55] Failed to create D3D11 device",
+             [dec:h264 @ 0x55] No device available for decoder: device type vaapi needed for codec h264.\n\
+             [dec:h264 @ 0x55] Hardware device setup failed for decoder: Generic error in an external library",
+            "Unrecognized hwaccel: nonesuch.\nSupported hwaccels: cuda vaapi qsv",
+            "Failed to set value 'd3d11va' for option 'hwaccel': Option not found",
             "Unrecognized option 'hwaccel'.",
-            "DEVICE CREATION FAILED",
+            "Format vulkan requires hwaccel vulkan initialisation.",
+            "Your platform doesn't support hardware accelerated AV1 decoding.",
+            "NO DEVICE AVAILABLE FOR DECODER: device type cuda",
         ] {
             assert!(looks_like_hardware_decode_failure(text), "{text}");
         }
         // The render's own trouble, or a hang: rerunning in software may cure it, but the
-        // hardware was not what failed.
+        // hardware was not what failed. The first is a real run: an `auto` that probed devices
+        // that are not there, then could not open its output.
         for text in [
+            AUTO_THEN_OUTPUT_FAILS,
+            "[CUDA @ 0x55] Cannot load libcuda.so.1\nDevice creation failed: -1.",
+            "[h264 @ 0x55] Failed setup for format vulkan: hwaccel initialisation returned error.\n\
+             Error opening output file /out/a.mp4.\nNo space left on device",
             "",
             "ffmpeg stopped reporting progress for 300s and was stopped: frame= 120",
             "ffmpeg exited with exit status: 1: Error opening output file /out/a.mp4.\nPermission denied",
@@ -453,17 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn an_export_that_learned_hardware_is_broken_stops_asking_for_auto_but_not_for_a_name() {
-        // Hardware on: the request goes through as it is.
+    fn an_export_stops_asking_for_auto_when_hardware_is_off_or_proven_broken_but_not_for_a_name() {
+        // Hardware allowed and not proven broken: the request goes through as it is.
         for requested in [None, Some("auto"), Some("cuda"), Some("none"), Some("")] {
-            assert_eq!(export_hwaccel_request(requested, true).as_deref(), requested);
+            assert_eq!(export_hwaccel_request(requested, true, false).as_deref(), requested);
         }
-        // Off: only the symbolic `auto` (in any spelling) is dropped.
-        assert_eq!(export_hwaccel_request(Some("auto"), false), None);
-        assert_eq!(export_hwaccel_request(Some(" AUTO "), false), None);
-        assert_eq!(export_hwaccel_request(Some("d3d11va"), false).as_deref(), Some("d3d11va"));
-        assert_eq!(export_hwaccel_request(Some("vaapi"), false).as_deref(), Some("vaapi"));
-        assert_eq!(export_hwaccel_request(None, false), None);
+        // `KERF_HWACCEL=none`, or a conviction: only the symbolic `auto` (in any spelling) goes.
+        for (env_allows, proven_bad) in [(false, false), (true, true), (false, true)] {
+            let request = |r| export_hwaccel_request(r, env_allows, proven_bad);
+            assert_eq!(request(Some("auto")), None);
+            assert_eq!(request(Some(" AUTO ")), None);
+            assert_eq!(request(Some("d3d11va")).as_deref(), Some("d3d11va"));
+            assert_eq!(request(Some("vaapi")).as_deref(), Some("vaapi"));
+            assert_eq!(request(None), None);
+        }
     }
 
     #[test]
