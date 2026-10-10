@@ -88,7 +88,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	use:trapFocus
+	use:trapFocus={{ rescue: true }}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Separate stems"
@@ -181,7 +181,7 @@
 							></div>
 						</div>
 					</div>
-					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>
+					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}
 					</Btn>
 				</div>
@@ -189,7 +189,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="layers" disabled={!canStart} onclick={start}>Separate</Btn>
+					<Btn variant="primary" size="md" icon="layers" data-rescue disabled={!canStart} onclick={start}>Separate</Btn>
 				</div>
 			{/if}
 		</div>

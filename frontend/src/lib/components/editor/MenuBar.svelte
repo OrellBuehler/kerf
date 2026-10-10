@@ -93,6 +93,10 @@
 	let bar = $state<HTMLElement | null>(null);
 	/** Where focus was before the bar took it, to give back when it lets go. */
 	let returnTo: HTMLElement | null = null;
+	/** Keys, not the pointer, are driving the bar. Its tab stop is then where focus goes back to
+	 *  when a dialog a menu entry opened closes and nothing else had it (`modal.ts`) — for a
+	 *  pointer user focus stays off the bar, or Space would open a menu instead of playing. */
+	let byKeys = $state(false);
 	let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 	/** The title the pointer opened by arriving on it while another menu was open. A
 	 *  click on it then is the same gesture finishing, not a request to close it. */
@@ -225,6 +229,7 @@
 
 	function onWindowPointerDown(ev: PointerEvent) {
 		altTap.pointerDown();
+		byKeys = false;
 		if (!bar || !(ev.target instanceof Node)) return;
 		if (bar.contains(ev.target)) {
 			noteReturn();
@@ -257,6 +262,7 @@
 		}
 		const path = pathOf(e.target);
 		if (!path) return;
+		byKeys = true;
 		const handled = () => {
 			e.preventDefault();
 			e.stopPropagation();
@@ -361,6 +367,7 @@
 
 	/** Alt / F10: the bar's first title takes focus, as in every menu bar. */
 	function focusBar() {
+		byKeys = true;
 		noteReturn();
 		active = 0;
 		void focusPath([0]);
@@ -561,6 +568,7 @@
 				aria-expanded={open[0] === i}
 				aria-label={compact ? 'Menu' : undefined}
 				tabindex={active === i ? 0 : -1}
+				data-focus-return={byKeys && active === i ? '' : undefined}
 				class="kerf-menu-top"
 				onclick={() => topClick(i)}
 				onpointerenter={() => topEnter(i)}
