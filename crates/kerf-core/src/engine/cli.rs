@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use super::cpu;
 use super::decode_policy::{
-    facts_from_assets, facts_matter, resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading,
+    export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, resolve_hwaccel, tune_inputs,
+    Chroma, Codec, HostOs, InputFacts, Reading,
 };
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
@@ -2537,7 +2538,8 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             return Err(Error::Cancelled);
         }
         if output.status.success() {
-            let blame = blame_after_software_success(hw_enc.is_some(), hw_dec.is_some());
+            let blame =
+                blame_after_software_success(hw_enc.is_some(), hw_dec.is_some(), looks_like_hardware_decode_failure(&err));
             if blame.encode {
                 HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             }
@@ -2573,13 +2575,16 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
 /// Which hardware a software rerun that succeeded convicts (pure, unit-tested). The rerun
 /// changes the encoder *and* the decoder, so with both in use there is no telling which one
 /// failed: the encoder is blamed, as it always was, and the next proxy — no longer offered one —
-/// finds out about the decoder. With only a decoder in use it is the culprit (a named
-/// accelerator such as `d3d11va` exits non-zero on a machine with no device, where `auto`
-/// fell back quietly, so without this every proxy would pay a failed launch first).
-fn blame_after_software_success(hw_encode: bool, hw_decode: bool) -> Blame {
+/// finds out about the decoder. With only a decoder in use it is the culprit **if the failure
+/// reads as a hardware one** (`decoder_message`: the first run's error text through
+/// `looks_like_hardware_decode_failure`) — a named accelerator such as `d3d11va` exits non-zero
+/// on a machine with no device, where `auto` fell back quietly, so without this every proxy would
+/// pay a failed launch first; a failure that is not the decoder's (a full disk, a bad file) must
+/// not turn it off for the process. (A *stall* is convicted before the rerun, as it always was.)
+fn blame_after_software_success(hw_encode: bool, hw_decode: bool, decoder_message: bool) -> Blame {
     Blame {
         encode: hw_encode,
-        decode: hw_decode && !hw_encode,
+        decode: hw_decode && !hw_encode && decoder_message,
     }
 }
 
@@ -4641,7 +4646,9 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
 /// — so defaulting exports to GPU decode can never lose a render that plain
 /// software decoding would have produced (`-hwaccel auto` already falls back at
 /// init, a named accelerator does not, and a decoder can fail mid-stream). A
-/// retry that completes turns hardware decode off for the process.
+/// retry that completes after a failure that reads as the hardware's turns
+/// hardware decode off for the process, and from then on the symbolic `auto`
+/// is dropped from an export's options (a named accelerator never is).
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with_progress(
     timeline: &Timeline,
@@ -4651,6 +4658,10 @@ pub fn render_with_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
+    let opts = &ExportOptions {
+        hwaccel: export_hwaccel_request(opts.hwaccel.as_deref(), decode_hwaccel().is_some()),
+        ..opts.clone()
+    };
     retry_export_in_software(
         opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
@@ -4659,11 +4670,12 @@ pub fn render_with_progress(
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
-/// decode failed. The retry changes nothing but the decode, so when it completes the hardware
-/// decode was the culprit and `blame_hardware` is told (the learned fallback, which a named
-/// accelerator — `d3d11va`, unlike `auto` — needs: with no device it exits non-zero where `auto`
-/// fell back quietly, and every later render would pay a failed launch). A failure of a run that
-/// asked for no hardware, or one the retry fails the same way, is not the hardware's.
+/// decode failed. When the retry completes **and the first failure reads as the hardware's**
+/// (`looks_like_hardware_decode_failure` over its error text: a named accelerator — `d3d11va`,
+/// unlike `auto` — exits non-zero with no device behind it) `blame_hardware` is told, so later
+/// exports stop asking (`export_hwaccel_request`). A failure that does not read that way (a
+/// stall, a locked output) is still rerun, as it always was, but convicts nothing. A run that
+/// asked no input for hardware is not rerun at all: its software rebuild would be the same argv.
 fn retry_export_in_software(
     opts: &ExportOptions,
     mut attempt: impl FnMut(&ExportOptions, &std::cell::Cell<bool>) -> Result<RenderStatus>,
@@ -4673,12 +4685,13 @@ fn retry_export_in_software(
     match attempt(opts, &hw_used) {
         Err(e) if hw_used.get() => {
             tracing::warn!(error = %e, "export with hardware decode failed; retrying with software decode");
+            let hardware_failure = looks_like_hardware_decode_failure(&e.to_string());
             let sw = ExportOptions {
                 hwaccel: None,
                 ..opts.clone()
             };
             let again = attempt(&sw, &std::cell::Cell::new(false));
-            if matches!(again, Ok(RenderStatus::Completed)) {
+            if hardware_failure && matches!(again, Ok(RenderStatus::Completed)) {
                 blame_hardware();
             }
             again
@@ -8081,17 +8094,18 @@ mod tests {
 
     #[test]
     fn an_export_is_tuned_per_input_at_spawn_and_says_whether_hardware_is_left() {
-        let export_args = |assets: &[Asset]| {
+        let build = |assets: &[Asset], hwaccel: Option<&str>| {
             let tracks = assets
                 .iter()
                 .map(|a| video_track(vec![make_clip(a.id, 0.0, 5.0, 0.0)]))
                 .collect();
             let opts = ExportOptions {
-                hwaccel: Some("auto".to_string()),
+                hwaccel: hwaccel.map(String::from),
                 ..ExportOptions::default()
             };
             build_export_args(&timeline_of(tracks), assets, "/out.mp4", &opts).unwrap()
         };
+        let export_args = |assets: &[Asset]| build(assets, Some("auto"));
         let hevc = at_path("/media/a.mp4", "hevc", "yuv420p10le");
         let built = export_args(std::slice::from_ref(&hevc));
         assert_eq!(flag_val(&built, "-hwaccel"), Some("auto"));
@@ -8124,6 +8138,20 @@ mod tests {
             HostOs::Windows
         ));
         assert_eq!(count(&from_proxy, "-hwaccel"), 0);
+
+        // So a run that was handed no hardware has no software rerun to make: the argv rebuilt
+        // with no `hwaccel` is the tuned one, byte for byte (a proxy, and an image-only timeline).
+        assert_eq!(from_proxy, build(std::slice::from_ref(&proxy), None));
+        let card = img_asset(Uuid::new_v4());
+        let mut from_image = export_args(std::slice::from_ref(&card));
+        assert!(!tune_export_args(
+            &mut from_image,
+            std::slice::from_ref(&card),
+            HostOs::Windows
+        ));
+        assert_eq!(from_image, build(std::slice::from_ref(&card), None));
+        // And one that was handed some does have something to change.
+        assert_ne!(windows, build(std::slice::from_ref(&hevc), None));
     }
 
     #[test]
@@ -8152,39 +8180,17 @@ mod tests {
 
     #[test]
     fn a_software_rerun_that_works_convicts_the_hardware_that_was_in_use() {
-        let blame = |enc, dec| blame_after_software_success(enc, dec);
-        // A decoder alone is the culprit.
-        assert_eq!(
-            blame(false, true),
-            Blame {
-                encode: false,
-                decode: true
-            }
-        );
+        let blame = |encode, decode| Blame { encode, decode };
+        // A decoder alone is the culprit when the failure reads as the hardware's ...
+        assert_eq!(blame_after_software_success(false, true, true), blame(false, true));
+        // ... and not when it does not (a full disk that the rerun happened to dodge).
+        assert_eq!(blame_after_software_success(false, true, false), blame(false, false));
         // An encoder alone, as ever.
-        assert_eq!(
-            blame(true, false),
-            Blame {
-                encode: true,
-                decode: false
-            }
-        );
+        assert_eq!(blame_after_software_success(true, false, false), blame(true, false));
         // Both: the encoder is blamed and the next proxy, offered no encoder, finds out about the
         // decoder.
-        assert_eq!(
-            blame(true, true),
-            Blame {
-                encode: true,
-                decode: false
-            }
-        );
-        assert_eq!(
-            blame(false, false),
-            Blame {
-                encode: false,
-                decode: false
-            }
-        );
+        assert_eq!(blame_after_software_success(true, true, true), blame(true, false));
+        assert_eq!(blame_after_software_success(false, false, true), blame(false, false));
     }
 
     #[test]
@@ -8193,18 +8199,25 @@ mod tests {
             hwaccel: Some("d3d11va".to_string()),
             ..ExportOptions::default()
         };
-        let fail = || Err(Error::Engine("Device creation failed".into()));
+        // What ffmpeg 9.0.2 says with no device behind a named accelerator.
+        let no_device = || {
+            Err(Error::Engine(
+                "ffmpeg exited with exit status: 244: Device creation failed: -12.\nHardware device setup failed for decoder"
+                    .into(),
+            ))
+        };
         let blamed = std::cell::Cell::new(0);
         let mut seen: Vec<Option<String>> = Vec::new();
 
-        // Hardware was handed to an input and the run failed; the software run completes.
+        // Hardware was handed to an input, the run failed the way a missing device fails, and the
+        // software run completes: rerun, and the hardware is blamed.
         let result = retry_export_in_software(
             &opts,
             |o, hw_used| {
                 seen.push(o.hwaccel.clone());
                 if o.hwaccel.is_some() {
                     hw_used.set(true);
-                    fail()
+                    no_device()
                 } else {
                     Ok(RenderStatus::Completed)
                 }
@@ -8215,14 +8228,39 @@ mod tests {
         assert_eq!(seen, [Some("d3d11va".to_string()), None]);
         assert_eq!(blamed.get(), 1);
 
+        // The same run failing some other way (a stall, a locked output): still rerun, as ever,
+        // and the rerun completes, but nothing says the hardware did it, so it is not blamed.
+        for other in [
+            "ffmpeg stopped reporting progress for 300s and was stopped: frame= 120",
+            "ffmpeg exited with exit status: 1: Error opening output file /out/a.mp4\nPermission denied",
+        ] {
+            seen.clear();
+            let result = retry_export_in_software(
+                &opts,
+                |o, hw_used| {
+                    seen.push(o.hwaccel.clone());
+                    if o.hwaccel.is_some() {
+                        hw_used.set(true);
+                        Err(Error::Engine(other.into()))
+                    } else {
+                        Ok(RenderStatus::Completed)
+                    }
+                },
+                || blamed.set(blamed.get() + 1),
+            );
+            assert_eq!(result.unwrap(), RenderStatus::Completed);
+            assert_eq!(seen.len(), 2, "{other}");
+        }
+        assert_eq!(blamed.get(), 1);
+
         // Hardware was requested but no input was handed it (a proxy, an image): the failure is
-        // the render's own, so no rerun and no blame.
+        // the render's own, so no rerun and no blame — the rerun would be the same argv.
         seen.clear();
         let result = retry_export_in_software(
             &opts,
             |o, _| {
                 seen.push(o.hwaccel.clone());
-                fail()
+                no_device()
             },
             || blamed.set(blamed.get() + 1),
         );
@@ -8238,7 +8276,7 @@ mod tests {
                 |o, hw_used| {
                     if o.hwaccel.is_some() {
                         hw_used.set(true);
-                        fail()
+                        no_device()
                     } else {
                         rerun.take().unwrap()
                     }
@@ -8259,6 +8297,51 @@ mod tests {
         );
         assert_eq!(result.unwrap(), RenderStatus::Completed);
         assert_eq!(blamed.get(), 1);
+    }
+
+    /// Against the real binary: a named accelerator that cannot get a device exits non-zero with
+    /// text the classifier reads as the hardware's, where `auto` falls back and succeeds — the
+    /// reason a named `d3d11va` needs the learned fallback `auto` never did.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored no_device`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_named_accelerator_with_no_device_fails_in_words_the_classifier_reads() {
+        let dir = Scratch::new("no-device");
+        let media = dir.join("a.mp4");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=10:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            media.to_str().unwrap(),
+        ]);
+        let decode = |accel: &str| {
+            command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-hwaccel", accel, "-i"])
+                .arg(&media)
+                .args(["-frames:v", "1", "-f", "null", "-"])
+                .output()
+                .expect("run ffmpeg")
+        };
+        let mut failed = 0;
+        for accel in ["vaapi", "cuda", "vdpau", "d3d11va", "dxva2", "videotoolbox", "qsv"] {
+            let out = decode(accel);
+            // A machine that has the device (or an ffmpeg built with the name) has nothing to learn.
+            if out.status.success() {
+                continue;
+            }
+            failed += 1;
+            let text = String::from_utf8_lossy(&out.stderr);
+            assert!(looks_like_hardware_decode_failure(&text), "{accel}: {text}");
+        }
+        assert!(decode("auto").status.success(), "`auto` is expected to fall back quietly");
+        if failed == 0 {
+            skip("skipped: every accelerator worked here");
+        }
     }
 
     /// A recording stand-in for ffmpeg: writes the argv it was given, one per line, and answers

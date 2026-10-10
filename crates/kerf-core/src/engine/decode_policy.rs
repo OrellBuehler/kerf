@@ -192,6 +192,39 @@ pub(crate) fn facts_matter(os: HostOs, requested: &str, reading: Reading) -> boo
     requested.trim().eq_ignore_ascii_case("auto") && (os == HostOs::Windows || (reading == Reading::Frame && os != HostOs::MacOs))
 }
 
+/// Whether the text of a failed run (the tail of its stderr, which an error carries) reads as the
+/// hardware decoder's failure rather than the render's own: a named accelerator with no device
+/// behind it exits non-zero at start where `auto` fell back quietly. Used to decide whether a
+/// software rerun that works convicts the hardware (turns it off for the process); a stall, a
+/// locked output or a bad file does not. ffmpeg 9.0.2 prints, for a missing device,
+/// `Device creation failed: -12.`, `No device available for decoder: device type d3d11va needed
+/// for codec h264.` and `Hardware device setup failed for decoder: ...`.
+pub(crate) fn looks_like_hardware_decode_failure(text: &str) -> bool {
+    const MARKS: [&str; 6] = [
+        "device creation failed",
+        "no device available for decoder",
+        "hardware device setup failed",
+        "failed setup for format",
+        "avhw",
+        "hwaccel",
+    ];
+    let text = text.to_ascii_lowercase();
+    MARKS.iter().any(|m| text.contains(m))
+}
+
+/// The `-hwaccel` an export is asked for, given what the process has learned about hardware
+/// decode (`hardware_on`: `decode_hwaccel()` is not `None`, i.e. it was not switched off by
+/// `KERF_HWACCEL=none` or by an earlier failure that a software rerun cured). The symbolic `auto`
+/// — the GUI's default, which names no device — is dropped when hardware is off, so a machine
+/// whose decoder failed once does not launch and fail again for every export. A named accelerator
+/// is the caller's choice and is never touched.
+pub(crate) fn export_hwaccel_request(requested: Option<&str>, hardware_on: bool) -> Option<String> {
+    match requested {
+        Some(r) if !hardware_on && r.trim().eq_ignore_ascii_case("auto") => None,
+        other => other.map(str::to_string),
+    }
+}
+
 /// What [`tune_inputs`] left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Tuning {
@@ -386,6 +419,51 @@ mod tests {
         for chroma in [Chroma::Yuv420, Chroma::Unknown] {
             assert!(resolve_hwaccel(HostOs::Other, "auto", facts(Codec::H264, chroma), Reading::Frame).is_some());
         }
+    }
+
+    #[test]
+    fn a_missing_device_reads_as_the_hardwares_failure_and_nothing_else_does() {
+        // What ffmpeg 9.0.2 prints for a named accelerator with no device behind it.
+        for text in [
+            "ffmpeg exited with exit status: 244: Device creation failed: -12.\n\
+             [dec:h264 @ 0x55] No device available for decoder: device type d3d11va needed for codec h264.\n\
+             [dec:h264 @ 0x55] Hardware device setup failed for decoder: Cannot allocate memory",
+            "[CUDA @ 0x55] Cannot load libcuda.so.1\nDevice creation failed: -1.",
+            "[h264 @ 0x55] Failed setup for format vulkan: hwaccel initialisation returned error.",
+            "[AVHWDeviceContext @ 0x55] Failed to create D3D11 device",
+            "Unrecognized option 'hwaccel'.",
+            "DEVICE CREATION FAILED",
+        ] {
+            assert!(looks_like_hardware_decode_failure(text), "{text}");
+        }
+        // The render's own trouble, or a hang: rerunning in software may cure it, but the
+        // hardware was not what failed.
+        for text in [
+            "",
+            "ffmpeg stopped reporting progress for 300s and was stopped: frame= 120",
+            "ffmpeg exited with exit status: 1: Error opening output file /out/a.mp4.\nPermission denied",
+            "[mov,mp4 @ 0x55] moov atom not found\nInvalid data found when processing input",
+            "Error while decoding stream #0:0: Invalid data found when processing input",
+            "Conversion failed!",
+            "ffmpeg exited with exit status: 234: No space left on device",
+            "timeline has no clips to export",
+        ] {
+            assert!(!looks_like_hardware_decode_failure(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_export_that_learned_hardware_is_broken_stops_asking_for_auto_but_not_for_a_name() {
+        // Hardware on: the request goes through as it is.
+        for requested in [None, Some("auto"), Some("cuda"), Some("none"), Some("")] {
+            assert_eq!(export_hwaccel_request(requested, true).as_deref(), requested);
+        }
+        // Off: only the symbolic `auto` (in any spelling) is dropped.
+        assert_eq!(export_hwaccel_request(Some("auto"), false), None);
+        assert_eq!(export_hwaccel_request(Some(" AUTO "), false), None);
+        assert_eq!(export_hwaccel_request(Some("d3d11va"), false).as_deref(), Some("d3d11va"));
+        assert_eq!(export_hwaccel_request(Some("vaapi"), false).as_deref(), Some("vaapi"));
+        assert_eq!(export_hwaccel_request(None, false), None);
     }
 
     #[test]

@@ -153,16 +153,26 @@ so the feature is **only** activated through these forwards — which is what ma
   through verbatim); a long read (stream, export, proxy, scenes, filmstrip) still tries.
   There is **no size threshold** (the review's "hardware only above 1080p" is not
   implemented): a small original still asks. **A named accelerator exits non-zero with no
-  device where `auto` fell back quietly**, so every path that reruns in software turns hardware
-  decode off for the process when the rerun works (`disable_decode_hwaccel`): stills, frame
-  grabs, stream, scenes, salience, filmstrips, and now `generate_proxy_with` (only a decoder in
-  use is convicted; with an encoder too the encoder is, as before — `blame_after_software_success`)
-  and `render_with_progress` (`retry_export_in_software`). Still, stream and export decide
-  whether a failure may blame the hardware from the rewritten argv (an input really handed
-  `-hwaccel`), not from the request. Call sites: `tune_still_args` (`run_still`),
-  `stream_preview_once`, `tune_export_args`, `decode_frame` / `decode_hwaccel_for`;
-  `limit_frame_args` is the same for `kerf-gpu`'s per-layer decodes. **The Insta360 stitch is
-  not tuned**: it keeps the plain request (`auto`, never `d3d11va`).
+  device where `auto` fell back quietly** (ffmpeg 9.0.2: `Device creation failed`, `No device
+  available for decoder`, `Hardware device setup failed`), so what a rerun in software
+  teaches the process (`disable_decode_hwaccel`, which also stops the stream, the stills and the
+  rest asking) differs by path. **Convict on any rescue, unclassified, as before:** stills, frame
+  grabs, the stream (before its first frame), scenes, salience, filmstrips. **Convict only a
+  failure that reads as the hardware's** (`looks_like_hardware_decode_failure` over the first
+  run's error text, so a locked output or a bad file does not turn hardware off for the process):
+  `render_with_progress` (`retry_export_in_software`) and `generate_proxy_with` when only a
+  decoder was in use (with an encoder too the encoder is blamed, as it always was, and the next
+  proxy finds out about the decoder — `blame_after_software_success`; a *stall* still convicts
+  both before the rerun). Once hardware is off, an export's symbolic `auto` is dropped before its
+  argv is built (`export_hwaccel_request`; also under `KERF_HWACCEL=none`), a named accelerator
+  never is — it fails and reruns once per export on a machine without the device. Still,
+  stream and export decide whether a failed run may blame hardware at all from the rewritten
+  argv (an input really handed `-hwaccel`), not from the request: **an export whose tuned argv
+  has no `-hwaccel` (a proxy or image-only timeline) gets no software rerun**, because the
+  rerun would be byte-identical (pinned by a test). Call sites: `tune_still_args`
+  (`run_still`), `stream_preview_once`, `tune_export_args`, `decode_frame` /
+  `decode_hwaccel_for`; `limit_frame_args` is the same for `kerf-gpu`'s per-layer decodes.
+  **The Insta360 stitch is not tuned**: it keeps the plain request (`auto`, never `d3d11va`).
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
   written to finish as fast as it can — every run grabs every core and nothing
   coordinates one run with the next — so an agent analyzing eight sources over
