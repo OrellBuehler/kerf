@@ -64,7 +64,11 @@ mod pcm;
 // Bar-level music structure (fitted beat grid, downbeat, chroma, repeating phrases):
 // pure DSP on decoded PCM, cached per file.
 pub mod music;
+
+// Stem separation (Demucs htdemucs on ONNX Runtime; STFT, chunking and overlap-add here).
+pub mod stems;
 pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the

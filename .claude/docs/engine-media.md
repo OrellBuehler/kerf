@@ -112,6 +112,24 @@
   whole bar and L2-normalized (zeros when silent); `phrase_matches` lists 8- and 4-bar
   phrases on 4-bar boundaries whose bars all match above `SPLICE_SIMILARITY` (0.95) —
   the legal splice points. Loudness stays ffmpeg's (`measure_loudness`), not `ebur128`.
+- `stems.rs` (always compiled): **stem separation** with Demucs `htdemucs` (MIT) on the
+  ONNX Runtime the voiceover already loads (`tts::ensure_runtime` / `init_runtime` are
+  shared). **Only the network is ONNX** — `scripts/demucs/export.py` exports it (inputs
+  `mix` [1,2,343980] + `mag` [1,4,2048,336], outputs `spec_out` + `wave_out`; re-running
+  it reproduces the pinned SHA-256) because the model's STFT does not export. `spec` /
+  `ispec` port `HTDemucs._spec` / `_ispec` (two-stage reflect pad, periodic Hann,
+  `normalized`, Nyquist bin and 2 edge frames dropped/restored, DC imag zeroed before the
+  c2r) and are pinned against values printed by PyTorch; `separate_buffer` ports
+  `apply_model` (7.8 s segments, stride ¾, each padded with its *neighbours'* audio and
+  centre-trimmed, triangular blend) with `demucs.separate`'s mean/std normalization and
+  `shifts=0` (deterministic). An ignored parity test (`KERF_DEMUCS_PARITY_DIR`, fixture
+  from `scripts/demucs/parity.py`) matches PyTorch per stem under 1e-3 RMS across several
+  segments, the stems summing back to the mix within 0.02 (Demucs is not constrained to;
+  PyTorch lands the same on that synthetic mix). `separate(path)` decodes at 44.1 kHz
+  stereo, runs under `cpu::lease` with ORT threads = the budget, and caches 24-bit FLAC
+  stems at `<cache>/kerf/stems/<hash>/` (float WAV would be ~200 MB per stem for ten
+  minutes). The model (~170 MB) downloads on first use from a release asset
+  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

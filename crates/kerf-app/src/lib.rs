@@ -47,6 +47,7 @@ struct AppState {
     levels_cancel: Arc<AtomicBool>,
     /// Same, for a voiceover being synthesized (or its model downloading).
     voiceover_cancel: Arc<AtomicBool>,
+    stems_cancel: Arc<AtomicBool>,
     /// Whether the main window has been shown. It is created hidden (`visible:
     /// false` in `tauri.conf.json`) so nobody sees the webview's unthemed first
     /// frame; the webview asks for it once the theme is applied
@@ -769,6 +770,68 @@ async fn generate_voiceover(
 #[tauri::command(async)]
 fn cancel_voiceover(state: State<'_, AppState>) {
     state.voiceover_cancel.store(true, Ordering::SeqCst);
+}
+
+/// Whether stem separation would still download its runtime or model.
+#[tauri::command(async)]
+fn stems_status() -> CmdResult<kerf_core::StemsStatus> {
+    Ok(kerf_core::stems_status())
+}
+
+/// The error an abandoned separation returns, for the webview to stay quiet on.
+const STEMS_CANCELLED: &str = "stems cancelled";
+
+#[derive(Serialize)]
+struct StemsResult {
+    placed: kerf_core::StemsPlaced,
+    timeline: Timeline,
+}
+
+/// Split an asset's sound into drums / bass / other / vocals, streaming
+/// `stems-progress` (`download_runtime`, `download_model`, `separate`, `encode`), and
+/// add them to the library — laid under `clip_id` on new tracks when given. The
+/// separation runs with the project lock released; only landing it takes the lock.
+#[tauri::command]
+async fn separate_stems(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+    clip_id: Option<String>,
+) -> CmdResult<StemsResult> {
+    let asset_id = id(&asset_id)?;
+    let clip = clip_id.as_deref().map(id).transpose()?;
+    let shared = state.project.clone();
+    let cancel = state.stems_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || {
+        let asset = lock_user(&shared).require_asset(asset_id).map_err(|e| e.to_string())?;
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "stems-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        let stems =
+            Project::separate_stems_media(&asset, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(|e| match e {
+                kerf_core::Error::Cancelled => STEMS_CANCELLED.to_string(),
+                other => other.to_string(),
+            })?;
+        let project = lock_user(&shared);
+        let placed = project.place_stems(asset_id, &stems, clip).map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(StemsResult { placed, timeline })
+    })
+    .await
+}
+
+/// Request cancellation of the running stem separation (or its download).
+#[tauri::command(async)]
+fn cancel_stems(state: State<'_, AppState>) {
+    state.stems_cancel.store(true, Ordering::SeqCst);
 }
 
 // ---- ripple mode -------------------------------------------------------------
@@ -3188,6 +3251,7 @@ pub fn run() {
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             levels_cancel: Arc::new(AtomicBool::new(false)),
             voiceover_cancel: Arc::new(AtomicBool::new(false)),
+            stems_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
             launch: Mutex::new(LaunchSlot::new(launch.clone())),
         })
@@ -3298,6 +3362,9 @@ pub fn run() {
             set_master_duck,
             plan_music_fit,
             fit_music,
+            stems_status,
+            separate_stems,
+            cancel_stems,
             get_levels,
             cancel_levels,
             set_delivery_format,

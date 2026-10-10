@@ -106,6 +106,11 @@
   or, by default, the picture's end minus the clip's start; `fit_music` replaces the clip
   with `music_fit_clips` in one `edit_timeline_exact` revision ("Fit music to length") and
   refuses a result that would run into the next clip on the track.
+  `separate_stems_media(asset, progress, cancel)` (static, lock released) separates and
+  probes the four stems; `place_stems(source, stems, clip?)` stores them (reusing
+  imported ones) and, with a clip, lays each on a new audio track named after it at the
+  clip's span/speed/gain and switches the clip's own sound off (audio clip disabled,
+  picture `source_audio` off; a picture whose sound is on a linked clip is refused).
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

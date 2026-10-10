@@ -589,7 +589,8 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
-**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` use the
+**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
+`FitMusicDialog` / `StemsDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
 close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
 which focuses itself) `inert` and returns early from its global key handler while
@@ -805,7 +806,7 @@ playhead / append, the audio action — labelled for what the backend will do (`
 playing its own sound, `add_asset_audio`)
 (`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
 their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
-track), remove silences (greyed out until silence has been detected), **Analyze** — one entry per kind
+track), remove silences (greyed out until silence has been detected), **Separate stems…** (assets with sound; see below), **Analyze** — one entry per kind
 ("Detect silence", "Find scene changes", "Measure loudness", "Find the beat and tempo", "Transcribe
 speech", "Analyze everything"), each saying `done · run again` / `failed · retry`, disabled with the reason
 for a voiceover, a running pass, a file with no audio or no speech backend — and Stop analysis, **Rebuild /
@@ -813,6 +814,26 @@ Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the
 path, show in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
 row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
 it, which the shared `ContextMenu` renders non-interactively.
+**Stem separation** (Demucs: drums / bass / other / vocals). One modal, `StemsDialog` (`ui.stemsDialog`,
+`ui.openStems(assetId, clipId?)`, inert-behind like the voiceover's), reached from the bin's **Separate
+stems…** (the stems join the library as `<name> · drums` …, the cut is untouched) and the clip menu's
+**Separate stems under this clip…** (also four new audio tracks Drums / Bass / Other / Vocals at the
+clip's position and span, and the clip's own sound switched off — an audio clip disabled, a picture's
+`source_audio` off — as one `Separate stems` revision with a toast Undo; the four new clips are
+selected). `stems.ts` `stemsOffer` is the clip menu's gate: shown when the asset has an audio stream,
+greyed with the backend's refusals (locked track; a picture whose sound is on a linked audio clip —
+separate that clip). The dialog follows the voiceover's arrangement: it asks `stemsStatus` first and
+says what the first run downloads (`downloadNote`: the ~174 MB model, the audio runtime), then streams
+`stems-progress` (`download_runtime` / `download_model` / `separate` / `encode`, a bar per stage) with a
+**Cancel** (`cancelStems`; the run rejects with `stems cancelled`, which stays quiet and returns to the
+form) and a success toast (`describeStems`); other failures are error toasts. It cannot be dismissed
+mid-run, and `editor.separateStems` refreshes the asset list on a failure, because the core stores the
+stems *before* it places them, so a refused placement still leaves them in the library. Under `bun run
+dev` `separateStems` fakes the progress (a first-use "download", then separate / encode), makes four
+stem assets and, with a clip, runs `stems.ts` `placeStems` — the faithful mirror of
+`Project::place_stems` (same checks and messages, same lanes, sound-off rule), replayed by
+`stems.test.ts`; a second run of the same asset finds the stems again by path and reports no
+progress, like the app's per-file cache. `api-stems.test.ts` drives the bridge.
 **Dropping files onto the window imports them** (`+page.svelte` listens for Tauri's
 `onDragDropEvent`, filters by `isMediaPath` — the same extension list the picker
 filters by, so a dropped folder of mixed files doesn't answer with one error per

@@ -4612,6 +4612,83 @@ impl Project {
         Ok(asset)
     }
 
+    /// Separate an asset's sound into drums, bass, other and vocals and describe each
+    /// stem as an importable [`Asset`] (`"<name> · drums"` …), *without* `&self*: the
+    /// separation runs for a minute or more (after a first-use model download), so it
+    /// happens with the project lock released; [`Project::place_stems`] lands the result.
+    pub fn separate_stems_media(
+        asset: &Asset,
+        progress: engine::tts::ProgressFn,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<Asset>> {
+        if !asset.streams.iter().any(|s| s.kind == StreamKind::Audio) {
+            return Err(Error::InvalidArgument("this asset has no sound to separate".to_string()));
+        }
+        let paths = engine::stems::separate(Path::new(&asset.path), progress, cancel)?;
+        paths
+            .iter()
+            .zip(engine::STEM_NAMES)
+            .map(|(path, name)| {
+                let mut stem = Self::probe_asset(path)?;
+                stem.name = format!("{} · {name}", asset.name);
+                Ok(stem)
+            })
+            .collect()
+    }
+
+    /// Store separated stems (reusing ones already imported) and, with `clip_id`, lay
+    /// them under that clip as one edit: each on a new audio track named after it, at
+    /// the clip's position, span, speed and gain — and the clip's own sound switched
+    /// off (an audio clip disabled, a picture's `source_audio` off), so the mix is not
+    /// heard twice. The clip must be of the separated asset and not linked to a sound
+    /// clip elsewhere (separate that one instead).
+    pub fn place_stems(&self, source: Uuid, stems: &[Asset], clip_id: Option<Uuid>) -> Result<StemsPlaced> {
+        let stems: Vec<Asset> = stems.iter().map(|a| self.insert_or_get_asset(a)).collect::<Result<_>>()?;
+        let Some(clip_id) = clip_id else {
+            return Ok(StemsPlaced {
+                assets: stems,
+                clips: Vec::new(),
+            });
+        };
+        let clips = self.edit_timeline_exact("Separate stems", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let track = &timeline.tracks[ti];
+            let clip = track.clips[ci].clone();
+            if clip.asset_id != source {
+                return Err(Error::InvalidArgument("that clip is not of the separated asset".to_string()));
+            }
+            if track.locked {
+                return Err(Error::InvalidArgument(format!("{} is locked", track.name)));
+            }
+            let on_audio = track.kind == StreamKind::Audio;
+            if !on_audio && clip.link_id.is_some() {
+                return Err(Error::InvalidArgument(
+                    "this picture's sound is on a linked audio clip — separate that clip instead".to_string(),
+                ));
+            }
+            let mut placed = Vec::new();
+            for (stem, name) in stems.iter().zip(engine::STEM_NAMES) {
+                let mut c = Clip::for_asset(stem, clip.source_in, clip.source_out.min(stem.duration), clip.timeline_start);
+                c.speed = clip.speed;
+                c.volume = clip.volume;
+                c.fade_in = clip.fade_in;
+                c.fade_out = clip.fade_out;
+                let mut lane = Track::new(StreamKind::Audio, capitalized(name));
+                lane.clips.push(c.clone());
+                timeline.tracks.push(lane);
+                placed.push(c);
+            }
+            let original = &mut timeline.tracks[ti].clips[ci];
+            if on_audio {
+                original.enabled = false;
+            } else {
+                original.source_audio = false;
+            }
+            Ok(placed)
+        })?;
+        Ok(StemsPlaced { assets: stems, clips })
+    }
+
     /// Land a synthesized voiceover: store the asset (reusing it when the same
     /// script was generated before), record its script as the asset's
     /// transcript, and put it on the timeline as one edit.
@@ -4956,6 +5033,19 @@ mod linked_tests;
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]
 mod linked_corpus;
+
+/// What [`Project::place_stems`] did: the stem assets (in `STEM_NAMES` order) and the
+/// clips it laid under the separated clip, if one was named.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StemsPlaced {
+    pub assets: Vec<Asset>,
+    pub clips: Vec<Clip>,
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {
@@ -5373,6 +5463,63 @@ mod tests {
         project.begin_staging(None, None).unwrap();
         project.set_master_duck(None).unwrap();
         assert_eq!(project.apply_staged(false).unwrap().master.duck_depth_db, None);
+    }
+
+    #[test]
+    fn stems_land_under_the_clip_and_silence_its_mix() {
+        let project = Project::open_in_memory().unwrap();
+        let mut song = asset_with("/song.wav", vec![aud_stream()]);
+        song.duration = 30.0;
+        let song = project.insert_or_get_asset(&song).unwrap();
+        project.add_asset_audio(song.id).unwrap();
+        let clip = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .find(|t| t.kind == StreamKind::Audio)
+            .unwrap()
+            .clips[0]
+            .clone();
+        let stems: Vec<Asset> = engine::STEM_NAMES
+            .iter()
+            .map(|n| {
+                let mut a = asset_with(&format!("/stems/{n}.flac"), vec![aud_stream()]);
+                a.duration = 30.0;
+                a.name = format!("song · {n}");
+                a
+            })
+            .collect();
+        let other = project
+            .insert_or_get_asset(&asset_with("/other.wav", vec![aud_stream()]))
+            .unwrap();
+        assert!(
+            project.place_stems(other.id, &stems, Some(clip.id)).is_err(),
+            "a clip of another asset"
+        );
+
+        let placed = project.place_stems(song.id, &stems, Some(clip.id)).unwrap();
+        assert_eq!(placed.assets.len(), 4);
+        assert_eq!(placed.clips.len(), 4);
+        let timeline = project.timeline().unwrap();
+        let names: Vec<&str> = timeline.tracks.iter().map(|t| t.name.as_str()).collect();
+        for n in ["Drums", "Bass", "Other", "Vocals"] {
+            assert!(names.contains(&n), "{names:?}");
+        }
+        for c in &placed.clips {
+            assert_eq!(
+                (c.timeline_start, c.source_in, c.source_out),
+                (clip.timeline_start, clip.source_in, clip.source_out)
+            );
+        }
+        assert!(!timeline.clip(clip.id).unwrap().enabled, "the mix is not heard twice");
+        // Importing again reuses the stored stems.
+        let again = project.place_stems(song.id, &stems, None).unwrap();
+        assert_eq!(
+            again.assets.iter().map(|a| a.id).collect::<Vec<_>>(),
+            placed.assets.iter().map(|a| a.id).collect::<Vec<_>>()
+        );
+        assert!(again.clips.is_empty());
     }
 
     #[test]

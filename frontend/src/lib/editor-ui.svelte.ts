@@ -89,6 +89,9 @@ class EditorUi {
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
 	voiceoverDialog = $state<{ prefill: VoiceoverPrefill | null } | null>(null);
+	/** The Separate-stems dialog: `null` while closed, else the asset whose sound it splits and,
+	 *  when opened from a clip, the clip the stems are laid under. */
+	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
 	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
@@ -200,6 +203,14 @@ class EditorUi {
 
 	closeVoiceover() {
 		this.voiceoverDialog = null;
+	}
+
+	openStems(assetId: string, clipId: string | null = null) {
+		this.stemsDialog = { assetId, clipId };
+	}
+
+	closeStems() {
+		this.stemsDialog = null;
 	}
 
 	openFitMusic(clipId: string) {

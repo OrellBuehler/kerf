@@ -47,12 +47,12 @@ pub use engine::{
     export_seek_arg, export_still, ffmpeg_command, ffmpeg_path, filmstrip_for, fps_mode_flag, generate_proxy, hw_encoders,
     insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants, render_with,
     render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
-    source_seek_points_are_keyframes, speech_model_names, stitch_insta360, stitched_path, stream_preview, validate_export,
-    voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, Container,
-    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, LoudnessPreset,
-    PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel,
-    WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED,
-    MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED,
+    source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360, stitched_path, stream_preview,
+    validate_export, voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer,
+    Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat,
+    LoudnessPreset, PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, StemsStatus, VariantProgress, VoiceInfo,
+    VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT,
+    MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED, STEM_NAMES,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
@@ -74,7 +74,7 @@ pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
-pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
