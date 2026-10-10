@@ -245,7 +245,7 @@
 		font-size: 12px;
 		font-weight: 600;
 		line-height: 1;
-		color: var(--text-disabled);
+		color: var(--text-muted);
 		background: transparent;
 		border: var(--line-width) solid var(--border-strong);
 		border-radius: var(--radius-xs);
@@ -271,7 +271,7 @@
 	.hint {
 		min-height: 10px;
 		margin: -2px 0 -1px;
-		font-size: 9px;
+		font-size: var(--text-2xs);
 		line-height: 1;
 		text-align: center;
 		color: var(--text-muted);

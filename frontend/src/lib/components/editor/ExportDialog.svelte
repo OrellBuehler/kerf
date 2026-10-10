@@ -531,11 +531,11 @@
 						{@render sliderRow('Quality (CRF)', opts.crf ?? vc.crf[2], vc.crf[0], vc.crf[1], 1, String(opts.crf ?? vc.crf[2]), (v) =>
 							patch({ crf: Math.round(v) })
 						)}
-						<div style="font-size:12px;color:var(--text-disabled);padding:0 0 2px 100px">lower = higher quality &amp; larger file</div>
+						<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 100px">lower = higher quality &amp; larger file</div>
 					{:else if opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass'}
 						{@render textRow('Target bitrate', opts.video_bitrate ?? '', 'e.g. 8M', (v) => patch({ video_bitrate: v }))}
 						{#if opts.rate_control === 'two_pass'}
-							<div style="font-size:12px;color:var(--text-disabled);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
+							<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
 						{/if}
 					{:else if opts.rate_control === 'lossless'}
 						<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Mathematically lossless — very large files.</div>

@@ -51,12 +51,12 @@
 </script>
 
 <div
-	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default)"
+	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
 	{#if meta}
-		<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{meta}</span>
+		<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
 	{/if}
-	<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">
+	<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
@@ -66,7 +66,7 @@
 			data-testid="preview-source"
 			data-source={sourceNote.tone}
 			title={sourceNote.title}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:10px;color:{sourceNote.tone === 'proxy'
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
 				? 'var(--kerf-300)'
 				: sourceNote.tone === 'waiting'
 					? 'var(--orange-400)'
@@ -81,21 +81,21 @@
 		<span
 			data-testid="preview-renderer"
 			title={gpuPreview.reasons.length ? gpuPreview.reasons.join('\n') : 'Drawn by the GPU compositor'}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:10px;color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-muted)'}"
 		>
 			{gpuPreview.label}
 		</span>
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 	{/if}
 	{#if editor.loading}
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--text-muted)">
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--text-muted)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--text-muted);border-top-color:transparent;border-radius:50%"></span>
 			Loading project…
 		</span>
 	{:else if editor.exportRun}
 		<!-- A render keeps going after its dialog is closed; this is where it stays
 		     visible and stoppable. -->
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--kerf-300)">
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
 			{#if editor.exportRun.progress?.waiting}Export {editor.exportRun.progress.waiting}…{:else}Exporting {Math.round(
 					(editor.exportRun.progress?.fraction ?? 0) * 100
@@ -106,7 +106,7 @@
 			disabled={editor.exportRun.cancelling}
 			title="Stop the export and delete the partial file"
 			onclick={() => void editor.stopExport()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
 		</button>
@@ -114,7 +114,7 @@
 		<!-- Analysis is a long commitment (a speech model download, then minutes
 		     of inference per asset), so say which step it is on, how much is
 		     still queued behind it, and offer the way out. -->
-		<span style="display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--agent-300)">
+		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--agent-300)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--agent-400);border-top-color:transparent;border-radius:50%"></span>
 			{ui.analysisLabel ?? 'analyzing'}{ui.analysisQueued > 0 ? ` · ${ui.analysisQueued} queued` : ''}
 		</span>
@@ -123,12 +123,12 @@
 			disabled={ui.stoppingAnalysis}
 			title="Stop analyzing — it gives up between steps, and within about a second during transcription"
 			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:10px;padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
 		>
 			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
 		</button>
 	{:else}
-		<span style="font-size:10px;color:var(--text-disabled)">
+		<span style="font-size:var(--text-xs);color:var(--text-muted)">
 			{editor.assets.length} asset{editor.assets.length === 1 ? '' : 's'} · {clipCount} clip{clipCount ===
 			1
 				? ''
@@ -139,7 +139,7 @@
 	<span style="width:1px;height:12px;background:var(--border-default)"></span>
 	<span
 		title={editor.currentPath ?? 'In-memory project — not yet saved'}
-		style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);max-width:min(320px,40vw);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+		style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted);max-width:min(320px,40vw);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 		>{editor.currentPath ?? 'local · in-memory'}</span
 	>
 	{#if showLogs}
@@ -149,7 +149,7 @@
 			title="Open the log folder — attach kerf.<date>.log when reporting an issue"
 			onclick={() =>
 				revealLogs().catch((e) => toast.error(e instanceof Error ? e.message : String(e)))}
-			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-disabled);font-size:10px;padding:0"
+			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);padding:0"
 		>
 			<Icon n="folder-open" s={11} />
 			Logs

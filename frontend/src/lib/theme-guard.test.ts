@@ -130,6 +130,49 @@ describe('color literals', () => {
 	});
 });
 
+// ---- 1b. the disabled color --------------------------------------------------
+
+/** The only files that draw in `text-disabled`, and what for. It is the color of what is *off*
+ *  — a greyed menu row, a disabled button — and it is dimmer than anything people are meant to
+ *  read: 3.3:1 on a panel. The status bar, every explanatory paragraph and the idle S / L / DUCK
+ *  toggles used it, which is how the Settings gear came to be the dimmest thing in the window.
+ *  Text people read is `text-muted` (4.5:1 or better) and a toggle that is live but idle is
+ *  `text-muted` too. Paths are relative to `src/`. */
+const DISABLED_INK_ALLOWED: Record<string, string> = {
+	'lib/styles/kerf-tokens.css': 'the token stylesheet',
+	'lib/styles/controls.css': 'the label of a disabled Btn / IconBtn',
+	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
+	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
+	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
+	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text',
+	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
+};
+
+describe('the disabled color', () => {
+	test('only what is off is drawn in it', () => {
+		const offenders: string[] = [];
+		for (const file of uiSources(SRC).map(posix)) {
+			if (file in DISABLED_INK_ALLOWED) continue;
+			const code = withoutComments(readFileSync(join(SRC, file), 'utf8'));
+			for (const m of code.matchAll(/--text-disabled/g)) {
+				offenders.push(`${file}:${code.slice(0, m.index).split('\n').length}  — text people read is text-muted`);
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	test('every exception is still needed', () => {
+		for (const file of Object.keys(DISABLED_INK_ALLOWED)) {
+			const path = join(SRC, file);
+			expect(existsSync(path), `${file} no longer exists — drop it from DISABLED_INK_ALLOWED`).toBe(true);
+			expect(
+				readFileSync(path, 'utf8').includes('--text-disabled'),
+				`${file} no longer uses it — drop it from DISABLED_INK_ALLOWED`
+			).toBe(true);
+		}
+	});
+});
+
 // ---- 2. contrast ------------------------------------------------------------
 //
 // WCAG 2.x contrast ratios between the opaque tokens of a preset, for the pairs
@@ -144,7 +187,7 @@ describe('color literals', () => {
 //   SECONDARY (3:1)  What is not body text: text-muted on the hover / active
 //     states, accent and status hues used as text or icon colour on the
 //     panels, the amber chips that carry text-on-accent (the S / L flags), the
-//     idle state of live toggles (text-disabled — see below), and the strokes and
+//     label of a disabled control (text-disabled — see below), and the strokes and
 //     marks that carry meaning — clip edges and the playhead / selection amber
 //     against the lane, the waveform against its clip, the drag ghost.
 //   COMPOSITES  Fills the stylesheet builds with color-mix, resolved per preset
@@ -156,11 +199,11 @@ describe('color literals', () => {
 //
 // Not checked, on purpose:
 //   - text-disabled on a *disabled* control: inactive components are exempt from
-//     WCAG contrast. But the UI also draws the idle state of controls that are
-//     live — the DUCK / S / L toggles, the notification bell, 56 uses — in
-//     text-disabled, and an idle toggle is not disabled, so it is held to 3:1 on
-//     the resting surfaces (it is still required to read dimmer than text-muted,
-//     below).
+//     WCAG contrast. It is still held to 3:1 on the resting surfaces so a greyed
+//     label can be found, and required to read dimmer than text-muted (below).
+//     It is no longer the colour of anything live — the DUCK / S / L toggles, the
+//     bell and the status bar were drawn in it — and the scan in "the disabled
+//     color" keeps it that way.
 //   - Translucent hairlines (border-*, timeline grid, scrims): they are derived in
 //     the stylesheet by color-mix, so they are not a pair of opaque tokens; they
 //     separate rather than identify.
@@ -197,7 +240,7 @@ const PAIRS: Pair[] = [
 	...cross(['text-inverted'], ['text-primary'], READING, 'inverted label on a text-colored fill'),
 	// Secondary text, status hues and the marks that carry meaning.
 	...cross(['text-muted'], STATES, SECONDARY, 'muted text on a hover / active state'),
-	...cross(['text-disabled'], RESTING, SECONDARY, 'idle state of a live toggle (DUCK / S / L, the bell)'),
+	...cross(['text-disabled'], RESTING, SECONDARY, 'a disabled control\'s label stays findable'),
 	...cross(
 		['kerf-300', 'kerf-400', 'agent-300', 'agent-400', 'green-400', 'red-400', 'orange-400', 'green-500', 'orange-500', 'red-500'],
 		PANELS,

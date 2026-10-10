@@ -226,13 +226,13 @@
 					</p>
 
 					{#if percent < 100}
-						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 							Below 100%, background work also runs at lower scheduling priority, so the window you are
 							looking at always wins a core when it wants one.
 						</p>
 					{/if}
 
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						A job already running keeps the cores it started with — FFmpeg cannot be told otherwise
 						mid-render. The next one picks this up.
 					</p>
@@ -279,7 +279,7 @@
 							</label>
 						{/each}
 					</div>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
 						runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
 					</p>
@@ -297,7 +297,7 @@
 							>Analysis</button
 						>.
 					</p>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						{settings.autoAnalysis.transcript
 							? 'Transcription is on for new imports.'
 							: 'Transcription is off for new imports: the Transcript tab and captions have nothing to work from until you transcribe a clip by hand (right-click it in the bin, Analyze).'}
@@ -340,7 +340,7 @@
 							</div>
 						</div>
 					{/if}
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.
 						Without this it downloads the first time you generate one.
 					</p>
@@ -364,7 +364,7 @@
 							>
 						{/each}
 					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						{PROXY_SIZES.find((p) => p.size === settings.proxySize)?.hint} Pixels across; 360 footage keeps its larger
 						ratio. A proxy made at another size stays on disk until you delete it from the bin.
 					</p>
@@ -389,7 +389,7 @@
 							>
 						{/each}
 					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						{settings.proxySize === 0
 							? 'Proxies are off, so the preview decodes the original.'
 							: PREVIEW_SOURCES.find((p) => p.source === settings.previewSource)?.hint}
@@ -416,7 +416,7 @@
 							</span>
 						</span>
 					</label>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
 						toggles the same setting.
 					</p>
@@ -463,7 +463,7 @@
 						</p>
 					{/if}
 					{#if gpuStatus?.supported && gpuStatus.technique === 'child'}
-						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 							On this platform the surface is a window over the preview, so a frame with a title box, the trim
 							monitor or safe-area guides on it is FFmpeg's.
 						</p>
@@ -499,7 +499,7 @@
 							>Light</button
 						>
 					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-disabled)">
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
 						Every color and line the editor draws with. Changing one makes the theme custom; a theme exports
 						as a JSON file you can share or bring back with Import.
 					</p>
@@ -556,7 +556,7 @@
 										style="width:26px;height:20px;padding:0;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
 									/>
 									<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{t.label}</span>
-									<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-disabled)"
+									<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
 										>{settings.theme.colors[t.name]}</span
 									>
 								</label>

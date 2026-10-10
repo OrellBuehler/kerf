@@ -252,7 +252,7 @@
 				<Btn variant="ghost" size="sm" data-autofocus onclick={keepShortcuts}>Keep</Btn>
 			</div>
 		{:else}
-			<p style="margin:0;font-size:12px;line-height:1.5;min-height:30px;color:var(--text-disabled)">
+			<p style="margin:0;font-size:12px;line-height:1.5;min-height:30px;color:var(--text-muted)">
 				Click a shortcut, then press the keys you want. Esc cancels; Backspace removes it.
 			</p>
 		{/if}
@@ -287,7 +287,7 @@
 									{/if}
 								</span>
 								{#if a.hint}
-									<span style="font-size:11px;line-height:1.4;color:var(--text-disabled)">{a.hint}</span>
+									<span style="font-size:11px;line-height:1.4;color:var(--text-muted)">{a.hint}</span>
 								{/if}
 							</div>
 
@@ -327,7 +327,7 @@
 										data-key-row={a.id}
 										onclick={() => startRecording(a.id, null)}
 										aria-label="{a.label} has no shortcut. Assign one"
-										style="{chip()};border-style:dashed;color:var(--text-disabled)">Unassigned</button
+										style="{chip()};border-style:dashed;color:var(--text-muted)">Unassigned</button
 									>
 								{:else}
 									<button
@@ -408,7 +408,7 @@
 			>
 				Always the same
 			</div>
-			<p style="margin:4px 0 6px;font-size:12px;line-height:1.5;color:var(--text-disabled)">
+			<p style="margin:4px 0 6px;font-size:12px;line-height:1.5;color:var(--text-muted)">
 				These work the same everywhere and cannot be changed.
 			</p>
 			<ul style="list-style:none;margin:0;padding:0">

@@ -75,7 +75,7 @@
 	<div style="flex:1;overflow-y:auto;padding:12px">
 	{#if txLines.length === 0}
 		<div
-			style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-disabled);text-align:center"
+			style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-muted);text-align:center"
 		>
 			<Icon n="captions" s={22} />
 			<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
@@ -142,18 +142,18 @@
 						onclick={() => seekLine(l)}
 						disabled={!l.clip}
 						title={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
-						style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;cursor:{l.clip
+						style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;opacity:1;cursor:{l.clip
 							? 'pointer'
 							: 'default'}"
 					>
 						<span
-							style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);flex:none;padding-top:1px"
+							style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted);flex:none;padding-top:1px"
 							>{l.t}</span
 						>
 						<span
 							style="font-size:12px;line-height:1.45;color:{l.clip
 								? 'var(--text-secondary)'
-								: 'var(--text-disabled)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
+								: 'var(--text-muted)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
 						>
 					</button>
 					{#if l.clip}
@@ -161,7 +161,7 @@
 							title="Cut this line out of the timeline"
 							aria-label="Cut line"
 							onclick={() => void cutLine(l)}
-							style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:1px 0 0"
+							style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:1px 0 0"
 							><Icon n="x" s={11} /></button
 						>
 					{/if}

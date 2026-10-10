@@ -77,7 +77,7 @@
 			<Icon n="bell" s={14} color="var(--text-secondary)" />
 			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary)">Notifications</span>
 			{#if notifications.unread}
-				<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)"
+				<span style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted)"
 					>{notifications.unread} unread</span
 				>
 			{/if}
@@ -120,10 +120,10 @@
 		<div style="flex:1;overflow-y:auto;min-height:0">
 			{#if shown.length === 0}
 				<div
-					style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 16px;color:var(--text-disabled);text-align:center"
+					style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 16px;color:var(--text-muted);text-align:center"
 				>
 					<Icon n="bell" s={20} />
-					<span style="font-size:11.5px"
+					<span style="font-size:var(--text-sm)"
 						>{notifications.items.length === 0
 							? 'Nothing has been reported yet.'
 							: filter === 'unread'
@@ -148,7 +148,7 @@
 							>
 							<span
 								title={clock(n)}
-								style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{age(n)}</span
+								style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted)">{age(n)}</span
 							>
 						</div>
 						<button
@@ -169,7 +169,7 @@
 							onclick={() => notifications.remove(n.id)}
 							title="Remove"
 							aria-label="Remove"
-							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-disabled)"
+							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
 						>
 							<Icon n="x" s={12} color="currentColor" />
 						</button>

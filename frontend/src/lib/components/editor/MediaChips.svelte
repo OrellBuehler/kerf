@@ -55,7 +55,7 @@
 					data-testid="analysis-chip"
 					data-kind={chip.kind}
 					data-state={chip.state}
-					style="display:inline-flex;align-items:center;gap:2px;height:17px;padding:0 4px;border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:9px;font-weight:600;letter-spacing:0.02em;line-height:1;{LOOK[
+					style="display:inline-flex;align-items:center;gap:2px;height:17px;padding:0 4px;border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:var(--text-2xs);font-weight:600;letter-spacing:0.02em;line-height:1;{LOOK[
 						chip.state
 					]}"
 				>

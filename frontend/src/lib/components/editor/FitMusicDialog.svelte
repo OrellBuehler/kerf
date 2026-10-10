@@ -196,7 +196,7 @@
 				{:else if problem}
 					<span style="grid-column:1 / -1;font-size:12px;line-height:1.4;color:var(--text-muted)">{problem}</span>
 				{:else}
-					<span style="grid-column:1 / -1;font-size:12px;color:var(--text-disabled)">Planning…</span>
+					<span style="grid-column:1 / -1;font-size:12px;color:var(--text-muted)">Planning…</span>
 				{/if}
 			</div>
 
@@ -216,7 +216,7 @@
 				/>
 				<span style="font-size:12px;color:var(--text-secondary)">Fade out at the end</span>
 				{#if fit && !overruns}
-					<span style="font-size:11px;color:var(--text-disabled)">— nothing runs over</span>
+					<span style="font-size:11px;color:var(--text-muted)">— nothing runs over</span>
 				{/if}
 			</label>
 

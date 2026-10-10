@@ -426,14 +426,14 @@
 							</div>
 							{#if spec}
 								<div
-									style="font-size:12px;color:var(--text-muted);margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
+									style="font-size:12px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'};margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
 									title={spec}
 								>
 									{spec}
 								</div>
 							{/if}
 							<div style="display:flex;gap:5px;align-items:center;margin-top:4px;flex-wrap:wrap">
-								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
+								<span style="font-family:var(--font-mono);font-size:11px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'}"
 									>{a.info.duration}</span
 								>
 								{#if a.info.projection}

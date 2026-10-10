@@ -1177,7 +1177,7 @@
 			</div>
 		{:else}
 			<div
-				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-disabled);text-align:center"
+				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-muted);text-align:center"
 			>
 				<Icon n="sliders-horizontal" s={22} />
 				<span style="font-size:12px">Select a clip or a title to inspect it</span>
