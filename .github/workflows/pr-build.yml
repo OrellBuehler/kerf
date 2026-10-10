@@ -50,7 +50,7 @@ jobs:
         include:
           - name: windows-x64
             platform: windows-latest
-            config: '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false,"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/fonts-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
+            config: '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false,"externalBin":["binaries/ffmpeg","binaries/ffprobe"],"resources":["licenses/whisper.cpp-NOTICE.md","licenses/misaki-rs-NOTICE.md","licenses/fonts-NOTICE.md","licenses/FFmpeg-NOTICE.md","licenses/FFmpeg-LICENSE.txt"]}}'
             bundleFfmpeg: true
             # NSIS only: the .msi is the same app through a slower WiX build.
             bundles: nsis
