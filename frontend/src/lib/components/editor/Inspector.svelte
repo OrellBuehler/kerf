@@ -702,11 +702,11 @@
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
-					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
-						? 'var(--track-audio)'
-						: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
+					style="width:40px;height:28px;border-radius:3px;flex:none;background:{picture
+						? VIDEO_THUMB_BG
+						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
-					<Icon n={kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
+					<Icon n={picture ? 'video' : 'audio-waveform'} s={14} />
 				</div>
 				<div style="flex:1;min-width:0">
 					<div
@@ -716,7 +716,7 @@
 						{asset?.name ?? 'clip'}
 					</div>
 					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
-						<Badge tone="neutral">{track?.name ?? (kind === 'audio' ? 'audio' : 'video')}</Badge>
+						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
 						{#if linkedTo.length > 0}
 							<span title={linkInfo?.title}>
 								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
