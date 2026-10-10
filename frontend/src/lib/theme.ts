@@ -20,6 +20,7 @@ export const COLOR_GROUPS = [
 			{ name: 'surface-active', label: 'Active' },
 			{ name: 'input', label: 'Input' },
 			{ name: 'scrim', label: 'Scrim' },
+			{ name: 'shadow-color', label: 'Shadow' },
 			{ name: 'border-base', label: 'Border' },
 			{ name: 'scrollbar-thumb', label: 'Scrollbar' },
 			{ name: 'scrollbar-thumb-hover', label: 'Scrollbar hover' }
@@ -93,12 +94,16 @@ export type ColorToken = (typeof COLOR_GROUPS)[number]['tokens'][number]['name']
 export const COLOR_TOKENS: readonly ColorToken[] = COLOR_GROUPS.flatMap((g) => g.tokens.map((t) => t.name));
 
 export const SHAPE_TOKENS = [
-	{ name: 'line-width', label: 'Line thickness', hint: 'Panel dividers, borders, clip edges, ruler ticks', min: 0.5, max: 3, step: 0.5, def: 1 },
-	{ name: 'line-emphasis', label: 'Selection thickness', hint: 'The selected clip outline', min: 1, max: 4, step: 0.5, def: 1.5 },
-	{ name: 'playhead-width', label: 'Playhead thickness', hint: 'The cut line', min: 1, max: 6, step: 1, def: 2 },
-	{ name: 'slider-track', label: 'Slider track', hint: 'Thickness of every slider track', min: 1, max: 10, step: 1, def: 4 },
-	{ name: 'slider-track-radius', label: 'Track corners', hint: 'Rounding of the track ends', min: 0, max: 5, step: 1, def: 2 },
-	{ name: 'slider-thumb', label: 'Slider thumb', hint: 'Size of the slider handle', min: 8, max: 24, step: 1, def: 14 }
+	{ name: 'line-width', label: 'Line thickness', hint: 'Panel dividers, borders, clip edges, ruler ticks', min: 0.5, max: 3, step: 0.5, def: 1, unit: 'px' },
+	{ name: 'line-emphasis', label: 'Selection thickness', hint: 'The selected clip outline', min: 1, max: 4, step: 0.5, def: 1.5, unit: 'px' },
+	{ name: 'playhead-width', label: 'Playhead thickness', hint: 'The cut line', min: 1, max: 6, step: 1, def: 2, unit: 'px' },
+	{ name: 'slider-track', label: 'Slider track', hint: 'Thickness of every slider track', min: 1, max: 10, step: 1, def: 4, unit: 'px' },
+	{ name: 'slider-track-radius', label: 'Track corners', hint: 'Rounding of the track ends', min: 0, max: 5, step: 1, def: 2, unit: 'px' },
+	{ name: 'slider-thumb', label: 'Slider thumb', hint: 'Size of the slider handle', min: 8, max: 24, step: 1, def: 14, unit: 'px' },
+	{ name: 'border-alpha-subtle', label: 'Faint borders', hint: 'How opaque the faintest dividers are', min: 0, max: 100, step: 1, def: 6, unit: '%' },
+	{ name: 'border-alpha-default', label: 'Borders', hint: 'How opaque panel borders and dividers are', min: 0, max: 100, step: 1, def: 10, unit: '%' },
+	{ name: 'border-alpha-strong', label: 'Strong borders', hint: 'How opaque the outlines of buttons, chips, inputs and menus are', min: 0, max: 100, step: 1, def: 16, unit: '%' },
+	{ name: 'shadow-strength', label: 'Shadow strength', hint: 'How dark the shadows of menus, dialogs and the preview frame are', min: 0, max: 150, step: 5, def: 100, unit: '%' }
 ] as const;
 
 export type ShapeToken = (typeof SHAPE_TOKENS)[number]['name'];
@@ -140,6 +145,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'surface-active': '#2c3540',
 			input: '#10151b',
 			scrim: '#000000',
+			'shadow-color': '#000000',
 			'border-base': '#ffffff',
 			'scrollbar-thumb': '#2c3540',
 			'scrollbar-thumb-hover': '#36404c',
@@ -197,6 +203,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'surface-active': '#d3d9e0',
 			input: '#ffffff',
 			scrim: '#000000',
+			'shadow-color': '#141e32',
 			'border-base': '#000000',
 			'scrollbar-thumb': '#c2c9d1',
 			'scrollbar-thumb-hover': '#a9b2bd',
@@ -214,18 +221,18 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'kerf-600': '#e29d2e',
 			'kerf-700': '#eab14e',
 			'agent-200': '#0b4a54',
-			'agent-300': '#126f80',
+			'agent-300': '#116b7b',
 			'agent-400': '#1894a6',
 			'agent-500': '#1a9fb0',
 			'agent-600': '#22b4c4',
 			'agent-700': '#3fcdd4',
 			'agent-fg': '#04181c',
-			'green-400': '#1f8f60',
+			'green-400': '#186d49',
 			'green-500': '#1c9a68',
-			'red-400': '#c8362a',
+			'red-400': '#a62d23',
 			'red-500': '#e4452f',
 			'red-600': '#b32d1e',
-			'orange-400': '#c46b0c',
+			'orange-400': '#8f4e09',
 			'orange-500': '#c76f0a',
 			'track-bg': '#eceff2',
 			'track-video': '#3b6d8c',
@@ -238,7 +245,13 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'drag-ghost': '#4a5fd6',
 			'frame-matte': '#000000'
 		},
-		shape: { ...DEFAULT_SHAPE }
+		shape: {
+			...DEFAULT_SHAPE,
+			'border-alpha-subtle': 8,
+			'border-alpha-default': 14,
+			'border-alpha-strong': 22,
+			'shadow-strength': 30
+		}
 	},
 	'high-contrast': {
 		name: 'High contrast',
@@ -254,6 +267,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'surface-active': '#3a3a3a',
 			input: '#050505',
 			scrim: '#000000',
+			'shadow-color': '#000000',
 			'border-base': '#ffffff',
 			'scrollbar-thumb': '#4d4d4d',
 			'scrollbar-thumb-hover': '#666666',
@@ -301,7 +315,10 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'line-emphasis': 3,
 			'playhead-width': 3,
 			'slider-track': 6,
-			'slider-thumb': 16
+			'slider-thumb': 16,
+			'border-alpha-subtle': 30,
+			'border-alpha-default': 45,
+			'border-alpha-strong': 70
 		}
 	}
 };
@@ -325,6 +342,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'surface-active': '#d3d9e0',
 		input: '#ffffff',
 		scrim: '#000000',
+		'shadow-color': '#141e32',
 		'border-base': '#000000',
 		'scrollbar-thumb': '#c2c9d1',
 		'scrollbar-thumb-hover': '#a9b2bd',
@@ -377,6 +395,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'surface-active': '#d3d9e0',
 		input: '#ffffff',
 		scrim: '#000000',
+		'shadow-color': '#141e32',
 		'border-base': '#000000',
 		'scrollbar-thumb': '#c2c9d1',
 		'scrollbar-thumb-hover': '#a9b2bd',
@@ -384,6 +403,60 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'text-secondary': '#3f4956',
 		'text-muted': '#5a6776',
 		'text-disabled': '#97a3b2',
+		'text-on-accent': '#1a1205',
+		'text-inverted': '#ffffff',
+		'text-on-video': '#ffffff',
+		'kerf-200': '#7a4f0e',
+		'kerf-300': '#9a6413',
+		'kerf-400': '#a96d11',
+		'kerf-500': '#b8770f',
+		'kerf-600': '#e29d2e',
+		'kerf-700': '#eab14e',
+		'agent-200': '#0b4a54',
+		'agent-300': '#126f80',
+		'agent-400': '#1894a6',
+		'agent-500': '#1a9fb0',
+		'agent-600': '#22b4c4',
+		'agent-700': '#3fcdd4',
+		'agent-fg': '#04181c',
+		'green-400': '#1f8f60',
+		'green-500': '#1c9a68',
+		'red-400': '#c8362a',
+		'red-500': '#e4452f',
+		'red-600': '#b32d1e',
+		'orange-400': '#c46b0c',
+		'orange-500': '#c76f0a',
+		'track-bg': '#eceff2',
+		'track-video': '#3b6d8c',
+		'track-video-edge': '#3f7ea3',
+		'track-audio': '#2f6f56',
+		'track-audio-edge': '#2f7d5e',
+		'track-text': '#5d4180',
+		'track-text-edge': '#7b56a0',
+		waveform: '#a8ecca',
+		'drag-ghost': '#4a5fd6',
+		'frame-matte': '#000000'
+	},
+	// As shipped in v0.24.0, before the tinted-surface contrast pass darkened the light
+	// status hues the badges and chips draw as text.
+	{
+		'surface-void': '#e2e6ea',
+		'surface-app': '#f2f4f6',
+		'surface-panel': '#ffffff',
+		'surface-raised': '#f6f8fa',
+		'surface-inset': '#e9edf1',
+		'surface-hover': '#e4e8ed',
+		'surface-active': '#d3d9e0',
+		input: '#ffffff',
+		scrim: '#000000',
+		'shadow-color': '#141e32',
+		'border-base': '#000000',
+		'scrollbar-thumb': '#c2c9d1',
+		'scrollbar-thumb-hover': '#a9b2bd',
+		'text-primary': '#14181e',
+		'text-secondary': '#3f4956',
+		'text-muted': '#5a6776',
+		'text-disabled': '#76828f',
 		'text-on-accent': '#1a1205',
 		'text-inverted': '#ffffff',
 		'text-on-video': '#ffffff',
@@ -449,6 +522,16 @@ export function presetIdFor(theme: Theme): PresetId | 'custom' {
 	return 'custom';
 }
 
+/** The shape a theme with these colors takes for values it does not carry: that of the preset
+ *  whose colors they are exactly (a High contrast saved before the border and shadow values
+ *  existed is still High contrast), else the scheme's own. */
+function shapeBase(scheme: Scheme, colors: Record<ColorToken, string>): Shape {
+	const same = PRESET_IDS.find(
+		(id) => PRESETS[id].scheme === scheme && COLOR_TOKENS.every((t) => PRESETS[id].colors[t] === colors[t].toLowerCase())
+	);
+	return PRESETS[same ?? (scheme === 'light' ? 'kerf-light' : 'kerf-dark')].shape;
+}
+
 /** A theme from stored or imported JSON, or `null` when it is not one.
  *  Unknown tokens are dropped and missing ones filled from the scheme's
  *  preset, so a file from a build with fewer tokens still applies. */
@@ -471,7 +554,7 @@ export function parseTheme(raw: unknown): Theme | null {
 		if (typeof v !== 'string' || !HEX.test(v)) return null;
 		colors[t] = v.toLowerCase();
 	}
-	const baseShape = PRESETS[r.scheme === 'light' ? 'kerf-light' : 'kerf-dark'].shape;
+	const baseShape = shapeBase(r.scheme, colors);
 	const gs = typeof r.shape === 'object' && r.shape !== null && !Array.isArray(r.shape) ? (r.shape as Record<string, unknown>) : {};
 	const shape = { ...baseShape };
 	for (const t of SHAPE_NAMES) {
@@ -502,7 +585,7 @@ export function shapeProps(shape: Shape): Record<string, string> {
 	const size = shape['slider-thumb'];
 	const bar = shape['slider-thumb-style'] === 'bar';
 	const props: Record<string, string> = {};
-	for (const t of SHAPE_NAMES) props[`--${t}`] = `${shape[t]}px`;
+	for (const t of SHAPE_TOKENS) props[`--${t.name}`] = `${shape[t.name]}${t.unit}`;
 	props['--slider-thumb-w'] = `${bar ? Math.max(4, Math.round(size * 0.4)) : size}px`;
 	props['--slider-thumb-radius'] = bar ? '2px' : '999px';
 	return props;

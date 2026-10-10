@@ -2003,7 +2003,7 @@
 			<span
 				data-alt-chip
 				title={ALT_HINT}
-				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--warning);background:var(--warning-surface)"
+				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--orange-400);background:var(--warning-surface)"
 				><Icon n="unlink" s={10} />links off</span
 			>
 		{/if}

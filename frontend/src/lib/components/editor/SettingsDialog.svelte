@@ -507,7 +507,7 @@
 					<div
 						style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
 					>
-						Lines and sliders
+						Lines, shadows and sliders
 					</div>
 					<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
 						{#each SHAPE_TOKENS as t (t.name)}
@@ -524,7 +524,7 @@
 									style="flex:1;min-width:0"
 								/>
 								<span style="flex:none;width:44px;text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--text-primary)"
-									>{settings.theme.shape[t.name]}px</span
+									>{settings.theme.shape[t.name]}{t.unit}</span
 								>
 							</label>
 						{/each}

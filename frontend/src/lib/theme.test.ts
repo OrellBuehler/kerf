@@ -119,6 +119,42 @@ describe('shape', () => {
 		expect(p['--slider-thumb-radius']).toBe('2px');
 	});
 
+	test('lengths are px, the border weights and shadow strength are percentages', () => {
+		const p = shapeProps(PRESETS['high-contrast'].shape);
+		expect(p['--line-width']).toBe('1.5px');
+		expect(p['--border-alpha-subtle']).toBe('30%');
+		expect(p['--border-alpha-default']).toBe('45%');
+		expect(p['--border-alpha-strong']).toBe('70%');
+		expect(p['--shadow-strength']).toBe('100%');
+		expect(shapeProps(PRESETS['kerf-light'].shape)['--shadow-strength']).toBe('30%');
+	});
+
+	test('border weights and shadow strength are held to their ranges and steps', () => {
+		const out = parseTheme({ ...base, shape: { 'border-alpha-strong': 140, 'border-alpha-subtle': 7.4, 'shadow-strength': 62 } })!;
+		expect(out.shape['border-alpha-strong']).toBe(100);
+		expect(out.shape['border-alpha-subtle']).toBe(7);
+		expect(out.shape['shadow-strength']).toBe(60);
+	});
+
+	test('a High contrast stored before the border and shadow values existed is still High contrast', () => {
+		const hc = PRESETS['high-contrast'];
+		const stored = JSON.parse(JSON.stringify(hc));
+		for (const k of ['border-alpha-subtle', 'border-alpha-default', 'border-alpha-strong', 'shadow-strength']) delete stored.shape[k];
+		delete stored.colors['shadow-color'];
+		const out = parseTheme(stored)!;
+		expect(out).toEqual(hc);
+		expect(presetIdFor(out)).toBe('high-contrast');
+	});
+
+	test('an edited theme takes the scheme\'s own border and shadow values, not another preset\'s', () => {
+		const hc = PRESETS['high-contrast'];
+		const stored = JSON.parse(JSON.stringify({ ...hc, colors: { ...hc.colors, waveform: '#123456' } }));
+		for (const k of ['border-alpha-subtle', 'border-alpha-default', 'border-alpha-strong', 'shadow-strength']) delete stored.shape[k];
+		const out = parseTheme(stored)!;
+		expect(out.shape['border-alpha-default']).toBe(PRESETS['kerf-dark'].shape['border-alpha-default']);
+		expect(out.shape['line-width']).toBe(hc.shape['line-width']);
+	});
+
 	test('one changed shape value makes a theme custom', () => {
 		expect(presetIdFor({ ...base, shape: { ...base.shape, 'slider-thumb': 20 } })).toBe('custom');
 		expect(presetIdFor({ ...base, shape: { ...base.shape, 'slider-thumb-style': 'bar' } })).toBe('custom');

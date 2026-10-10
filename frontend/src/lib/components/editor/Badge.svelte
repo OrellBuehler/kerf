@@ -15,7 +15,7 @@
 
 	const tones = {
 		neutral: { fg: 'var(--text-secondary)', bg: 'var(--surface-hover)' },
-		kerf: { fg: 'var(--kerf-300)', bg: 'var(--selection-fill)' },
+		kerf: { fg: 'var(--kerf-200)', bg: 'var(--selection-fill)' },
 		agent: { fg: 'var(--agent-300)', bg: 'var(--agent-surface)' },
 		success: { fg: 'var(--green-400)', bg: 'var(--success-surface)' },
 		warning: { fg: 'var(--orange-400)', bg: 'var(--warning-surface)' },
