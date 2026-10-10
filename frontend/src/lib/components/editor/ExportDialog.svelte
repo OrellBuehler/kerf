@@ -24,7 +24,7 @@
 		GIF_DITHERS,
 		FITS,
 		RESOLUTIONS,
-		FRAME_RATES,
+		frameRateOptions,
 		applyPreset,
 		containerInfo,
 		isHwCodec,
@@ -423,7 +423,7 @@
 				{@render selectRow(
 					'Frame rate',
 					opts.fps ? String(opts.fps) : 'source',
-					FRAME_RATES.map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
+					frameRateOptions(opts.fps).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
 					(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
 				)}
 				{#if qualityOptions.length}
