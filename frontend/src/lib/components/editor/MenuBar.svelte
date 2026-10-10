@@ -93,9 +93,10 @@
 	let bar = $state<HTMLElement | null>(null);
 	/** Where focus was before the bar took it, to give back when it lets go. */
 	let returnTo: HTMLElement | null = null;
-	/** Keys, not the pointer, are driving the bar. Its tab stop is then where focus goes back to
-	 *  when a dialog a menu entry opened closes and nothing else had it (`modal.ts`) — for a
-	 *  pointer user focus stays off the bar, or Space would open a menu instead of playing. */
+	/** A menu entry that opened a dialog was run from the keyboard. The bar's tab stop is then where focus goes back to
+	 *  when the dialog it opened closes and nothing else had it (`modal.ts`) — for anyone else
+	 *  focus stays off the bar, or Space would open a menu instead of playing. It lasts only until
+	 *  the user moves on: a pointer press, Tab, or focus given back (Escape, a chord). */
 	let byKeys = $state(false);
 	let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 	/** The title the pointer opened by arriving on it while another menu was open. A
@@ -137,6 +138,7 @@
 	}
 
 	function giveBackFocus() {
+		byKeys = false;
 		const to = returnTo;
 		returnTo = null;
 		if (to && to.isConnected && !to.hasAttribute('inert')) to.focus();
@@ -172,12 +174,14 @@
 		if (focusFirst && first !== undefined) void focusPath([...path, first]);
 	}
 
-	function run(e: MenuEntry) {
+	function run(e: MenuEntry, keys = false) {
 		if (e.kind === 'separator' || e.kind === 'submenu') return;
 		if ('disabled' in e && e.disabled) return;
 		closeAll(true);
 		if (e.kind === 'action') onAction(e.id);
 		else onCommand(e.command);
+		// Only a command that opened a dialog has a focus to give back later.
+		byKeys = keys && modal;
 	}
 
 	// ---- pointer -----------------------------------------------------------------
@@ -262,7 +266,6 @@
 		}
 		const path = pathOf(e.target);
 		if (!path) return;
-		byKeys = true;
 		const handled = () => {
 			e.preventDefault();
 			e.stopPropagation();
@@ -274,12 +277,14 @@
 		const k = e.key;
 
 		if (k === 'Tab') {
+			byKeys = false;
 			closeAll();
 			return;
 		}
 		if (k === 'Escape') {
 			handled();
 			if (top) {
+				byKeys = false;
 				if (open.length > 0) {
 					closeAll();
 					el(path)?.focus();
@@ -351,7 +356,7 @@
 			handled();
 			if (!entry) return;
 			if (entry.kind === 'submenu') openSub(path, true);
-			else run(entry);
+			else run(entry, true);
 		} else if (k.length === 1 && /\S/.test(k)) {
 			// A letter belongs to the menu while one is open: it jumps, or does nothing,
 			// but is never the razor tool.
@@ -367,7 +372,6 @@
 
 	/** Alt / F10: the bar's first title takes focus, as in every menu bar. */
 	function focusBar() {
-		byKeys = true;
 		noteReturn();
 		active = 0;
 		void focusPath([0]);
