@@ -354,7 +354,8 @@ as the export's `if(lt(t,..))` does — but the timeline's volume line and
 waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
-shot already matches the frame or is 360), a **Mask** section (pictures only; None / Rectangle /
+shot already matches the frame or is 360), a **Mask** section (pictures only — as is every picture section, Transform to Animation: `picture` is a
+picture asset *on a picture track*, so the sound half of a linked pair has none; None / Rectangle /
 Ellipse chips, then centre / size / feather / invert; picking a shape starts from
 a visible default rather than a collapsed one, and the caption carries the recipe
 the shape alone does not suggest — a lower track shows through, so a blurred face
@@ -438,7 +439,8 @@ target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), 
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
 The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
 dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —
-a remembered 9:16 preset must not open on a 16:9 cut), and a click on the scrim does not close the
+a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.projectReplaced()` when a
+project is opened or created), and a click on the scrim does not close the
 dialog (Esc, Cancel and ✕ do). The frame-rate select is `frameRateOptions(fps)`: `FRAME_RATES`
 (15 / 12 / 10 are the GIF's) plus the current value when the list lacks it, never a blank select.
 The **readiness panel** stays visible
@@ -611,8 +613,9 @@ swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks 
 the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
 not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is
 gone (the menu entry that opened the dialog) to the menu bar's tab stop (`data-focus-return`) **when
-keys were driving the bar** — a pointer user is left on `body`, since a focused menu title would take
-Space from play / pause. **A scrim click never loses typed input**: Export ignores it (its options
+a menu entry that opened a dialog was run from the keyboard** — anyone else is left on `body`, since
+a focused menu title would take Space from play / pause. The bar's `byKeys` ends with a pointer press,
+Tab, or focus given back (Escape, a chord), so it cannot leak into a later dialog a shortcut opens. **A scrim click never loses typed input**: Export ignores it (its options
 come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
 script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
 regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
@@ -724,8 +727,9 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
 **Restart now** — which warns first when the project has unsaved changes; a failed *check* is titled
-"Couldn't check for updates", never "up to date", and the AppImage fallback note shows only for a failed
-install on Linux — `update-copy.ts`); the
+"Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
+*Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux
+(`isLinux`, `keymap.ts`) — `update-copy.ts`); the
 dialog auto-opens the first time a given version is seen (remembered under
 `kerf.update.seen` in localStorage) so declining doesn't nag every launch. The
 `Update` handle the plugin returns stays module-local in `api.ts`, which hands the

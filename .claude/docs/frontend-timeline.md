@@ -147,7 +147,7 @@ razor, roll / slip / slide, and the menu's *Remove only this clip*. The context 
 hand on each right-click, so `menu-items.ts` (pure) keeps them honest: `tidyMenu` (run by `contextMenu.show`)
 collapses doubled and edge separators when an optional group is missing, `muteItem` is the track menu's
 eye-or-speaker row by track kind, `removeRows` the clip menu's delete rows (an icon each; the
-*only this clip* pair has none, under a rule of its own). A drag's plan is a `$derived` of the
+*only this clip* pair has none, and no rule of its own: the menu is no taller for them). A drag's plan is a `$derived` of the
 pointer, the cut and Alt (`planMove` with `{links}`): dragged clips take the lane offset, their partners
 are **carried by the same Δt on their own track** (`withLinkedMoves`' rule; the grabbed clip's own
 partners are never lane-shifted even when selected) and checked with the group — a locked partner or
