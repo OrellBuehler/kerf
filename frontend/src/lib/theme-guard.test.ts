@@ -240,6 +240,7 @@ const PAIRS: Pair[] = [
 	...cross(['text-inverted'], ['text-primary'], READING, 'inverted label on a text-colored fill'),
 	// Secondary text, status hues and the marks that carry meaning.
 	...cross(['text-muted'], STATES, SECONDARY, 'muted text on a hover / active state'),
+	...cross(['kerf-300'], ['surface-hover'], READING, 'amber text on a hovered or selected row (the bin, the inspector)'),
 	...cross(['text-disabled'], RESTING, SECONDARY, 'a disabled control\'s label stays findable'),
 	...cross(
 		['kerf-300', 'kerf-400', 'agent-300', 'agent-400', 'green-400', 'red-400', 'orange-400', 'green-500', 'orange-500', 'red-500'],
@@ -334,6 +335,8 @@ describe('contrast', () => {
 		tint: Tint;
 		min: number;
 		what: string;
+		/** What it sits on; the three panels and the hover surface unless it says otherwise. */
+		on?: ColorToken[];
 	}
 
 	/** What a tint is once it sits on a surface. */
@@ -345,6 +348,9 @@ describe('contrast', () => {
 		{ fg: 'red-400', tint: tintOf('danger-surface'), min: READING, what: 'danger badge, failed analysis chip' },
 		{ fg: 'agent-300', tint: tintOf('agent-surface'), min: READING, what: 'agent badge, running analysis chip' },
 		{ fg: 'kerf-200', tint: tintOf('selection-fill'), min: READING, what: 'amber badge (360, voiceover, the preview\'s file name)' },
+		// The timeline toolbar's lit toggles (snap, ripple, fades, heights, overview, delivery frame) draw
+		// kerf-300 on the selection wash; the toolbar is a panel, so the hover surface is not under it.
+		{ fg: 'kerf-300', tint: tintOf('selection-fill'), min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },
 		// Written inline in the dialogs' error blocks: `color-mix(in srgb,var(--red-600) 14%,transparent)`.
 		{ fg: 'red-400', tint: { hue: 'red-600', weight: 0.14 }, min: READING, what: 'error block in a dialog' },
 		{ fg: 'text-primary', tint: tintOf('danger-surface'), min: READING, what: 'agent connection banner' },
@@ -355,7 +361,7 @@ describe('contrast', () => {
 
 	function tintFailures(colors: Record<ColorToken, string>, pairs: TintPair[]): string[] {
 		return pairs.flatMap((p) =>
-			SURFACES_UNDER_TINTS.flatMap((surface) => {
+			(p.on ?? SURFACES_UNDER_TINTS).flatMap((surface) => {
 				const fill = mixSrgb(colors[p.tint.hue], colors[surface], p.tint.weight);
 				const ratio = contrastRatio(colors[p.fg], fill);
 				return ratio >= p.min
@@ -374,11 +380,15 @@ describe('contrast', () => {
 	}
 
 	test('the tinted-surface check would have caught Kerf Light as it shipped', () => {
-		// Light's `green-400` and `orange-400` read 3.2:1 and 3.1:1 on their own washes.
-		const old = SUPERSEDED_KERF_LIGHT[SUPERSEDED_KERF_LIGHT.length - 1];
-		const out = tintFailures(old, TINTED);
-		expect(out.some((l) => l.startsWith('green-400'))).toBe(true);
-		expect(out.some((l) => l.startsWith('orange-400'))).toBe(true);
+		// As of v0.24.0 Light's `green-400` and `orange-400` read 3.2:1 and 3.1:1 on their own washes,
+		// and its `kerf-300` 3.8:1 on the selection wash the toolbar's lit toggles sit on.
+		const shipped = SUPERSEDED_KERF_LIGHT.find((o) => o['green-400'] === '#1f8f60' && o['text-disabled'] === '#76828f')!;
+		const out = tintFailures(shipped, TINTED);
+		for (const hue of ['green-400', 'orange-400', 'kerf-300']) expect(out.some((l) => l.startsWith(hue)), hue).toBe(true);
+		// …and kerf-300 alone is what the later set still failed.
+		const later = tintFailures(SUPERSEDED_KERF_LIGHT[SUPERSEDED_KERF_LIGHT.length - 1], TINTED);
+		expect(later.every((l) => l.startsWith('kerf-300'))).toBe(true);
+		expect(later.length).toBeGreaterThan(0);
 	});
 
 	// ---- component edges --------------------------------------------------------

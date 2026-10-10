@@ -69,8 +69,9 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   panels and the hover surface; the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
   `agent-600` / `-700`) under their labels; the focus outline's `kerf-400` on every resting surface; and
   High contrast's `border-alpha-default` / `-strong` against its panels at 3 / 4.5. Writing it moved Kerf
-  Light's `green-400`, `orange-400`, `red-400` and `agent-300` darker (the v0.24.0 set joined
-  `SUPERSEDED_KERF_LIGHT`) and the amber `Badge` onto `kerf-200`. **`--text-disabled` is for what is off**:
+  Light's `green-400`, `orange-400`, `red-400`, `agent-300` and `kerf-300` darker (the v0.24.0 set and the
+  one before `kerf-300` moved joined `SUPERSEDED_KERF_LIGHT`; `kerf-300` could only go as far as the S / L
+  flags' 3:1 under their dark label allows, 3.1) and the amber `Badge` onto `kerf-200`. **`--text-disabled` is for what is off**:
   a scan allows it only in the menus' disabled rows, `controls.css`, and a few named exceptions (each with
   its reason in `theme-guard.test.ts`), because the status bar, every explanatory paragraph and the idle
   S / L / DUCK toggles used it at 3.3:1 — text people read is `text-muted`. **`type-guard.test.ts` keeps the
