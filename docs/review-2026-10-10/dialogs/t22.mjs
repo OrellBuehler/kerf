@@ -1,0 +1,12 @@
+import { open, DIR } from './lib.mjs';
+const { browser, page, logs } = await open({ w: 1920, h: 1080, dsf: 2 });
+await page.getByText('broll.mp4').first().click({ button: 'right' });
+await page.waitForTimeout(300);
+await page.getByRole('menuitem', { name: /Analyze everything/ }).click();
+await page.waitForTimeout(500);
+await page.screenshot({ path: `${DIR}/170-statusbar-analysis.png`, clip: { x: 960, y: 1048, width: 960, height: 32 } });
+await page.screenshot({ path: `${DIR}/171-bin-analysis.png`, clip: { x: 0, y: 60, width: 420, height: 420 } });
+await page.evaluate(async () => { const m = await import('/src/lib/state.svelte.ts'); m.editor.exportRun = { progress: { fraction: 0.42, elapsed_secs: 31, eta_secs: 75 }, cancelling: false }; });
+await page.waitForTimeout(300);
+await page.screenshot({ path: `${DIR}/172-statusbar-export.png`, clip: { x: 960, y: 1048, width: 960, height: 32 } });
+await browser.close();

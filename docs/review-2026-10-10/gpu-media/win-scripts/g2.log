@@ -1,0 +1,16 @@
+== S1 SDR-like (no tonemap) software + x264 intra
+wall_med_ms=2,293 wall_min_ms=2,223 cpu_med_ms=17,453
+== S2 auto + AMF
+wall_med_ms=2,394 wall_min_ms=2,253 cpu_med_ms=1,250
+== S3 d3d11va + AMF
+wall_med_ms=1,850 wall_min_ms=1,686 cpu_med_ms=563
+== S5 d3d11va + x264 intra
+wall_med_ms=1,897 wall_min_ms=1,839 cpu_med_ms=1,016
+== S6 d3d11va + CPU scale, decode-only (null)
+wall_med_ms=1,818 wall_min_ms=1,799 cpu_med_ms=594
+== R1 4:2:2 PQ: software decode only
+wall_med_ms=3,941 wall_min_ms=3,916 cpu_med_ms=23,516
+== R2 4:2:2 PQ: hwaccel auto decode only (expect software fallback)
+wall_med_ms=4,115 wall_min_ms=3,996 cpu_med_ms=22,359
+== R3 4:2:2 PQ: hwaccel d3d11va decode only
+wall_med_ms=3,641 wall_min_ms=3,285 cpu_med_ms=23,391

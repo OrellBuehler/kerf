@@ -1,0 +1,6 @@
+policy FixedBt601
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+adapter "llvmpipe (LLVM 15.0.7, 256 bits)"

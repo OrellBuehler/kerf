@@ -1,0 +1,14 @@
+== stream 240f from AMF intra proxy (960x540 mjpeg q6) sw decode
+wall_med_ms=279 wall_min_ms=264 cpu_med_ms=188
+== stream 240f from x264 intra proxy sw decode
+wall_med_ms=269 wall_min_ms=267 cpu_med_ms=172
+== stream 240f from AMF intra proxy, -hwaccel auto
+wall_med_ms=353 wall_min_ms=345 cpu_med_ms=78
+== stream 240f from AMF intra proxy, q2
+wall_med_ms=286 wall_min_ms=283 cpu_med_ms=313
+== stream 240f from 4K HLG ORIGINAL (no tonemap! decode+scale+mjpeg only) sw
+wall_med_ms=1,650 wall_min_ms=1,580 cpu_med_ms=9,484
+== stream 240f from 4K HLG ORIGINAL, d3d11va
+wall_med_ms=1,466 wall_min_ms=1,412 cpu_med_ms=359
+== stream 240f from 4K HLG ORIGINAL, auto(dxva2)
+wall_med_ms=1,885 wall_min_ms=1,852 cpu_med_ms=656

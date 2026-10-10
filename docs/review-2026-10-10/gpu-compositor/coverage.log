@@ -1,0 +1,175 @@
+explicit font used for the 'explicit font' runs: Some("DejaVu Sans") (resolvable: true)
+
+=================== titles/captions with default font (font: None, the model default) ===================
+
+### T1 talking-head short 9:16 (60 s, 15 clips, 0.1 s clip fades, ~85% captions)
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  12.7% (190/1500); 26 drawable stretches, 27 refused stretches
+     +text                                        drawable  12.7% (190/1500); 26 drawable stretches, 27 refused stretches
+     +mask +all effects                           drawable  12.7% (190/1500); 26 drawable stretches, 27 refused stretches
+     +keyed zoom/opacity/colour                   drawable  12.7% (190/1500); 26 drawable stretches, 27 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 1301/1250, Fade 60/9
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  12.2% (183/1500); 26 drawable stretches, 27 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +transitions (slide/push travel, tails)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +mask +all effects                           drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +keyed zoom/opacity/colour                   drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/183, Text 1308/0, Fade 60/0
+
+### T1b same, no clip fades (hard cuts), captions
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  13.3% (199/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable  13.3% (199/1500); 26 drawable stretches, 25 refused stretches
+     +mask +all effects                           drawable  13.3% (199/1500); 26 drawable stretches, 25 refused stretches
+     +keyed zoom/opacity/colour                   drawable  13.3% (199/1500); 26 drawable stretches, 25 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 1301/1301
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +transitions (slide/push travel, tails)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +mask +all effects                           drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +keyed zoom/opacity/colour                   drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/192, Text 1308/0
+
+### T1c same, clip fades, no captions
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +text                                        drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +mask +all effects                           drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +keyed zoom/opacity/colour                   drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Fade 60/60
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +transitions (slide/push travel, tails)      drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +text                                        drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/1440, Fade 60/0
+
+### T2 montage 16:9 (45 s, 18 clips, 55% dissolves/12% dips/6% slides, graded, 2 titles)
+  -- Still plan (paused/scrubbed frames): canvas 1920x1080 @ 25/1, 1125 frames, render 540x302
+     A0 (today)                                   drawable  69.5% (782/1125); 15 drawable stretches, 16 refused stretches
+     +text                                        drawable  69.5% (782/1125); 15 drawable stretches, 16 refused stretches
+     +mask +all effects                           drawable  69.5% (782/1125); 15 drawable stretches, 16 refused stretches
+     +keyed zoom/opacity/colour                   drawable  69.5% (782/1125); 15 drawable stretches, 16 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Fade 228/52, StillTail 154/0, Text 150/104, Travel 11/0
+  -- Motion plan (playback/export frames): canvas 1920x1080 @ 25/1, 1125 frames, render 540x302
+     A0 (today)                                   drawable   0.0% (0/1125); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  69.6% (783/1125); 15 drawable stretches, 16 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  74.2% (835/1125); 14 drawable stretches, 13 refused stretches
+     +transitions (slide/push travel, tails)      drawable  86.7% (975/1125); 3 drawable stretches, 2 refused stretches
+     +text                                        drawable  86.7% (975/1125); 3 drawable stretches, 2 refused stretches
+     +mask +all effects                           drawable  86.7% (975/1125); 3 drawable stretches, 2 refused stretches
+     +keyed zoom/opacity/colour                   drawable  86.7% (975/1125); 3 drawable stretches, 2 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1125/783, Fade 228/0, Tail 153/0, Text 150/0, Travel 10/0
+
+### T3 tutorial 16:9 (90 s, screen + webcam PiP, 5 lower thirds, 5 keyed push-ins, 1 mask+blur)
+  -- Still plan (paused/scrubbed frames): canvas 1920x1080 @ 25/1, 2250 frames, render 540x302
+     A0 (today)                                   drawable  65.6% (1475/2250); 6 drawable stretches, 5 refused stretches
+     +text                                        drawable  65.6% (1475/2250); 6 drawable stretches, 5 refused stretches
+     +mask +all effects                           drawable  65.6% (1475/2250); 6 drawable stretches, 5 refused stretches
+     +keyed zoom/opacity/colour                   drawable  77.8% (1750/2250); 6 drawable stretches, 5 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 500/400, Effects 375/0, Mask 375/0, ZoomBehind 375/0
+  -- Motion plan (playback/export frames): canvas 1920x1080 @ 25/1, 2250 frames, render 540x302
+     A0 (today)                                   drawable   0.0% (0/2250); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +transitions (slide/push travel, tails)      drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +text                                        drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +mask +all effects                           drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +keyed zoom/opacity/colour                   drawable  77.6% (1745/2250); 6 drawable stretches, 5 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 2250/374, KeyedZoom 1876/0, Text 505/0, Effects 376/0, Mask 376/0
+
+=================== titles/captions with explicit font ===================
+
+### T1 talking-head short 9:16 (60 s, 15 clips, 0.1 s clip fades, ~85% captions)
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  12.7% (190/1500); 26 drawable stretches, 27 refused stretches
+     +text                                        drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +mask +all effects                           drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +keyed zoom/opacity/colour                   drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 1301/1250, Fade 60/9
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  12.2% (183/1500); 26 drawable stretches, 27 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +transitions (slide/push travel, tails)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/183, Text 1308/0, Fade 60/0
+
+### T1b same, no clip fades (hard cuts), captions
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  13.3% (199/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 1301/1301
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +transitions (slide/push travel, tails)      drawable  12.8% (192/1500); 26 drawable stretches, 25 refused stretches
+     +text                                        drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/192, Text 1308/0
+
+### T1c same, clip fades, no captions
+  -- Still plan (paused/scrubbed frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +text                                        drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +mask +all effects                           drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +keyed zoom/opacity/colour                   drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Fade 60/60
+  -- Motion plan (playback/export frames): canvas 1080x1920 @ 25/1, 1500 frames, render 540x960
+     A0 (today)                                   drawable   0.0% (0/1500); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  96.0% (1440/1500); 15 drawable stretches, 16 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +transitions (slide/push travel, tails)      drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +text                                        drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1500/1500); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1500/1440, Fade 60/0
+
+### T2 montage 16:9 (45 s, 18 clips, 55% dissolves/12% dips/6% slides, graded, 2 titles)
+  -- Still plan (paused/scrubbed frames): canvas 1920x1080 @ 25/1, 1125 frames, render 540x302
+     A0 (today)                                   drawable  69.5% (782/1125); 15 drawable stretches, 16 refused stretches
+     +text                                        drawable  78.8% (886/1125); 17 drawable stretches, 18 refused stretches
+     +mask +all effects                           drawable  78.8% (886/1125); 17 drawable stretches, 18 refused stretches
+     +keyed zoom/opacity/colour                   drawable  78.8% (886/1125); 17 drawable stretches, 18 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Fade 228/52, StillTail 154/0, Text 150/104, Travel 11/0
+  -- Motion plan (playback/export frames): canvas 1920x1080 @ 25/1, 1125 frames, render 540x302
+     A0 (today)                                   drawable   0.0% (0/1125); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  69.6% (783/1125); 15 drawable stretches, 16 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  74.2% (835/1125); 14 drawable stretches, 13 refused stretches
+     +transitions (slide/push travel, tails)      drawable  86.7% (975/1125); 3 drawable stretches, 2 refused stretches
+     +text                                        drawable 100.0% (1125/1125); 1 drawable stretches, 0 refused stretches
+     +mask +all effects                           drawable 100.0% (1125/1125); 1 drawable stretches, 0 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (1125/1125); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 1125/783, Fade 228/0, Tail 153/0, Text 150/0, Travel 10/0
+
+### T3 tutorial 16:9 (90 s, screen + webcam PiP, 5 lower thirds, 5 keyed push-ins, 1 mask+blur)
+  -- Still plan (paused/scrubbed frames): canvas 1920x1080 @ 25/1, 2250 frames, render 540x302
+     A0 (today)                                   drawable  65.6% (1475/2250); 6 drawable stretches, 5 refused stretches
+     +text                                        drawable  83.3% (1875/2250); 2 drawable stretches, 1 refused stretches
+     +mask +all effects                           drawable  83.3% (1875/2250); 2 drawable stretches, 1 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (2250/2250); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Text 500/400, Effects 375/0, Mask 375/0, ZoomBehind 375/0
+  -- Motion plan (playback/export frames): canvas 1920x1080 @ 25/1, 2250 frames, render 540x302
+     A0 (today)                                   drawable   0.0% (0/2250); 0 drawable stretches, 1 refused stretches
+     +motion (Fps picks, per-frame geometry)      drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +fades (clip fades, dips, dissolve ramp)     drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +transitions (slide/push travel, tails)      drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +text                                        drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +mask +all effects                           drawable  16.6% (374/2250); 1 drawable stretches, 1 refused stretches
+     +keyed zoom/opacity/colour                   drawable 100.0% (2250/2250); 1 drawable stretches, 0 refused stretches
+     reasons at A0 (frames hit / frames where it is the only reason): Motion 2250/374, KeyedZoom 1876/0, Text 505/0, Effects 376/0, Mask 376/0

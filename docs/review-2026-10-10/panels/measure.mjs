@@ -1,0 +1,23 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({});
+await page.mouse.click(800, 858);
+await page.waitForTimeout(400);
+await page.getByText('Inspector', { exact: true }).first().click(); await page.waitForTimeout(250);
+await page.evaluate(() => document.querySelectorAll('details').forEach(d => d.open = true));
+const m = await page.evaluate(() => {
+  const r = (e) => { const b = e.getBoundingClientRect(); return [Math.round(b.width*10)/10, Math.round(b.height*10)/10]; };
+  const out = {};
+  out.keyToggle = r(document.querySelector('button[aria-label*="brightness keyframe"]'));
+  out.xBtn = r([...document.querySelectorAll('button')].find(b => b.textContent.trim()==='×') || document.body);
+  out.chip = r([...document.querySelectorAll('button')].find(b => b.textContent.trim()==='Warm'));
+  out.btnSm = r([...document.querySelectorAll('button')].find(b => b.textContent.trim()==='Analyze'));
+  out.numInput = r(document.querySelector('input[type=number]'));
+  out.select = r(document.querySelector('select'));
+  out.range = r(document.querySelector('input[type=range]'));
+  out.checkbox = r(document.querySelector('input[type=checkbox]'));
+  out.summary = r(document.querySelector('summary'));
+  const fs = {}; for (const e of document.querySelectorAll('#library-content, details, details *')) { const s = getComputedStyle(e).fontSize; fs[s] = (fs[s]||0)+1; } out.fontSizes = fs;
+  return out;
+});
+console.log(JSON.stringify(m, null, 1));
+await browser.close();

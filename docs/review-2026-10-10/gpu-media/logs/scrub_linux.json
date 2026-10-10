@@ -1,0 +1,86 @@
+{
+ "ff9/version": {
+  "wall_med": 0.009,
+  "wall_min": 0.0085,
+  "cpu_med": 0.0088,
+  "out_bytes": 2380
+ },
+ "ff9/lavfi1": {
+  "wall_med": 0.0159,
+  "wall_min": 0.0132,
+  "cpu_med": 0.0157,
+  "out_bytes": 0
+ },
+ "ff9/still_proxy_x264intra": {
+  "wall_med": 0.0699,
+  "wall_min": 0.0586,
+  "cpu_med": 0.1087,
+  "out_bytes": 27299
+ },
+ "ff9/still_fhd_original": {
+  "wall_med": 0.1628,
+  "wall_min": 0.157,
+  "cpu_med": 0.6271,
+  "out_bytes": 31922
+ },
+ "ff9/still_4k_hevc10_original_notm": {
+  "wall_med": 0.7558,
+  "wall_min": 0.692,
+  "cpu_med": 2.4246,
+  "out_bytes": 27653
+ },
+ "ff9/still_4k_hlg_original_TM_at_4k": {
+  "wall_med": 1.0848,
+  "wall_min": 0.9407,
+  "cpu_med": 3.7134,
+  "out_bytes": 31897
+ },
+ "ff9/still_4k_422_original_notm": {
+  "wall_med": 1.3658,
+  "wall_min": 1.2506,
+  "cpu_med": 5.6246,
+  "out_bytes": 27733
+ },
+ "ff4/version": {
+  "wall_med": 0.0315,
+  "wall_min": 0.0267,
+  "cpu_med": 0.0314,
+  "out_bytes": 1689
+ },
+ "ff4/lavfi1": {
+  "wall_med": 0.0351,
+  "wall_min": 0.0327,
+  "cpu_med": 0.0352,
+  "out_bytes": 0
+ },
+ "ff4/still_proxy_x264intra": {
+  "wall_med": 0.079,
+  "wall_min": 0.0724,
+  "cpu_med": 0.1291,
+  "out_bytes": 23596
+ },
+ "ff4/still_fhd_original": {
+  "wall_med": 0.1504,
+  "wall_min": 0.1464,
+  "cpu_med": 0.6408,
+  "out_bytes": 27555
+ },
+ "ff4/still_4k_hevc10_original_notm": {
+  "wall_med": 0.5618,
+  "wall_min": 0.5457,
+  "cpu_med": 2.1838,
+  "out_bytes": 24796
+ },
+ "ff4/still_4k_hlg_original_TM_at_4k": {
+  "wall_med": 0.8634,
+  "wall_min": 0.8498,
+  "cpu_med": 2.8137,
+  "out_bytes": 27606
+ },
+ "ff4/still_4k_422_original_notm": {
+  "wall_med": 0.8982,
+  "wall_min": 0.8756,
+  "cpu_med": 5.1339,
+  "out_bytes": 24807
+ }
+}

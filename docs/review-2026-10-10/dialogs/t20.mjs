@@ -1,0 +1,10 @@
+import { open, DIR } from './lib.mjs';
+const { browser, page, logs } = await open({ w: 1920, h: 1080 });
+await page.getByRole('button', { name: 'Deliver', exact: true }).click();
+await page.waitForTimeout(900);
+await page.screenshot({ path: `${DIR}/150-deliver-workspace.png` });
+await page.getByRole('button', { name: '9:16', exact: true }).click();
+await page.waitForTimeout(500);
+const box = await page.evaluate(() => { const el = [...document.querySelectorAll('*')].find(e => e.textContent?.trim() === 'Deliver' && e.closest('.dv-content-container')); return null; });
+await page.screenshot({ path: `${DIR}/151-deliver-workspace-916.png` });
+await browser.close();

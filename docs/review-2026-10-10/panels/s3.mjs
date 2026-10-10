@@ -1,0 +1,14 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({});
+await page.mouse.click(400, 858);
+await page.waitForTimeout(500);
+await page.getByText('Inspector', { exact: true }).first().click();
+await page.waitForTimeout(300);
+const ins = async () => (await page.evaluate(() => { const g = [...document.querySelectorAll('.dv-groupview')].find(g => g.innerText.startsWith('Inspector')); return g.innerText.slice(0,80).replace(/\n/g,' | '); }));
+console.log(await ins());
+await page.evaluate(() => document.querySelectorAll('details').forEach(d => d.open = true));
+console.log(await ins());
+await page.setViewportSize({ width: 1920, height: 3300 });
+await page.waitForTimeout(800);
+console.log(await ins());
+await browser.close();

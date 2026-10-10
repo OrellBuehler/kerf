@@ -1,0 +1,11 @@
+ff9/uhd_hevc10_hlg/a_decode_only {"wall_med": 1.4844, "wall_min": 1.4054, "cpu_med": 12.6584, "out_bytes": 0}
+ff9/uhd_hevc10_hlg/b_decode_scale {"wall_med": 1.6998, "wall_min": 1.5918, "cpu_med": 15.237, "out_bytes": 0}
+ff9/uhd_hevc10_hlg/c_decode_scale_tonemap {"wall_med": 2.5638, "wall_min": 2.527, "cpu_med": 22.6125, "out_bytes": 0}
+ff9/uhd_hevc10_hlg/d_full_x264_intra {"wall_med": 3.3871, "wall_min": 2.905, "cpu_med": 25.0701, "out_bytes": 0}
+ff9/uhd_hevc422_pq/a_decode_only {"wall_med": 4.1611, "wall_min": 3.529, "cpu_med": 33.7579, "out_bytes": 0}
+ff9/uhd_hevc422_pq/b_decode_scale {"wall_med": 4.4473, "wall_min": 4.0201, "cpu_med": 35.8902, "out_bytes": 0}
+ff9/uhd_hevc422_pq/c_decode_scale_tonemap {"wall_med": 5.0603, "wall_min": 5.0499, "cpu_med": 44.8152, "out_bytes": 0}
+ff9/uhd_hevc422_pq/d_full_x264_intra {"wall_med": 4.925, "wall_min": 4.7442, "cpu_med": 46.8444, "out_bytes": 0}
+ff9/fhd_h264_sdr/a_decode_only {"wall_med": 0.33, "wall_min": 0.3086, "cpu_med": 1.9436, "out_bytes": 0}
+ff9/fhd_h264_sdr/b_decode_scale {"wall_med": 0.3791, "wall_min": 0.3713, "cpu_med": 2.4328, "out_bytes": 0}
+ff9/fhd_h264_sdr/d_full_x264_intra {"wall_med": 0.6307, "wall_min": 0.6132, "cpu_med": 4.4653, "out_bytes": 0}

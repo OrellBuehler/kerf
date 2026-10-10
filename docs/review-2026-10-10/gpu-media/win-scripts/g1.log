@@ -1,0 +1,10 @@
+== A production default: hwaccel auto + CPU scale + CPU tonemap + h264_amf(cqp24,g1)
+wall_med_ms=3,956 wall_min_ms=3,807 cpu_med_ms=13,313
+== B hwaccel auto + libx264 intra
+wall_med_ms=3,980 wall_min_ms=3,934 cpu_med_ms=16,125
+== C hwaccel d3d11va + h264_amf
+wall_med_ms=3,285 wall_min_ms=3,172 cpu_med_ms=14,609
+== D all software: hwaccel none + libx264 intra
+wall_med_ms=4,096 wall_min_ms=4,054 cpu_med_ms=26,078
+== E hwaccel none + h264_amf
+wall_med_ms=4,182 wall_min_ms=4,134 cpu_med_ms=24,391

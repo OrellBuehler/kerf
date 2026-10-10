@@ -1,0 +1,11 @@
+import { launch, open } from './lib.mjs';
+const b = await launch();
+const { p } = await open(b, { q: '?music=1' });
+const c4 = await p.locator('.kclip[data-clip-id="c4"]').boundingBox();
+await p.mouse.click(c4.x + 300, c4.y + 20, { button: 'right' });
+await p.waitForTimeout(300);
+const d = async () => p.evaluate(() => { const e = document.activeElement; return `${e.tagName}.${e.className} role=${e.getAttribute('role')} inMenu=${!!e.closest('[role=menu]')} txt=${(e.textContent||'').slice(0,20)}`; });
+console.log('open   ', await d());
+await p.keyboard.press('ArrowDown'); console.log('down   ', await d());
+await p.keyboard.press('Tab'); console.log('tab    ', await d());
+await b.close();

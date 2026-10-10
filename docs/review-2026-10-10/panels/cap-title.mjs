@@ -1,0 +1,21 @@
+import { open } from './lib.mjs';
+const [name, theme = 'dark'] = process.argv.slice(2);
+const { browser, page } = await open({ theme });
+await page.getByText('Inspector', { exact: true }).first().click();
+await page.waitForTimeout(300);
+await page.getByRole('button', { name: '+ Title' }).first().click();
+await page.waitForTimeout(600);
+await page.getByRole('button', { name: '+ Caption' }).first().click().catch(()=>{});
+await page.waitForTimeout(600);
+// select the first title block in the title lane
+const lane = page.locator('[data-title-lane]').first();
+console.log(await lane.count());
+const bb = await lane.boundingBox(); console.log(bb);
+await page.mouse.click(bb.x + 40, bb.y + bb.height/2);
+await page.waitForTimeout(500);
+await page.evaluate(() => document.querySelectorAll('details').forEach(d => d.open = true));
+await page.setViewportSize({ width: 1920, height: 2400 });
+await page.waitForTimeout(800);
+const b = await page.evaluate(() => { const g = [...document.querySelectorAll('.dv-groupview')].find(g => g.innerText.startsWith('Inspector')); const r = g.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+await page.screenshot({ path: `${name}.png`, clip: { x: b.x, y: b.y, width: b.w, height: Math.min(b.h, 2300) } });
+await browser.close();

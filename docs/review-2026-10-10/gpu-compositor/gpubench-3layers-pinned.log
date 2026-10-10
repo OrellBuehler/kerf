@@ -1,0 +1,19 @@
+
+## 3 layers (base + 2 PiP, one 80% opaque, one rotated), 960w
+canvas 1280x720 @ 25/1 render 960x540 layers 3
+plan.at_frame (Planner reused): min 0.00 med 0.00 mean 0.00 p95 0.00 ms
+Planner::new + at (per-call, as the app does): min 0.00 med 0.01 mean 0.01 p95 0.01 ms
+[forward free-run 150 frames] 7.5 fps wall, process CPU 372.5 ms/frame (parent only; ffmpeg children not counted)
+  decode wait (FrameSource, incl cache): min 0.15 med 8.29 mean 13.45 p95 27.33 ms
+  composite record+submit (CPU): min 1.85 med 3.01 mean 3.73 p95 3.50 ms
+  GPU completion + readback (lavapipe = CPU raster): min 64.34 med 118.70 mean 116.73 p95 174.68 ms
+  total/frame: min 66.59 med 130.25 mean 133.93 p95 189.58 ms
+  stats SourceStats { cache: CacheStats { entries: 168, bytes: 267724800, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 504, hits: 450, misses: 25, past_end: 0, evictions: 336, cold_dropped: 0, conflicts: 0 }, runs: 3, spawned: 3, replaced: 0, reused: 19, oneshots: 0, fallbacks: 0, distrusted: 0 }
+[scrub random jumps, 60 frames, after warm-up skip first]
+  decode wait: min 0.16 med 35.28 mean 37.68 p95 84.76 ms
+  composite record+submit: min 1.89 med 2.28 mean 2.38 p95 3.14 ms
+  total: min 65.72 med 111.98 mean 111.43 p95 155.52 ms
+  stats SourceStats { cache: CacheStats { entries: 175, bytes: 267264000, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 2673, hits: 180, misses: 4891, past_end: 0, evictions: 2498, cold_dropped: 0, conflicts: 0 }, runs: 6, spawned: 25, replaced: 19, reused: 86, oneshots: 0, fallbacks: 0, distrusted: 0 }
+[paused re-render of a cached frame]
+  composite record+submit: min 1.83 med 1.94 mean 5.34 p95 2.87 ms
+  total incl completion: min 63.43 med 67.76 mean 70.85 p95 82.00 ms

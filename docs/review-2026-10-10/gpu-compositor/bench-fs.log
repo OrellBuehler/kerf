@@ -1,0 +1,12 @@
+
+running 1 test
+720p    playback           116.5             12.7   SourceStats { cache: CacheStats { entries: 60, bytes: 82944000, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 60, hits: 60, misses: 58, past_end: 0, evictions: 0, cold_dropped: 0, conflicts: 0 }, runs: 1, spawned: 1, replaced: 0, reused: 3, oneshots: 0, fallbacks: 0, distrusted: 0 }
+720p    scrub              123.4             11.3   SourceStats { cache: CacheStats { entries: 155, bytes: 214272000, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 155, hits: 20, misses: 154, past_end: 0, evictions: 0, cold_dropped: 0, conflicts: 0 }, runs: 1, spawned: 1, replaced: 0, reused: 7, oneshots: 0, fallbacks: 0, distrusted: 0 }
+1080p   playback           174.8              9.0   SourceStats { cache: CacheStats { entries: 60, bytes: 186624000, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 60, hits: 60, misses: 59, past_end: 0, evictions: 0, cold_dropped: 0, conflicts: 0 }, runs: 1, spawned: 1, replaced: 0, reused: 4, oneshots: 0, fallbacks: 0, distrusted: 0 }
+1080p   scrub              122.6             28.2   SourceStats { cache: CacheStats { entries: 86, bytes: 267494400, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 141, hits: 20, misses: 140, past_end: 0, evictions: 55, cold_dropped: 0, conflicts: 0 }, runs: 3, spawned: 3, replaced: 0, reused: 17, oneshots: 0, fallbacks: 0, distrusted: 0 }
+2160p   playback           232.9             15.4   SourceStats { cache: CacheStats { entries: 21, bytes: 261273600, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 60, hits: 60, misses: 59, past_end: 0, evictions: 39, cold_dropped: 0, conflicts: 0 }, runs: 1, spawned: 1, replaced: 0, reused: 12, oneshots: 0, fallbacks: 0, distrusted: 0 }
+2160p   scrub              237.0             65.4   SourceStats { cache: CacheStats { entries: 21, bytes: 261273600, cap: 268435456, pinned: 0, pinned_bytes: 0, cold: 0, inserts: 141, hits: 20, misses: 140, past_end: 0, evictions: 120, cold_dropped: 0, conflicts: 0 }, runs: 3, spawned: 3, replaced: 0, reused: 17, oneshots: 0, fallbacks: 0, distrusted: 0 }
+test bench_frame_source_decode_vs_one_shot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 48.60s
+

@@ -1,0 +1,17 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ dsf: 2 });
+await page.mouse.click(400, 858);
+await page.waitForTimeout(400);
+await page.locator('[data-library-tab="audio"]').click();
+await page.waitForTimeout(400);
+await page.mouse.move(700, 500);
+await page.screenshot({ path: 'c-audio-tiles.png', clip: { x: 40, y: 100, width: 360, height: 180 } });
+const tiles = await page.evaluate(() => [...document.querySelectorAll('#library-content button')].filter(b=>/Compressor|Gate|High/.test(b.innerText)).map(b => { const r=b.getBoundingClientRect(); return {t:b.innerText, x:r.x, r:r.right, w:r.width, sw:b.scrollWidth, cw:b.clientWidth}; }));
+console.log(JSON.stringify(tiles), await page.evaluate(()=>{const c=document.querySelector('#library-content'); return [c.getBoundingClientRect().right, c.scrollWidth, c.clientWidth]}));
+await page.locator('[data-library-tab="titles"]').click();
+await page.waitForTimeout(300);
+await page.screenshot({ path: 'c-titles.png', clip: { x: 40, y: 66, width: 360, height: 220 } });
+await page.locator('[data-library-tab="transcript"]').click();
+await page.waitForTimeout(300);
+await page.screenshot({ path: 'c-transcript.png', clip: { x: 40, y: 66, width: 360, height: 180 } });
+await browser.close();

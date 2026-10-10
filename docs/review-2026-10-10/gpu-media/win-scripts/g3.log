@@ -1,0 +1,14 @@
+== fhd_h264 original (sw)
+wall_med_ms=198 wall_min_ms=190 cpu_med_ms=469
+== fhd_h264 original (auto=dxva2)
+wall_med_ms=273 wall_min_ms=262 cpu_med_ms=47
+== 4K hevc10 HLG proxy-AMF (SDR 1280, intra)
+wall_med_ms=86 wall_min_ms=82 cpu_med_ms=16
+== 4K hevc10 HLG proxy-x264 (SDR 1280, intra)
+wall_med_ms=101 wall_min_ms=93 cpu_med_ms=31
+== 4K hevc10 HLG ORIGINAL, tonemap at full-res in graph (sw)
+wall_med_ms=693 wall_min_ms=628 cpu_med_ms=2,484
+== 4K hevc10 HLG ORIGINAL, tonemap at full-res in graph (auto=dxva2)
+wall_med_ms=765 wall_min_ms=750 cpu_med_ms=1,234
+== 4K hevc422 PQ ORIGINAL, tonemap at full-res in graph (sw)
+wall_med_ms=1,490 wall_min_ms=1,437 cpu_med_ms=6,109

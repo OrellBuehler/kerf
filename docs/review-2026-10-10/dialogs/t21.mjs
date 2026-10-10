@@ -1,0 +1,12 @@
+import { open, DIR } from './lib.mjs';
+const { browser, page, logs } = await open({ w: 1920, h: 1080 });
+await page.getByRole('menuitem', { name: 'View', exact: true }).click();
+await page.getByRole('menuitem', { name: 'Delivery frame' }).click();
+await page.waitForTimeout(300);
+const items = await page.$$eval('[role=menu] [role=menuitemradio]', (els) => els.map(e => e.textContent.trim().replace(/\s+/g,' ')));
+console.log(items.join('\n'));
+await page.getByRole('menuitemradio', { name: /Square|1:1/ }).first().click();
+await page.waitForTimeout(600);
+await page.keyboard.press('Control+e'); await page.waitForTimeout(600);
+await (await page.$('[role=dialog] > div')).screenshot({ path: `${DIR}/160-export-projectframe.png` });
+await browser.close();

@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:03,500
+Welcome back to the channel.
+
+2
+00:00:04,000 --> 00:00:07,000
+Today we are talking about non-destructive editing.
+
+3
+00:00:30,000 --> 00:00:32,000
+This cue is outside the cut.

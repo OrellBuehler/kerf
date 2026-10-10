@@ -1,0 +1,4 @@
+   Compiling kerf-core v0.23.0 (/home/orell/github/kerf/crates/kerf-core)
+   Compiling kerf-gpu v0.23.0 (/home/orell/github/kerf/crates/kerf-gpu)
+   Compiling gpubench v0.0.0 (/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/gpubench)
+    Finished `release` profile [optimized] target(s) in 25.41s

@@ -1,0 +1,37 @@
+
+running 28 tests
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+error: socket path "/tmp/claude-1000/-home-orell-github-kerf/3a822707-e08c-4465-adf8-e4864e1d4032/scratchpad/review/gpu-compositor/xdg/wayland-0" plus null terminator exceeds 108 bytes
+test a_gap_is_black ... ok
+test an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing ... ok
+test a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg ... ok
+test an_odd_layer_in_a_frame_with_an_odd_chroma_line ... ok
+test a_rotated_neutral_layer_has_no_colour_fringe ... ok
+test an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on ... ok
+test a_letterboxed_layer_covers_what_is_below_it ... ok
+test colour_adjustments ... ok
+test busy_sources_are_held_to_the_scaler_not_to_a_flat_region ... ok
+test contain_and_cover_into_a_vertical_frame ... ok
+test frames_the_gpu_would_draw_wrong_are_refused ... ok
+test grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn ... ok
+test odd_sizes_and_layers_that_leave_the_canvas ... ok
+test opacity ... ok
+test rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give ... ok
+test scaled_rotated_and_cropped ... ok
+test single_clip_at_the_footage_size ... ok
+test crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one ... ok
+test resizing_a_picture_ffmpeg_scales_in_another_format_is_refused ... ok
+test sources_that_are_not_plain_8_bit_420 ... ok
+test still_images ... ok
+test source_time_speed_reverse_and_keyframes ... ok
+test the_eq_tables_match_ffmpegs_eq_filter ... ok
+test the_composite_follows_the_matrix_ffmpeg_negotiates ... ok
+test two_overlapping_tracks ... ok
+test translucent_layers_take_the_round_trip_with_the_right_matrices ... ok
+test the_scaler_matches_ffmpegs_scale_plane_by_plane ... ok
+test frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.43s
+

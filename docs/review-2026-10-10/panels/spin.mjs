@@ -1,0 +1,16 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ dsf: 3 });
+await page.mouse.click(400, 858);
+await page.waitForTimeout(300);
+await page.getByText('Inspector', { exact: true }).first().click(); await page.waitForTimeout(300);
+const inp = page.locator('input[type=number]').nth(1);
+await inp.hover();
+await page.waitForTimeout(300);
+const b = await inp.boundingBox();
+await page.screenshot({ path: 'spin-hover.png', clip: { x: b.x - 120, y: b.y - 25, width: b.width + 130, height: b.height + 50 } });
+await inp.focus();
+await page.waitForTimeout(200);
+await page.screenshot({ path: 'spin-focus.png', clip: { x: b.x - 120, y: b.y - 25, width: b.width + 130, height: b.height + 50 } });
+const st = await inp.evaluate(e => { const c = getComputedStyle(e); return [c.outlineStyle, c.outlineColor, c.borderColor, c.boxShadow]; });
+console.log(st);
+await browser.close();

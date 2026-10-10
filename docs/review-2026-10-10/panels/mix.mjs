@@ -1,0 +1,11 @@
+import { open } from './lib.mjs';
+const [name, theme = 'dark', w = '1920', h = '1080', dsf = '1'] = process.argv.slice(2);
+const { browser, page } = await open({ theme, w: +w, h: +h, dsf: +dsf });
+await page.getByRole('button', { name: 'Audio', exact: true }).click();
+await page.waitForTimeout(1200);
+await page.screenshot({ path: `${name}-full.png` });
+const info = await page.evaluate(() => [...document.querySelectorAll('.dv-groupview')].map(g => { const r = g.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, t: g.innerText.slice(0,20).replace(/\n/g,' ') }; }));
+console.log(JSON.stringify(info));
+const m = info.find(i => i.t.startsWith('Mixer'));
+if (m) await page.screenshot({ path: `${name}-mixer.png`, clip: { x: m.x, y: m.y, width: m.w, height: m.h } });
+await browser.close();

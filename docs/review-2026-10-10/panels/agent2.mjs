@@ -1,0 +1,10 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ dsf: 2, q: '?music=1' });
+await page.getByText('Agent', { exact: true }).first().click(); await page.waitForTimeout(400);
+await page.getByRole('button', { name: /Connect an agent/ }).click();
+await page.waitForTimeout(300);
+await page.setViewportSize({ width: 1920, height: 1900 });
+await page.waitForTimeout(700);
+const b = await page.evaluate(() => { const g = [...document.querySelectorAll('.dv-groupview')].find(g => g.innerText.startsWith('Inspector')); const r = g.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+await page.screenshot({ path: 'agent-connect.png', clip: { x: b.x, y: b.y, width: b.w, height: Math.min(b.h, 1100) } });
+await browser.close();

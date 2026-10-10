@@ -1,0 +1,2 @@
+KERF_FFMPEG=/home/orell/github/kerf/crates/kerf-app/binaries/ffmpeg-x86_64-unknown-linux-gnu
+KERF_FFPROBE=/home/orell/github/kerf/crates/kerf-app/binaries/ffprobe-x86_64-unknown-linux-gnu

@@ -1,0 +1,10 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ theme: 'light', dsf: 2 });
+await page.screenshot({ path: 'l-bin.png', clip: { x: 0, y: 36, width: 400, height: 460 } });
+await page.mouse.click(400, 858);
+await page.waitForTimeout(400);
+await page.locator('[data-library-tab="effects"]').click();
+await page.waitForTimeout(300);
+await page.mouse.move(700,500);
+await page.screenshot({ path: 'l-effects.png', clip: { x: 0, y: 36, width: 400, height: 330 } });
+await browser.close();

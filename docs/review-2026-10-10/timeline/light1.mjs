@@ -1,0 +1,14 @@
+import { launch, open, shot } from './lib.mjs';
+const b = await launch();
+const { p } = await open(b, { q: '?music=1', dsf: 1, theme: 'light' });
+const TL = { x: 0, y: 665, width: 1920, height: 390 };
+await shot(p, 'l-full');
+const clip = async (id) => (await p.locator(`.kclip[data-clip-id="${id}"]`).boundingBox());
+const c2 = await clip('c2');
+await p.mouse.click(c2.x + 150, c2.y + 25);
+await p.mouse.move(c2.x + 120, c2.y + 30);
+await p.waitForTimeout(400);
+await shot(p, 'l-select', TL);
+await shot(p, 'l-select-crop', { x: 0, y: 790, width: 1000, height: 270 });
+console.log(p.logs);
+await b.close();

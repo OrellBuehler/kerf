@@ -1,0 +1,10 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ w: 1366, h: 768 });
+await page.screenshot({ path: 's768-edit.png' });
+await page.mouse.click(300, 600);
+await page.getByRole('button', { name: 'Audio', exact: true }).click();
+await page.waitForTimeout(1200);
+await page.screenshot({ path: 's768-audio.png' });
+const info = await page.evaluate(() => [...document.querySelectorAll('.dv-groupview')].map(g => { const r = g.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), t: g.innerText.slice(0,20).replace(/\n/g,' ') }; }));
+console.log(JSON.stringify(info));
+await browser.close();

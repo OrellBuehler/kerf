@@ -1,0 +1,10 @@
+import { open, DIR } from './lib.mjs';
+const { browser, page, logs } = await open({ w: 1920, h: 1080 });
+await page.keyboard.press('Control+,'); await page.waitForTimeout(400);
+await page.locator('[role=dialog] button', { hasText: /^\s*Speech\s*$/ }).click();
+await page.getByRole('button', { name: 'Download now' }).click();
+await page.waitForTimeout(500);
+await (await page.$('[role=dialog] > div')).screenshot({ path: `${DIR}/200-settings-speech-downloading.png` });
+await page.waitForTimeout(2500);
+await (await page.$('[role=dialog] > div')).screenshot({ path: `${DIR}/201-settings-speech-after.png` });
+await browser.close();

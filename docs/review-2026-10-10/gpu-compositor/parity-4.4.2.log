@@ -1,0 +1,255 @@
+
+running 28 tests
+test a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg ... FAILED
+test a_letterboxed_layer_covers_what_is_below_it ... FAILED
+test a_gap_is_black ... FAILED
+test a_rotated_neutral_layer_has_no_colour_fringe ... FAILED
+test an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing ... FAILED
+test an_odd_layer_in_a_frame_with_an_odd_chroma_line ... FAILED
+test an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on ... FAILED
+test busy_sources_are_held_to_the_scaler_not_to_a_flat_region ... FAILED
+test colour_adjustments ... FAILED
+test contain_and_cover_into_a_vertical_frame ... FAILED
+test crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one ... FAILED
+test frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn ... FAILED
+test frames_the_gpu_would_draw_wrong_are_refused ... FAILED
+test grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn ... FAILED
+test odd_sizes_and_layers_that_leave_the_canvas ... FAILED
+test opacity ... FAILED
+test resizing_a_picture_ffmpeg_scales_in_another_format_is_refused ... FAILED
+test scaled_rotated_and_cropped ... FAILED
+test single_clip_at_the_footage_size ... FAILED
+test rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give ... FAILED
+test source_time_speed_reverse_and_keyframes ... FAILED
+test sources_that_are_not_plain_8_bit_420 ... FAILED
+test the_eq_tables_match_ffmpegs_eq_filter ... ok
+test still_images ... FAILED
+test the_composite_follows_the_matrix_ffmpeg_negotiates ... FAILED
+test the_scaler_matches_ffmpegs_scale_plane_by_plane ... FAILED
+test translucent_layers_take_the_round_trip_with_the_right_matrices ... FAILED
+test two_overlapping_tracks ... FAILED
+
+failures:
+
+---- a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg stdout ----
+
+thread 'a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg' (67081) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_letterboxed_layer_covers_what_is_below_it stdout ----
+
+thread 'a_letterboxed_layer_covers_what_is_below_it' (67083) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- a_gap_is_black stdout ----
+
+thread 'a_gap_is_black' (67082) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- a_rotated_neutral_layer_has_no_colour_fringe stdout ----
+
+thread 'a_rotated_neutral_layer_has_no_colour_fringe' (68073) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing stdout ----
+
+thread 'an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing' (69019) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- an_odd_layer_in_a_frame_with_an_odd_chroma_line stdout ----
+
+thread 'an_odd_layer_in_a_frame_with_an_odd_chroma_line' (69835) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on stdout ----
+
+thread 'an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on' (70704) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- busy_sources_are_held_to_the_scaler_not_to_a_flat_region stdout ----
+
+thread 'busy_sources_are_held_to_the_scaler_not_to_a_flat_region' (71440) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- colour_adjustments stdout ----
+
+thread 'colour_adjustments' (72279) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- contain_and_cover_into_a_vertical_frame stdout ----
+
+thread 'contain_and_cover_into_a_vertical_frame' (73079) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one stdout ----
+
+thread 'crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one' (74099) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn stdout ----
+
+thread 'frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn' (74858) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- frames_the_gpu_would_draw_wrong_are_refused stdout ----
+
+thread 'frames_the_gpu_would_draw_wrong_are_refused' (76046) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn stdout ----
+
+thread 'grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn' (76803) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- odd_sizes_and_layers_that_leave_the_canvas stdout ----
+
+thread 'odd_sizes_and_layers_that_leave_the_canvas' (77540) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- opacity stdout ----
+
+thread 'opacity' (78335) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- resizing_a_picture_ffmpeg_scales_in_another_format_is_refused stdout ----
+
+thread 'resizing_a_picture_ffmpeg_scales_in_another_format_is_refused' (80213) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- scaled_rotated_and_cropped stdout ----
+
+thread 'scaled_rotated_and_cropped' (81078) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- single_clip_at_the_footage_size stdout ----
+
+thread 'single_clip_at_the_footage_size' (82053) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give stdout ----
+
+thread 'rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give' (79384) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- source_time_speed_reverse_and_keyframes stdout ----
+
+thread 'source_time_speed_reverse_and_keyframes' (82907) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- sources_that_are_not_plain_8_bit_420 stdout ----
+
+thread 'sources_that_are_not_plain_8_bit_420' (83887) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- still_images stdout ----
+
+thread 'still_images' (84677) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- the_composite_follows_the_matrix_ffmpeg_negotiates stdout ----
+
+thread 'the_composite_follows_the_matrix_ffmpeg_negotiates' (85446) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- the_scaler_matches_ffmpegs_scale_plane_by_plane stdout ----
+
+thread 'the_scaler_matches_ffmpegs_scale_plane_by_plane' (86708) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- translucent_layers_take_the_round_trip_with_the_right_matrices stdout ----
+
+thread 'translucent_layers_take_the_round_trip_with_the_right_matrices' (87250) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+---- two_overlapping_tracks stdout ----
+
+thread 'two_overlapping_tracks' (88294) panicked at crates/kerf-gpu/tests/parity.rs:340:5:
+ffmpeg ["-display_rotation", "90", "-i", "/home/orell/github/kerf/target/tmp/parity-media/landscape.mp4", "-c", "copy", "/home/orell/github/kerf/target/tmp/parity-media/rotated.mp4"]: Unrecognized option 'display_rotation'.
+Error splitting the argument list: Option not found
+
+
+
+failures:
+    a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg
+    a_gap_is_black
+    a_letterboxed_layer_covers_what_is_below_it
+    a_rotated_neutral_layer_has_no_colour_fringe
+    an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing
+    an_odd_layer_in_a_frame_with_an_odd_chroma_line
+    an_unmeasured_policy_draws_only_what_every_ffmpeg_agrees_on
+    busy_sources_are_held_to_the_scaler_not_to_a_flat_region
+    colour_adjustments
+    contain_and_cover_into_a_vertical_frame
+    crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one
+    frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn
+    frames_the_gpu_would_draw_wrong_are_refused
+    grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn
+    odd_sizes_and_layers_that_leave_the_canvas
+    opacity
+    rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give
+    resizing_a_picture_ffmpeg_scales_in_another_format_is_refused
+    scaled_rotated_and_cropped
+    single_clip_at_the_footage_size
+    source_time_speed_reverse_and_keyframes
+    sources_that_are_not_plain_8_bit_420
+    still_images
+    the_composite_follows_the_matrix_ffmpeg_negotiates
+    the_scaler_matches_ffmpegs_scale_plane_by_plane
+    translucent_layers_take_the_round_trip_with_the_right_matrices
+    two_overlapping_tracks
+
+test result: FAILED. 1 passed; 27 failed; 0 ignored; 0 measured; 0 filtered out; finished in 94.91s
+

@@ -1,0 +1,13 @@
+import pkg from '/home/orell/github/bissbilanz/node_modules/playwright/index.js'; const { chromium } = pkg;
+const browser = await chromium.launch({ executablePath: '/usr/bin/google-chrome', headless: true });
+const ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
+const page = await ctx.newPage();
+page.on('console', m => { console.log('CON', m.type(), m.text().slice(0,300)); });
+page.on('pageerror', e => console.log('PAGEERR', e.message));
+page.on('requestfailed', r => console.log('REQFAIL', r.url()));
+page.on('response', r => { if (r.status()>=400) console.log('HTTP', r.status(), r.url()); });
+await page.goto('http://localhost:1420/?music=1&staged=1');
+await page.waitForTimeout(6000);
+await page.screenshot({ path: 'full-1920.png' });
+console.log(await page.evaluate(() => document.body.innerText.slice(0, 600)));
+await browser.close();

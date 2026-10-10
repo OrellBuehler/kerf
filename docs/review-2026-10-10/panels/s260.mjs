@@ -1,0 +1,11 @@
+import { open } from './lib.mjs';
+const { browser, page } = await open({ w: 1100, h: 700 });
+await page.mouse.click(400, 622);
+await page.waitForTimeout(300);
+await page.getByText('Inspector', { exact: true }).first().click(); await page.waitForTimeout(300);
+await page.evaluate(() => document.querySelectorAll('details').forEach(d => d.open = true));
+await page.setViewportSize({ width: 1100, height: 2800 });
+await page.waitForTimeout(800);
+const b = await page.evaluate(() => { const g = [...document.querySelectorAll('.dv-groupview')].find(g => g.innerText.startsWith('Inspector')); const r = g.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+await page.screenshot({ path: 'insp260.png', clip: { x: b.x, y: b.y, width: b.w, height: Math.min(b.h, 2700) } });
+await browser.close();

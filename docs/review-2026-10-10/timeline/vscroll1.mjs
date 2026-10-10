@@ -1,0 +1,11 @@
+import { launch, open, shot } from './lib.mjs';
+const b = await launch();
+const { p } = await open(b, { q: '?music=1', dsf: 2 });
+await p.mouse.click(224 + 36 * 5, 782);
+await p.locator('button[aria-label="All tracks large"]').click();
+await p.waitForTimeout(400);
+const info = await p.evaluate(() => { const s = document.querySelector('[data-lane]').parentElement.parentElement; s.scrollTop = 200; return { st: s.scrollTop, sh: s.scrollHeight, ch: s.clientHeight }; });
+console.log(info);
+await p.waitForTimeout(400);
+await shot(p, 'vs-scrolled', { x: 0, y: 732, width: 1000, height: 330 });
+await b.close();

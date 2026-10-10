@@ -1,0 +1,20 @@
+== [HDR] X1 sw decode + libx264 crf20 medium
+wall_med_ms=6,255 wall_min_ms=5,923 cpu_med_ms=58,344
+== [HDR] X2 auto(dxva2) + libx264 crf20 medium
+wall_med_ms=5,416 wall_min_ms=5,177 cpu_med_ms=37,719
+== [HDR] X3 d3d11va + libx264 crf20 medium
+wall_med_ms=5,012 wall_min_ms=4,697 cpu_med_ms=28,438
+== [HDR] X4 d3d11va + h264_amf cqp20 (Kerf spelling)
+wall_med_ms=3,799 wall_min_ms=3,782 cpu_med_ms=2,703
+== [HDR] X5 d3d11va + hevc_amf cqp23
+wall_med_ms=4,343 wall_min_ms=4,220 cpu_med_ms=5,000
+== [SDRLIKE] X1 sw decode + libx264 crf20 medium
+wall_med_ms=4,221 wall_min_ms=3,844 cpu_med_ms=36,734
+== [SDRLIKE] X2 auto(dxva2) + libx264 crf20 medium
+wall_med_ms=3,817 wall_min_ms=3,687 cpu_med_ms=24,094
+== [SDRLIKE] X3 d3d11va + libx264 crf20 medium
+wall_med_ms=3,449 wall_min_ms=3,407 cpu_med_ms=25,406
+== [SDRLIKE] X4 d3d11va + h264_amf cqp20 (Kerf spelling)
+wall_med_ms=2,009 wall_min_ms=1,973 cpu_med_ms=1,922
+== [SDRLIKE] X5 d3d11va + hevc_amf cqp23
+wall_med_ms=2,037 wall_min_ms=2,025 cpu_med_ms=1,828
