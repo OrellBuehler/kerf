@@ -36,7 +36,7 @@
 	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
-	import { linkBadge } from '$lib/link-ui';
+	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 
 	const clip = $derived(editor.selectedClip);
@@ -54,6 +54,8 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	const linkInfo = $derived(clip ? linkBadge(editor.timeline, clip, (id) => editor.assetName(id)) : null);
+	const linkedTo = $derived(linkInfo?.partners.map((p) => p.track) ?? []);
 	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
 	const music = $derived(clip ? editor.analysisFor(clip.asset_id)?.music : undefined);
 	const musicOffer = $derived(clip ? fitOffer(track, clip, editor.analysisFor(clip.asset_id)) : { show: false, reason: null });
@@ -683,9 +685,10 @@
 		{#if overlay}
 			{@render overlayEditor(overlay)}
 		{:else if clip}
-			{#if editor.selectedClips.length > 1}
+			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
 				<!-- Several clips are selected but an edit here acts on one. Say which,
-				     rather than let a fader look like it moves them all. -->
+				     rather than let a fader look like it moves them all. A picture and its
+				     linked sound are one selection: that is what a click on either gives. -->
 				<div
 					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
 				>
@@ -709,8 +712,13 @@
 					>
 						{asset?.name ?? 'clip'}
 					</div>
-					<div style="margin-top:3px">
+					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
 						<Badge tone="neutral">{track?.name ?? (kind === 'audio' ? 'audio' : 'video')}</Badge>
+						{#if linkedTo.length > 0}
+							<span title={linkInfo?.title}>
+								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
+							</span>
+						{/if}
 					</div>
 				</div>
 			</div>
@@ -1014,8 +1022,6 @@
 				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ gamma: v }), 'gamma')}
 				</InspectorSection>
 
-			{/if}
-
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<button
@@ -1064,6 +1070,7 @@
 				</div>
 			{/if}
 			</InspectorSection>
+			{/if}
 
 			<InspectorSection title="Transition (in)" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
