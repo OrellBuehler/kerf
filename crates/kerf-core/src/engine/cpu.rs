@@ -510,6 +510,26 @@ pub fn cap_args(args: &mut Vec<String>, threads: usize) {
     splice_caps(args, threads, true);
 }
 
+/// Cap an argv that reads **one frame** from sources that need next to no decoding
+/// (a preview proxy: one intra frame is a few milliseconds) to a single thread
+/// everywhere but the decoders: the filter graph, and the encoder just before the
+/// sink. Thread pools are created and torn down per process, which for a frame that
+/// cheap is a quarter of the whole run; the share of the machine they would be
+/// given has no work to spend them on.
+///
+/// Holds at any budget, 100% included (like [`cap_args`]): it is the nature of the
+/// read, not the user's share, that is being applied. The decoders are the caller's:
+/// one `-threads 1` ahead of each `-i` (this cannot know which inputs are cheap).
+pub fn single_frame_args(args: &mut Vec<String>) {
+    if let Some(sink) = args.len().checked_sub(1) {
+        args.splice(sink..sink, ["-threads".to_string(), "1".to_string()]);
+    }
+    args.splice(
+        0..0,
+        ["-filter_threads", "1", "-filter_complex_threads", "1"].map(String::from),
+    );
+}
+
 /// The one place thread caps are written into an argv: the decode flags at the
 /// front and the encoder's `-threads` just before the sink, when `capped`.
 fn splice_caps(args: &mut Vec<String>, threads: usize, capped: bool) {
@@ -654,6 +674,30 @@ mod tests {
         // The encoder cap sits in the output group: after the last input,
         // immediately before the sink.
         assert_eq!(&args[args.len() - 3..], &["-threads", "1", "out.mp4"]);
+        set_cpu_percent(restore);
+    }
+
+    #[test]
+    fn a_single_frame_read_is_one_thread_at_any_budget() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        for percent in [MIN_CPU_PERCENT, 100] {
+            set_cpu_percent(percent);
+            let mut args: Vec<String> = ["-hide_banner", "-threads", "1", "-i", "p.mp4", "-frames:v", "1", "pipe:1"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            single_frame_args(&mut args);
+            assert_eq!(
+                args.join(" "),
+                "-filter_threads 1 -filter_complex_threads 1 -hide_banner -threads 1 -i p.mp4 -frames:v 1 -threads 1 pipe:1",
+                "at {percent}%"
+            );
+        }
+        // Nothing to cap in an empty argv, and nothing to find a sink in.
+        let mut none: Vec<String> = Vec::new();
+        single_frame_args(&mut none);
+        assert_eq!(none, ["-filter_threads", "1", "-filter_complex_threads", "1"]);
         set_cpu_percent(restore);
     }
 
