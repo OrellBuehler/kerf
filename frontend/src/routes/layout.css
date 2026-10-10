@@ -5,6 +5,7 @@
 @import '@fontsource-variable/geist-mono';
 @import '@fontsource-variable/space-grotesk';
 @import '$lib/styles/kerf-tokens.css';
+@import '$lib/styles/controls.css';
 @import 'dockview/dist/styles/dockview.css';
 @import '$lib/styles/dockview-kerf.css';
 
@@ -87,7 +88,7 @@ html:not(.dark) {
 
 @layer base {
 	* {
-		@apply border-border outline-ring/50;
+		@apply border-border;
 	}
 	html {
 		font-family: var(--font-sans);
@@ -141,12 +142,20 @@ html:not(.dark) {
 	}
 }
 
-/* Native editor controls share a clear keyboard focus and disabled state. */
-button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible {
-	outline: 2px solid var(--kerf-400);
-	outline-offset: 2px;
+/* One keyboard focus indicator for everything that can take focus (`--focus-outline`; sliders draw
+   the same color and width as a ring on the thumb, below). Zero specificity apart from the
+   state, so a control that needs its own placement — an inset ring in a dense strip — can say so.
+   dockview's tabs are role=tab too and draw theirs inset (`dockview-kerf.css`). */
+:where(button, summary, input, select, textarea, a[href], [role='button'], [role='tab']:not(.dv-tab)):focus-visible {
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
 }
-button:disabled { opacity: .5; cursor: not-allowed !important; }
+
+/* A dialog or a menu panel takes focus when it opens so the keyboard has somewhere to start; it is
+   not a control, and a ring around the whole window (a scrim is `inset:0`) says nothing. */
+:is(div, section, aside, nav, ul, ol, form, main)[tabindex='-1']:not([role='tab'], [role='button'], [role='menuitem'], [role='option']):focus-visible {
+	outline: none;
+}
 
 /* Every slider in the editor. Thickness, thumb size / style and the track's
    rounding are theme shape tokens (`lib/theme.ts`); `--slider-accent` is the

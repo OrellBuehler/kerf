@@ -40,16 +40,12 @@
 	{#each WORKSPACE_SPECS as w (w.id)}
 		{@const on = workspace.shown === w.id}
 		<button
+			class="k-tab"
 			data-workspace={w.id}
 			aria-pressed={on}
 			title="{w.label} workspace — {w.hint}"
 			onclick={(e) => choose(e, w.id)}
 			onkeydown={onKey}
-			style="height:22px;padding:0 11px;border-radius:var(--radius-sm);cursor:pointer;font:var(--type-label);border:var(--line-width) solid {on
-				? 'var(--border-strong)'
-				: 'transparent'};background:{on ? 'var(--surface-active)' : 'transparent'};color:{on
-				? 'var(--text-primary)'
-				: 'var(--text-muted)'};box-shadow:{on ? 'inset 0 -2px 0 var(--kerf-500)' : 'none'};transition:background var(--dur-fast) var(--ease-out),color var(--dur-fast) var(--ease-out)"
 			>{w.label}</button
 		>
 	{/each}

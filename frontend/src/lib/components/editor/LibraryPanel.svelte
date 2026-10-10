@@ -192,9 +192,12 @@
 		{#each LIBRARY_TAB_SPECS as t (t.id)}
 			{@const open = !collapsed && t.id === tab}
 			<button
+				class="k-ibtn"
 				role="tab"
 				id="library-tab-{t.id}"
 				data-library-tab={t.id}
+				data-tone="quiet"
+				data-current={t.id === tab ? '' : undefined}
 				aria-selected={open}
 				aria-controls={open ? 'library-content' : undefined}
 				aria-label={t.label}
@@ -202,13 +205,7 @@
 				tabindex={t.id === focusTab ? 0 : -1}
 				onclick={(e) => pick(t.id, e)}
 				onfocus={() => (focusTab = t.id)}
-				style="position:relative;width:36px;height:36px;flex:none;display:inline-flex;align-items:center;justify-content:center;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {open
-					? 'var(--border-strong)'
-					: 'transparent'};background:{open ? 'var(--surface-active)' : 'transparent'};color:{open
-					? 'var(--kerf-400)'
-					: t.id === tab
-						? 'var(--text-secondary)'
-						: 'var(--text-muted)'};transition:background var(--dur-fast) var(--ease-out),color var(--dur-fast) var(--ease-out)"
+				style="position:relative;width:36px;height:36px;flex:none"
 			>
 				<Icon n={t.icon} s={18} />
 			</button>

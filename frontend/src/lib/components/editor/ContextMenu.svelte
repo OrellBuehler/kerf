@@ -127,7 +127,7 @@
 						? 'var(--text-disabled)'
 						: item.danger
 							? 'var(--red-400)'
-							: 'var(--text-primary)'};opacity:{item.disabled ? 0.55 : 1}"
+							: 'var(--text-primary)'};opacity:1"
 					onpointerenter={(e) => {
 						if (!item.disabled) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover)';
 					}}

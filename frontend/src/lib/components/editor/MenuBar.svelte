@@ -595,8 +595,8 @@
 	   stylesheet adds is the ring a keyboard user needs. */
 	.kerf-menu-top:focus-visible,
 	.kerf-menu-item:focus-visible {
-		outline: var(--line-emphasis) solid var(--kerf-400);
-		outline-offset: -1px;
+		outline: var(--focus-outline);
+		outline-offset: calc(var(--focus-offset) * -1);
 	}
 	.kerf-menu-item[aria-disabled='true']:hover {
 		background: transparent;

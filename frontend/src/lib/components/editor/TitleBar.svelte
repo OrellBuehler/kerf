@@ -53,51 +53,47 @@
 			{/if}
 		</div>
 		<button
+			class="k-ibtn"
+			data-on={settings.open ? '' : undefined}
+			data-on-ink="primary"
 			onclick={() => settings.toggle()}
 			title={settings.withShortcut('Settings — performance, appearance and keyboard shortcuts', 'app.settings')}
 			aria-label="Settings"
-			style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {settings.open
-				? 'var(--border-strong)'
-				: 'transparent'};background:{settings.open ? 'var(--surface-active)' : 'transparent'};color:{settings.open
-				? 'var(--text-primary)'
-				: 'var(--text-disabled)'}"
+			style="-webkit-app-region:no-drag;width:26px;height:22px"
 		>
 			<Icon n="settings" s={13} color="currentColor" />
 		</button>
 		<!-- Toasts are gone in seconds; this is where they can be read afterwards.
 		     The badge only turns red when something unread actually failed. -->
 		<button
+			class="k-ibtn"
 			data-notification-bell
+			data-on={notifications.open ? '' : undefined}
+			data-on-ink="primary"
 			onclick={() => notifications.toggle()}
 			title={notifications.unread
 				? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
 				: 'Notifications'}
 			aria-label="Notifications"
-			style="-webkit-app-region:no-drag;position:relative;display:inline-flex;align-items:center;justify-content:center;width:26px;height:22px;border-radius:var(--radius-sm);cursor:pointer;border:var(--line-width) solid {notifications.open
-				? 'var(--border-strong)'
-				: 'transparent'};background:{notifications.open ? 'var(--surface-active)' : 'transparent'};color:{notifications.open
-				? 'var(--text-primary)'
-				: 'var(--text-disabled)'}"
+			style="-webkit-app-region:no-drag;position:relative;width:26px;height:22px"
 		>
 			<Icon n="bell" s={13} color="currentColor" />
 			{#if notifications.unread}
 				<span
-					style="position:absolute;top:0;right:0;min-width:13px;height:13px;padding:0 3px;border-radius:999px;display:grid;place-items:center;font-family:var(--font-mono);font-size:9px;line-height:1;color:var(--text-on-accent);background:{notifications.unreadProblem
+					style="position:absolute;top:0;right:0;min-width:14px;height:14px;padding:0 3px;border-radius:999px;display:grid;place-items:center;font-family:var(--font-mono);font-size:var(--text-2xs);line-height:1;color:var(--text-on-accent);background:{notifications.unreadProblem
 						? 'var(--danger)'
 						: 'var(--kerf-500)'}">{notifications.unread > 99 ? '99+' : notifications.unread}</span
 				>
 			{/if}
 		</button>
 		<button
+			class="k-ibtn"
+			data-accent={available ? '' : undefined}
 			onclick={() => updater.open()}
 			title={available
 				? `Kerf ${updater.update?.version} is available — click to install`
 				: `Kerf ${updater.version} — click to check for updates`}
-			style="-webkit-app-region:no-drag;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;cursor:pointer;font-family:var(--font-mono);font-size:11px;border:var(--line-width) solid {available
-				? 'var(--kerf-500)'
-				: 'transparent'};background:{available
-				? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
-				: 'transparent'};color:{available ? 'var(--text-primary)' : 'var(--text-disabled)'}"
+			style="-webkit-app-region:no-drag;gap:5px;padding:2px 8px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"
 		>
 			{#if available}
 				<Icon n="download" s={12} />
