@@ -39,9 +39,9 @@ export interface RemoveRows {
 }
 
 /** The delete rows of a clip's menu. Four red rows with one trash can between them said
- *  nothing about how they differ, so each kind has its own icon — the trash for removing,
- *  the ripple glyph for closing the gap — and the two that leave the linked clips where they
- *  are carry none, under a rule of their own. */
+ *  nothing about how they differ, so each kind has its own icon — the trash for removing, the
+ *  ripple glyph for closing the gap — and the two that leave the linked clips where they are
+ *  carry none. */
 export function removeRows(o: RemoveRows): MenuItem[] {
 	const n = o.count;
 	const items: MenuItem[] = [
@@ -64,7 +64,6 @@ export function removeRows(o: RemoveRows): MenuItem[] {
 	const reason = o.locked ? `Track ${o.trackName} is locked` : undefined;
 	return [
 		...items,
-		{ type: 'separator' },
 		{ label: 'Remove only this clip', danger: true, disabled: o.locked, reason, action: () => o.removeAlone(false) },
 		{ label: 'Ripple delete only this clip', danger: true, disabled: o.locked, reason, action: () => o.removeAlone(true) }
 	];

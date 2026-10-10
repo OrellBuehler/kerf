@@ -1335,6 +1335,7 @@
 			},
 			{
 				label: t.solo ? 'Clear solo' : 'Solo track',
+				icon: 'headphones',
 				action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
 			},
 			{

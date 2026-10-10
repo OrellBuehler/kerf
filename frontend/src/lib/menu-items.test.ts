@@ -80,8 +80,8 @@ describe('removeRows', () => {
 		expect(r.filter((i) => !i.icon).map((i) => i.label)).toEqual(['Remove only this clip', 'Ripple delete only this clip']);
 	});
 
-	test('"only this clip" sits under its own rule, and only for a linked clip', () => {
-		expect(removeRows({ ...base, linked: true }).some((i) => i.type === 'separator')).toBe(true);
+	test('the menu is no taller for the linked variants than it needs to be: no rule of their own', () => {
+		expect(removeRows({ ...base, linked: true }).some((i) => i.type === 'separator')).toBe(false);
 		expect(removeRows(base).some((i) => i.type === 'separator')).toBe(false);
 	});
 
