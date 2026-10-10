@@ -530,10 +530,12 @@ mod tests {
     /// (`shifts=0`, `overlap=0.25`) — see `.claude/docs/engine-media.md`. Downloads the
     /// ONNX Runtime on first use.
     #[test]
-    #[ignore = "needs the exported model, a PyTorch reference and the ONNX Runtime"]
+    #[ignore = "needs the exported model, a PyTorch reference and the ONNX Runtime: set KERF_DEMUCS_PARITY_DIR"]
+    #[allow(clippy::print_stderr)]
     fn separation_matches_demucs_and_the_stems_sum_to_the_mix() {
         let Some(dir) = std::env::var_os("KERF_DEMUCS_PARITY_DIR").map(PathBuf::from) else {
-            panic!("set KERF_DEMUCS_PARITY_DIR");
+            eprintln!("skipped: set KERF_DEMUCS_PARITY_DIR to compare against PyTorch");
+            return;
         };
         let runtime = ensure_runtime(&mut |_| {}, &|| false).unwrap();
         init_runtime(&runtime).unwrap();
