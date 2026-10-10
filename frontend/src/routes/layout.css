@@ -225,3 +225,40 @@ input[type='range']:focus-visible::-moz-range-thumb {
 [data-surface-hole] {
 	background: transparent !important;
 }
+
+/* Toasts in Kerf's theme (`ui/sonner`): the library's stylesheet is built for a light page, so its
+   shadow is invisible on Dark, its description grey is a literal, and its action is an inverse pill
+   that was the loudest thing on screen. These are the same tokens as a menu: raised surface, the
+   overlay shadow, a ghost action in the accent. */
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] {
+	box-shadow: var(--shadow-md);
+	font-family: var(--font-sans);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-description] {
+	color: var(--text-secondary);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button] {
+	background: transparent;
+	color: var(--kerf-400);
+	border: var(--line-width) solid var(--border-strong);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button]:hover {
+	background: var(--surface-hover);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-button]:focus-visible {
+	box-shadow: none;
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='success'] [data-icon] {
+	color: var(--success);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='error'] [data-icon] {
+	color: var(--danger);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='warning'] [data-icon] {
+	color: var(--warning);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type='info'] [data-icon] {
+	color: var(--info);
+}
