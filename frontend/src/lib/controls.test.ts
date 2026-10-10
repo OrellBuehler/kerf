@@ -58,6 +58,9 @@ describe('controls.css', () => {
 		const veil = selectors(CONTROLS, 'button:not(:disabled)')[0];
 		expect(veil).toContain(':not(.kclip)');
 		expect(veil).toContain(":not([role^='menuitem'])");
+		// dockview's close X and overflow menu have a hover of their own.
+		expect(CONTROLS).toMatch(/\[role='button'\]:not\(\[aria-disabled='true'\]\):not\(\[class\*='dv-'\]\):hover/);
+		expect(veil).toContain(":not([class*='dv-'])");
 	});
 });
 

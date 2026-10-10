@@ -233,17 +233,18 @@
 
 /* A veil over the control's own fill; the colors of these stay inline. Not the clips on the
    timeline (they are the picture, and carry their own hover), nor menu rows (which light
-   themselves from the pointer and the keys alike). */
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):hover,
-[role='button']:not([aria-disabled='true']):hover {
+   themselves from the pointer and the keys alike), nor dockview's own controls (the tab's close
+   X, the overflow menu), which have a hover of theirs. */
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']):hover,
+[role='button']:not([aria-disabled='true']):not([class*='dv-']):hover {
 	box-shadow: var(--hover-fill);
 }
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):active,
-[role='button']:not([aria-disabled='true']):active {
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']):active,
+[role='button']:not([aria-disabled='true']):not([class*='dv-']):active {
 	box-shadow: var(--press-fill);
 }
-button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']),
-[role='button'] {
+button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']),
+[role='button']:not([class*='dv-']) {
 	transition: box-shadow var(--dur-fast) var(--ease-out);
 }
 /* What a disabled control that still carries its colors inline falls back to. The cursor is
