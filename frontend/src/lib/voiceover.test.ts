@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
 	DEFAULT_PREFS,
 	PARAGRAPH_GAP,
@@ -10,8 +10,11 @@ import {
 	estimateSeconds,
 	fmtSpeed,
 	isVoiceoverCancelled,
+	loadDraft,
 	parsePrefs,
+	saveDraft,
 	scriptSegments,
+	scrimCloses,
 	splitSentences,
 	stageLabel,
 	voiceInfo,
@@ -143,5 +146,73 @@ describe('parsePrefs', () => {
 	});
 	test('wrong types fall back field by field', () => {
 		expect(parsePrefs('{"voice":7,"speed":"fast","caption":1,"captionStyle":"x"}')).toEqual(DEFAULT_PREFS);
+	});
+});
+
+/** A `localStorage` the tests can hand the module, or break. */
+function fakeStorage(opts: { throws?: boolean } = {}) {
+	const data = new Map<string, string>();
+	(globalThis as unknown as { localStorage: unknown }).localStorage = {
+		getItem(k: string) {
+			if (opts.throws) throw new Error('blocked');
+			return data.get(k) ?? null;
+		},
+		setItem(k: string, v: string) {
+			if (opts.throws) throw new Error('blocked');
+			data.set(k, v);
+		},
+		removeItem(k: string) {
+			if (opts.throws) throw new Error('blocked');
+			data.delete(k);
+		}
+	};
+	return data;
+}
+
+afterEach(() => {
+	delete (globalThis as unknown as { localStorage?: unknown }).localStorage;
+});
+
+describe('the script draft', () => {
+	test('what was typed is there when the dialog opens again', () => {
+		fakeStorage();
+		expect(loadDraft()).toBe('');
+		saveDraft('Welcome to the show.\n\nToday: bread.');
+		expect(loadDraft()).toBe('Welcome to the show.\n\nToday: bread.');
+	});
+
+	test('emptying the script forgets it, and a blank one is not kept', () => {
+		const data = fakeStorage();
+		saveDraft('Hello.');
+		saveDraft('');
+		expect(data.size).toBe(0);
+		saveDraft('  \n ');
+		expect(data.size).toBe(0);
+		expect(loadDraft()).toBe('');
+	});
+
+	test('a blocked or missing store is no draft and never throws', () => {
+		fakeStorage({ throws: true });
+		expect(loadDraft()).toBe('');
+		expect(() => saveDraft('Hello.')).not.toThrow();
+		delete (globalThis as unknown as { localStorage?: unknown }).localStorage;
+		expect(loadDraft()).toBe('');
+		expect(() => saveDraft('Hello.')).not.toThrow();
+	});
+});
+
+describe('scrimCloses', () => {
+	test('an empty dialog goes with a click outside it', () => {
+		expect(scrimCloses('', false)).toBe(true);
+		expect(scrimCloses('  \n', false)).toBe(true);
+	});
+
+	test('a script that has been typed is not thrown away by one', () => {
+		expect(scrimCloses('Hello.', false)).toBe(false);
+	});
+
+	test('nothing closes it mid-run', () => {
+		expect(scrimCloses('', true)).toBe(false);
+		expect(scrimCloses('Hello.', true)).toBe(false);
 	});
 });

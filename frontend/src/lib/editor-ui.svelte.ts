@@ -28,6 +28,7 @@ import type {
 import { autoSteps, kindInfo, kindOfStage, missingSteps } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
+import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
@@ -96,6 +97,8 @@ class EditorUi {
 	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
 	exportDialog = $state(false);
+	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
+	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
 	 *  export, and whether each shot is framed for each of them first. Held here
 	 *  rather than in the export dialog because the Deliver panel edits the same
