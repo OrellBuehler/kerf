@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { applyPreset, buildSummary, LOUDNESS_TARGETS, loudnessChoice, withLoudness } from './export-presets';
+import {
+	FRAME_RATES,
+	PRESETS,
+	applyPreset,
+	buildSummary,
+	frameRateOptions,
+	LOUDNESS_TARGETS,
+	loudnessChoice,
+	withLoudness
+} from './export-presets';
 import type { LoudnessPreset } from './types';
 
 describe('the loudness target', () => {
@@ -47,5 +56,35 @@ describe('the loudness target', () => {
 		// No sound in the file, no target to name.
 		expect(buildSummary(withLoudness(base, 'apple'), true, false)).not.toContain('LUFS');
 		expect(buildSummary({ ...withLoudness(base, 'apple'), include_audio: false }, true, true)).not.toContain('LUFS');
+	});
+});
+
+describe('the frame-rate select', () => {
+	// The dialog's select shows `String(fps)` (or "source"); a value with no option renders blank.
+	const shown = (fps: number | null | undefined) =>
+		frameRateOptions(fps).some((f) => (f.value ? String(f.value) : 'source') === (fps ? String(fps) : 'source'));
+
+	test('every preset opens on a frame rate the select has an option for', () => {
+		for (const p of PRESETS) expect(shown(applyPreset(p.id).fps), p.id).toBe(true);
+	});
+
+	test('the GIF preset lands on 15, and 12 and 10 are there to go lower', () => {
+		const values = FRAME_RATES.map((f) => f.value);
+		expect(applyPreset('gif').fps).toBe(15);
+		expect(values).toContain(15);
+		expect(values).toContain(12);
+		expect(values).toContain(10);
+	});
+
+	test('a rate the list does not carry is added rather than leaving the select blank', () => {
+		expect(shown(18)).toBe(true);
+		expect(frameRateOptions(18).at(-1)).toEqual({ label: '18', value: 18 });
+		expect(frameRateOptions(18)).toHaveLength(FRAME_RATES.length + 1);
+	});
+
+	test('a listed rate, or the source rate, adds nothing', () => {
+		expect(frameRateOptions(30)).toBe(FRAME_RATES);
+		expect(frameRateOptions(null)).toBe(FRAME_RATES);
+		expect(frameRateOptions(undefined)).toBe(FRAME_RATES);
 	});
 });

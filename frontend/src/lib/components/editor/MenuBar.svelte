@@ -93,6 +93,11 @@
 	let bar = $state<HTMLElement | null>(null);
 	/** Where focus was before the bar took it, to give back when it lets go. */
 	let returnTo: HTMLElement | null = null;
+	/** A menu entry that opened a dialog was run from the keyboard. The bar's tab stop is then where focus goes back to
+	 *  when the dialog it opened closes and nothing else had it (`modal.ts`) — for anyone else
+	 *  focus stays off the bar, or Space would open a menu instead of playing. It lasts only until
+	 *  the user moves on: a pointer press, Tab, or focus given back (Escape, a chord). */
+	let byKeys = $state(false);
 	let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 	/** The title the pointer opened by arriving on it while another menu was open. A
 	 *  click on it then is the same gesture finishing, not a request to close it. */
@@ -133,6 +138,7 @@
 	}
 
 	function giveBackFocus() {
+		byKeys = false;
 		const to = returnTo;
 		returnTo = null;
 		if (to && to.isConnected && !to.hasAttribute('inert')) to.focus();
@@ -168,12 +174,14 @@
 		if (focusFirst && first !== undefined) void focusPath([...path, first]);
 	}
 
-	function run(e: MenuEntry) {
+	function run(e: MenuEntry, keys = false) {
 		if (e.kind === 'separator' || e.kind === 'submenu') return;
 		if ('disabled' in e && e.disabled) return;
 		closeAll(true);
 		if (e.kind === 'action') onAction(e.id);
 		else onCommand(e.command);
+		// Only a command that opened a dialog has a focus to give back later.
+		byKeys = keys && modal;
 	}
 
 	// ---- pointer -----------------------------------------------------------------
@@ -225,6 +233,7 @@
 
 	function onWindowPointerDown(ev: PointerEvent) {
 		altTap.pointerDown();
+		byKeys = false;
 		if (!bar || !(ev.target instanceof Node)) return;
 		if (bar.contains(ev.target)) {
 			noteReturn();
@@ -268,12 +277,14 @@
 		const k = e.key;
 
 		if (k === 'Tab') {
+			byKeys = false;
 			closeAll();
 			return;
 		}
 		if (k === 'Escape') {
 			handled();
 			if (top) {
+				byKeys = false;
 				if (open.length > 0) {
 					closeAll();
 					el(path)?.focus();
@@ -345,7 +356,7 @@
 			handled();
 			if (!entry) return;
 			if (entry.kind === 'submenu') openSub(path, true);
-			else run(entry);
+			else run(entry, true);
 		} else if (k.length === 1 && /\S/.test(k)) {
 			// A letter belongs to the menu while one is open: it jumps, or does nothing,
 			// but is never the razor tool.
@@ -501,7 +512,7 @@
 							if (hot === k && !(item.kind === 'submenu' && isOpen(p))) hot = null;
 						}}
 						onfocus={() => (hot = k)}
-						style="display:grid;grid-template-columns:16px minmax(0,1fr) auto 12px;align-items:center;column-gap:8px;width:100%;height:26px;padding:0 6px 0 8px;border:none;border-radius:var(--radius-sm);text-align:left;font-size:12.5px;white-space:nowrap;cursor:{off
+						style="display:grid;grid-template-columns:16px minmax(0,1fr) auto 12px;align-items:center;column-gap:8px;width:100%;height:26px;padding:0 6px 0 8px;border:none;border-radius:var(--radius-sm);text-align:left;font-size:var(--text-sm);white-space:nowrap;cursor:{off
 							? 'default'
 							: 'pointer'};background:{hot === k || (item.kind === 'submenu' && isOpen(p))
 							? 'var(--surface-hover)'
@@ -516,7 +527,7 @@
 						</span>
 						<span style="overflow:hidden;text-overflow:ellipsis">{entryLabel(item)}</span>
 						<span
-							style="font-family:var(--font-mono);font-size:10.5px;padding-left:18px;color:{off
+							style="font-family:var(--font-mono);font-size:var(--text-xs);padding-left:18px;color:{off
 								? 'var(--text-disabled)'
 								: 'var(--text-muted)'}">{accel(item)}</span
 						>
@@ -561,6 +572,7 @@
 				aria-expanded={open[0] === i}
 				aria-label={compact ? 'Menu' : undefined}
 				tabindex={active === i ? 0 : -1}
+				data-focus-return={byKeys && active === i ? '' : undefined}
 				class="kerf-menu-top"
 				onclick={() => topClick(i)}
 				onpointerenter={() => topEnter(i)}
@@ -572,7 +584,7 @@
 					active = i;
 					noteReturn();
 				}}
-				style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 {compact ? 7 : 9}px;border-radius:var(--radius-sm);cursor:pointer;font:var(--type-label);border:var(--line-width) solid {open[0] ===
+				style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 {compact ? 7 : 9}px;border-radius:var(--radius-sm);cursor:pointer;font:var(--type-ui);border:var(--line-width) solid {open[0] ===
 				i
 					? 'var(--border-strong)'
 					: 'transparent'};background:{open[0] === i
@@ -595,8 +607,8 @@
 	   stylesheet adds is the ring a keyboard user needs. */
 	.kerf-menu-top:focus-visible,
 	.kerf-menu-item:focus-visible {
-		outline: var(--line-emphasis) solid var(--kerf-400);
-		outline-offset: -1px;
+		outline: var(--focus-outline);
+		outline-offset: calc(var(--focus-offset) * -1);
 	}
 	.kerf-menu-item[aria-disabled='true']:hover {
 		background: transparent;

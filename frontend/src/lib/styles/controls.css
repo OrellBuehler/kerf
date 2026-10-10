@@ -1,0 +1,271 @@
+/* =============================================================
+   Interactive states for the chrome's controls.
+
+   An inline `style=` cannot say `:hover`, and an inline background beats any
+   stylesheet rule, so a control that is to react to the pointer cannot carry its
+   colors inline. The shared ones — `Btn`, `IconBtn`, the workspace tabs, the
+   title bar's buttons, the library rail — are classes here, and take their
+   resting, hovered, pressed, on and disabled colors from tokens, so every theme
+   gets all five. Everything else that is a plain <button> or role=button and
+   keeps its colors inline gets the veil at the bottom: it paints over whatever
+   fill the control has, which is the one thing an inline `background:` cannot
+   fight (inline styles do not set `box-shadow`).
+   ============================================================= */
+
+/* ---------- Btn ---------- */
+
+.k-btn {
+	--k-h: 34px;
+	--k-px: 14px;
+	--k-edge-off: var(--border-default);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 7px;
+	height: var(--k-h);
+	padding: 0 var(--k-px);
+	font-family: var(--font-sans);
+	font-size: var(--text-base);
+	font-weight: 500;
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+	border: var(--line-width) solid var(--k-edge);
+	border-radius: var(--radius-sm);
+	background: var(--k-fill);
+	color: var(--k-ink);
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out),
+		box-shadow var(--dur-fast) var(--ease-out);
+}
+.k-btn[data-size='sm'] {
+	--k-h: 30px;
+	--k-px: 10px;
+	font-size: var(--text-sm);
+}
+.k-btn[data-size='lg'] {
+	--k-h: 38px;
+	--k-px: 18px;
+	font-size: var(--text-md);
+}
+
+/* A filled button steps to the next shade of its own hue: 600 under the pointer, 700 pressed. */
+.k-btn[data-variant='primary'] {
+	--k-fill: var(--kerf-500);
+	--k-ink: var(--text-on-accent);
+	--k-edge: var(--kerf-500);
+	--k-fill-hover: var(--kerf-600);
+	--k-edge-hover: var(--kerf-600);
+	--k-fill-press: var(--kerf-700);
+	--k-edge-press: var(--kerf-700);
+}
+.k-btn[data-variant='agent'] {
+	--k-fill: var(--agent-500);
+	--k-ink: var(--agent-fg);
+	--k-edge: var(--agent-500);
+	--k-fill-hover: var(--agent-600);
+	--k-edge-hover: var(--agent-600);
+	--k-fill-press: var(--agent-700);
+	--k-edge-press: var(--agent-700);
+}
+.k-btn[data-variant='secondary'] {
+	--k-fill: var(--surface-hover);
+	--k-ink: var(--text-primary);
+	--k-edge: var(--border-strong);
+	--k-fill-hover: var(--surface-active);
+	--k-fill-press: var(--surface-active);
+}
+.k-btn[data-variant='ghost'] {
+	--k-fill: transparent;
+	--k-ink: var(--text-secondary);
+	--k-edge: transparent;
+	--k-edge-off: transparent;
+	--k-fill-hover: var(--surface-hover);
+	--k-ink-hover: var(--text-primary);
+	--k-fill-press: var(--surface-active);
+	--k-ink-press: var(--text-primary);
+}
+.k-btn[data-variant='destructive'] {
+	--k-fill: transparent;
+	--k-ink: var(--red-400);
+	--k-edge: var(--red-600);
+	--k-fill-hover: var(--danger-surface);
+	--k-fill-press: color-mix(in srgb, var(--red-500) 22%, transparent);
+}
+.k-btn:hover:not(:disabled) {
+	background: var(--k-fill-hover, var(--k-fill));
+	border-color: var(--k-edge-hover, var(--k-edge));
+	color: var(--k-ink-hover, var(--k-ink));
+}
+.k-btn:active:not(:disabled) {
+	background: var(--k-fill-press, var(--k-fill-hover, var(--k-fill)));
+	border-color: var(--k-edge-press, var(--k-edge-hover, var(--k-edge)));
+	color: var(--k-ink-press, var(--k-ink-hover, var(--k-ink)));
+}
+.k-btn[data-variant='secondary']:active:not(:disabled) {
+	box-shadow: inset 0 1px 2px color-mix(in srgb, var(--shadow-color) calc(var(--shadow-strength) * 0.5), transparent);
+}
+/* Off is a plain outline in the disabled ink, not a dimmed copy of the live look: the old blanket
+   50 % made a secondary label 2.7:1 and an amber button a washed-out amber. */
+.k-btn:disabled {
+	background: transparent;
+	border-color: var(--k-edge-off);
+	color: var(--text-disabled);
+	box-shadow: none;
+	cursor: default;
+	opacity: 1;
+}
+
+/* ---------- IconBtn, the title bar's buttons, the library rail ---------- */
+
+.k-ibtn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	border: var(--line-width) solid transparent;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	color: var(--k-ink, var(--text-secondary));
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out),
+		box-shadow var(--dur-fast) var(--ease-out);
+}
+.k-ibtn[data-tone='quiet'] {
+	--k-ink: var(--text-muted);
+}
+.k-ibtn[data-tone='quiet'][data-current] {
+	--k-ink: var(--text-secondary);
+}
+.k-ibtn:hover:not(:disabled) {
+	background: var(--surface-hover);
+	color: var(--text-primary);
+}
+.k-ibtn:active:not(:disabled) {
+	background: var(--surface-active);
+	color: var(--text-primary);
+}
+/* On: a toggle that is pressed, a tab that is open, a dialog that is showing. */
+.k-ibtn {
+	--k-on-ink: var(--kerf-400);
+}
+.k-ibtn[data-on-ink='primary'] {
+	--k-on-ink: var(--text-primary);
+}
+.k-ibtn[aria-pressed='true'],
+.k-ibtn[aria-selected='true'],
+.k-ibtn[data-on] {
+	background: var(--surface-active);
+	border-color: var(--border-strong);
+	color: var(--k-on-ink);
+}
+.k-ibtn[aria-pressed='true']:hover:not(:disabled),
+.k-ibtn[aria-selected='true']:hover:not(:disabled),
+.k-ibtn[data-on]:hover:not(:disabled) {
+	background: var(--surface-active);
+	color: var(--k-on-ink);
+	box-shadow: var(--hover-fill);
+}
+.k-ibtn[aria-pressed='true']:active:not(:disabled),
+.k-ibtn[aria-selected='true']:active:not(:disabled),
+.k-ibtn[data-on]:active:not(:disabled) {
+	background: var(--surface-active);
+	color: var(--k-on-ink);
+	box-shadow: var(--press-fill);
+}
+/* An update is waiting: the version chip lights as the amber primary. */
+.k-ibtn[data-accent] {
+	border-color: var(--kerf-500);
+	background: color-mix(in srgb, var(--kerf-500) 22%, transparent);
+	color: var(--text-primary);
+}
+.k-ibtn[data-accent]:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--kerf-500) 34%, transparent);
+}
+.k-ibtn[data-accent]:active:not(:disabled) {
+	background: color-mix(in srgb, var(--kerf-500) 44%, transparent);
+}
+.k-ibtn:disabled {
+	background: transparent;
+	border-color: transparent;
+	color: var(--text-disabled);
+	box-shadow: none;
+	cursor: default;
+	opacity: 1;
+}
+
+/* The library rail sits in a 40 px column that clips what overflows it, and its buttons are 36 px:
+   an outset ring would be cut off, so its focus outline is drawn inside the button (as dock tabs'). */
+.k-ibtn[role='tab']:focus-visible {
+	outline-offset: calc(var(--focus-offset) * -1);
+}
+
+/* ---------- Workspace tabs ---------- */
+
+.k-tab {
+	height: 22px;
+	padding: 0 11px;
+	cursor: pointer;
+	font: var(--type-ui);
+	border: var(--line-width) solid transparent;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	color: var(--text-muted);
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out);
+}
+.k-tab:hover {
+	background: var(--surface-hover);
+	color: var(--text-primary);
+}
+.k-tab:active {
+	background: var(--surface-active);
+	color: var(--text-primary);
+}
+.k-tab[aria-pressed='true'] {
+	background: var(--surface-active);
+	border-color: var(--border-strong);
+	color: var(--text-primary);
+	box-shadow: inset 0 -2px 0 var(--kerf-500);
+}
+
+/* ---------- Text fields drawn as a wrapper ---------- */
+
+/* A search box or the agent's composer is a bordered wrapper around a bare <input> with no outline
+   of its own, so the wrapper carries the one focus outline while the *input* has keyboard focus (not
+   `:focus-within`: focusing the Queue button beside the composer's input must not ring the field too). */
+.k-field:has(input:focus-visible) {
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
+}
+
+/* ---------- Everything else that is a button ---------- */
+
+/* A veil over the control's own fill; the colors of these stay inline. Not the clips on the
+   timeline (they are the picture, and carry their own hover), nor menu rows (which light
+   themselves from the pointer and the keys alike), nor dockview's own controls (the tab's close
+   X, the overflow menu), which have a hover of theirs. */
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
+[role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):hover {
+	box-shadow: var(--hover-fill);
+}
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
+[role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):active {
+	box-shadow: var(--press-fill);
+}
+button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
+[role='button']:not([class^='dv-']):not([class*=' dv-']) {
+	transition: box-shadow var(--dur-fast) var(--ease-out);
+}
+/* What a disabled control that still carries its colors inline falls back to. The cursor is
+   `default`: a red-circle `not-allowed` on a greyed Undo reads as an error. */
+button:disabled {
+	opacity: 0.5;
+	cursor: default !important;
+}

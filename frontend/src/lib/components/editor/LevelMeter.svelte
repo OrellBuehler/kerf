@@ -83,14 +83,14 @@
 		width: 20px;
 		font-family: var(--font-mono);
 		font-weight: 500;
-		color: var(--text-disabled);
+		color: var(--text-muted);
 	}
 	.mark {
 		position: absolute;
 		right: 0;
 		transform: translateY(50%);
 		line-height: 1;
-		font-size: 9px;
+		font-size: var(--text-2xs);
 		white-space: nowrap;
 	}
 	.channels {

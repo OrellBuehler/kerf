@@ -5,6 +5,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
 	import { agentStatus, confirmAction } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
@@ -366,8 +367,8 @@
 			{#if t.status !== 'ready'}
 				<button
 					title="Remove from queue"
-					onclick={() => agent.remove(t.id)}
-					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:var(--text-disabled);cursor:pointer"
+					onclick={() => dismissTask(t.id)}
+					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:var(--text-muted);cursor:pointer"
 				>
 					<Icon n="plus" s={13} style="transform:rotate(45deg)" />
 				</button>
@@ -394,23 +395,24 @@
 			</div>
 		{/if}
 		{#if t.status === 'ready'}
-			{#if staged?.task_id === t.id}
+			{#if staged && readyCard(t, staged) === 'reviewing'}
 				<div style="font-size:12px;color:var(--agent-300);margin-top:8px;padding-left:21px">
-					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} above — applying accepts them
+					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} in the review above — apply or discard them there
+				</div>
+			{:else}
+				<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
+					<button
+						onclick={() => resolveReady(t.id)}
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+						>Apply</button
+					>
+					<button
+						onclick={() => dismissTask(t.id)}
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+						>Dismiss</button
+					>
 				</div>
 			{/if}
-			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
-				<button
-					onclick={() => agent.resolve(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
-					>Apply</button
-				>
-				<button
-					onclick={() => agent.remove(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
-					>Dismiss</button
-				>
-			</div>
 		{/if}
 	</div>
 {/snippet}
@@ -480,7 +482,7 @@
 					{#each groups as group (group.label)}
 						<div>
 							<div
-								style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-disabled);margin-bottom:4px"
+								style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted);margin-bottom:4px"
 							>
 								{group.label}
 							</div>
@@ -653,7 +655,7 @@
 						</button>
 						{#if rev.current}
 							<span
-								style="display:inline-flex;align-items:center;gap:4px;font-family:var(--font-mono);font-size:9px;color:var(--green-400)"
+								style="display:inline-flex;align-items:center;gap:4px;font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--green-400)"
 							>
 								<span style="width:6px;height:6px;border-radius:50%;background:var(--green-500)"></span>now
 							</span>
@@ -671,13 +673,13 @@
 						{@const d = revisionDiffs[rev.seq]}
 						<div style="padding:2px 4px 8px 26px;display:flex;flex-direction:column;gap:2px">
 							{#if d === undefined}
-								<span style="font-size:12px;color:var(--text-disabled)">Reading the change…</span>
+								<span style="font-size:12px;color:var(--text-muted)">Reading the change…</span>
 							{:else if d === null}
-								<span style="font-size:12px;color:var(--text-disabled)"
+								<span style="font-size:12px;color:var(--text-muted)"
 									>Change details are available in the desktop app.</span
 								>
 							{:else if d.entries.length === 0}
-								<span style="font-size:12px;color:var(--text-disabled)">Changed nothing.</span>
+								<span style="font-size:12px;color:var(--text-muted)">Changed nothing.</span>
 							{:else}
 								<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)"
 									>{diffHeadline(d)}</span
@@ -707,6 +709,7 @@
 		style="flex:none;padding:12px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:9px"
 	>
 		<div
+			class="k-field"
 			style="display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;background:var(--surface-inset);border:var(--line-width) solid var(--input);border-radius:var(--radius-sm);opacity:{disabled
 				? 0.5
 				: 1}"

@@ -76,7 +76,8 @@ import {
 	Unlink2,
 	Menu,
 	Music2,
-	Layers
+	Layers,
+	Headphones
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -162,7 +163,8 @@ export const icons: Record<string, LucideIcon> = {
 	// Music: the song a clip is fitted from.
 	'music': Music2,
 	// Stems: the parts a sound is split into, stacked.
-	'layers': Layers
+	'layers': Layers,
+	'headphones': Headphones
 };
 
 export type IconName = keyof typeof icons;

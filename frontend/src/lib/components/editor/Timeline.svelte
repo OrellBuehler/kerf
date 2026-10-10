@@ -76,6 +76,7 @@
 	import { linkPartners } from '$lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
 	import { analyzeSubmenuItem } from '$lib/analyze-menu';
+	import { muteItem, removeRows } from '$lib/menu-items';
 	import { doneCount, doneSummary } from '$lib/analysis-steps';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
@@ -143,7 +144,7 @@
 	/** Shared look for the one-letter S / L track flags. */
 	const flagBtn = (on: boolean, accent: string) =>
 		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
-		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-disabled)'}`;
+		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-muted)'}`;
 
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
@@ -1329,12 +1330,12 @@
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
 			{ type: 'separator' },
 			{
-				label: t.muted ? (t.kind === 'video' ? 'Show track' : 'Unmute track') : t.kind === 'video' ? 'Hide track' : 'Mute track',
-				icon: t.muted ? 'eye' : 'eye-off',
+				...muteItem(t),
 				action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
 			},
 			{
 				label: t.solo ? 'Clear solo' : 'Solo track',
+				icon: 'headphones',
 				action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
 			},
 			{
@@ -1387,7 +1388,6 @@
 			{
 				label: 'Split at playhead',
 				icon: 'Scissors',
-				shortcut: settings.shortcut('tool.razor'),
 				disabled: !within || !!t.locked,
 				action: () => {
 					// The playhead can be anywhere between frames; the cut is on one.
@@ -1510,41 +1510,17 @@
 				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
 			},
 			{ type: 'separator' },
-			{
-				label: n > 1 ? `Remove ${n} clips` : 'Remove',
-				icon: 'trash',
-				shortcut: settings.shortcut('edit.delete'),
-				danger: true,
-				action: () => removeClip(c.id, false)
-			},
-			{
-				label: n > 1 ? `Ripple delete ${n} clips` : 'Ripple delete',
-				icon: 'trash',
-				shortcut: settings.shortcut('edit.rippleDelete'),
-				danger: true,
-				action: () => removeClip(c.id, true)
-			},
-			// Delete the picture and keep its sound, or the other way round: `link: false`.
-			...(linked
-				? [
-						{
-							label: 'Remove only this clip',
-							icon: 'trash',
-							danger: true,
-							disabled: !!t.locked,
-							reason: t.locked ? `Track ${t.name} is locked` : undefined,
-							action: () => removeAlone(c.id, false)
-						} satisfies MenuItem,
-						{
-							label: 'Ripple delete only this clip',
-							icon: 'trash',
-							danger: true,
-							disabled: !!t.locked,
-							reason: t.locked ? `Track ${t.name} is locked` : undefined,
-							action: () => removeAlone(c.id, true)
-						} satisfies MenuItem
-					]
-				: [])
+			// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
+			...removeRows({
+				count: n,
+				linked,
+				locked: !!t.locked,
+				trackName: t.name,
+				removeKey: settings.shortcut('edit.delete'),
+				rippleKey: settings.shortcut('edit.rippleDelete'),
+				remove: (ripple) => removeClip(c.id, ripple),
+				removeAlone: (ripple) => removeAlone(c.id, ripple)
+			})
 		]);
 	}
 
@@ -1877,7 +1853,6 @@
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
 			{ type: 'separator' },
-			{ type: 'separator' },
 			{
 				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
 				icon: 'copy',
@@ -1991,7 +1966,7 @@
 			{@render toolBtn(settings.withShortcut('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
 		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
-		<span title="Length of the cut" style="font-family:var(--font-mono);font-size:10px;color:var(--text-disabled)">{fmt(duration)}</span>
+		<span title="Length of the cut" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
 				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}{hasLinkedClips ? `. ${ALT_HINT}` : ''}"
@@ -2003,7 +1978,7 @@
 			<span
 				data-alt-chip
 				title={ALT_HINT}
-				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--warning);background:var(--warning-surface)"
+				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--orange-400);background:var(--warning-surface)"
 				><Icon n="unlink" s={10} />links off</span
 			>
 		{/if}
@@ -2075,7 +2050,7 @@
 				onclick={() => (ui.snap = !ui.snap)}
 				style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{ui.snap
 					? 'var(--surface-hover)'
-					: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+					: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-muted)'}"
 				>{ui.snap ? 'snap on' : 'snap off'}</button
 			>
 			<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
@@ -2091,7 +2066,7 @@
 					? 'var(--kerf-400)'
 					: 'var(--border-strong)'};background:{editor.rippleMode
 					? 'var(--selection-fill)'
-					: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-disabled)'}"
+					: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-muted)'}"
 				><Icon n="between-horizontal-start" s={12} />Ripple</button
 			>
 			<span style="display:inline-flex;align-items:center;gap:6px">
@@ -2110,7 +2085,7 @@
 								: 'var(--border-strong)'};background:{allHeight === p ? 'var(--selection-fill)' : 'transparent'};color:{allHeight ===
 							p
 								? 'var(--kerf-300)'
-								: 'var(--text-disabled)'}"><HeightGlyph preset={p} /></button
+								: 'var(--text-muted)'}"><HeightGlyph preset={p} /></button
 						>
 					{/each}
 				</div>
@@ -2123,7 +2098,7 @@
 						? 'var(--kerf-400)'
 						: 'var(--border-strong)'};background:{ui.minimap ? 'var(--selection-fill)' : 'transparent'};color:{ui.minimap
 						? 'var(--kerf-300)'
-						: 'var(--text-disabled)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
+						: 'var(--text-muted)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
 				>
 			</span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
@@ -2233,7 +2208,7 @@
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
-					style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:var(--text-disabled)"
+					style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:var(--text-muted)"
 					><Icon n="plus" s={12} /></button
 				>
 			</div>
@@ -2251,7 +2226,7 @@
 						aria-haspopup="menu"
 						onclick={(e) => openHeightMenu(e, t)}
 						style="flex:none;display:inline-flex;align-items:center;gap:1px;min-height:26px;padding:0;background:none;border:none;cursor:pointer;font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary)"
-						>{t.name}<Icon n="chevron-down" s={10} color="var(--text-disabled)" /></button
+						>{t.name}<Icon n="chevron-down" s={10} color="var(--text-muted)" /></button
 					>
 					<!-- No "Video"/"Audio" caption: the name (V1 / A1) and the eye vs
 					     speaker icon both already say the kind, and the row now carries
@@ -2268,7 +2243,7 @@
 								? 'var(--kerf-500)'
 								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
 								? 'var(--text-on-accent)'
-								: 'var(--text-disabled)'};font-size:12px;font-weight:600;min-height:26px;padding:2px 4px;flex:none"
+								: 'var(--text-muted)'};font-size:12px;font-weight:600;min-height:26px;padding:2px 4px;flex:none"
 							>DUCK</button
 						>
 					{/if}
@@ -2285,7 +2260,7 @@
 						onclick={() => void editor.setTrackMuted(t.id, !t.muted).catch(err)}
 						style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:{t.muted
 							? 'var(--red-500)'
-							: 'var(--text-disabled)'}"
+							: 'var(--text-muted)'}"
 						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
 					>
 					<button
@@ -2306,7 +2281,7 @@
 						title="Remove track"
 						aria-label="Remove track"
 						onclick={() => onRemoveTrack(t)}
-						style="background:none;border:none;cursor:pointer;color:var(--text-disabled);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
+						style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
 						><Icon n="x" s={12} /></button
 					>
 				</div>
@@ -2369,7 +2344,7 @@
 			>
 				{#each ticks as t (t.k)}
 					<span
-						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-disabled);pointer-events:none"
+						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-muted);pointer-events:none"
 						>{tickLabel(t.k, tickStep)}</span
 					>
 				{/each}
@@ -2421,11 +2396,11 @@
 									else if (e.key === 'Escape') renaming = null;
 									e.stopPropagation();
 								}}
-								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:9px;padding:1px 3px;border-radius:3px;border:var(--line-width) solid {accent};background:var(--surface-inset);color:var(--text-primary)"
+								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:var(--text-2xs);padding:1px 3px;border-radius:3px;border:var(--line-width) solid {accent};background:var(--surface-inset);color:var(--text-primary)"
 							/>
 						{:else}
 							<span
-								style="position:relative;flex:none;margin-left:3px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;font-weight:600;line-height:1;padding:2px 4px;border-radius:3px;background:{accent};color:var(--text-on-accent);pointer-events:none"
+								style="position:relative;flex:none;margin-left:3px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-2xs);font-weight:600;line-height:1;padding:2px 4px;border-radius:3px;background:{accent};color:var(--text-on-accent);pointer-events:none"
 								>{m.name}</span
 							>
 						{/if}
@@ -2478,7 +2453,7 @@
 
 			{#if !hasClips}
 				<div
-					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-disabled);font-size:12px"
+					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-muted);font-size:12px"
 				>
 					Timeline empty — import media and queue a cut
 				</div>
@@ -2497,7 +2472,7 @@
 			>
 				{#if editor.overlays.length === 0}
 					<span
-						style="position:absolute;left:8px;top:0;bottom:0;display:flex;align-items:center;font-size:11px;color:var(--text-disabled);pointer-events:none;white-space:nowrap"
+						style="position:absolute;left:8px;top:0;bottom:0;display:flex;align-items:center;font-size:11px;color:var(--text-muted);pointer-events:none;white-space:nowrap"
 						>Titles and captions appear here</span
 					>
 				{/if}
@@ -2655,7 +2630,7 @@
 								{@const sp = c.speed ?? 1}
 								<span
 									title="Speed {sp}×"
-									style="position:absolute;right:3px;top:3px;font-size:9px;font-weight:700;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);border-radius:3px;padding:1px 4px;pointer-events:none"
+									style="position:absolute;right:3px;top:3px;font-size:var(--text-2xs);font-weight:700;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);border-radius:3px;padding:1px 4px;pointer-events:none"
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
 							{/if}

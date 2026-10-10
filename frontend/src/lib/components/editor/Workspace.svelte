@@ -71,7 +71,7 @@
 	function createWatermarkComponent() {
 		const element = document.createElement('div');
 		element.style.cssText =
-			'display:grid;place-items:center;height:100%;font-size:12px;color:var(--text-disabled)';
+			'display:grid;place-items:center;height:100%;font-size:12px;color:var(--text-muted)';
 		element.textContent = 'Open a panel from the Window menu';
 		return { element, init() {} };
 	}

@@ -5,6 +5,7 @@
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import { trapFocus } from '$lib/modal';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '$lib/api';
@@ -21,8 +22,11 @@
 		estimateSeconds,
 		fmtSpeed,
 		isVoiceoverCancelled,
+		loadDraft,
 		loadPrefs,
+		saveDraft,
 		savePrefs,
+		scrimCloses,
 		stageLabel,
 		wordCount,
 		type VoiceoverPrefill
@@ -34,7 +38,10 @@
 	// The dialog opens once with what it is given; a later change is not its business.
 	const start = untrack(() => prefill);
 
-	let text = $state(start?.text ?? '');
+	/** A script of its own is kept as it is typed and comes back when the dialog does; one
+	 *  regenerated from an existing voiceover is that voiceover's, not a draft. */
+	const keepDraft = start?.text === undefined;
+	let text = $state(start?.text ?? loadDraft());
 	let voice = $state(start?.voice ?? prefs.voice);
 	let speed = $state(clampSpeed(start?.speed ?? prefs.speed));
 	let place = $state<'playhead' | 'append'>('playhead');
@@ -49,10 +56,8 @@
 	let cancelling = $state(false);
 	let progress = $state<VoiceoverProgress | null>(null);
 
-	let dialogEl = $state<HTMLDivElement | null>(null);
-	let textEl = $state<HTMLTextAreaElement | null>(null);
 	$effect(() => {
-		(textEl ?? dialogEl)?.focus();
+		if (keepDraft) saveDraft(text);
 	});
 
 	$effect(() => {
@@ -97,6 +102,7 @@
 				captions: caption ? { style: captionStyle } : undefined
 			});
 			toast.success(caption ? 'Voiceover added and captioned' : 'Voiceover added');
+			if (keepDraft) saveDraft('');
 			onClose();
 		} catch (e) {
 			// A stop is the user's own doing — back to the form, no notice.
@@ -128,12 +134,12 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	bind:this={dialogEl}
+	use:trapFocus={{ initial: 'textarea', rescue: true }}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Voiceover"
 	tabindex="-1"
-	onclick={() => !generating && onClose()}
+	onclick={() => scrimCloses(text, generating) && onClose()}
 	onkeydown={(e) => {
 		if (e.key === 'Escape' && !generating) onClose();
 		e.stopPropagation();
@@ -175,7 +181,6 @@
 			<div style="display:flex;flex-direction:column;gap:5px">
 				<span style={labelCss}>Script</span>
 				<textarea
-					bind:this={textEl}
 					bind:value={text}
 					rows="7"
 					placeholder="Write what the voice should say. A blank line makes a longer pause."
@@ -251,7 +256,7 @@
 						</button>
 					{/each}
 				{:else}
-					<span style="font-size:12px;color:var(--text-disabled)">No captions are added.</span>
+					<span style="font-size:12px;color:var(--text-muted)">No captions are added.</span>
 				{/if}
 			</div>
 		</fieldset>
@@ -276,7 +281,7 @@
 							></div>
 						</div>
 					</div>
-					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>
+					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}
 					</Btn>
 				</div>
@@ -284,7 +289,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="mic" disabled={!canGenerate} onclick={generate}>Generate</Btn>
+					<Btn variant="primary" size="md" icon="mic" data-rescue disabled={!canGenerate} onclick={generate}>Generate</Btn>
 				</div>
 			{/if}
 		</div>

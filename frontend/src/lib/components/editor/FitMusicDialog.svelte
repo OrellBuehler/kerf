@@ -111,7 +111,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	use:trapFocus
+	use:trapFocus={{ rescue: true }}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Fit music to video"
@@ -196,7 +196,7 @@
 				{:else if problem}
 					<span style="grid-column:1 / -1;font-size:12px;line-height:1.4;color:var(--text-muted)">{problem}</span>
 				{:else}
-					<span style="grid-column:1 / -1;font-size:12px;color:var(--text-disabled)">Planning…</span>
+					<span style="grid-column:1 / -1;font-size:12px;color:var(--text-muted)">Planning…</span>
 				{/if}
 			</div>
 
@@ -216,7 +216,7 @@
 				/>
 				<span style="font-size:12px;color:var(--text-secondary)">Fade out at the end</span>
 				{#if fit && !overruns}
-					<span style="font-size:11px;color:var(--text-disabled)">— nothing runs over</span>
+					<span style="font-size:11px;color:var(--text-muted)">— nothing runs over</span>
 				{/if}
 			</label>
 
@@ -230,7 +230,7 @@
 			<div style="display:flex;align-items:center;gap:8px">
 				<div style="flex:1"></div>
 				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-				<Btn variant="primary" size="md" icon="music" disabled={!canApply} onclick={apply}>Fit music</Btn>
+				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit music</Btn>
 			</div>
 		</div>
 	</div>

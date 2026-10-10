@@ -11,7 +11,8 @@ import {
 	marqueeSelectLinked,
 	onlyPartners,
 	playsOwnSound,
-	reasonOf
+	reasonOf,
+	selectionUnits
 } from './link-ui';
 import { NO_SELECTION } from './selection';
 import type { Clip, StreamKind, Timeline, Track } from './types';
@@ -54,6 +55,47 @@ function cut(): Timeline {
 	linkClips(t, ['v1', 'a1']);
 	return t;
 }
+
+describe('selectionUnits', () => {
+	test('a picture and its sound are one selection, not two', () => {
+		expect(selectionUnits(cut(), ['v1', 'a1'])).toBe(1);
+		const clicked = clickSelectLinked(cut(), NO_SELECTION, 'v1', 'replace');
+		expect(selectionUnits(cut(), clicked.ids)).toBe(1);
+	});
+
+	test('one clip is one, and nothing is none', () => {
+		expect(selectionUnits(cut(), ['v2'])).toBe(1);
+		expect(selectionUnits(cut(), ['v1'])).toBe(1);
+		expect(selectionUnits(cut(), [])).toBe(0);
+	});
+
+	test('a pair plus another clip is two things, whatever the clip count', () => {
+		expect(selectionUnits(cut(), ['v1', 'a1', 'm1'])).toBe(2);
+		expect(selectionUnits(cut(), ['m1', 'v1', 'a1', 'v2'])).toBe(3);
+	});
+
+	test('clips that were never linked to each other are separate selections', () => {
+		expect(selectionUnits(cut(), ['v2', 'm1'])).toBe(2);
+		expect(selectionUnits(cut(), ['w1', 'a1'])).toBe(2);
+	});
+
+	test('two linked pairs are two', () => {
+		const t = cut();
+		linkClips(t, ['v2', 'm1']);
+		expect(selectionUnits(t, ['v1', 'a1', 'v2', 'm1'])).toBe(2);
+	});
+
+	test('a link group counts once however many members it has', () => {
+		const t = cut();
+		linkClips(t, ['v1', 'a1', 'w1']);
+		expect(selectionUnits(t, ['v1', 'a1', 'w1'])).toBe(1);
+		expect(selectionUnits(t, ['v1', 'w1'])).toBe(1);
+	});
+
+	test('a repeated id is not a second selection', () => {
+		expect(selectionUnits(cut(), ['v2', 'v2'])).toBe(1);
+	});
+});
 
 describe('clickSelectLinked', () => {
 	test('a plain click on a linked clip selects it and its partners, the clicked one primary', () => {

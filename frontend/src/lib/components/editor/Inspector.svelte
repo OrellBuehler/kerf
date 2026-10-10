@@ -36,7 +36,7 @@
 	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
-	import { linkBadge } from '$lib/link-ui';
+	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 
 	const clip = $derived(editor.selectedClip);
@@ -54,6 +54,11 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	/** Something is drawn from this clip: its footage has a picture *and* it sits on a picture track.
+	 *  The sound half of a linked pair has the picture's asset but plays no picture of its own. */
+	const picture = $derived(kind === 'video' && track?.kind !== 'audio');
+	const linkInfo = $derived(clip ? linkBadge(editor.timeline, clip, (id) => editor.assetName(id)) : null);
+	const linkedTo = $derived(linkInfo?.partners.map((p) => p.track) ?? []);
 	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
 	const music = $derived(clip ? editor.analysisFor(clip.asset_id)?.music : undefined);
 	const musicOffer = $derived(clip ? fitOffer(track, clip, editor.analysisFor(clip.asset_id)) : { show: false, reason: null });
@@ -321,7 +326,7 @@
 		const c = clip;
 		const items: MenuItem[] = [];
 		if (c) {
-			if (kind === 'video') {
+			if (picture) {
 				items.push(
 					{ label: 'Reset transform', icon: 'rotate-ccw', action: () => run(() => editor.setTransform(c.id, DEFAULT_TRANSFORM)) },
 					{ label: 'Reset color', icon: 'rotate-ccw', action: () => run(() => editor.setColor(c.id, DEFAULT_COLOR)) },
@@ -683,9 +688,10 @@
 		{#if overlay}
 			{@render overlayEditor(overlay)}
 		{:else if clip}
-			{#if editor.selectedClips.length > 1}
+			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
 				<!-- Several clips are selected but an edit here acts on one. Say which,
-				     rather than let a fader look like it moves them all. -->
+				     rather than let a fader look like it moves them all. A picture and its
+				     linked sound are one selection: that is what a click on either gives. -->
 				<div
 					style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-inset);font-size:11px;line-height:1.4;color:var(--text-secondary)"
 				>
@@ -696,11 +702,11 @@
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
-					style="width:40px;height:28px;border-radius:3px;flex:none;background:{kind === 'audio'
-						? 'var(--track-audio)'
-						: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
+					style="width:40px;height:28px;border-radius:3px;flex:none;background:{picture
+						? VIDEO_THUMB_BG
+						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
-					<Icon n={kind === 'audio' ? 'audio-waveform' : 'video'} s={14} />
+					<Icon n={picture ? 'video' : 'audio-waveform'} s={14} />
 				</div>
 				<div style="flex:1;min-width:0">
 					<div
@@ -709,8 +715,13 @@
 					>
 						{asset?.name ?? 'clip'}
 					</div>
-					<div style="margin-top:3px">
-						<Badge tone="neutral">{track?.name ?? (kind === 'audio' ? 'audio' : 'video')}</Badge>
+					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
+						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
+						{#if linkedTo.length > 0}
+							<span title={linkInfo?.title}>
+								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
+							</span>
+						{/if}
 					</div>
 				</div>
 			</div>
@@ -834,7 +845,7 @@
 			</label>
 			</InspectorSection>
 
-			{#if kind === 'video'}
+			{#if picture}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
@@ -926,7 +937,7 @@
 
 			{/if}
 
-			{#if kind === 'video'}
+			{#if picture}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					setTf({ scale: v })
@@ -1014,8 +1025,6 @@
 				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ gamma: v }), 'gamma')}
 				</InspectorSection>
 
-			{/if}
-
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<button
@@ -1064,6 +1073,7 @@
 				</div>
 			{/if}
 			</InspectorSection>
+			{/if}
 
 			<InspectorSection title="Transition (in)" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
@@ -1099,7 +1109,7 @@
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
 				{/if}
 
-				{#if kind === 'video'}
+				{#if picture}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
 
 					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
@@ -1177,7 +1187,7 @@
 			</div>
 		{:else}
 			<div
-				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-disabled);text-align:center"
+				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-muted);text-align:center"
 			>
 				<Icon n="sliders-horizontal" s={22} />
 				<span style="font-size:12px">Select a clip or a title to inspect it</span>

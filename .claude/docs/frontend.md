@@ -5,7 +5,14 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `vite.config.ts` via the `sveltekit()` plugin (new-style config). Static SPA via
   `adapter-static` (fallback `index.html`); `+layout.ts` sets `ssr = false` +
   `prerender = true`. Dev port is pinned to **1420** for Tauri.
-- **Tailwind 4 = CSS config**, no `tailwind.config.js`. `src/routes/layout.css` imports
+- **Tailwind 4 = CSS config**, no `tailwind.config.js`. **Fonts are self-hosted**: Geist, Geist Mono
+  and Space Grotesk come from `@fontsource-variable/*` imported first in `layout.css` (family names
+  `'Geist Variable'`, `'Geist Mono Variable'`, `'Space Grotesk Variable'`, which is what `--font-sans` /
+  `-mono` / `-display` name), bundled by Vite, so nothing is fetched at first paint and the CSP has no font
+  host (a `@import url(https://fonts.googleapis.com…)` sat after the Tailwind imports for a long time,
+  which CSS ignores — the brand fonts never loaded and every screenshot was the system fallback).
+  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list).
+  `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
   semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
@@ -29,7 +36,15 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `input[type=range]` is styled once in `routes/layout.css` (webkit and moz
   pseudo-elements) from those variables, with `--slider-accent` as the one
   per-slider choice; changing a shape value makes the theme `Custom`, and
-  High contrast ships thicker lines. `app.html` paints Kerf Dark before hydration
+  High contrast ships thicker lines. The shape also carries the **three border weights**
+  (`border-alpha-subtle` / `-default` / `-strong`, the % of `border-base` that `--border-subtle` /
+  `-default` / `-strong` are; Dark 6 / 10 / 16, Light 8 / 14 / 22, High contrast 30 / 45 / 70 so its
+  component edges pass 3:1) and the **shadow strength** (`shadow-strength`, % of the Dark alphas; Light
+  30), with `shadow-color` a colour token beside `scrim` (Light's is a cool `#141e32`, so its menus stop
+  casting a grey smear); `SHAPE_TOKENS` carry a `unit` (`px` or `%`) that `shapeProps` appends, and every
+  `--shadow-*` is a `color-mix` of `--shadow-color` scaled by `--shadow-strength`. `parseTheme` fills a
+  value a stored theme lacks from the preset whose colours it is exactly (a High contrast saved before
+  these existed stays High contrast), else the scheme's. `app.html` paints Kerf Dark before hydration
   (and the desktop window stays hidden until the theme is applied — see kerf-app).
   **Two bun guards keep this true** (`theme-guard.test.ts`): a scan fails on any
   color literal (`#hex`, `rgb()`, `hsl()`, …) in `src/` outside `theme.ts`,
@@ -44,10 +59,26 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   the strokes that carry meaning (clip edges, the playhead / selection amber, the
   waveform, the drag ghost), plus the `color-mix` fill of a generated caption's
   block (`GENERATED_TITLE_FILL`, resolved per preset by `mixSrgb` and held to 4.5
-  under its label). `text-disabled` is exempt on a *disabled* control but the UI
-  also draws the idle state of live toggles in it (DUCK / S / L, the bell), so it
-  is held to 3:1 on the resting surfaces; the translucent hairlines are exempt.
-  High contrast is also held to 7:1 on its reading text. The pair list
+  under its label). `text-disabled` is exempt on a *disabled* control; it used to be
+  the idle colour of live toggles too (DUCK / S / L, the bell), which is no longer so (see below),
+  but it is still held to 3:1 on the resting surfaces so a greyed label can be found; the
+  translucent hairlines are exempt.
+  High contrast is also held to 7:1 on its reading text. **Tinted surfaces** are checked too: a badge, an
+  analysis chip or an error block is its hue at 10–16 % over whatever it sits on (read from
+  `kerf-tokens.css` by `tintOf`), with the hue's light shade as 10 px text on it, held to 4.5 on the three
+  panels and the hover surface; the filled buttons' hover / pressed shades (`kerf-600` / `-700`,
+  `agent-600` / `-700`) under their labels; the focus outline's `kerf-400` on every resting surface; and
+  High contrast's `border-alpha-default` / `-strong` against its panels at 3 / 4.5. Writing it moved Kerf
+  Light's `green-400`, `orange-400`, `red-400`, `agent-300` and `kerf-300` darker (the v0.24.0 set and the
+  one before `kerf-300` moved joined `SUPERSEDED_KERF_LIGHT`; `kerf-300` could only go as far as the S / L
+  flags' 3:1 under their dark label allows, 3.1) and the amber `Badge` onto `kerf-200`. **`--text-disabled` is for what is off**:
+  a scan allows it only in the menus' disabled rows, `controls.css`, and a few named exceptions (each with
+  its reason in `theme-guard.test.ts`), because the status bar, every explanatory paragraph and the idle
+  S / L / DUCK toggles used it at 3.3:1 — text people read is `text-muted`. **`type-guard.test.ts` keeps the
+  scale a scale**: a `font-size` is a `var(--text-*)` or one of the literal steps (10 / 11 / 12 / 13 / 14 /
+  16 / 20 / 26 / 34 / 46 px, read from the stylesheet), nothing under the 10 px floor, and a `var(--type-*)`
+  / `var(--text-*)` must be defined (`--type-caption` was used and never existed, so its text took its
+  parent's size). The pair list
   and its reasoning live at the top of that test; a failing preset gets its
   *values* fixed, not the list. Writing it found real defects — Kerf Light's clip
   bodies were pale under white labels (1.5:1), the logo mark was a hard-coded
@@ -322,7 +353,9 @@ stale), keeping the newest answer. Shapes are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
 (`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
-The `Inspector` is **mounted whether or not a clip is selected**:
+A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
+link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
+its track badge instead. The `Inspector` is **mounted whether or not a clip is selected**:
 its Text overlays section belongs to the timeline rather than to any one clip, so
 gating the panel on a selection made titles and captions unreachable until you
 clicked a clip. Its sections are `InspectorSection`s — native `<details>`
@@ -352,7 +385,8 @@ as the export's `if(lt(t,..))` does — but the timeline's volume line and
 waveform scaling still draw the static gain), a **Framing** section
 (a `Smart crop` button that frames *this* shot for the delivery frame, plus
 `Reset crop`, above the crop sliders it writes — greyed out with a reason when the
-shot already matches the frame or is 360), a **Mask** section (None / Rectangle /
+shot already matches the frame or is 360), a **Mask** section (pictures only — as is every picture section, Transform to Animation: `picture` is a
+picture asset *on a picture track*, so the sound half of a linked pair has none; None / Rectangle /
 Ellipse chips, then centre / size / feather / invert; picking a shape starts from
 a visible default rather than a collapsed one, and the caption carries the recipe
 the shape alone does not suggest — a lower track shows through, so a blurred face
@@ -384,7 +418,30 @@ fade-in/out opacity keyframes; the caption style matches what
 captions look alike (`CAPTION_LOOKS` in the same file is only the two
 generate-time labels; their numbers live in `captions.ts`).
 Everything is styled with the CSS-variable tokens directly (inline `style`), not Tailwind
-utilities. **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
+utilities — **except what has to react to the pointer, because an inline style cannot say `:hover` and
+an inline background beats any stylesheet rule**. `styles/controls.css` (imported by `layout.css`) holds
+the shared controls as classes with attribute hooks: `.k-btn` (`Btn`: `data-variant` primary / agent /
+secondary / ghost / destructive, `data-size`; a filled button steps to its 600 shade hovered and 700
+pressed, ghost / secondary step up the surfaces, disabled is a plain outline in `text-disabled` rather than
+a dimmed copy of the live look), `.k-ibtn` (`IconBtn`, the title bar's gear / bell / version chip and the
+library rail: `aria-pressed` / `aria-selected` / `data-on` is the on state, `data-tone="quiet"` the rail's
+muted rest, `data-accent` the version chip when an update waits; `IconBtn` writes `aria-pressed` only when
+it is given `active`, since a plain icon button announced as "not pressed" reads as a switch) and `.k-tab`
+(the workspace tabs). Everything else that is a plain `<button>` or `role=button` and keeps its colours
+inline gets one **veil** (`--hover-fill` / `--press-fill`, an inset `box-shadow` of `text-primary` that
+paints over any fill, because inline styles never set `box-shadow`), except the timeline clips, menu
+rows and dockview's own controls (its close X has a hover of its own; matched by class-token start, `[class^='dv-']` / `[class*=' dv-']`, not a substring), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
+`not-allowed`: a red circle on a greyed Undo reads as an error) — a control that must stay legible when off
+sets `opacity:1` itself (the context menu's rows, the transcript's cut lines, which used to be dimmed twice).
+Dock tabs hover and press in `dockview-kerf.css`. **One keyboard focus indicator**: `--focus-outline`
+(2 px `kerf-400`, offset `--focus-offset`) from a zero-specificity `:where(button, summary, input, select,
+textarea, a[href], [role=button], [role=tab])` rule in `layout.css`, inset in dense strips (the menu bar, the library rail, which clips an outset ring, dock
+tabs — dockview's own was a 1 px outline in the divider colour, invisible), and a bordered wrapper around a bare
+`<input>` (`.k-field`: the agent composer, the keyboard search) carries it while the *input* has keyboard focus (`:has(input:focus-visible)`, so the Queue button beside it does not ring the field too), and the slider thumb draws the
+same colour and width as a ring (`--focus-ring`); `outline-ring/50` is gone from the base layer. **Toasts
+are in the theme** (`ui/sonner`): Kerf's scheme (not the OS's, since `ModeWatcher` is not mounted), an
+offset above the status bar, the menu's surface / shadow / radius, a ghost accent action instead of
+sonner's inverse pill, and status-coloured icons (`layout.css`). **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
 been timeline-level, and the UI now says so: the Timeline has a **titles lane**
 (`T`, above V1; `data-title-lane`) where every title / lower-third / caption is a
 block from `start` to `end` (generated captions dashed and dimmer; overlapping
@@ -434,7 +491,13 @@ YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TA
 target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), and
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
-Options are not persisted between openings. The **readiness panel** stays visible
+The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
+dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —
+a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.projectReplaced()` when a
+project is opened or created), and a click on the scrim does not close the
+dialog (Esc, Cancel and ✕ do). The frame-rate select is `frameRateOptions(fps)`: `FRAME_RATES`
+(15 / 12 / 10 are the GIF's) plus the current value when the list lacks it, never a blank select.
+The **readiness panel** stays visible
 (only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
 collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
@@ -560,7 +623,9 @@ it describes. **Preview** swaps the editor onto the proposed timeline behind a
 banner (`editor.previewingStaged`; any real edit or a fresh `load()` drops back to
 the live cut, and `refreshTimeline` parks an incoming live update rather than
 yanking the view) — so the proposal can be *watched*, not only read. Apply lands it
-as one revision (confirming first when it went `stale`), Discard drops it. The
+as one revision (confirming first when it went `stale`), Discard drops it. The queue card of the
+task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
+any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
 headline arithmetic is `src/lib/diff.ts`, the bun-tested TS mirror of
 `TimelineDiff::headline`; the entries themselves are phrased by kerf-core, which is
 why `revisionDiff` returns `null` in the browser instead of a second, divergent diff
@@ -592,12 +657,23 @@ Settings dialog's Preview section carries the toggle and the machine's status li
 **Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
 `FitMusicDialog` / `StemsDialog` use the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close), and `+page.svelte` makes the app behind them (and behind `VoiceoverDialog`,
-which focuses itself) `inert` and returns early from its global key handler while
+close; `VoiceoverDialog` too, with `initial: 'textarea'`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
-textarea / select / contenteditable. **Nothing unsaved is dropped silently**: once saved a project is a
+textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer
+swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks its footer actions
+`data-rescue`: when the button that had focus is replaced or disabled a `MutationObserver` moves it to
+the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
+not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is
+gone (the menu entry that opened the dialog) to the menu bar's tab stop (`data-focus-return`) **when
+a menu entry that opened a dialog was run from the keyboard** — anyone else is left on `body`, since
+a focused menu title would take Space from play / pause. The bar's `byKeys` ends with a pointer press,
+Tab, or focus given back (Escape, a chord), so it cannot leak into a later dialog a shortcut opens. **A scrim click never loses typed input**: Export ignores it (its options
+come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
+script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
+regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
+**Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
@@ -704,7 +780,10 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
-**Restart now** — which warns first when the project has unsaved changes); the
+**Restart now** — which warns first when the project has unsaved changes; a failed *check* is titled
+"Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
+*Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux
+(`isLinux`, `keymap.ts`) — `update-copy.ts`); the
 dialog auto-opens the first time a given version is seen (remembered under
 `kerf.update.seen` in localStorage) so declining doesn't nag every launch. The
 `Update` handle the plugin returns stays module-local in `api.ts`, which hands the

@@ -4,7 +4,7 @@
 	--dv-group-view-background-color: var(--surface-panel);
 	--dv-tabs-and-actions-container-background-color: var(--surface-app);
 	--dv-tabs-and-actions-container-height: 34px;
-	--dv-tabs-and-actions-container-font-size: 13px;
+	--dv-tabs-and-actions-container-font-size: var(--text-sm);
 	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
 	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
 	--dv-inactivegroup-visiblepanel-tab-background-color: var(--surface-panel);
@@ -27,7 +27,7 @@
 	--dv-floating-box-shadow: var(--shadow-lg);
 	--dv-floating-border: var(--line-width) solid var(--border-strong);
 	--dv-overlay-z-index: 45;
-	--dv-tab-font-size: 13px;
+	--dv-tab-font-size: var(--text-sm);
 	--dv-border-radius: 0px;
 	--dv-tab-border-radius: 0px;
 	--dv-sash-border-radius: 0px;
@@ -55,7 +55,7 @@
 	--dv-tab-group-color-orange: var(--orange-500);
 	--dv-tab-group-chip-padding: 4px 8px;
 	--dv-tab-group-chip-border-radius: var(--radius-md);
-	--dv-tab-group-chip-font-size: 11px;
+	--dv-tab-group-chip-font-size: var(--text-xs);
 	--dv-tab-group-line-height: 2px;
 	--dv-tab-group-line-opacity: 0.6;
 }
@@ -65,4 +65,21 @@
 }
 .dockview-theme-kerf .dv-tab.dv-active-tab {
 	box-shadow: inset 0 -2px 0 var(--kerf-500);
+}
+/* A tab that is not showing reacts to the pointer; the one showing is already lit. dockview paints the
+   inactive tab from group-qualified selectors, so these name the same chain to win. */
+.dockview-theme-kerf .dv-groupview > .dv-tabs-and-actions-container .dv-tabs-container > .dv-tab.dv-inactive-tab:hover {
+	background-color: var(--surface-hover);
+	color: var(--text-primary);
+}
+.dockview-theme-kerf .dv-groupview > .dv-tabs-and-actions-container .dv-tabs-container > .dv-tab.dv-inactive-tab:active {
+	background-color: var(--surface-active);
+	color: var(--text-primary);
+}
+/* dockview draws a tab's keyboard focus as a 1px outline in the divider color — 1.15:1, so
+   tabbing onto a tab showed nothing. It is the app's one focus outline, inset to stay in the strip. */
+.dockview-theme-kerf .dv-tab:focus-visible::after,
+.dockview-theme-kerf .dv-tab:has(:focus-visible)::after {
+	outline: var(--focus-outline) !important;
+	outline-offset: calc(var(--focus-offset) * -1);
 }

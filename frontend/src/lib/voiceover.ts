@@ -195,3 +195,31 @@ export function savePrefs(prefs: VoiceoverPrefs) {
 		/* a convenience, not state — ignore a blocked store */
 	}
 }
+
+const DRAFT_KEY = 'kerf.voiceover.draft';
+
+/** The script that was being written when the dialog last closed, or `''`. */
+export function loadDraft(): string {
+	try {
+		return localStorage.getItem(DRAFT_KEY) ?? '';
+	} catch {
+		return '';
+	}
+}
+
+/** Remember the script as it is typed; an empty one forgets it. */
+export function saveDraft(text: string) {
+	try {
+		if (text.trim()) localStorage.setItem(DRAFT_KEY, text);
+		else localStorage.removeItem(DRAFT_KEY);
+	} catch {
+		/* a convenience, not state — ignore a blocked store */
+	}
+}
+
+/** Whether a click on the scrim closes the dialog. A script that has been typed is work: only
+ *  an empty dialog goes with a stray click (Escape, Cancel and the ✕ are deliberate, and the
+ *  draft outlives them), and nothing closes it mid-run. */
+export function scrimCloses(text: string, generating: boolean): boolean {
+	return !generating && text.trim() === '';
+}
