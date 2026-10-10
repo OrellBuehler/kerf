@@ -146,6 +146,17 @@ describe('shape', () => {
 		expect(presetIdFor(out)).toBe('high-contrast');
 	});
 
+	test('every preset stored before the border and shadow values existed reads back as itself', () => {
+		for (const id of PRESET_IDS) {
+			const stored = JSON.parse(JSON.stringify(PRESETS[id]));
+			for (const k of ['border-alpha-subtle', 'border-alpha-default', 'border-alpha-strong', 'shadow-strength']) delete stored.shape[k];
+			delete stored.colors['shadow-color'];
+			const out = parseTheme(stored)!;
+			expect(out, id).toEqual(PRESETS[id]);
+			expect(presetIdFor(out), id).toBe(id);
+		}
+	});
+
 	test('an edited theme takes the scheme\'s own border and shadow values, not another preset\'s', () => {
 		const hc = PRESETS['high-contrast'];
 		const stored = JSON.parse(JSON.stringify({ ...hc, colors: { ...hc.colors, waveform: '#123456' } }));
