@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { contrastRatio, mixSrgb } from './contrast';
+import { posix, SRC, uiSources } from './test-sources';
 import { PRESET_IDS, PRESETS, SUPERSEDED_KERF_LIGHT, type ColorToken } from './theme';
 import { GENERATED_TITLE_FILL } from './titles';
 
@@ -13,7 +14,6 @@ import { GENERATED_TITLE_FILL } from './titles';
 //     how a logo that was fine on Kerf Dark came to be invisible on Kerf Light.
 //  2. Every preset meets WCAG contrast for the pairs the UI actually draws.
 
-const SRC = join(import.meta.dir, '..');
 const REPO = join(SRC, '..', '..');
 
 // ---- 1. color literals ------------------------------------------------------
@@ -50,16 +50,6 @@ function colorLiterals(text: string): { line: number; literal: string }[] {
 		literal: m[0]
 	}));
 }
-
-function uiSources(dir: string): string[] {
-	return readdirSync(dir).flatMap((name) => {
-		const path = join(dir, name);
-		if (statSync(path).isDirectory()) return uiSources(path);
-		return /\.(svelte|ts|css|html)$/.test(name) && !name.endsWith('.test.ts') ? [path] : [];
-	});
-}
-
-const posix = (path: string) => relative(SRC, path).split(sep).join('/');
 
 describe('color literals', () => {
 	test('the detector finds colors and leaves the rest alone', () => {

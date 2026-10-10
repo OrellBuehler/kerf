@@ -238,8 +238,9 @@
 /* ---------- Text fields drawn as a wrapper ---------- */
 
 /* A search box or the agent's composer is a bordered wrapper around a bare <input> with no outline
-   of its own, so the wrapper carries the one focus outline while the field has focus. */
-.k-field:focus-within {
+   of its own, so the wrapper carries the one focus outline while the *input* has keyboard focus (not
+   `:focus-within`: focusing the Queue button beside the composer's input must not ring the field too). */
+.k-field:has(input:focus-visible) {
 	outline: var(--focus-outline);
 	outline-offset: var(--focus-offset);
 }
@@ -250,16 +251,16 @@
    timeline (they are the picture, and carry their own hover), nor menu rows (which light
    themselves from the pointer and the keys alike), nor dockview's own controls (the tab's close
    X, the overflow menu), which have a hover of theirs. */
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']):hover,
-[role='button']:not([aria-disabled='true']):not([class*='dv-']):hover {
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
+[role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):hover {
 	box-shadow: var(--hover-fill);
 }
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']):active,
-[role='button']:not([aria-disabled='true']):not([class*='dv-']):active {
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
+[role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):active {
 	box-shadow: var(--press-fill);
 }
-button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class*='dv-']),
-[role='button']:not([class*='dv-']) {
+button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
+[role='button']:not([class^='dv-']):not([class*=' dv-']) {
 	transition: box-shadow var(--dur-fast) var(--ease-out);
 }
 /* What a disabled control that still carries its colors inline falls back to. The cursor is

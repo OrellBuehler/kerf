@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { posix, SRC, uiSources } from './test-sources';
 
 // An inline `style=` cannot say `:hover`, and an inline background beats any stylesheet
 // rule — so a control that carries its colors inline never reacts to the pointer (69 of
@@ -8,7 +9,6 @@ import { join } from 'node:path';
 // the pieces together: the stylesheet has the states, the components use the classes and
 // carry no colors of their own, and the old blanket rules are gone.
 
-const SRC = join(import.meta.dir, '..');
 const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 /** CSS without its comments, which are allowed to name what they replaced. */
 const code = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, '');
@@ -59,8 +59,12 @@ describe('controls.css', () => {
 		expect(veil).toContain(':not(.kclip)');
 		expect(veil).toContain(":not([role^='menuitem'])");
 		// dockview's close X and overflow menu have a hover of their own.
-		expect(CONTROLS).toMatch(/\[role='button'\]:not\(\[aria-disabled='true'\]\):not\(\[class\*='dv-'\]\):hover/);
-		expect(veil).toContain(":not([class*='dv-'])");
+		// Token-start matching, not a substring: a class that merely contains `dv-` is not dockview's.
+		const dv = ":not([class^='dv-']):not([class*=' dv-'])";
+		expect(CONTROLS).not.toContain("[class*='dv-']");
+		expect(veil).toContain(dv);
+		expect(selectors(CONTROLS, "[role='button']").every((sel) => sel.includes(dv))).toBe(true);
+		expect(CONTROLS.split(dv).length - 1).toBe(6);
 	});
 });
 
@@ -124,17 +128,21 @@ describe('the old rules are gone', () => {
 		const rail = /\.k-ibtn\[role='tab'\]:focus-visible\s*\{([^}]*)\}/.exec(CONTROLS);
 		expect(rail, 'the rail rule').not.toBeNull();
 		expect(rail![1]).toContain('outline-offset: calc(var(--focus-offset) * -1)');
-		expect(CONTROLS).toMatch(/\.k-field:focus-within\s*\{\s*outline: var\(--focus-outline\)/);
+		expect(CONTROLS).toMatch(/\.k-field:has\(input:focus-visible\)\s*\{\s*outline: var\(--focus-outline\)/);
+		expect(CONTROLS).not.toContain('.k-field:focus-within');
 		// Every input that kills its own outline sits in a .k-field (the Agent composer, the Keyboard search).
 		for (const file of ['AgentPanel.svelte', 'KeyboardSettings.svelte']) {
 			const source = read(`${EDITOR}${file}`);
 			expect(source, file).toContain('class="k-field"');
 		}
-		for (const file of ['AgentPanel.svelte', 'KeyboardSettings.svelte', 'SettingsDialog.svelte', 'ExportDialog.svelte', 'Inspector.svelte']) {
-			const source = read(`${EDITOR}${file}`);
-			const bare = [...source.matchAll(/<input\b[\s\S]*?\/>/g)].filter((m) => /outline:\s*none/.test(m[0]));
-			if (bare.length) expect(source, `${file} has an input with outline:none`).toContain('class="k-field"');
+		// …and so does every other input or textarea in the app that does the same.
+		const bare: string[] = [];
+		for (const file of uiSources(SRC).filter((f) => f.endsWith('.svelte'))) {
+			const source = readFileSync(file, 'utf8');
+			const killed = [...source.matchAll(/<(?:input|textarea)\b[\s\S]*?\/>/g)].some((m) => /outline:\s*none/.test(m[0]));
+			if (killed && !source.includes('class="k-field"')) bare.push(`${posix(file)} has an input with outline:none and no .k-field`);
 		}
+		expect(bare).toEqual([]);
 	});
 
 	test('dock tabs react to the pointer', () => {

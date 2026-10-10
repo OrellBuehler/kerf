@@ -11,7 +11,7 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `-mono` / `-display` name), bundled by Vite, so nothing is fetched at first paint and the CSP has no font
   host (a `@import url(https://fonts.googleapis.com…)` sat after the Tailwind imports for a long time,
   which CSS ignores — the brand fonts never loaded and every screenshot was the system fallback).
-  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three).
+  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three; `bundle-resources.test.ts` holds the overrides to the committed list).
   `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
   semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
@@ -430,14 +430,14 @@ it is given `active`, since a plain icon button announced as "not pressed" reads
 (the workspace tabs). Everything else that is a plain `<button>` or `role=button` and keeps its colours
 inline gets one **veil** (`--hover-fill` / `--press-fill`, an inset `box-shadow` of `text-primary` that
 paints over any fill, because inline styles never set `box-shadow`), except the timeline clips, menu
-rows and dockview's own controls (its close X has a hover of its own), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
+rows and dockview's own controls (its close X has a hover of its own; matched by class-token start, `[class^='dv-']` / `[class*=' dv-']`, not a substring), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
 `not-allowed`: a red circle on a greyed Undo reads as an error) — a control that must stay legible when off
 sets `opacity:1` itself (the context menu's rows, the transcript's cut lines, which used to be dimmed twice).
 Dock tabs hover and press in `dockview-kerf.css`. **One keyboard focus indicator**: `--focus-outline`
 (2 px `kerf-400`, offset `--focus-offset`) from a zero-specificity `:where(button, summary, input, select,
 textarea, a[href], [role=button], [role=tab])` rule in `layout.css`, inset in dense strips (the menu bar, the library rail, which clips an outset ring, dock
 tabs — dockview's own was a 1 px outline in the divider colour, invisible), and a bordered wrapper around a bare
-`<input>` (`.k-field`: the agent composer, the keyboard search) carries it through `:focus-within`, and the slider thumb draws the
+`<input>` (`.k-field`: the agent composer, the keyboard search) carries it while the *input* has keyboard focus (`:has(input:focus-visible)`, so the Queue button beside it does not ring the field too), and the slider thumb draws the
 same colour and width as a ring (`--focus-ring`); `outline-ring/50` is gone from the base layer. **Toasts
 are in the theme** (`ui/sonner`): Kerf's scheme (not the OS's, since `ModeWatcher` is not mounted), an
 offset above the status bar, the menu's surface / shadow / radius, a ghost accent action instead of
