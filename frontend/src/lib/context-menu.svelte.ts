@@ -5,6 +5,7 @@
    window (`popout.svelte.ts`) draws it there — a menu has to be in the document of
    the window that was clicked, or it appears on the wrong screen. */
 
+import { tidyMenu } from './menu-items';
 import { windowOf } from './realm';
 
 export type MenuItem =
@@ -42,7 +43,7 @@ class ContextMenuState {
 		e.stopPropagation();
 		const target = e.target;
 		const node = target && 'nodeType' in target ? (target as Node) : anchor;
-		this.items = items;
+		this.items = tidyMenu(items);
 		this.x = e.clientX;
 		this.y = e.clientY;
 		this.win = windowOf(node);

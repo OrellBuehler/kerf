@@ -232,8 +232,18 @@ export const FRAME_RATES: { label: string; value: number | null }[] = [
 	{ label: '29.97', value: 29.97 },
 	{ label: '25', value: 25 },
 	{ label: '24', value: 24 },
-	{ label: '23.976', value: 23.976 }
+	{ label: '23.976', value: 23.976 },
+	{ label: '15', value: 15 },
+	{ label: '12', value: 12 },
+	{ label: '10', value: 10 }
 ];
+
+/** The frame-rate choices with the current value among them: a rate a preset or an agent set
+ *  that the list does not carry would otherwise leave the select blank. */
+export function frameRateOptions(fps: number | null | undefined): { label: string; value: number | null }[] {
+	if (!fps || FRAME_RATES.some((f) => f.value === fps)) return FRAME_RATES;
+	return [...FRAME_RATES, { label: String(fps), value: fps }];
+}
 
 export interface Preset {
 	id: string;
