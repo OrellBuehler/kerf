@@ -133,6 +133,27 @@ so the feature is **only** activated through these forwards — which is what ma
   decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
+  **What each input is actually asked for** is `engine/decode_policy.rs`, applied to the
+  built argv at **spawn** (`tune_inputs`; the builders still emit `-hwaccel` as the options
+  say, which is what the golden oracle pins) from what is known of the file behind each
+  `-i` — an asset's recorded codec / `pix_fmt`, or for a bare path the cached
+  `source_traits` probe. Rules, all pure and unit-tested (`resolve_hwaccel`): **a preview
+  proxy (`is_cache_proxy`, by its `kerf/proxies/<hash>.mp4` name) is never decoded in
+  hardware** — the session costs 70-80 ms a process against a 3 ms intra frame, and a
+  sustained stream from it is faster in software too; **a one-frame read of proxies runs on
+  one thread** (`-threads 1` ahead of each such `-i`, `cpu::single_frame_args` for the graph
+  and the encoder; a still that also reads an original keeps the budget's caps, a 4K
+  long-GOP seek needs them); on **Windows `auto` becomes `d3d11va`** for H.264 / HEVC (`auto`
+  picks DXVA2: slower, 4x the CPU), any other codec stays `auto` so one with no D3D11VA
+  decoder is not handed a named one; a one-frame read of a **non-4:2:0 original (4:2:2,
+  4:4:4, 12 bit) asks for none** on Windows and Linux (AMD and most NVIDIA decoders lack
+  it, the attempt is all cost; macOS is exempt, Intel iGPUs lose the attempt — name
+  `KERF_HWACCEL=qsv`/`vaapi` to force it, a named accelerator always goes through
+  verbatim); a long read (stream, export, proxy, scenes, filmstrip) still tries. Whether a
+  failed run may blame the hardware (the learned software fallback) is decided from the
+  rewritten argv, not from the request. Call sites: `tune_still_args` (`run_still`),
+  `stream_preview_once`, `tune_export_args`, `decode_frame` / `decode_hwaccel_for`;
+  `limit_frame_args` is the same for `kerf-gpu`'s per-layer decodes.
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
   written to finish as fast as it can — every run grabs every core and nothing
   coordinates one run with the next — so an agent analyzing eight sources over

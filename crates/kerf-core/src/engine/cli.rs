@@ -14,10 +14,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cpu;
+use super::decode_policy::{facts_from_assets, resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading};
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint, HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, is_cache_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint,
+    HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -118,9 +120,11 @@ pub(super) fn ffprobe_bin() -> String {
 }
 
 /// The decode hardware-acceleration to request for preview frames. Defaults to
-/// ffmpeg's `auto` (D3D11VA on Windows, VAAPI / VideoToolbox elsewhere; falls
-/// back to software when none is usable), which offloads 4K decode off the CPU.
-/// Set `KERF_HWACCEL=none` (or empty) to force software decoding.
+/// ffmpeg's `auto` (VAAPI / CUDA / VideoToolbox, falls back to software when none
+/// is usable), which offloads 4K decode off the CPU; on Windows `auto` would pick
+/// DXVA2, so a run turns it into `d3d11va` per input where the codec allows
+/// (`decode_policy`). Set `KERF_HWACCEL=none` (or empty) to force software
+/// decoding, or a name (`cuda`, `qsv`, ...) to use exactly that.
 fn hwaccel() -> Option<String> {
     match std::env::var("KERF_HWACCEL") {
         Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("none") => None,
@@ -143,13 +147,48 @@ static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// The `-hwaccel` for the engine's own decodes (preview stills and streaming,
 /// proxy generation, stitching, scene detection): the configured accel unless
-/// an earlier fallback proved it broken on this machine.
+/// an earlier fallback proved it broken on this machine. This is what is
+/// *requested*; each input of a run then gets what `decode_policy` makes of it
+/// (a proxy none, Windows `d3d11va` for `auto`, ...).
 pub fn decode_hwaccel() -> Option<String> {
     if HWACCEL_OK.load(std::sync::atomic::Ordering::Relaxed) {
         hwaccel()
     } else {
         None
     }
+}
+
+/// What a decode that is handed a bare path knows of the file behind it: whether it is a
+/// preview proxy by its name, and for anything else its codec and chroma format from the
+/// cached per-file probe (`source_traits`; spawns ffprobe once per file: not under a lock).
+fn path_facts(path: &Path) -> InputFacts {
+    if is_cache_proxy(&path.to_string_lossy()) {
+        return InputFacts {
+            proxy: true,
+            ..InputFacts::default()
+        };
+    }
+    let traits = source_traits(path).unwrap_or_default();
+    InputFacts {
+        codec: traits.codec,
+        chroma: traits.chroma,
+        ..InputFacts::default()
+    }
+}
+
+/// [`decode_hwaccel`] resolved for the file at `path` (see `decode_policy::resolve_hwaccel`).
+/// Probes the file only when a hardware decoder was asked for at all.
+fn decode_hwaccel_for(path: &Path, reading: Reading) -> Option<String> {
+    let requested = decode_hwaccel()?;
+    resolve_hwaccel(HostOs::CURRENT, &requested, path_facts(path), reading)
+}
+
+/// [`decode_hwaccel`] resolved for a whole-file read of `asset`'s original, from the facts the
+/// import recorded (no probe).
+pub(super) fn decode_hwaccel_for_asset(asset: &Asset) -> Option<String> {
+    let requested = decode_hwaccel()?;
+    let facts = facts_from_assets(std::slice::from_ref(asset))(&asset.path);
+    resolve_hwaccel(HostOs::CURRENT, &requested, facts, Reading::Whole)
 }
 
 /// Record that an accelerated decode failed where the software retry of the very
@@ -1060,6 +1099,10 @@ pub(crate) struct SourceTraits {
     /// are not (their timestamps are measured or guessed and their seeks land on a later
     /// keyframe), and neither is a file whose format the probe did not name.
     pub indexed: bool,
+    /// The stream's codec and chroma format, for the one thing a decode that is handed a bare
+    /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
+    pub codec: Codec,
+    pub chroma: Chroma,
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1084,7 +1127,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,start_time:format=start_time,format_name",
+        "stream=color_transfer,start_time,codec_name,pix_fmt:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1139,7 +1182,14 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         .and_then(|f| f.get("format_name"))
         .and_then(|n| n.as_str())
         .is_some_and(|n| n.split(',').any(|n| matches!(n, "mp4" | "matroska")));
-    SourceTraits { hdr, lead, indexed }
+    let text = |key: &str| stream.and_then(|s| s.get(key)).and_then(|v| v.as_str()).unwrap_or("");
+    SourceTraits {
+        hdr,
+        lead,
+        indexed,
+        codec: Codec::from_name(text("codec_name")),
+        chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+    }
 }
 
 /// Whether the file at `path` is an MP4/MOV or Matroska/WebM file (see
@@ -1217,6 +1267,8 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
 
     let bin = ffmpeg_bin();
     let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    // Probed before queueing: a hung probe must not hold the one heavy-job slot.
+    let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
     let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
@@ -1233,7 +1285,6 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
             .output()
             .map_err(|e| launch_err(&bin, e))
     };
-    let hw = decode_hwaccel();
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
@@ -1305,6 +1356,7 @@ pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
+    let hw = decode_hwaccel_for(path, Reading::Whole);
     let cpu = cpu::lease();
     let mut args = build_salience_args(path, start, end);
     cpu::limit_args(&mut args, cpu.threads());
@@ -1318,7 +1370,6 @@ pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
             .output()
             .map_err(|e| launch_err(&bin, e))
     };
-    let hw = decode_hwaccel();
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
@@ -1564,17 +1615,19 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
 
     use std::sync::atomic::Ordering;
     let bin = ffmpeg_bin();
-    let hw = hwaccel();
-    let use_hw = hw.is_some() && HWACCEL_OK.load(Ordering::Relaxed);
+    // A proxy is one intra frame of a small H.264: no hardware session, one thread.
+    let proxy = is_cache_proxy(&path.to_string_lossy());
+    let hw = decode_hwaccel_for(path, Reading::Frame);
+    let use_hw = hw.is_some();
 
     let bytes = if use_hw {
-        match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, hw.as_deref()) {
+        match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, hw.as_deref(), proxy) {
             Ok(b) => b,
             Err(hw_err) => {
                 // The accelerated decode failed — retry in software. If *that*
                 // works, `-hwaccel` is the culprit on this machine, so disable it
                 // for subsequent frames; if it fails too, the error is genuine.
-                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None) {
+                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy) {
                     Ok(b) => {
                         HWACCEL_OK.store(false, Ordering::Relaxed);
                         tracing::warn!("hardware decode failed ({hw_err}); using software decode for previews");
@@ -1585,7 +1638,7 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
             }
         }
     } else {
-        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None)?
+        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy)?
     };
 
     if let Ok(mut c) = frame_cache().lock() {
@@ -1607,11 +1660,17 @@ fn run_frame_decode(
     quality: Option<u8>,
     accurate: bool,
     hw: Option<&str>,
+    single_thread: bool,
 ) -> Result<Vec<u8>> {
     let mut cmd = command(bin);
     // Interactive: never gated and never de-prioritized — a scrubbed frame is
-    // wanted now — but still held to the budget's threads.
-    cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    // wanted now — but still held to the budget's threads, or to one when the
+    // frame is read from a proxy (the thread pools would outlast the decode).
+    if single_thread {
+        cmd.args(["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1"]);
+    } else {
+        cpu::limit_cmd(&mut cmd, cpu::budget_threads());
+    }
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if let Some(hw) = hw {
         cmd.args(["-hwaccel", hw]);
@@ -1627,8 +1686,11 @@ fn run_frame_decode(
     if let Some(q) = quality {
         cmd.args(["-q:v", q.to_string().as_str()]);
     }
-    cmd.args(["-f", "image2pipe", "-vcodec", vcodec, "pipe:1"])
-        .stderr(Stdio::piped());
+    cmd.args(["-f", "image2pipe", "-vcodec", vcodec]);
+    if single_thread {
+        cmd.args(["-threads", "1"]);
+    }
+    cmd.arg("pipe:1").stderr(Stdio::piped());
     let output = cmd.output().map_err(|e| launch_err(bin, e))?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
@@ -2435,7 +2497,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     // whole process. These sources are rare and the encode is the same all-intra
     // x264 pass, so they never ask.
     let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
-    let hw_dec = decode_hwaccel();
+    let hw_dec = decode_hwaccel_for(src, Reading::Whole);
     let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
         let _ = std::fs::remove_file(&tmp);
@@ -4308,11 +4370,13 @@ pub fn stream_preview(
     fps: f64,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
-    let hw = decode_hwaccel().is_some();
+    // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
+    // inputs do, and a failure of a run that did not is not the hardware's.
+    let mut hw = false;
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent) {
+    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -4321,7 +4385,7 @@ pub fn stream_preview(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent)
+            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
@@ -4353,11 +4417,15 @@ fn stream_preview_once(
     fps: f64,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
+    hw_used: &mut bool,
 ) -> Result<()> {
     let fps = fps.clamp(1.0, 60.0);
     let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
+    // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
+    // faster in software, start-up included.
+    *hw_used = tune_inputs(&mut args, HostOs::CURRENT, Reading::Stream, &facts_from_assets(assets)).hw;
     // Playback is paced to the wall clock, so it never races ahead; the cap is
     // there so the budget means the same thing while the cut is playing.
     cpu::limit_args(&mut args, cpu::budget_threads());
@@ -4563,6 +4631,13 @@ pub fn render_with_progress(
     }
 }
 
+/// Tune a built export argv for the process about to be spawned: each input's `-hwaccel` per
+/// `decode_policy` (on Windows `auto` becomes `d3d11va` for H.264 and HEVC), the threads left
+/// to [`run_ffmpeg_progress`]. The builders emit the options as given.
+fn tune_export_args(args: &mut Vec<String>, assets: &[Asset]) {
+    tune_inputs(args, HostOs::CURRENT, Reading::Whole, &facts_from_assets(assets));
+}
+
 /// One delivery of a multi-format export: the frame and where its file goes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportVariant {
@@ -4710,6 +4785,7 @@ fn render_attempt(
         };
         // Analysis pass fills the first half of the bar, the encode the second.
         let mut a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
+        tune_export_args(&mut a1, assets);
         let _g1 = externalize_filter_complex(&mut a1, "p1")?;
         let s1 = run_ffmpeg_progress(
             &a1,
@@ -4728,6 +4804,7 @@ fn render_attempt(
             return Ok(RenderStatus::Cancelled);
         }
         let mut a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
+        tune_export_args(&mut a2, assets);
         let _g2 = externalize_filter_complex(&mut a2, "p2")?;
         let res = run_ffmpeg_progress(
             &a2,
@@ -4745,6 +4822,7 @@ fn render_attempt(
         res
     } else {
         let mut args = build_export_args(timeline, assets, output_str, opts)?;
+        tune_export_args(&mut args, assets);
         let _g = externalize_filter_complex(&mut args, "s")?;
         run_ffmpeg_progress(
             &args,
@@ -6573,9 +6651,10 @@ fn run_still(
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    let hw_used = std::cell::Cell::new(false);
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
-        cpu::limit_args(&mut args, cpu::budget_threads());
+        hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
         let bin = ffmpeg_bin();
         let output = command(&bin)
             .args(&args)
@@ -6590,14 +6669,11 @@ fn run_still(
         }
         Ok(output.stdout)
     };
-    let hw = opts
-        .hwaccel
-        .as_deref()
-        .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"));
     match run(opts) {
         // Mirror `decode_frame`'s fallback: a software retry that succeeds means
-        // `-hwaccel` is the culprit here, so stop asking for it.
-        Err(hw_err) if hw => match run(&ExportOptions {
+        // `-hwaccel` is the culprit here, so stop asking for it. Only a run that
+        // still asked for hardware after the spawn-time tuning can blame it.
+        Err(hw_err) if hw_used.get() => match run(&ExportOptions {
             hwaccel: None,
             ..opts.clone()
         }) {
@@ -6610,6 +6686,21 @@ fn run_still(
         },
         result => result,
     }
+}
+
+/// Tune a built still argv for the process about to be spawned: each input's `-hwaccel` and
+/// threads per `decode_policy` (a proxy is decoded on one thread without a hardware session; a
+/// still whose every input is a proxy runs its graph and encoder on one thread too), the budget's
+/// threads otherwise. Returns whether any input still asks for hardware decode. At spawn time,
+/// not in [`build_still_args`], so the builder keeps describing exactly what was asked for.
+fn tune_still_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> bool {
+    let tuning = tune_inputs(args, os, Reading::Frame, &facts_from_assets(assets));
+    if tuning.all_cheap {
+        cpu::single_frame_args(args);
+    } else {
+        cpu::limit_args(args, cpu::budget_threads());
+    }
+    tuning.hw
 }
 
 /// The JPEG-pipe still args — [`timeline_frame`]'s shape, and what every still
@@ -7809,6 +7900,274 @@ mod tests {
         let at = args.iter().position(|a| a == "-hwaccel").expect("-hwaccel present");
         assert_eq!(args[at + 1], "auto");
         assert!(at < args.iter().position(|a| a == "-i").unwrap());
+    }
+
+    const PROXY_PATH: &str = "/cache/kerf/proxies/0123456789abcdef.mp4";
+
+    fn hw_still_opts() -> ExportOptions {
+        ExportOptions {
+            hwaccel: Some("auto".to_string()),
+            ..ExportOptions::default()
+        }
+    }
+
+    /// The still argv for `assets` (one clip each, on tracks of their own) the way the app asks
+    /// for it — decode acceleration requested — before and after the spawn-time tuning.
+    fn tuned_still(assets: &[Asset], os: HostOs) -> (Vec<String>, Vec<String>, bool) {
+        let tracks = assets
+            .iter()
+            .map(|a| video_track(vec![make_clip(a.id, 0.0, 5.0, 0.0)]))
+            .collect();
+        let built = build_timeline_frame_args(&timeline_of(tracks), assets, &hw_still_opts(), 1.0, 960, 4).unwrap();
+        let mut tuned = built.clone();
+        let hw = tune_still_args(&mut tuned, assets, os);
+        (built, tuned, hw)
+    }
+
+    fn at_path(path: &str, codec: &str, pix_fmt: &str) -> Asset {
+        let mut asset = test_asset(vec![video_stream(3840, 2160, 30.0)]);
+        asset.path = path.into();
+        asset.streams[0].codec = codec.into();
+        asset.streams[0].pix_fmt = Some(pix_fmt.into());
+        asset
+    }
+
+    fn count(args: &[String], flag: &str) -> usize {
+        args.iter().filter(|a| *a == flag).count()
+    }
+
+    #[test]
+    fn a_still_from_a_proxy_asks_for_no_hardware_and_one_thread() {
+        let _serial = cpu::test_lock();
+        let (built, tuned, hw) = tuned_still(&[at_path(PROXY_PATH, "h264", "yuv420p")], HostOs::Windows);
+        // The builder still describes what was asked for (the golden oracle pins that) ...
+        assert_eq!(count(&built, "-hwaccel"), 1);
+        // ... and the spawn drops it for the proxy, which decodes a frame in milliseconds, and
+        // keeps every pool in the process to one thread.
+        assert!(!hw);
+        assert_eq!(count(&tuned, "-hwaccel"), 0, "{tuned:?}");
+        assert_eq!(&tuned[..4], ["-filter_threads", "1", "-filter_complex_threads", "1"]);
+        assert_eq!(&tuned[tuned.len() - 3..], ["-threads", "1", "pipe:1"]);
+        let input = tuned.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(&tuned[input - 2..input], ["-threads", "1"]);
+        assert_eq!(tuned[input + 1], PROXY_PATH);
+        // Nothing else moved: the tuned argv is the built one with those flags added and the
+        // hardware one taken out.
+        let mut rest = tuned;
+        rest.drain(..4);
+        rest.drain(rest.len() - 3..rest.len() - 1);
+        rest.drain(input - 4 - 2..input - 4);
+        let mut plain = built;
+        let at = plain.iter().position(|a| a == "-hwaccel").unwrap();
+        plain.drain(at..at + 2);
+        assert_eq!(rest, plain);
+    }
+
+    #[test]
+    fn a_still_from_originals_keeps_the_budget_and_names_the_windows_decoder() {
+        let _serial = cpu::test_lock();
+        let original = at_path("/media/a.mp4", "hevc", "yuv420p10le");
+        let (built, windows, hw) = tuned_still(std::slice::from_ref(&original), HostOs::Windows);
+        assert!(hw);
+        assert_eq!(flag_val(&windows, "-hwaccel"), Some("d3d11va"));
+        let (_, linux, hw) = tuned_still(std::slice::from_ref(&original), HostOs::Other);
+        assert!(hw);
+        // Where `auto` is already right the argv is the built one, plus the budget's caps (none
+        // at a full budget) — and never the one-thread form, which a 4K original decoding from
+        // a long-GOP keyframe would pay for.
+        let mut expected = built;
+        cpu::limit_args(&mut expected, cpu::budget_threads());
+        assert_eq!(linux, expected);
+        for args in [&windows, &linux] {
+            assert_ne!(args[0], "-filter_threads");
+            assert_eq!(count(args, "-hwaccel"), 1);
+        }
+    }
+
+    #[test]
+    fn a_still_skips_hardware_for_a_chroma_format_the_decoders_lack() {
+        let _serial = cpu::test_lock();
+        let r5 = at_path("/media/r5.mp4", "hevc", "yuv422p10le");
+        for os in [HostOs::Windows, HostOs::Other] {
+            let (_, tuned, hw) = tuned_still(std::slice::from_ref(&r5), os);
+            assert!(!hw, "{os:?}");
+            assert_eq!(count(&tuned, "-hwaccel"), 0, "{os:?}");
+        }
+        let (_, mac, hw) = tuned_still(std::slice::from_ref(&r5), HostOs::MacOs);
+        assert!(hw);
+        assert_eq!(flag_val(&mac, "-hwaccel"), Some("auto"));
+    }
+
+    #[test]
+    fn a_still_mixing_a_proxy_and_an_original_tunes_each_input_alone() {
+        let _serial = cpu::test_lock();
+        let proxy = at_path(PROXY_PATH, "h264", "yuv420p");
+        let original = at_path("/media/a.mp4", "h264", "yuv420p");
+        let (_, tuned, hw) = tuned_still(&[proxy, original], HostOs::Windows);
+        assert!(hw);
+        let first = tuned.iter().position(|a| a == "-i").unwrap();
+        let second = tuned.iter().rposition(|a| a == "-i").unwrap();
+        assert_eq!(
+            (tuned[first + 1].as_str(), tuned[second + 1].as_str()),
+            (PROXY_PATH, "/media/a.mp4")
+        );
+        // The proxy's input: no hardware, one decoder thread. The original's: the decoder and
+        // the thread caps of the budget, which the one-thread form of an all-proxy still is not.
+        assert!(!tuned[..first].contains(&"-hwaccel".to_string()));
+        assert_eq!(&tuned[first - 2..first], ["-threads", "1"]);
+        let hw_at = tuned.iter().position(|a| a == "-hwaccel").unwrap();
+        assert!(first < hw_at && hw_at < second, "{tuned:?}");
+        assert_eq!(tuned[hw_at + 1], "d3d11va");
+        assert_ne!(tuned[0], "-filter_threads");
+    }
+
+    /// A recording stand-in for ffmpeg: writes the argv it was given, one per line, and answers
+    /// with a byte of "image".
+    #[cfg(unix)]
+    fn argv_of_frame_decode(dir: &Path, proxy: bool, hw: Option<&str>) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let rec = dir.join("rec.sh");
+        let out = dir.join("rec.out");
+        std::fs::write(
+            &rec,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\nprintf x\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bytes = run_frame_decode(
+            rec.to_str().unwrap(),
+            Path::new("/media/a.mp4"),
+            3.0,
+            "scale=320:-2",
+            "mjpeg",
+            Some(4),
+            true,
+            hw,
+            proxy,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"x");
+        std::fs::read_to_string(out).unwrap().lines().map(String::from).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_grab_of_a_proxy_is_one_thread_and_of_an_original_the_budget() {
+        let _serial = cpu::test_lock();
+        let dir = std::env::temp_dir().join(format!("kerf-frame-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proxy = argv_of_frame_decode(&dir, true, None);
+        assert_eq!(
+            proxy.join(" "),
+            "-threads 1 -filter_threads 1 -filter_complex_threads 1 -hide_banner -loglevel error -ss 3.000 -i /media/a.mp4 \
+             -frames:v 1 -vf scale=320:-2 -q:v 4 -f image2pipe -vcodec mjpeg -threads 1 pipe:1"
+        );
+        // An original keeps its hardware decoder, and no encoder thread cap of its own.
+        let original = argv_of_frame_decode(&dir, false, Some("auto"));
+        assert_eq!(count(&original, "-hwaccel"), 1);
+        assert_eq!(&original[original.len() - 3..], ["-vcodec", "mjpeg", "pipe:1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_traits_carry_the_codec_and_chroma_the_hardware_decision_reads() {
+        let probe = |codec: &str, pix_fmt: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{{"codec_name":"{codec}","pix_fmt":"{pix_fmt}"}}],"format":{{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}}}"#
+            ))
+        };
+        let iphone = probe("hevc", "yuv420p10le");
+        assert_eq!((iphone.codec, iphone.chroma), (Codec::Hevc, Chroma::Yuv420));
+        let r5 = probe("hevc", "yuv422p10le");
+        assert_eq!((r5.codec, r5.chroma), (Codec::Hevc, Chroma::Other));
+        assert_eq!(probe("prores", "yuv422p10le").codec, Codec::Other);
+        // A stream that says nothing, and a probe that failed, assume nothing.
+        let silent = parse_source_traits(r#"{"streams":[{}],"format":{}}"#);
+        assert_eq!((silent.codec, silent.chroma), (Codec::Unknown, Chroma::Unknown));
+        assert_eq!(parse_source_traits("not json"), SourceTraits::default());
+    }
+
+    #[test]
+    fn a_proxy_is_known_by_its_name_without_a_probe() {
+        let facts = path_facts(Path::new(PROXY_PATH));
+        assert!(facts.proxy);
+        assert_eq!((facts.codec, facts.chroma), (Codec::Unknown, Chroma::Unknown));
+    }
+
+    /// Against the real binary: what the spawn-time tuning of a proxy read changes is the
+    /// cost of the run and not one byte of the picture — the scrubbed still, the frame grab
+    /// and the playback stream, all handed `-hwaccel auto` as the app does.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored tuned_proxy_reads`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn tuned_proxy_reads_are_the_same_picture_as_the_untuned_ones() {
+        let _serial = cpu::test_lock();
+        let dir = Scratch::new("tuned-proxy");
+        let proxies = dir.join("kerf").join("proxies");
+        std::fs::create_dir_all(&proxies).unwrap();
+        let proxy = proxies.join("0123456789abcdef.mp4");
+        // What `build_proxy_args` makes: all-intra H.264, 4:2:0.
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=3",
+            "-c:v",
+            "libx264",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mp4",
+            proxy.to_str().unwrap(),
+        ]);
+        let mut asset = at_path(proxy.to_str().unwrap(), "h264", "yuv420p");
+        asset.streams[0].width = Some(1280);
+        asset.streams[0].height = Some(720);
+        asset.duration = 3.0;
+        let assets = [asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 3.0, 0.0)]);
+        let jpeg = |bytes: &[u8]| bytes.len() > 1000 && bytes[..2] == [0xFF, 0xD8];
+
+        // The composited still: the argv as built plus the budget's caps (what ran before)
+        // against the one that is spawned now.
+        let built = build_timeline_frame_args(&timeline, &assets, &hw_still_opts(), 1.5, 640, 4).unwrap();
+        let spawn = |args: &[String]| {
+            let out = command(&ffmpeg_bin()).args(args).output().expect("run ffmpeg");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        };
+        let mut untuned = built.clone();
+        cpu::limit_args(&mut untuned, cpu::budget_threads());
+        let mut tuned = built;
+        assert!(!tune_still_args(&mut tuned, &assets, HostOs::CURRENT));
+        assert_ne!(untuned, tuned);
+        let (old, new) = (spawn(&untuned), spawn(&tuned));
+        assert!(jpeg(&new));
+        assert_eq!(old, new, "the still differs");
+        let options = hw_still_opts();
+        assert_eq!(timeline_frame(&timeline, &assets, &options, 1.5, 640, 4).unwrap(), new);
+
+        // The frame grab: `frame_jpeg` decides for itself from the path it is given.
+        let vf = "scale='min(320,iw)':-2";
+        let grab = frame_jpeg(&proxy, 1.5, 320, 4, true).unwrap();
+        assert!(jpeg(&grab));
+        let untuned = run_frame_decode(&ffmpeg_bin(), &proxy, 1.5, vf, "mjpeg", Some(4), true, None, false).unwrap();
+        assert_eq!(grab, untuned, "the grab differs");
+
+        // The stream: a second of frames, read from the proxy with the hardware dropped.
+        let mut frames = 0;
+        stream_preview(&timeline, &assets, 0.5, 24.0, &mut |f| {
+            assert!(jpeg(&f.jpeg));
+            frames += 1;
+            frames < 12
+        })
+        .expect("stream");
+        assert_eq!(frames, 12);
     }
 
     #[test]

@@ -25,8 +25,9 @@ does too); an asset with no recorded `pix_fmt` costs a second `yuva420p` decode 
 refused if anything is transparent. A child is killed after 30 s or when it writes more than the probed size,
 and `-ss` past the last frame (zero frames) is `Ok(None)` — FFmpeg's own still draws
 nothing for that layer, and so does the compositor. The layers of a frame decode in
-parallel, each given `budget / layers` threads even at a full CPU budget
-(`limit_ffmpeg_args(args, share)`). That is the one-shot path; `FrameSource` (below) is the
+parallel, each given `budget / layers` threads even at a full CPU budget, or one thread and
+no hardware when the layer reads a preview proxy (`limit_frame_args(args, share)`,
+`engine/decode_policy.rs`). That is the one-shot path; `FrameSource` (below) is the
 long-lived one.
 
 **Presenting a frame (A2).** `Compositor::render_plan_texture_with` is `render_plan_with`

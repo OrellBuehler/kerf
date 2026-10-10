@@ -342,7 +342,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
     let frame_len = yuv420p_len(w, h).ok_or_else(|| GpuError::Unsupported(format!("{path}: a {w}x{h} picture")))?;
     let run = |alpha: bool, cap: usize| {
         let mut args = decode_args(layer, alpha);
-        kerf_core::limit_ffmpeg_args(&mut args, share);
+        kerf_core::limit_frame_args(&mut args, share);
         run_ffmpeg(&args, cap).map_err(|e| match e {
             RunError::Overflow => GpuError::Unsupported(format!(
                 "{path}: the decode is larger than the probed {w}x{h} (a display rotation the probe missed?)"
