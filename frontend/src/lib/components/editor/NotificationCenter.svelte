@@ -88,7 +88,7 @@
 				title="Mark every notification as read"
 				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
 					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;cursor:{notifications.unread ? 'pointer' : 'default'}"
+					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.unread ? 'pointer' : 'default'}"
 				>Mark all read</button
 			>
 			<button
@@ -98,7 +98,7 @@
 				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
 					.items.length
 					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;cursor:{notifications.items.length ? 'pointer' : 'default'}"
+					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.items.length ? 'pointer' : 'default'}"
 				>Clear</button
 			>
 		</div>

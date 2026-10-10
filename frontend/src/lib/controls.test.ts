@@ -125,6 +125,15 @@ describe('the old rules are gone', () => {
 		expect(dock).toMatch(/\.dv-tab\.dv-inactive-tab:active\s*\{[^}]*surface-active/);
 	});
 
+	test('a control drawn in the disabled color is not also dimmed by the blanket opacity', () => {
+		// "Mark all read" and "Clear" go `text-disabled` when they have nothing to act on; the blanket
+		// `button:disabled` 50 % on top made them dimmer than a disabled control is meant to be.
+		const log = read(`${EDITOR}NotificationCenter.svelte`);
+		const buttons = [...log.matchAll(/<button\b[\s\S]*?>\s*(?:Mark all read|Clear)\s*<\/button/g)].map((m) => m[0]);
+		expect(buttons.length).toBe(2);
+		for (const tag of buttons) expect(tag, tag.slice(0, 80)).toContain('opacity:1');
+	});
+
 	test('a disabled context-menu row is not dimmed on top of its disabled color', () => {
 		const menu = read(`${EDITOR}ContextMenu.svelte`);
 		expect(menu).not.toMatch(/opacity:\{[^}]*0\.\d+/);
