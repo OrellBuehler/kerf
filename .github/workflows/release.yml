@@ -21,6 +21,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Only `v*` tags are app releases; `models-v*` and the like just host files, so
+  # every job that does not wait on another is gated on the tag.
+
   # `releases/latest` moves to a release the instant it is published, but its
   # `latest.json` is only attached ~20 minutes later, once the slowest bundle has
   # built — so `releases/latest/download/latest.json` 404s for that whole window
@@ -38,7 +41,7 @@ jobs:
   # `updater-manifest`, and never becomes `releases/latest`.
   hold-release:
     name: hold releases/latest
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -58,6 +61,7 @@ jobs:
   # already have, forever.
   version-check:
     name: version consistency
+    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -87,6 +91,7 @@ jobs:
   # rather than read a missing run as a failure.
   ci-green:
     name: CI passed on the tagged commit
+    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -237,7 +242,7 @@ jobs:
   attest:
     name: build provenance
     needs: app-bundles
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -278,7 +283,7 @@ jobs:
   updater-manifest:
     name: latest.json
     needs: [hold-release, app-bundles]
-    if: ${{ !cancelled() && !github.event.release.prerelease }}
+    if: ${{ !cancelled() && startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

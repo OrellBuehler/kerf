@@ -71,7 +71,8 @@ manifest still ships (better than none), but no longer silently. Nothing is
 built until `ci-green` has seen a successful CI run on the tagged commit (it
 polls, because a release is usually published while CI on the merge commit is
 still running), and `attest` adds a build-provenance attestation to every
-installer. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
+installer. Only `v*` tags run it: a release that just hosts files (`models-v1`, the
+Demucs model) skips every job. **`prepare-release.yml`** (`workflow_dispatch`, input `version`) does
 the release PR's edits: the three version fields, `cargo update --workspace`,
 and `fetch-ffmpeg.mjs --repin`, which moves the FFmpeg pins to the newest
 upstream builds and rewrites the script's digests. CI's `engine` job runs the
