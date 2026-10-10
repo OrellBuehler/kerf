@@ -426,14 +426,15 @@ muted rest, `data-accent` the version chip when an update waits; `IconBtn` write
 it is given `active`, since a plain icon button announced as "not pressed" reads as a switch) and `.k-tab`
 (the workspace tabs). Everything else that is a plain `<button>` or `role=button` and keeps its colours
 inline gets one **veil** (`--hover-fill` / `--press-fill`, an inset `box-shadow` of `text-primary` that
-paints over any fill, because inline styles never set `box-shadow`), except the timeline clips and menu
-rows, and a disabled one falls back to `opacity:.5` with a `default` cursor (not
+paints over any fill, because inline styles never set `box-shadow`), except the timeline clips, menu
+rows and dockview's own controls (its close X has a hover of its own), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
 `not-allowed`: a red circle on a greyed Undo reads as an error) — a control that must stay legible when off
 sets `opacity:1` itself (the context menu's rows, the transcript's cut lines, which used to be dimmed twice).
 Dock tabs hover and press in `dockview-kerf.css`. **One keyboard focus indicator**: `--focus-outline`
 (2 px `kerf-400`, offset `--focus-offset`) from a zero-specificity `:where(button, summary, input, select,
-textarea, a[href], [role=button], [role=tab])` rule in `layout.css`, inset in dense strips (the menu bar, dock
-tabs — dockview's own was a 1 px outline in the divider colour, invisible), and the slider thumb draws the
+textarea, a[href], [role=button], [role=tab])` rule in `layout.css`, inset in dense strips (the menu bar, the library rail, which clips an outset ring, dock
+tabs — dockview's own was a 1 px outline in the divider colour, invisible), and a bordered wrapper around a bare
+`<input>` (`.k-field`: the agent composer, the keyboard search) carries it through `:focus-within`, and the slider thumb draws the
 same colour and width as a ring (`--focus-ring`); `outline-ring/50` is gone from the base layer. **Toasts
 are in the theme** (`ui/sonner`): Kerf's scheme (not the OS's, since `ModeWatcher` is not mounted), an
 offset above the status bar, the menu's surface / shadow / radius, a ghost accent action instead of
