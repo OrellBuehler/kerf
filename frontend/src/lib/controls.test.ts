@@ -119,6 +119,24 @@ describe('the old rules are gone', () => {
 		expect(read(`${EDITOR}MenuBar.svelte`)).toContain('outline: var(--focus-outline)');
 	});
 
+	test('the rail draws its focus ring inside, and a bare input is outlined through its wrapper', () => {
+		// The rail is a 40 px column with `overflow-x:hidden`; an outset ring on its 36 px buttons is clipped.
+		const rail = /\.k-ibtn\[role='tab'\]:focus-visible\s*\{([^}]*)\}/.exec(CONTROLS);
+		expect(rail, 'the rail rule').not.toBeNull();
+		expect(rail![1]).toContain('outline-offset: calc(var(--focus-offset) * -1)');
+		expect(CONTROLS).toMatch(/\.k-field:focus-within\s*\{\s*outline: var\(--focus-outline\)/);
+		// Every input that kills its own outline sits in a .k-field (the Agent composer, the Keyboard search).
+		for (const file of ['AgentPanel.svelte', 'KeyboardSettings.svelte']) {
+			const source = read(`${EDITOR}${file}`);
+			expect(source, file).toContain('class="k-field"');
+		}
+		for (const file of ['AgentPanel.svelte', 'KeyboardSettings.svelte', 'SettingsDialog.svelte', 'ExportDialog.svelte', 'Inspector.svelte']) {
+			const source = read(`${EDITOR}${file}`);
+			const bare = [...source.matchAll(/<input\b[\s\S]*?\/>/g)].filter((m) => /outline:\s*none/.test(m[0]));
+			if (bare.length) expect(source, `${file} has an input with outline:none`).toContain('class="k-field"');
+		}
+	});
+
 	test('dock tabs react to the pointer', () => {
 		const dock = read('lib/styles/dockview-kerf.css');
 		expect(dock).toMatch(/\.dv-tab\.dv-inactive-tab:hover\s*\{[^}]*surface-hover/);

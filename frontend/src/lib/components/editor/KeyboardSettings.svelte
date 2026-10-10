@@ -205,6 +205,7 @@
 	>
 		<div style="display:flex;align-items:center;gap:8px">
 			<label
+				class="k-field"
 				style="flex:1;min-width:0;display:flex;align-items:center;gap:7px;height:28px;padding:0 8px;background:var(--surface-inset);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);color:var(--text-muted)"
 			>
 				<Icon n="search" s={13} color="currentColor" />

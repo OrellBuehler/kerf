@@ -198,6 +198,12 @@
 	opacity: 1;
 }
 
+/* The library rail sits in a 40 px column that clips what overflows it, and its buttons are 36 px:
+   an outset ring would be cut off, so its focus outline is drawn inside the button (as dock tabs'). */
+.k-ibtn[role='tab']:focus-visible {
+	outline-offset: calc(var(--focus-offset) * -1);
+}
+
 /* ---------- Workspace tabs ---------- */
 
 .k-tab {
@@ -227,6 +233,15 @@
 	border-color: var(--border-strong);
 	color: var(--text-primary);
 	box-shadow: inset 0 -2px 0 var(--kerf-500);
+}
+
+/* ---------- Text fields drawn as a wrapper ---------- */
+
+/* A search box or the agent's composer is a bordered wrapper around a bare <input> with no outline
+   of its own, so the wrapper carries the one focus outline while the field has focus. */
+.k-field:focus-within {
+	outline: var(--focus-outline);
+	outline-offset: var(--focus-offset);
 }
 
 /* ---------- Everything else that is a button ---------- */

@@ -707,6 +707,7 @@
 		style="flex:none;padding:12px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app);display:flex;flex-direction:column;gap:9px"
 	>
 		<div
+			class="k-field"
 			style="display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;background:var(--surface-inset);border:var(--line-width) solid var(--input);border-radius:var(--radius-sm);opacity:{disabled
 				? 0.5
 				: 1}"
