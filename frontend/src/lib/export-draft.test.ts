@@ -1,6 +1,15 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
+import './test-runes';
 import { applyPreset } from './export-presets';
 import { frameKey, restoreDraft, type ExportDraft } from './export-draft';
+
+// `notifications.svelte` pulls in svelte-sonner's components, which bun cannot load.
+const note = () => {};
+mock.module('./notifications.svelte', () => ({
+	toast: Object.assign(note, { success: note, info: note, warning: note, error: note }),
+	notifications: {}
+}));
+const { ui } = await import('./editor-ui.svelte');
 
 const draft = (over: Partial<ExportDraft> = {}): ExportDraft => ({
 	opts: { ...applyPreset('youtube_4k'), crf: 18 },
@@ -53,5 +62,13 @@ describe('restoreDraft', () => {
 	test('a project with no frame keeps its draft', () => {
 		const d = draft({ frame: null });
 		expect(restoreDraft(d, null)?.opts).toEqual(d.opts);
+	});
+});
+
+describe('a different project', () => {
+	test('forgets the export options of the last one', () => {
+		ui.exportDraft = draft();
+		ui.projectReplaced();
+		expect(ui.exportDraft).toBeNull();
 	});
 });

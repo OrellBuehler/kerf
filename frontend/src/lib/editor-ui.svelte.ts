@@ -232,6 +232,12 @@ class EditorUi {
 		this.exportDialog = false;
 	}
 
+	/** A different project was opened or created: what the session remembered about the last one
+	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
+	projectReplaced() {
+		this.exportDraft = null;
+	}
+
 	toggleDeliverShape(id: string) {
 		this.deliverShapes = this.deliverShapes.includes(id)
 			? this.deliverShapes.filter((v) => v !== id)

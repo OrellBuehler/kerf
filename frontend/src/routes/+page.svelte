@@ -244,6 +244,7 @@
 		if (!(await okToReplace())) return;
 		try {
 			if (await editor.newProject()) {
+				ui.projectReplaced();
 				await agent.load();
 				toast.success('New project');
 			}
@@ -261,6 +262,7 @@
 		if (!(await okToReplace())) return;
 		try {
 			if (await editor.openProject(path)) {
+				ui.projectReplaced();
 				await agent.load();
 				toast.success(`Opened ${editor.projectName}`);
 			}
