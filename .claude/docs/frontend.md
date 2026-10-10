@@ -11,6 +11,7 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `-mono` / `-display` name), bundled by Vite, so nothing is fetched at first paint and the CSP has no font
   host (a `@import url(https://fonts.googleapis.com…)` sat after the Tailwind imports for a long time,
   which CSS ignores — the brand fonts never loaded and every screenshot was the system fallback).
+  The fonts are SIL OFL 1.1, so their licence text ships with the installer: `crates/kerf-app/licenses/fonts-NOTICE.md`, listed in `bundle.resources` of `tauri.conf.json` *and* in the `resources` override of `pr-build.yml` / `release.yml` (a new notice must go in all three).
   `src/routes/layout.css` imports
   the **Kerf design tokens** (`src/lib/styles/kerf-tokens.css`) and maps the shadcn
   semantic vars onto them. **Every color is themable**: `src/lib/theme.ts` lists
