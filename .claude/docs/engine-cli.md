@@ -159,7 +159,7 @@ so the feature is **only** activated through these forwards — which is what ma
   flag, which the previews read: stills, frame grabs, the stream (before its first frame), scenes,
   salience, filmstrips. **Classified** — only a failure whose text names an unobtainable decoder
   (`looks_like_hardware_decode_failure`: those two phrases, `Unrecognized hwaccel`, a bad
-  `hwaccel` option, `requires hwaccel`; *not* `Device creation failed`, `Using auto hwaccel` or
+  `hwaccel` option, `requires hwaccel`, and the pinned build's `implib-gen: ... failed to load library` abort (SIGABRT) for a hardware library — `libva-drm.so.2` missing makes every `auto` and `vaapi` run die on a Linux box without libva; *not* `Device creation failed`, `Using auto hwaccel` or
   `Failed setup for format`, which a successful `auto` run prints too, so a missing output
   directory or a full disk is not the hardware's) convicts, through `convict_hardware_decode`
   (which also sets the separate `HWACCEL_PROVEN_BAD`): `render_with_progress`

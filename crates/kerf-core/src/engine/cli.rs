@@ -8370,7 +8370,16 @@ mod tests {
             let text = String::from_utf8_lossy(&out.stderr);
             assert!(looks_like_hardware_decode_failure(&text), "{accel}: {text}");
         }
-        assert!(decode("auto").status.success(), "`auto` is expected to fall back quietly");
+        // `auto` falls back quietly — except on a machine where the pinned build's shim for a
+        // hardware library (`libva-drm.so.2`) cannot load it, which aborts the run: that must be
+        // read as the hardware's too, and there is then no probing `auto` run left to check.
+        let auto = decode("auto");
+        if !auto.status.success() {
+            let text = String::from_utf8_lossy(&auto.stderr);
+            assert!(looks_like_hardware_decode_failure(&text), "auto: {text}");
+            skip("skipped the output check: `auto` itself fails here, as the hardware's failure");
+            return;
+        }
         // The probing `auto` prints (`Device creation failed`, `Using auto hwaccel type ...`) is
         // not a failure: a run that then dies on its output is not the hardware's.
         let out = command(&ffmpeg_bin())
@@ -8504,8 +8513,9 @@ mod tests {
         // The composited still: the argv as built plus the budget's caps (what ran before)
         // against the one that is spawned now.
         let built = build_timeline_frame_args(&timeline, &assets, &hw_still_opts(), 1.5, 640, 4).unwrap();
+        let run = |args: &[String]| command(&ffmpeg_bin()).args(args).output().expect("run ffmpeg");
         let spawn = |args: &[String]| {
-            let out = command(&ffmpeg_bin()).args(args).output().expect("run ffmpeg");
+            let out = run(args);
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             out.stdout
         };
@@ -8514,7 +8524,20 @@ mod tests {
         let mut tuned = built;
         assert!(!tune_still_args(&mut tuned, &assets, HostOs::CURRENT));
         assert_ne!(untuned, tuned);
-        let (old, new) = (spawn(&untuned), spawn(&tuned));
+        // What ran before asked the proxy for `-hwaccel auto`. On a machine where that run dies
+        // (the pinned build aborts when `libva-drm.so.2` is missing) the baseline is what the
+        // software rerun of production produced: the same still with no hardware asked for.
+        let first = run(&untuned);
+        let old = if first.status.success() {
+            first.stdout
+        } else {
+            let text = String::from_utf8_lossy(&first.stderr);
+            assert!(looks_like_hardware_decode_failure(&text), "{text}");
+            let mut software = build_timeline_frame_args(&timeline, &assets, &ExportOptions::default(), 1.5, 640, 4).unwrap();
+            cpu::limit_args(&mut software, cpu::budget_threads());
+            spawn(&software)
+        };
+        let new = spawn(&tuned);
         assert!(jpeg(&new));
         assert_eq!(old, new, "the still differs");
         let options = hw_still_opts();

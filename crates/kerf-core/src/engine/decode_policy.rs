@@ -203,6 +203,13 @@ pub(crate) fn facts_matter(os: HostOs, requested: &str, reading: Reading) -> boo
 /// is not the hardware's. ffmpeg 9.0.2 ends a run with no device for a named accelerator with
 /// `No device available for decoder: device type d3d11va needed for codec h264.` and `Hardware
 /// device setup failed for decoder: ...`.
+///
+/// The pinned build also loads the hardware libraries lazily through `implib-gen` shims, which
+/// **abort the process** (SIGABRT) when one is missing: on a Linux machine without `libva-drm.so.2`
+/// every `-hwaccel auto` and `-hwaccel vaapi` run dies with `implib-gen: libva-drm.so.2: failed to
+/// load library ... dlopen: ...` and an assertion. That is fatal and the hardware's, but only for
+/// the hardware libraries (a missing `libpulse` is not) — and unlike `Cannot load libcuda.so.1`,
+/// which a working `auto` run prints, it ends the run.
 pub(crate) fn looks_like_hardware_decode_failure(text: &str) -> bool {
     const MARKS: [&str; 8] = [
         "no device available for decoder",
@@ -214,8 +221,23 @@ pub(crate) fn looks_like_hardware_decode_failure(text: &str) -> bool {
         "requires hwaccel",
         "doesn't support hardware accelerated",
     ];
+    const HARDWARE_LIBRARIES: [&str; 8] = [
+        "libva",
+        "libvdpau",
+        "libdrm",
+        "libcuda",
+        "libnvcuvid",
+        "libmfx",
+        "libvpl",
+        "libamf",
+    ];
     let text = text.to_ascii_lowercase();
     MARKS.iter().any(|m| text.contains(m))
+        || text.lines().any(|l| {
+            l.contains("implib-gen:")
+                && l.contains("failed to load library")
+                && HARDWARE_LIBRARIES.iter().any(|lib| l.contains(lib))
+        })
 }
 
 /// The `-hwaccel` an export is asked for, given what the process knows about hardware decode:
@@ -450,10 +472,21 @@ mod tests {
         Error opening output file -.\n\
         Error opening output files: Cannot allocate memory";
 
+    /// The pinned ffmpeg 9.0.2 on a GitHub runner with no `libva-drm.so.2` (CI, `-hwaccel auto` and
+    /// `-hwaccel vaapi` alike): the shim aborts the process.
+    const MISSING_HARDWARE_LIBRARY: &str = "[CUDA @ 0x55e5dfa45a40] Cannot load libcuda.so.1\n\
+        [CUDA @ 0x55e5dfa45a40] Could not dynamically load CUDA\n\
+        Device creation failed: -1.\n\
+        implib-gen: libva-drm.so.2: failed to load library 'libva-drm.so.2' via dlopen: libva-drm.so.2: cannot open shared object file: No such file or directory\n\
+        ffmpeg-x86_64-unknown-linux-gnu: libva-drm.so.2.init.c:122: load_library: Assertion `0 && \"Assertion in generated code\"' failed.";
+
     #[test]
     fn a_missing_device_reads_as_the_hardwares_failure_and_nothing_else_does() {
         for text in [
             NAMED_WITHOUT_A_DEVICE,
+            MISSING_HARDWARE_LIBRARY,
+            "ffmpeg exited with signal: 6 (SIGABRT): implib-gen: libva.so.2: failed to load library 'libva.so.2'",
+            "implib-gen: libvdpau.so.1: failed to load library 'libvdpau.so.1' via dlopen: not found",
             "ffmpeg exited with exit status: 244: Device creation failed: -12.\n\
              [dec:h264 @ 0x55] No device available for decoder: device type vaapi needed for codec h264.\n\
              [dec:h264 @ 0x55] Hardware device setup failed for decoder: Generic error in an external library",
@@ -482,6 +515,10 @@ mod tests {
             "Conversion failed!",
             "ffmpeg exited with exit status: 234: No space left on device",
             "timeline has no clips to export",
+            // A shim for a library that is not the hardware's, and the benign `auto` probing line
+            // that is not a shim at all.
+            "implib-gen: libpulse.so.0: failed to load library 'libpulse.so.0' via dlopen: not found",
+            "[CUDA @ 0x55e5dfa45a40] Cannot load libcuda.so.1\nCould not dynamically load CUDA",
         ] {
             assert!(!looks_like_hardware_decode_failure(text), "{text}");
         }
