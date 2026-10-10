@@ -54,6 +54,9 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	/** Something is drawn from this clip: its footage has a picture *and* it sits on a picture track.
+	 *  The sound half of a linked pair has the picture's asset but plays no picture of its own. */
+	const picture = $derived(kind === 'video' && track?.kind !== 'audio');
 	const linkInfo = $derived(clip ? linkBadge(editor.timeline, clip, (id) => editor.assetName(id)) : null);
 	const linkedTo = $derived(linkInfo?.partners.map((p) => p.track) ?? []);
 	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
@@ -323,7 +326,7 @@
 		const c = clip;
 		const items: MenuItem[] = [];
 		if (c) {
-			if (kind === 'video') {
+			if (picture) {
 				items.push(
 					{ label: 'Reset transform', icon: 'rotate-ccw', action: () => run(() => editor.setTransform(c.id, DEFAULT_TRANSFORM)) },
 					{ label: 'Reset color', icon: 'rotate-ccw', action: () => run(() => editor.setColor(c.id, DEFAULT_COLOR)) },
@@ -842,7 +845,7 @@
 			</label>
 			</InspectorSection>
 
-			{#if kind === 'video'}
+			{#if picture}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
@@ -934,7 +937,7 @@
 
 			{/if}
 
-			{#if kind === 'video'}
+			{#if picture}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
 					setTf({ scale: v })
@@ -1106,7 +1109,7 @@
 					{@render fxBlock('Audio effects', audioFx, AUDIO_FX, addAudioFx, setAudioFxParam, removeAudioFx)}
 				{/if}
 
-				{#if kind === 'video'}
+				{#if picture}
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
 
 					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
