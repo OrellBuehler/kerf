@@ -13,7 +13,15 @@ import {
 	masterOf,
 	nudgeCeiling,
 	posToCeiling,
-	trackRenders
+	trackRenders,
+	clampDuckDepth,
+	DUCK_DEFAULT_DEPTH_DB,
+	DUCK_MAX_DEPTH_DB,
+	DUCK_MIN_DEPTH_DB,
+	duckLabel,
+	duckToPos,
+	nudgeDuck,
+	posToDuck
 } from './levels';
 import type { Asset, LevelReading, Loudness, MasterBus, Timeline, TrackLevels } from './types';
 
@@ -244,5 +252,43 @@ describe('the limiter ceiling slider', () => {
 		expect(ceilingLabel(-1)).toBe('-1.0 dBFS');
 		expect(ceilingLabel(0)).toBe('0.0 dBFS');
 		expect(ceilingLabel(-0.01)).toBe('0.0 dBFS');
+	});
+});
+
+describe('the speech gate depth', () => {
+	test('clamps where the engine does, and the compressor is the absence of a depth', () => {
+		expect([DUCK_MIN_DEPTH_DB, DUCK_MAX_DEPTH_DB, DUCK_DEFAULT_DEPTH_DB]).toEqual([-40, -1, -12]);
+		expect(clampDuckDepth(-90)).toBe(-40);
+		expect(clampDuckDepth(3)).toBe(-1);
+		expect(clampDuckDepth(0)).toBe(-1);
+		expect(clampDuckDepth(-12.5)).toBe(-12.5);
+		expect(masterOf({}).duck_depth_db).toBeUndefined();
+		expect(masterOf({ master: { ...DEFAULT_MASTER, duck_depth_db: -9 } }).duck_depth_db).toBe(-9);
+	});
+
+	test('the slider runs from -40 on the left to -1 on the right', () => {
+		expect(duckToPos(-40)).toBe(0);
+		expect(duckToPos(-1)).toBe(1);
+		expect(duckToPos(-90)).toBe(0);
+		expect(posToDuck(0)).toBe(-40);
+		expect(posToDuck(1)).toBe(-1);
+		expect(posToDuck(2)).toBe(-1);
+		expect(posToDuck(duckToPos(-12))).toBe(-12);
+		for (let db = -40; db <= -1; db++) expect(posToDuck(duckToPos(db))).toBe(db);
+	});
+
+	test('nudges in whole dB on the grid of its size, within the range', () => {
+		expect(nudgeDuck(-12, 1)).toBe(-11);
+		expect(nudgeDuck(-12, -1)).toBe(-13);
+		expect(nudgeDuck(-12, 1, 'coarse')).toBe(-10);
+		expect(nudgeDuck(-12, -1, 'coarse')).toBe(-15);
+		expect(nudgeDuck(-12, -1, 'page')).toBe(-20);
+		expect(nudgeDuck(-1, 1)).toBe(-1);
+		expect(nudgeDuck(-40, -1)).toBe(-40);
+	});
+
+	test('reads as dB, with a tenth only when it has one', () => {
+		expect(duckLabel(-12)).toBe('-12 dB');
+		expect(duckLabel(-7.5)).toBe('-7.5 dB');
 	});
 });

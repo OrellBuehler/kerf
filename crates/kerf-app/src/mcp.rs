@@ -427,6 +427,38 @@ struct SnapToBeatsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PlanMusicFitParams {
+    #[schemars(description = "UUID of the music clip (on an audio track, at normal speed)")]
+    clip_id: String,
+    #[schemars(
+        description = "How long the music should last, in seconds. Omit to fit it to the picture: from the clip's start to the end of the last video clip"
+    )]
+    target: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FitMusicParams {
+    #[schemars(description = "UUID of the music clip (on an audio track, at normal speed, not linked to a picture)")]
+    clip_id: String,
+    #[schemars(
+        description = "How long the music should last, in seconds. Omit to fit it to the picture: from the clip's start to the end of the last video clip"
+    )]
+    target: Option<f64>,
+    #[schemars(
+        description = "When the nearest bar-aligned arrangement runs over the target, cut it there and fade out over the last 2 s (default true). False keeps the whole arrangement, ending included"
+    )]
+    fade_out: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMasterDuckParams {
+    #[schemars(
+        description = "Speech-gate depth in dB (negative, clamped to -40..-1; -12 is a good bed under dialogue). Omit to go back to the sidechain compressor"
+    )]
+    depth_db: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CutClipRangeParams {
     #[schemars(description = "UUID of the clip to cut")]
     clip_id: String,
@@ -1989,6 +2021,20 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Choose how ducked tracks (set_track_duck) dip under the rest of the mix on export. With \
+                       depth_db, a speech gate: whenever the other tracks speak the ducked tracks drop by exactly \
+                       that much (ramping down in ~50 ms and back ~300 ms after the speech stops) — -12 is a good \
+                       music bed under dialogue. Without it, the default sidechain compressor, which dips by how loud \
+                       the speech is. Returns the master bus."
+    )]
+    fn set_master_duck(&self, Parameters(p): Parameters<SetMasterDuckParams>) -> Result<String, McpError> {
+        self.edit(|project| {
+            let master = project.set_master_duck(p.depth_db).map_err(core_err)?;
+            json(&master)
+        })
+    }
+
+    #[tool(
         description = "Set the frame this project is cut for — the shape of the delivered video, e.g. \
                        1080x1920 for a vertical Reel or 1080x1080 for a square feed post. Everything \
                        that renders a picture (preview_timeline, get_frame and the export) then uses \
@@ -2725,6 +2771,68 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Read the bar structure of an analyzed music asset, compactly: tempo, the fitted beat grid \
+                       (period, phase, which beat is the downbeat), every bar start, and the repeating 8- and 4-bar \
+                       phrases (bar indices counted from the first downbeat) that fit_music may splice between. \
+                       Analyze the asset first; `music` is null when it has no steady pulse."
+    )]
+    fn get_music_structure(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let analysis = self.lock().get_analysis(id).map_err(core_err)?;
+        let Some(analysis) = analysis else {
+            return Err(McpError::invalid_params(
+                "the asset has not been analyzed yet — call analyze_asset first",
+                None,
+            ));
+        };
+        let music = analysis.music.map(|m| {
+            serde_json::json!({
+                "bpm": m.grid.bpm(),
+                "grid": m.grid,
+                "duration": m.duration,
+                "bar_seconds": m.grid.bar_s(),
+                "bars": m.bar_chroma.len(),
+                "bar_starts": (0..m.bar_chroma.len()).map(|k| m.grid.bar_start(k)).collect::<Vec<_>>(),
+                "intro_end": m.grid.first_downbeat().max(0.0),
+                "phrases": m.phrases,
+            })
+        });
+        json(&serde_json::json!({ "asset_id": id, "music": music, "loudness": analysis.loudness }))
+    }
+
+    #[tool(
+        description = "Preview fit_music without changing anything: the bar-aligned arrangement (source segments in \
+                       output order), how long it lasts, the remainder (target minus duration: positive is short, \
+                       negative runs over and fit_music would fade it out) and how many splices it needs. The intro \
+                       and ending always play; only whole repeating phrases are repeated or dropped."
+    )]
+    fn plan_music_fit(&self, Parameters(p): Parameters<PlanMusicFitParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        let fit = self.lock().plan_music_fit(clip_id, p.target).map_err(core_err)?;
+        json(&fit)
+    }
+
+    #[tool(
+        description = "Fit music to length: replace a music clip with a bar-aligned edit list that lasts as long as \
+                       the target (by default the picture from the clip's start). Keeps the intro and ending, repeats \
+                       or drops whole repeating phrases, and crossfades each splice over 10 ms centred on it — \
+                       non-destructive clips on the original file, nothing is rendered. Needs analyze_asset on the \
+                       music first (a steady beat). If no arrangement hits the target on bar lines the nearest one is \
+                       used and, with fade_out (default), cut at the target and faded. Check plan_music_fit first if \
+                       the remainder matters. Returns the new clip ids, the plan and the timeline."
+    )]
+    fn fit_music(&self, Parameters(p): Parameters<FitMusicParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        self.edit(|project| {
+            let report = project
+                .fit_music(clip_id, p.target, p.fade_out.unwrap_or(true))
+                .map_err(core_err)?;
+            let timeline = project.working_timeline().map_err(core_err)?;
+            json(&serde_json::json!({ "fit": report, "timeline": timeline }))
+        })
+    }
+
+    #[tool(
         description = "Give an asset's sound its own clip on an audio track, for every clip of the asset on a video \
                        track that still plays it: each is DETACHED (see detach_audio: an audio clip with the same span \
                        and position, linked to the picture, whose own sound is muted) so nothing is heard twice — in \
@@ -2975,7 +3083,8 @@ impl KerfMcp {
     #[tool(
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
-                       safe H.264/AAC MP4 default. A render takes minutes: send a `progressToken` in the request's \
+                       safe H.264/AAC MP4 default. `options.loudness` normalizes the mix to a platform target: \
+                       youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP. A render takes minutes: send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Refuses to overwrite an existing file unless \
@@ -3828,7 +3937,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              platforms play at about -14 LUFS and want a true peak under -1 dBTP, \
              so check it, then fix a hot mix with set_master_volume / \
              set_master_limiter or export with loudnorm (which normalises to \
-             -14 LUFS). Call export to render, and export_cover to \
+             -14 LUFS) or a `loudness` preset. For music under a cut: \
+             analyze_asset the track, then fit_music fits it to the picture \
+             with bar-aligned phrase splices (plan_music_fit / \
+             get_music_structure to look first), and set_track_duck plus \
+             set_master_duck dips it under dialogue. Call export to render, and export_cover to \
              write the thumbnail the platform shows before anyone presses play. \
              export / export_srt / export_cover / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
@@ -4887,6 +5000,25 @@ mod tests {
                 vec!["ceiling_db".to_string(), "enabled".to_string()],
                 vec!["enabled".to_string()]
             )
+        );
+        assert_eq!(
+            schema("set_master_duck"),
+            (vec!["depth_db".to_string()], Vec::<String>::new())
+        );
+        assert_eq!(
+            schema("fit_music"),
+            (
+                vec!["clip_id".to_string(), "fade_out".to_string(), "target".to_string()],
+                vec!["clip_id".to_string()]
+            )
+        );
+        assert_eq!(
+            schema("plan_music_fit"),
+            (vec!["clip_id".to_string(), "target".to_string()], vec!["clip_id".to_string()])
+        );
+        assert_eq!(
+            schema("get_music_structure"),
+            (vec!["asset_id".to_string()], vec!["asset_id".to_string()])
         );
         // Both optional, and no request context leaking into the schema.
         assert_eq!(

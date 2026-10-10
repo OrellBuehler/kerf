@@ -161,6 +161,7 @@ still-file-jpeg image2 -vcodec mjpeg -y
 still-jpeg-pipe image2pipe
 still-rgb-pipe -pix_fmt rgb24
 ducking sidechaincompress
+audio-delay-samples S:all=1
 audio-pan pan=stereo|c0=
 audio-compressor acompressor=
 libm-canary-39 threshold=1.065368864e-2
@@ -544,11 +545,13 @@ fn master_for(j: usize) -> MasterBus {
             ..MasterBus::default()
         },
         3 | 11 => MasterBus {
+            duck_depth_db: None,
             volume,
             limiter: true,
             ceiling_db,
         },
         7 => MasterBus {
+            duck_depth_db: None,
             volume: 9.0,
             limiter: true,
             ceiling_db: -90.0,
@@ -563,11 +566,13 @@ fn master_for(j: usize) -> MasterBus {
             ..MasterBus::default()
         },
         14 => MasterBus {
+            duck_depth_db: None,
             volume: 1.0 + (j % 5) as f64 * 0.1,
             limiter: true,
             ceiling_db: -1.0,
         },
         _ => MasterBus {
+            duck_depth_db: None,
             volume: f64::NAN,
             limiter: true,
             ceiling_db: f64::INFINITY,

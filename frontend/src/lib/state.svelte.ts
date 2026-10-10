@@ -62,6 +62,8 @@ import {
 	setTrackPan,
 	setMasterVolume,
 	setMasterLimiter,
+	setMasterDuck,
+	fitMusic,
 	setDeliveryFormat,
 	setTrackMuted,
 	setTrackSolo,
@@ -125,6 +127,7 @@ import type {
 	Easing,
 	Keyframe,
 	Mask,
+	MusicFitReport,
 	Projection,
 	Property,
 	PropertyKey,
@@ -412,12 +415,35 @@ class EditorState {
 		return this.analyses[assetId];
 	}
 
+	/** Assets whose cached analysis has been asked for, so a never-analyzed one is asked once. */
+	#analysisAsked = new Set<string>();
+
+	/** Load the cached analysis of assets nobody has selected or analyzed yet — the ones the audio tracks
+	 *  play, whose tempo and bar grid draw the ruler and whose music analysis offers *Fit to video*.
+	 *  Each is asked for once (an unanalyzed asset answers `null`; `analyze` fills it in later); a failed
+	 *  read is asked again next time. Never overwrites an analysis already here. */
+	async ensureAnalyses(assetIds: Iterable<string>) {
+		const wanted = [...assetIds].filter((id) => !this.analyses[id] && !this.#analysisAsked.has(id));
+		for (const id of wanted) this.#analysisAsked.add(id);
+		await Promise.all(
+			wanted.map(async (id) => {
+				try {
+					const { analysis } = await getAssetMetadata(id);
+					if (analysis && !this.analyses[id]) this.analyses[id] = analysis;
+				} catch {
+					this.#analysisAsked.delete(id);
+				}
+			})
+		);
+	}
+
 	async load() {
 		this.loading = true;
 		this.error = null;
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
+			this.#analysisAsked.clear();
 			// The ripple flag is the project's, saved in its file: a project that was
 			// saved with ripple on has to open that way, and a new one has to reset
 			// the toggle, so it is read with everything else every load. (It never
@@ -807,6 +833,11 @@ class EditorState {
 	setMasterLimiter(enabled: boolean, ceilingDb?: number | null) {
 		return this.#apply(setMasterLimiter(enabled, ceilingDb));
 	}
+	/** How ducked tracks dip: a negative `depthDb` is the speech gate (that many dB under speech,
+	 *  `-40..-1`), omitted the sidechain compressor. */
+	setMasterDuck(depthDb?: number | null) {
+		return this.#apply(setMasterDuck(depthDb));
+	}
 	/** The frame this project is cut for; `null` follows the footage's shape. */
 	setDeliveryFormat(format: Delivery | null) {
 		return this.#apply(setDeliveryFormat(format));
@@ -1003,6 +1034,20 @@ class EditorState {
 	}
 	removeSilence(assetId: string) {
 		return this.#apply(removeSilence(assetId));
+	}
+	/** **Fit to video**: replace a music clip with a bar-aligned arrangement that lasts `target` seconds
+	 *  (by default the picture's length from the clip's start) — one `Fit music to length` revision.
+	 *  Resolves to what it did. The clip is gone, so the clips that replace it are selected. */
+	async fitMusic(clipId: string, target: number | null | undefined, fadeOut: boolean): Promise<MusicFitReport> {
+		let report!: MusicFitReport;
+		await this.#apply(
+			fitMusic(clipId, target, fadeOut).then((r) => {
+				report = r.report;
+				return r.timeline;
+			})
+		);
+		if (report.clips.length > 0) this.selectClips(report.clips, report.clips[0]);
+		return report;
 	}
 	/** Ripple a track's cuts onto the music's beat grid; all video tracks by default. */
 	snapToBeats(trackId?: string, tolerance?: number) {

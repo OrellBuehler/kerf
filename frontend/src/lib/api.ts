@@ -40,6 +40,9 @@ import type {
 	PropertyKey,
 	LaunchRequest,
 	Levels,
+	MasterBus,
+	MusicFit,
+	MusicFitted,
 	PreviewBoundsReport,
 	PreviewFrameResult,
 	Projection,
@@ -99,7 +102,10 @@ import { linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
-import { clampCeiling, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
+import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
+import { toFixedEven } from './format-fixed';
+import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
+import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
 import { checkAll } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
@@ -164,6 +170,15 @@ const sampleAssets: Asset[] = [
 		duration: 45,
 		streams: [{ index: 0, kind: 'video', codec: 'h264', width: 3840, height: 2160, fps: 24 }],
 		imported_at: new Date().toISOString()
+	},
+	// Audio only, with a fitted bar grid: the song "Fit to video" and the ruler's bars are explored with.
+	{
+		id: '33333333-3333-3333-3333-333333333333',
+		path: '/samples/music.mp3',
+		name: 'music.mp3',
+		duration: SAMPLE_MUSIC_DURATION,
+		streams: [{ index: 0, kind: 'audio', codec: 'mp3', sample_rate: 44100, channels: 2 }],
+		imported_at: new Date().toISOString()
 	}
 ];
 
@@ -182,8 +197,9 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		],
 		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
 		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
-		tempo: { bpm: 120, beats: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], confidence: 0.62 },
-		audio_class: { class: 'speech', confidence: 0.71 }
+		tempo: { bpm: 120, beats: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], confidence: 0.62, downbeats: [] },
+		audio_class: { class: 'speech', confidence: 0.71 },
+		music: null
 	},
 	[sampleAssets[1].id]: {
 		asset_id: sampleAssets[1].id,
@@ -192,9 +208,11 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		transcript: [],
 		loudness: { integrated_lufs: -11.8, loudness_range: 9.1, true_peak_dbtp: -0.8, threshold_lufs: -22.0 },
 		onsets: [0.4, 0.9, 1.5, 2.1, 2.7, 3.3, 3.9],
-		tempo: { bpm: 128, beats: [0.23, 0.7, 1.17, 1.64, 2.11, 2.58, 3.05, 3.52], confidence: 0.78 },
-		audio_class: { class: 'music', confidence: 0.83 }
-	}
+		tempo: { bpm: 128, beats: [0.23, 0.7, 1.17, 1.64, 2.11, 2.58, 3.05, 3.52], confidence: 0.78, downbeats: [] },
+		audio_class: { class: 'music', confidence: 0.83 },
+		music: null
+	},
+	[sampleAssets[2].id]: sampleMusicAnalysis(sampleAssets[2].id)
 };
 
 // The starter cut is the *detached-and-linked* shape linked A/V produces: the interview's
@@ -205,6 +223,14 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 // (`Project::sample`) detaches the same way and then unlinks, because the kerf-core tests
 // built on it edit one clip at a time; the harness is for exploring, so it keeps the link.
 const SAMPLE_LINK = 'sample-link-interview';
+
+/** `?music=1` in the browser harness lays the sample song on an audio track of its own, 0 to its end,
+ *  so the bar ticks on the ruler and *Fit to video* are one right-click away. (Without it the song is
+ *  in the library, ready to be added.) */
+function wantsSampleMusic(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('music');
+}
+
 const sampleTimeline: Timeline = {
 	tracks: [
 		{
@@ -244,7 +270,28 @@ const sampleTimeline: Timeline = {
 					link_id: SAMPLE_LINK
 				}
 			]
-		}
+		},
+		...(wantsSampleMusic()
+			? [
+					{
+						id: 'a2',
+						kind: 'audio' as const,
+						name: 'A2',
+						clips: [
+							{
+								id: 'c4',
+								asset_id: sampleAssets[2].id,
+								source_in: 0,
+								source_out: SAMPLE_MUSIC_DURATION,
+								timeline_start: 0,
+								volume: 0.8,
+								fade_in: 0,
+								fade_out: 0
+							}
+						]
+					}
+				]
+			: [])
 	]
 };
 
@@ -877,7 +924,8 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		loudness: null,
 		onsets: [],
 		tempo: null,
-		audio_class: null
+		audio_class: null,
+		music: null
 	};
 	sampleAnalysis[assetId] ??= empty;
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
@@ -1103,7 +1151,8 @@ export async function generateVoiceover(opts: VoiceoverRequest): Promise<Voiceov
 			loudness: null,
 			onsets: [],
 			tempo: null,
-			audio_class: { class: 'speech', confidence: 1 }
+			audio_class: { class: 'speech', confidence: 1 },
+			music: null
 		};
 		devEdit(undefined, () => {
 			let track = opts.trackId ? devTimeline.tracks.find((t) => t.id === opts.trackId) : undefined;
@@ -1502,11 +1551,17 @@ export async function setTrackPan(trackId: string, pan: number): Promise<Timelin
 }
 
 /** Keep the harness timeline's master absent while it is the default, like the saved file. */
-function storeDevMaster(next: { volume: number; limiter: boolean; ceiling_db: number }) {
+function storeDevMaster(next: MasterBus) {
+	// The compressor duck is `None` in the core: the key is omitted, not `null`.
+	if (next.duck_depth_db == null) {
+		next = { ...next };
+		delete next.duck_depth_db;
+	}
 	const untouched =
 		next.volume === DEFAULT_MASTER.volume &&
 		next.limiter === DEFAULT_MASTER.limiter &&
-		next.ceiling_db === DEFAULT_MASTER.ceiling_db;
+		next.ceiling_db === DEFAULT_MASTER.ceiling_db &&
+		next.duck_depth_db === undefined;
 	if (untouched) delete devTimeline.master;
 	else devTimeline.master = next;
 }
@@ -1540,6 +1595,23 @@ export async function setMasterLimiter(enabled: boolean, ceilingDb?: number | nu
 		return snapshot();
 	}
 	return invoke<Timeline>('set_master_limiter', { enabled, ceilingDb: ceiling });
+}
+
+/**
+ * Choose how tracks flagged `duck` dip under the rest of the mix on export. A `depthDb` (negative
+ * dB, clamped to -40..-1) is the **speech gate**: the ducked bus drops by exactly that much while
+ * the other tracks speak. Omitted (or `null`) is the sidechain compressor, which dips by how loud
+ * the rest is. One revision; the preview does not duck either way (export-only).
+ */
+export async function setMasterDuck(depthDb?: number | null): Promise<Timeline> {
+	if (depthDb != null && !Number.isFinite(depthDb)) throw new Error('duck depth must be a number');
+	const depth = depthDb == null ? null : clampDuckDepth(depthDb);
+	if (!inTauri()) {
+		storeDevMaster({ ...masterOf(devTimeline), duck_depth_db: depth });
+		recordDev(depth === null ? 'Duck with the compressor' : `Duck by ${toFixedEven(depth, 0)} dB under speech`);
+		return snapshot();
+	}
+	return invoke<Timeline>('set_master_duck', { depthDb: depth });
 }
 
 /**
@@ -2274,6 +2346,42 @@ export async function snapToBeats(trackId?: string, tolerance?: number): Promise
 		return snapshot();
 	}
 	return invoke<Timeline>('snap_to_beats', { trackId, tolerance });
+}
+
+/** What the harness's fit reads the project for: its assets and the analysis it has of them. */
+function devFitSources(): FitSources {
+	return { assets: sampleAssets, analysisOf: (id) => sampleAnalysis[id] };
+}
+
+/**
+ * What **Fit to video** would make of a music clip, without making it: the bar-aligned arrangement
+ * (source segments in output order), how long it lasts and how far that is from the target
+ * (`remainder = target - duration`: positive is short, negative runs over and would be faded).
+ * `target` seconds omitted fits the picture — from the clip's start to the end of the last video
+ * clip. Rejects when the clip is not music on an audio track or has no bar grid (`analyze` first).
+ * The browser harness plans with `music-fit.ts`, the faithful mirror of the Rust planner.
+ */
+export async function planMusicFit(clipId: string, target?: number | null): Promise<MusicFit> {
+	if (!inTauri()) return musicFitInputs(devTimeline, devFitSources(), clipId, target).fit;
+	return invoke<MusicFit>('plan_music_fit', { clipId, target: target ?? null });
+}
+
+/**
+ * **Fit to video**: replace a music clip with the bar-aligned edit list `planMusicFit` shows — intro
+ * and ending kept, whole repeating phrases repeated or dropped, each splice crossfaded over 10 ms —
+ * as clips on the original file. With `fadeOut`, a fit that runs over its target is cut there and
+ * faded out over the last 2 s. One revision; resolves to the refreshed timeline and the report.
+ */
+export async function fitMusic(clipId: string, target: number | null | undefined, fadeOut: boolean): Promise<MusicFitted> {
+	if (!inTauri()) {
+		// `edit_timeline_exact`: no ripple; a refusal part-way leaves the timeline as it was.
+		const scratch = snapshot();
+		const report = fitMusicOnto(scratch, devFitSources(), clipId, target, fadeOut, uid);
+		devTimeline = scratch;
+		recordDev('Fit music to length');
+		return { timeline: snapshot(), report };
+	}
+	return invoke<MusicFitted>('fit_music', { clipId, target: target ?? null, fadeOut });
 }
 
 /** Frame each shot for the delivery frame instead of centring it blindly.

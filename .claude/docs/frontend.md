@@ -428,7 +428,13 @@ codec, rate control, tune/profile/pixel format, audio codec and container knobs
 all live behind one **Advanced encoding** disclosure, and a CRF typed there
 reads back as `Custom` in the select. Loudness normalization sits beside
 `Include audio` rather than in Advanced, because for the social-video user it is
-a polish switch, not an encoder setting. The **readiness panel** stays visible
+a polish switch, not an encoder setting. It is a **select of targets** — Off /
+YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TARGETS`, all
+−1 dBTP) — writing `ExportOptions.loudness`; the old `loudnorm` boolean is the YouTube
+target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), and
+`withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
+by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
+Options are not persisted between openings. The **readiness panel** stays visible
 (only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
 TikTok", then any length errors / reach warnings one line each, then a *single*
 collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
@@ -510,7 +516,7 @@ from the playhead rather than playing it out in slow motion against the sound.
 playback moves under `bun run dev` and that failure mode is reproducible without a
 desktop build. `ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
-loudness normalize, and a **Range: In → out** choice when marks are set. It **opens on
+a loudness target, and a **Range: In → out** choice when marks are set. It **opens on
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
 that frame when one matches, else the default preset with its resolution cleared so
 "Project frame" renders — otherwise a 9:16 project opened its export already
@@ -706,7 +712,9 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build.
+driven end-to-end without a desktop build. **`?music=1`** lays the harness's song (`music.mp3`,
+always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
+*Fit to video* (see frontend-timeline.md) are then one right-click away.
 `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
 all project data renders from the real backend.
 
@@ -754,6 +762,9 @@ voiceover placement — through `devEdit`, `edit_timeline` in miniature (snapsho
 `rippleFrom`), while the layout-deciding ones (move, reorder, ripple delete, cut range,
 beat snap, paste) skip it as in the core; `moveClips` / `removeClips(ids, ripple?)`
 reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives it all.
+`music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
+`Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
+`planMusicFit` / `fitMusic`.
 This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that

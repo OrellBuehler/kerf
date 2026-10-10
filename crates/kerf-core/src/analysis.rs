@@ -924,6 +924,7 @@ fn run_steps(
                 run.patch.onsets = r.onsets;
                 run.patch.tempo = r.tempo;
                 run.patch.audio_class = r.audio_class;
+                run.patch.music = r.music;
             }),
             AnalysisKind::Transcript => providers
                 .transcriber
@@ -1034,12 +1035,14 @@ mod tests {
                 tempo: Some(Tempo {
                     bpm: 120.0,
                     beats: vec![0.0, 0.5],
+                    downbeats: Vec::new(),
                     confidence: 0.9,
                 }),
                 audio_class: Some(AudioClassification {
                     class: AudioClass::Music,
                     confidence: 0.8,
                 }),
+                music: None,
             })
         }
     }

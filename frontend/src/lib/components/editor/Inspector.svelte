@@ -37,6 +37,7 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge } from '$lib/link-ui';
+	import { fitOffer, musicSummary } from '$lib/music-ui';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
@@ -53,6 +54,9 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	/** Music with a fitted bar grid offers *Fit to video*: the section only exists for a clip that does. */
+	const music = $derived(clip ? editor.analysisFor(clip.asset_id)?.music : undefined);
+	const musicOffer = $derived(clip ? fitOffer(track, clip, editor.analysisFor(clip.asset_id)) : { show: false, reason: null });
 	// While the clip is animated the Transform panel shows the *sampled* pose at
 	// the playhead (so the sliders track the motion) and editing a channel adds a
 	// keyframe there; otherwise it edits the static transform.
@@ -786,6 +790,23 @@
 				</label>
 				</InspectorSection>
 
+			{/if}
+
+			{#if musicOffer.show && music}
+				<InspectorSection title="Music" summary={musicSummary(music)}>
+				<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+					<button
+						style={chip(false)}
+						disabled={editor.busy || musicOffer.reason !== null}
+						title="Make this music last as long as the picture, repeating or dropping whole phrases"
+						onclick={() => ui.openFitMusic(clip.id)}>Fit to video…</button
+					>
+				</div>
+				<div style="font:var(--type-caption);color:var(--text-muted)">
+					{musicOffer.reason ??
+						'Repeats or drops whole phrases on bar lines, keeping the intro and the ending, until the music lasts as long as the picture.'}
+				</div>
+				</InspectorSection>
 			{/if}
 
 			<InspectorSection title="Fades" summary={`${clip.fade_in}s in · ${clip.fade_out}s out`}>

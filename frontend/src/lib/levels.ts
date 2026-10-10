@@ -28,6 +28,12 @@ export const MASTER_MIN_CEILING_DB = -24;
  *  *sample* peak and the peak between samples runs above it, so it sits half a dB under
  *  the -1 dBTP that platforms ask for. */
 export const MASTER_DEFAULT_CEILING_DB = -1.5;
+/** The speech gate's depth when it is switched on without one (`DUCK_DEFAULT_DEPTH_DB`). */
+export const DUCK_DEFAULT_DEPTH_DB = -12;
+/** The deepest the speech gate ducks (`DUCK_MIN_DEPTH_DB`): a bed 40 dB down is as good as gone. */
+export const DUCK_MIN_DEPTH_DB = -40;
+/** The shallowest it ducks: the engine clamps a depth to `-40..=-1`, and 0 would be no duck at all. */
+export const DUCK_MAX_DEPTH_DB = -1;
 /** The streaming loudness target the notes judge against (`LEVELS_TARGET_LUFS`). */
 export const LEVELS_TARGET_LUFS = -14;
 /** The true-peak ceiling platforms ask of a delivery (`LEVELS_TRUE_PEAK_CEILING_DBTP`). */
@@ -48,6 +54,34 @@ export const clampMasterVolume = (v: number): number => Math.min(MASTER_MAX_VOLU
 
 /** A ceiling as the engine clamps it: `-24..=0` dBFS. */
 export const clampCeiling = (db: number): number => Math.min(0, Math.max(MASTER_MIN_CEILING_DB, db));
+
+/** A speech-gate depth as the engine clamps it (`set_master_duck`): `-40..=-1` dB. */
+export const clampDuckDepth = (db: number): number => Math.min(DUCK_MAX_DEPTH_DB, Math.max(DUCK_MIN_DEPTH_DB, db));
+
+/** `-12 dB`: a speech-gate depth as the control writes it (a tenth only when it has one). */
+export const duckLabel = (db: number): string => `${Number.isInteger(db) ? db : db.toFixed(1)} dB`;
+
+/** How far one keypress moves the speech gate's depth, in dB. */
+export const DUCK_STEP = { fine: 1, normal: 1, coarse: 5, page: 10 } as const;
+
+/** The depth slider's travel: a depth's place on it, `0..1` (left is `-40` dB, right is `-1`). */
+export const duckToPos = (db: number): number =>
+	(clampDuckDepth(db) - DUCK_MIN_DEPTH_DB) / (DUCK_MAX_DEPTH_DB - DUCK_MIN_DEPTH_DB);
+
+/** The depth a place on the travel means, to the whole dB — what the label says. */
+export const posToDuck = (pos: number): number =>
+	clampDuckDepth(
+		Math.round(DUCK_MIN_DEPTH_DB + Math.min(1, Math.max(0, pos)) * (DUCK_MAX_DEPTH_DB - DUCK_MIN_DEPTH_DB))
+	);
+
+/** The depth nudged by `steps` marks of `size` (whole dB), within `-40..-1`. */
+export function nudgeDuck(db: number, steps: number, size: keyof typeof DUCK_STEP = 'normal'): number {
+	const grid = DUCK_STEP[size];
+	const eps = 1e-9;
+	const from = clampDuckDepth(db);
+	const cell = steps >= 0 ? Math.floor(from / grid + eps) : Math.ceil(from / grid - eps);
+	return clampDuckDepth((cell + steps) * grid);
+}
 
 /** How far one keypress moves the limiter's ceiling, in dB. */
 export const CEILING_STEP = { fine: 0.1, normal: 0.5, coarse: 3, page: 6 } as const;

@@ -68,7 +68,8 @@
 	import type { Target } from '$lib/minimap';
 	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
-	import { beatGrid, beatPeriod, sourceToTimeline } from '$lib/beats';
+	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '$lib/beats';
+	import { fitOffer } from '$lib/music-ui';
 	import { transitionLabel } from '$lib/transitions';
 	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
 	import { linkPartners } from '$lib/link-groups';
@@ -184,6 +185,24 @@
 	const beatTimes = $derived.by(() => {
 		const ts = beatGrid(editor.timeline, (id) => editor.analysisFor(id)?.tempo);
 		return beatPeriod(ts) * pxPerSec < BEAT_MIN_PX ? [] : ts;
+	});
+
+	/** Bar starts of fitted music: drawn taller than a beat and a snap target of their own, which
+	 *  wins over a beat that is nearer. A bar is four beats or so apart, so they stay when the
+	 *  beats have folded away on zoom-out. */
+	const barTimes = $derived.by(() => {
+		const ts = barGrid(editor.timeline, (id) => editor.analysisFor(id)?.tempo);
+		return beatPeriod(ts) * pxPerSec < BEAT_MIN_PX ? [] : ts;
+	});
+
+	// The cut's audio is what the grid comes from, and an asset's analysis is only read when
+	// something selects or analyzes it — so ask for the ones the audio tracks use. Without it a
+	// reopened project's ruler stays bare, and the music menu has nothing to go on, until the
+	// music happens to be clicked.
+	$effect(() => {
+		const ids = new Set<string>();
+		for (const t of editor.timeline.tracks) if (t.kind === 'audio') for (const c of t.clips) ids.add(c.asset_id);
+		untrack(() => void editor.ensureAnalyses(ids));
 	});
 
 	function silenceRegions(c: Clip): { left: number; width: number }[] {
@@ -516,14 +535,16 @@
 	}
 
 	/** Where a dragged edge (or a cut) lands: a magnet within reach — 0, the
-	 *  playhead, a beat, a clip edge — when snapping is on, otherwise the nearest
+	 *  playhead, a bar or a beat (a bar wins over a nearer beat), a clip edge — when snapping is on, otherwise the nearest
 	 *  frame. Frames are not a magnet: they apply with snapping off too. A landing
 	 *  within a hair of a neighbour's edge is that edge exactly, magnet or not. */
 	function snapPoint(time: number, trackId: string, except: string | ReadonlySet<string>): number {
 		const edges = clipEdges(trackId, except);
 		return quantizeTime(time, {
 			fps,
-			magnets: ui.snap ? [0, ui.time, ...beatTimes, ...edges] : [],
+			magnets: ui.snap
+				? [0, ui.time, ...gridMagnets(time, [0], beatTimes, barTimes, 8 / pxPerSec), ...edges]
+				: [],
 			threshold: 8 / pxPerSec,
 			welds: edges
 		});
@@ -656,14 +677,15 @@
 	}
 
 	/** Where a clip of `dur` seconds placed near `start` lands: a magnet — 0, the
-	 *  playhead, a beat, a clip edge, either of its own edges against any of them —
+	 *  playhead, a bar or a beat, a clip edge, either of its own edges against any of them —
 	 *  when snapping is on, otherwise the nearest frame for its start. */
 	function snapStart(start: number, trackId: string, except: string | ReadonlySet<string>, dur: number): number {
 		const edges = clipEdges(trackId, except);
 		const magnets: number[] = [];
 		if (ui.snap) {
 			magnets.push(0, ui.time);
-			for (const b of beatTimes) magnets.push(b, b - dur); // land either edge on a beat
+			// land either edge on a bar, else on a beat
+			magnets.push(...gridMagnets(start, [0, dur], beatTimes, barTimes, 8 / pxPerSec));
 			// align heads, butt after, butt before
 			// `startBefore`, not `edge - dur`: the latter can end an ULP past the edge it butts.
 			for (let i = 0; i < edges.length; i += 2) magnets.push(edges[i], edges[i + 1], startBefore(edges[i], dur));
@@ -1352,6 +1374,8 @@
 		// Detach / Reattach / Link / Unlink for what is selected, each with the reason it cannot be.
 		const lp = selectionLinkPlans();
 		const linked = linkPartners(editor.timeline, c.id).length > 0;
+		// Music with a fitted bar grid can be made to last as long as the picture.
+		const fit = fitOffer(t, c, editor.analysisFor(c.asset_id));
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
@@ -1440,6 +1464,18 @@
 			{ type: 'separator' },
 			...clipAnalysisItems(c, e),
 			{ type: 'separator' },
+			...(fit.show
+				? [
+						{
+							label: 'Fit to video…',
+							icon: 'music',
+							disabled: fit.reason !== null,
+							reason: fit.reason ?? undefined,
+							action: () => ui.openFitMusic(c.id)
+						} satisfies MenuItem,
+						{ type: 'separator' } satisfies MenuItem
+					]
+				: []),
 			{
 				label: enabled ? 'Disable clip' : 'Enable clip',
 				icon: enabled ? 'eye-off' : 'eye',
@@ -1647,9 +1683,9 @@
 	let titleDrag = $state<TitleDrag | null>(null);
 	let titleLaneEl = $state<HTMLElement | null>(null);
 
-	/** Where a title's edges snap to: 0, the playhead, beats, every clip edge and the other titles'. */
+	/** Where a title's edges snap to: 0, the playhead, beats and bars, every clip edge and the other titles'. */
 	function titleSnapPoints(id: string): number[] {
-		const pts = [0, ui.time, ...beatTimes];
+		const pts = [0, ui.time, ...beatTimes, ...barTimes];
 		for (const t of editor.timeline.tracks)
 			for (const c of t.clips) pts.push(c.timeline_start, c.timeline_start + clipDuration(c));
 		for (const o of editor.overlays) if (o.id !== id) pts.push(o.start, o.end);
@@ -2334,6 +2370,12 @@
 					<span
 						title="Beat"
 						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:var(--line-width);height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
+					></span>
+				{/each}
+				{#each barTimes as b (b)}
+					<span
+						title="Bar"
+						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:calc(var(--line-width) * 2);height:11px;background:var(--beat-marker);pointer-events:none"
 					></span>
 				{/each}
 				<!-- user markers: click seeks, drag moves, double-click renames -->

@@ -70,3 +70,6 @@
   export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
   `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
   zoom and of an alpha source's terminal format is the same `format=yuva420p`).
+- **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
+  re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
+  `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.

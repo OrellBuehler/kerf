@@ -168,7 +168,8 @@ describe('stages and cached data', () => {
 		loudness: null,
 		onsets: [],
 		tempo: null,
-		audio_class: null
+		audio_class: null,
+		music: null
 	};
 
 	test('a kind is done when its step ran, or — for an older cache — when it has data', () => {

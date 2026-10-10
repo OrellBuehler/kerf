@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { cancelLevels, getHistory, getLevels, revertTo, setMasterLimiter, setMasterVolume, setTrackVolume } from './api';
+import {
+	cancelLevels,
+	getHistory,
+	getLevels,
+	revertTo,
+	setMasterDuck,
+	setMasterLimiter,
+	setMasterVolume,
+	setTrackVolume
+} from './api';
 
 // Under bun there is no Tauri, so these drive the browser harness's master bus and
 // its stand-in for `get_levels`, which have to keep the backend's contract: the
@@ -43,6 +52,40 @@ describe('the master bus (browser harness)', () => {
 		const history = await getHistory();
 		expect(history.find((h) => h.current)!.seq).toBe(head + 2);
 		expect(history.map((h) => h.label).slice(-2)).toEqual(['Set master level', 'Set master limiter']);
+	});
+});
+
+describe('the duck mode (browser harness)', () => {
+	test('a depth is the speech gate, clamped to -40..-1, and none is the compressor', async () => {
+		const gate = await setMasterDuck(-12);
+		expect(gate.master).toEqual({ volume: 1, limiter: false, ceiling_db: -1.5, duck_depth_db: -12 });
+		expect((await setMasterDuck(-90)).master?.duck_depth_db).toBe(-40);
+		expect((await setMasterDuck(5)).master?.duck_depth_db).toBe(-1);
+		// Back to the compressor the key is gone, like the saved file — and the master with it.
+		const back = await setMasterDuck(null);
+		expect(back.master).toBeUndefined();
+		expect((await setMasterDuck(-8)).master?.duck_depth_db).toBe(-8);
+		expect((await setMasterDuck()).master).toBeUndefined();
+	});
+
+	test('survives the other master moves, and does not make them stick around', async () => {
+		await setMasterDuck(-9);
+		expect((await setMasterVolume(0.5)).master).toEqual({ volume: 0.5, limiter: false, ceiling_db: -1.5, duck_depth_db: -9 });
+		expect((await setMasterLimiter(true)).master?.duck_depth_db).toBe(-9);
+		await setMasterLimiter(false);
+		await setMasterVolume(1);
+		expect((await setMasterDuck(null)).master).toBeUndefined();
+	});
+
+	test('refuses what is not a number, and is one revision labelled as the core labels it', async () => {
+		await expect(setMasterDuck(Number.NaN)).rejects.toThrow('number');
+		await expect(setMasterDuck(Number.NEGATIVE_INFINITY)).rejects.toThrow('number');
+		const head = (await getHistory()).find((h) => h.current)!.seq;
+		await setMasterDuck(-12);
+		await setMasterDuck(null);
+		const history = await getHistory();
+		expect(history.find((h) => h.current)!.seq).toBe(head + 2);
+		expect(history.map((h) => h.label).slice(-2)).toEqual(['Duck by -12 dB under speech', 'Duck with the compressor']);
 	});
 });
 

@@ -89,6 +89,8 @@ class EditorUi {
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
 	voiceoverDialog = $state<{ prefill: VoiceoverPrefill | null } | null>(null);
+	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
+	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
 	exportDialog = $state(false);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -198,6 +200,14 @@ class EditorUi {
 
 	closeVoiceover() {
 		this.voiceoverDialog = null;
+	}
+
+	openFitMusic(clipId: string) {
+		this.fitMusicDialog = { clipId };
+	}
+
+	closeFitMusic() {
+		this.fitMusicDialog = null;
 	}
 
 	openExport() {

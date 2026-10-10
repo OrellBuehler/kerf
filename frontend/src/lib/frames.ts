@@ -12,7 +12,7 @@
  * edits cannot accumulate drift. What a gesture then derives (`trimEdit`) comes
  * from that one rounded position.
  *
- * Magnetic snapping (0 / playhead / beats / clip edges, `ui.snap`) still wins when
+ * Magnetic snapping (0 / playhead / bars and beats / clip edges, `ui.snap`) still wins when
  * it is within reach; frame quantization is what applies otherwise. It is not
  * switched off with the magnet: time has no meaning between frames. */
 

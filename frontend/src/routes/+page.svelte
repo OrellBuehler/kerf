@@ -8,6 +8,7 @@
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
+	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
 	import Icon from '$lib/components/editor/Icon.svelte';
@@ -53,7 +54,9 @@
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
-	const modalOpen = $derived(ui.exportDialog || settings.open || updater.dialogOpen || ui.voiceoverDialog !== null);
+	const modalOpen = $derived(
+		ui.exportDialog || settings.open || updater.dialogOpen || ui.voiceoverDialog !== null || ui.fitMusicDialog !== null
+	);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
 
@@ -639,6 +642,10 @@
 
 {#if ui.voiceoverDialog}
 	<VoiceoverDialog prefill={ui.voiceoverDialog.prefill} onClose={() => ui.closeVoiceover()} />
+{/if}
+
+{#if ui.fitMusicDialog}
+	<FitMusicDialog clipId={ui.fitMusicDialog.clipId} onClose={() => ui.closeFitMusic()} />
 {/if}
 
 {#if updater.dialogOpen}

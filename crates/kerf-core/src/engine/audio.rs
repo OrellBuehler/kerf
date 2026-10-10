@@ -9,6 +9,7 @@ use std::process::Stdio;
 
 use super::cli::{bg_command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
 use super::cpu;
+use super::music;
 use crate::error::{Error, Result};
 use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 
@@ -96,10 +97,22 @@ pub fn analyze_rhythm(path: &Path, sensitivity: f64) -> Result<Rhythm> {
     const SR: u32 = 22_050;
     let samples = decode_audio_mono_f32(path, SR)?;
     let (env, frame_rate) = onset_envelope(&samples, SR);
+    let music = music::cached(path).unwrap_or_else(|| {
+        let fresh = music::analyze_music(&samples, SR);
+        music::store(path, &fresh);
+        fresh
+    });
+    // A fitted bar grid is the steadier beat: it replaces the autocorrelation's.
+    let mut tempo = estimate_tempo(&env, frame_rate);
+    if let Some(m) = &music {
+        let confidence = tempo.as_ref().map_or(0.0, |t| t.confidence);
+        tempo = Some(Tempo::from_grid(&m.grid, m.duration, confidence));
+    }
     Ok(Rhythm {
         onsets: pick_onsets(&env, frame_rate, sensitivity),
-        tempo: estimate_tempo(&env, frame_rate),
+        tempo,
         audio_class: classify_samples(&samples),
+        music,
     })
 }
 
@@ -206,7 +219,12 @@ fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
         beats.push(t / frame_rate);
         t += period;
     }
-    Some(Tempo { bpm, beats, confidence })
+    Some(Tempo {
+        bpm,
+        beats,
+        confidence,
+        downbeats: Vec::new(),
+    })
 }
 
 // ---- speech vs. music classification ---------------------------------------

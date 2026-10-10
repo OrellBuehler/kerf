@@ -588,6 +588,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
     fn the_master_bus_and_loudnorm_sit_on_the_tapped_mix() {
         let (mut tl, assets) = two_track_cut();
         tl.master = MasterBus {
+            duck_depth_db: None,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -792,6 +793,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         // take it down to -12 and not a hair above.
         let mut tl = tracks_of(&asset, 1);
         tl.master = MasterBus {
+            duck_depth_db: None,
             volume: 4.0,
             limiter: true,
             ceiling_db: -12.0,
@@ -857,6 +859,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         tl.tracks[1].volume = 0.8;
         tl.tracks[1].duck = true;
         tl.master = MasterBus {
+            duck_depth_db: None,
             volume: 0.9,
             limiter: true,
             ceiling_db: -3.0,

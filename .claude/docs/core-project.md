@@ -101,6 +101,11 @@
   edits) and `remove_task` discards it. `diff_revisions` / `revision_diff` point
   the same diff at the stored history snapshots, so the edit log can say what an
   edit did rather than only which operation ran.
+  `plan_music_fit(clip, target)` / `fit_music(clip, target, fade_out)` fit a music clip on
+  an audio track (normal speed, unlinked, with a cached `AssetAnalysis.music`) to `target`
+  or, by default, the picture's end minus the clip's start; `fit_music` replaces the clip
+  with `music_fit_clips` in one `edit_timeline_exact` revision ("Fit music to length") and
+  refuses a result that would run into the next clip on the track.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

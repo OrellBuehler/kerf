@@ -579,6 +579,7 @@ fn the_beat_snap_does_not_carry_a_sound_over_an_unlinked_clip_either() {
         .set_analysis(&AssetAnalysis {
             asset_id: music.id,
             tempo: Some(crate::model::Tempo {
+                downbeats: Vec::new(),
                 bpm: 120.0,
                 beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
                 confidence: 0.8,
@@ -918,6 +919,7 @@ fn the_beat_snap_carries_each_retimed_clip_to_its_partner() {
         .set_analysis(&AssetAnalysis {
             asset_id: music.id,
             tempo: Some(crate::model::Tempo {
+                downbeats: Vec::new(),
                 bpm: 120.0,
                 beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
                 confidence: 0.8,

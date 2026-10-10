@@ -230,6 +230,9 @@
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
+  `Timeline::bar_grid` is the same over `Tempo.downbeats` (bar starts; the rhythm pass
+  replaces an asset's autocorrelated `Tempo` with `Tempo::from_grid` when a bar grid is
+  fitted, so the ruler, snapping and cut-to-the-beat all use the fitted grid).
   `Timeline::beat_grid` maps the audio tracks' cached `Tempo` onto timeline time
   (confidence-gated by `BEAT_MIN_CONFIDENCE`, mirroring the ruler's ticks) and
   `Track::align_cuts_to_beats` ripples a track's cuts onto that grid — each clip
@@ -315,3 +318,20 @@
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
+  target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
+  whole bar) and walks the bars between, **jumping only between repeating phrases**
+  (`PhraseMatch`, 8 bars cost 2, 4 bars cost 3, never two jumps in a row): a DP over (bar,
+  bars played, just jumped) picks the bar count nearest the target — a **tie goes to the
+  longer** walk (a fade can shorten it; the shorter leaves picture without music) — then the
+  fewest jumps. The search runs to `max(wanted, bars) + bars` (a jump moves at most a song's
+  length; capping it at `wanted + 1` missed the arrangement just above). Consecutive bars
+  merge into one segment, so a continuous join is never a splice. Boundaries land on the
+  source's sample grid and each `output_start` is the exact running sum rounded once (no
+  drift). `music_fit_clips` turns a plan into clips copied from the music clip (gain and
+  audio effects kept, keyframes and link dropped) with each splice crossfaded over **one
+  10 ms window centred on it**: the outgoing clip's `source_out` and the incoming clip's
+  `source_in` / `timeline_start` move half a window early, and the incoming `Crossfade` of
+  a full window makes the export's tail and fade-in cover the same samples (offset windows
+  played both copies at full gain — +65 % peak in the Python prototype). An overrun with
+  `fade_out` is cut at the target and faded over `FIT_FADE_S`.

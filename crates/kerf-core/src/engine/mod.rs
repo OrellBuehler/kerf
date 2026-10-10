@@ -57,6 +57,15 @@ pub mod cpu;
 mod audio;
 pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
 
+// Decoded audio as an interleaved f32 buffer (through the ffmpeg binary) and a WAV
+// writer for tests and debug renders.
+mod pcm;
+
+// Bar-level music structure (fitted beat grid, downbeat, chroma, repeating phrases):
+// pure DSP on decoded PCM, cached per file.
+pub mod music;
+pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the
 // transcript surface works in the `--no-default-features` build too.
@@ -79,7 +88,8 @@ pub use cli::{
     generate_proxy_with, hw_encoders, insta360_pair, mix_levels, proxy_base_width, proxy_path, proxy_width, proxy_width_for,
     ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity, stitch_insta360,
     stitched_path, stream_preview, timeline_frame, timeline_frame_region, validate_export, waveform, Container, ExportOptions,
-    ExportProgress, ExportVariant, Fit, ImageFormat, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, VariantProgress,
+    ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus,
+    VariantProgress,
 };
 
 pub(crate) use cli::insta360_pair_name;
