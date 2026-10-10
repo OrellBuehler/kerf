@@ -184,6 +184,14 @@ pub(crate) fn resolve_hwaccel(os: HostOs, requested: &str, facts: InputFacts, re
     }
 }
 
+/// Whether anything beyond an input's name can change what [`resolve_hwaccel`] says, so that a
+/// decode handed a bare path needs to learn its codec and chroma format (a probe) at all: only
+/// for `auto`, on Windows (the codec picks `d3d11va`) and on a one-frame read everywhere but macOS
+/// (the chroma format can skip the hardware). Anywhere else the answer is the same unprobed.
+pub(crate) fn facts_matter(os: HostOs, requested: &str, reading: Reading) -> bool {
+    requested.trim().eq_ignore_ascii_case("auto") && (os == HostOs::Windows || (reading == Reading::Frame && os != HostOs::MacOs))
+}
+
 /// What [`tune_inputs`] left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Tuning {
@@ -378,6 +386,32 @@ mod tests {
         for chroma in [Chroma::Yuv420, Chroma::Unknown] {
             assert!(resolve_hwaccel(HostOs::Other, "auto", facts(Codec::H264, chroma), Reading::Frame).is_some());
         }
+    }
+
+    #[test]
+    fn a_file_is_probed_only_where_what_it_holds_changes_the_answer() {
+        let probed = |os, requested, reading| facts_matter(os, requested, reading);
+        // Windows names the decoder by codec, whatever is read.
+        for reading in READINGS {
+            assert!(probed(HostOs::Windows, "auto", reading), "{reading:?}");
+        }
+        // Linux only skips hardware for a chroma format, and only on one frame.
+        assert!(probed(HostOs::Other, "auto", Reading::Frame));
+        assert!(!probed(HostOs::Other, "auto", Reading::Stream));
+        assert!(!probed(HostOs::Other, "auto", Reading::Whole));
+        // macOS decides on neither.
+        for reading in READINGS {
+            assert!(!probed(HostOs::MacOs, "auto", reading), "{reading:?}");
+        }
+        // A named decoder goes through as it is, and nothing asked for needs nothing.
+        for os in OSES {
+            for reading in READINGS {
+                for requested in ["cuda", "d3d11va", "none", ""] {
+                    assert!(!probed(os, requested, reading), "{os:?} {requested:?}");
+                }
+            }
+        }
+        assert!(probed(HostOs::Windows, " AUTO ", Reading::Whole));
     }
 
     #[test]
@@ -616,10 +650,12 @@ mod tests {
         let mut lone = original.clone();
         limit_frame_args(&mut lone, 1);
         assert!(lone.iter().all(|a| !a.contains("threads")), "{lone:?}");
-        // A shared one splits the budget, even at 100%.
+        // A shared one splits the budget, even at 100% (on a machine with a core to split).
         let mut shared = original;
         limit_frame_args(&mut shared, 4);
-        assert!(shared.contains(&"-filter_threads".to_string()), "{shared:?}");
+        if cpu::cores() > 1 {
+            assert!(shared.contains(&"-filter_threads".to_string()), "{shared:?}");
+        }
         cpu::set_cpu_percent(restore);
     }
 }

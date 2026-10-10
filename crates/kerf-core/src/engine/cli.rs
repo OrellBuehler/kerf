@@ -14,7 +14,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cpu;
-use super::decode_policy::{facts_from_assets, resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading};
+use super::decode_policy::{
+    facts_from_assets, facts_matter, resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading,
+};
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
@@ -177,18 +179,28 @@ fn path_facts(path: &Path) -> InputFacts {
 }
 
 /// [`decode_hwaccel`] resolved for the file at `path` (see `decode_policy::resolve_hwaccel`).
-/// Probes the file only when a hardware decoder was asked for at all.
+/// Probes the file only where what it holds can change the answer (`facts_matter`).
 fn decode_hwaccel_for(path: &Path, reading: Reading) -> Option<String> {
     let requested = decode_hwaccel()?;
-    resolve_hwaccel(HostOs::CURRENT, &requested, path_facts(path), reading)
+    let os = HostOs::CURRENT;
+    let facts = if facts_matter(os, &requested, reading) {
+        path_facts(path)
+    } else {
+        InputFacts::of_path(&path.to_string_lossy())
+    };
+    resolve_hwaccel(os, &requested, facts, reading)
 }
 
 /// [`decode_hwaccel`] resolved for a whole-file read of `asset`'s original, from the facts the
 /// import recorded (no probe).
 pub(super) fn decode_hwaccel_for_asset(asset: &Asset) -> Option<String> {
-    let requested = decode_hwaccel()?;
+    hwaccel_for_asset(decode_hwaccel(), HostOs::CURRENT, asset)
+}
+
+/// [`decode_hwaccel_for_asset`] for a given request and operating system (pure).
+fn hwaccel_for_asset(requested: Option<String>, os: HostOs, asset: &Asset) -> Option<String> {
     let facts = facts_from_assets(std::slice::from_ref(asset))(&asset.path);
-    resolve_hwaccel(HostOs::CURRENT, &requested, facts, Reading::Whole)
+    resolve_hwaccel(os, &requested?, facts, Reading::Whole)
 }
 
 /// Record that an accelerated decode failed where the software retry of the very
@@ -2525,8 +2537,12 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             return Err(Error::Cancelled);
         }
         if output.status.success() {
-            if hw_enc.is_some() {
+            let blame = blame_after_software_success(hw_enc.is_some(), hw_dec.is_some());
+            if blame.encode {
                 HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if blame.decode {
+                disable_decode_hwaccel();
             }
             tracing::warn!(error = %err, "hardware-accelerated proxy encode failed; using software");
         }
@@ -2552,6 +2568,26 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             .ok()
             .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
     })
+}
+
+/// Which hardware a software rerun that succeeded convicts (pure, unit-tested). The rerun
+/// changes the encoder *and* the decoder, so with both in use there is no telling which one
+/// failed: the encoder is blamed, as it always was, and the next proxy — no longer offered one —
+/// finds out about the decoder. With only a decoder in use it is the culprit (a named
+/// accelerator such as `d3d11va` exits non-zero on a machine with no device, where `auto`
+/// fell back quietly, so without this every proxy would pay a failed launch first).
+fn blame_after_software_success(hw_encode: bool, hw_decode: bool) -> Blame {
+    Blame {
+        encode: hw_encode,
+        decode: hw_decode && !hw_encode,
+    }
+}
+
+/// What to stop asking for: see [`blame_after_software_success`].
+#[derive(Debug, PartialEq, Eq)]
+struct Blame {
+    encode: bool,
+    decode: bool,
 }
 
 /// Whether a proxy encode that went through hardware is run again in software (pure,
@@ -4600,11 +4636,12 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
 /// `cancel` between updates — returning [`RenderStatus::Cancelled`] (and leaving
 /// the partial output for the caller to remove) when it trips.
 ///
-/// When the options request hardware decode (`opts.hwaccel`) and the render
-/// fails, it is retried once fully in software — so defaulting exports to GPU
-/// decode can never lose a render that plain software decoding would have
-/// produced. (`-hwaccel auto` already falls back at init; this covers the rarer
-/// mid-stream decoder failure.)
+/// When the options request hardware decode (`opts.hwaccel`), an input is
+/// really handed it, and the render fails, it is retried once fully in software
+/// — so defaulting exports to GPU decode can never lose a render that plain
+/// software decoding would have produced (`-hwaccel auto` already falls back at
+/// init, a named accelerator does not, and a decoder can fail mid-stream). A
+/// retry that completes turns hardware decode off for the process.
 #[cfg_attr(feature = "libav-render", allow(dead_code))]
 pub fn render_with_progress(
     timeline: &Timeline,
@@ -4614,18 +4651,37 @@ pub fn render_with_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
-    let hw_requested = opts
-        .hwaccel
-        .as_deref()
-        .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"));
-    match render_attempt(timeline, assets, output, opts, progress, cancel) {
-        Err(e) if hw_requested => {
+    retry_export_in_software(
+        opts,
+        |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
+        disable_decode_hwaccel,
+    )
+}
+
+/// Run an export attempt, and once more in software when one that asked an input for hardware
+/// decode failed. The retry changes nothing but the decode, so when it completes the hardware
+/// decode was the culprit and `blame_hardware` is told (the learned fallback, which a named
+/// accelerator — `d3d11va`, unlike `auto` — needs: with no device it exits non-zero where `auto`
+/// fell back quietly, and every later render would pay a failed launch). A failure of a run that
+/// asked for no hardware, or one the retry fails the same way, is not the hardware's.
+fn retry_export_in_software(
+    opts: &ExportOptions,
+    mut attempt: impl FnMut(&ExportOptions, &std::cell::Cell<bool>) -> Result<RenderStatus>,
+    blame_hardware: impl FnOnce(),
+) -> Result<RenderStatus> {
+    let hw_used = std::cell::Cell::new(false);
+    match attempt(opts, &hw_used) {
+        Err(e) if hw_used.get() => {
             tracing::warn!(error = %e, "export with hardware decode failed; retrying with software decode");
             let sw = ExportOptions {
                 hwaccel: None,
                 ..opts.clone()
             };
-            render_attempt(timeline, assets, output, &sw, progress, cancel)
+            let again = attempt(&sw, &std::cell::Cell::new(false));
+            if matches!(again, Ok(RenderStatus::Completed)) {
+                blame_hardware();
+            }
+            again
         }
         result => result,
     }
@@ -4633,9 +4689,10 @@ pub fn render_with_progress(
 
 /// Tune a built export argv for the process about to be spawned: each input's `-hwaccel` per
 /// `decode_policy` (on Windows `auto` becomes `d3d11va` for H.264 and HEVC), the threads left
-/// to [`run_ffmpeg_progress`]. The builders emit the options as given.
-fn tune_export_args(args: &mut Vec<String>, assets: &[Asset]) {
-    tune_inputs(args, HostOs::CURRENT, Reading::Whole, &facts_from_assets(assets));
+/// to [`run_ffmpeg_progress`]. The builders emit the options as given. Returns whether any input
+/// still asks for hardware decode.
+fn tune_export_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> bool {
+    tune_inputs(args, os, Reading::Whole, &facts_from_assets(assets)).hw
 }
 
 /// One delivery of a multi-format export: the frame and where its file goes.
@@ -4737,6 +4794,7 @@ fn render_attempt(
     opts: &ExportOptions,
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
+    hw_used: &std::cell::Cell<bool>,
 ) -> Result<RenderStatus> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
@@ -4785,7 +4843,7 @@ fn render_attempt(
         };
         // Analysis pass fills the first half of the bar, the encode the second.
         let mut a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
-        tune_export_args(&mut a1, assets);
+        hw_used.set(tune_export_args(&mut a1, assets, HostOs::CURRENT));
         let _g1 = externalize_filter_complex(&mut a1, "p1")?;
         let s1 = run_ffmpeg_progress(
             &a1,
@@ -4804,7 +4862,7 @@ fn render_attempt(
             return Ok(RenderStatus::Cancelled);
         }
         let mut a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
-        tune_export_args(&mut a2, assets);
+        hw_used.set(hw_used.get() | tune_export_args(&mut a2, assets, HostOs::CURRENT));
         let _g2 = externalize_filter_complex(&mut a2, "p2")?;
         let res = run_ffmpeg_progress(
             &a2,
@@ -4822,7 +4880,7 @@ fn render_attempt(
         res
     } else {
         let mut args = build_export_args(timeline, assets, output_str, opts)?;
-        tune_export_args(&mut args, assets);
+        hw_used.set(tune_export_args(&mut args, assets, HostOs::CURRENT));
         let _g = externalize_filter_complex(&mut args, "s")?;
         run_ffmpeg_progress(
             &args,
@@ -8019,6 +8077,188 @@ mod tests {
         assert!(first < hw_at && hw_at < second, "{tuned:?}");
         assert_eq!(tuned[hw_at + 1], "d3d11va");
         assert_ne!(tuned[0], "-filter_threads");
+    }
+
+    #[test]
+    fn an_export_is_tuned_per_input_at_spawn_and_says_whether_hardware_is_left() {
+        let export_args = |assets: &[Asset]| {
+            let tracks = assets
+                .iter()
+                .map(|a| video_track(vec![make_clip(a.id, 0.0, 5.0, 0.0)]))
+                .collect();
+            let opts = ExportOptions {
+                hwaccel: Some("auto".to_string()),
+                ..ExportOptions::default()
+            };
+            build_export_args(&timeline_of(tracks), assets, "/out.mp4", &opts).unwrap()
+        };
+        let hevc = at_path("/media/a.mp4", "hevc", "yuv420p10le");
+        let built = export_args(std::slice::from_ref(&hevc));
+        assert_eq!(flag_val(&built, "-hwaccel"), Some("auto"));
+
+        let mut windows = built.clone();
+        assert!(tune_export_args(&mut windows, std::slice::from_ref(&hevc), HostOs::Windows));
+        assert_eq!(flag_val(&windows, "-hwaccel"), Some("d3d11va"));
+        // Nothing else moved.
+        let mut back = windows.clone();
+        let at = back.iter().position(|a| a == "-hwaccel").unwrap();
+        back[at + 1] = "auto".into();
+        assert_eq!(back, built);
+
+        let mut linux = built.clone();
+        assert!(tune_export_args(&mut linux, std::slice::from_ref(&hevc), HostOs::Other));
+        assert_eq!(linux, built);
+
+        // A render is a long read: 4:2:2 still tries the hardware.
+        let r5 = at_path("/media/r5.mp4", "hevc", "yuv422p10le");
+        let mut render = export_args(std::slice::from_ref(&r5));
+        assert!(tune_export_args(&mut render, std::slice::from_ref(&r5), HostOs::Other));
+        assert_eq!(flag_val(&render, "-hwaccel"), Some("auto"));
+
+        // A proxy is never decoded in hardware, whatever reads it: nothing is left to blame.
+        let proxy = at_path(PROXY_PATH, "h264", "yuv420p");
+        let mut from_proxy = export_args(std::slice::from_ref(&proxy));
+        assert!(!tune_export_args(
+            &mut from_proxy,
+            std::slice::from_ref(&proxy),
+            HostOs::Windows
+        ));
+        assert_eq!(count(&from_proxy, "-hwaccel"), 0);
+    }
+
+    #[test]
+    fn a_whole_file_read_of_an_asset_is_resolved_from_what_the_import_recorded() {
+        let auto = || Some("auto".to_string());
+        let h264 = at_path("/media/a.mp4", "h264", "yuv420p");
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::Windows, &h264).as_deref(), Some("d3d11va"));
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::Other, &h264).as_deref(), Some("auto"));
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::MacOs, &h264).as_deref(), Some("auto"));
+        // Windows keeps `auto` for a codec D3D11VA has no decoder for.
+        let prores = at_path("/media/a.mov", "prores", "yuv422p10le");
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::Windows, &prores).as_deref(), Some("auto"));
+        // 4:2:2 is read whole in hardware (the chroma gate is for one frame).
+        let r5 = at_path("/media/r5.mp4", "hevc", "yuv422p10le");
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::Windows, &r5).as_deref(), Some("d3d11va"));
+        // Named, nothing requested, and a proxy.
+        assert_eq!(
+            hwaccel_for_asset(Some("cuda".into()), HostOs::Windows, &h264).as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(hwaccel_for_asset(None, HostOs::Windows, &h264), None);
+        assert_eq!(hwaccel_for_asset(Some("none".into()), HostOs::Windows, &h264), None);
+        let proxy = at_path(PROXY_PATH, "h264", "yuv420p");
+        assert_eq!(hwaccel_for_asset(auto(), HostOs::Windows, &proxy), None);
+    }
+
+    #[test]
+    fn a_software_rerun_that_works_convicts_the_hardware_that_was_in_use() {
+        let blame = |enc, dec| blame_after_software_success(enc, dec);
+        // A decoder alone is the culprit.
+        assert_eq!(
+            blame(false, true),
+            Blame {
+                encode: false,
+                decode: true
+            }
+        );
+        // An encoder alone, as ever.
+        assert_eq!(
+            blame(true, false),
+            Blame {
+                encode: true,
+                decode: false
+            }
+        );
+        // Both: the encoder is blamed and the next proxy, offered no encoder, finds out about the
+        // decoder.
+        assert_eq!(
+            blame(true, true),
+            Blame {
+                encode: true,
+                decode: false
+            }
+        );
+        assert_eq!(
+            blame(false, false),
+            Blame {
+                encode: false,
+                decode: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_export_that_fails_in_hardware_decode_is_rerun_in_software_and_blames_it() {
+        let opts = ExportOptions {
+            hwaccel: Some("d3d11va".to_string()),
+            ..ExportOptions::default()
+        };
+        let fail = || Err(Error::Engine("Device creation failed".into()));
+        let blamed = std::cell::Cell::new(0);
+        let mut seen: Vec<Option<String>> = Vec::new();
+
+        // Hardware was handed to an input and the run failed; the software run completes.
+        let result = retry_export_in_software(
+            &opts,
+            |o, hw_used| {
+                seen.push(o.hwaccel.clone());
+                if o.hwaccel.is_some() {
+                    hw_used.set(true);
+                    fail()
+                } else {
+                    Ok(RenderStatus::Completed)
+                }
+            },
+            || blamed.set(blamed.get() + 1),
+        );
+        assert_eq!(result.unwrap(), RenderStatus::Completed);
+        assert_eq!(seen, [Some("d3d11va".to_string()), None]);
+        assert_eq!(blamed.get(), 1);
+
+        // Hardware was requested but no input was handed it (a proxy, an image): the failure is
+        // the render's own, so no rerun and no blame.
+        seen.clear();
+        let result = retry_export_in_software(
+            &opts,
+            |o, _| {
+                seen.push(o.hwaccel.clone());
+                fail()
+            },
+            || blamed.set(blamed.get() + 1),
+        );
+        assert!(result.is_err());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(blamed.get(), 1);
+
+        // The rerun fails too, or is cancelled: not the hardware's doing.
+        for rerun in [Err(Error::Engine("disk full".into())), Ok(RenderStatus::Cancelled)] {
+            let mut rerun = Some(rerun);
+            let _ = retry_export_in_software(
+                &opts,
+                |o, hw_used| {
+                    if o.hwaccel.is_some() {
+                        hw_used.set(true);
+                        fail()
+                    } else {
+                        rerun.take().unwrap()
+                    }
+                },
+                || blamed.set(blamed.get() + 1),
+            );
+        }
+        assert_eq!(blamed.get(), 1);
+
+        // A run that works is left alone.
+        let result = retry_export_in_software(
+            &opts,
+            |_, hw_used| {
+                hw_used.set(true);
+                Ok(RenderStatus::Completed)
+            },
+            || blamed.set(blamed.get() + 1),
+        );
+        assert_eq!(result.unwrap(), RenderStatus::Completed);
+        assert_eq!(blamed.get(), 1);
     }
 
     /// A recording stand-in for ffmpeg: writes the argv it was given, one per line, and answers
