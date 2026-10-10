@@ -87,6 +87,21 @@ export function marqueeSelectLinked(
 	return normalize(marqueeSelect(base, withLinkPartners(timeline, [...hits]), mode).ids, touched.primary);
 }
 
+/** How many things `ids` selects, a link group counting once: a picture and its sound are one
+ *  selection, not two. The Inspector's "N clips selected" notice is for more than one. */
+export function selectionUnits(timeline: Timeline, ids: readonly string[]): number {
+	const chosen = new Set(ids);
+	const counted = new Set<string>();
+	let units = 0;
+	for (const id of chosen) {
+		if (counted.has(id)) continue;
+		units += 1;
+		counted.add(id);
+		for (const partner of linkPartners(timeline, id)) if (chosen.has(partner)) counted.add(partner);
+	}
+	return units;
+}
+
 /** Whether `others` are all partners of `clipId` — a selection that is just the clip's own
  *  link group, which an Alt-press narrows to the clip instead of starting a group drag. */
 export function onlyPartners(timeline: Timeline, clipId: string, others: readonly string[]): boolean {

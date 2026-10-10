@@ -5,6 +5,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
 	import { agentStatus, confirmAction } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
@@ -366,7 +367,7 @@
 			{#if t.status !== 'ready'}
 				<button
 					title="Remove from queue"
-					onclick={() => agent.remove(t.id)}
+					onclick={() => dismissTask(t.id)}
 					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:var(--text-muted);cursor:pointer"
 				>
 					<Icon n="plus" s={13} style="transform:rotate(45deg)" />
@@ -394,23 +395,24 @@
 			</div>
 		{/if}
 		{#if t.status === 'ready'}
-			{#if staged?.task_id === t.id}
+			{#if staged && readyCard(t, staged) === 'reviewing'}
 				<div style="font-size:12px;color:var(--agent-300);margin-top:8px;padding-left:21px">
-					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} above — applying accepts them
+					{staged.diff.entries.length} proposed change{staged.diff.entries.length === 1 ? '' : 's'} in the review above — apply or discard them there
+				</div>
+			{:else}
+				<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
+					<button
+						onclick={() => resolveReady(t.id)}
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
+						>Apply</button
+					>
+					<button
+						onclick={() => dismissTask(t.id)}
+						style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
+						>Dismiss</button
+					>
 				</div>
 			{/if}
-			<div style="display:flex;gap:7px;margin-top:11px;padding-left:21px">
-				<button
-					onclick={() => agent.resolve(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:var(--kerf-500);color:var(--text-on-accent);font-weight:500;font-size:13px;cursor:pointer"
-					>Apply</button
-				>
-				<button
-					onclick={() => agent.remove(t.id)}
-					style="flex:1;height:30px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer"
-					>Dismiss</button
-				>
-			</div>
 		{/if}
 	</div>
 {/snippet}

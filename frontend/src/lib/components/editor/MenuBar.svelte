@@ -93,6 +93,11 @@
 	let bar = $state<HTMLElement | null>(null);
 	/** Where focus was before the bar took it, to give back when it lets go. */
 	let returnTo: HTMLElement | null = null;
+	/** A menu entry that opened a dialog was run from the keyboard. The bar's tab stop is then where focus goes back to
+	 *  when the dialog it opened closes and nothing else had it (`modal.ts`) — for anyone else
+	 *  focus stays off the bar, or Space would open a menu instead of playing. It lasts only until
+	 *  the user moves on: a pointer press, Tab, or focus given back (Escape, a chord). */
+	let byKeys = $state(false);
 	let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 	/** The title the pointer opened by arriving on it while another menu was open. A
 	 *  click on it then is the same gesture finishing, not a request to close it. */
@@ -133,6 +138,7 @@
 	}
 
 	function giveBackFocus() {
+		byKeys = false;
 		const to = returnTo;
 		returnTo = null;
 		if (to && to.isConnected && !to.hasAttribute('inert')) to.focus();
@@ -168,12 +174,14 @@
 		if (focusFirst && first !== undefined) void focusPath([...path, first]);
 	}
 
-	function run(e: MenuEntry) {
+	function run(e: MenuEntry, keys = false) {
 		if (e.kind === 'separator' || e.kind === 'submenu') return;
 		if ('disabled' in e && e.disabled) return;
 		closeAll(true);
 		if (e.kind === 'action') onAction(e.id);
 		else onCommand(e.command);
+		// Only a command that opened a dialog has a focus to give back later.
+		byKeys = keys && modal;
 	}
 
 	// ---- pointer -----------------------------------------------------------------
@@ -225,6 +233,7 @@
 
 	function onWindowPointerDown(ev: PointerEvent) {
 		altTap.pointerDown();
+		byKeys = false;
 		if (!bar || !(ev.target instanceof Node)) return;
 		if (bar.contains(ev.target)) {
 			noteReturn();
@@ -268,12 +277,14 @@
 		const k = e.key;
 
 		if (k === 'Tab') {
+			byKeys = false;
 			closeAll();
 			return;
 		}
 		if (k === 'Escape') {
 			handled();
 			if (top) {
+				byKeys = false;
 				if (open.length > 0) {
 					closeAll();
 					el(path)?.focus();
@@ -345,7 +356,7 @@
 			handled();
 			if (!entry) return;
 			if (entry.kind === 'submenu') openSub(path, true);
-			else run(entry);
+			else run(entry, true);
 		} else if (k.length === 1 && /\S/.test(k)) {
 			// A letter belongs to the menu while one is open: it jumps, or does nothing,
 			// but is never the razor tool.
@@ -561,6 +572,7 @@
 				aria-expanded={open[0] === i}
 				aria-label={compact ? 'Menu' : undefined}
 				tabindex={active === i ? 0 : -1}
+				data-focus-return={byKeys && active === i ? '' : undefined}
 				class="kerf-menu-top"
 				onclick={() => topClick(i)}
 				onpointerenter={() => topEnter(i)}

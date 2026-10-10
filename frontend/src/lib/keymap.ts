@@ -42,9 +42,15 @@ export interface NavigatorLike {
 	userAgentData?: { platform?: string };
 }
 
+const platformText = (nav: NavigatorLike | undefined) => nav?.userAgentData?.platform || nav?.platform || nav?.userAgent || '';
+
 export function detectPlatform(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): Platform {
-	const p = nav?.userAgentData?.platform || nav?.platform || nav?.userAgent || '';
-	return /mac|iphone|ipad|ipod/i.test(p) ? 'mac' : 'other';
+	return /mac|iphone|ipad|ipod/i.test(platformText(nav)) ? 'mac' : 'other';
+}
+
+/** Whether this is a Linux desktop (Android's webview says "Linux" too, and is not one). */
+export function isLinux(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
+	return /linux/i.test(platformText(nav)) && !/android/i.test(nav?.userAgent ?? '');
 }
 
 // ---- chords ------------------------------------------------------------------

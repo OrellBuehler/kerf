@@ -11,6 +11,7 @@ import {
 	chordFromEvent,
 	conflictsFor,
 	detectPlatform,
+	isLinux,
 	differsFromDefault,
 	displayChord,
 	emptyOverrides,
@@ -71,6 +72,16 @@ describe('platform', () => {
 		expect(detectPlatform({ platform: 'Win32' })).toBe('other');
 		expect(detectPlatform({ platform: 'Linux x86_64' })).toBe('other');
 		expect(detectPlatform({})).toBe('other');
+	});
+
+	test('Linux is told from the same fields, and is not macOS, Windows or Android', () => {
+		expect(isLinux({ platform: 'Linux x86_64' })).toBe(true);
+		expect(isLinux({ userAgentData: { platform: 'Linux' }, platform: 'x' })).toBe(true);
+		expect(isLinux({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15' })).toBe(true);
+		expect(isLinux({ platform: 'MacIntel' })).toBe(false);
+		expect(isLinux({ platform: 'Win32' })).toBe(false);
+		expect(isLinux({ platform: 'Linux armv81', userAgent: 'Mozilla/5.0 (Linux; Android 14)' })).toBe(false);
+		expect(isLinux({})).toBe(false);
 	});
 });
 

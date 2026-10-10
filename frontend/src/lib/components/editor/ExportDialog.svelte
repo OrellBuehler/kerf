@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { trapFocus } from '$lib/modal';
 	import Btn from './Btn.svelte';
@@ -10,6 +11,7 @@
 	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
+	import { frameKey, restoreDraft } from '$lib/export-draft';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
@@ -24,7 +26,7 @@
 		GIF_DITHERS,
 		FITS,
 		RESOLUTIONS,
-		FRAME_RATES,
+		frameRateOptions,
 		applyPreset,
 		containerInfo,
 		isHwCodec,
@@ -56,12 +58,19 @@
 		if (hit) return { id: hit.id, opts: applyPreset(hit.id) };
 		return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: d.fit } };
 	}
-	const initial = initialExport();
+	// What the dialog was last closed on comes back, unless the project has been re-cut for another
+	// frame since: the options are not lost to a Cancel, an Escape or a stray click.
+	const frame = frameKey(editor.timeline.format);
+	const remembered = restoreDraft(ui.exportDraft, frame);
+	const initial = remembered ? { id: remembered.preset, opts: remembered.opts } : initialExport();
 
 	let opts = $state<ExportOptions>(initial.opts);
 	let outputPath = $state('');
 	let activePreset = $state(initial.id);
-	let customRes = $state(false);
+	let customRes = $state(remembered?.customRes ?? false);
+	onDestroy(() => {
+		ui.exportDraft = { opts: $state.snapshot(opts), preset: activePreset, customRes, frame };
+	});
 	// The render outlives this dialog (see `editor.exportRun`), so reopening it
 	// mid-render shows the progress and a Stop rather than a dead Export button.
 	const rendering = $derived(editor.exportRun !== null);
@@ -295,15 +304,14 @@
 	</label>
 {/snippet}
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- A click on the scrim does not close this one: it holds a preset, shapes and encoder settings. -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	use:trapFocus
+	use:trapFocus={{ rescue: true }}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Export video"
 	tabindex="-1"
-	onclick={onClose}
 	onkeydown={(e) => {
 		if (e.key === 'Escape') onClose();
 		e.stopPropagation();
@@ -311,7 +319,6 @@
 	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
 >
 	<div
-		onclick={(e) => e.stopPropagation()}
 		style="width:600px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
 	>
 		<!-- header -->
@@ -423,7 +430,7 @@
 				{@render selectRow(
 					'Frame rate',
 					opts.fps ? String(opts.fps) : 'source',
-					FRAME_RATES.map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
+					frameRateOptions(opts.fps).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
 					(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
 				)}
 				{#if qualityOptions.length}
@@ -695,13 +702,13 @@
 							)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
 						</span>
 					</div>
-					<Btn variant="destructive" size="md" disabled={cancelling} onclick={stop}>
+					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Stop'}
 					</Btn>
 				{:else}
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="upload" disabled={!canExport} onclick={doExport}>
+					<Btn variant="primary" size="md" icon="upload" data-rescue disabled={!canExport} onclick={doExport}>
 						{variantFormats.length > 1 ? `Export ${variantFormats.length} files` : 'Export'}
 					</Btn>
 				{/if}

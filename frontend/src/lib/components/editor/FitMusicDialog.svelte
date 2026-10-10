@@ -111,7 +111,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	use:trapFocus
+	use:trapFocus={{ rescue: true }}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Fit music to video"
@@ -230,7 +230,7 @@
 			<div style="display:flex;align-items:center;gap:8px">
 				<div style="flex:1"></div>
 				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-				<Btn variant="primary" size="md" icon="music" disabled={!canApply} onclick={apply}>Fit music</Btn>
+				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit music</Btn>
 			</div>
 		</div>
 	</div>

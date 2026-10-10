@@ -125,6 +125,7 @@ class Updater {
 			await openReleases();
 		} catch (e) {
 			this.error = `Couldn't open ${RELEASES_URL} — ${msg(e)}`;
+			this.errorKind = null;
 		}
 	}
 
