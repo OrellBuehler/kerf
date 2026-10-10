@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { installNote, onLinux, updateTitle } from './update-copy';
+import { errorView, installNote, updateTitle } from './update-copy';
 
 const found = { version: '0.25.0' };
 
@@ -23,18 +23,29 @@ describe('updateTitle', () => {
 	});
 });
 
-describe('onLinux', () => {
-	test('reads the platform the webview reports', () => {
-		expect(onLinux({ platform: 'Linux x86_64' })).toBe(true);
-		expect(onLinux({ userAgentData: { platform: 'Linux' }, platform: 'x' })).toBe(true);
-		expect(onLinux({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15' })).toBe(true);
+describe('errorView', () => {
+	const raw = 'error sending request for url (https://example.test/latest.json): dns error';
+
+	test('a failed check says what happened, with the raw error under Details', () => {
+		const v = errorView('check', raw);
+		expect(v.headline).toBe("Couldn't reach the update server. Check your connection and try again.");
+		expect(v.details).toBe("Error sending request for url (https://example.test/latest.json): dns error");
 	});
 
-	test('not macOS, not Windows, and not Android', () => {
-		expect(onLinux({ platform: 'MacIntel' })).toBe(false);
-		expect(onLinux({ platform: 'Win32' })).toBe(false);
-		expect(onLinux({ platform: 'Linux armv81', userAgent: 'Mozilla/5.0 (Linux; Android 14)' })).toBe(false);
-		expect(onLinux({})).toBe(false);
+	test('any other error is the headline itself, capitalised, with nothing to disclose', () => {
+		expect(errorView('install', 'permission denied (os error 13)')).toEqual({
+			headline: 'Permission denied (os error 13)',
+			details: null
+		});
+		expect(errorView(null, "Couldn't open https://example.test — no browser")).toEqual({
+			headline: "Couldn't open https://example.test — no browser",
+			details: null
+		});
+	});
+
+	test('a message already capitalised, or empty, survives', () => {
+		expect(errorView('install', 'Failed to install').headline).toBe('Failed to install');
+		expect(errorView('install', '').headline).toBe('');
 	});
 });
 

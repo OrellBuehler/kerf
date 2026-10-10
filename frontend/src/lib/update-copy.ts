@@ -13,18 +13,22 @@ export function updateTitle(phase: UpdatePhase, update: Pick<UpdateInfo, 'versio
 	return phase === 'error' ? "Couldn't check for updates" : 'Kerf is up to date';
 }
 
-/** Just enough of `navigator` to tell the platform. */
-export interface PlatformNavigator {
-	userAgentData?: { platform?: string };
-	platform?: string;
-	userAgent?: string;
+const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+export interface ErrorView {
+	/** What the box says. */
+	headline: string;
+	/** The raw message under a disclosure, when the headline is a summary of it. */
+	details: string | null;
 }
 
-/** Whether this is a Linux desktop (the webview's own answer; Android also says "Linux" in its
- *  user agent, and is not one). */
-export function onLinux(nav: PlatformNavigator | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
-	const p = nav?.userAgentData?.platform || nav?.platform || nav?.userAgent || '';
-	return /linux/i.test(p) && !/android/i.test(nav?.userAgent ?? '');
+/** The error box. A failed check says what happened in words; the transport's own message — a
+ *  request error naming a URL, which reads as noise — goes under *Details*. Any other message is
+ *  the headline itself, its first letter capitalised. */
+export function errorView(kind: 'check' | 'install' | null, raw: string): ErrorView {
+	const message = capital(raw.trim());
+	if (kind !== 'check') return { headline: message, details: null };
+	return { headline: "Couldn't reach the update server. Check your connection and try again.", details: message };
 }
 
 /** The fallback offered under a failed install. Only the AppImage build updates in place, so
