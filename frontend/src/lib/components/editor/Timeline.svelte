@@ -76,6 +76,7 @@
 	import { linkPartners } from '$lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
 	import { analyzeSubmenuItem } from '$lib/analyze-menu';
+	import { muteItem, removeRows } from '$lib/menu-items';
 	import { doneCount, doneSummary } from '$lib/analysis-steps';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
@@ -1329,8 +1330,7 @@
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
 			{ type: 'separator' },
 			{
-				label: t.muted ? (t.kind === 'video' ? 'Show track' : 'Unmute track') : t.kind === 'video' ? 'Hide track' : 'Mute track',
-				icon: t.muted ? 'eye' : 'eye-off',
+				...muteItem(t),
 				action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
 			},
 			{
@@ -1387,7 +1387,6 @@
 			{
 				label: 'Split at playhead',
 				icon: 'Scissors',
-				shortcut: settings.shortcut('tool.razor'),
 				disabled: !within || !!t.locked,
 				action: () => {
 					// The playhead can be anywhere between frames; the cut is on one.
@@ -1510,41 +1509,17 @@
 				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
 			},
 			{ type: 'separator' },
-			{
-				label: n > 1 ? `Remove ${n} clips` : 'Remove',
-				icon: 'trash',
-				shortcut: settings.shortcut('edit.delete'),
-				danger: true,
-				action: () => removeClip(c.id, false)
-			},
-			{
-				label: n > 1 ? `Ripple delete ${n} clips` : 'Ripple delete',
-				icon: 'trash',
-				shortcut: settings.shortcut('edit.rippleDelete'),
-				danger: true,
-				action: () => removeClip(c.id, true)
-			},
-			// Delete the picture and keep its sound, or the other way round: `link: false`.
-			...(linked
-				? [
-						{
-							label: 'Remove only this clip',
-							icon: 'trash',
-							danger: true,
-							disabled: !!t.locked,
-							reason: t.locked ? `Track ${t.name} is locked` : undefined,
-							action: () => removeAlone(c.id, false)
-						} satisfies MenuItem,
-						{
-							label: 'Ripple delete only this clip',
-							icon: 'trash',
-							danger: true,
-							disabled: !!t.locked,
-							reason: t.locked ? `Track ${t.name} is locked` : undefined,
-							action: () => removeAlone(c.id, true)
-						} satisfies MenuItem
-					]
-				: [])
+			// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
+			...removeRows({
+				count: n,
+				linked,
+				locked: !!t.locked,
+				trackName: t.name,
+				removeKey: settings.shortcut('edit.delete'),
+				rippleKey: settings.shortcut('edit.rippleDelete'),
+				remove: (ripple) => removeClip(c.id, ripple),
+				removeAlone: (ripple) => removeAlone(c.id, ripple)
+			})
 		]);
 	}
 
@@ -1876,7 +1851,6 @@
 		contextMenu.show(e, [
 			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
 			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
-			{ type: 'separator' },
 			{ type: 'separator' },
 			{
 				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
