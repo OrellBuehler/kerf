@@ -134,9 +134,9 @@
 	--drag-ghost: #788cff;
 
 	/* ---------- Typography ---------- */
-	--font-display: 'Space Grotesk', 'Geist', ui-sans-serif, system-ui, sans-serif;
-	--font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-	--font-mono: 'Geist Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+	--font-display: 'Space Grotesk Variable', 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+	--font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: 'Geist Mono Variable', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
 
 	--fw-light: 300;
 	--fw-regular: 400;

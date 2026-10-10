@@ -27,8 +27,8 @@
       "csp": {
         "default-src": "'self'",
         "script-src": "'self'",
-        "style-src": "'self' 'unsafe-inline' https://fonts.googleapis.com",
-        "font-src": "'self' data: https://fonts.gstatic.com",
+        "style-src": "'self' 'unsafe-inline'",
+        "font-src": "'self' data:",
         "img-src": "'self' data:",
         "connect-src": "ipc: http://ipc.localhost",
         "object-src": "'none'",
@@ -38,8 +38,8 @@
       "devCsp": {
         "default-src": "'self'",
         "script-src": "'self' 'unsafe-inline'",
-        "style-src": "'self' 'unsafe-inline' https://fonts.googleapis.com",
-        "font-src": "'self' data: https://fonts.gstatic.com",
+        "style-src": "'self' 'unsafe-inline'",
+        "font-src": "'self' data:",
         "img-src": "'self' data:",
         "connect-src": "ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
         "object-src": "'none'",
