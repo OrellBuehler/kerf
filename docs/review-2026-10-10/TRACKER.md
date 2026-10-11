@@ -14,7 +14,7 @@
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
 | UI-5 Timeline gestures | ui-5 (on ui-4) | | in-progress | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | | | todo | panels/shell medium + polish; shell H6 | wave 3 |
-| UI-8 Export dialog logic | ui-8 (on ui-6) | | in-progress | dialogs 3 | wave 3 |
+| UI-8 Export dialog logic | ui-8 (on ui-6) | | review | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
 | GPU-2 Text on the GPU | | | todo | gpu-compositor | wave 3 |
 | GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
@@ -31,6 +31,7 @@
 - UI-6: the themed tooltip is not hoverable (`pointer-events:none`), so it can't swallow a click on the next toolbar row. Escape is consumed only when keyboard focus raised the tip. `confirmAction` requires named buttons. The Update dialog stays busy while downloading: on Windows the updater exits the process when the download ends, which would lose unsaved work, so Hide was reverted. Failure copy is one line, `X failed — Reason`. Toast glyphs use the -400 hues for contrast.
 - Wave 3 starts before wave 2 merges: the merges are blocked only by the external CI outage. UI-5 is stacked on ui-4 (Timeline) and UI-8 on ui-6 (ExportDialog), the branches they overlap most. PERF-4 and GPU-2 wait for GPU-3 and PERF-3 (still path, stream).
 - PERF-3: playback frames travel as raw bytes, but the page decodes them through one persistent `<img>` from a data URL built in JS. The ImageBitmap/canvas path is off by default: it measured slower in Chromium (the Windows WebView) and is unmeasured in WebKit.
+- UI-8: the shape-mismatch sentence ("…would be letterboxed. Tick 9:16…") shows only when a project cut for a shape exports a wider file; otherwise it's the neutral line (one function, `barsLine`). With nothing ticked, length limits still show for the platforms the frame is made for. `kerf_core::platform` stays authoritative: the app's `platform_check` returns the judged cut and takes a range, and the MCP tool is unchanged.
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
 - The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
@@ -59,6 +60,8 @@
 
 ## Needs a real machine
 
+- UI-8: in the real app, set In/Out, switch Range to In → out, confirm the Platform check length follows (Tauri command only type-checked).
+
 - PERF-3: createImageBitmap(Blob) vs data-URL <img> decode in WebView2/WKWebView/WebKitGTK; Tauri channel raw-payload throughput/order at 60 fps × ~60 KB; OVERLOAD_AFTER tuning vs stream start-up; 60 fps CPU on real HEVC/4K proxies.
 
 - UI-6: reason tooltips on disabled controls in WebKitGTK/WKWebView (they may not receive pointer events; ~31 sites).
@@ -86,6 +89,9 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+
+- UI-8: file-size limits (TikTok 500 MB / 2 GB) don't exist in kerf_core::platform; adding them needs an engine size estimate (bitrate × duration; CRF can't be estimated).
+- UI-8: at 1366×768 the Platform check sits below the fold (M12 layout).
 
 
 - UI-6: make the tooltip hoverable (WCAG 1.4.13)? It's a one-line change.
