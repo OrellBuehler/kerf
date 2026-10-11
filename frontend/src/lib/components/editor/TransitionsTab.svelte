@@ -8,11 +8,15 @@
 	import { attempt } from '$lib/ops';
 	import { chip } from '$lib/chip';
 	import type { TransitionKind } from '$lib/types';
+	import { FieldEdits } from '$lib/field-edit';
 
 	const clip = $derived(editor.selectedClip);
 	const current = $derived(clip?.transition_in ?? null);
 	const reason = $derived(clip ? null : 'Select a clip on the timeline to set the transition into it.');
 	const off = $derived(reason !== null || editor.busy);
+	/** The clip the length field took focus on and what was typed: its `change` comes with the blur, after the click that selects another clip has moved the selection and re-rendered the field with that clip's length. */
+	const length = new FieldEdits<string | null>();
+	const clipById = (id: string | null) => editor.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === id);
 
 	function pick(kind: TransitionKind) {
 		const c = clip;
@@ -48,13 +52,17 @@
 						value={current.duration}
 						disabled={editor.busy}
 						aria-label="Transition length in seconds"
+						onfocus={(e) => length.focus(e.currentTarget, editor.selectedClipId)}
+						oninput={(e) => length.input(e.currentTarget, e.currentTarget.value)}
 						onchange={(e) => {
-							const v = parseFloat(e.currentTarget.value);
+							const { scope: id, text } = length.end(e.currentTarget, { scope: editor.selectedClipId, text: e.currentTarget.value });
+							const v = parseFloat(text);
+							const was = clipById(id)?.transition_in;
 							// Put the field back first: an emptied or negative entry would
 							// otherwise sit there showing something that was ignored.
 							e.currentTarget.value = String(current.duration);
-							if (Number.isFinite(v) && v > 0 && clip)
-								void attempt(() => editor.setTransition(clip.id, { kind: current.kind, duration: Math.max(0.05, v) }));
+							if (Number.isFinite(v) && v > 0 && id && was)
+								void attempt(() => editor.setTransition(id, { kind: was.kind, duration: Math.max(0.05, v) }));
 						}}
 						style="width:58px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 5px;text-align:right"
 					/>

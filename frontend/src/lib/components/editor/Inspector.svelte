@@ -41,6 +41,7 @@
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import { DEGREES, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
+	import { FieldEdits } from '$lib/field-edit';
 
 	const clip = $derived(editor.selectedClip);
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit
@@ -73,8 +74,13 @@
 		const pose = sampleOverlay(ov, at.time);
 		return run(() => editor.moveOverlay(ov.id, to.x ?? pose.x, to.y ?? pose.y, at.time));
 	}
-	/** What a plain number field was editing when it took focus: its `change` comes with the blur, after a click on another clip has already moved the selection. */
-	const began = new WeakMap<HTMLElement, Edit>();
+	/** What the plain fields (a number, a title's text, an effect's parameter) are editing: the scope when each took
+	 *  focus and what was typed into it. Its `change` comes with the blur, after the click that selects another clip has
+	 *  moved the selection and the field has been re-rendered with that clip's value. */
+	const fields = new FieldEdits<Edit>();
+	const noteFocus = (e: { currentTarget: HTMLElement }) => fields.focus(e.currentTarget, scope);
+	const noteTyped = (e: { currentTarget: HTMLInputElement }) => fields.input(e.currentTarget, e.currentTarget.value);
+	const endEdit = (el: HTMLInputElement | HTMLSelectElement) => fields.end(el, { scope, text: el.value });
 	const clipOf = (at: Edit): Clip | undefined => {
 		for (const t of editor.timeline.tracks) {
 			const c = t.clips.find((c) => c.id === at.clipId);
@@ -83,6 +89,12 @@
 		return undefined;
 	};
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
+	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
+	function patchTitle(el: HTMLInputElement | HTMLSelectElement, patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
+		const { scope: at, text } = endEdit(el);
+		const ov = overlayOf(at);
+		if (ov) void run(() => editor.updateOverlay(ov.id, patch(text)));
+	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
@@ -262,10 +274,12 @@
 		if (!c || !kindKey) return;
 		void run(() => editor.setVideoEffects(c.id, [...effects, structuredClone(VIDEO_FX[kindKey])]));
 	}
-	function setVideoFxParam(i: number, key: string, value: unknown) {
-		const c = clip;
-		if (!c) return;
-		void run(() => editor.setVideoEffects(c.id, effects.map((e, j) => (j === i ? { ...e, [key]: value } : e))));
+	/** An effect's parameter on the clip the edit began on (see `fields`), read from that clip's chain as it is now. */
+	function setVideoFxParam(i: number, key: string, value: unknown, at: Edit = scope) {
+		const c = clipOf(at);
+		const chain = c?.effects ?? [];
+		if (!c || !chain[i]) return;
+		void run(() => editor.setVideoEffects(c.id, chain.map((e, j) => (j === i ? { ...e, [key]: value } : e))));
 	}
 	function removeVideoFx(i: number) {
 		const c = clip;
@@ -277,10 +291,11 @@
 		if (!c || !kindKey) return;
 		void run(() => editor.setAudioEffects(c.id, [...audioFx, structuredClone(AUDIO_FX[kindKey])]));
 	}
-	function setAudioFxParam(i: number, key: string, value: unknown) {
-		const c = clip;
-		if (!c) return;
-		void run(() => editor.setAudioEffects(c.id, audioFx.map((e, j) => (j === i ? { ...e, [key]: value } : e))));
+	function setAudioFxParam(i: number, key: string, value: unknown, at: Edit = scope) {
+		const c = clipOf(at);
+		const chain = c?.audio ?? [];
+		if (!c || !chain[i]) return;
+		void run(() => editor.setAudioEffects(c.id, chain.map((e, j) => (j === i ? { ...e, [key]: value } : e))));
 	}
 	function removeAudioFx(i: number) {
 		const c = clip;
@@ -443,14 +458,16 @@
 			{step}
 			min="0"
 			disabled={editor.busy}
-			onfocus={(e) => began.set(e.currentTarget, scope)}
+			onfocus={noteFocus}
+			oninput={noteTyped}
 			onchange={(e) => {
-				const v = parseFloat(e.currentTarget.value);
+				const { scope: at, text } = endEdit(e.currentTarget);
+				const v = parseFloat(text);
 				// Put the field back to what the clip has first: an emptied, negative
 				// or clamped entry then doesn't sit there showing something that
 				// was ignored, while an accepted one re-renders over this.
 				e.currentTarget.value = String(value);
-				if (Number.isFinite(v) && v >= 0) onCommit(v, began.get(e.currentTarget) ?? scope);
+				if (Number.isFinite(v) && v >= 0) onCommit(v, at);
 			}}
 			style="{inputCss};grid-column:2 / 5;justify-self:end"
 		/>
@@ -500,7 +517,7 @@
 	items: Array<Record<string, unknown>>,
 	presets: Record<string, unknown>,
 	onAdd: (k: string) => void,
-	onParam: (i: number, key: string, value: unknown) => void,
+	onParam: (i: number, key: string, value: unknown, at: Edit) => void,
 	onRemove: (i: number) => void
 )}
 	<InspectorSection title={title} summary={count(items.length, 'effect')}>
@@ -517,7 +534,12 @@
 						value={v}
 						title={k}
 						disabled={editor.busy}
-						onchange={(ev) => onParam(i, k, ev.currentTarget.value)}
+						onfocus={noteFocus}
+						oninput={noteTyped}
+						onchange={(ev) => {
+							const { scope: at, text } = endEdit(ev.currentTarget);
+							onParam(i, k, text, at);
+						}}
 						style={fxTxt}
 					/>
 				{:else}
@@ -527,9 +549,12 @@
 						title={k}
 						step="0.1"
 						disabled={editor.busy}
+						onfocus={noteFocus}
+						oninput={noteTyped}
 						onchange={(ev) => {
-							const n = parseFloat(ev.currentTarget.value);
-							if (Number.isFinite(n)) onParam(i, k, n);
+							const { scope: at, text } = endEdit(ev.currentTarget);
+							const n = parseFloat(text);
+							if (Number.isFinite(n)) onParam(i, k, n, at);
 						}}
 						style={fxNum}
 					/>
@@ -588,7 +613,9 @@
 				type="text"
 				value={o.text}
 				disabled={editor.busy}
-				onchange={(e) => run(() => editor.updateOverlay(o.id, { text: e.currentTarget.value }))}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ text: typed }))}
 				style={inputCss + ';flex:1;width:auto;text-align:left'}
 			/>
 		</label>
@@ -612,7 +639,9 @@
 				type="text"
 				value={o.color}
 				disabled={editor.busy}
-				onchange={(e) => run(() => editor.updateOverlay(o.id, { color: e.currentTarget.value }))}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ color: typed }))}
 				style={fxTxt}
 			/>
 			<span style="font-size:12px;color:var(--text-muted)">Box</span>
@@ -621,7 +650,9 @@
 				value={o.bg ?? ''}
 				placeholder="none"
 				disabled={editor.busy}
-				onchange={(e) => run(() => editor.updateOverlay(o.id, { bg: e.currentTarget.value }))}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ bg: typed }))}
 				style={fxTxt}
 			/>
 		</label>
@@ -630,7 +661,8 @@
 			<select
 				value={o.font ?? ''}
 				disabled={editor.busy}
-				onchange={(e) => run(() => editor.updateOverlay(o.id, { font: e.currentTarget.value }))}
+				onfocus={noteFocus}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }))}
 				style={selectCss + ';flex:1'}
 			>
 				<option value="">Default</option>
@@ -645,7 +677,8 @@
 				type="checkbox"
 				checked={o.bold}
 				disabled={editor.busy}
-				onchange={(e) => run(() => editor.updateOverlay(o.id, { bold: e.currentTarget.checked }))}
+				onfocus={noteFocus}
+				onchange={(e) => patchTitle(e.currentTarget, () => ({ bold: e.currentTarget.checked }))}
 				style="accent-color:var(--kerf-500);width:18px;height:18px"
 			/>
 		</label>

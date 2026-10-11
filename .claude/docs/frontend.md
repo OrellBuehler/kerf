@@ -682,7 +682,12 @@ is exactly there — a 0.4° rotation reads 0° and can still be reset or typed 
 entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
 reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
 back with the value (`at`); the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
-number's `keyAtPlayhead`) read that clip, and its plain number fields (`numRow`) note theirs on focus. Rest values are the model's
+number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's Text / Color / Box / Font / Bold, an effect's parameters, the
+Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
+re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
+(`field-edit.ts`) notes the scope on `focus` and the typed text on `input`, and the commit takes both from there (`noteFocus` /
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+text and number input of the Inspector to this. Rest values are the model's
 `DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
 fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
 A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.

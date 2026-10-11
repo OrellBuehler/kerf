@@ -164,7 +164,7 @@ describe('SliderRow', () => {
 			}
 		}
 		expect(inspector).toContain('{scope}');
-		expect(inspector).toContain('began.get(e.currentTarget) ?? scope');
+		expect(inspector).toContain('fields.focus(e.currentTarget, scope)');
 		expect(row).toContain('pending.end(');
 		expect(row).toContain('onCommit(v, at)');
 		expect(row).toContain('generics="S');
@@ -174,6 +174,35 @@ describe('SliderRow', () => {
 		for (const helper of ['setTf', 'setCol', 'setGain', 'setCam', 'patchMask', 'setFade', 'moveTitle'])
 			expect(inspector, helper).toMatch(new RegExp(`(function ${helper}|const ${helper} = )\\(?[^)]*at: Edit`));
 		expect(inspector).toMatch(/function keyAtPlayhead\([^)]*playhead: number = ui\.time\)/);
+	});
+
+	test('a plain field commits what was typed into it, to what it took focus on', () => {
+		// By the blur the selection is the other clip's and the field has been re-rendered with that
+		// clip's value: reading either writes the other clip's number onto this one.
+		const inputs = (inspector.match(/<input\b[\s\S]*?\n\s*\/>/g) ?? []).filter((tag) => /type="(text|number)"/.test(tag));
+		expect(inputs.length).toBeGreaterThanOrEqual(6);
+		for (const tag of inputs) {
+			const name = tag.replace(/\s+/g, ' ').slice(0, 70);
+			expect(tag, name).toContain('onfocus={noteFocus}');
+			expect(tag, name).toContain('oninput={noteTyped}');
+			expect(tag, name).toMatch(/endEdit\(|patchTitle\(/);
+			expect(tag, name).not.toMatch(/currentTarget\.value(?!\s*=[^=])/);
+			expect(tag, name).not.toMatch(/\bclip[.!]|\bo\.id|selectedClip|\boverlay\b/);
+		}
+		// The title's select and checkbox change at once, but go through the same door.
+		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
+		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
+		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])
+			expect(inspector, helper).toMatch(new RegExp(`function ${helper}\\([^)]*at: Edit[^)]*\\) \\{\\s*const c = clipOf\\(at\\)`));
+		expect(inspector).toContain('onParam: (i: number, key: string, value: unknown, at: Edit)');
+	});
+
+	test('the Transitions tab’s length field is held to the same rule', () => {
+		const tab = read(`${EDITOR}TransitionsTab.svelte`);
+		const field = tab.slice(tab.indexOf('onfocus={(e) => length.focus('), tab.indexOf('style="width:58px'));
+		expect(field).toContain('length.input(');
+		expect(field).toContain('length.end(');
+		expect(field).not.toMatch(/\bclip[.!?]|current\.kind/);
 	});
 
 	test('the rest values are the model’s defaults, not copies of them', () => {
