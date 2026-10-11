@@ -318,16 +318,28 @@ struct MaskPlane {
     gpu: OnceLock<Plane>,
 }
 
-/// The mask planes in use, newest first: a few, under a byte cap.
-#[derive(Default)]
+/// The mask planes in use, newest first: a few, under a byte cap that counts each plane twice (the
+/// CPU copy and the one uploaded for it).
 struct MaskCache {
     entries: Mutex<Vec<(MaskKey, Arc<MaskPlane>)>>,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
 type MaskKey = ([u64; 6], u32, u32);
 
 const MASK_CACHE_ENTRIES: usize = 8;
 const MASK_CACHE_BYTES: usize = 96 << 20;
+
+impl Default for MaskCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            max_entries: MASK_CACHE_ENTRIES,
+            max_bytes: MASK_CACHE_BYTES,
+        }
+    }
+}
 
 impl MaskCache {
     fn get(&self, mask: &Mask, w: u32, h: u32) -> Arc<MaskPlane> {
@@ -373,8 +385,9 @@ impl MaskCache {
         entries.insert(0, (key, Arc::clone(&plane)));
         let (mut bytes, mut keep) = (0usize, 0usize);
         for (_, p) in entries.iter() {
-            bytes += p.data.len();
-            if keep > 0 && (keep >= MASK_CACHE_ENTRIES || bytes > MASK_CACHE_BYTES) {
+            // (The texture a plane is uploaded to is as many bytes again: one 8-bit sample each.)
+            bytes += 2 * p.data.len();
+            if keep > 0 && (keep >= self.max_entries || bytes > self.max_bytes) {
                 break;
             }
             keep += 1;
@@ -2575,5 +2588,82 @@ fn plane_stage(stage: &ScaleStage, chroma: bool) -> PlaneStage {
             w: half(stage.keep.w),
             h: half(stage.keep.h),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mask(x: f64) -> Mask {
+        Mask {
+            shape: MaskShape::Rect,
+            x,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: 0.1,
+            inverted: false,
+        }
+    }
+
+    fn held(cache: &MaskCache) -> Vec<(u32, u32)> {
+        let entries = cache.entries.lock().unwrap();
+        entries.iter().map(|(k, _)| (k.1, k.2)).collect()
+    }
+
+    #[test]
+    fn a_mask_plane_is_made_once_for_a_mask_and_a_size() {
+        let cache = MaskCache::default();
+        let a = cache.get(&mask(0.5), 32, 18);
+        assert_eq!(a.data, kerf_core::mask_alpha_plane(&mask(0.5), 32, 18));
+        assert!(
+            Arc::ptr_eq(&a, &cache.get(&mask(0.5), 32, 18)),
+            "the same mask and size is one plane"
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &cache.get(&mask(0.5), 64, 36)),
+            "another size is another plane"
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &cache.get(&mask(0.4), 32, 18)),
+            "another mask is another plane"
+        );
+        // A size no mask can have is clamped to a visible one before it is a key.
+        let wide = |w| Mask { width: w, ..mask(0.5) };
+        assert!(Arc::ptr_eq(&cache.get(&wide(9.0), 8, 8), &cache.get(&wide(99.0), 8, 8)));
+    }
+
+    #[test]
+    fn the_newest_planes_are_kept_under_the_entry_cap_and_the_byte_cap() {
+        let cache = MaskCache {
+            max_entries: 3,
+            ..MaskCache::default()
+        };
+        for w in 10..15 {
+            cache.get(&mask(0.5), w, 10);
+        }
+        assert_eq!(held(&cache), [(14, 10), (13, 10), (12, 10)], "three, newest first");
+        // A hit moves a plane to the front, so it outlives older ones.
+        cache.get(&mask(0.5), 12, 10);
+        cache.get(&mask(0.5), 15, 10);
+        assert_eq!(held(&cache), [(15, 10), (12, 10), (14, 10)]);
+
+        // The cap counts the CPU copy and the uploaded one: a plane of 120 samples is 240 bytes.
+        let cache = MaskCache {
+            max_bytes: 500,
+            ..MaskCache::default()
+        };
+        for w in [10, 11, 12] {
+            cache.get(&mask(0.5), w, 10);
+        }
+        assert_eq!(
+            held(&cache),
+            [(12, 10), (11, 10)],
+            "two planes are 460 bytes counted twice, a third 660"
+        );
+        // The plane just asked for is kept whatever its size.
+        cache.get(&mask(0.5), 100, 100);
+        assert_eq!(held(&cache), [(100, 100)]);
     }
 }
