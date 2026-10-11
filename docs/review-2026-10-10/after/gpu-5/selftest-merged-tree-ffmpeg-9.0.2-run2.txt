@@ -1,0 +1,1 @@
+test selftest::tests::this_ffmpeg_and_this_adapter_pass_their_own_self_test ... self-test: ok fit: flat 48.8 dB max 4, all 48.5 dB, 81% judged (ffmpeg 88 ms, gpu 295 ms); ok pip: flat 46.2 dB max 6, all 46.0 dB, 91% judged (ffmpeg 155 ms, gpu 244 ms); ok bt709: flat 48.6 dB max 5, all 47.9 dB, 76% judged (ffmpeg 120 ms, gpu 193 ms) (BottomLayerTag, 1680 ms)

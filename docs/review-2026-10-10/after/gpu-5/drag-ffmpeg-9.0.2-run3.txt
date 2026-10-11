@@ -1,0 +1,36 @@
+# a forward drag of 60 positions (a frame of timeline per pointer event) over 1280x720 all-intra clips on llvmpipe (LLVM 20.1.2, 256 bits)
+         # (a software adapter makes the GPU part of a frame tens of milliseconds; the lines differ by what surrounds it)
+         # steady: every position drawn in turn, at rest. before: the page's single flight (the newest position when the last answer is in,
+         #   3 ms for the round trip) and the inputs taken from the project for every frame. after: the pointer into the latest-wins mailbox, inputs held.
+
+## rendered 800 px wide; the screen waits for the GPU to finish each frame (lavapipe's raster is the frame)
+steady, inputs taken per frame                                      60 requests  60 drawn, last on screen at   5872 ms ( 97.9 per drawn); request to screen p50   95.9 p95  127.6 ms; decode 2.0 record 1.4 present+completion 92.1 ms; inputs taken 60x
+steady, held snapshot                                               60 requests  60 drawn, last on screen at   5987 ms ( 99.8 per drawn); request to screen p50   94.3 p95  141.0 ms; decode 2.1 record 1.4 present+completion 89.5 ms; inputs taken 3x
+before: page single-flight, pointer 125 Hz                          60 requests   5 drawn, last on screen at    676 ms (135.2 per drawn); request to screen p50  140.4 p95  174.5 ms; decode 22.5 record 1.7 present+completion 100.9 ms; inputs taken 5x
+after:  mailbox, pointer 125 Hz                                     60 requests   5 drawn, last on screen at    734 ms (146.7 per drawn); request to screen p50  142.7 p95  197.8 ms; decode 24.5 record 1.5 present+completion 130.5 ms; inputs taken 1x
+before: page single-flight, pointer 60 Hz                           60 requests  10 drawn, last on screen at   1214 ms (121.4 per drawn); request to screen p50  132.4 p95  159.8 ms; decode 17.2 record 1.2 present+completion 100.9 ms; inputs taken 10x
+after:  mailbox, pointer 60 Hz                                      60 requests  10 drawn, last on screen at   1108 ms (110.8 per drawn); request to screen p50  123.6 p95  151.0 ms; decode 13.1 record 1.3 present+completion 91.0 ms; inputs taken 1x
+
+## rendered 800 px wide; CPU side only: the GPU's work is not waited for, as a real present does not
+steady, inputs taken per frame                                      60 requests  60 drawn, last on screen at   5722 ms ( 95.4 per drawn); request to screen p50   95.2 p95  218.0 ms; decode 1.7 record 90.8 present+completion 0.0 ms; inputs taken 60x
+steady, held snapshot                                               60 requests  60 drawn, last on screen at   5425 ms ( 90.4 per drawn); request to screen p50   90.1 p95  190.2 ms; decode 1.6 record 83.2 present+completion 0.0 ms; inputs taken 3x
+before: page single-flight, pointer 125 Hz                          60 requests   6 drawn, last on screen at    601 ms (100.1 per drawn); request to screen p50  110.0 p95  228.8 ms; decode 18.5 record 87.4 present+completion 0.0 ms; inputs taken 6x
+after:  mailbox, pointer 125 Hz                                     60 requests   5 drawn, last on screen at    588 ms (117.7 per drawn); request to screen p50  151.0 p95  211.1 ms; decode 26.6 record 112.8 present+completion 0.0 ms; inputs taken 1x
+before: page single-flight, pointer 60 Hz                           60 requests  10 drawn, last on screen at   1118 ms (111.8 per drawn); request to screen p50  130.1 p95  242.5 ms; decode 9.4 record 98.7 present+completion 0.0 ms; inputs taken 10x
+after:  mailbox, pointer 60 Hz                                      60 requests  12 drawn, last on screen at   1151 ms ( 95.9 per drawn); request to screen p50  141.7 p95  237.7 ms; decode 12.4 record 107.0 present+completion 0.0 ms; inputs taken 1x
+
+## rendered 400 px wide over a gap in the cut (no layer: nothing to decode, the cheapest frame the path draws)
+steady, inputs taken per frame                                      60 requests  60 drawn, last on screen at    327 ms (  5.5 per drawn); request to screen p50    4.8 p95   11.8 ms; decode 0.0 record 0.2 present+completion 4.4 ms; inputs taken 60x
+steady, held snapshot                                               60 requests  60 drawn, last on screen at    402 ms (  6.7 per drawn); request to screen p50    4.5 p95   11.4 ms; decode 0.0 record 0.2 present+completion 3.9 ms; inputs taken 1x
+before: page single-flight, pointer 125 Hz                          60 requests  54 drawn, last on screen at    511 ms (  9.5 per drawn); request to screen p50    9.4 p95   14.5 ms; decode 0.0 record 0.2 present+completion 4.3 ms; inputs taken 54x
+after:  mailbox, pointer 125 Hz                                     60 requests  60 drawn, last on screen at    518 ms (  8.6 per drawn); request to screen p50    6.2 p95    9.6 ms; decode 0.0 record 0.2 present+completion 5.2 ms; inputs taken 1x
+before: page single-flight, pointer 60 Hz                           60 requests  60 drawn, last on screen at    975 ms ( 16.2 per drawn); request to screen p50    6.3 p95   20.7 ms; decode 0.0 record 0.2 present+completion 5.8 ms; inputs taken 60x
+after:  mailbox, pointer 60 Hz                                      60 requests  60 drawn, last on screen at    974 ms ( 16.2 per drawn); request to screen p50    6.6 p95   13.5 ms; decode 0.0 record 0.2 present+completion 5.2 ms; inputs taken 1x
+
+## rendered 400 px wide over a gap in the cut, in a project of 120 clips on four tracks (the plan is made from all of them)
+steady, inputs taken per frame                                      60 requests  60 drawn, last on screen at    223 ms (  3.7 per drawn); request to screen p50    3.4 p95    6.5 ms; decode 0.0 record 0.2 present+completion 2.4 ms; inputs taken 60x
+steady, held snapshot                                               60 requests  60 drawn, last on screen at    247 ms (  4.1 per drawn); request to screen p50    3.2 p95    9.0 ms; decode 0.0 record 0.2 present+completion 2.8 ms; inputs taken 1x
+before: page single-flight, pointer 125 Hz                          60 requests  59 drawn, last on screen at    503 ms (  8.5 per drawn); request to screen p50    4.6 p95   13.1 ms; decode 0.0 record 0.2 present+completion 2.6 ms; inputs taken 59x
+after:  mailbox, pointer 125 Hz                                     60 requests  60 drawn, last on screen at    499 ms (  8.3 per drawn); request to screen p50    4.6 p95   10.6 ms; decode 0.0 record 0.2 present+completion 3.7 ms; inputs taken 1x
+before: page single-flight, pointer 60 Hz                           60 requests  60 drawn, last on screen at    973 ms ( 16.2 per drawn); request to screen p50    3.8 p95    6.8 ms; decode 0.0 record 0.2 present+completion 2.9 ms; inputs taken 60x
+after:  mailbox, pointer 60 Hz                                      60 requests  60 drawn, last on screen at    972 ms ( 16.2 per drawn); request to screen p50    4.9 p95    8.6 ms; decode 0.0 record 0.2 present+completion 3.8 ms; inputs taken 1x

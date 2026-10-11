@@ -1,0 +1,5 @@
+# the inputs of one preview frame, per frame (microseconds, median / p95 of 3000)
+# before = lock + proxy_waits + working timeline (JSON parse) + preview assets + assets; after = held snapshot + proxy_wait
+  2 assets    8 clips (timeline JSON   4016 bytes): before     45.2 /     77.8 us   after   0.12 /   0.25 us   (371x)   a stale snapshot rebuilt:     39.8 /     69.6 us
+ 12 assets  120 clips (timeline JSON  55524 bytes): before    211.8 /    369.9 us   after   0.16 /   0.70 us   (1323x)   a stale snapshot rebuilt:    196.5 /    349.0 us
+ 40 assets  480 clips (timeline JSON 221404 bytes): before    729.7 /   1142.0 us   after   0.27 /   0.94 us   (2683x)   a stale snapshot rebuilt:    688.1 /   1070.0 us

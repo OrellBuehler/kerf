@@ -1,0 +1,5 @@
+# the inputs of one preview frame, per frame (microseconds, median / p95 of 3000)
+# before = lock + proxy_waits + working timeline (JSON parse) + preview assets + assets; after = held snapshot + proxy_wait
+  2 assets    8 clips (timeline JSON   4016 bytes): before     43.1 /     71.7 us   after   0.13 /   0.17 us   (334x)
+ 12 assets  120 clips (timeline JSON  55524 bytes): before    201.2 /    279.2 us   after   0.14 /   0.28 us   (1437x)
+ 40 assets  480 clips (timeline JSON 221404 bytes): before    694.7 /   1212.7 us   after   0.21 /   0.77 us   (3356x)

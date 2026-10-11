@@ -21,7 +21,7 @@
 | PERF-5 AMF/VAAPI export encode | perf-5 | #142 | merged | gpu-media WP4, WP5, WP11 | wave 4 |
 | macOS presenter (WP-8) | macos-presenter | #141 | merged | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
 | GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4 ea0d186) | | r3 closing fix done (integer worst case: a 2nd sharpen after a source refused); final verify | gpu-compositor WP-6 | dev done: T3 Still 83.3→100%, Motion 16.6→100%; masks exact (geq f64 plane, cached), grayscale/invert/sharpen exact, blur ≤1 level; found FFmpeg 6.1 geq edge read (probed); mask still 847→371 ms at 960 px on CPU adapter |
-| GPU-5 Scrub at GPU speed + hardening | gpu-5 (on main fec0368) | | dev | gpu-compositor WP-5 | |
+| GPU-5 Scrub at GPU speed + hardening | gpu-5 (on main 3646b85) | | r1 review | gpu-compositor WP-5 | dev done: per-frame project cost 43–710 µs → 0.13–0.2 µs (8–480 clips; Arc snapshot on a plan epoch); latest-wins mailbox; no-vsync drags; render lock off the decode wait; CPU adapters refused for preview; runtime self-test 1–3 s (fit/pip/bt709 vs local ffmpeg); refusal counters (`gpu_preview_diagnostics`) |
 | GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
@@ -100,6 +100,7 @@
 - PERF-4 reconciled with PERF-5 (proxies never hardware-encode): every proxy is the cores' job, so proxy GPU-lane classification, the 2-worker Windows proxy queue and `Lease::fall_back_to_cpu` are removed; the GPU slot remains for hardware exports only (AMF/NVENC/QSV/VT/VAAPI with a named decode accelerator and light graph; `hwupload` counts as light).
 - GPU-6: a sharpen amplifies an upstream 1-level difference (a scale ahead, or a blur earlier in the chain) by 1 + 2 x amount (Y 3 / 7 / 11 at 1.5 / 3 / 5); chained sharpens compound. Refused when the product passes 2 rather than accepted as drawn, per "refuse rather than approximate". Blur and table effects on a scaled layer stay within 2. The CI gpu parity timeout is raised 20 → 30 min, because the suite alone takes 9–12 min on 4 cores.
 - CI engine job timeout raised 15 → 25 min (#144): macOS Intel runs 15–17 min now that the ignored suite includes PERF-4's scrub bench.
+- GPU-5: the preview refuses CPU adapters (llvmpipe/lavapipe/WARP-as-CPU) by default. On lavapipe a frame with a picture costs 65–100 ms, slower than PERF-4's FFmpeg scrub (0.04–15 ms per next frame), and the rasteriser takes the cores. `KERF_GPU_ADAPTER=software` forces it and `auto`/`any` takes wgpu's choice. Tests keep `for_tests` (lavapipe). Snapshot TTL is 2 s; a drag is requests under 120 ms apart and ends after 600 ms gaps. The self-test verdict holds for the session.
 
 ## Needs a real machine
 - GPU-6: compute/storage-buffer passes on Metal, DX12, hardware Vulkan (FMA changes blur's last bits); real-GPU timings; Windows `hypot` vs Linux for ellipse masks; the geq edge probe on non-pinned macOS/Windows FFmpegs.
@@ -144,6 +145,7 @@
 - PERF-1: Apple silicon VideoToolbox 4:2:2, and whether dropping hw for proxies wins there; Linux VAAPI (radeonsi, iHD) and NVDEC session cost; whether auto picks DXVA2 on non-AMD Windows GPUs.
 
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
+- GPU-5: Metal/WARP parity matrix; real-GPU frame times and the effect of the mailbox and AutoNoVsync (lavapipe has no vsync, and its frames dwarf the IPC); WebKit per-frame IPC cost; self-test false positives on real GPUs (`pip` max error 6 of the harness's 8, and a mismatch disables the GPU path for the session); the FFV1/Matroska fixture encoders in the Windows and macOS FFmpeg bundles.
 
 ## Needs a decision
 - GPU-4 (r3, after the last review round): full range is detected by pix_fmt name (`yuvj…`), which misses pc-tagged >8-bit footage (`yuv420p10le` + `color_range=pc`); the merged fix conservatively treats any >8-bit picture as maybe full range under 9.0-style policy. Proper fix: record ffprobe `color_range` in `StreamInfo` (+ `types.ts`) and use `pc || yuvj`, which would give limited 10-bit footage back to the GPU. Interim (shipped): a >8-bit YCbCr pix_fmt counts as maybe full range unless the policy is `FixedBt601`, so on 9.0.2 limited 10-bit cuts (HDR phone footage) also fall back to FFmpeg in Motion and in still fades; recording `color_range` lifts that.
@@ -205,3 +207,5 @@
 - UI-3: should audio-only clips offer only Crossfade (and Dips) in Transition (in), instead of all eleven kinds?
 - UI-3: should the toolbar's "N selected" also count a linked pair as one?
 - UI-7 (review r3 nits, unfixed after 3 rounds): MenuBar `hasClips` reads `editor.timeline` while Export uses `liveTimeline` (staged preview on an empty cut shows File ▸ Export enabled, then refuses); the mixer strip guard hard-codes padding/edges, so at `--line-width:3px` DUCK overflows 2 px into padding; `.k-btn[aria-disabled]` duplicates the `:disabled` rule.
+- GPU-5: a persisted setting vs an env var for the CPU-adapter policy, and whether to build "unless proven faster"; whether an inconclusive self-test stays closed until toggled or retries on a backoff; the snapshot TTL and drag constants; whether to add `kerf-app -- --ignored gpu_preview::drive_tests` to the CI parity job.
+
