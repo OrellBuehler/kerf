@@ -1516,6 +1516,16 @@ mod tests {
             Some(std::path::Path::new("/kerf-test/fonts/PinnedSans-Regular.ttf"))
         );
         assert!(named.synthetic_bold);
+        // ...which a text pass cannot reproduce: the border's glyph bitmaps overlap and are blended in turn.
+        let mut thick = export.at_frame(30).unwrap();
+        thick.overlays[0] = named;
+        let drawn = GpuCaps {
+            motion: true,
+            text: true,
+            ..GpuCaps::A0
+        };
+        let size = thick.size(u32::MAX);
+        assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
     }
 
     #[test]

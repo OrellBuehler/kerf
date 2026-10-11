@@ -177,6 +177,10 @@ pub enum Unsupported {
     /// A live text overlay names no font file the compositor can draw with (the shipped default font
     /// could not be written to disk).
     TextWithoutFont,
+    /// A live text overlay is bold in a font with no bold face, which `drawtext` thickens with a
+    /// same-colour border: each glyph's border bitmap is blended in turn and they overlap, which
+    /// a compositor that has only their sum cannot reproduce (up to 33 levels of chroma at those pixels).
+    TextBorder,
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
@@ -249,6 +253,9 @@ impl fmt::Display for Unsupported {
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),
+            Self::TextBorder => f.write_str(
+                "a bold text overlay in a font with no bold face, which drawtext thickens with an overlapping border",
+            ),
             Self::Scaler(s) => write!(f, "scaler '{s}'"),
             Self::MatrixUnknown(n) => write!(
                 f,

@@ -147,7 +147,15 @@ image-under-a-frame -t 0.0
 overlay drawtext=
 overlay-keyed alpha='
 overlay-percent \\%
-overlay-quote '\''
+overlay-quote \'\''
+overlay-colon a\: b
+overlay-backslash back\\\\slash
+still-overlay-quote \'\''
+still-overlay-colon a\: b
+still-overlay-backslash back\\\\slash
+preview-overlay-quote \'\''
+preview-overlay-colon a\: b
+preview-overlay-backslash back\\\\slash
 overlay-bold borderw=2
 overlay-box box=1
 overlay-default-font fontfile='/kerf-test/fonts/Geist-Regular.ttf'

@@ -816,8 +816,13 @@ impl RenderPlan {
         if !self.overlays.is_empty() {
             if !caps.text {
                 out.push(Unsupported::Text);
-            } else if self.overlays.iter().any(|o| o.font_file.is_none()) {
-                out.push(Unsupported::TextWithoutFont);
+            } else {
+                if self.overlays.iter().any(|o| o.font_file.is_none()) {
+                    out.push(Unsupported::TextWithoutFont);
+                }
+                if self.overlays.iter().any(|o| o.synthetic_bold) {
+                    out.push(Unsupported::TextBorder);
+                }
             }
         }
         // The compositor implements swscale's default (bicubic) only.
