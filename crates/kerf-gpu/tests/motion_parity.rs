@@ -2229,11 +2229,14 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
 /// off, none more. Everything else an effect does (the tables, the sharpen) is exact, 0 differing.
 const EFFECT: Limits = Limits { y: 1, uv: 1 };
 
-/// A blur, grayscale or invert, or a sharpen of at most 0.5, on a picture the compositor scaled first (or took
-/// through the translucent round trip): the scaler's level (`SCALED`) and the blur's own (`EFFECT`) on a
-/// sample where both fall. A stronger sharpen is not held to a bound: `unsharp` amplifies the scaler's level
-/// by `1 + 2 * amount` at an edge sample (measured 3 at 1.5 after a blur, 7 at 3, 11 at 5), so the plan
-/// refuses it after a scale (`render_plan.rs`, `a_strong_sharpen_is_refused_on_a_picture_scaled_ahead_of_it`).
+/// Two levels: a blur, grayscale or invert on a picture the compositor scaled first (or took through the
+/// translucent round trip), the scaler's level (`SCALED`) and the blur's own (`EFFECT`) on a sample where both
+/// fall; and a blur followed by a sharpen, or a scale by one, within a worst-case error of two. `unsharp` is
+/// exact but amplifies the one-level difference upstream of it by `1 + 2 * amount` at an edge sample (measured
+/// after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16`
+/// rounds up a level more with each further sharpen. So the plan refuses what passes two (one sharpen above 0.5,
+/// or a second one) after a scale or a blur, and nothing past it is held to a bound: see `render_plan.rs`,
+/// `a_sharpen_that_amplifies_a_scale_or_a_blur_past_two_levels_is_refused`.
 const EFFECT_SCALED: Limits = Limits { y: 2, uv: 2 };
 
 /// Two scale stages in cascade, the fit scale and then the zoom: the first stage is a level off the

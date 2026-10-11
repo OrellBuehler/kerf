@@ -599,9 +599,9 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 | 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
 | 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
-| 2 | `EFFECT_SCALED`: a blur, grayscale or invert, or a sharpen after a scale or a blur within a gain of 2, on a scaled or translucent layer. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
+| 2 | `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
-A **sharpen after a scale or a blur has no row: it is refused past a gain of 2.** `unsharp` is exact, but it amplifies the one-level difference upstream (the scaler's, or `gblur`'s SIMD order) to `1 + 2 * amount` levels of luma at an edge sample, and a second sharpen amplifies that again (measured after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5 at 5), and the GPU refuses rather than approximates. A gain of 2, one sharpen of 0.5, is the two levels of a scaled blur.
+A **sharpen after a scale or a blur has no row beyond that: it is refused past a worst-case error of 2.** `unsharp` is exact, but it carries the one-level difference upstream (the scaler's, or `gblur`'s SIMD order) through at worst `1 + 2|amount|` levels of luma at an edge sample (measured after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16` floors, so each further sharpen adds at least a level (measured on 6.1.1: two of 0.2 reach 3, three of 0.1 reach 4), and the GPU refuses rather than approximates. One sharpen of 0.5 is the two levels of a scaled blur. (A grade between a scale and a sharpen amplifies too: `GRADED_SCALED` already accepts two.)
 
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves
@@ -648,7 +648,7 @@ caption styles, positions and edges, boxes, colours, sizes, keyframed and overla
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
 holds 681 rows on FFmpeg 6.1.1 and 641 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
-controls included, 165 the transitions and fades and 145 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
+controls included, 161 the transitions and fades and 143 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
