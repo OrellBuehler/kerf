@@ -15,7 +15,7 @@
 | UI-5 Timeline gestures | ui-5 (on ui-4, pushed) | | ready (PR after #130) | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | ui-7 (on ui-8) | | pushed (awaits ui-8 merge for PR) | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
-| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | in-progress | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | wave 3 |
+| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | review | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | review | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | | in-progress | gpu-media WP4, WP5, WP11 | wave 4 |
@@ -71,7 +71,10 @@
 - GPU-4: still plans carry transition state (fades, travel, tails as `still_fx.rs` draws them) instead of moving the preview to Motion plans; `RenderPlan.tails` / `Unsupported::StillTail` removed. Fades use vf_fade's integer arithmetic; layers with alpha < 255 blend with overlay's FAST_DIV255 in the shader, opaque layers keep the hardware blend. Fades on translucent layers, dip-to-white on alpha planes or beside a black fade, and still picks whose rate rationals disagree are refused.
 - The gpu-3 flake fix (ec41f1c) is not yet merged into gpu-2/gpu-4; it rides in when #129 merges and they are rebased via merge.
 
+- PERF-4: the playhead is quantised to the cut's frame grid (preview shows the export's frame; the old `-ss` landed one source frame late). A scrub window refuses (one-shot still serves) frames with fades/transitions/tails, non-integer source/cut rate ratios, a title's last frame, 360, HDR and missing assets. MCP `preview_timeline` stays a one-shot still. GPU lane on by default but only Windows `d3d11va` qualifies; `KERF_GPU_LANE=off` disables.
+
 ## Needs a real machine
+- PERF-4: the GPU lane (`Resource::Gpu`, MAX_GPU_JOBS=2) and its software fall-back on a real Windows/AMD driver; the GPU-preview prefetch driver against a real surface (cut-stall numbers are debug-build lavapipe).
 - GPU-4: fade/blend integer math bit-identical on real Metal / DX12 / Vulkan and WARP (lavapipe only); dip-to-white 2-level bound measured on x86 swscale only (macOS arm64 NEON unmeasured); a paused frame inside a dissolve in the real GPU preview.
 - GPU-2: the private 0700 temp font dir + ownership check (Linux only exercised); sbix/COLR colour fonts (only CBDT tested: drawtext errors on it in both FFmpegs, 6.1.1 segfaults).
 - GPU-2: default font lives under the user profile on Windows; drawtext opens `fontfile` via FreeType's narrow open, so a non-ASCII profile name may fail every title export.
@@ -110,6 +113,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- PERF-4: a Settings switch for the GPU lane (API exported, no UI); an `hw_decoders()` probe so Linux/macOS qualify for the lane; add `,format=yuv420p` to the one-shot still's `color` base so the still matches export on ffmpeg < 7 (6.1.1 differs by ~14 chroma levels on every cut; moves the still golden family); more threads for multi-layer windows.
 - GPU-4: keep `Compositor::CAPS.dip_white` on (drawn within 2 levels: x86 yuv→rgb24 kernel vs C tables) or off to hold "match exactly" strictly? Draw black fades on translucent layers exactly (fade inside the RGB stage, alpha included) or keep refusing? `MotionFrames` decodes clips sequentially, no prefetch (WP-7 needs parallel cursors).
 - GPU-2 (r3 nits, unfixed): the title handle is not re-measured when Geist finishes loading (stays on the fallback measure until the next render); the atlas position key is full precision, so a keyframed slide-in rasterises once per frame.
 
