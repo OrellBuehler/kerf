@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions` and `dip_white` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -443,6 +443,58 @@ chroma at those pixels). The shipped default font has a real bold, so neither a 
 `FFmpeg` cannot read a colour of (not reachable from `valid_color`) or a rasterisation that fails is `GpuError::Unsupported` for that frame. Over a **full-range** picture on
 9.0 (which draws the text in full range and converts last) the picture is within 2 levels of the control without the text; it is drawn, not refused.
 
+**Fades, dips, dissolves, slides and pushes** (`composite.wgsl`, `roundtrip.wgsl`, `motion.rs`; `GpuCaps::{motion, fades,
+transitions, dip_white}`). The plan hands each layer's `fade` steps as integers (`RenderPlan::fade_ops`: tint, edge and the
+factor `65535 * i / N` the filter multiplies by; `65535` is "does not run", not even a rounding) and the compositor applies **`vf_fade`'s own
+arithmetic** (`kerf_core::fade_luma` / `fade_chroma` / `fade_alpha`, the shader's copies): luma `((Y - bl) * f + (bl << 16) + 32768) >> 16`,
+with the black level `bl` **16 on `yuv420p` and 0 on `yuva420p`** (`RenderPlan::on_alpha_plane`: a rotation, an opacity, a mask, the dissolve the
+clip entered through), chroma `((C - 128) * f + 8421367) >> 16` (the constant is nine short of the obvious one, and a plain `+ 32768`
+is a level off at a few factors), alpha `(A * f + 32768) >> 16`. `fade_arithmetic_is_ffmpegs` checks it against the filter on
+every sample value of every factor of eight rates / starts / lengths, in and out, `yuv420p`, `yuva420p` and `alpha=1` (1566 frames), identical on 6.1.1 and 9.0.2. The fades run in
+`fs_compose`, **after** the rotation and the letterbox matte (they are part of the picture the filter sees) and on the 8-bit picture,
+the clip's own fade-in and fade-out in turn (a dip to black's halves are those). A **dissolve is two ordinary layers**: the outgoing clip on its tail
+(a plain layer, from the handle it borrows) and the incoming one on an alpha ramp, which `overlay` blends as `FAST_DIV255(d * (255 - a) + s * a)`
+(`(x + 128) * 257 >> 16`, measured exact on all three planes for a uniform alpha, both builds). A layer whose alpha is below 255 is
+therefore blended **in integers** (`fs_compose_exact`, over a copy of the region it touches, since a pass cannot read what it
+writes) instead of by the hardware's blend, whose rounding is the device's own (so the same plan would differ from FFmpeg's by a
+different amount on every GPU); an opaque layer keeps the hardware's, which is exactly the source. The translucent layers of `parity.rs` take the
+integer blend too and stayed inside their bounds (44 to 50 dB flat, 3 to 6 levels). A slide or a push is a position (the geometry already
+adds the travel to the overlay's, truncated and rounded to even as `overlay` does) and the outgoing side of a push is a tail
+that travels. **The alpha ramp of a translucent incoming clip comes ahead of the 256/255 scale** (an opacity below 1 leaves
+RGBA, `fade alpha=1` runs on it there): `((a * f + 32768) >> 16) * 256 / 255`, not the ramp of the scaled alpha. **A dip to white** is a filter
+that takes RGB only, so FFmpeg converts `yuv420p -> rgb24 -> yuv420p` around it (in every frame of the clip in an export, in a still while the fade
+runs): the translucent round trip's passes with the RGB fade (`((c - 255) * f + (255 << 16) + 32768) >> 16`, exact against `rgb24`)
+between them, and the one thing here that is **not exact**: `yuv420p -> rgb24` is an x86 kernel whose 13-bit
+coefficients land up to two levels from the C tables the round trip follows (2189 of 6144 random samples differ, none by more than 2), so a dip to white
+is within **two levels in every plane** (test patterns and noise in all three planes, both builds), a per-effect bound recorded
+beside the case, and `caps.dip_white` turns it off. **Where it is refused** (specific reasons, `Unsupported::FadeOnTranslucent` /
+`DipToWhite`): a black or white fade running on a layer below full opacity (`colorchannelmixer` leaves RGBA and `rotate` and
+`fade` run on that, **alpha plane included**: Y 153 levels off the first time it was drawn like a plain fade — the harness found it), and a
+dip to white on an alpha plane (FFmpeg picks another RGB format) or beside a running black fade of the same clip (a YUV filter ahead of the
+conversion). **Export frames** (`PlanMode::Motion`, `caps.motion`) pick source frames with the `fps` filter
+(`Pick::Fps`), which a `FrameCursor` serves; `MotionFrames` (`motion.rs`) is the per-clip bookkeeping: a cursor opened the first
+time a clip is on screen, handed the pick of each later frame in order, dropped when the clip leaves the plan, reopened for a frame earlier than
+the last it answered. A still plan (what the app's preview and `FrameSource` serve) holds the same fades, travel and tails with the still's `-ss` picks, so
+a paused frame inside a transition is drawn like the file shows it — where the FFmpeg *still* used to be the only thing that did.
+
+**`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short
+cut, renders it through `render_with` (the real graph) losslessly, reads **every frame back as `yuv420p` planes** (no colour conversion between: the planes `overlay`
+blended) and draws the same frames from a Motion plan through `MotionFrames`, comparing plane for plane with a stated bound per case
+(`target/parity/motion-report.txt`, the montages `FFmpeg | GPU | diff x8` of the frames worth a look in `target/parity/motion/`, and of any frame over the bound). The sources
+are lossless (testsrc2 with its running frame counter, so a wrong source frame shows; colour bars; a 25 fps clip; a still image; a vertical one for a letterbox; noise in all
+three planes; a smooth gradient over black for the rotated cases). **Measured on 9.0.2 and 6.1.1, identically:** a hard cut, speed 2 / 0.5 / reversed, a
+still image, a 25 fps source in a 30 fps cut, at 24 / 25 / 29.97 / 30 / 60 fps, a picture-in-picture over a graded layer, clip fades in and out (a
+frame long, 0.61 s, longer than the clip, overlapping, graded, speed 2, reversed, a letterbox, a smaller layer over another), dips to black (five rates, a frame
+to two seconds, beside the clips' own fades, over another track), **dissolves** (five rates, covering and partial incoming clip, a frame to a second, up from black, a reversed outgoing clip into a
+sped-up one, then a fade out of the same clip, chained, graded incoming, into and out of a still image, a sped-up outgoing clip, no handle to borrow, over another track),
+all **eight slides and pushes** (covering and partial, five rates, a frame to a second, into a clip with its own fade-in), a title over a dissolve, keyed position (linear, eased, held, bezier) and a keyed rotation, a rotated clip fading and dissolving (on an alpha plane) and the montage and
+talking-head shapes of the coverage archetypes at 960x540 and 9:16 with a Cover crop: **every plane sample equal to the export's wherever the picture is drawn at its own size (max error 0, 0 differing
+samples)**, one level where the compositor scales a layer (the scaler's, `parity.rs`), two where it scales **and** grades one (the grade's contrast scales that level), two in the interior of a rotated layer
+(the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to white at two. A mutation of the chroma constant by nine in 65536 fails the dips at once. The Still-plan side is
+`parity.rs`: `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (the plan holds the frame and the GPU is held strictly to the still, the still to the export), and
+`every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_still` (all eleven kinds, covering and partial, four frames each, and fades over another track, graded and letterboxed), the three refusals above
+in `frames_the_gpu_would_draw_wrong_are_refused`.
+
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves
 nothing about the other) renders each case at several times through `export_still` (a
@@ -482,21 +534,22 @@ the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a 
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
-each of which FFmpeg still renders, and **text** (the `text/` family: the app's title and
+each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated layer and beside a black fade), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
+above), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
-"Text" above). 238
-renders in the table on FFmpeg 6.1.1 (228 compared and 10 asserted refused on the pinned
-9.0.2 the Windows and macOS bundles ship; 76 of them are `text/`) plus the plane-level scaler runs, all passing
-strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
+"Text" above). The table
+holds 555 rows on FFmpeg 6.1.1 and 545 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
+controls included, and 165 the transitions and fades) plus the plane-level scaler runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
 layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
 process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise).
-`tests/coverage.rs` plans the review's four archetypes (no decode, no adapter) and tells how many frames a
-compositor draws before and after text (the captioned 9:16 talking head: 12.7% to 96.0%, 13.3% to 100% with hard cuts; the rest
-is the clip fades). **The readback is bounded**: the
+`tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
+frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
+same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was
+refused whole; the tutorial with a webcam picture-in-picture is 83.3% as a still, and 0% to 16.6% as export frames, where its keyed push-ins, the mask and the blur are what is left). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 
@@ -505,4 +558,5 @@ cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg 
 KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
 KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
 cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
+cargo test -p kerf-gpu --no-default-features --test motion_parity -- --ignored --nocapture   # the export's frames vs the compositor's, plane for plane
 ```
