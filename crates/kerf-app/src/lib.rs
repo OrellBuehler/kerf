@@ -2602,12 +2602,16 @@ fn platform_check(
     state: State<'_, AppState>,
     width: Option<u32>,
     height: Option<u32>,
-) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
-    // The export dialog can resize away from the project frame; when it does it
-    // passes the frame it is actually about to render, so the verdict is about
-    // the file that will exist rather than the one the project defaults to.
+    range: Option<kerf_core::TimeRange>,
+) -> CmdResult<kerf_core::PlatformReport> {
+    // The export dialog can resize away from the project frame and write only
+    // the marked span; when it does it passes the frame and range it is actually
+    // about to render, so the verdict is about the file that will exist rather
+    // than the one the project defaults to. The answer carries the cut it judged
+    // so the dialog can say its frame and length in words.
     let frame = width.zip(height);
-    state.project().platform_check(frame).map_err(|e| e.to_string())
+    let range = range.map(|r| (r.start, r.end));
+    state.project().platform_report(frame, range).map_err(|e| e.to_string())
 }
 
 /// Show a file in the OS file manager. The last step of an export: the render

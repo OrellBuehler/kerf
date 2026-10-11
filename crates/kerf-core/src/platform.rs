@@ -161,7 +161,7 @@ pub struct DeliveryCheck {
 
 /// What a readiness check needs to know about a cut. Resolved by the caller
 /// (`Project::platform_check`) so the check itself stays pure.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CutSummary {
     pub duration: f64,
     /// The frame the cut renders at — the project's delivery format, or the
@@ -174,6 +174,21 @@ pub struct CutSummary {
 }
 
 impl CutSummary {
+    /// What an export of only `range` of this cut writes: the same cut, as long as the span. Clamped
+    /// the way the export clamps it (`effective_range`) — an empty or inverted span is the whole cut.
+    pub fn within(self, range: Option<(f64, f64)>) -> Self {
+        let Some((start, end)) = range else { return self };
+        let (start, end) = (start.max(0.0), end.min(self.duration));
+        if end - start > 1e-9 {
+            Self {
+                duration: end - start,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
     /// The cut's frame as a [`Delivery`]-shaped pair, for comparing aspects.
     fn aspect(&self) -> f64 {
         if self.height == 0 {
@@ -187,6 +202,15 @@ impl CutSummary {
 fn fmt_dur(secs: f64) -> String {
     let s = secs.max(0.0).round() as i64;
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// `Instagram Reels'`, `TikTok's`: the possessive of a platform's name.
+fn possessive(label: &str) -> String {
+    if label.ends_with('s') {
+        format!("{label}'")
+    } else {
+        format!("{label}'s")
+    }
 }
 
 fn ratio_label(w: u32, h: u32) -> String {
@@ -223,9 +247,9 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
                 severity: Severity::Error,
                 kind: IssueKind::Length,
                 message: format!(
-                    "{} is shorter than {}'s {:.0}s minimum.",
+                    "{} is shorter than {} {:.0}s minimum.",
                     fmt_dur(cut.duration),
-                    target.label,
+                    possessive(target.label),
                     min
                 ),
             });
@@ -237,9 +261,9 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
                 severity: Severity::Error,
                 kind: IssueKind::Length,
                 message: format!(
-                    "{} is over {}'s {} limit — trim {} to fit.",
+                    "{} is over {} {} limit — trim {} to fit.",
                     fmt_dur(cut.duration),
-                    target.label,
+                    possessive(target.label),
                     fmt_dur(max),
                     fmt_dur(cut.duration - max)
                 ),
@@ -297,8 +321,12 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
             severity: Severity::Warning,
             kind: IssueKind::Resolution,
             message: format!(
-                "{}×{} is below {}'s {}×{}; the platform will upscale it and it will look soft.",
-                cut.width, cut.height, target.label, target.width, target.height
+                "{}×{} is below {} {}×{}; the platform will upscale it and it will look soft.",
+                cut.width,
+                cut.height,
+                possessive(target.label),
+                target.width,
+                target.height
             ),
         });
     }
@@ -323,6 +351,22 @@ pub fn check(target: &PlatformTarget, cut: &CutSummary) -> DeliveryCheck {
 /// Check a cut against every known target.
 pub fn check_all(cut: &CutSummary) -> Vec<DeliveryCheck> {
     TARGETS.iter().map(|t| check(t, cut)).collect()
+}
+
+/// A cut's readiness for every target, with the cut it was judged on: the frame and length a UI
+/// states in words have to be the ones the checks used, not a second reading of the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlatformReport {
+    pub cut: CutSummary,
+    pub targets: Vec<DeliveryCheck>,
+}
+
+/// Check a cut against every known target and keep the cut beside the answer.
+pub fn report(cut: &CutSummary) -> PlatformReport {
+    PlatformReport {
+        cut: *cut,
+        targets: check_all(cut),
+    }
 }
 
 /// The target a delivery frame is evidently aimed at, if any — used to lead the
@@ -361,6 +405,25 @@ mod tests {
         assert_eq!(c.issues[0].severity, Severity::Error);
         assert!(m.contains("3:00"), "names the limit: {m}");
         assert!(m.contains("0:20"), "names the overshoot: {m}");
+    }
+
+    #[test]
+    fn a_name_ending_in_s_takes_a_bare_apostrophe() {
+        assert_eq!(possessive("YouTube Shorts"), "YouTube Shorts'");
+        assert_eq!(possessive("Instagram Reels"), "Instagram Reels'");
+        assert_eq!(possessive("TikTok"), "TikTok's");
+        let c = check(target("shorts").unwrap(), &vertical_cut(200.0));
+        assert!(
+            c.issues[0].message.contains("YouTube Shorts' 3:00 limit"),
+            "{}",
+            c.issues[0].message
+        );
+        let c = check(target("reels").unwrap(), &vertical_cut(2.0));
+        assert!(
+            c.issues[0].message.contains("Instagram Reels' 3s minimum"),
+            "{}",
+            c.issues[0].message
+        );
     }
 
     #[test]
@@ -449,6 +512,39 @@ mod tests {
             ..vertical_cut(0.0)
         };
         assert!(check_all(&cut).iter().all(|c| !c.ok));
+    }
+
+    #[test]
+    fn a_range_is_judged_at_its_own_length() {
+        // A 4 min timeline with a 20 s span marked: the Reel is 20 s, not 4 min.
+        let cut = vertical_cut(4.0 * 60.0);
+        let span = cut.within(Some((10.0, 30.0)));
+        assert_eq!(span.duration, 20.0);
+        assert_eq!((span.width, span.height), (cut.width, cut.height));
+        assert!(check(target("reels").unwrap(), &span).issues.is_empty());
+        assert!(!check(target("reels").unwrap(), &cut).issues.is_empty());
+    }
+
+    #[test]
+    fn a_range_is_clamped_to_the_cut_like_the_export_clamps_it() {
+        let cut = vertical_cut(60.0);
+        assert_eq!(cut.within(Some((-5.0, 20.0))).duration, 20.0);
+        assert_eq!(cut.within(Some((40.0, 500.0))).duration, 20.0);
+        // Empty, inverted or wholly past the end: the export falls back to the whole cut.
+        assert_eq!(cut.within(Some((10.0, 10.0))).duration, 60.0);
+        assert_eq!(cut.within(Some((30.0, 10.0))).duration, 60.0);
+        assert_eq!(cut.within(Some((90.0, 120.0))).duration, 60.0);
+        assert_eq!(cut.within(None).duration, 60.0);
+    }
+
+    #[test]
+    fn the_report_carries_the_cut_it_judged() {
+        let r = report(&vertical_cut(45.0));
+        assert_eq!((r.cut.width, r.cut.height, r.cut.duration), (1080, 1920, 45.0));
+        assert_eq!(r.targets.len(), TARGETS.len());
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["cut"]["width"], 1080);
+        assert_eq!(json["targets"][0]["target"], "reels");
     }
 
     #[test]

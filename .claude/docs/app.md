@@ -79,7 +79,7 @@ order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it),
 delivery (`export_cover` → a cover image at the full delivery frame,
-`platform_targets` / `platform_check` → the readiness verdict, `reveal_path` →
+`platform_targets` / `platform_check` (frame, range → a `PlatformReport`: the checks and the cut they judged) → the platform check, `reveal_path` →
 show a rendered file in the OS file manager, opening its *containing folder*
 rather than the file, since "show me where it went" is not a request to launch a
 player), the

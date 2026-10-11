@@ -14,10 +14,16 @@
   ("0:20 over", "cutting 1:00 would keep it in the feed"); aspect is compared as
   a **ratio**, so 720x1280 reads as the right shape and merely soft. The numbers
   are other companies' product decisions, verified 2026-08-25 and **advisory** —
-  nothing here ever blocks an export. `Project::platform_check(frame)` resolves
+  nothing here ever blocks an export. `Project::platform_report(frame, range)` resolves
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
-  a render resizes away from the project frame.
+  a render resizes away from the project frame, and an optional `range` that
+  `CutSummary::within` clamps the way the export clamps `ExportOptions.range` (an
+  empty or inverted span is the whole cut), so a Reel cut from the middle of a long
+  timeline is judged at the Reel's length. It answers a `PlatformReport`: every
+  target's check *and* the `CutSummary` they judged, so a UI can state the file's
+  frame and length without reading the project a second time. Messages say
+  `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
   canvas (the same `export_format` the still uses, through `render_geometry`) plus the
