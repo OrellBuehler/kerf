@@ -144,7 +144,8 @@
 //!   (`tests/text.rs` holds that blend to `drawtext` sample for sample, the `text/` cases and
 //!   `the_text_pass_is_the_reference_blend_plane_by_plane` hold the shader to it). Text is edge
 //!   everywhere, so a text case is judged against the same picture *without* the text
-//!   ([`TEXT_EXTRA`]), not by the band. What the compositor cannot reproduce is refused
+//!   (`check_text`: no allowance over it, but for three measured cases that say why), not by
+//!   the band. What the compositor cannot reproduce is refused
 //!   (`text_the_gpu_cannot_reproduce_is_refused`): a synthetic-bold border, text under 12 px
 //!   (glyphs that overlap are blended once as a mask and in turn by `drawtext`), a face the
 //!   plan cannot name.
@@ -2893,19 +2894,26 @@ fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
 /// Text is edge everywhere — a glyph is a few pixels wide, and the edge band (two pixels around every
 /// strong step of the reference) would excuse every pixel of it — so a text case is not judged by
 /// the band. It is held to **the same picture without the text**: the whole-image error may be at
-/// most [`TEXT_EXTRA`] levels more than it is for that control (which the suite's own bounds judge),
-/// so whatever the composite and the YUV -> RGB conversion cost everywhere (up to 3 levels on the
-/// test picture, 5 under a letterbox or a translucent layer) is not charged to the text. Measured:
-/// every case adds at most 1 level but the 12 px one (the smallest the plan draws), which adds 2 (a level
-/// or two of chroma at the pixels glyph bitmaps share, times the 1.77 of the blue channel).
-/// A control with no colour in it (a black frame) has none of the conversion's bias (up to
-/// [`CONVERSION_BIAS`] levels on any colour: swscale truncates, the shader rounds) to show, so that is
-/// its floor. A frame with **no layer** is blended in RGB, with no conversion at all, and is
-/// held to the control exactly (`tests/text.rs` holds the blend to FFmpeg's `drawtext` sample for sample).
-const TEXT_EXTRA: i32 = 2;
+/// most that of the control (which the suite's own bounds judge), so whatever the composite and the
+/// YUV -> RGB conversion cost everywhere is not charged to the text. A control with no colour in it
+/// has none of the conversion's bias (up to [`CONVERSION_BIAS`] levels on any colour: swscale
+/// truncates, the shader rounds) to show, so that is its floor. A frame with **no layer** is blended in
+/// RGB, with no conversion at all, and is held to the control exactly (`tests/text.rs` holds the blend
+/// to FFmpeg's `drawtext` sample for sample).
+///
+/// **The allowance over the control is nothing**, and a case that needs some says how much and why
+/// ([`check_text_extra`]); measured on both FFmpegs, three do: two pixels of the lower third's box one
+/// level over inside its fade-in, the 12 px text (two levels), and the full-range pictures on 9.0.
 const CONVERSION_BIAS: i32 = 3;
 
 fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    check_text_extra(case, tl, assets, times, 0, "");
+}
+
+/// [`check_text`] with `extra` levels over the control, for the reason `why` (which a case with no
+/// allowance does not need).
+fn check_text_extra(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], extra: i32, why: &str) {
+    assert!(extra == 0 || !why.is_empty(), "{case}: an allowance says why");
     let mut bare = tl.clone();
     bare.overlays.clear();
     for &t in times {
@@ -2921,7 +2929,7 @@ fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
                 if in_rgb {
                     *worst
                 } else {
-                    (*worst).max(CONVERSION_BIAS) + TEXT_EXTRA
+                    (*worst).max(CONVERSION_BIAS) + extra
                 }
             }),
             ..STRICT
@@ -2992,7 +3000,21 @@ fn the_apps_title_and_caption_styles_are_drawn_as_ffmpeg_draws_them() {
         ),
     ];
     for (name, o, times) in styles {
-        check_text(name, &with_text(timeline(base(), None), vec![o.clone()]), one, times);
+        let tl = with_text(timeline(base(), None), vec![o.clone()]);
+        if name == "text/lower-third" {
+            check_text_extra(
+                name,
+                &tl,
+                one,
+                &times[..1],
+                1,
+                "inside the fade-in the box's alpha is a sampled number here and drawtext's own float \
+                 expression there: two pixels of it one level over the control, at 0.1 s",
+            );
+            check_text(name, &tl, one, &times[1..]);
+        } else {
+            check_text(name, &tl, one, times);
+        }
         // The same styles in the 9:16 frame the captions are made for (the font is a fraction of the
         // frame's height, so the text is a different size in pixels).
         let tall = with_text(timeline(base(), Some(Delivery::new(360, 640, Fit::Cover))), vec![o]);
@@ -3012,7 +3034,16 @@ fn text_positions_sizes_colours_and_boxes_are_drawn_as_ffmpeg_draws_them() {
     for size in [0.034, 0.06, 0.12, 0.2] {
         let mut o = overlay("Hello, World", 0.0, 2.0);
         (o.size, o.pos_x, o.pos_y) = (size, 0.4137, 0.5821);
-        check_text(&format!("text/size-{size}"), &tl(vec![o]), one, &[0.5]);
+        let extra = if size < 0.04 { 2 } else { 0 };
+        check_text_extra(
+            &format!("text/size-{size}"),
+            &tl(vec![o]),
+            one,
+            &[0.5],
+            extra,
+            "12 px is the smallest text the plan draws: its glyph bitmaps share the most pixels, a level or two of \
+             chroma there, times the 1.77 of the blue channel",
+        );
     }
     // At the frame's edges, half off it, and wholly outside (drawn as nothing).
     for (name, pos) in [
@@ -3101,7 +3132,15 @@ fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
             timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None),
             vec![title("Over a full-range picture")],
         );
-        check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
+        let negotiates = matches!(policy(), CompositeColorPolicy::BottomLayerTag);
+        check_text_extra(
+            &format!("text/over-{name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.5],
+            if negotiates { 2 } else { 0 },
+            "9.0 draws the text in full range and converts the range last, which the control (no text) does not",
+        );
     }
     // Over a layer whose source has no frame there (a clip longer than its footage): nothing is drawn
     // for it, but the overlay chain is in the graph, so the text is blended as YUV, not as the RGB of a
@@ -3190,6 +3229,21 @@ fn text_on_a_frame_with_no_layer_is_drawn_in_rgb_as_ffmpeg_draws_it() {
         std::slice::from_ref(&m.testsrc),
         &[1.4, 2.2],
     );
+    // There are no YUV planes to hand back for such a frame: its text would be missing from them.
+    let plan = RenderPlan::at(
+        &tl(overlay("Title card", 1.2, 2.0)),
+        std::slice::from_ref(&m.testsrc),
+        &ExportOptions::default(),
+        1.5,
+        policy(),
+    )
+    .expect("plan");
+    assert!(plan.layers.is_empty() && !plan.overlays.is_empty());
+    let size = plan.size(plan.canvas.width);
+    let err = compositor()
+        .composite_yuv(&plan, &[], size)
+        .expect_err("no YUV for text in RGB");
+    assert!(matches!(err, kerf_gpu::GpuError::Unsupported(_)), "{err:?}");
 }
 
 #[test]
@@ -3255,7 +3309,17 @@ fn text_in_an_installed_font_is_drawn_as_ffmpeg_draws_it() {
         check_text(&format!("text/font-{}", family.replace(' ', "-")), &tl, one, &[0.5]);
         drawn += 1;
     }
-    eprintln!("installed families drawn: {drawn}");
+    // On CI the runners have at least one of these; a machine without any says so rather than
+    // passing as if the case had run.
+    assert!(
+        drawn > 0 || std::env::var_os("CI").is_none(),
+        "CI has none of the listed system fonts installed, so no installed-font case ran"
+    );
+    if drawn == 0 {
+        eprintln!("SKIPPED the installed-font cases: none of the listed families is installed here");
+    } else {
+        eprintln!("installed families drawn: {drawn}");
+    }
     let mut o = overlay("Not installed", 0.0, 2.0);
     (o.font, o.size, o.bold) = (Some("No Such Family 123".into()), 0.08, true);
     let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
@@ -3379,6 +3443,42 @@ fn text_the_gpu_cannot_reproduce_is_refused() {
     let why = reasons(&plan, size).join("; ");
     assert!(why.contains("no font file"), "{why}");
     eprintln!("refused/text: border, small text, no font file");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_in_a_colour_bitmap_font_is_not_drawn_in_colour_by_anyone() {
+    // `drawtext` loads glyphs without FT_LOAD_COLOR and has no BGRA path: a colour bitmap font (CBDT,
+    // sbix) is a hard error in FFmpeg 6.1.1 (which then segfaults) and 9.0.2 alike, at the one
+    // size the font's strike has and at every other ("Could not set font size"). So there is no colour
+    // glyph for the compositor to draw as a silhouette; its rasteriser runs the same `drawtext` and the
+    // frame is an error, never a picture with the wrong glyphs. (A COLR font is drawn as its monochrome
+    // outlines by `drawtext` itself, which the compositor then blends exactly like any other face.)
+    let Some((path, _)) = kerf_core::fonts::resolve_font_file("Noto Color Emoji", false) else {
+        eprintln!("SKIPPED the colour-font case: no colour bitmap font is installed here");
+        return;
+    };
+    let m = media();
+    let assets = std::slice::from_ref(&m.testsrc);
+    for size in [0.3028, 0.1] {
+        let mut o = overlay("\u{1f3ac}", 0.0, 2.0);
+        (o.font, o.size) = (Some("Noto Color Emoji".into()), size);
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        let png = std::env::temp_dir().join(format!("kerf-colour-font-{}-{size}.png", std::process::id()));
+        let still = export_still(&tl, assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0);
+        let _ = std::fs::remove_file(&png);
+        assert!(
+            still.is_err(),
+            "{}: FFmpeg drew a colour bitmap font after all",
+            path.display()
+        );
+        let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        if reasons(&plan, size).is_empty() {
+            let drawn = compositor().render_plan(&plan, size);
+            assert!(drawn.is_err(), "the compositor drew a frame FFmpeg cannot");
+        }
+    }
 }
 
 // ---- the scaler, plane by plane --------------------------------------------------
@@ -3675,7 +3775,8 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // never recorded its pixel format), asserted refused rather than compared. Both
 // runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
 // The `text/` rows are the cases with text, judged against the same picture without it
-// (whole-image max at most the control's, floor 3, plus 2); the `(no text)` controls are in the
+// (whole-image max at most the control's, floor 3; the lower third at 0.1 s +1, the 12 px text and the
+// full-range pictures on 9.0 +2, each with its reason at the case); the `(no text)` controls are in the
 // report, not here. The `blank-*` rows are frames with no layer (drawn in RGB: exact).
 // The smallest flat share of any non-busy case is 56.9% (`grid/yuv420p-cover-odd-y-then-
 // scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
