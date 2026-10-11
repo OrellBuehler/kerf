@@ -993,13 +993,15 @@ impl RenderPlan {
     /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`
     /// rewriting the alpha plane, ahead of `colorchannelmixer` (the RGB round trip an opacity below 1
     /// takes, which is arithmetic on that alpha) and `rotate` (which turns the alpha plane with
-    /// the picture, a partly transparent edge included).
+    /// the picture, a partly transparent edge included). The opacity judged is the sampled one, the
+    /// frame's own: a clip whose keys hold 1 here has no alpha to round-trip (a keyed opacity as such
+    /// is `KeyedOpacity`'s).
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         if rotated {
             Some("on a rotated layer")
-        } else if layer.transform.opacity < 1.0 || layer.animated.is_some_and(|a| a.opacity) {
+        } else if layer.transform.opacity < 1.0 {
             Some("on a layer below full opacity")
         } else {
             None
@@ -2194,6 +2196,32 @@ mod tests {
             c.mask = Some(mask);
             c.transform.opacity = 0.5;
         });
+        assert!(
+            matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("opacity")),
+            "{why:?}"
+        );
+        // The opacity that counts is the sampled one: a clip whose keys hold 1 at this time is drawn.
+        let faded_by_keys = |t: f64| {
+            let key = |time: f64, opacity: f64| Keyframe {
+                time,
+                scale: 1.0,
+                pos_x: 0.0,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity,
+                easing: Default::default(),
+            };
+            let plan = fading_plan(
+                |c| {
+                    c.mask = Some(mask);
+                    c.keyframes = vec![key(0.0, 1.0), key(1.0, 1.0), key(4.0, 0.5)];
+                },
+                t,
+            );
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        assert!(faded_by_keys(0.5).is_empty(), "{:?}", faded_by_keys(0.5));
+        let why = faded_by_keys(3.0);
         assert!(
             matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("opacity")),
             "{why:?}"
