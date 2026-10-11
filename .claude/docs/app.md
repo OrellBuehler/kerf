@@ -72,10 +72,20 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
-`start_playback` / `stop_playback` — streamed composited frames over a
-`tauri::ipc::Channel`, cancelled **by caller-supplied id** rather than a generation
-counter, because start and stop are separate async calls that can arrive out of
-order and a late stop must not kill the stream that replaced it —
+`start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
+composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
+the frame's timeline time as a little-endian `f64`, then the JPEG undecoded; the page parses it with
+`frame-transport.ts`, and both ends hold the same fixed vector in a test) — not base64 in JSON: a quarter
+fewer bytes through the channel and no base64 / JSON at this end. It is not a faster webview decode (headless
+Chromium measured none, `frontend.md`): the page builds the data URL itself, for the frames it shows. Tauri 2.12
+sends a raw payload over 1 KiB through its `fetch` channel command and a smaller one
+inline; the page receives an `ArrayBuffer` either way, in order. `fps` / `max_width` left out mean the
+cut's own rate and the default width (`kerf_core::playback_params`); the preview always states the width and
+the rate only when restarting a stream that could not keep up. The "playback stream ended" log line carries `fps`,
+`max_width`, `late_frames` (more than two frame intervals behind the schedule) and `worst_late_ms`,
+the numbers to read from a user's log when playback is reported choppy. Cancelled **by caller-supplied
+id** rather than a generation counter, because start and stop are separate async calls that can arrive
+out of order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it),
 delivery (`export_cover` → a cover image at the full delivery frame,
@@ -191,7 +201,8 @@ FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedi
 measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
-is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
+is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
+overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. The device, compositor, `FrameSource` and presenter are built lazily by
 the first frame that wants them and dropped together (`Backend`); a build failure is
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
@@ -265,8 +276,8 @@ non-Xlib handle, which leaves the JPEG with that reason in the status). A child 
 frame that needs a title box, the trim monitor or safe-area guides to the JPEG, and so does
 one with a dialog, a menu or a drag ghost over the frame (`covered`: a 3x3
 `elementFromPoint` grid on the frame, every 150 ms and after each click or key — the
-Settings dialog opened *under* the picture before this existed); the in-frame badge,
-resolution and timecode are under it too (the transport bar has the timecode). **macOS has
+Settings dialog opened *under* the picture before this existed); the in-frame HUD
+(the name and `resolution · fps` chips, on a scrim) is under it too; it no longer prints a timecode, which is the transport bar's. **macOS has
 no technique in this build**: a surface under the webview needs a transparent window, which
 Tauri gates behind `macos-private-api` (a private WKWebView key, and a feature that changes
 every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces the attempt).

@@ -217,7 +217,7 @@ pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
 }
 
 /// Why a child run did not produce output.
-enum RunError {
+pub(crate) enum RunError {
     /// It wrote more than the cap allows.
     Overflow,
     Failed(String),
@@ -260,7 +260,7 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
 
 /// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -342,7 +342,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
     let frame_len = yuv420p_len(w, h).ok_or_else(|| GpuError::Unsupported(format!("{path}: a {w}x{h} picture")))?;
     let run = |alpha: bool, cap: usize| {
         let mut args = decode_args(layer, alpha);
-        kerf_core::limit_ffmpeg_args(&mut args, share);
+        kerf_core::limit_frame_args(&mut args, share);
         run_ffmpeg(&args, cap).map_err(|e| match e {
             RunError::Overflow => GpuError::Unsupported(format!(
                 "{path}: the decode is larger than the probed {w}x{h} (a display rotation the probe missed?)"

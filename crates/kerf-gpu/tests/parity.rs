@@ -140,6 +140,15 @@
 //!   GPU does not copy them (`a_rotated_neutral_layer_has_no_colour_fringe`).
 //! * **swscale's YUV -> RGB** truncates, a mean bias of up to a level (the flat
 //!   mean error column in the report); the shader rounds.
+//! * **Text** is FFmpeg's own `drawtext` raster blended with `drawtext`'s own arithmetic
+//!   (`tests/text.rs` holds that blend to `drawtext` sample for sample, the `text/` cases and
+//!   `the_text_pass_is_the_reference_blend_plane_by_plane` hold the shader to it). Text is edge
+//!   everywhere, so a text case is judged against the same picture *without* the text
+//!   (`check_text`: no allowance over it, but for three measured cases that say why), not by
+//!   the band. What the compositor cannot reproduce is refused
+//!   (`text_the_gpu_cannot_reproduce_is_refused`): a synthetic-bold border, text under 12 px
+//!   (glyphs that overlap are blended once as a mask and in turn by `drawtext`), a face the
+//!   plan cannot name.
 //! * **A 10-bit source that is also scaled**: FFmpeg's `scale` converts and scales
 //!   in one pass (with ordered dither), the GPU path decodes to 8 bits first.
 //!   Measured unscaled only (`source/10-bit`).
@@ -321,6 +330,15 @@ fn with_policy<T>(forced: CompositeColorPolicy, f: impl FnOnce() -> T) -> T {
     let out = f();
     FORCED_POLICY.with(|p| p.set(before));
     out
+}
+
+/// Why the compositor would refuse `plan` at `size`: what *it* says it draws (`Compositor::caps`),
+/// not the plan's size-free A0 answer, which refuses every text overlay.
+fn reasons(plan: &RenderPlan, size: (u32, u32)) -> Vec<String> {
+    plan.reasons(&compositor().caps(), size)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn target_dir() -> PathBuf {
@@ -834,7 +852,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
 }
 
 /// [`check`] for a render with options (the frame rate the plan counts frames in, say).
-fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits, opts: &ExportOptions) {
+fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits, opts: &ExportOptions) -> Vec<i32> {
     let out_dir = target_dir().join("parity");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -844,10 +862,11 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let mut failures = Vec::new();
+    let mut maxes = Vec::new();
     for &t in times {
         let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
-        let why = plan.unsupported_reasons_at(size);
+        let why = reasons(&plan, size);
         assert!(
             why.is_empty(),
             "{case} @ {t}: the plan says the GPU cannot draw this at {size:?} (canvas {}x{}): {why:?}",
@@ -887,6 +906,7 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         let gpu_rgb = rgba_to_rgb(&frame.data);
 
         let (m, band) = compare(&reference, &gpu_rgb, w, h, limits.edge_step);
+        maxes.push(m.max_all);
         let line = format!(
             "{case:<28} t={t:<7} {w}x{h} layers={} flat: PSNR {:>5.1} dB  max {:>2}  mean {:.2} | all: PSNR {:>5.1} dB  max {:>3} | edge band {:>4.1}%  (decode {:.0} ms, composite {:.0} ms)",
             plan.layers.len(),
@@ -950,9 +970,10 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         for f in &failures {
             eprintln!("WOULD FAIL: {f}");
         }
-        return;
+        return maxes;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    maxes
 }
 
 fn write_report() {
@@ -1041,6 +1062,25 @@ fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give()
             vec![1.0, 1.4, 1.7],
         ),
     ];
+    let mut captioned = vec![overlay("A caption, with a box: 50%", 0.0, 2.0), overlay("Title", 0.5, 1.5)];
+    (captioned[0].size, captioned[0].pos_y, captioned[0].bg) = (0.05, 0.88, Some("black@0.5".into()));
+    (captioned[1].size, captioned[1].bold, captioned[1].color) = (0.1, true, "yellow@0.9".into());
+    let cases = {
+        let mut cases = cases.to_vec();
+        cases.push((
+            "text over a transform",
+            with_text(
+                timeline(
+                    vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+                    None,
+                ),
+                captioned,
+            ),
+            vec![m.gradient.clone(), m.testsrc.clone()],
+            vec![0.25, 1.0],
+        ));
+        cases
+    };
     let compositor = compositor();
     let source = kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default());
     assert!(source.runs_enabled(), "the run path is off on this ffmpeg");
@@ -1876,13 +1916,13 @@ fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Re
     let _ = std::fs::remove_file(&png);
     match expect {
         Refusal::Plan(reason) => {
-            let reasons = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            let reasons = reasons(&plan, plan.size(u32::MAX));
             assert!(!reasons.is_empty(), "{case}: the plan should refuse");
             let reasons = reasons.join("; ");
             assert!(reasons.contains(reason), "{case}: {reasons:?} does not say {reason:?}");
         }
         Refusal::Render(reason) => {
-            let why = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            let why = reasons(&plan, plan.size(u32::MAX));
             assert!(why.is_empty(), "{case}: {why:?}");
             let err = compositor()
                 .render_plan(&plan, plan.size(u32::MAX))
@@ -2018,21 +2058,19 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
 /// through `kind` over `secs`, the incoming clip `scale` of the frame (1 covers it, 0.5 leaves a
 /// border).
 ///
-/// What FFmpeg's still draws is the frame each *clip's own span* contributes: no fades, and no
-/// clip past its end. What the **export** draws is what plays, and a transition differs from the
-/// still in more places than where it is visibly mid-way: the outgoing clip's `enable` window
-/// runs on after the ramp (or the travel) is over, and it is drawn around an incoming clip that
-/// does not cover it. So the contract tested here is the one that matters — for every frame
-/// listed, either the plan refuses it, or the still it draws like is the export's frame (and the
-/// GPU matches that still strictly) — plus the expectations written out per frame: before the
-/// transition and after it frames are drawn, inside it (and on the frame after the ramp where
-/// only the tail is left) they are refused, and the second half of a dip, which has neither a
-/// tail nor a fade left, is drawn. Both FFmpegs.
+/// FFmpeg's still draws a frame inside a transition as the export does (the outgoing clip on its
+/// tail under the incoming one's ramp, the dips, the slide and push travel), and the compositor
+/// does not: a *still* plan has no tail layer and no fade, so a plan is refused wherever a fade
+/// is changing the picture, a travel moves a clip or a tail is open, and the frame goes to
+/// FFmpeg. So the contract tested here is that for every frame listed the still it draws like
+/// is the export's frame, and that the plan refuses exactly the frames expected — before the
+/// transition and after it frames are drawn (and the GPU matches that still strictly), inside it
+/// (and on the frame after the ramp where only the tail is left) they are refused, and the second
+/// half of a dip, which has neither a tail nor a fade left, is drawn. Both FFmpegs.
 ///
 /// A dissolve of 0.61 s is chosen so that a frame with *only* the tail left exists at 30 fps:
-/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. (A
-/// slide or a push cannot part from the still there: its travel ends when its window does, and
-/// an equal-rate outgoing clip has no frame at the very end; those frames are refused anyway.)
+/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. The
+/// still used to part from the export on that frame (a tail it did not draw); it draws it now.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
@@ -2094,7 +2132,6 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
             None,
         ),
     ];
-    let mut parted = 0;
     for (name, kind, secs, frames, tail_only) in cases {
         let assets = [m.bars.clone(), m.testsrc.clone()];
         for (cover, scale) in [("covering", 1.0), ("partial", 0.5)] {
@@ -2120,7 +2157,7 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                 let size = plan.size(u32::MAX);
                 let (w, h) = (size.0 as usize, size.1 as usize);
                 assert_eq!(plan.frame, k as i64);
-                let why = plan.unsupported_reasons_at(size);
+                let why = reasons(&plan, size);
                 assert_eq!(!why.is_empty(), refused, "{case}: frame {k}: {why:?}");
                 // The still the plan stands for, against the frame that plays.
                 let png = scratch.join(format!("transition-{name}-{cover}-{k}.png"));
@@ -2134,35 +2171,25 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                     if refused { "refused" } else { "drawn  " },
                     apart.psnr_all
                 );
+                assert!(
+                    apart.psnr_all >= 35.0,
+                    "{case}: frame {k}: the FFmpeg still draws the transition differently from the export ({:.1} dB)",
+                    apart.psnr_all
+                );
                 if refused {
-                    // Only the tail is left on this frame; a border around the incoming clip shows it.
+                    // Only the tail is left on this frame: the plan says so, and the still draws it.
                     if scale < 1.0 && tail_only == Some(k) {
-                        assert!(
-                            apart.psnr_all < 25.0,
-                            "{case}: frame {k} is refused for a tail the export draws, yet the still agrees ({:.1} dB)",
-                            apart.psnr_all
-                        );
                         assert!(
                             why.iter().any(|r| r.contains("past its end")) && !why.iter().any(|r| r.contains("inside")),
                             "{case}: frame {k}: {why:?}"
                         );
-                        parted += 1;
                     }
                 } else {
-                    assert!(
-                        apart.psnr_all >= 35.0,
-                        "{case}: frame {k} is drawn like the still, but the export draws it differently ({:.1} dB)",
-                        apart.psnr_all
-                    );
                     check_with(&case, &tl, &assets, &[t], STRICT, &opts);
                 }
             }
         }
     }
-    assert_eq!(
-        parted, 1,
-        "the dissolve parts from the export on the frame only its tail is left on"
-    );
 }
 
 #[test]
@@ -2862,6 +2889,601 @@ fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
     check_refused("old-asset/enlarged", &tl, assets, 0.5, Refusal::Plan("not recorded"));
 }
 
+// ---- text ---------------------------------------------------------------------
+
+/// Text is edge everywhere — a glyph is a few pixels wide, and the edge band (two pixels around every
+/// strong step of the reference) would excuse every pixel of it — so a text case is not judged by
+/// the band. It is held to **the same picture without the text**: the whole-image error may be at
+/// most that of the control (which the suite's own bounds judge), so whatever the composite and the
+/// YUV -> RGB conversion cost everywhere is not charged to the text. A control with no colour in it
+/// has none of the conversion's bias (up to [`CONVERSION_BIAS`] levels on any colour: swscale
+/// truncates, the shader rounds) to show, so that is its floor. A frame with **no layer** is blended in
+/// RGB, with no conversion at all, and is held to the control exactly (`tests/text.rs` holds the blend
+/// to FFmpeg's `drawtext` sample for sample).
+///
+/// **The allowance over the control is nothing**, and a case that needs some says how much and why
+/// ([`check_text_extra`]); measured on both FFmpegs, three do: two glyph-edge pixels of the lower third
+/// one level over at 0.1 s (YUV -> RGB error near the gamut edge), the 12 px text (two levels), and the
+/// full-range pictures on 9.0 (a known model difference).
+const CONVERSION_BIAS: i32 = 3;
+
+fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    check_text_extra(case, tl, assets, times, 0, "");
+}
+
+/// [`check_text`] with `extra` levels over the control, for the reason `why` (which a case with no
+/// allowance does not need).
+fn check_text_extra(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], extra: i32, why: &str) {
+    assert!(extra == 0 || !why.is_empty(), "{case}: an allowance says why");
+    let mut bare = tl.clone();
+    bare.overlays.clear();
+    for &t in times {
+        let opts = ExportOptions::default();
+        let control = check_with(&format!("{case} (no text)"), &bare, assets, &[t], STRICT, &opts);
+        let in_rgb = RenderPlan::at(tl, assets, &opts, t, policy())
+            .expect("plan")
+            .layers
+            .is_empty();
+        let limits = Limits {
+            flat_share: 0.0,
+            max_all: control.first().map(|worst| {
+                if in_rgb {
+                    *worst
+                } else {
+                    (*worst).max(CONVERSION_BIAS) + extra
+                }
+            }),
+            ..STRICT
+        };
+        check_with(case, tl, assets, &[t], limits, &opts);
+    }
+}
+
+fn overlay(text: &str, start: f64, end: f64) -> kerf_core::TextOverlay {
+    kerf_core::TextOverlay::new(text, start, end)
+}
+
+fn with_text(mut tl: Timeline, overlays: Vec<kerf_core::TextOverlay>) -> Timeline {
+    tl.overlays = overlays;
+    tl
+}
+
+/// An overlay in one of the app's own looks (`style-presets.ts`, `CaptionStyle`): position, size,
+/// colour, box and weight, with the opacity fade the preset writes as keyframes.
+fn preset(text: &str, (x, y): (f64, f64), size: f64, bold: bool, bg: Option<&str>, fade: f64) -> kerf_core::TextOverlay {
+    let mut o = overlay(text, 0.0, 2.0);
+    (o.pos_x, o.pos_y, o.size, o.bold, o.bg) = (x, y, size, bold, bg.map(String::from));
+    if fade > 0.0 {
+        let key = |time, opacity| kerf_core::TextKeyframe {
+            time,
+            pos_x: x,
+            pos_y: y,
+            opacity,
+        };
+        o.keyframes = vec![key(0.0, 0.0), key(fade, 1.0), key(2.0 - fade, 1.0), key(2.0, 0.0)];
+    }
+    o
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_apps_title_and_caption_styles_are_drawn_as_ffmpeg_draws_them() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]];
+    // Title / Lower third / Caption (the presets), both caption looks (`Lines` and `WordPunch`, which
+    // is bold in the default font's own bold face), each at times through its fade.
+    let styles: [(&str, kerf_core::TextOverlay, &[f64]); 5] = [
+        (
+            "text/title",
+            preset("Title", (0.5, 0.4), 0.085, true, None, 0.5),
+            &[0.0, 0.25, 0.5, 1.0, 1.7, 1.99],
+        ),
+        (
+            "text/lower-third",
+            preset("Name \u{2014} Role", (0.24, 0.86), 0.042, true, Some("black@0.55"), 0.35),
+            &[0.1, 0.35, 1.0, 1.8],
+        ),
+        (
+            "text/caption",
+            preset("Caption", (0.5, 0.88), 0.05, false, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+        (
+            "text/captions-lines",
+            preset("A few words held", (0.5, 0.88), 0.05, false, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+        (
+            "text/captions-word-punch",
+            preset("WORD", (0.5, 0.72), 0.11, true, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+    ];
+    for (name, o, times) in styles {
+        let tl = with_text(timeline(base(), None), vec![o.clone()]);
+        if name == "text/lower-third" {
+            check_text_extra(
+                name,
+                &tl,
+                one,
+                &times[..1],
+                1,
+                "two glyph-edge pixels of low coverage over saturated green are one level over the control at 0.1 s: \
+                 the YUV -> RGB conversion's error near the gamut edge, not the blend (`tests/text.rs` holds \
+                 the blend's arithmetic to drawtext's, sample for sample)",
+            );
+            check_text(name, &tl, one, &times[1..]);
+        } else {
+            check_text(name, &tl, one, times);
+        }
+        // The same styles in the 9:16 frame the captions are made for (the font is a fraction of the
+        // frame's height, so the text is a different size in pixels).
+        let tall = with_text(timeline(base(), Some(Delivery::new(360, 640, Fit::Cover))), vec![o]);
+        check_text(&format!("{name}-9x16"), &tall, one, &times[..1]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_positions_sizes_colours_and_boxes_are_drawn_as_ffmpeg_draws_them() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let tl =
+        |overlays: Vec<kerf_core::TextOverlay>| with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), overlays);
+    // Sizes from 12 px (the smallest the plan lets through) to a fifth of the frame, at fractional positions
+    // (quarter-pixel glyph phases).
+    for size in [0.034, 0.06, 0.12, 0.2] {
+        let mut o = overlay("Hello, World", 0.0, 2.0);
+        (o.size, o.pos_x, o.pos_y) = (size, 0.4137, 0.5821);
+        let extra = if size < 0.04 { 2 } else { 0 };
+        check_text_extra(
+            &format!("text/size-{size}"),
+            &tl(vec![o]),
+            one,
+            &[0.5],
+            extra,
+            "12 px is the smallest text the plan draws: its glyph bitmaps share the most pixels, a level or two of \
+             chroma there, times the 1.77 of the blue channel",
+        );
+    }
+    // At the frame's edges, half off it, and wholly outside (drawn as nothing).
+    for (name, pos) in [
+        ("left", (0.0, 0.5)),
+        ("right", (1.0, 0.5)),
+        ("top", (0.5, 0.0)),
+        ("bottom", (0.5, 1.0)),
+        ("corner", (1.0, 1.0)),
+        ("outside", (2.5, 0.5)),
+    ] {
+        for bg in [None, Some("black@0.5")] {
+            let mut o = overlay("Edge of the frame", 0.0, 2.0);
+            (o.pos_x, o.pos_y, o.size) = (pos.0, pos.1, 0.08);
+            o.bg = bg.map(String::from);
+            check_text(
+                &format!("text/edge-{name}{}", if bg.is_some() { "-boxed" } else { "" }),
+                &tl(vec![o]),
+                one,
+                &[0.5],
+            );
+        }
+    }
+    // Colours: a name, a hex, translucent, with a translucent box, and an invalid one (drawn as the
+    // default, white, as the graph does).
+    for (name, color, bg) in [
+        ("yellow", "yellow", None),
+        ("hex", "#ff6a00", Some("black@0.6")),
+        ("translucent", "white@0.5", Some("0x203040")),
+        ("translucent-box", "#ffcc00", Some("#00000080")),
+        ("invalid", "not a colour!", Some("bad:colour")),
+    ] {
+        let mut o = overlay("Coloured text", 0.0, 2.0);
+        (o.color, o.bg, o.pos_y) = (color.into(), bg.map(String::from), 0.3);
+        check_text(&format!("text/colour-{name}"), &tl(vec![o]), one, &[0.5]);
+    }
+    // A keyframed overlay: position and opacity moving, sampled at times between the frame grid's.
+    let mut moving = overlay("Sliding in", 0.0, 2.0);
+    moving.size = 0.07;
+    moving.keyframes = vec![
+        kerf_core::TextKeyframe {
+            time: 0.0,
+            pos_x: 0.2,
+            pos_y: 0.3,
+            opacity: 0.1,
+        },
+        kerf_core::TextKeyframe {
+            time: 1.5,
+            pos_x: 0.7,
+            pos_y: 0.6,
+            opacity: 1.0,
+        },
+    ];
+    check_text("text/keyframed", &tl(vec![moving]), one, &[0.0, 0.37, 0.8, 1.2345, 1.9]);
+    // Several at once, overlapping: drawn in order, the later on the earlier.
+    let (mut a, mut b) = (overlay("Back", 0.0, 2.0), overlay("Front, over it", 0.5, 2.0));
+    (a.size, a.bg, a.pos_y) = (0.2, Some("black@0.4".into()), 0.5);
+    (b.size, b.color, b.bg, b.pos_y) = (0.08, "yellow".into(), Some("white@0.5".into()), 0.5);
+    check_text("text/overlapping", &tl(vec![a, b]), one, &[0.2, 1.0]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
+    let m = media();
+    let title = |text: &str| {
+        let mut o = overlay(text, 0.0, 2.0);
+        (o.size, o.pos_y, o.bg, o.color) = (0.09, 0.5, Some("black@0.5".into()), "yellow@0.9".into());
+        o
+    };
+    // The composite's matrix is what FFmpeg converts the text colour with: BT.601 under 6.1 whatever
+    // the picture is tagged, the tag under 9.0. (A mixed stack is refused by the plan, as ever.)
+    for (name, a) in [
+        ("untagged", &m.bars),
+        ("bt709", &m.bars709),
+        ("bt2020", &m.bars2020),
+        ("gradient-709", &m.gradient709),
+    ] {
+        let tl = with_text(
+            timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None),
+            vec![title("Over the bars")],
+        );
+        check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
+    }
+    for (name, a) in [("full-range-mjpeg", &m.fullrange), ("full-range-jpeg-still", &m.jpeg)] {
+        let tl = with_text(
+            timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None),
+            vec![title("Over a full-range picture")],
+        );
+        let negotiates = matches!(policy(), CompositeColorPolicy::BottomLayerTag);
+        check_text_extra(
+            &format!("text/over-{name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.5],
+            if negotiates { 2 } else { 0 },
+            "a known model difference, not rounding: 9.0 draws the text in full range and converts the range last, \
+             the compositor blends it in the limited-range composite",
+        );
+    }
+    // Over a layer whose source has no frame there (a clip longer than its footage): nothing is drawn
+    // for it, but the overlay chain is in the graph, so the text is blended as YUV, not as the RGB of a
+    // frame with no layer at all.
+    let mut late = title("Past the end of the footage");
+    late.end = 5.0;
+    let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 5.0, 0.0)]], None), vec![late]);
+    assert!(kerf_gpu::decode_layers(
+        &RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &ExportOptions::default(),
+            3.0,
+            policy()
+        )
+        .expect("plan")
+        .layers
+    )
+    .expect("decode")[0]
+        .is_none());
+    check_text("text/over-an-empty-layer", &tl, std::slice::from_ref(&m.testsrc), &[3.0]);
+    // Over a graded layer, a translucent one and a letterbox (the bars are part of the picture).
+    let mut graded = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    graded.color = Color {
+        contrast: 1.3,
+        saturation: 0.6,
+        brightness: 0.05,
+        ..Color::default()
+    };
+    let tl = with_text(timeline(vec![vec![graded]], None), vec![title("Graded")]);
+    check_text("text/over-graded", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+    let mut half = clip(&m.bars, 0.0, 2.0, 0.0);
+    half.transform.opacity = 0.5;
+    let tl = with_text(
+        timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![half]], None),
+        vec![title("Translucent")],
+    );
+    check_text("text/over-translucent", &tl, &[m.gradient.clone(), m.bars.clone()], &[0.5]);
+    let tl = with_text(
+        timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        ),
+        vec![title("Letterboxed")],
+    );
+    check_text("text/over-letterbox-9x16", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+    // 9:16 from a landscape source, and a frame with an odd chroma grid at the box's edge.
+    let mut odd = title("Odd");
+    (odd.pos_x, odd.size) = (0.4999, 0.14);
+    let tl = with_text(
+        timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(202, 100, Fit::Cover)),
+        ),
+        vec![odd],
+    );
+    check_text("text/odd-canvas-202x100", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_on_a_frame_with_no_layer_is_drawn_in_rgb_as_ffmpeg_draws_it() {
+    let m = media();
+    // Past the clip: FFmpeg hands the black base straight to `drawtext` and the PNG without ever
+    // converting it to YUV, so the text is blended on RGB (and the colour is the one written).
+    let tl = |o: kerf_core::TextOverlay| with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None), vec![o]);
+    for (name, color, bg) in [
+        ("white", "white", None),
+        ("yellow-boxed", "yellow@0.9", Some("black@0.5")),
+        ("hex-on-a-solid-box", "#33aaff", Some("#ff00aa")),
+    ] {
+        let mut o = overlay("Title card, no picture", 1.2, 2.0);
+        (o.size, o.pos_y, o.color, o.bg) = (0.09, 0.5, color.into(), bg.map(String::from));
+        check_text(
+            &format!("text/blank-{name}"),
+            &tl(o),
+            std::slice::from_ref(&m.testsrc),
+            &[1.5],
+        );
+    }
+    let mut fading = preset("Fading in", (0.5, 0.5), 0.1, true, Some("black@0.5"), 0.5);
+    (fading.start, fading.end) = (1.2, 3.2);
+    check_text(
+        "text/blank-fading",
+        &tl(fading),
+        std::slice::from_ref(&m.testsrc),
+        &[1.4, 2.2],
+    );
+    // There are no YUV planes to hand back for such a frame: its text would be missing from them.
+    let plan = RenderPlan::at(
+        &tl(overlay("Title card", 1.2, 2.0)),
+        std::slice::from_ref(&m.testsrc),
+        &ExportOptions::default(),
+        1.5,
+        policy(),
+    )
+    .expect("plan");
+    assert!(plan.layers.is_empty() && !plan.overlays.is_empty());
+    let size = plan.size(plan.canvas.width);
+    let err = compositor()
+        .composite_yuv(&plan, &[], size)
+        .expect_err("no YUV for text in RGB");
+    assert!(matches!(err, kerf_gpu::GpuError::Unsupported(_)), "{err:?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_that_needs_escaping_is_drawn_as_the_user_typed_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // Each of these used to draw something else in the still itself (an apostrophe swallowed the options
+    // after it, a colon failed the render on FFmpeg 9 and cut the text on 6.1, a backslash vanished): the
+    // text is what was typed, in the still and on the GPU alike.
+    for (n, text) in [
+        "It's here",
+        "Note: this works",
+        "50% off, 100%",
+        "back\\slash",
+        "say \"hi\", ok; [x] {y}",
+        "  padded  ",
+        "Café ☕ 世界",
+        "Привет, Łódź",
+        "%{pts}",
+        "",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut o = overlay(text, 0.0, 2.0);
+        (o.size, o.pos_y, o.bg) = (0.08, 0.4, Some("black@0.5".into()));
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        check_text(&format!("text/escapes-{n}"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_in_an_installed_font_is_drawn_as_ffmpeg_draws_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // Whatever families this machine has: a face with a real bold is drawn bold, the one with none is
+    // refused (the border `drawtext` thickens it with is blended glyph by glyph, which a mask cannot
+    // be), and a family that is not installed is the shipped default.
+    let installed = kerf_core::list_system_fonts();
+    let mut drawn = 0;
+    for family in [
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Noto Sans",
+        "Arial",
+        "Helvetica",
+        "Segoe UI",
+        "Inter",
+    ] {
+        if !installed.iter().any(|f| f == family) {
+            continue;
+        }
+        let regular = kerf_core::fonts::resolve_font_file(family, false).is_some();
+        let has_bold = kerf_core::fonts::resolve_font_file(family, true).is_some_and(|(_, bold)| bold);
+        if !regular {
+            continue;
+        }
+        let mut o = overlay("Named font, Ay Te", 0.0, 2.0);
+        (o.font, o.size, o.pos_y, o.bold) = (Some(family.into()), 0.08, 0.5, has_bold);
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        check_text(&format!("text/font-{}", family.replace(' ', "-")), &tl, one, &[0.5]);
+        drawn += 1;
+    }
+    // On CI the runners have at least one of these; a machine without any says so rather than
+    // passing as if the case had run.
+    assert!(
+        drawn > 0 || std::env::var_os("CI").is_none(),
+        "CI has none of the listed system fonts installed, so no installed-font case ran"
+    );
+    if drawn == 0 {
+        eprintln!("SKIPPED the installed-font cases: none of the listed families is installed here");
+    } else {
+        eprintln!("installed families drawn: {drawn}");
+    }
+    let mut o = overlay("Not installed", 0.0, 2.0);
+    (o.font, o.size, o.bold) = (Some("No Such Family 123".into()), 0.08, true);
+    let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+    check_text("text/font-not-installed", &tl, one, &[0.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_text_pass_is_the_reference_blend_plane_by_plane() {
+    // The shader against its scalar reference on the planes themselves (no YUV -> RGB in between), over
+    // pictures with texture: the composite with and without the overlays, the reference blend applied to
+    // the second. `tests/text.rs` holds the reference to `drawtext`, so the two together hold the shader to it.
+    let m = media();
+    let mut title = overlay("Plane by plane, Ay Te 50%", 0.0, 2.0);
+    (title.size, title.pos_x, title.pos_y, title.bg) = (0.07, 0.4137, 0.5821, Some("black@0.55".into()));
+    let mut caption = overlay("Odd origin", 0.0, 2.0);
+    (caption.size, caption.pos_x, caption.pos_y) = (0.09, 0.0031, 0.9733);
+    caption.color = "yellow@0.8".into();
+    let mut solid = overlay("Solid", 0.0, 2.0);
+    (solid.size, solid.pos_x, solid.pos_y, solid.bg) = (0.12, 0.9, 0.12, Some("0x30a0c0".into()));
+    let mut fading = overlay("Fading", 0.0, 2.0);
+    (fading.size, fading.pos_y, fading.bg) = (0.1, 0.3, Some("white@0.5".into()));
+    fading.keyframes = vec![
+        kerf_core::TextKeyframe {
+            time: 0.0,
+            pos_x: 0.5,
+            pos_y: 0.3,
+            opacity: 0.0,
+        },
+        kerf_core::TextKeyframe {
+            time: 1.0,
+            pos_x: 0.5,
+            pos_y: 0.3,
+            opacity: 1.0,
+        },
+    ];
+    for (name, asset) in [
+        ("testsrc2", &m.testsrc),
+        ("bt709 bars", &m.bars709),
+        ("gradient", &m.gradient),
+    ] {
+        let tl = with_text(
+            timeline(vec![vec![clip(asset, 0.0, 2.0, 0.0)]], None),
+            vec![title.clone(), caption.clone(), solid.clone(), fading.clone()],
+        );
+        for t in [0.2, 0.6, 1.4] {
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &ExportOptions::default(), t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            assert!(reasons(&plan, size).is_empty(), "{:?}", reasons(&plan, size));
+            let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+            let mut bare = plan.clone();
+            bare.overlays.clear();
+            let base = compositor().composite_yuv(&bare, &frames, size).expect("composite");
+            let with = compositor().composite_yuv(&plan, &frames, size).expect("composite with text");
+            let (mut y, mut u, mut v) = (base.y.clone(), base.u.clone(), base.v.clone());
+            for text in &plan.overlays {
+                let graph = kerf_core::text_raster_graph(text, size);
+                let raster = kerf_gpu::text::rasterize(&graph).expect("rasterise");
+                let blends = kerf_gpu::text::blends(text, &raster, plan.canvas.matrix, false).expect("blends");
+                let mut pic = kerf_gpu::text::Planes {
+                    w: size.0 as usize,
+                    h: size.1 as usize,
+                    subsampled: true,
+                    planes: [&mut y, &mut u, &mut v],
+                };
+                kerf_gpu::text::blend_all(&mut pic, &raster, &blends);
+            }
+            assert_ne!(y, base.y, "{name} @ {t}: the text drew nothing");
+            for (plane, got, want) in [("Y", &with.y, &y), ("U", &with.u, &u), ("V", &with.v, &v)] {
+                let wrong = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    wrong, 0,
+                    "{name} @ {t}: {wrong} samples of the {plane} plane differ from the reference blend"
+                );
+            }
+            eprintln!(
+                "text pass == reference blend: {name} @ {t} ({}x{}, {} overlays)",
+                size.0,
+                size.1,
+                plan.overlays.len()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_the_gpu_cannot_reproduce_is_refused() {
+    let m = media();
+    let tl = with_text(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+        vec![overlay("Bold, in a font with no bold face", 0.0, 2.0)],
+    );
+    let assets = std::slice::from_ref(&m.testsrc);
+    let mut plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    assert!(reasons(&plan, size).is_empty(), "the control is drawn");
+    // A bold request the face cannot meet (the plan marks it): `drawtext` thickens it with a border.
+    plan.overlays[0].synthetic_bold = true;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("no bold face"), "{why}");
+    let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(w) if w.contains("no bold face")),
+        "{err}"
+    );
+    plan.overlays[0].synthetic_bold = false;
+    // Text under 12 px is all shared pixels: a mask cannot stand for the bitmaps `drawtext` blends in turn.
+    plan.overlays[0].size = 0.03;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("11 px font"), "{why}");
+    let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(w) if w.contains("11 px font")),
+        "{err}"
+    );
+    plan.overlays[0].size = 0.034;
+    assert!(reasons(&plan, size).is_empty(), "12 px and up is drawn");
+    // A font file the plan cannot name (the default could not be written): FFmpeg's own default font.
+    plan.overlays[0].font_file = None;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("no font file"), "{why}");
+    eprintln!("refused/text: border, small text, no font file");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_in_a_colour_bitmap_font_is_not_drawn_in_colour_by_anyone() {
+    // `drawtext` loads glyphs without FT_LOAD_COLOR and has no BGRA path: a colour bitmap font (CBDT,
+    // sbix) is a hard error in FFmpeg 6.1.1 (which then segfaults) and 9.0.2 alike, at the one
+    // size the font's strike has and at every other ("Could not set font size"). So there is no colour
+    // glyph for the compositor to draw as a silhouette; its rasteriser runs the same `drawtext` and the
+    // frame is an error, never a picture with the wrong glyphs. (A COLR font is drawn as its monochrome
+    // outlines by `drawtext` itself, which the compositor then blends exactly like any other face.)
+    let Some((path, _)) = kerf_core::fonts::resolve_font_file("Noto Color Emoji", false) else {
+        eprintln!("SKIPPED the colour-font case: no colour bitmap font is installed here");
+        return;
+    };
+    let m = media();
+    let assets = std::slice::from_ref(&m.testsrc);
+    for size in [0.3028, 0.1] {
+        let mut o = overlay("\u{1f3ac}", 0.0, 2.0);
+        (o.font, o.size) = (Some("Noto Color Emoji".into()), size);
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        let png = std::env::temp_dir().join(format!("kerf-colour-font-{}-{size}.png", std::process::id()));
+        let still = export_still(&tl, assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0);
+        let _ = std::fs::remove_file(&png);
+        assert!(
+            still.is_err(),
+            "{}: FFmpeg drew a colour bitmap font after all",
+            path.display()
+        );
+        let plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        if reasons(&plan, size).is_empty() {
+            let drawn = compositor().render_plan(&plan, size);
+            assert!(drawn.is_err(), "the compositor drew a frame FFmpeg cannot");
+        }
+    }
+}
+
 // ---- the scaler, plane by plane --------------------------------------------------
 
 /// The picture scaled by FFmpeg's own `scale` (default flags: bicubic) to the
@@ -2954,7 +3576,7 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                 Some(Delivery::new(w, h, Fit::Contain)),
             );
             let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t, policy()).expect("plan");
-            let why = plan.unsupported_reasons_at((w, h));
+            let why = reasons(&plan, (w, h));
             assert!(why.is_empty(), "{why:?}");
             let gpu_planes = {
                 let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
@@ -3155,6 +3777,10 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
 // never recorded its pixel format), asserted refused rather than compared. Both
 // runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
+// The `text/` rows are the cases with text, judged against the same picture without it
+// (whole-image max at most the control's, floor 3; the lower third at 0.1 s +1, the 12 px text and the
+// full-range pictures on 9.0 +2, each with its reason at the case); the `(no text)` controls are in the
+// report, not here. The `blank-*` rows are frames with no layer (drawn in RGB: exact).
 // The smallest flat share of any non-busy case is 56.9% (`grid/yuv420p-cover-odd-y-then-
 // scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
 // largest band among the cases judged strictly is that one. Every run rewrites `target/parity/report.txt` (these columns plus the
@@ -3291,6 +3917,82 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
 // still/pip-over-video                             1   640x360 |    46.4 dB        5 |    45.6 dB       17 |  9.4% 48.0 / 5
 // still/png-under-video-pip                        1   640x360 |    47.6 dB        5 |    47.6 dB        5 | 13.5%    =
+// text/blank-fading                              1.4   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
+// text/blank-fading                              2.2   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
+// text/blank-hex-on-a-solid-box                  1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  4.8%    =
+// text/blank-white                               1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.9%    =
+// text/blank-yellow-boxed                        1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.8%    =
+// text/caption                                   0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.9%    =
+// text/caption-9x16                              0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 |  9.7%    =
+// text/captions-lines                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
+// text/captions-lines-9x16                       0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 11.4%    =
+// text/captions-word-punch                       0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
+// text/captions-word-punch-9x16                  0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 12.6%    =
+// text/colour-hex                                0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
+// text/colour-invalid                            0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/colour-translucent                        0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
+// text/colour-translucent-box                    0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/colour-yellow                             0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.2%    =
+// text/edge-bottom                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/edge-bottom-boxed                         0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/edge-corner                               0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.3%    =
+// text/edge-corner-boxed                         0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.7%    =
+// text/edge-left                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
+// text/edge-left-boxed                           0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.7%    =
+// text/edge-outside                              0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/edge-outside-boxed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/edge-right                                0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/edge-right-boxed                          0.5   640x360 |    48.7 dB        3 |    48.6 dB        3 | 17.7%    =
+// text/edge-top                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.7%    =
+// text/edge-top-boxed                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.6%    =
+// text/escapes-0                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
+// text/escapes-1                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 19.0%    =
+// text/escapes-2                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.7%    =
+// text/escapes-3                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
+// text/escapes-4                                 0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 19.4%    =
+// text/escapes-5                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/escapes-6                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.2%    =
+// text/escapes-7                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.8%    =
+// text/escapes-8                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
+// text/escapes-9                                 0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/font-DejaVu-Sans                          0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 18.0%    =
+// text/font-Inter                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
+// text/font-Liberation-Sans                      0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
+// text/font-not-installed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.5%    =
+// text/keyframed                                   0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// text/keyframed                                0.37   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.3%    =
+// text/keyframed                                 0.8   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.0%    =
+// text/keyframed                              1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
+// text/keyframed                                 1.9   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.0%    =
+// text/lower-third                               0.1   640x360 |    48.8 dB        3 |    48.7 dB        4 | 16.0%    =
+// text/lower-third                              0.35   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.0%    =
+// text/lower-third                                 1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.5%    =
+// text/lower-third                               1.8   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.3%    =
+// text/lower-third-9x16                          0.1   360x640 |    46.4 dB        4 |    46.4 dB        5 |  9.7%    =
+// text/odd-canvas-202x100                        0.5   202x100 |    49.1 dB        3 |    48.3 dB        5 | 45.5%    =
+// text/over-an-empty-layer                         3   640x360 |    99.0 dB        0 |    63.3 dB        3 |  3.8%    =
+// text/over-bt2020                               0.5   640x360 |    49.0 dB        3 |    48.9 dB        3 | 11.1% 47.9 / 2
+// text/over-bt709                                0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6% 50.0 / 3
+// text/over-full-range-jpeg-still                0.5   480x270 |    48.8 dB        3 |    48.3 dB        3 | 24.8% 52.7 / 3
+// text/over-full-range-mjpeg                     0.5   640x360 |    48.8 dB        3 |    48.5 dB        3 | 20.7% 52.9 / 3
+// text/over-graded                               0.5   640x360 |    48.1 dB        3 |    47.9 dB        3 | 17.0%    =
+// text/over-gradient-709                         0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  3.5% 46.5 / 3
+// text/over-letterbox-9x16                       0.5   360x640 |    55.3 dB        3 |    52.8 dB        5 | 15.6%    =
+// text/over-translucent                          0.5   640x360 |    43.8 dB        5 |    43.9 dB        5 | 12.6%    =
+// text/over-untagged                             0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6%    =
+// text/overlapping                               0.2   640x360 |    49.2 dB        3 |    49.1 dB        3 | 19.3%    =
+// text/overlapping                                 1   640x360 |    49.1 dB        3 |    48.9 dB        3 | 20.4%    =
+// text/size-0.034                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        5 | 16.1%    =
+// text/size-0.06                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 16.6%    =
+// text/size-0.12                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 18.3%    =
+// text/size-0.2                                  0.5   640x360 |    48.9 dB        3 |    48.9 dB        3 | 20.8%    =
+// text/title                                       0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// text/title                                    0.25   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
+// text/title                                     0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.4%    =
+// text/title                                       1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
+// text/title                                     1.7   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.0%    =
+// text/title                                    1.99   640x360 |    74.4 dB        1 |    74.4 dB        1 |  0.0%    =
+// text/title-9x16                                  0   360x640 |    46.3 dB        4 |    46.4 dB        5 |  7.1%    =
 // time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
 // time/keyframes                                1.25   640x360 |    50.3 dB        4 |    49.9 dB        5 | 18.4%    =
 // time/keyframes                                   2   640x360 |    56.2 dB        4 |    54.3 dB        5 |  9.5%    =

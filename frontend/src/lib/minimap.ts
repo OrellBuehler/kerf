@@ -79,6 +79,18 @@ export function viewSpan(v: View): { from: number; to: number } {
 	return { from: Math.max(0, v.scrollLeft) / pps, to: (Math.max(0, v.scrollLeft) + Math.max(v.viewW, 0)) / pps };
 }
 
+/** The strip shows nothing the timeline does not once the view takes in this much of the cut. */
+export const COVERED_RATIO = 0.98;
+
+/** Whether the view already shows (at least `COVERED_RATIO` of) the whole cut, so the strip,
+ *  whose rectangle would span all of it, adds nothing but its height. An empty cut has nothing to map. */
+export function viewCoversCut(v: View, duration: number): boolean {
+	if (!(duration > 0)) return true;
+	const { from, to } = viewSpan(v);
+	const shown = Math.max(0, Math.min(to, duration) - Math.max(from, 0));
+	return shown >= duration * COVERED_RATIO - 1e-9;
+}
+
 /** The rectangle that stands for the view. */
 export function windowRect(v: View, g: MapGeo): WindowRect {
 	const { from, to } = viewSpan(v);

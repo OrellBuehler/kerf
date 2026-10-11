@@ -319,13 +319,15 @@ impl Planner {
             .overlays
             .iter()
             .map(|o| {
-                // Resolving a font loads the system font database: only when one is asked for.
-                let resolved = o.font.as_deref().and_then(|f| crate::fonts::resolve_font_file(f, o.bold));
+                // The graph's own resolution (`drawtext_common`): the family it names, else the
+                // shipped default. Naming a family loads the system font database; no family
+                // does not.
+                let font = crate::fonts::resolve_text_font(o.font.as_deref(), o.bold);
                 PlannedText {
                     color: safe_color(&o.color, "white").to_string(),
                     bg: o.bg.clone().filter(|bg| valid_color(bg)),
-                    synthetic_bold: o.bold && resolved.as_ref().map(|r| r.1) != Some(true),
-                    font_file: resolved.map(|r| r.0),
+                    synthetic_bold: o.bold && !font.as_ref().is_some_and(|f| f.bold),
+                    font_file: font.map(|f| f.path),
                     overlay: o.clone(),
                 }
             })
@@ -1150,10 +1152,10 @@ mod tests {
         for (caps, gone) in flips {
             let now = plan.reasons(&caps, size);
             assert!(!has(&now, gone), "{now:?}");
-            assert_eq!(now.len(), why.len() - 1 + usize::from(caps.text), "{now:?}");
+            assert_eq!(now.len(), why.len() - 1, "{now:?}");
         }
-        // Fades are the export's: the FFmpeg still draws none, so a *still* plan inside one is
-        // refused whatever the caps say, and a Motion plan (frame 15 of 30 fps is 0.5 s) by `caps.fades`.
+        // Fades are the export's: a *still* plan holds none (the FFmpeg still draws them), so one
+        // inside a fade is refused whatever the caps say, and a Motion plan (frame 15 of 30 fps is 0.5 s) by `caps.fades`.
         let fading = GpuCaps {
             fades: true,
             transitions: true,
@@ -1183,13 +1185,16 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
         };
-        // (The overlay has no font, which even a text pass cannot draw, and a still plan is
-        // still inside the fade.)
+        // (The overlay names the shipped default font, which a text pass can draw, and a still
+        // plan is still inside the fade.)
         let left = plan.reasons(&all, size);
-        assert_eq!(left.len(), 2, "{left:?}");
-        assert!(has(&left, |u| matches!(u, Unsupported::TextWithoutFont)) && has(&left, |u| matches!(u, Unsupported::Fade(..))));
-        let left = export.reasons(&all, size);
-        assert_eq!(left, vec![Unsupported::TextWithoutFont]);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(has(&left, |u| matches!(u, Unsupported::Fade(..))));
+        assert_eq!(export.reasons(&all, size), vec![]);
+        // Without a file to name — the default could not be written — no text pass has anything to draw.
+        let mut unnamed = export;
+        unnamed.overlays[0].font_file = None;
+        assert_eq!(unnamed.reasons(&all, size), vec![Unsupported::TextWithoutFont]);
     }
 
     #[test]
@@ -1495,7 +1500,39 @@ mod tests {
             ((title.sample(t).0, title.sample(t).1), title.sample(t).2)
         );
         assert_eq!((text.color.as_str(), text.bg.as_deref()), ("white", None));
-        assert!(text.font_file.is_none() && text.synthetic_bold);
+        assert_eq!(text.font_file, crate::fonts::default_font_file(true));
+        assert!(
+            !text.synthetic_bold,
+            "the shipped default has a bold face, so nothing is thickened"
+        );
+        // A family with no bold face is: the plan thickens what the graph thickens.
+        tl.overlays[0].font = Some(crate::fonts::PINNED_FAMILY.into());
+        let named = crate::fonts::with_pinned_default_font(|| {
+            let export = planner(&tl, &assets, PlanMode::Motion, &opts(25.0));
+            export.at_frame(30).unwrap().overlays[0].clone()
+        });
+        assert_eq!(
+            named.font_file.as_deref(),
+            Some(std::path::Path::new("/kerf-test/fonts/PinnedSans-Regular.ttf"))
+        );
+        assert!(named.synthetic_bold);
+        // ...which a text pass cannot reproduce: the border's glyph bitmaps overlap and are blended in turn.
+        let mut thick = export.at_frame(30).unwrap();
+        thick.overlays[0] = named;
+        let drawn = GpuCaps {
+            motion: true,
+            text: true,
+            ..GpuCaps::A0
+        };
+        let size = thick.size(u32::MAX);
+        assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
+        // ...and so is text whose glyph bitmaps share too many pixels: a font height under 12 px.
+        let mut small = export.at_frame(30).unwrap();
+        let (_, h) = small.size(u32::MAX);
+        small.overlays[0].size = 11.4 / f64::from(h);
+        assert_eq!(small.reasons(&drawn, size), vec![Unsupported::TextTooSmall(11)]);
+        small.overlays[0].size = 11.6 / f64::from(h);
+        assert!(small.reasons(&drawn, size).is_empty());
     }
 
     #[test]

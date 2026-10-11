@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::VideoEffect;
-use crate::render_plan::{YuvMatrix, MAX_SHRINK};
+use crate::render_plan::{YuvMatrix, MAX_SHRINK, MIN_TEXT_PX};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,9 +59,9 @@ impl EffectKinds {
 ///
 /// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity`,
 /// `keyed_zoom` and `keyed_color` are about the export graph and apply to [`PlanMode::Motion`] plans only:
-/// the FFmpeg still draws no fades and a still plan has no tail layers, so a *still* plan
-/// inside a fade, a travel or a tail is refused whatever these say. (`keyed_zoom` also
-/// holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
+/// a still plan has no fades or tail layers (the FFmpeg still draws them, the plan does not
+/// hold them), so a *still* plan inside a fade, a travel or a tail is refused whatever these
+/// say. (`keyed_zoom` also holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
 /// export does: with a grade, rotation, opacity, mask or effect in front of it the still is
 /// refused unless the compositor says it orders them that way.) `mask`, `text`,
 /// `reframe`, `hdr` and `effects` hold for both, since both graphs draw them.
@@ -174,8 +174,16 @@ pub enum Unsupported {
     ZoomBehind(LayerRef),
     /// A text overlay is live.
     Text,
-    /// A live text overlay names no font file the compositor can draw with.
+    /// A live text overlay names no font file the compositor can draw with (the shipped default font
+    /// could not be written to disk).
     TextWithoutFont,
+    /// A live text overlay is bold in a font with no bold face, which `drawtext` thickens with a
+    /// same-colour border: each glyph's border bitmap is blended in turn and they overlap, which
+    /// a compositor that has only their sum cannot reproduce (up to 33 levels of chroma at those pixels).
+    TextBorder,
+    /// A live text overlay is drawn in a font under [`MIN_TEXT_PX`] pixels (the smallest, in pixels):
+    /// glyph bitmaps share too many pixels for one mask to stand for them.
+    TextTooSmall(u32),
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
@@ -248,6 +256,13 @@ impl fmt::Display for Unsupported {
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),
+            Self::TextTooSmall(px) => write!(
+                f,
+                "a text overlay in a {px} px font, under the {MIN_TEXT_PX} px whose glyph bitmaps a mask stands for exactly"
+            ),
+            Self::TextBorder => f.write_str(
+                "a bold text overlay in a font with no bold face, which drawtext thickens with an overlapping border",
+            ),
             Self::Scaler(s) => write!(f, "scaler '{s}'"),
             Self::MatrixUnknown(n) => write!(
                 f,

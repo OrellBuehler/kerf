@@ -45,14 +45,16 @@ pub use engine::cpu::{
 pub use engine::{
     composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, disable_decode_hwaccel, download_speech_model,
     export_seek_arg, export_still, ffmpeg_command, ffmpeg_path, filmstrip_for, fps_mode_flag, generate_proxy, hw_encoders,
-    insta360_pair, limit_ffmpeg_args, prepare_voiceover, proxy_path, proxy_width, render_variants, render_with,
-    render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
+    insta360_pair, limit_ffmpeg_args, limit_frame_args, playback_params, prepare_voiceover, proxy_path, proxy_width,
+    render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
     source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360, stitched_path, stream_preview,
-    validate_export, voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer,
-    Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat,
-    LoudnessPreset, PreviewFrame, RateControl, Region, RenderStatus, SpeechModelInfo, StemsStatus, VariantProgress, VoiceInfo,
+    stream_preview_with, text_raster_graph, text_still_filter, validate_export, voiceover_status, wav_bytes, waveform_pyramid,
+    waveform_range, waveform_range_of, write_wav, AudioBuffer, Container, DownloadProgress, ExportOptions, ExportProgress,
+    ExportVariant, Filmstrip, FilmstripSheet, Fit, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame,
+    RateControl, Region, RenderStatus, SpeechModelInfo, StemsStatus, TextPart, TextRasterGraph, VariantProgress, VoiceInfo,
     VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT,
-    MAX_FILMSTRIP_FRAMES, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_VOICE_SPEED, STEM_NAMES,
+    MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS,
+    MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
@@ -78,5 +80,5 @@ pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
-    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
+    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
 };

@@ -52,6 +52,12 @@ pub(crate) mod test_support;
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;
 
+// Which hardware decoder each input of a run is asked for, and what a one-frame read of a
+// preview proxy is capped to: decided at spawn from what is known of the file, never in the
+// argv builders.
+mod decode_policy;
+pub use decode_policy::limit_frame_args;
+
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
@@ -87,13 +93,14 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame, detect_scenes,
-    detect_silence, disable_decode_hwaccel, export_still, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy,
-    generate_proxy_with, hw_encoders, insta360_pair, mix_levels, proxy_base_width, proxy_path, proxy_width, proxy_width_for,
-    ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity, stitch_insta360,
-    stitched_path, stream_preview, timeline_frame, timeline_frame_region, validate_export, waveform, Container, ExportOptions,
-    ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus,
-    VariantProgress,
+    audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
+    detect_scenes_preferring, detect_silence, disable_decode_hwaccel, export_still, frame_at, frame_jpeg, frame_jpeg_region,
+    generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path,
+    proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity,
+    stitch_insta360, stitched_path, stream_preview, stream_preview_with, timeline_frame, timeline_frame_region, validate_export,
+    waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams,
+    PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, VariantProgress, MAX_STREAM_FPS,
+    MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;
@@ -103,8 +110,9 @@ pub(crate) use cli::proxy_video_info;
 pub(crate) use cli::render_geometry;
 pub use cli::{
     composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, limit_ffmpeg_args,
-    source_is_indexed_container,
+    source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,
 };
+pub(crate) use cli::{proxy_fidelity, ProxyFidelity};
 pub(crate) use cli::{safe_color, valid_color};
 
 // Speech models: the download itself, plus what can be downloaded. Re-exported

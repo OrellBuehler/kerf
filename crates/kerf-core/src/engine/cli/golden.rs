@@ -28,7 +28,10 @@
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
 //! (`with_alimiter_latency`; every case is built with the option, and a case with the
 //! limiter on has its export argv appended once more without it), `drawtext`'s
-//! resolved font path (no overlay names a font, so none is looked up), and libm: the
+//! font path (`with_pinned_default_font`: the shipped default that an overlay with no
+//! family gets, and the one family an overlay names, `PINNED_FAMILY`, are fixed paths, so
+//! neither this machine's cache directory nor its installed fonts reach the argv),
+//! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
 //! numbers to 10 significant digits, which still pins the dB mapping. The digest files are
@@ -145,9 +148,27 @@ image-under-a-frame -t 0.0
 overlay drawtext=
 overlay-keyed alpha='
 overlay-percent \\%
-overlay-quote '\''
+overlay-quote \'\''
+overlay-colon a\: b
+overlay-backslash back\\\\slash
+overlay-linebreak one two three four five
+still-overlay-quote \'\''
+still-overlay-colon a\: b
+still-overlay-backslash back\\\\slash
+still-overlay-linebreak one two three four five
+preview-overlay-quote \'\''
+preview-overlay-colon a\: b
+preview-overlay-backslash back\\\\slash
+preview-overlay-linebreak one two three four five
 overlay-bold borderw=2
 overlay-box box=1
+overlay-default-font fontfile='/kerf-test/fonts/Geist-Regular.ttf'
+overlay-default-font-bold fontfile='/kerf-test/fonts/Geist-Bold.ttf'
+overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
+still-overlay-default-font fontfile='/kerf-test/fonts/Geist-
+still-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
+preview-overlay-default-font fontfile='/kerf-test/fonts/Geist-
+preview-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
 cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
@@ -156,6 +177,10 @@ gif-loop-forever -loop 0
 gif-loop-once -loop -1
 hwaccel -hwaccel
 still-region crop=2*trunc(
+still-fade settb=expr=
+still-fade-alpha :alpha=1,setpts=PTS-STARTPTS
+still-fade-white :c=white,setpts=PTS-STARTPTS
+still-fade-pixel-format ,setpts=PTS-STARTPTS,format=yuv
 still-file-png image2 -vcodec png
 still-file-jpeg image2 -vcodec mjpeg -y
 still-jpeg-pipe image2pipe
@@ -696,12 +721,21 @@ fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
 fn overlay(r: &mut Rng) -> TextOverlay {
     let text = r.pick(&["Hello", "50% off", "It's \"quoted\"", "back\\slash", "two\nlines", "a: b, c; [d] =e", "日本語 ünï", "", "%{pts}"]);
     let start = r.real(0.0, 20.0);
+    // Half of the draws of "two\nlines" break the line with every other kind of break as well (a CR, a CRLF,
+    // the Unicode separators), so the oracle pins that they are all one space; from draws already made, so no
+    // other case moves.
+    let text = if text == "two\nlines" && start.fract() >= 0.5 { "one\rtwo\r\nthree\u{2028}four\u{2029}five" } else { text };
     let mut o = TextOverlay::new(text, start, start + r.real(0.2, 6.0));
     o.id = r.id();
     (o.pos_x, o.pos_y, o.size) = (r.real(0.0, 1.0), r.real(0.0, 1.0), r.real(0.02, 0.2));
     o.color = r.pick(&["white", "yellow@0.9", "#ffcc00", "0xFF00FF80", "not a colour!", "a,b"]).into();
     o.bg = r.pick(&[None, None, Some("black@0.5"), Some("#00000080"), Some("bad:colour")]).map(String::from);
     (o.bold, o.generated) = (r.chance(0.2), r.chance(0.2));
+    // The shipped default has a bold face, so a bold overlay no longer carries a border; one font with
+    // none keeps the border branch covered. Chosen from draws already made, so no other case moves.
+    if o.bold && !o.generated {
+        o.font = Some(crate::fonts::PINNED_FAMILY.into());
+    }
     for _ in 0..maybe(r, 0.3, |r| 1 + r.below(3)).unwrap_or(0) {
         let (time, pos_x, pos_y) = (r.real(0.0, 5.0), r.real(0.0, 1.0), r.real(0.0, 1.0));
         o.keyframes.push(TextKeyframe { time, pos_x, pos_y, opacity: r.real(0.0, 1.0) });
@@ -927,9 +961,12 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     (text, transitions(c, assets))
 }
 
-/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`.
+/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`, and the
+/// shipped default font were at a fixed path.
 fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
-    with_zscale(zscale, || with_alimiter_latency(latency, f))
+    with_zscale(zscale, || {
+        with_alimiter_latency(latency, || crate::fonts::with_pinned_default_font(f))
+    })
 }
 
 /// Which way each transition went, from what `transition_fx` did with it: a dip
@@ -966,7 +1003,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 25] = [
+const STRUCTURAL: [&str; 27] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -992,6 +1029,8 @@ const STRUCTURAL: [&str; 25] = [
     "channel-held-static",
     "channel-colour-only",
     "channel-opacity-alone",
+    "still-tail",
+    "still-travel",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1091,6 +1130,16 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             .flat_map(|t| &t.clips)
     };
     let times = [c.stills[0].0, c.stills[1].0, c.preview.0];
+    // A still inside a transition: a clip kept on screen past its end, or one a slide or a push moves.
+    let fps = export_format(&rendered, assets, &c.opts).fps;
+    let layers = |t: f64| still_layers(&rendered, assets, fps, t.max(0.0));
+    let still_transitions = c.stills.iter().fold((false, false), |(tail, travel), (t, _)| {
+        let layers = layers(*t);
+        (
+            tail || layers.iter().any(|l| t.max(0.0) >= l.active.clip.timeline_end()),
+            travel || layers.iter().any(|l| l.motion != (0.0, 0.0)),
+        )
+    });
     let channels = |rf: &Reframe| {
         let k = &rf.keyframes;
         [
@@ -1155,6 +1204,8 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
             "channel-opacity-alone",
         ),
+        (still_transitions.0, "still-tail"),
+        (still_transitions.1, "still-travel"),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
         (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
         (chain_tails(&flat[0]).1, "alpha-kept"),

@@ -65,8 +65,9 @@
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
-  one sampled transform, fades and transitions left out of the picture, half-open spans,
-  text drawn statically). `Motion` is the export graph at output frame `k`: every
+  one sampled transform, half-open spans, text drawn statically; the FFmpeg still also draws
+  the fades, tails and travel of a frame inside a transition — `engine/cli/still_fx.rs` — which
+  a still plan does not hold). `Motion` is the export graph at output frame `k`: every
   expression the graph evaluates (`enable`, keyframes, the overlay position, `drawtext`) is
   read at `ffmpeg_frame_time(k)`, the slot boundary is `exact_time(k)`; an outgoing clip
   plays on its tail; a keyframed clip is never padded and always scales again
@@ -80,12 +81,13 @@
   frame (read at `t` and at `ffmpeg_frame_time(frame)`) and `reasons` refuses it
   (`Unsupported::StillTail`), as it refuses a still inside a fade step or a travel,
   **whatever the caps**: `fades`, `transitions`, `keyed_*` and `motion` are about Motion
-  plans (the FFmpeg still draws no fades), `mask` / `text` / `effects` / `reframe` / `hdr`
+  plans (a still plan holds none of it; the FFmpeg still draws it, so the fallback is the
+  export's frame), `mask` / `text` / `effects` / `reframe` / `hdr`
   hold for both. `frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn`
   (kerf-gpu parity: dissolve / slide / push / dip, covering and partial incoming clip,
-  frames before / inside / after, both FFmpegs) holds every listed frame to "refused, or
-  the still it draws like is the export's frame and the GPU matches it", so the second half
-  of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge
+  frames before / inside / after, both FFmpegs) holds every listed frame's FFmpeg still to the
+  export's frame (>= 35 dB, the tail-only frame included) and the drawn ones to the GPU, so the
+  second half of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge
   (the layers whose `enable` window contains the frame time, end included) and **`fps_pick`
   resolves them**: a candidate is drawn exactly when its pick names a frame
   (`rendered.rs` holds that to the pixels at five rates, and every drawn clip is planned).
@@ -230,10 +232,21 @@
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,
-  HDR, a live text overlay, a fade or transition in progress, a non-bicubic scaler, a
+  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
   layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
   steepest the scaler comparison measures), and the classes below. Pure + unit-tested
   like the rest of the timeline math.
+  - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
+    `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
+    names, else the shipped Geist, `Regular` or `Bold`, written to `<cache>/kerf/fonts/`, checked on each call) is called by the graph
+    (`drawtext_common`) and the planner alike, so `PlanText.font_file` is exactly what the still / export pass as
+    `fontfile=` — `TextWithoutFont` is only the case where the default could not be written. `kerf_core::text_still_filter(&PlanText, h)`
+    is the `drawtext` the still draws for a plan's overlay (a test holds it byte-equal to `drawtext_still` over the
+    timeline's overlay at the same time) and `text_raster_graph` the graph the compositor rasterises it with (same options and
+    position, white on black in `rgb24`, parts `Glyphs` and `Box`). Refused: `Text` (no `caps.text`), `TextWithoutFont`,
+    **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
+    **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
+    render size by `reasons`, not the size-free half).
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,

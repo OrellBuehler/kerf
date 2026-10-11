@@ -931,13 +931,23 @@ fn the_platform_check_of_a_range_describes_the_file_the_range_writes() {
     // The first ten seconds are the portrait picture alone: no sound, no title, its own frame.
     let first = project.cut_summary_in(None, Some((0.0, 8.0))).unwrap();
     assert_eq!(first.duration, 8.0);
-    assert!(!first.has_audio && !first.has_text, "{first:?}");
+    assert!(
+        !first.has_audio && !first.has_text,
+        "audio {} text {}",
+        first.has_audio,
+        first.has_text
+    );
     assert_eq!((first.width, first.height), (720, 1280));
 
     // The tail is the landscape shot with its sound and the title: a different file altogether.
     let tail = project.cut_summary_in(None, Some((12.0, 30.0))).unwrap();
     assert_eq!(tail.duration, 18.0);
-    assert!(tail.has_audio && tail.has_text, "{tail:?}");
+    assert!(
+        tail.has_audio && tail.has_text,
+        "audio {} text {}",
+        tail.has_audio,
+        tail.has_text
+    );
     assert_eq!(
         (tail.width, tail.height),
         (1920, 1080),
