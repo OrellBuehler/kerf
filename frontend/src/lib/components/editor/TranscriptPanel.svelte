@@ -18,7 +18,10 @@
 	const activeTx = $derived(activeLineIndex(txLines, ui.time));
 
 	function seekLine(l: TxLine) {
-		if (l.clip) ui.seek(srcToTimeline(l.clip, l.start));
+		if (!l.clip) return;
+		// The start of a line: the first frame inside it, so it is the line the playhead is on.
+		const from = srcToTimeline(l.clip, l.start);
+		ui.seek(from, { snap: 'up', end: Math.max(from, srcToTimeline(l.clip, l.end)) });
 	}
 
 	async function cutLine(l: TxLine) {

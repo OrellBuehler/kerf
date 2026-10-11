@@ -5328,6 +5328,9 @@ pub struct DiffEntry {
     pub track_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_id: Option<Uuid>,
+    /// The title or caption an `Overlay*` entry is about, so a view of the proposal can mark it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_id: Option<Uuid>,
     /// Where on the timeline to look, so the reviewer can jump straight to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<f64>,
@@ -5341,6 +5344,7 @@ impl DiffEntry {
             detail: None,
             track_id: None,
             clip_id: None,
+            overlay_id: None,
             at: None,
         }
     }
@@ -5357,6 +5361,11 @@ impl DiffEntry {
 
     fn on_clip(mut self, id: Uuid) -> Self {
         self.clip_id = Some(id);
+        self
+    }
+
+    fn on_overlay(mut self, id: Uuid) -> Self {
+        self.overlay_id = Some(id);
         self
     }
 
@@ -5948,6 +5957,7 @@ impl Timeline {
                             fmt_time(overlay.end)
                         ),
                     )
+                    .on_overlay(overlay.id)
                     .at(overlay.start),
                 ),
                 Some(before) => {
@@ -5955,6 +5965,7 @@ impl Timeline {
                         rest.push(
                             DiffEntry::new(DiffKind::OverlayChanged, format!("Changed text “{}”", overlay.text))
                                 .detail(detail)
+                                .on_overlay(overlay.id)
                                 .at(overlay.start),
                         );
                     }
@@ -5968,6 +5979,7 @@ impl Timeline {
                         DiffKind::OverlayRemoved,
                         format!("Removed text “{}” at {}", overlay.text, fmt_time(overlay.start)),
                     )
+                    .on_overlay(overlay.id)
                     .at(overlay.start),
                 );
             }
@@ -7250,6 +7262,34 @@ mod tests {
         );
         // Every entry lands in the rendered summary the agent reads back.
         assert_eq!(diff.summary().lines().count(), 4);
+    }
+
+    #[test]
+    fn diff_overlay_entries_name_the_overlay() {
+        let mut before = Timeline::new();
+        let kept = TextOverlay::new("Kept", 0.0, 2.0);
+        let removed = TextOverlay::new("Gone", 5.0, 7.0);
+        before.overlays.push(kept.clone());
+        before.overlays.push(removed.clone());
+
+        let mut after = Timeline::new();
+        let mut changed = kept.clone();
+        changed.start = 0.5;
+        let added = TextOverlay::new("New", 3.0, 4.0);
+        after.overlays.push(changed);
+        after.overlays.push(added.clone());
+
+        let diff = before.diff(&after);
+        let id_of = |kind: DiffKind| diff.entries.iter().find(|e| e.kind == kind).and_then(|e| e.overlay_id);
+        assert_eq!(id_of(DiffKind::OverlayChanged), Some(kept.id));
+        assert_eq!(id_of(DiffKind::OverlayAdded), Some(added.id));
+        assert_eq!(id_of(DiffKind::OverlayRemoved), Some(removed.id));
+        // It rides the JSON the surfaces send, and is left out of an entry that has none.
+        let entry = diff.entries.iter().find(|e| e.kind == DiffKind::OverlayAdded).unwrap();
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["overlay_id"], serde_json::json!(added.id.to_string()), "{json}");
+        let marker = DiffEntry::new(DiffKind::MarkerAdded, "m".to_string());
+        assert!(serde_json::to_value(&marker).unwrap().get("overlay_id").is_none());
     }
 
     // ---- smart crop ---------------------------------------------------------

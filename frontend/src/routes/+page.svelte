@@ -51,6 +51,9 @@
 	} from '$lib/api';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
+	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
+	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -81,6 +84,17 @@
 	$effect(() => {
 		void editor.timeline;
 		untrack(() => ui.resync());
+	});
+
+	// The playhead cannot stand past the end of the cut. An edit that shortens it (a delete, an undo, an
+	// agent's trim, a proposal on screen) takes it back to the new end rather than leaving it parked in
+	// nothing, reading a time the cut does not have.
+	$effect(() => {
+		const end = editor.duration;
+		untrack(() => {
+			const back = clampPlayhead(ui.time, end);
+			if (back !== null) ui.seek(back);
+		});
 	});
 
 	// The desktop window is created hidden, so the unthemed first frame is never
@@ -371,9 +385,20 @@
 		hadStaged = has;
 	});
 
-	/** Step by one timeline frame; Shift seeks a whole second. */
-	function frameStep(coarse: boolean): number {
-		return coarse ? 1 : 1 / editor.fps;
+	/** The times the proposal on screen changes the cut at, for stepping through them. */
+	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
+
+	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
+	function stepReview(dir: 1 | -1): void | false {
+		if (!editor.previewingStaged) return false;
+		const at = stepChange(reviewPoints, ui.time, dir, editor.fps, editor.duration);
+		if (at === null) toast.info(dir > 0 ? 'That is the last change in the proposal' : 'That is the first change in the proposal');
+		else ui.seek(at);
+	}
+
+	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	function step(frames: number) {
+		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -488,10 +513,10 @@
 		'playback.shuttleBack': () => ui.shuttle(-1),
 		'playback.pause': () => ui.pause(),
 		'playback.shuttleForward': () => ui.shuttle(1),
-		'playback.stepBack': () => ui.seek(ui.time - frameStep(false)),
-		'playback.stepForward': () => ui.seek(ui.time + frameStep(false)),
-		'playback.jumpBack': () => ui.seek(ui.time - frameStep(true)),
-		'playback.jumpForward': () => ui.seek(ui.time + frameStep(true)),
+		'playback.stepBack': () => step(-1),
+		'playback.stepForward': () => step(1),
+		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
+		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
 
@@ -502,6 +527,8 @@
 				.catch(clipErr),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
+		'review.prevChange': () => stepReview(-1),
+		'review.nextChange': () => stepReview(1),
 		// The in / out pair stays ordered so a mark can't cross its partner.
 		'range.markIn': () => {
 			ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
@@ -569,6 +596,9 @@
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
+		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
+		// from the editor surface (the timeline, the preview, nothing in particular).
+		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
 		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
 		// is consumed, so the browser does not scroll or click on it either.
 		if (e.repeat && !allowsRepeat(id)) {
@@ -593,6 +623,53 @@
 			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
 			></span>
 			<span>Previewing the agent's proposed cut — your timeline is unchanged.</span>
+			{#if editor.staged}
+				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
+				     marks mean (colour and outline style both say it). -->
+				<span
+					data-review-nav
+					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px"
+				>
+					<button
+						title={settings.withShortcut('Previous change', 'review.prevChange')}
+						aria-label="Previous change"
+						disabled={reviewPoints.length === 0}
+						onclick={() => void stepReview(-1)}
+						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
+						><Icon n="chevron-left" s={12} /></button
+					>
+					<span
+						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
+						aria-live="polite"
+						title="The proposal changes the cut at {reviewPoints.length} place{reviewPoints.length === 1 ? '' : 's'}; {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'} in all"
+						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
+					>
+					<button
+						title={settings.withShortcut('Next change', 'review.nextChange')}
+						aria-label="Next change"
+						disabled={reviewPoints.length === 0}
+						onclick={() => void stepReview(1)}
+						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
+						><Icon n="chevron-right" s={12} /></button
+					>
+					<span style="margin-left:4px;font-family:var(--font-mono)"
+						>· {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}</span
+					>
+				</span>
+				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary)">
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
+					>
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span style="width:12px;height:9px;border:2px dashed var(--diff-shift);border-radius:2px"></span>changed</span
+					>
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span
+							style="width:12px;height:9px;border:1.5px dashed var(--diff-remove);border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--diff-remove) 55%,transparent) 0 1px,transparent 1px 4px)"
+						></span>removed</span
+					>
+				</span>
+			{/if}
 			<div style="flex:1"></div>
 			<button
 				onclick={() => editor.exitStagedPreview()}
