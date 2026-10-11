@@ -228,7 +228,7 @@ and a failure is nothing: the frame is decoded when asked. **Nothing
 here may freeze the preview**: a backend is built **off the render lock** and with a deadline
 (`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
 JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish
-and dropped; a masked plan has FFmpeg's `geq` measured by `kerf_gpu::prepare` there too, once, not under the lock), a panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)
+and dropped), a masked plan has FFmpeg's `geq` measured once by `kerf_gpu::prepare`, on the frame's own blocking thread before `ensure_backend` (off the render lock and outside the build deadline, bounded by the probe's own `PROBE_TIMEOUT`, 10 s; a failed probe is FFmpeg's JPEG for that frame and retried after a backoff), a panic anywhere in the GPU path (`frame()`'s `catch_unwind`, and the build thread's)
 drops the backend behind the backoff, hides the surface and answers with FFmpeg's JPEG — and the
 page treats a *rejected* `get_preview_frame` the same way (the JPEG for that frame, the surface
 hidden). The setting flips **synchronously** (`set_enabled` returns whether a teardown is due; only
