@@ -14995,13 +14995,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_frame_reports_how_far_behind_its_slot_it_arrived() {
+        let timeouts = PreviewTimeouts {
+            first: std::time::Duration::from_secs(5),
+            stall: std::time::Duration::from_secs(5),
+        };
         let mut delays = Vec::new();
         let mut sent = Some(0);
         pump_preview(
             fake_stream(r"printf '\377\330a\377\331'; sleep 0.3; printf '\377\330b\377\331'"),
             0.0,
             1000.0,
-            short_timeouts(),
+            timeouts,
             &mut |f| {
                 delays.push(f.late);
                 true
@@ -15023,7 +15027,7 @@ mod tests {
             fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
             0.0,
             4.0,
-            short_timeouts(),
+            timeouts,
             &mut |f| {
                 delays.push(f.late);
                 true
