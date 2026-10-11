@@ -375,7 +375,7 @@ the cursors above, not over the router's runs: the router serves `Pick::AtOrAfte
 export's `fps` pick, which only a cursor reads. `MotionFrames::frames(plan)` reads a frame's layers **side by side** (scoped threads, one per
 cursor: three layers cost the slowest decode, not the sum), `Compositor::render_motion_texture(plan, size, &mut motion)` is
 `render_plan_texture_with` over it (the texture stays on the GPU for the presenter), and `Compositor::warm_text(plan, size)` rasterises a
-plan's titles into the atlas without drawing, so a caption that comes on screen costs its `ffmpeg` on a prefetch thread and not on the frame.
+plan's titles into the atlas without drawing, so a caption that comes on screen costs its `ffmpeg` on a prefetch thread and not on the frame (and `render_motion_texture` warms the frame's own titles *while* its cursors read, the two waits being independent).
 **`MotionFrames::feed()` is a `CursorFeed`**: `open(layer)` checks the clip as `FrameSource::cursor` does (`FrameSource::check_cursor`, the same
 gates split out: the self-test, a recorded opaque pixel format, an indexed container, seek points on keyframes, no run has marked the file) and
 starts its `ffmpeg`, which fills the pipe and waits (at most 6 waiting, 10 s each); the frame that first needs the clip takes the waiting

@@ -1795,7 +1795,17 @@ impl Compositor {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
         let t0 = Instant::now();
-        let frames = motion.frames(plan)?;
+        // The titles of a frame are rasterised (a first-seen one costs an `ffmpeg`) while its cursors
+        // read, not after them: the two waits are independent, and the composite below finds the text
+        // in the atlas. A failure here is the composite's to report.
+        let frames = std::thread::scope(|scope| {
+            let text = (!plan.overlays.is_empty()).then(|| scope.spawn(|| self.warm_text(plan, size)));
+            let frames = motion.frames(plan);
+            if let Some(text) = text {
+                let _ = text.join();
+            }
+            frames
+        })?;
         let decode = t0.elapsed();
         let t1 = Instant::now();
         let rendered = match self.composite_as(plan, &frames, size, Output::Texture)? {
