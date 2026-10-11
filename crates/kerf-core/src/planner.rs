@@ -1395,7 +1395,7 @@ mod tests {
             .unwrap();
         let size = plan.size(u32::MAX);
         let why = plan.reasons(&GpuCaps::A0, size);
-        assert!(has(&why, |u| matches!(u, Unsupported::Effects(_))));
+        assert!(has(&why, |u| matches!(u, Unsupported::Effects(..))));
         assert!(has(&why, |u| matches!(u, Unsupported::Mask(_))));
         assert!(has(&why, |u| matches!(u, Unsupported::Fade(_, _, false))));
         assert!(has(&why, |u| matches!(u, Unsupported::Text)));
@@ -1409,7 +1409,7 @@ mod tests {
             effects: EffectKinds::BLUR,
             ..GpuCaps::A0
         };
-        assert!(has(&plan.reasons(&blur, size), |u| matches!(u, Unsupported::Effects(_))));
+        assert!(has(&plan.reasons(&blur, size), |u| matches!(u, Unsupported::Effects(..))));
         let both = EffectKinds::BLUR.union(EffectKinds::CHROMA_KEY);
         let flips: [(GpuCaps, Gone); 3] = [
             (
@@ -1417,7 +1417,7 @@ mod tests {
                     effects: both,
                     ..GpuCaps::A0
                 },
-                |u| matches!(u, Unsupported::Effects(_)),
+                |u| matches!(u, Unsupported::Effects(..)),
             ),
             (
                 GpuCaps {
@@ -1539,7 +1539,7 @@ mod tests {
             plan.reasons(caps, plan.size(u32::MAX))
         };
         let zoom = zoomed.tracks[0].clips[0].clone();
-        let behind = |u: &Unsupported| matches!(u, Unsupported::ZoomBehind(_));
+        let behind = |u: &Unsupported| matches!(u, Unsupported::ZoomBehind(..));
         assert!(!has(&still(zoom.clone(), &GpuCaps::A0), behind));
         let mut graded = zoom.clone();
         graded.color.contrast = 1.3;
@@ -1565,13 +1565,18 @@ mod tests {
                 ..keyed(2.0, 0.5, 0.0)
             },
         ];
-        for clip in [graded, turning, fading] {
-            assert!(has(&still(clip.clone(), &GpuCaps::A0), behind));
-            let ordered = GpuCaps {
-                keyed_zoom: true,
-                ..GpuCaps::A0
-            };
-            assert!(!has(&still(clip, &ordered), behind));
+        let ordered = GpuCaps {
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        for clip in [graded.clone(), turning.clone(), fading.clone()] {
+            assert!(has(&still(clip, &GpuCaps::A0), behind));
+        }
+        // A compositor that zooms last draws a grade in front of the zoom; a rotation and an
+        // opacity below 1 are the two it does not order that way, and are refused whatever it says.
+        assert!(!has(&still(graded, &ordered), behind));
+        for clip in [turning, fading] {
+            assert!(has(&still(clip, &ordered), behind));
         }
         // A rotation or a grade with no zoom to move has nothing to be ordered against.
         let mut steady = tl.tracks[0].clips[0].clone();

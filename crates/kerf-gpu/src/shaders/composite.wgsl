@@ -92,8 +92,8 @@ struct ComposeParams {
     pic_shows: vec2<i32>,
     rotate: u32,
     tail: u32,          // 1: draw only the chroma of an odd layer's last half block
-    pad0: u32,
-    pad1: u32,
+    has_alpha: u32,     // 1: the layer's alpha is a plane (a mask), bound as `atex`
+    edge: u32,          // 1: `geq` read the layer's last column and row one in (the mask's filter, on some builds)
     // `fade`'s integer factors (65535: not running), then the black level it takes for the layer's
     // pixel format and the layer's alpha before the ramp (0..255).
     fade_in: u32,
@@ -221,7 +221,15 @@ fn layer_pixel(frag: vec4<f32>) -> vec4<f32> {
     }
     // Chroma is shared by 2x2 luma pixels (the layer's origin is even, so the
     // grids line up); the final conversion replicates it, as swscale's does.
-    let lc = vec2<i32>(l.x / 2, l.y / 2);
+    var lc = vec2<i32>(l.x / 2, l.y / 2);
+    var ly = l;
+    if (cp.edge != 0u) {
+        // `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` on a build that clamps its read to `w - 2` /
+        // `h - 2`: each plane's last column and row are their neighbours' (the planes are the layer's, the
+        // padded frame of a letterboxed picture included).
+        ly = min(l, cp.layer - vec2<i32>(2, 2));
+        lc = min(lc, cp.clayer - vec2<i32>(2, 2));
+    }
     let uv = layer_uv(lc);
     var u = i32(round(uv.x));
     var v = i32(round(uv.y));
@@ -230,7 +238,7 @@ fn layer_pixel(frag: vec4<f32>) -> vec4<f32> {
     // `overlay` blends whole chroma samples, so the chroma block an odd layer ends in reaches one pixel
     // past it — with the luma left to the layers below (the tail pass writes only U and V).
     if (cp.tail == 0u) {
-        let sy = layer_y(l);
+        let sy = layer_y(ly);
         y = i32(round(sy.x));
         cov = sy.y;
     }
@@ -266,12 +274,50 @@ fn fs_compose(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 // The canvas before this layer, for a layer whose alpha is below 255 and so cannot be the hardware's
 // blend: FFmpeg's own, in integers.
 @group(0) @binding(4) var prev: texture_2d<f32>;
+// The mask's alpha plane (a 1x1 stand-in when the layer has none: `cp.has_alpha` is 0).
+@group(0) @binding(5) var atex: texture_2d<f32>;
 
 // `overlay`'s blend of a `yuva420p` picture on a `yuv420p` one (`blend_plane`): `d * (255 - a) + s * a`
 // divided by 255 with `FAST_DIV255`, rounding to nearest. Exact for a = 255 (the source) and 0 (the
 // destination). 6.1 and 9.0 alike, on all three planes for a uniform alpha.
 fn blend255(d: u32, s: u32, a: u32) -> u32 {
     return ((d * (255u - a) + s * a + 128u) * 257u) >> 16u;
+}
+
+// The alpha of layer pixel `l` (0..255) as `overlay` finds it: the mask's plane when the layer has one,
+// else the layer's one alpha, then the dissolve's `fade alpha=1`, which runs on the plane.
+fn alpha_at(l: vec2<i32>) -> u32 {
+    var a = cp.alpha;
+    if (cp.has_alpha != 0u) {
+        a = u32(round(textureLoad(atex, l, 0).r * 255.0));
+    }
+    if (cp.ramp < 65535u) {
+        a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
+    }
+    return a;
+}
+
+// `overlay`'s alpha for the chroma sample of block `lc` (`blend_plane`, 6.1 and 9.0 alike): the four
+// alphas of its 2x2 luma block, `>> 2`, wherever the block has a neighbour sample to its right and
+// below; the last chroma column and row (the sample counts are the chroma plane's) average what they
+// have — and a last column ignores its own second luma column, a quirk of the filter, kept.
+fn chroma_alpha_at(lc: vec2<i32>) -> u32 {
+    let p = lc * 2;
+    let right = lc.x + 1 < cp.clayer.x;
+    let below = lc.y + 1 < cp.clayer.y;
+    let a00 = alpha_at(p);
+    if (right && below) {
+        return (a00 + alpha_at(p + vec2<i32>(1, 0)) + alpha_at(p + vec2<i32>(0, 1)) + alpha_at(p + vec2<i32>(1, 1))) >> 2u;
+    }
+    var ah = a00;
+    if (right) {
+        ah = (a00 + alpha_at(p + vec2<i32>(1, 0))) >> 1u;
+    }
+    var av = a00;
+    if (below) {
+        av = (a00 + alpha_at(p + vec2<i32>(0, 1))) >> 1u;
+    }
+    return (av + ah) >> 1u;
 }
 
 @fragment
@@ -281,17 +327,28 @@ fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32
         discard;
     }
     // The alpha plane: opacity (colorchannelmixer), then the dissolve's ramp (`fade alpha=1`), and
-    // wherever a rotation left the picture there is none.
-    var a = cp.alpha;
-    if (cp.ramp < 65535u) {
-        a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
-    }
-    if (px.w < 0.5) {
-        a = 0u;
+    // wherever a rotation left the picture there is none. A mask makes it a plane: luma blends with
+    // its own sample, and each chroma sample with the average `overlay` takes over its block.
+    var a_y = 0u;
+    var a_c = 0u;
+    if (cp.has_alpha != 0u) {
+        let l = vec2<i32>(frag.xy) - cp.origin;
+        a_y = alpha_at(l);
+        a_c = chroma_alpha_at(l / 2);
+    } else {
+        var a = cp.alpha;
+        if (cp.ramp < 65535u) {
+            a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
+        }
+        if (px.w < 0.5) {
+            a = 0u;
+        }
+        a_y = a;
+        a_c = a;
     }
     let d = vec3<u32>(round(textureLoad(prev, vec2<i32>(frag.xy), 0).rgb * 255.0));
     let s = vec3<u32>(px.xyz);
-    let out = vec3<u32>(blend255(d.x, s.x, a), blend255(d.y, s.y, a), blend255(d.z, s.z, a));
+    let out = vec3<u32>(blend255(d.x, s.x, a_y), blend255(d.y, s.y, a_c), blend255(d.z, s.z, a_c));
     return vec4<f32>(vec3<f32>(out) / 255.0, 1.0);
 }
 

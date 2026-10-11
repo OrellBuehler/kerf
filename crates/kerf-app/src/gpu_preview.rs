@@ -1563,6 +1563,10 @@ impl GpuPreview {
             Err(e) => return fallback("no_plan", format!("no plan for this frame: {e}")),
         };
 
+        // What the plan needs measured (FFmpeg's `geq`, for a mask: one child process, once) is measured
+        // here, off the render lock, not by the first masked frame under it.
+        kerf_gpu::prepare(&plan);
+
         // A backend is built off the render lock, with a deadline: a slow or stuck build is a frame
         // that goes through FFmpeg, not a preview that waits for it.
         if let Err(why) = self.ensure_backend(technique, now) {
