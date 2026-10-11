@@ -57,7 +57,58 @@ The prefetch runs the probes and starts the decode on a spare slot while the pre
 so the frame at the cut is a cache read. Measured on lavapipe in a debug build: the GPU side is not in the
 number, the source side is.
 
+## Round 2: originals, backward drags, jumps
+
+Review asked whether a backward miss (a window with 22 frames of lead) or a jump (a full window for one frame) is
+slow when the inputs are originals and not proxies. `tests/scrub_bench.rs` now has a 1080p long-GOP original
+(`-g 250`, B-frames, outside `kerf/proxies`) beside the proxy cases, and three new scenarios: **twenty steps back at
+60 Hz**, **one step back** out of a drawn window (24 frames before it), and **twelve jumps** on one cache. Before is the
+previous commit's engine, built from a worktree; before and after were run interleaved, 3 runs per build, at a load
+average of 13 to 15, so the one-shot (the control: it did not change) moved by 10 to 25 % between runs. Medians of the
+three runs' medians, in ms (`round2/`):
+
+| 1080p original | 9.0.2 before | 9.0.2 after | 6.1.1 before | 6.1.1 after |
+| --- | --- | --- | --- | --- |
+| one-shot per frame (control) | 770 | 782 | 862 | 921 |
+| first frame of a window | 805 | 728 | 886 | 876 |
+| 20 steps forward at 60 Hz | 1126 | 1020 | 1475 | 1232 |
+| 20 steps back at 60 Hz | 2071 | 1690 | 2228 | 2450 |
+| one step back | 1241 | 1370 | 1388 | 1436 |
+| jumps, median | 874 | 672 | 855 | 822 |
+
+What changed in the engine is one thing: a window over an original has **no lead frame**, so the frame asked for is
+the first one out (a proxy keeps its lead of 1: the frame behind is nearly free and a hit on the step back). That is
+worth about 10 % on a first frame or a jump on 9.0.2 and nothing measurable on 6.1.1; the proxy cases (code path
+unchanged) differ by -23 to +30 % between before and after (steps of a few ms aside), which is the noise.
+
+**What was not adopted, with the numbers.** The review suggested, for a backward miss or no direction, a short window
+starting at the frame. Tried as an experiment (an interleaved A/B on the 1080p original, 4 to 5 rounds, load ~14, the
+toggles were temporary and are not in the tree, `window-variants/`): A the old engine, B lead-free windows with the
+reverse window kept for steps back (what is committed), C B plus a short window at the frame for the first step back
+and the reverse window from the second step, D C plus a short first window for a first request or a jump.
+
+| 1080p original, 9.0.2, medians | A old | B committed | C | D |
+| --- | --- | --- | --- | --- |
+| first frame | 824 | 717 | 744 | 725 |
+| jumps | 697 | 618 | 794 | 726 |
+| 20 steps forward | 965 | 979 | 921 | 1846 |
+| 20 steps back | 1916 | 1660 | 3044 | 2988 |
+| one step back (4 rounds, A B C) | 1283 | 1338 | 1121 | |
+
+C saves about 160 ms on an *isolated* step back and costs 1.2 to 1.4 s on a drag back (two processes, each with its own start
+and seek, where one window behind the frame serves the whole drag). D doubles a forward drag from a cold start, since
+the short first window is outrun and the next process pays a start. So: the window behind stays, and a jump keeps
+the full window. A jump still leaves the process decoding up to 23 frames after its frame is out, until the next
+request kills it: that is CPU and not latency (the request returned), and it is what makes the first steps of a
+forward drag hits.
+
 ## What the rendered tests hold
+
+Round 2 added cut shapes: a cut that is itself 29.97 and 23.976 (frame `k * 1001 / 30000`, `k * 1001 / 24000`), a
+23.976 cut with an in-point half a frame off, an animated keyframed title over a box, and two generated captions that
+meet at a frame (with a `%` in the text). All pass on 9.0.2 and 6.1.1 (20 cases): on 9.0.2 every one is the still's JPEG
+byte for byte but the 5 rounding cases below. A caption may not contain `:` or `'`: see the findings.
+
 
 `scrub_rendered.rs` (`#[ignore]`d, drives the real ffmpeg): a window frame is the still's JPEG byte for byte or
 the export's frame, for every kind of cut a window may draw, from a window started at any frame.
@@ -69,6 +120,10 @@ Findings from writing them, all in `.claude/docs/engine-cli.md`:
   cut: its bare `color` base lets the overlay settle on another pixel format and `testsrc2`'s one-pixel chroma
   lines come out 14 levels off on the mean. Adding `format=yuv420p` after the base (as the window's graph has)
   gives the window's picture exactly. The window equals the export there. The still's argv was left alone.
+- **Found, not fixed (export, not scrub):** a `:` in a title or caption aborts the whole export on 9.0.2 (`No option
+  name near ...`; 6.1.1 accepts it), and an `'` makes the text draw black at the default size at the top left on both
+  builds. The `text='...'` quoting is one level short: the filtergraph parser strips the quotes before the filter's
+  own option parser reads the value. The window tests avoid both characters; the fix is in `escape_drawtext`.
 - A source whose rate is not a whole multiple of the cut's (24 or 25 in 30, speed 0.5 or 1.5) samples frames
   depending on where the slice starts, so a window is refused there and the still serves it.
 - A start exactly half a frame off the grid is a tie between two source frames: window and still take one on
@@ -82,4 +137,7 @@ Findings from writing them, all in `.claude/docs/engine-cli.md`:
   uncached side, not the cached one.
 - The GPU resource lane (`Resource::Gpu`, `MAX_GPU_JOBS = 2`) could not be measured: there is no hardware
   encoder here. It is covered by unit tests of the gate (lanes, priority, fall-back to the CPU class) and of the
-  classifiers. On Linux and macOS no job qualifies until a decoder probe exists, so there it changes nothing.
+  classifiers (H.264 qualifies at 8 bit only: High10 has no D3D11VA, DXVA2 or VAAPI decoder; HEVC at 8 or 10 bit).
+  On Linux and macOS no job qualifies until a decoder probe exists, so there it changes nothing. The proxy queue runs
+  two encodes at once only where the lane can qualify (on, Windows), so a hardware proxy no longer waits for the
+  software one in front of it; elsewhere it stays one.
