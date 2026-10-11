@@ -436,9 +436,10 @@
 							<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
 							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
 								Frames the GPU compositor draws exactly are shown from a native surface instead of FFmpeg's
-								JPEG. Every other frame — a transition in progress, an effect it does not draw yet, anything
-								that fails — is FFmpeg's, as before. Playback still uses FFmpeg. The status bar says which
-								renderer made the frame you are looking at.
+								JPEG, fades, dissolves, dips, slides and pushes included. Every other frame — an effect it does
+								not draw yet, a dip to white it has not measured, anything that fails — is FFmpeg's, as
+								before. Playback still uses FFmpeg. The status bar says which renderer made the frame you are
+								looking at.
 							</span>
 						</span>
 					</label>
