@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
+import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
 
@@ -87,11 +87,28 @@ describe('the title bar chip', () => {
 	test('is the whole label while the cell has room, or is not measured yet', () => {
 		expect(reviewChipText(four, 0)).toBe('Review 4 changes');
 		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH)).toBe('Review 4 changes');
-		expect(reviewChipText(four, 1366 / 2 - 150)).toBe('Review 4 changes');
+		expect(reviewChipText(four, 1920 / 2 - 150)).toBe('Review 4 changes');
+	});
+
+	test('1366×768 (a right cell of 513) gets the short chip, so the project’s name keeps its room', () => {
+		expect(reviewChipText(four, 513)).toBe('4');
 	});
 
 	test('is the count alone in a narrow cell, and a word when there is no count', () => {
 		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4');
 		expect(reviewChipText(proposalIndicator(staged(0))!, 300)).toBe('Review');
+	});
+});
+
+describe('the Agent tab’s name', () => {
+	test('is the visible label, then what the count means', () => {
+		expect(agentTabLabel(null)).toBe('Agent');
+		expect(agentTabLabel(proposalIndicator(staged(4)))).toBe('Agent, 4 changes to review');
+		expect(agentTabLabel(proposalIndicator(staged(1)))).toBe('Agent, 1 change to review');
+		expect(agentTabLabel(proposalIndicator(staged(0)))).toBe('Agent, proposal to review');
+	});
+
+	test('starts with the word on the tab, so a voice command for the visible label still works', () => {
+		expect(agentTabLabel(proposalIndicator(staged(2))).startsWith('Agent')).toBe(true);
 	});
 });

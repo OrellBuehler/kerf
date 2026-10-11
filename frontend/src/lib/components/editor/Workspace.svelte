@@ -19,7 +19,7 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { popout } from '$lib/popout.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { proposalIndicator } from '$lib/agent-status';
+	import { agentTabLabel, proposalIndicator } from '$lib/agent-status';
 
 	const COMPONENTS: Record<PanelId, Component<any>> = {
 		library: LibraryPanel,
@@ -49,10 +49,10 @@
 				const label = tab.querySelector<HTMLElement>('.dv-default-tab-content');
 				if (badge) {
 					label?.setAttribute('data-pending', badge.count > 0 ? String(badge.count) : '•');
-					tab.setAttribute('aria-label', `Agent — ${badge.tip}`);
+					tab.setAttribute('aria-label', agentTabLabel(badge));
 				} else {
 					label?.removeAttribute('data-pending');
-					tab.setAttribute('aria-label', 'Agent');
+					tab.setAttribute('aria-label', agentTabLabel(null));
 				}
 			}
 		};

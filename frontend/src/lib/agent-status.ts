@@ -44,6 +44,12 @@ export interface ProposalIndicator {
 
 const changes = (n: number) => `${n} ${n === 1 ? 'change' : 'changes'}`;
 
+/** The Agent dock tab's accessible name: its visible label, then what the count on it means. */
+export function agentTabLabel(indicator: ProposalIndicator | null): string {
+	if (!indicator) return 'Agent';
+	return indicator.count === 0 ? 'Agent, proposal to review' : `Agent, ${changes(indicator.count)} to review`;
+}
+
 /**
  * What a pending agent proposal looks like away from the Agent panel, or `null` when there is none. In
  * the Audio and Deliver workspaces the agent is only a tab, and a proposal that landed there was
@@ -74,8 +80,9 @@ export function showComposerHint(panelHeight: number): boolean {
 
 /** The title bar's right cell, px, below which the review chip is its icon and count: with the project's
  *  name and badge, Export, the gear, the bell and the version beside it, the full label leaves the name
- *  nothing (at 960 px the badge itself went). */
-export const REVIEW_CHIP_FULL_WIDTH = 510;
+ *  almost nothing (at 960 px the badge itself went). 1366×768 has 513 and so gets the short chip
+ *  with its name intact; the full label is for wider windows. */
+export const REVIEW_CHIP_FULL_WIDTH = 560;
 
 /** What the title bar's chip says in a cell `cellWidth` wide (0 while it is not measured yet: the full label). */
 export function reviewChipText(indicator: ProposalIndicator, cellWidth: number): string {
